@@ -10,6 +10,7 @@
 //! and `Executor` fakes carry the scaffolding a test configures, while the
 //! port method bodies remain stubs for this skeleton.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
@@ -61,16 +62,20 @@ impl Clock for FakeClock {
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-#[allow(dead_code)] // fields are read once the in-memory logic is filled in.
 struct InMemoryState {
+    /// The append-only event log.
     events: Vec<EventKind>,
+    /// Steps a subsequent `claim_ready_steps` will hand out.
     ready: Vec<StepRun>,
+    /// Current run statuses — the "state table" the real store keeps.
+    runs: HashMap<RunId, RunStatus>,
 }
 
 /// An in-memory [`Db`] for tests. Holds the same shape of state a real store
-/// would (event log + a ready queue). Port methods are stubs for now.
+/// would: an append-only event log, a ready queue, and a run-status table that
+/// enforces optimistic concurrency on transitions — the in-process stand-in for
+/// the version-stamped `UPDATE … WHERE status = $from` the Postgres adapter runs.
 pub struct InMemoryDb {
-    #[allow(dead_code)]
     state: Mutex<InMemoryState>,
 }
 
@@ -85,6 +90,16 @@ impl InMemoryDb {
     pub fn seed_ready(&self, steps: Vec<StepRun>) {
         self.state.lock().unwrap().ready = steps;
     }
+
+    /// Snapshot of the append-only event log, in append order.
+    pub fn events(&self) -> Vec<EventKind> {
+        self.state.lock().unwrap().events.clone()
+    }
+
+    /// The last recorded status for `run`, if any transition has been recorded.
+    pub fn run_status(&self, run: &RunId) -> Option<RunStatus> {
+        self.state.lock().unwrap().runs.get(run).copied()
+    }
 }
 
 impl Default for InMemoryDb {
@@ -95,25 +110,40 @@ impl Default for InMemoryDb {
 
 #[async_trait]
 impl Db for InMemoryDb {
-    async fn claim_ready_steps(&self, _limit: u32) -> Result<Vec<StepRun>, DbError> {
-        unimplemented!("InMemoryDb::claim_ready_steps")
+    async fn claim_ready_steps(&self, limit: u32) -> Result<Vec<StepRun>, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let take = (limit as usize).min(st.ready.len());
+        Ok(st.ready.drain(..take).collect())
     }
 
     async fn record_transition(
         &self,
-        _run: &RunId,
-        _from: RunStatus,
-        _to: RunStatus,
+        run: &RunId,
+        from: RunStatus,
+        to: RunStatus,
     ) -> Result<(), DbError> {
-        unimplemented!("InMemoryDb::record_transition")
+        let mut st = self.state.lock().unwrap();
+        // A run first seen here is assumed `Pending`; the recorded `from` must
+        // match the current status or the transition is a stale/duplicate write
+        // (e.g. a crashed worker re-driving) and is rejected as a conflict.
+        let current = st.runs.get(run).copied().unwrap_or(RunStatus::Pending);
+        if current != from {
+            return Err(DbError::Conflict);
+        }
+        st.runs.insert(run.clone(), to);
+        Ok(())
     }
 
-    async fn append_event(&self, _event: &EventKind) -> Result<(), DbError> {
-        unimplemented!("InMemoryDb::append_event")
+    async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
+        self.state.lock().unwrap().events.push(event.clone());
+        Ok(())
     }
 
-    async fn lease(&self, _step: &StepId, _owner: &str, _ttl_ms: i64) -> Result<Lease, DbError> {
-        unimplemented!("InMemoryDb::lease")
+    async fn lease(&self, _step: &StepId, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
+        Ok(Lease {
+            owner: owner.to_string(),
+            expires_at: Timestamp(ttl_ms),
+        })
     }
 }
 

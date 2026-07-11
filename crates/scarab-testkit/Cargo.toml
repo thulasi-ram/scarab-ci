@@ -7,3 +7,8 @@ license.workspace = true
 [dependencies]
 scarab-engine = { workspace = true }
 async-trait = { workspace = true }
+
+# Test-only: an async runtime to drive the async `Db`/`Clock` ports in tests.
+# This is a dev-dependency, so the testkit library itself stays infra-free.
+[dev-dependencies]
+tokio = { workspace = true }
