@@ -92,6 +92,19 @@ impl<'a> Scheduler<'a> {
         }
     }
 
+    /// Override the outbox claim-lease (visibility) window. Mainly for tests that
+    /// want a crashed drainer's launch intent reclaimable quickly.
+    pub fn with_outbox_visibility_ms(mut self, ms: i64) -> Self {
+        self.cfg.outbox_visibility_ms = ms;
+        self
+    }
+
+    /// Override the leadership lease TTL.
+    pub fn with_lease_ttl_ms(mut self, ms: i64) -> Self {
+        self.cfg.lease_ttl_ms = ms;
+        self
+    }
+
     /// One full cycle for a run: admit → reconcile → advance.
     pub async fn tick(&self, run: &RunId) -> Result<(), SchedulerError> {
         self.admit(run).await?;
