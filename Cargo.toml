@@ -46,7 +46,7 @@ axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring"] }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "migrate", "macros", "json"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 object_store = { version = "0.14", features = ["aws"] }
 kube = { version = "4", default-features = false, features = ["client", "rustls-tls"] }

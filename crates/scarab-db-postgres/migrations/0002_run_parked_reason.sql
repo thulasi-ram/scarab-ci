@@ -1,0 +1,12 @@
+-- Expand-contract demonstration (ADR-0022, expand phase).
+--
+-- Adding a NULLABLE column with no default is a pure *expand*: it is
+-- backward-compatible, so an old binary (which never names `parked_reason`)
+-- keeps reading and writing `runs` unchanged against this new schema, while a
+-- new binary can record why a run was parked (e.g. its {ir_version,
+-- event_schema_version} fell outside the engine's supported window). No
+-- dual-write/backfill/contract phase is needed for a nullable add.
+--
+-- The old-binary × new-schema overlap this enables is exercised in the crate's
+-- migration-harness test.
+ALTER TABLE runs ADD COLUMN parked_reason TEXT;

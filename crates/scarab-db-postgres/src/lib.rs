@@ -1,19 +1,38 @@
 //! Postgres adapter for the [`scarab_engine::Db`] port.
 //!
-//! Adapter crate: pairs the pure `scarab-engine` domain with the `sqlx`
-//! infra crate. All port methods are stubs.
+//! Adapter crate: pairs the pure `scarab-engine` domain with the `sqlx` infra
+//! crate (the domain core stays pure — ADR-0016). This module owns the durable
+//! schema (see `migrations/`), the expand-contract migration harness, and the
+//! Postgres implementation of the state tables + append-only event log +
+//! transactional outbox (ADR-0003, 0013, 0022).
+//!
+//! Timestamps cross the boundary as `Timestamp(i64)` unix-millis and are stored
+//! as `BIGINT`, so no date/time crate leaks toward the domain.
+//!
+//! Scope note: `claim_ready_steps` (SELECT … FOR UPDATE SKIP LOCKED) and the
+//! outbox *dispatcher* land with the scheduler slice; this crate establishes the
+//! schema and round-trips every table through the adapter.
 
 use async_trait::async_trait;
-use scarab_engine::{
-    Db, DbError, EventKind, RunId, RunStatus, StepId, StepRun,
-};
+use serde_json::Value;
+use sqlx::migrate::Migrator;
+use sqlx::{PgPool, Row};
+
 use scarab_engine::ports::Lease;
+use scarab_engine::{
+    Attempt, AttemptId, Db, DbError, EventKind, EventPayload, FailureKind, RunId, RunStatus, StepId,
+    StepRun, StepStatus, Timestamp,
+};
+
+/// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
+/// applies all pending ones (tracked in `_sqlx_migrations`); tests can also walk
+/// `MIGRATOR.iter()` to apply schema versions one at a time.
+pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 /// A Postgres-backed [`Db`]. Holds an optional connection pool so the
 /// composition root can construct it without performing I/O.
 pub struct PostgresDb {
-    #[allow(dead_code)] // wired at composition time; read once queries land.
-    pool: Option<sqlx::PgPool>,
+    pool: Option<PgPool>,
 }
 
 impl PostgresDb {
@@ -23,8 +42,204 @@ impl PostgresDb {
     }
 
     /// Construct from an existing connection pool.
-    pub fn with_pool(pool: sqlx::PgPool) -> Self {
+    pub fn with_pool(pool: PgPool) -> Self {
         Self { pool: Some(pool) }
+    }
+
+    /// Connect a pool to `url`.
+    pub async fn connect(url: &str) -> Result<Self, DbError> {
+        let pool = PgPool::connect(url).await.map_err(db_err)?;
+        Ok(Self::with_pool(pool))
+    }
+
+    /// Apply all pending migrations (the production expand-contract path).
+    pub async fn migrate(&self) -> Result<(), DbError> {
+        MIGRATOR.run(self.pool()?).await.map_err(|e| DbError::Other(e.to_string()))
+    }
+
+    fn pool(&self) -> Result<&PgPool, DbError> {
+        self.pool.as_ref().ok_or(DbError::Unavailable)
+    }
+
+    // --- write helpers (round-trip all six tables through the adapter) -----
+
+    /// Insert a new run in `Pending` with its self-describing version stamps.
+    pub async fn create_run(
+        &self,
+        run: &RunId,
+        ir_version: u32,
+        event_schema_version: u32,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO runs (id, status, ir_version, event_schema_version, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $5)",
+        )
+        .bind(&run.0)
+        .bind(run_status_str(RunStatus::Pending))
+        .bind(ir_version as i32)
+        .bind(event_schema_version as i32)
+        .bind(at.0)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Insert a step's per-run projection in `Pending`.
+    pub async fn create_step_run(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO step_runs (run_id, step_id, status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $4)",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(step_status_str(StepStatus::Pending))
+        .bind(at.0)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Record an attempt (upsert on its monotonic id — the fencing unit).
+    pub async fn record_attempt(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &Attempt,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO attempts (run_id, step_id, attempt_id, started_at, failure)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (run_id, step_id, attempt_id)
+             DO UPDATE SET failure = EXCLUDED.failure",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.id.0)
+        .bind(attempt.started_at.0)
+        .bind(attempt.failure.map(failure_str))
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Enqueue an outbox row for exactly-once side-effect dispatch. A duplicate
+    /// `idempotency_key` collapses to the existing row (no double effect).
+    pub async fn enqueue_outbox(
+        &self,
+        run: &RunId,
+        kind: &str,
+        payload: &Value,
+        idempotency_key: &str,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO outbox (run_id, kind, payload, idempotency_key, created_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (idempotency_key) DO NOTHING",
+        )
+        .bind(&run.0)
+        .bind(kind)
+        .bind(payload)
+        .bind(idempotency_key)
+        .bind(at.0)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    // --- read helpers ------------------------------------------------------
+
+    /// Current status of a run, if it exists.
+    pub async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
+        let row = sqlx::query("SELECT status FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| run_status_from_str(r.get::<String, _>("status")))
+            .transpose()
+    }
+
+    /// Current status of a step, if it exists.
+    pub async fn step_status(&self, run: &RunId, step: &StepId) -> Result<Option<StepStatus>, DbError> {
+        let row = sqlx::query("SELECT status FROM step_runs WHERE run_id = $1 AND step_id = $2")
+            .bind(&run.0)
+            .bind(&step.0)
+            .fetch_optional(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| step_status_from_str(r.get::<String, _>("status")))
+            .transpose()
+    }
+
+    /// All attempts of a step, in start order.
+    pub async fn attempts(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
+        let rows = sqlx::query(
+            "SELECT attempt_id, started_at, failure FROM attempts
+             WHERE run_id = $1 AND step_id = $2 ORDER BY started_at",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .fetch_all(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| {
+                let failure = r
+                    .get::<Option<String>, _>("failure")
+                    .map(|s| failure_from_str(&s))
+                    .transpose()?;
+                Ok(Attempt {
+                    id: AttemptId(r.get::<String, _>("attempt_id")),
+                    started_at: Timestamp(r.get::<i64, _>("started_at")),
+                    failure,
+                })
+            })
+            .collect()
+    }
+
+    /// The run's append-only event log, in append order.
+    pub async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
+        let rows = sqlx::query("SELECT version, at, payload FROM events WHERE run_id = $1 ORDER BY seq")
+            .bind(&run.0)
+            .fetch_all(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| {
+                let payload: Value = r.get("payload");
+                let kind: EventPayload =
+                    serde_json::from_value(payload).map_err(|e| DbError::Other(e.to_string()))?;
+                Ok(EventKind {
+                    version: r.get::<i32, _>("version") as u32,
+                    run: run.clone(),
+                    kind,
+                    at: Timestamp(r.get::<i64, _>("at")),
+                })
+            })
+            .collect()
+    }
+
+    /// Kinds of the currently-pending (undispatched) outbox rows for a run.
+    pub async fn pending_outbox_kinds(&self, run: &RunId) -> Result<Vec<String>, DbError> {
+        let rows = sqlx::query(
+            "SELECT kind FROM outbox WHERE run_id = $1 AND dispatched_at IS NULL ORDER BY id",
+        )
+        .bind(&run.0)
+        .fetch_all(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|r| r.get::<String, _>("kind")).collect())
     }
 }
 
@@ -37,24 +252,165 @@ impl Default for PostgresDb {
 #[async_trait]
 impl Db for PostgresDb {
     async fn claim_ready_steps(&self, _limit: u32) -> Result<Vec<StepRun>, DbError> {
-        // TODO: SELECT ... FOR UPDATE SKIP LOCKED against the steps table.
+        // SELECT … FOR UPDATE SKIP LOCKED lands with the scheduler slice (f6e11c2).
         unimplemented!("PostgresDb::claim_ready_steps")
     }
 
     async fn record_transition(
         &self,
-        _run: &RunId,
-        _from: RunStatus,
-        _to: RunStatus,
+        run: &RunId,
+        from: RunStatus,
+        to: RunStatus,
     ) -> Result<(), DbError> {
-        unimplemented!("PostgresDb::record_transition")
+        // Optimistic concurrency: the UPDATE only fires if the row is still in
+        // `from`. Zero rows affected means a concurrent/duplicate writer already
+        // moved it (e.g. a crashed worker re-driving) → Conflict, not a second
+        // advance. This is the state-table guard behind exactly-once admission.
+        let affected = sqlx::query(
+            "UPDATE runs
+             SET status = $3, updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1 AND status = $2",
+        )
+        .bind(&run.0)
+        .bind(run_status_str(from))
+        .bind(run_status_str(to))
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if affected == 0 {
+            return Err(DbError::Conflict);
+        }
+        Ok(())
     }
 
-    async fn append_event(&self, _event: &EventKind) -> Result<(), DbError> {
-        unimplemented!("PostgresDb::append_event")
+    async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
+        let payload = serde_json::to_value(&event.kind).map_err(|e| DbError::Other(e.to_string()))?;
+        sqlx::query("INSERT INTO events (run_id, version, at, payload) VALUES ($1, $2, $3, $4)")
+            .bind(&event.run.0)
+            .bind(event.version as i32)
+            .bind(event.at.0)
+            .bind(payload)
+            .execute(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        Ok(())
     }
 
-    async fn lease(&self, _step: &StepId, _owner: &str, _ttl_ms: i64) -> Result<Lease, DbError> {
-        unimplemented!("PostgresDb::lease")
+    async fn lease(&self, step: &StepId, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
+        // Acquire or renew, taking over only an expired lease. RETURNING yields
+        // the winning holder; if the incumbent lease is still valid the DO
+        // UPDATE is skipped and we read back the current holder instead.
+        let row = sqlx::query(
+            "INSERT INTO leases (resource, owner, expires_at)
+             VALUES ($1, $2, (extract(epoch from now()) * 1000)::bigint + $3)
+             ON CONFLICT (resource) DO UPDATE
+               SET owner = EXCLUDED.owner, expires_at = EXCLUDED.expires_at
+               WHERE leases.expires_at < (extract(epoch from now()) * 1000)::bigint
+             RETURNING owner, expires_at",
+        )
+        .bind(&step.0)
+        .bind(owner)
+        .bind(ttl_ms)
+        .fetch_optional(self.pool()?)
+        .await
+        .map_err(db_err)?;
+
+        match row {
+            Some(r) => Ok(Lease {
+                owner: r.get::<String, _>("owner"),
+                expires_at: Timestamp(r.get::<i64, _>("expires_at")),
+            }),
+            None => {
+                // Not acquired: a valid lease is still held by someone else.
+                let r = sqlx::query("SELECT owner, expires_at FROM leases WHERE resource = $1")
+                    .bind(&step.0)
+                    .fetch_one(self.pool()?)
+                    .await
+                    .map_err(db_err)?;
+                Ok(Lease {
+                    owner: r.get::<String, _>("owner"),
+                    expires_at: Timestamp(r.get::<i64, _>("expires_at")),
+                })
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Codecs: domain enums <-> the small, stable strings stored in TEXT columns.
+// Kept explicit (rather than leaning on serde) so the on-disk vocabulary is
+// visible and independent of Rust identifier spelling.
+// ---------------------------------------------------------------------------
+
+fn run_status_str(s: RunStatus) -> &'static str {
+    match s {
+        RunStatus::Pending => "pending",
+        RunStatus::Running => "running",
+        RunStatus::Suspended => "suspended",
+        RunStatus::Succeeded => "succeeded",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+        RunStatus::DeadLettered => "dead_lettered",
+    }
+}
+
+fn run_status_from_str(s: String) -> Result<RunStatus, DbError> {
+    Ok(match s.as_str() {
+        "pending" => RunStatus::Pending,
+        "running" => RunStatus::Running,
+        "suspended" => RunStatus::Suspended,
+        "succeeded" => RunStatus::Succeeded,
+        "failed" => RunStatus::Failed,
+        "cancelled" => RunStatus::Cancelled,
+        "dead_lettered" => RunStatus::DeadLettered,
+        other => return Err(DbError::Other(format!("unknown run status {other:?}"))),
+    })
+}
+
+fn step_status_str(s: StepStatus) -> &'static str {
+    match s {
+        StepStatus::Pending => "pending",
+        StepStatus::Ready => "ready",
+        StepStatus::Running => "running",
+        StepStatus::Succeeded => "succeeded",
+        StepStatus::Failed => "failed",
+        StepStatus::Skipped => "skipped",
+        StepStatus::Cancelled => "cancelled",
+    }
+}
+
+fn step_status_from_str(s: String) -> Result<StepStatus, DbError> {
+    Ok(match s.as_str() {
+        "pending" => StepStatus::Pending,
+        "ready" => StepStatus::Ready,
+        "running" => StepStatus::Running,
+        "succeeded" => StepStatus::Succeeded,
+        "failed" => StepStatus::Failed,
+        "skipped" => StepStatus::Skipped,
+        "cancelled" => StepStatus::Cancelled,
+        other => return Err(DbError::Other(format!("unknown step status {other:?}"))),
+    })
+}
+
+fn failure_str(f: FailureKind) -> &'static str {
+    match f {
+        FailureKind::Infra => "infra",
+        FailureKind::Step => "step",
+    }
+}
+
+fn failure_from_str(s: &str) -> Result<FailureKind, DbError> {
+    match s {
+        "infra" => Ok(FailureKind::Infra),
+        "step" => Ok(FailureKind::Step),
+        other => Err(DbError::Other(format!("unknown failure kind {other:?}"))),
+    }
+}
+
+fn db_err(e: sqlx::Error) -> DbError {
+    match e {
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => DbError::Unavailable,
+        other => DbError::Other(other.to_string()),
     }
 }
