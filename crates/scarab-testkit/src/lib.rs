@@ -135,11 +135,6 @@ impl InMemoryDb {
             );
         }
     }
-
-    /// Snapshot of the append-only event log, in append order.
-    pub fn events(&self) -> Vec<EventKind> {
-        self.state.lock().unwrap().events.clone()
-    }
 }
 
 impl Default for InMemoryDb {
@@ -174,8 +169,53 @@ impl Db for InMemoryDb {
         Ok(claimed)
     }
 
+    async fn create_run(
+        &self,
+        run: &RunId,
+        _ir_version: u32,
+        _event_schema_version: u32,
+        _at: Timestamp,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .runs
+            .insert(run.clone(), RunStatus::Pending);
+        Ok(())
+    }
+
+    async fn create_step_run(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        spec: Option<&StepSpec>,
+        _at: Timestamp,
+    ) -> Result<(), DbError> {
+        self.state.lock().unwrap().steps.insert(
+            (run.clone(), step.clone()),
+            StepRec {
+                status: Some(StepStatus::Pending),
+                spec: spec.cloned(),
+                attempts: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
         Ok(self.state.lock().unwrap().runs.get(run).copied())
+    }
+
+    async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .events
+            .iter()
+            .filter(|e| &e.run == run)
+            .cloned()
+            .collect())
     }
 
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {

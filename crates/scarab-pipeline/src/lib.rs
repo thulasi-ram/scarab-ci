@@ -15,14 +15,26 @@ pub struct PipelineIr {
     pub steps: Vec<StepSpec>,
 }
 
-/// One authored step.
+/// One authored step. The step contract (ADR-0008) is an OCI `image` + a
+/// `command`; the rest are DAG/placement modifiers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepSpec {
     pub id: String,
+    /// OCI image the step runs in.
+    pub image: String,
+    /// Entrypoint/command (empty = the image default).
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Environment overrides for the step.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    #[serde(default)]
     pub needs: Needs,
     pub matrix: Option<Matrix>,
     pub when: Option<When>,
+    #[serde(default)]
     pub runs_on: RunsOn,
+    #[serde(default)]
     pub resources: Resources,
 }
 

@@ -43,7 +43,11 @@ scarab-testkit = { path = "crates/scarab-testkit" }
 # --- infra (only inside adapter / binary crates) ---------------------------
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "net"] }
 axum = "0.8"
-clap = { version = "4", features = ["derive"] }
+utoipa = { version = "5" }
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+tower = "0.5"
+clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "migrate", "macros", "json"] }

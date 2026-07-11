@@ -41,8 +41,30 @@ pub trait Db: Send + Sync {
     /// `SELECT … FOR UPDATE SKIP LOCKED`-style claim so replicas don't collide.
     async fn claim_ready_steps(&self, limit: u32) -> Result<Vec<StepRun>, DbError>;
 
+    /// Create a new run in `Pending`, self-describing its `{ir_version,
+    /// event_schema_version}` (ADR-0022).
+    async fn create_run(
+        &self,
+        run: &RunId,
+        ir_version: u32,
+        event_schema_version: u32,
+        at: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// Create a step projection in `Pending`, storing its durable launch `spec`.
+    async fn create_step_run(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        spec: Option<&StepSpec>,
+        at: Timestamp,
+    ) -> Result<(), DbError>;
+
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;
+
+    /// The run's append-only event log, in append order (the SSE tail source).
+    async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError>;
 
     /// All step projections of a run (with their attempts) — the DAG snapshot
     /// the scheduler folds to decide admission and completion.

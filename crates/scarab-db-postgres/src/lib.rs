@@ -61,57 +61,6 @@ impl PostgresDb {
         self.pool.as_ref().ok_or(DbError::Unavailable)
     }
 
-    // --- write helpers (round-trip all six tables through the adapter) -----
-
-    /// Insert a new run in `Pending` with its self-describing version stamps.
-    pub async fn create_run(
-        &self,
-        run: &RunId,
-        ir_version: u32,
-        event_schema_version: u32,
-        at: Timestamp,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO runs (id, status, ir_version, event_schema_version, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $5)",
-        )
-        .bind(&run.0)
-        .bind(run_status_str(RunStatus::Pending))
-        .bind(ir_version as i32)
-        .bind(event_schema_version as i32)
-        .bind(at.0)
-        .execute(self.pool()?)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    /// Insert a step's per-run projection in `Pending`.
-    pub async fn create_step_run(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        spec: Option<&StepSpec>,
-        at: Timestamp,
-    ) -> Result<(), DbError> {
-        let spec_json = spec
-            .map(|s| serde_json::to_value(s).map_err(|e| DbError::Other(e.to_string())))
-            .transpose()?;
-        sqlx::query(
-            "INSERT INTO step_runs (run_id, step_id, status, spec, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $5)",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(step_status_str(StepStatus::Pending))
-        .bind(spec_json)
-        .bind(at.0)
-        .execute(self.pool()?)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
     // --- read helpers ------------------------------------------------------
 
     /// Current status of a step, if it exists.
@@ -147,28 +96,6 @@ impl PostgresDb {
                     id: AttemptId(r.get::<String, _>("attempt_id")),
                     started_at: Timestamp(r.get::<i64, _>("started_at")),
                     failure,
-                })
-            })
-            .collect()
-    }
-
-    /// The run's append-only event log, in append order.
-    pub async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
-        let rows = sqlx::query("SELECT version, at, payload FROM events WHERE run_id = $1 ORDER BY seq")
-            .bind(&run.0)
-            .fetch_all(self.pool()?)
-            .await
-            .map_err(db_err)?;
-        rows.into_iter()
-            .map(|r| {
-                let payload: Value = r.get("payload");
-                let kind: EventPayload =
-                    serde_json::from_value(payload).map_err(|e| DbError::Other(e.to_string()))?;
-                Ok(EventKind {
-                    version: r.get::<i32, _>("version") as u32,
-                    run: run.clone(),
-                    kind,
-                    at: Timestamp(r.get::<i64, _>("at")),
                 })
             })
             .collect()
@@ -235,6 +162,53 @@ impl Db for PostgresDb {
         Ok(claimed)
     }
 
+    async fn create_run(
+        &self,
+        run: &RunId,
+        ir_version: u32,
+        event_schema_version: u32,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO runs (id, status, ir_version, event_schema_version, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $5)",
+        )
+        .bind(&run.0)
+        .bind(run_status_str(RunStatus::Pending))
+        .bind(ir_version as i32)
+        .bind(event_schema_version as i32)
+        .bind(at.0)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn create_step_run(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        spec: Option<&StepSpec>,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        let spec_json = spec
+            .map(|s| serde_json::to_value(s).map_err(|e| DbError::Other(e.to_string())))
+            .transpose()?;
+        sqlx::query(
+            "INSERT INTO step_runs (run_id, step_id, status, spec, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $5)",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(step_status_str(StepStatus::Pending))
+        .bind(spec_json)
+        .bind(at.0)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
         let row = sqlx::query("SELECT status FROM runs WHERE id = $1")
             .bind(&run.0)
@@ -243,6 +217,27 @@ impl Db for PostgresDb {
             .map_err(db_err)?;
         row.map(|r| run_status_from_str(r.get::<String, _>("status")))
             .transpose()
+    }
+
+    async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
+        let rows = sqlx::query("SELECT version, at, payload FROM events WHERE run_id = $1 ORDER BY seq")
+            .bind(&run.0)
+            .fetch_all(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| {
+                let payload: Value = r.get("payload");
+                let kind: EventPayload =
+                    serde_json::from_value(payload).map_err(|e| DbError::Other(e.to_string()))?;
+                Ok(EventKind {
+                    version: r.get::<i32, _>("version") as u32,
+                    run: run.clone(),
+                    kind,
+                    at: Timestamp(r.get::<i64, _>("at")),
+                })
+            })
+            .collect()
     }
 
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {

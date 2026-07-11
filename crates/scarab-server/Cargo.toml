@@ -4,6 +4,10 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[lib]
+name = "scarab_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "scarab-server"
 path = "src/main.rs"
@@ -15,6 +19,12 @@ tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
 
 # every scarab crate — the server is the composition root
 scarab-engine = { workspace = true }
@@ -31,3 +41,6 @@ scarab-storage-s3 = { workspace = true }
 scarab-executor-k8s = { workspace = true }
 scarab-executor-local = { workspace = true }
 scarab-testkit = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }

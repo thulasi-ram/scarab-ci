@@ -47,7 +47,7 @@ async fn run_happy_path_records_each_transition_once() {
         Some(RunStatus::Succeeded)
     );
 
-    let events = db.events();
+    let events = db.events(&run_id()).await.unwrap();
     assert_eq!(events.len(), 3);
     assert!(matches!(events[0].kind, EventPayload::RunCreated));
     assert!(matches!(
@@ -128,7 +128,9 @@ async fn crash_between_transitions_advances_exactly_once() {
         Some(RunStatus::Running)
     );
     let transitions = db
-        .events()
+        .events(&run_id())
+        .await
+        .unwrap()
         .into_iter()
         .filter(|e| matches!(e.kind, EventPayload::RunTransitioned { .. }))
         .count();
