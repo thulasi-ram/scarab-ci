@@ -42,10 +42,12 @@ scarab-testkit = { path = "crates/scarab-testkit" }
 
 # --- infra (only inside adapter / binary crates) ---------------------------
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "net"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 axum = "0.8"
 utoipa = { version = "5" }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
+flate2 = "1"
 tower = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"

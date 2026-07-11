@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 scarab-engine = { workspace = true }
+scarab-storage = { workspace = true }
 async-trait = { workspace = true }
 
 # Test-only: an async runtime to drive the async `Db`/`Clock` ports in tests.

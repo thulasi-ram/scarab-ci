@@ -20,8 +20,8 @@ use sqlx::{PgPool, Row};
 
 use scarab_engine::ports::Lease;
 use scarab_engine::{
-    Attempt, AttemptId, Db, DbError, EventKind, EventPayload, FailureKind, OutboxId, OutboxMessage,
-    RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, Db, DbError, EventKind, EventPayload, FailureKind, LogChunkMeta, OutboxId,
+    OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
@@ -274,6 +274,60 @@ impl Db for PostgresDb {
             )),
             None => Ok(None),
         }
+    }
+
+    async fn append_log_chunk(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        meta: &LogChunkMeta,
+    ) -> Result<(), DbError> {
+        // Offsets only — the body is in the object store. Idempotent on the seq.
+        sqlx::query(
+            "INSERT INTO log_chunks
+               (run_id, step_id, attempt_id, seq, byte_offset, len, object_key, at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, (extract(epoch from now()) * 1000)::bigint)
+             ON CONFLICT (run_id, step_id, attempt_id, seq) DO NOTHING",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(meta.seq as i64)
+        .bind(meta.byte_offset as i64)
+        .bind(meta.len as i64)
+        .bind(&meta.object_key)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn log_chunks(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Vec<LogChunkMeta>, DbError> {
+        let rows = sqlx::query(
+            "SELECT seq, byte_offset, len, object_key FROM log_chunks
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3 ORDER BY seq",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_all(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| LogChunkMeta {
+                seq: r.get::<i64, _>("seq") as u64,
+                byte_offset: r.get::<i64, _>("byte_offset") as u64,
+                len: r.get::<i64, _>("len") as u64,
+                object_key: r.get::<String, _>("object_key"),
+            })
+            .collect())
     }
 
     async fn record_step_transition(

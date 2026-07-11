@@ -187,6 +187,25 @@ pub struct OutboxMessage {
     pub at: Timestamp,
 }
 
+// ---------------------------------------------------------------------------
+// Log index
+// ---------------------------------------------------------------------------
+
+/// The Postgres-side **index** of one persisted log chunk (ADR-0013). Log
+/// *bodies* live only in the object store (chunked + compressed); Postgres keeps
+/// just this offset metadata so the store never bloats with log text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogChunkMeta {
+    /// 0-based position of this chunk within the step's log stream.
+    pub seq: u64,
+    /// Cumulative *uncompressed* byte offset where this chunk begins.
+    pub byte_offset: u64,
+    /// Uncompressed length of this chunk in bytes.
+    pub len: u64,
+    /// Object-store key holding the compressed chunk body.
+    pub object_key: String,
+}
+
 /// The discriminated payload carried by an [`EventKind`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventPayload {

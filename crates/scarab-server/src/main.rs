@@ -12,7 +12,8 @@ use std::sync::Arc;
 use clap::{Parser, ValueEnum};
 
 use scarab_db_postgres::PostgresDb;
-use scarab_server::{router, AppState, SystemClock};
+use scarab_server::{router, AppState, LogService, SystemClock};
+use scarab_storage_s3::S3Storage;
 
 /// Which slice(s) of Scarab this process should run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -59,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(role = ?cli.role, "starting scarab-server");
     println!("scarab-server role = {:?}", cli.role);
 
-    let db = match &cli.database_url {
+    let pg = match &cli.database_url {
         Some(url) => {
             let db = PostgresDb::connect(url).await?;
             db.migrate().await?;
@@ -67,7 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => PostgresDb::new(),
     };
-    let state = AppState::new(Arc::new(db), Arc::new(SystemClock));
+    let db: Arc<dyn scarab_engine::Db> = Arc::new(pg);
+    let store: Arc<dyn scarab_storage::ObjectStore> = Arc::new(S3Storage::new("scarab-logs"));
+    let logs = Arc::new(LogService::new(store, db.clone()));
+    let state = AppState::new(db, Arc::new(SystemClock), logs);
     let app = router(state);
 
     if cli.serve {

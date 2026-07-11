@@ -17,9 +17,10 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Lease};
 use scarab_engine::{
-    Attempt, Clock, Db, DbError, EventKind, ExecError, Executor, OutboxId, OutboxMessage, RunId,
-    RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, Clock, Db, DbError, EventKind, ExecError, Executor, LogChunkMeta, OutboxId,
+    OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
+use scarab_storage::{ObjectStore, StorageError};
 
 // ---------------------------------------------------------------------------
 // FakeClock — manually-advanced virtual time
@@ -86,6 +87,8 @@ struct InMemoryState {
     steps: HashMap<(RunId, StepId), StepRec>,
     /// The transactional outbox.
     outbox: Vec<OutboxEntry>,
+    /// Per-(run, step, attempt) log-chunk index (offsets only, no bodies).
+    logs: HashMap<(RunId, StepId, AttemptId), Vec<LogChunkMeta>>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -216,6 +219,42 @@ impl Db for InMemoryDb {
             .filter(|e| &e.run == run)
             .cloned()
             .collect())
+    }
+
+    async fn append_log_chunk(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        meta: &LogChunkMeta,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        let chunks = st
+            .logs
+            .entry((run.clone(), step.clone(), attempt.clone()))
+            .or_default();
+        // Idempotent on seq.
+        if !chunks.iter().any(|c| c.seq == meta.seq) {
+            chunks.push(meta.clone());
+            chunks.sort_by_key(|c| c.seq);
+        }
+        Ok(())
+    }
+
+    async fn log_chunks(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Vec<LogChunkMeta>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .logs
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
@@ -460,6 +499,57 @@ impl Executor for FakeExecutor {
     }
 
     async fn cancel(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InMemoryObjectStore — a blob store fake (the object store is a true external,
+// mocked at the port boundary per ADR-0017).
+// ---------------------------------------------------------------------------
+
+/// An in-process [`ObjectStore`] backed by a map. Stands in for S3/MinIO in
+/// tests of the log pipeline and workspace CAS.
+#[derive(Default)]
+pub struct InMemoryObjectStore {
+    blobs: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl InMemoryObjectStore {
+    pub fn new() -> Self {
+        Self {
+            blobs: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Number of stored objects (for assertions).
+    pub fn len(&self) -> usize {
+        self.blobs.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[async_trait]
+impl ObjectStore for InMemoryObjectStore {
+    async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+        self.blobs
+            .lock()
+            .unwrap()
+            .get(key)
+            .cloned()
+            .ok_or(StorageError::NotFound)
+    }
+
+    async fn put(&self, key: &str, data: Vec<u8>) -> Result<(), StorageError> {
+        self.blobs.lock().unwrap().insert(key.to_string(), data);
+        Ok(())
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StorageError> {
+        self.blobs.lock().unwrap().remove(key);
         Ok(())
     }
 }

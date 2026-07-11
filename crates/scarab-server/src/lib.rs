@@ -21,8 +21,9 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use futures::stream::{self, Stream};
+use futures::stream::{self, BoxStream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::BroadcastStream;
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -30,6 +31,9 @@ use scarab_engine::{
     Clock, Db, DbError, EventKind, EventPayload, RunId, RunStatus, StepId, StepSpec, StepStatus,
     Timestamp, EVENT_VERSION,
 };
+
+pub mod logs;
+pub use logs::LogService;
 
 /// A wall-clock [`Clock`] for production wiring (tests inject `FakeClock`).
 pub struct SystemClock;
@@ -45,16 +49,17 @@ impl Clock for SystemClock {
     }
 }
 
-/// Shared handler state: the durable store and a clock, behind their ports.
+/// Shared handler state: the durable store, a clock, and the log pipeline.
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<dyn Db>,
     pub clock: Arc<dyn Clock>,
+    pub logs: Arc<LogService>,
 }
 
 impl AppState {
-    pub fn new(db: Arc<dyn Db>, clock: Arc<dyn Clock>) -> Self {
-        Self { db, clock }
+    pub fn new(db: Arc<dyn Db>, clock: Arc<dyn Clock>, logs: Arc<LogService>) -> Self {
+        Self { db, clock, logs }
     }
 }
 
@@ -219,16 +224,15 @@ async fn get_run(
     }))
 }
 
-/// Server-Sent-Events tail of the run's append-only event log (ADR-0013). Step
-/// stdout/stderr log-body chunks arrive with the log-streaming slice; for now
-/// this streams the status timeline that drives the UI.
+/// Server-Sent-Events tail of the run's append-only event log — the status
+/// timeline (ADR-0013): RunCreated, transitions, attempt start/finish.
 #[utoipa::path(
     get,
-    path = "/v1/runs/{id}/logs",
+    path = "/v1/runs/{id}/events",
     params(("id" = String, Path, description = "run id")),
     responses((status = 200, description = "SSE stream of the run's event log"))
 )]
-async fn get_logs(
+async fn get_events(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
@@ -248,6 +252,57 @@ async fn get_logs(
     Ok(Sse::new(stream::iter(items)))
 }
 
+/// Server-Sent-Events of step **log bodies** (ADR-0013): replays every
+/// committed chunk (decompressed from the object store, indexed by Postgres
+/// offsets), then — while the run is still going — live-tails new chunks via the
+/// log pipeline's broadcast. A terminal run yields the full log and closes.
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/logs",
+    params(("id" = String, Path, description = "run id")),
+    responses((status = 200, description = "SSE stream of step log output"))
+)]
+async fn get_logs(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Sse<BoxStream<'static, Result<Event, Infallible>>>, ApiError> {
+    let run = RunId(id);
+    let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
+    let steps = st.db.steps_of_run(&run).await?;
+
+    let mut replay: Vec<Result<Event, Infallible>> = Vec::new();
+    let mut receivers = Vec::new();
+    for s in &steps {
+        for a in &s.attempts {
+            let body = st.logs.read_all(&run, &s.step, &a.id).await.unwrap_or_default();
+            if !body.is_empty() {
+                replay.push(Ok(Event::default().data(String::from_utf8_lossy(&body).into_owned())));
+            }
+            if !status.is_terminal() {
+                receivers.push(st.logs.subscribe(&run, &s.step, &a.id));
+            }
+        }
+    }
+
+    let replay_stream = stream::iter(replay);
+    if status.is_terminal() {
+        // Nothing more will be written: replay and close.
+        Ok(Sse::new(replay_stream.boxed()))
+    } else {
+        // Replay what's committed, then live-tail new chunks.
+        let live = futures::stream::select_all(receivers.into_iter().map(|rx| {
+            BroadcastStream::new(rx).map(|r| {
+                Ok(match r {
+                    Ok(bytes) => Event::default().data(String::from_utf8_lossy(&bytes).into_owned()),
+                    // A slow reader that lagged the broadcast buffer: note the gap.
+                    Err(_) => Event::default().comment("log stream lagged"),
+                })
+            })
+        }));
+        Ok(Sse::new(replay_stream.chain(live).boxed()))
+    }
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -261,7 +316,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
 /// The generated OpenAPI document. The pipeline request schema is the IR subset.
 #[derive(OpenApi)]
 #[openapi(
-    paths(create_run, get_run, get_logs),
+    paths(create_run, get_run, get_events, get_logs),
     components(schemas(
         CreateRunRequest,
         PipelineDto,
@@ -280,6 +335,7 @@ pub fn router(state: AppState) -> Router {
         .route("/openapi.json", get(openapi))
         .route("/v1/runs", post(create_run))
         .route("/v1/runs/{id}", get(get_run))
+        .route("/v1/runs/{id}/events", get(get_events))
         .route("/v1/runs/{id}/logs", get(get_logs))
         .with_state(state)
 }

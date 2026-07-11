@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Attempt, DbError, EventKind, ExecError, OutboxId, OutboxMessage, RunId, RunStatus, StepId,
-    StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, DbError, EventKind, ExecError, LogChunkMeta, OutboxId, OutboxMessage, RunId,
+    RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -65,6 +65,24 @@ pub trait Db: Send + Sync {
 
     /// The run's append-only event log, in append order (the SSE tail source).
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError>;
+
+    /// Record the index of a persisted log chunk (offsets only — the body lives
+    /// in the object store). Idempotent on `(run, step, attempt, seq)`.
+    async fn append_log_chunk(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        meta: &LogChunkMeta,
+    ) -> Result<(), DbError>;
+
+    /// The log-chunk index for one attempt's stream, ordered by `seq`.
+    async fn log_chunks(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Vec<LogChunkMeta>, DbError>;
 
     /// All step projections of a run (with their attempts) — the DAG snapshot
     /// the scheduler folds to decide admission and completion.

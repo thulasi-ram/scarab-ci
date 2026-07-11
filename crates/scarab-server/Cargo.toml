@@ -20,11 +20,14 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
+thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 utoipa = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
+flate2 = { workspace = true }
+tokio-stream = { workspace = true }
 
 # every scarab crate — the server is the composition root
 scarab-engine = { workspace = true }

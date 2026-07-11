@@ -11,8 +11,15 @@ use tower::ServiceExt; // oneshot
 
 use scarab_engine::ports::ExecState;
 use scarab_engine::{Clock, Db, RunId, Scheduler};
-use scarab_server::{router, AppState};
-use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
+use scarab_server::{router, AppState, LogService};
+use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb, InMemoryObjectStore};
+
+/// Build an AppState over the given in-memory store and a fresh clock.
+fn app_state(db: Arc<InMemoryDb>, clock: Arc<FakeClock>) -> AppState {
+    let store = Arc::new(InMemoryObjectStore::new());
+    let logs = Arc::new(LogService::new(store, db.clone()));
+    AppState::new(db, clock, logs)
+}
 
 async fn body_string(resp: axum::response::Response) -> String {
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -29,7 +36,7 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 async fn happy_path_post_run_then_scheduler_reaches_succeeded() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     let clock: Arc<FakeClock> = Arc::new(FakeClock::new(1_000));
-    let app = router(AppState::new(db.clone(), clock.clone()));
+    let app = router(app_state(db.clone(), clock.clone()));
 
     // POST /v1/runs with an inline 1-step pipeline (the IR subset).
     let body = serde_json::json!({
@@ -81,12 +88,12 @@ async fn happy_path_post_run_then_scheduler_reaches_succeeded() {
     assert_eq!(status["steps"][0]["id"], "build");
     assert_eq!(status["steps"][0]["status"], "succeeded");
 
-    // GET /v1/runs/:id/logs -> SSE tail of the event log.
+    // GET /v1/runs/:id/events -> SSE tail of the event log.
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri(format!("/v1/runs/{id}/logs"))
+                .uri(format!("/v1/runs/{id}/events"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -106,7 +113,7 @@ async fn happy_path_post_run_then_scheduler_reaches_succeeded() {
 async fn openapi_is_served_and_describes_the_ir_subset() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     let clock: Arc<FakeClock> = Arc::new(FakeClock::new(0));
-    let app = router(AppState::new(db, clock));
+    let app = router(app_state(db, clock));
 
     let resp = app
         .oneshot(Request::builder().uri("/openapi.json").body(Body::empty()).unwrap())
@@ -125,7 +132,7 @@ async fn openapi_is_served_and_describes_the_ir_subset() {
 async fn unknown_run_is_404() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     let clock: Arc<FakeClock> = Arc::new(FakeClock::new(0));
-    let app = router(AppState::new(db, clock));
+    let app = router(app_state(db, clock));
 
     let resp = app
         .oneshot(
