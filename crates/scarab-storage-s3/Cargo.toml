@@ -1,0 +1,10 @@
+[package]
+name = "scarab-storage-s3"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+scarab-storage = { workspace = true }
+async-trait = { workspace = true }
+object_store = { workspace = true }

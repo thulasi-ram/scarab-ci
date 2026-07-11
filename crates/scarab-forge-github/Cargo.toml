@@ -1,0 +1,10 @@
+[package]
+name = "scarab-forge-github"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+scarab-forge = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }

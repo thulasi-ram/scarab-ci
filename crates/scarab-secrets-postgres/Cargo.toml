@@ -1,0 +1,10 @@
+[package]
+name = "scarab-secrets-postgres"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+scarab-secrets = { workspace = true }
+async-trait = { workspace = true }
+sqlx = { workspace = true }

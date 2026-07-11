@@ -1,0 +1,9 @@
+[package]
+name = "scarab-testkit"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+scarab-engine = { workspace = true }
+async-trait = { workspace = true }

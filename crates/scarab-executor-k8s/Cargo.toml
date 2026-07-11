@@ -1,0 +1,11 @@
+[package]
+name = "scarab-executor-k8s"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+scarab-engine = { workspace = true }
+async-trait = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }

@@ -1,0 +1,33 @@
+[package]
+name = "scarab-server"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scarab-server"
+path = "src/main.rs"
+
+[dependencies]
+# infra
+axum = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# every scarab crate — the server is the composition root
+scarab-engine = { workspace = true }
+scarab-pipeline = { workspace = true }
+scarab-forge = { workspace = true }
+scarab-identity = { workspace = true }
+scarab-secrets = { workspace = true }
+scarab-storage = { workspace = true }
+scarab-projects = { workspace = true }
+scarab-db-postgres = { workspace = true }
+scarab-forge-github = { workspace = true }
+scarab-secrets-postgres = { workspace = true }
+scarab-storage-s3 = { workspace = true }
+scarab-executor-k8s = { workspace = true }
+scarab-executor-local = { workspace = true }
+scarab-testkit = { workspace = true }

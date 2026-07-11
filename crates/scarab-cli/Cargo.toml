@@ -1,0 +1,13 @@
+[package]
+name = "scarab-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "scarab"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
