@@ -9,3 +9,6 @@ scarab-engine = { workspace = true }
 async-trait = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

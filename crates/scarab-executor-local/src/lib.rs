@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState};
-use scarab_engine::{ExecError, Executor, StepRun};
+use scarab_engine::{ExecError, Executor, StepRun, StepSpec};
 
 /// A local-process executor. Steps run as OS child processes under `shell`.
 pub struct LocalExecutor {
@@ -30,7 +30,7 @@ impl Default for LocalExecutor {
 
 #[async_trait]
 impl Executor for LocalExecutor {
-    async fn launch(&self, _step: &StepRun) -> Result<ExecHandle, ExecError> {
+    async fn launch(&self, _step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
         // TODO: spawn `self.shell -c <script>` and track the child pid.
         let _cmd = tokio::process::Command::new(&self.shell);
         unimplemented!("LocalExecutor::launch")

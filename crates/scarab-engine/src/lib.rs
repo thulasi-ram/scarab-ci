@@ -118,6 +118,18 @@ pub struct Attempt {
     pub failure: Option<FailureKind>,
 }
 
+/// The executable contract of a Step (ADR-0008): an OCI image + command, plus
+/// environment. This is the minimal spec the [`Executor`] needs to launch one
+/// Pod; the full IR (`scarab-pipeline`) compiles down to it. It is handed to the
+/// executor at launch time rather than stored on the durable [`StepRun`], so the
+/// durable instance stays lean and the "what to run" comes from the Run's IR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepSpec {
+    pub image: String,
+    pub command: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
 /// A manual/approval gate that suspends a run until released.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gate {
@@ -450,6 +462,11 @@ impl StepRun {
     /// Number of attempts made so far.
     pub fn attempt_count(&self) -> usize {
         self.attempts.len()
+    }
+
+    /// The in-flight (latest) attempt, i.e. the current fence for execution.
+    pub fn current_attempt(&self) -> Option<&Attempt> {
+        self.attempts.last()
     }
 
     fn step_transition(&self, from: StepStatus, to: StepStatus, at: Timestamp) -> EventKind {

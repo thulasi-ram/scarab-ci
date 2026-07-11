@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Lease};
 use scarab_engine::{
     Clock, Db, DbError, EventKind, ExecError, Executor, OutboxId, OutboxMessage, RunId, RunStatus,
-    StepId, StepRun, Timestamp,
+    StepId, StepRun, StepSpec, Timestamp,
 };
 
 // ---------------------------------------------------------------------------
@@ -215,12 +215,15 @@ struct FakeExecState {
     scripted: Vec<ExecState>,
     /// Handles the test has declared "dead" (backend lost them).
     dead: Vec<ExecHandle>,
+    /// How many times each handle has been launched — proves idempotent
+    /// re-attach (a second launch of the same fence does not relaunch).
+    launches: HashMap<String, u32>,
 }
 
 /// An [`Executor`] whose behaviour a test scripts: it can be told that a given
-/// handle fails or dies, driving the engine's retry / recovery paths.
+/// handle fails or dies, driving the engine's retry / recovery paths. `launch`
+/// is idempotent on the step's fence, mirroring the real executor's re-attach.
 pub struct FakeExecutor {
-    #[allow(dead_code)]
     inner: Mutex<FakeExecState>,
 }
 
@@ -240,6 +243,26 @@ impl FakeExecutor {
     pub fn kill(&self, handle: ExecHandle) {
         self.inner.lock().unwrap().dead.push(handle);
     }
+
+    /// The deterministic handle a step's fence maps to.
+    pub fn handle_for(step: &StepRun) -> ExecHandle {
+        let attempt = step
+            .current_attempt()
+            .map(|a| a.id.0.as_str())
+            .unwrap_or("0");
+        ExecHandle(format!("fake://{}/{}/{}", step.run.0, step.step.0, attempt))
+    }
+
+    /// How many times the given handle was launched (0 if never).
+    pub fn launch_count(&self, handle: &ExecHandle) -> u32 {
+        self.inner
+            .lock()
+            .unwrap()
+            .launches
+            .get(&handle.0)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 impl Default for FakeExecutor {
@@ -250,15 +273,32 @@ impl Default for FakeExecutor {
 
 #[async_trait]
 impl Executor for FakeExecutor {
-    async fn launch(&self, _step: &StepRun) -> Result<ExecHandle, ExecError> {
-        unimplemented!("FakeExecutor::launch")
+    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        let handle = Self::handle_for(step);
+        *self
+            .inner
+            .lock()
+            .unwrap()
+            .launches
+            .entry(handle.0.clone())
+            .or_insert(0) += 1;
+        Ok(handle)
     }
 
-    async fn poll(&self, _handle: &ExecHandle) -> Result<ExecState, ExecError> {
-        unimplemented!("FakeExecutor::poll")
+    async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError> {
+        let mut st = self.inner.lock().unwrap();
+        if st.dead.contains(handle) {
+            return Ok(ExecState::Lost);
+        }
+        // Consume the next scripted outcome; default to Running while unscripted.
+        if st.scripted.is_empty() {
+            Ok(ExecState::Running)
+        } else {
+            Ok(st.scripted.remove(0))
+        }
     }
 
     async fn cancel(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
-        unimplemented!("FakeExecutor::cancel")
+        Ok(())
     }
 }

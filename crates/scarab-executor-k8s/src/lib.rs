@@ -1,18 +1,28 @@
-//! Kubernetes adapter for the [`scarab_engine::Executor`] port.
+//! Kubernetes adapter for the [`scarab_engine::Executor`] port (ADR-0004).
 //!
-//! Adapter crate: pairs the pure `scarab-engine` domain with `kube` +
-//! `k8s-openapi`. Each step becomes a Pod (or Job); this is a stub.
+//! Each Step runs as **one bare Pod** with `restartPolicy: Never` — a clean,
+//! individually-addressable, re-creatable object. The orchestrator owns retries
+//! (ADR-0020); this adapter only creates the Pod, reflects its status, and
+//! deletes it on cancel. `launch` is **idempotent on the step's fence**: the Pod
+//! name is derived deterministically from `{run, step, attempt}`, so a relaunch
+//! after a control-plane crash re-attaches to the existing Pod rather than
+//! starting a second one (the double-effect guard, ADR-0021).
 
 use async_trait::async_trait;
+use k8s_openapi::api::core::v1::{Container, EnvVar, Pod, PodSpec};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::api::{Api, DeleteParams, PostParams};
+
 use scarab_engine::ports::{ExecHandle, ExecState};
-use scarab_engine::{ExecError, Executor, StepRun};
+use scarab_engine::{ExecError, Executor, StepRun, StepSpec};
+
+/// Default graceful-cancel window: SIGTERM, then SIGKILL after this many seconds.
+const CANCEL_GRACE_SECS: i64 = 30;
 
 /// A Kubernetes-backed executor. Holds an optional client so the composition
 /// root can construct it without contacting an API server.
 pub struct K8sExecutor {
-    #[allow(dead_code)]
     client: Option<kube::Client>,
-    #[allow(dead_code)]
     namespace: String,
 }
 
@@ -30,21 +40,370 @@ impl K8sExecutor {
             namespace: namespace.into(),
         }
     }
+
+    fn pods(&self) -> Result<Api<Pod>, ExecError> {
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        Ok(Api::namespaced(client, &self.namespace))
+    }
 }
 
 #[async_trait]
 impl Executor for K8sExecutor {
-    async fn launch(&self, _step: &StepRun) -> Result<ExecHandle, ExecError> {
-        // TODO(kube): build and apply this Pod spec via the kube client.
-        let _pod: Option<k8s_openapi::api::core::v1::Pod> = None;
-        unimplemented!("K8sExecutor::launch")
+    async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        let pods = self.pods()?;
+        let name = pod_name(step);
+
+        // Re-attach: if the Pod already exists (a prior launch we may not have
+        // observed completing), adopt it instead of creating a duplicate.
+        if pods
+            .get_opt(&name)
+            .await
+            .map_err(|e| ExecError::Launch(e.to_string()))?
+            .is_some()
+        {
+            return Ok(ExecHandle(name));
+        }
+
+        let pod = build_pod(&name, &self.namespace, step, spec);
+        match pods.create(&PostParams::default(), &pod).await {
+            Ok(_) => Ok(ExecHandle(name)),
+            // A concurrent launcher won the race — the Pod now exists, which is
+            // exactly what we wanted; treat as a successful re-attach.
+            Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(ExecHandle(name)),
+            Err(e) => Err(ExecError::Launch(e.to_string())),
+        }
     }
 
-    async fn poll(&self, _handle: &ExecHandle) -> Result<ExecState, ExecError> {
-        unimplemented!("K8sExecutor::poll")
+    async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError> {
+        let pods = self.pods()?;
+        match pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?
+        {
+            Some(pod) => Ok(pod_state(&pod)),
+            // The Pod is gone (evicted, GC'd, node lost) — the backend lost it.
+            None => Ok(ExecState::Lost),
+        }
     }
 
-    async fn cancel(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
-        unimplemented!("K8sExecutor::cancel")
+    async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        let pods = self.pods()?;
+        // Graceful: SIGTERM, then SIGKILL after the grace period (ADR-0020).
+        let params = DeleteParams {
+            grace_period_seconds: Some(CANCEL_GRACE_SECS as u32),
+            ..DeleteParams::default()
+        };
+        match pods.delete(&handle.0, &params).await {
+            Ok(_) => Ok(()),
+            // Already gone is success for cancel.
+            Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+            Err(e) => Err(ExecError::Other(e.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure helpers (unit-testable without a cluster)
+// ---------------------------------------------------------------------------
+
+/// Deterministic Pod name for a step's fence `{run, step, attempt}`. Because it
+/// is a pure function of the fence, the same step always maps to the same Pod
+/// name across process restarts — which is what makes `launch` re-attach rather
+/// than relaunch. A short content hash keeps distinct fences from colliding
+/// after DNS-1123 sanitisation, and the whole thing stays within 63 chars.
+pub fn pod_name(step: &StepRun) -> String {
+    let attempt = step
+        .current_attempt()
+        .map(|a| a.id.0.as_str())
+        .unwrap_or("0");
+    let fence = format!("{}/{}/{}", step.run.0, step.step.0, attempt);
+    let hash = fnv1a(&fence);
+    let slug = truncate(&sanitize_dns(&format!("{}-{}", step.step.0, attempt)), 40);
+    // `scarab-` prefix + slug + 8-hex hash; always a valid DNS-1123 label.
+    format!("scarab-{slug}-{hash:08x}")
+}
+
+/// Build the bare Pod for a step: one container running `spec`, restartPolicy
+/// Never, with the fence injected as env vars for cooperating idempotency
+/// (ADR-0021) and labels for observability.
+pub fn build_pod(name: &str, namespace: &str, step: &StepRun, spec: &StepSpec) -> Pod {
+    let attempt = step
+        .current_attempt()
+        .map(|a| a.id.0.clone())
+        .unwrap_or_else(|| "0".to_string());
+
+    let mut env: Vec<EnvVar> = spec
+        .env
+        .iter()
+        .map(|(k, v)| EnvVar {
+            name: k.clone(),
+            value: Some(v.clone()),
+            value_from: None,
+        })
+        .collect();
+    // Fence env vars: hand each Attempt its monotonic {run, step, attempt} token.
+    for (k, v) in [
+        ("SCARAB_RUN", step.run.0.clone()),
+        ("SCARAB_STEP", step.step.0.clone()),
+        ("SCARAB_ATTEMPT", attempt.clone()),
+    ] {
+        env.push(EnvVar {
+            name: k.to_string(),
+            value: Some(v),
+            value_from: None,
+        });
+    }
+
+    let container = Container {
+        name: "step".to_string(),
+        image: Some(spec.image.clone()),
+        command: (!spec.command.is_empty()).then(|| spec.command.clone()),
+        env: Some(env),
+        ..Default::default()
+    };
+
+    let labels = std::collections::BTreeMap::from([
+        (
+            "app.kubernetes.io/managed-by".to_string(),
+            "scarab".to_string(),
+        ),
+        ("scarab.io/run".to_string(), sanitize_label(&step.run.0)),
+        ("scarab.io/step".to_string(), sanitize_label(&step.step.0)),
+        ("scarab.io/attempt".to_string(), sanitize_label(&attempt)),
+    ]);
+
+    Pod {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![container],
+            restart_policy: Some("Never".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Map a Pod's observed status to the domain [`ExecState`]. For a
+/// `restartPolicy: Never` Pod the phase is terminal on completion; the exit code
+/// is lifted from the container's terminated state.
+pub fn pod_state(pod: &Pod) -> ExecState {
+    let phase = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_deref())
+        .unwrap_or("Pending");
+    match phase {
+        "Succeeded" => ExecState::Succeeded,
+        "Failed" => ExecState::Failed {
+            exit_code: container_exit_code(pod),
+        },
+        "Running" => ExecState::Running,
+        // "Unknown" means the node stopped reporting — the backend lost it.
+        "Unknown" => ExecState::Lost,
+        _ => ExecState::Pending,
+    }
+}
+
+fn container_exit_code(pod: &Pod) -> Option<i32> {
+    pod.status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .first()?
+        .state
+        .as_ref()?
+        .terminated
+        .as_ref()
+        .map(|t| t.exit_code)
+}
+
+/// Lowercase, DNS-1123-label-safe slug: `[a-z0-9-]`, collapsed dashes, trimmed.
+fn sanitize_dns(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_dash = false;
+    for c in s.chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// A label *value*: like a DNS slug but bounded to 63 chars.
+fn sanitize_label(s: &str) -> String {
+    truncate(&sanitize_dns(s), 63)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    s.chars()
+        .take(max)
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+/// FNV-1a 32-bit — a tiny, fully deterministic hash (no `std` RNG variance), so
+/// Pod names are stable across builds and restarts.
+fn fnv1a(s: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in s.bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scarab_engine::{Attempt, AttemptId, RunId, StepId, StepStatus, Timestamp};
+
+    fn step_with_attempt(run: &str, step: &str, attempt: &str) -> StepRun {
+        StepRun {
+            run: RunId(run.into()),
+            step: StepId(step.into()),
+            status: StepStatus::Running,
+            attempts: vec![Attempt {
+                id: AttemptId(attempt.into()),
+                started_at: Timestamp(0),
+                failure: None,
+            }],
+        }
+    }
+
+    fn busybox() -> StepSpec {
+        StepSpec {
+            image: "busybox:latest".into(),
+            command: vec!["echo".into(), "hi".into()],
+            env: vec![("FOO".into(), "bar".into())],
+        }
+    }
+
+    #[test]
+    fn pod_name_is_deterministic_per_fence() {
+        let a = step_with_attempt("run-1", "build", "a1");
+        // Same fence -> same name (this is what lets launch re-attach).
+        assert_eq!(
+            pod_name(&a),
+            pod_name(&step_with_attempt("run-1", "build", "a1"))
+        );
+        // Different attempt -> different name.
+        assert_ne!(
+            pod_name(&a),
+            pod_name(&step_with_attempt("run-1", "build", "a2"))
+        );
+        // Different step -> different name.
+        assert_ne!(
+            pod_name(&a),
+            pod_name(&step_with_attempt("run-1", "test", "a1"))
+        );
+
+        let name = pod_name(&a);
+        assert!(name.starts_with("scarab-"));
+        assert!(name.len() <= 63, "name must be a valid DNS-1123 label");
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "name {name} must be DNS-1123-safe"
+        );
+    }
+
+    #[test]
+    fn pod_name_sanitizes_messy_ids() {
+        let s = step_with_attempt("Run/With CAPS", "step_under.score", "att#1");
+        let name = pod_name(&s);
+        assert!(name.starts_with("scarab-"));
+        assert!(name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+        assert!(!name.contains("--"));
+    }
+
+    #[test]
+    fn build_pod_sets_image_command_restart_policy_and_fence_env() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let pod = build_pod("scarab-build-a1-deadbeef", "scarab-run-1", &step, &busybox());
+
+        let spec = pod.spec.unwrap();
+        assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
+        let c = &spec.containers[0];
+        assert_eq!(c.image.as_deref(), Some("busybox:latest"));
+        assert_eq!(
+            c.command.as_ref().unwrap(),
+            &vec!["echo".to_string(), "hi".to_string()]
+        );
+
+        let env = c.env.as_ref().unwrap();
+        let get = |k: &str| env.iter().find(|e| e.name == k).and_then(|e| e.value.clone());
+        assert_eq!(get("FOO").as_deref(), Some("bar")); // spec env preserved
+        assert_eq!(get("SCARAB_RUN").as_deref(), Some("run-1")); // fence injected
+        assert_eq!(get("SCARAB_STEP").as_deref(), Some("build"));
+        assert_eq!(get("SCARAB_ATTEMPT").as_deref(), Some("a1"));
+
+        assert_eq!(
+            pod.metadata
+                .labels
+                .as_ref()
+                .unwrap()
+                .get("app.kubernetes.io/managed-by")
+                .map(String::as_str),
+            Some("scarab")
+        );
+    }
+
+    #[test]
+    fn pod_state_maps_phases_and_exit_code() {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus,
+        };
+
+        let with_phase = |phase: &str, exit: Option<i32>| {
+            let container_statuses = exit.map(|code| {
+                vec![ContainerStatus {
+                    name: "step".into(),
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: code,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]
+            });
+            Pod {
+                status: Some(PodStatus {
+                    phase: Some(phase.into()),
+                    container_statuses,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        };
+
+        assert_eq!(pod_state(&with_phase("Pending", None)), ExecState::Pending);
+        assert_eq!(pod_state(&with_phase("Running", None)), ExecState::Running);
+        assert_eq!(
+            pod_state(&with_phase("Succeeded", Some(0))),
+            ExecState::Succeeded
+        );
+        assert_eq!(
+            pod_state(&with_phase("Failed", Some(1))),
+            ExecState::Failed { exit_code: Some(1) }
+        );
+        assert_eq!(pod_state(&with_phase("Unknown", None)), ExecState::Lost);
+        // No status yet -> not scheduled -> Pending.
+        assert_eq!(pod_state(&Pod::default()), ExecState::Pending);
     }
 }

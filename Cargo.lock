@@ -2301,6 +2301,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "scarab-engine",
+ "tokio",
 ]
 
 [[package]]

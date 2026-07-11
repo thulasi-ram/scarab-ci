@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DbError, EventKind, ExecError, OutboxId, OutboxMessage, RunId, RunStatus, StepId, StepRun,
-    Timestamp,
+    StepSpec, Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -90,9 +90,15 @@ pub trait Clock: Send + Sync {
 }
 
 /// Launches and observes units of execution on some backend (k8s, local…).
+///
+/// `launch` must be **idempotent on the step's fence**: called twice for the
+/// same `{run, step, attempt}` (e.g. after a control-plane crash) it re-attaches
+/// to the existing unit rather than starting a second one. The orchestrator owns
+/// retries; the executor just reflects backend state (ADR-0004, 0020).
 #[async_trait]
 pub trait Executor: Send + Sync {
-    async fn launch(&self, step: &StepRun) -> Result<ExecHandle, ExecError>;
+    /// Launch (or re-attach to) the unit for `step`, running `spec`.
+    async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError>;
     async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError>;
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError>;
 }
