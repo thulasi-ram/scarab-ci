@@ -63,6 +63,9 @@ pub trait Db: Send + Sync {
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;
 
+    /// Ids of all non-terminal runs — the work list a converged scheduler drives.
+    async fn active_runs(&self) -> Result<Vec<RunId>, DbError>;
+
     /// The run's append-only event log, in append order (the SSE tail source).
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError>;
 

@@ -219,6 +219,16 @@ impl Db for PostgresDb {
             .transpose()
     }
 
+    async fn active_runs(&self) -> Result<Vec<RunId>, DbError> {
+        let rows = sqlx::query(
+            "SELECT id FROM runs WHERE status IN ('pending', 'running', 'suspended') ORDER BY created_at",
+        )
+        .fetch_all(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
+    }
+
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
         let rows = sqlx::query("SELECT version, at, payload FROM events WHERE run_id = $1 ORDER BY seq")
             .bind(&run.0)

@@ -32,6 +32,7 @@ use scarab_engine::{
     Timestamp, EVENT_VERSION,
 };
 
+pub mod converged;
 pub mod logs;
 pub use logs::LogService;
 

@@ -209,6 +209,18 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().runs.get(run).copied())
     }
 
+    async fn active_runs(&self) -> Result<Vec<RunId>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<RunId> = st
+            .runs
+            .iter()
+            .filter(|(_, s)| !s.is_terminal())
+            .map(|(r, _)| r.clone())
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
         Ok(self
             .state

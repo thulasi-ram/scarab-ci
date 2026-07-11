@@ -1,18 +1,21 @@
-//! # scarab-server — the API/worker process binary.
+//! # scarab-server — the converged API/worker process binary.
 //!
-//! One binary, selectable roles. The `converged` role runs everything in a
-//! single process (great for dev / small installs); the other roles let an
-//! operator scale each concern independently. This binary is a thin shell over
-//! the [`scarab_server`] library, which owns the router and handlers. Connecting
-//! Postgres/object-store and spawning the background scheduler loop land with
-//! the converged-wiring slice.
+//! One binary, selectable roles (ADR-0016). `converged` runs the API plus the
+//! scheduler + executor background loop in a single process — ideal for dev and
+//! small installs; the same code scales out by running roles as separate
+//! replicas, since Postgres (the outbox) is the coordination bus. This binary is
+//! a thin composition root over the [`scarab_server`] library.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 
 use scarab_db_postgres::PostgresDb;
-use scarab_server::{router, AppState, LogService, SystemClock};
+use scarab_engine::{Clock, Db, Executor};
+use scarab_executor_k8s::K8sExecutor;
+use scarab_server::{converged, router, AppState, LogService, SystemClock};
+use scarab_storage::ObjectStore;
 use scarab_storage_s3::S3Storage;
 
 /// Which slice(s) of Scarab this process should run.
@@ -28,6 +31,13 @@ enum Role {
     Executor,
     /// Ingest and normalize inbound forge webhooks only.
     Webhook,
+}
+
+impl Role {
+    /// Roles that drive the scheduler + executor background loop.
+    fn runs_driver(self) -> bool {
+        matches!(self, Role::Converged | Role::Scheduler | Role::Executor)
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -46,10 +56,19 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:8080")]
     addr: String,
 
-    /// Postgres connection URL. When set, the durable store is connected;
-    /// otherwise the process serves with an unconnected store (dev/smoke).
+    /// Postgres connection URL. When set, the durable store is connected and the
+    /// background driver runs; otherwise the process serves API-only (dev/smoke).
     #[arg(long, env = "SCARAB_DATABASE_URL")]
     database_url: Option<String>,
+
+    /// Local directory backing the object store (logs/artifacts). Swapped for
+    /// S3/MinIO in production; a plain directory needs no extra service for dev.
+    #[arg(long, env = "SCARAB_OBJECT_DIR", default_value = "./.scarab/objects")]
+    object_dir: String,
+
+    /// Kubernetes namespace the executor launches step Pods into.
+    #[arg(long, env = "SCARAB_NAMESPACE", default_value = "scarab")]
+    namespace: String,
 }
 
 #[tokio::main]
@@ -60,6 +79,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(role = ?cli.role, "starting scarab-server");
     println!("scarab-server role = {:?}", cli.role);
 
+    // Durable store.
+    let connected = cli.database_url.is_some();
     let pg = match &cli.database_url {
         Some(url) => {
             let db = PostgresDb::connect(url).await?;
@@ -68,10 +89,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => PostgresDb::new(),
     };
-    let db: Arc<dyn scarab_engine::Db> = Arc::new(pg);
-    let store: Arc<dyn scarab_storage::ObjectStore> = Arc::new(S3Storage::new("scarab-logs"));
+    let db: Arc<dyn Db> = Arc::new(pg);
+
+    // Object store (local FS for dev; S3/MinIO wired the same way in prod).
+    let store: Arc<dyn ObjectStore> = Arc::new(S3Storage::local(&cli.object_dir)?);
     let logs = Arc::new(LogService::new(store, db.clone()));
-    let state = AppState::new(db, Arc::new(SystemClock), logs);
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+    // Background scheduler + executor loop (only meaningful with a real store).
+    if cli.role.runs_driver() && connected {
+        let executor: Arc<dyn Executor> = Arc::new(K8sExecutor::new(cli.namespace.clone()));
+        converged::spawn_driver(
+            db.clone(),
+            clock.clone(),
+            executor,
+            "scarab-server".to_string(),
+            Duration::from_millis(500),
+        );
+        tracing::info!("converged driver started");
+    }
+
+    let state = AppState::new(db, clock, logs);
     let app = router(state);
 
     if cli.serve {

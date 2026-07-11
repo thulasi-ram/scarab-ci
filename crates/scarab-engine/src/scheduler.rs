@@ -100,6 +100,21 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    /// One cycle across *every* active run — the converged-driver tick. Admits
+    /// each active run, reconciles the outbox globally (one pass covers all
+    /// runs), then advances each. This is what the background loop calls.
+    pub async fn tick_all(&self) -> Result<(), SchedulerError> {
+        let runs = self.db.active_runs().await?;
+        for run in &runs {
+            self.admit(run).await?;
+        }
+        self.reconcile().await?;
+        for run in &runs {
+            self.advance(run).await?;
+        }
+        Ok(())
+    }
+
     /// Are we the admission leader right now?
     async fn is_leader(&self) -> Result<bool, SchedulerError> {
         let lease = self
