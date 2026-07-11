@@ -21,7 +21,7 @@ use sqlx::{PgPool, Row};
 use scarab_engine::ports::Lease;
 use scarab_engine::{
     Attempt, AttemptId, Db, DbError, EventKind, EventPayload, FailureKind, OutboxId, OutboxMessage,
-    RunId, RunStatus, StepId, StepRun, StepStatus, Timestamp,
+    RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
@@ -91,15 +91,20 @@ impl PostgresDb {
         &self,
         run: &RunId,
         step: &StepId,
+        spec: Option<&StepSpec>,
         at: Timestamp,
     ) -> Result<(), DbError> {
+        let spec_json = spec
+            .map(|s| serde_json::to_value(s).map_err(|e| DbError::Other(e.to_string())))
+            .transpose()?;
         sqlx::query(
-            "INSERT INTO step_runs (run_id, step_id, status, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $4)",
+            "INSERT INTO step_runs (run_id, step_id, status, spec, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $5)",
         )
         .bind(&run.0)
         .bind(&step.0)
         .bind(step_status_str(StepStatus::Pending))
+        .bind(spec_json)
         .bind(at.0)
         .execute(self.pool()?)
         .await
@@ -107,42 +112,7 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// Record an attempt (upsert on its monotonic id — the fencing unit).
-    pub async fn record_attempt(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &Attempt,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO attempts (run_id, step_id, attempt_id, started_at, failure)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (run_id, step_id, attempt_id)
-             DO UPDATE SET failure = EXCLUDED.failure",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.id.0)
-        .bind(attempt.started_at.0)
-        .bind(attempt.failure.map(failure_str))
-        .execute(self.pool()?)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
     // --- read helpers ------------------------------------------------------
-
-    /// Current status of a run, if it exists.
-    pub async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
-        let row = sqlx::query("SELECT status FROM runs WHERE id = $1")
-            .bind(&run.0)
-            .fetch_optional(self.pool()?)
-            .await
-            .map_err(db_err)?;
-        row.map(|r| run_status_from_str(r.get::<String, _>("status")))
-            .transpose()
-    }
 
     /// Current status of a step, if it exists.
     pub async fn step_status(&self, run: &RunId, step: &StepId) -> Result<Option<StepStatus>, DbError> {
@@ -265,6 +235,105 @@ impl Db for PostgresDb {
         Ok(claimed)
     }
 
+    async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
+        let row = sqlx::query("SELECT status FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| run_status_from_str(r.get::<String, _>("status")))
+            .transpose()
+    }
+
+    async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
+        let rows = sqlx::query("SELECT step_id, status FROM step_runs WHERE run_id = $1 ORDER BY step_id")
+            .bind(&run.0)
+            .fetch_all(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        let mut steps = Vec::with_capacity(rows.len());
+        for r in rows {
+            let step = StepId(r.get::<String, _>("step_id"));
+            let status = step_status_from_str(r.get::<String, _>("status"))?;
+            let attempts = self.attempts(run, &step).await?;
+            steps.push(StepRun {
+                run: run.clone(),
+                step,
+                status,
+                attempts,
+            });
+        }
+        Ok(steps)
+    }
+
+    async fn step_spec(&self, run: &RunId, step: &StepId) -> Result<Option<StepSpec>, DbError> {
+        let row = sqlx::query("SELECT spec FROM step_runs WHERE run_id = $1 AND step_id = $2")
+            .bind(&run.0)
+            .bind(&step.0)
+            .fetch_optional(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        match row.and_then(|r| r.get::<Option<Value>, _>("spec")) {
+            Some(v) => Ok(Some(
+                serde_json::from_value(v).map_err(|e| DbError::Other(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    async fn record_step_transition(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        from: StepStatus,
+        to: StepStatus,
+    ) -> Result<(), DbError> {
+        // Optimistic guard, like record_transition: the UPDATE fires only if the
+        // step is still in `from`, so a stale/duplicate finalize is a Conflict.
+        let affected = sqlx::query(
+            "UPDATE step_runs
+             SET status = $4, updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE run_id = $1 AND step_id = $2 AND status = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(step_status_str(from))
+        .bind(step_status_str(to))
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if affected == 0 {
+            return Err(DbError::Conflict);
+        }
+        Ok(())
+    }
+
+    async fn record_attempt(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &Attempt,
+    ) -> Result<(), DbError> {
+        // Idempotent on the monotonic attempt id (the fencing unit) — a re-drive
+        // records the same attempt rather than a duplicate.
+        sqlx::query(
+            "INSERT INTO attempts (run_id, step_id, attempt_id, started_at, failure)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (run_id, step_id, attempt_id)
+             DO UPDATE SET failure = EXCLUDED.failure",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.id.0)
+        .bind(attempt.started_at.0)
+        .bind(attempt.failure.map(failure_str))
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn record_transition(
         &self,
         run: &RunId,
@@ -382,7 +451,7 @@ impl Db for PostgresDb {
         Ok(())
     }
 
-    async fn lease(&self, step: &StepId, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
+    async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
         // Acquire or renew, taking over only an expired lease. RETURNING yields
         // the winning holder; if the incumbent lease is still valid the DO
         // UPDATE is skipped and we read back the current holder instead.
@@ -394,7 +463,7 @@ impl Db for PostgresDb {
                WHERE leases.expires_at < (extract(epoch from now()) * 1000)::bigint
              RETURNING owner, expires_at",
         )
-        .bind(&step.0)
+        .bind(resource)
         .bind(owner)
         .bind(ttl_ms)
         .fetch_optional(self.pool()?)
@@ -409,7 +478,7 @@ impl Db for PostgresDb {
             None => {
                 // Not acquired: a valid lease is still held by someone else.
                 let r = sqlx::query("SELECT owner, expires_at FROM leases WHERE resource = $1")
-                    .bind(&step.0)
+                    .bind(resource)
                     .fetch_one(self.pool()?)
                     .await
                     .map_err(db_err)?;

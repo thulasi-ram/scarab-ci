@@ -42,7 +42,10 @@ async fn run_happy_path_records_each_transition_once() {
     db.append_event(&ev).await.unwrap();
 
     assert_eq!(run.status, RunStatus::Succeeded);
-    assert_eq!(db.run_status(&run_id()), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
 
     let events = db.events();
     assert_eq!(events.len(), 3);
@@ -120,7 +123,10 @@ async fn crash_between_transitions_advances_exactly_once() {
     assert!(matches!(dup, Err(DbError::Conflict)));
 
     // Exactly one RunTransitioned in the log; status settled at Running.
-    assert_eq!(db.run_status(&run_id()), Some(RunStatus::Running));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Running)
+    );
     let transitions = db
         .events()
         .into_iter()

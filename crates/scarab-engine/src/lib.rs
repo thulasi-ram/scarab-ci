@@ -18,8 +18,10 @@
 //! Everything below is a compiling skeleton — method bodies are stubs.
 
 pub mod ports;
+pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor};
+pub use scheduler::{Scheduler, SchedulerError};
 
 use serde::{Deserialize, Serialize};
 

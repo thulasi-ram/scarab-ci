@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DbError, EventKind, ExecError, OutboxId, OutboxMessage, RunId, RunStatus, StepId, StepRun,
-    StepSpec, Timestamp,
+    Attempt, DbError, EventKind, ExecError, OutboxId, OutboxMessage, RunId, RunStatus, StepId,
+    StepRun, StepSpec, StepStatus, Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -41,12 +41,41 @@ pub trait Db: Send + Sync {
     /// `SELECT … FOR UPDATE SKIP LOCKED`-style claim so replicas don't collide.
     async fn claim_ready_steps(&self, limit: u32) -> Result<Vec<StepRun>, DbError>;
 
+    /// Current status of a run, or `None` if it does not exist.
+    async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;
+
+    /// All step projections of a run (with their attempts) — the DAG snapshot
+    /// the scheduler folds to decide admission and completion.
+    async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError>;
+
+    /// The durable launch spec for a step, or `None` if unset. Stored at run
+    /// creation so a resumed run can re-launch the same step after a crash.
+    async fn step_spec(&self, run: &RunId, step: &StepId) -> Result<Option<StepSpec>, DbError>;
+
     /// Record a run status transition (guarded by optimistic concurrency).
     async fn record_transition(
         &self,
         run: &RunId,
         from: RunStatus,
         to: RunStatus,
+    ) -> Result<(), DbError>;
+
+    /// Record a step status transition (guarded by optimistic concurrency on
+    /// `from`, so a duplicate/stale writer is rejected rather than double-applied).
+    async fn record_step_transition(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        from: StepStatus,
+        to: StepStatus,
+    ) -> Result<(), DbError>;
+
+    /// Persist an attempt (idempotent on its id — restart-safe).
+    async fn record_attempt(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &Attempt,
     ) -> Result<(), DbError>;
 
     /// Append one entry to the run's append-only event log.
@@ -73,10 +102,12 @@ pub trait Db: Send + Sync {
     /// Mark a claimed outbox message dispatched, so it is never redelivered.
     async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError>;
 
-    /// Acquire (or renew) a time-bounded lease over a step for `owner`.
+    /// Acquire (or renew) a time-bounded lease over a named `resource` (a step
+    /// id, `"scheduler"` leadership, …) for `owner`. Only an expired lease is
+    /// taken over; the returned [`Lease`] names the current holder.
     async fn lease(
         &self,
-        step: &StepId,
+        resource: &str,
         owner: &str,
         ttl_ms: i64,
     ) -> Result<Lease, DbError>;

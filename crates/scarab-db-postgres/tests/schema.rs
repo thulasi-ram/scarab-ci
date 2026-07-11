@@ -72,7 +72,7 @@ async fn tables_round_trip_via_adapter() {
     assert!(matches!(dup, Err(DbError::Conflict)));
 
     // step_runs
-    db.create_step_run(&run, &step, at).await.unwrap();
+    db.create_step_run(&run, &step, None, at).await.unwrap();
     assert_eq!(
         db.step_status(&run, &step).await.unwrap(),
         Some(StepStatus::Pending)
@@ -126,7 +126,7 @@ async fn tables_round_trip_via_adapter() {
     );
 
     // leases
-    let lease = db.lease(&step, "worker-a", 60_000).await.unwrap();
+    let lease = db.lease(&step.0, "worker-a", 60_000).await.unwrap();
     assert_eq!(lease.owner, "worker-a");
 
     tdb.cleanup().await;

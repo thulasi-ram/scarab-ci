@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Lease};
 use scarab_engine::{
-    Clock, Db, DbError, EventKind, ExecError, Executor, OutboxId, OutboxMessage, RunId, RunStatus,
-    StepId, StepRun, StepSpec, Timestamp,
+    Attempt, Clock, Db, DbError, EventKind, ExecError, Executor, OutboxId, OutboxMessage, RunId,
+    RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 
 // ---------------------------------------------------------------------------
@@ -68,22 +68,31 @@ struct OutboxEntry {
     dispatched: bool,
 }
 
+/// A step's in-memory row: status, durable spec, and attempts.
+#[derive(Default)]
+struct StepRec {
+    status: Option<StepStatus>,
+    spec: Option<StepSpec>,
+    attempts: Vec<Attempt>,
+}
+
 #[derive(Default)]
 struct InMemoryState {
     /// The append-only event log.
     events: Vec<EventKind>,
-    /// Steps a subsequent `claim_ready_steps` will hand out.
-    ready: Vec<StepRun>,
     /// Current run statuses — the "state table" the real store keeps.
     runs: HashMap<RunId, RunStatus>,
+    /// Per-(run, step) rows: status, spec, attempts.
+    steps: HashMap<(RunId, StepId), StepRec>,
     /// The transactional outbox.
     outbox: Vec<OutboxEntry>,
 }
 
-/// An in-memory [`Db`] for tests. Holds the same shape of state a real store
-/// would: an append-only event log, a ready queue, and a run-status table that
-/// enforces optimistic concurrency on transitions — the in-process stand-in for
-/// the version-stamped `UPDATE … WHERE status = $from` the Postgres adapter runs.
+/// An in-memory [`Db`] for tests: an append-only event log, run/step state
+/// tables that enforce optimistic concurrency on transitions (the in-process
+/// stand-in for the version-stamped `UPDATE … WHERE status = $from` the Postgres
+/// adapter runs), and a transactional outbox. A faithful-enough durable-store
+/// fake for driving the pure engine.
 pub struct InMemoryDb {
     state: Mutex<InMemoryState>,
 }
@@ -95,19 +104,41 @@ impl InMemoryDb {
         }
     }
 
-    /// Seed the ready queue a subsequent `claim_ready_steps` would return.
+    /// Seed a run's current status.
+    pub fn seed_run(&self, run: &RunId, status: RunStatus) {
+        self.state.lock().unwrap().runs.insert(run.clone(), status);
+    }
+
+    /// Seed a step row with a status and optional launch spec.
+    pub fn seed_step(&self, run: &RunId, step: &StepId, status: StepStatus, spec: Option<StepSpec>) {
+        self.state.lock().unwrap().steps.insert(
+            (run.clone(), step.clone()),
+            StepRec {
+                status: Some(status),
+                spec,
+                attempts: Vec::new(),
+            },
+        );
+    }
+
+    /// Seed steps as `Ready` (convenience for claim-based tests).
     pub fn seed_ready(&self, steps: Vec<StepRun>) {
-        self.state.lock().unwrap().ready = steps;
+        let mut st = self.state.lock().unwrap();
+        for s in steps {
+            st.steps.insert(
+                (s.run.clone(), s.step.clone()),
+                StepRec {
+                    status: Some(StepStatus::Ready),
+                    spec: None,
+                    attempts: s.attempts,
+                },
+            );
+        }
     }
 
     /// Snapshot of the append-only event log, in append order.
     pub fn events(&self) -> Vec<EventKind> {
         self.state.lock().unwrap().events.clone()
-    }
-
-    /// The last recorded status for `run`, if any transition has been recorded.
-    pub fn run_status(&self, run: &RunId) -> Option<RunStatus> {
-        self.state.lock().unwrap().runs.get(run).copied()
     }
 }
 
@@ -121,8 +152,98 @@ impl Default for InMemoryDb {
 impl Db for InMemoryDb {
     async fn claim_ready_steps(&self, limit: u32) -> Result<Vec<StepRun>, DbError> {
         let mut st = self.state.lock().unwrap();
-        let take = (limit as usize).min(st.ready.len());
-        Ok(st.ready.drain(..take).collect())
+        let mut claimed = Vec::new();
+        // Deterministic order for tests.
+        let mut keys: Vec<(RunId, StepId)> = st
+            .steps
+            .iter()
+            .filter(|(_, r)| r.status == Some(StepStatus::Ready))
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.sort_by(|a, b| (a.0 .0.as_str(), a.1 .0.as_str()).cmp(&(b.0 .0.as_str(), b.1 .0.as_str())));
+        for key in keys.into_iter().take(limit as usize) {
+            let rec = st.steps.get_mut(&key).unwrap();
+            rec.status = Some(StepStatus::Running);
+            claimed.push(StepRun {
+                run: key.0.clone(),
+                step: key.1.clone(),
+                status: StepStatus::Running,
+                attempts: rec.attempts.clone(),
+            });
+        }
+        Ok(claimed)
+    }
+
+    async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
+        Ok(self.state.lock().unwrap().runs.get(run).copied())
+    }
+
+    async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<StepRun> = st
+            .steps
+            .iter()
+            .filter(|((r, _), _)| r == run)
+            .filter_map(|((r, s), rec)| {
+                rec.status.map(|status| StepRun {
+                    run: r.clone(),
+                    step: s.clone(),
+                    status,
+                    attempts: rec.attempts.clone(),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| a.step.0.cmp(&b.step.0));
+        Ok(out)
+    }
+
+    async fn step_spec(&self, run: &RunId, step: &StepId) -> Result<Option<StepSpec>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.spec.clone()))
+    }
+
+    async fn record_step_transition(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        from: StepStatus,
+        to: StepStatus,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        let rec = st
+            .steps
+            .get_mut(&(run.clone(), step.clone()))
+            .ok_or(DbError::Conflict)?;
+        if rec.status != Some(from) {
+            return Err(DbError::Conflict);
+        }
+        rec.status = Some(to);
+        Ok(())
+    }
+
+    async fn record_attempt(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &Attempt,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        let rec = st
+            .steps
+            .entry((run.clone(), step.clone()))
+            .or_default();
+        // Idempotent on the attempt id.
+        if let Some(existing) = rec.attempts.iter_mut().find(|a| a.id == attempt.id) {
+            *existing = attempt.clone();
+        } else {
+            rec.attempts.push(attempt.clone());
+        }
+        Ok(())
     }
 
     async fn record_transition(
@@ -197,7 +318,7 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
-    async fn lease(&self, _step: &StepId, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
+    async fn lease(&self, _resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
         Ok(Lease {
             owner: owner.to_string(),
             expires_at: Timestamp(ttl_ms),

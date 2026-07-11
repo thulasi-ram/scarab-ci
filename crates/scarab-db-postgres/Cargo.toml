@@ -12,3 +12,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+scarab-testkit = { workspace = true }
