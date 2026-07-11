@@ -1,79 +1,26 @@
 //! Schema + expand-contract migration-harness tests for `scarab-db-postgres`.
 //!
-//! Per ADR-0017 Postgres is a *real collaborator*, not a mock. These tests run
-//! against a live server given by `SCARAB_TEST_DATABASE_URL` (a superuser-ish
-//! URL pointing at a maintenance database, e.g.
-//! `postgres://user@localhost/postgres`); each test carves a throwaway database
-//! so runs are isolated. When the variable is unset the tests skip cleanly, so
-//! `cargo test` stays green in environments without Postgres/Docker — the dev
-//! harness (issue 7e2038d) wires the URL in CI.
+//! Postgres is a real collaborator (ADR-0017); see `common` for the harness and
+//! its `SCARAB_TEST_DATABASE_URL` skip behaviour.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+mod common;
 
+use common::fresh_db;
 use scarab_db_postgres::{PostgresDb, MIGRATOR};
 use scarab_engine::{
     Attempt, AttemptId, Db, DbError, EventPayload, FailureKind, Run, RunId, RunStatus, StepId,
     StepStatus, Timestamp, EVENT_VERSION,
 };
-use sqlx::{PgPool, Row};
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-/// Provision an isolated, migrated database. Returns `None` (skip) when no test
-/// server is configured.
-async fn fresh_db() -> Option<(PgPool, String, String)> {
-    let admin_url = std::env::var("SCARAB_TEST_DATABASE_URL").ok()?;
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dbname = format!("scarab_test_{}_{}", std::process::id(), n);
-
-    let admin = PgPool::connect(&admin_url).await.expect("connect admin db");
-    // Idempotent from a prior aborted run.
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"))
-        .execute(&admin)
-        .await
-        .expect("drop stale test db");
-    sqlx::query(&format!("CREATE DATABASE {dbname}"))
-        .execute(&admin)
-        .await
-        .expect("create test db");
-    admin.close().await;
-
-    let url = swap_db(&admin_url, &dbname);
-    let pool = PgPool::connect(&url).await.expect("connect test db");
-    Some((pool, admin_url, dbname))
-}
-
-/// Replace the database path in a connection URL, preserving query params.
-fn swap_db(url: &str, dbname: &str) -> String {
-    let (base, query) = match url.split_once('?') {
-        Some((b, q)) => (b, Some(q)),
-        None => (url, None),
-    };
-    let slash = base.rfind('/').expect("url has a path");
-    let mut out = format!("{}/{}", &base[..slash], dbname);
-    if let Some(q) = query {
-        out.push('?');
-        out.push_str(q);
-    }
-    out
-}
-
-async fn drop_db(admin_url: &str, dbname: &str) {
-    if let Ok(admin) = PgPool::connect(admin_url).await {
-        let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"))
-            .execute(&admin)
-            .await;
-        admin.close().await;
-    }
-}
+use sqlx::Row;
 
 /// Migrations apply cleanly onto a fresh database.
 #[tokio::test]
 async fn migrations_apply_cleanly() {
-    let Some((pool, admin_url, dbname)) = fresh_db().await else {
+    let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
     };
+    let pool = tdb.pool.clone();
     let db = PostgresDb::with_pool(pool.clone());
     db.migrate().await.expect("migrations apply");
 
@@ -91,8 +38,7 @@ async fn migrations_apply_cleanly() {
     // Re-running is a no-op (idempotent).
     db.migrate().await.expect("re-migrate is a no-op");
 
-    pool.close().await;
-    drop_db(&admin_url, &dbname).await;
+    tdb.cleanup().await;
 }
 
 /// Every table round-trips through the adapter: write, then read the same data
@@ -100,11 +46,11 @@ async fn migrations_apply_cleanly() {
 /// `record_transition` yields `Conflict`).
 #[tokio::test]
 async fn tables_round_trip_via_adapter() {
-    let Some((pool, admin_url, dbname)) = fresh_db().await else {
+    let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
     };
-    let db = PostgresDb::with_pool(pool.clone());
+    let db = PostgresDb::with_pool(tdb.pool.clone());
     db.migrate().await.unwrap();
 
     let run = RunId("run-1".into());
@@ -164,13 +110,16 @@ async fn tables_round_trip_via_adapter() {
     assert_eq!(events[1].version, EVENT_VERSION);
 
     // outbox (idempotency_key collapses a duplicate enqueue)
-    let payload = serde_json::json!({"step": "build"});
-    db.enqueue_outbox(&run, "launch_step", &payload, "run-1:build:1", at)
-        .await
-        .unwrap();
-    db.enqueue_outbox(&run, "launch_step", &payload, "run-1:build:1", at)
-        .await
-        .unwrap();
+    let msg = scarab_engine::OutboxMessage {
+        id: scarab_engine::OutboxId(0),
+        run: run.clone(),
+        kind: "launch_step".into(),
+        payload: serde_json::json!({"step": "build"}),
+        idempotency_key: "run-1:build:1".into(),
+        at,
+    };
+    db.enqueue_outbox(&msg).await.unwrap();
+    db.enqueue_outbox(&msg).await.unwrap();
     assert_eq!(
         db.pending_outbox_kinds(&run).await.unwrap(),
         vec!["launch_step".to_string()]
@@ -180,8 +129,7 @@ async fn tables_round_trip_via_adapter() {
     let lease = db.lease(&step, "worker-a", 60_000).await.unwrap();
     assert_eq!(lease.owner, "worker-a");
 
-    pool.close().await;
-    drop_db(&admin_url, &dbname).await;
+    tdb.cleanup().await;
 }
 
 /// Expand-contract: apply only v1, write as an "old binary", then apply the v2
@@ -190,10 +138,11 @@ async fn tables_round_trip_via_adapter() {
 /// binary can populate the added column — old-binary × new-schema overlap.
 #[tokio::test]
 async fn expand_contract_old_binary_survives_new_schema() {
-    let Some((pool, admin_url, dbname)) = fresh_db().await else {
+    let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
     };
+    let pool = tdb.pool.clone();
 
     // Apply migrations one version at a time from the embedded set.
     let migrations: Vec<_> = MIGRATOR.iter().collect();
@@ -253,6 +202,5 @@ async fn expand_contract_old_binary_survives_new_schema() {
         .get("parked_reason");
     assert_eq!(parked.as_deref(), Some("ir_version out of window"));
 
-    pool.close().await;
-    drop_db(&admin_url, &dbname).await;
+    tdb.cleanup().await;
 }

@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DbError, EventKind, ExecError, RunId, RunStatus, StepId, StepRun, Timestamp,
+    DbError, EventKind, ExecError, OutboxId, OutboxMessage, RunId, RunStatus, StepId, StepRun,
+    Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -50,6 +51,27 @@ pub trait Db: Send + Sync {
 
     /// Append one entry to the run's append-only event log.
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError>;
+
+    /// Enqueue a message on the transactional outbox. Enqueuing the same
+    /// `idempotency_key` twice is a no-op (the effect is enqueued exactly once).
+    async fn enqueue_outbox(&self, msg: &OutboxMessage) -> Result<(), DbError>;
+
+    /// Claim up to `limit` undispatched outbox messages for `owner`, hiding them
+    /// from other drainers for `visibility_ms` (a claim lease). Uses
+    /// `FOR UPDATE SKIP LOCKED` so concurrent drainers get disjoint sets — no
+    /// message is handed to two drainers at once. If the owner crashes before
+    /// [`mark_dispatched`](Db::mark_dispatched), the claim expires and the
+    /// message is redelivered (at-least-once); the consumer's fence makes the
+    /// duplicate a no-op (ADR-0021).
+    async fn claim_outbox(
+        &self,
+        owner: &str,
+        limit: u32,
+        visibility_ms: i64,
+    ) -> Result<Vec<OutboxMessage>, DbError>;
+
+    /// Mark a claimed outbox message dispatched, so it is never redelivered.
+    async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError>;
 
     /// Acquire (or renew) a time-bounded lease over a step for `owner`.
     async fn lease(

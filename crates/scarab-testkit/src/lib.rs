@@ -17,8 +17,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Lease};
 use scarab_engine::{
-    Clock, Db, DbError, EventKind, ExecError, Executor, RunId, RunStatus, StepId, StepRun,
-    Timestamp,
+    Clock, Db, DbError, EventKind, ExecError, Executor, OutboxId, OutboxMessage, RunId, RunStatus,
+    StepId, StepRun, Timestamp,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,6 +61,13 @@ impl Clock for FakeClock {
 // InMemoryDb — in-process durable store stand-in
 // ---------------------------------------------------------------------------
 
+/// One outbox row: the message plus its claim/dispatch flags.
+struct OutboxEntry {
+    msg: OutboxMessage,
+    claimed: bool,
+    dispatched: bool,
+}
+
 #[derive(Default)]
 struct InMemoryState {
     /// The append-only event log.
@@ -69,6 +76,8 @@ struct InMemoryState {
     ready: Vec<StepRun>,
     /// Current run statuses — the "state table" the real store keeps.
     runs: HashMap<RunId, RunStatus>,
+    /// The transactional outbox.
+    outbox: Vec<OutboxEntry>,
 }
 
 /// An in-memory [`Db`] for tests. Holds the same shape of state a real store
@@ -136,6 +145,55 @@ impl Db for InMemoryDb {
 
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
         self.state.lock().unwrap().events.push(event.clone());
+        Ok(())
+    }
+
+    async fn enqueue_outbox(&self, msg: &OutboxMessage) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        // Idempotent on the key: a duplicate enqueue is a no-op.
+        if st
+            .outbox
+            .iter()
+            .any(|e| e.msg.idempotency_key == msg.idempotency_key)
+        {
+            return Ok(());
+        }
+        let id = OutboxId(st.outbox.len() as i64 + 1);
+        let mut msg = msg.clone();
+        msg.id = id;
+        st.outbox.push(OutboxEntry {
+            msg,
+            claimed: false,
+            dispatched: false,
+        });
+        Ok(())
+    }
+
+    async fn claim_outbox(
+        &self,
+        _owner: &str,
+        limit: u32,
+        _visibility_ms: i64,
+    ) -> Result<Vec<OutboxMessage>, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let mut out = Vec::new();
+        for entry in st.outbox.iter_mut() {
+            if out.len() as u32 >= limit {
+                break;
+            }
+            if !entry.dispatched && !entry.claimed {
+                entry.claimed = true;
+                out.push(entry.msg.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(e) = st.outbox.iter_mut().find(|e| e.msg.id == id) {
+            e.dispatched = true;
+        }
         Ok(())
     }
 

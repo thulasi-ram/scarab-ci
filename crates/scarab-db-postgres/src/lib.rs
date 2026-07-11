@@ -20,8 +20,8 @@ use sqlx::{PgPool, Row};
 
 use scarab_engine::ports::Lease;
 use scarab_engine::{
-    Attempt, AttemptId, Db, DbError, EventKind, EventPayload, FailureKind, RunId, RunStatus, StepId,
-    StepRun, StepStatus, Timestamp,
+    Attempt, AttemptId, Db, DbError, EventKind, EventPayload, FailureKind, OutboxId, OutboxMessage,
+    RunId, RunStatus, StepId, StepRun, StepStatus, Timestamp,
 };
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
@@ -131,32 +131,6 @@ impl PostgresDb {
         Ok(())
     }
 
-    /// Enqueue an outbox row for exactly-once side-effect dispatch. A duplicate
-    /// `idempotency_key` collapses to the existing row (no double effect).
-    pub async fn enqueue_outbox(
-        &self,
-        run: &RunId,
-        kind: &str,
-        payload: &Value,
-        idempotency_key: &str,
-        at: Timestamp,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO outbox (run_id, kind, payload, idempotency_key, created_at)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (idempotency_key) DO NOTHING",
-        )
-        .bind(&run.0)
-        .bind(kind)
-        .bind(payload)
-        .bind(idempotency_key)
-        .bind(at.0)
-        .execute(self.pool()?)
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
     // --- read helpers ------------------------------------------------------
 
     /// Current status of a run, if it exists.
@@ -251,9 +225,44 @@ impl Default for PostgresDb {
 
 #[async_trait]
 impl Db for PostgresDb {
-    async fn claim_ready_steps(&self, _limit: u32) -> Result<Vec<StepRun>, DbError> {
-        // SELECT … FOR UPDATE SKIP LOCKED lands with the scheduler slice (f6e11c2).
-        unimplemented!("PostgresDb::claim_ready_steps")
+    async fn claim_ready_steps(&self, limit: u32) -> Result<Vec<StepRun>, DbError> {
+        // Atomic dequeue: the inner SELECT locks up to `limit` ready rows with
+        // FOR UPDATE SKIP LOCKED (concurrent claimers skip each other's locked
+        // rows), and the outer UPDATE flips them to `running` in the same
+        // statement. After commit the rows are no longer `ready`, so a later
+        // claim cannot hand out the same step — no double-dispatch.
+        let rows = sqlx::query(
+            "UPDATE step_runs
+             SET status = 'running',
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE (run_id, step_id) IN (
+                 SELECT run_id, step_id FROM step_runs
+                 WHERE status = 'ready'
+                 ORDER BY created_at, step_id
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT $1
+             )
+             RETURNING run_id, step_id, status",
+        )
+        .bind(limit as i64)
+        .fetch_all(self.pool()?)
+        .await
+        .map_err(db_err)?;
+
+        let mut claimed = Vec::with_capacity(rows.len());
+        for r in rows {
+            let run = RunId(r.get::<String, _>("run_id"));
+            let step = StepId(r.get::<String, _>("step_id"));
+            let status = step_status_from_str(r.get::<String, _>("status"))?;
+            let attempts = self.attempts(&run, &step).await?;
+            claimed.push(StepRun {
+                run,
+                step,
+                status,
+                attempts,
+            });
+        }
+        Ok(claimed)
     }
 
     async fn record_transition(
@@ -294,6 +303,82 @@ impl Db for PostgresDb {
             .execute(self.pool()?)
             .await
             .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn enqueue_outbox(&self, msg: &OutboxMessage) -> Result<(), DbError> {
+        // Unique idempotency_key: a retried enqueue collapses to the existing
+        // row, so the logical effect is enqueued exactly once.
+        sqlx::query(
+            "INSERT INTO outbox (run_id, kind, payload, idempotency_key, created_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (idempotency_key) DO NOTHING",
+        )
+        .bind(&msg.run.0)
+        .bind(&msg.kind)
+        .bind(&msg.payload)
+        .bind(&msg.idempotency_key)
+        .bind(msg.at.0)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn claim_outbox(
+        &self,
+        owner: &str,
+        limit: u32,
+        visibility_ms: i64,
+    ) -> Result<Vec<OutboxMessage>, DbError> {
+        // Hand out undispatched rows whose claim (if any) has expired, hiding
+        // them for `visibility_ms`. SKIP LOCKED keeps concurrent drainers on
+        // disjoint sets; the visibility timeout makes a crashed drainer's rows
+        // reclaimable rather than lost.
+        let rows = sqlx::query(
+            "UPDATE outbox
+             SET claimed_by = $1,
+                 claimed_until = (extract(epoch from now()) * 1000)::bigint + $3
+             WHERE id IN (
+                 SELECT id FROM outbox
+                 WHERE dispatched_at IS NULL
+                   AND (claimed_until IS NULL
+                        OR claimed_until < (extract(epoch from now()) * 1000)::bigint)
+                 ORDER BY id
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT $2
+             )
+             RETURNING id, run_id, kind, payload, idempotency_key, created_at",
+        )
+        .bind(owner)
+        .bind(limit as i64)
+        .bind(visibility_ms)
+        .fetch_all(self.pool()?)
+        .await
+        .map_err(db_err)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| OutboxMessage {
+                id: OutboxId(r.get::<i64, _>("id")),
+                run: RunId(r.get::<String, _>("run_id")),
+                kind: r.get::<String, _>("kind"),
+                payload: r.get::<Value, _>("payload"),
+                idempotency_key: r.get::<String, _>("idempotency_key"),
+                at: Timestamp(r.get::<i64, _>("created_at")),
+            })
+            .collect())
+    }
+
+    async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE outbox SET dispatched_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(id.0)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 

@@ -144,6 +144,35 @@ pub struct EventKind {
     pub at: Timestamp,
 }
 
+// ---------------------------------------------------------------------------
+// Transactional outbox
+// ---------------------------------------------------------------------------
+
+/// The durable-store-assigned identity of an outbox row (a monotonic sequence).
+/// `OutboxId(0)` marks a message not yet persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct OutboxId(pub i64);
+
+/// A message on the transactional outbox — the coordination bus between the
+/// durable brain and the executor (ADR-0003). A state transition and the intent
+/// to act on it are written in one transaction; a drainer later claims and
+/// dispatches. `idempotency_key` is unique, so a logical effect is enqueued once
+/// and any duplicate dispatch is neutralized by the fence at the consumer
+/// (ADR-0021).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxMessage {
+    /// Store-assigned id (`OutboxId(0)` before it is persisted).
+    pub id: OutboxId,
+    pub run: RunId,
+    /// What kind of effect to perform (e.g. `"launch_step"`).
+    pub kind: String,
+    /// Effect-specific payload.
+    pub payload: serde_json::Value,
+    /// Unique key collapsing duplicate enqueues to a single effect.
+    pub idempotency_key: String,
+    pub at: Timestamp,
+}
+
 /// The discriminated payload carried by an [`EventKind`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventPayload {
