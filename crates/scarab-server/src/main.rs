@@ -91,22 +91,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let db: Arc<dyn Db> = Arc::new(pg);
 
-    // Object store (local FS for dev; S3/MinIO wired the same way in prod).
-    let store: Arc<dyn ObjectStore> = Arc::new(S3Storage::local(&cli.object_dir)?);
+    // Object store: MinIO/S3 when SCARAB_S3_BUCKET is set (the dev harness /
+    // prod), else a local directory (zero-dependency dev).
+    let store: Arc<dyn ObjectStore> = match std::env::var("SCARAB_S3_BUCKET") {
+        Ok(bucket) => {
+            let endpoint = std::env::var("SCARAB_S3_ENDPOINT").unwrap_or_default();
+            let region = std::env::var("SCARAB_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
+            let key = std::env::var("SCARAB_S3_ACCESS_KEY").unwrap_or_default();
+            let secret = std::env::var("SCARAB_S3_SECRET_KEY").unwrap_or_default();
+            Arc::new(S3Storage::s3(bucket, &endpoint, &region, &key, &secret)?)
+        }
+        Err(_) => Arc::new(S3Storage::local(&cli.object_dir)?),
+    };
     let logs = Arc::new(LogService::new(store, db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-    // Background scheduler + executor loop (only meaningful with a real store).
+    // Background scheduler + executor loop. Best-effort kube connect: without a
+    // cluster the driver is skipped and the process serves API-only.
     if cli.role.runs_driver() && connected {
-        let executor: Arc<dyn Executor> = Arc::new(K8sExecutor::new(cli.namespace.clone()));
-        converged::spawn_driver(
-            db.clone(),
-            clock.clone(),
-            executor,
-            "scarab-server".to_string(),
-            Duration::from_millis(500),
-        );
-        tracing::info!("converged driver started");
+        match K8sExecutor::connect(cli.namespace.clone()).await {
+            Ok(exec) => {
+                let executor: Arc<dyn Executor> = Arc::new(exec);
+                converged::spawn_driver(
+                    db.clone(),
+                    clock.clone(),
+                    executor,
+                    "scarab-server".to_string(),
+                    Duration::from_millis(500),
+                );
+                tracing::info!("converged driver started");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no kubernetes cluster reachable; driver not started (API-only)");
+            }
+        }
     }
 
     let state = AppState::new(db, clock, logs);

@@ -1,3 +1,10 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# dev harness runtime artifacts
+/dev/.kubeconfig
+/dev/server.pid
+/dev/server.log
+# local object-store backend (default dev fallback)
+/.scarab

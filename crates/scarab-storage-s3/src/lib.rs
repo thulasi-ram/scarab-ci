@@ -47,6 +47,30 @@ impl S3Storage {
         Ok(Self::with_backend("local", Arc::new(fs)))
     }
 
+    /// An S3-compatible store (AWS S3 or MinIO). `endpoint` + `allow_http` make
+    /// it point at the dev harness's MinIO; the same call reaches real S3 when
+    /// `endpoint` is empty and creds come from the environment.
+    pub fn s3(
+        bucket: impl Into<String>,
+        endpoint: &str,
+        region: &str,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<Self, StorageError> {
+        let bucket = bucket.into();
+        let mut builder = object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name(&bucket)
+            .with_region(region)
+            .with_access_key_id(access_key)
+            .with_secret_access_key(secret_key);
+        if !endpoint.is_empty() {
+            // MinIO / non-AWS endpoints are plain HTTP path-style.
+            builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        }
+        let s3 = builder.build().map_err(|e| StorageError::Backend(e.to_string()))?;
+        Ok(Self::with_backend(bucket, Arc::new(s3)))
+    }
+
     fn backend(&self) -> Result<&Arc<dyn OsObjectStore>, StorageError> {
         self.inner
             .as_ref()

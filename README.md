@@ -69,6 +69,29 @@ cargo check --workspace
 cargo run -p scarab-server -- --help
 ```
 
+## Local dev stack
+
+One command brings up the two stateful dependencies (Postgres + MinIO), a
+[kind](https://kind.sigs.k8s.io/) cluster for step Pods, and `scarab-server` in
+converged mode, then submits a pipeline and watches it complete:
+
+```sh
+just up      # Postgres + MinIO (docker compose) + kind + scarab-server (background)
+just demo    # POST a one-step pipeline, poll until it succeeds, print logs
+just down    # tear it all down
+```
+
+Requires `docker`, `kind`, `kubectl`, `cargo`, and `python3`. The kind cluster's
+kubeconfig is written to `dev/.kubeconfig` and used only via `KUBECONFIG`, so
+Scarab never touches an ambient (e.g. production) context. Postgres is published
+on **55432** to avoid clashing with a host Postgres on 5432. Config is entirely
+env-driven (`SCARAB_DATABASE_URL`, `SCARAB_S3_*`, `KUBECONFIG`,
+`SCARAB_NAMESPACE`) — see `Justfile` and `dev/`.
+
+Without Docker/kind, the server still runs API-only against a local Postgres and
+a filesystem object store (`--object-dir`); the background driver is skipped
+until a cluster is reachable.
+
 ## License
 
 TBD.

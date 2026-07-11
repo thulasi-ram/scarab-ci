@@ -41,6 +41,15 @@ impl K8sExecutor {
         }
     }
 
+    /// Connect a client from the ambient kube config (respects `KUBECONFIG`) —
+    /// the dev harness points that at its kind cluster, never a prod context.
+    pub async fn connect(namespace: impl Into<String>) -> Result<Self, ExecError> {
+        let client = kube::Client::try_default()
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        Ok(Self::with_client(namespace, client))
+    }
+
     fn pods(&self) -> Result<Api<Pod>, ExecError> {
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         Ok(Api::namespaced(client, &self.namespace))
