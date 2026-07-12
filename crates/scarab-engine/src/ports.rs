@@ -101,6 +101,21 @@ pub trait Db: Send + Sync {
     /// not run (or was cleared to force a re-run, or the step is unknown).
     async fn step_input(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
 
+    /// Record a step's **explicit input workspaces** — the subset of its `needs`
+    /// whose output it consumes (ADR-0007). Absent (never set) means implicit-by-
+    /// default (all needs). Used to compute a precise skip-if-unchanged signature.
+    async fn set_step_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        inputs: &[StepId],
+    ) -> Result<(), DbError>;
+
+    /// A step's explicit input workspaces, or `None` when it inherits all its
+    /// `needs` (the implicit default).
+    async fn step_inputs(&self, run: &RunId, step: &StepId)
+        -> Result<Option<Vec<StepId>>, DbError>;
+
     /// Assign a run to a named concurrency group with a policy (ADR-0011, 0032).
     async fn set_run_concurrency(
         &self,

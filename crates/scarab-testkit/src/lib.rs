@@ -85,6 +85,8 @@ struct StepRec {
     gate_kind: Option<String>,
     /// For a `timer` gate, the wait (seconds) before auto-release.
     gate_timer_seconds: Option<i64>,
+    /// Explicit input workspaces (subset of `needs`), or `None` = all needs.
+    explicit_inputs: Option<Vec<StepId>>,
 }
 
 #[derive(Default)]
@@ -148,6 +150,7 @@ impl InMemoryDb {
                 input: None,
                 gate_kind: None,
                 gate_timer_seconds: None,
+                explicit_inputs: None,
             },
         );
     }
@@ -167,6 +170,7 @@ impl InMemoryDb {
                     input: None,
                     gate_kind: None,
                     gate_timer_seconds: None,
+                    explicit_inputs: None,
                 },
             );
         }
@@ -239,6 +243,7 @@ impl Db for InMemoryDb {
                 input: None,
                 gate_kind: None,
                 gate_timer_seconds: None,
+                explicit_inputs: None,
             },
         );
         Ok(())
@@ -290,6 +295,33 @@ impl Db for InMemoryDb {
             .steps
             .get(&(run.clone(), step.clone()))
             .and_then(|r| r.input.clone()))
+    }
+
+    async fn set_step_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        inputs: &[StepId],
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
+            rec.explicit_inputs = Some(inputs.to_vec());
+        }
+        Ok(())
+    }
+
+    async fn step_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<Vec<StepId>>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.explicit_inputs.clone()))
     }
 
     async fn set_run_concurrency(

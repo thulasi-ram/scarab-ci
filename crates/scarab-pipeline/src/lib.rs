@@ -140,6 +140,14 @@ pub struct StepSpec {
     pub env: Vec<(String, String)>,
     #[serde(default)]
     pub needs: Needs,
+    /// Explicit input workspaces (ADR-0007): the subset of `needs` whose output
+    /// workspace this step consumes. Absent = implicit-by-default (inherit every
+    /// need's workspace). Naming a subset restricts what flows in *and* sharpens
+    /// restart invalidation — the step's skip-if-unchanged signature is computed
+    /// over exactly these inputs, so a change in a need it does not consume does
+    /// not force it to re-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<Vec<String>>,
     /// Authoring-only fan-out modifier; `None` on every compiled step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix: Option<Matrix>,
@@ -244,25 +252,35 @@ pub fn compile_yaml(yaml: &str) -> Result<PipelineIr, PipelineError> {
     // Rewrite needs: a dependency on an authored step becomes a dependency on
     // every concrete instance of it (fan-in over a matrix). Unknown targets are
     // left untouched so validate() flags them as dangling.
-    for step in &mut expanded {
-        let mut resolved: Vec<String> = Vec::new();
-        for need in &step.needs.0 {
-            match instances.get(need) {
-                Some(ids) => {
-                    for id in ids {
-                        if !resolved.contains(id) {
-                            resolved.push(id.clone());
+    // Fan an authored-id list onto every concrete instance of each id (matrix
+    // fan-in). Unknown targets are left untouched so validate() flags them.
+    let fan_in = |ids: &[String]| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for id in ids {
+            match instances.get(id) {
+                Some(concrete) => {
+                    for c in concrete {
+                        if !out.contains(c) {
+                            out.push(c.clone());
                         }
                     }
                 }
                 None => {
-                    if !resolved.contains(need) {
-                        resolved.push(need.clone());
+                    if !out.contains(id) {
+                        out.push(id.clone());
                     }
                 }
             }
         }
-        step.needs.0 = resolved;
+        out
+    };
+    for step in &mut expanded {
+        step.needs.0 = fan_in(&step.needs.0);
+        // Explicit `inputs:` fan in the same way, so a subset of a matrixed need
+        // resolves to that need's instances.
+        if let Some(inputs) = &step.inputs {
+            step.inputs = Some(fan_in(inputs));
+        }
     }
 
     let ir = PipelineIr {
@@ -431,6 +449,18 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 ));
             }
         }
+        // Explicit inputs must be a subset of needs — a step can only consume the
+        // workspace of a step it depends on (ADR-0007).
+        if let Some(inputs) = &step.inputs {
+            for input in inputs {
+                if !step.needs.0.contains(input) {
+                    diagnostics.push(format!(
+                        "step `{}`: input `{input}` is not among its needs",
+                        step.id
+                    ));
+                }
+            }
+        }
         // Submit-time CEL: `when:` guards and every `${{ … }}` interpolation
         // must parse now, not fail mid-run (ADR-0009).
         if let Some(When(expr)) = &step.when {
@@ -587,6 +617,9 @@ pub fn select_steps(
     let kept_ids: BTreeSet<String> = kept.iter().map(|s| s.id.clone()).collect();
     for step in &mut kept {
         step.needs.0.retain(|n| kept_ids.contains(n));
+        if let Some(inputs) = &mut step.inputs {
+            inputs.retain(|n| kept_ids.contains(n));
+        }
     }
     Ok(PipelineIr {
         ir_version: ir.ir_version,
@@ -1001,6 +1034,52 @@ mod tests {
         assert!(
             diags.iter().any(|d| d.contains("step `a`: missing image")),
             "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_inputs_compile_and_must_be_a_subset_of_needs() {
+        let ir = compile(
+            r#"
+            steps:
+              - { id: b, image: busybox }
+              - { id: c, image: busybox }
+              - { id: d, image: busybox, needs: [b, c], inputs: [b] }
+            "#,
+        );
+        let d = ir.steps.iter().find(|s| s.id == "d").unwrap();
+        assert_eq!(d.inputs.as_deref(), Some(["b".to_string()].as_slice()));
+
+        // An input that is not among the step's needs is rejected.
+        let diags = errors(
+            r#"
+            steps:
+              - { id: b, image: busybox }
+              - { id: d, image: busybox, needs: [b], inputs: [c] }
+            "#,
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("input `c` is not among its needs")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_inputs_fan_in_over_a_matrixed_need() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: build
+                image: rust
+                matrix: { dimensions: { os: [linux, mac] } }
+              - { id: ship, image: busybox, needs: [build], inputs: [build] }
+            "#,
+        );
+        let ship = ir.steps.iter().find(|s| s.id == "ship").unwrap();
+        assert_eq!(
+            ship.inputs.as_deref(),
+            Some(["build[os=linux]".to_string(), "build[os=mac]".to_string()].as_slice()),
+            "an input on a matrixed need fans to all its instances"
         );
     }
 

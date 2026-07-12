@@ -171,6 +171,58 @@ async fn restart_skips_unchanged_descendant_then_cascades_when_output_changes() 
     tdb.cleanup().await;
 }
 
+/// Explicit `inputs:` sharpen restart invalidation (ADR-0007, 0027). B and C
+/// both feed D and E; D declares `inputs: [B]` while E inherits both. Restart C
+/// producing a *changed* output: E cascades (it consumes C) but D is skipped
+/// (it consumes only B, which is unchanged).
+#[tokio::test]
+async fn explicit_inputs_scope_restart_invalidation() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let run = RunId("run-inputs".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &dep("B"), Some(&spec()), &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &dep("C"), Some(&spec()), &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &dep("D"), Some(&spec()), &[dep("B"), dep("C")], Timestamp(0))
+        .await
+        .unwrap();
+    db.create_step_run(&run, &dep("E"), Some(&spec()), &[dep("B"), dep("C")], Timestamp(0))
+        .await
+        .unwrap();
+    // D consumes only B's workspace; E inherits both (implicit default).
+    db.set_step_inputs(&run, &dep("D"), &[dep("B")]).await.unwrap();
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    for _ in 0..40 {
+        exec.script_outcome(ExecState::Succeeded);
+    }
+    for (id, out) in [("B", "ob"), ("C", "oc"), ("D", "od"), ("E", "oe")] {
+        exec.set_output(id, out);
+    }
+    let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
+
+    drive_to_terminal(&sched, &db, &run).await;
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+
+    // C now produces a *different* output; restart it.
+    exec.set_output("C", "oc2");
+    restart_step(&db, &clock, &run, &dep("C")).await.expect("restart");
+    drive_to_terminal(&sched, &db, &run).await;
+
+    let steps = db.steps_of_run(&run).await.unwrap();
+    assert_eq!(attempts_of(&steps, "C"), 2, "target C re-ran");
+    assert_eq!(attempts_of(&steps, "E"), 2, "E cascaded — it consumes C");
+    assert_eq!(attempts_of(&steps, "D"), 1, "D skipped — consumes only B (unchanged)");
+
+    tdb.cleanup().await;
+}
+
 /// Restarting an unknown step is an error, not a silent no-op.
 #[tokio::test]
 async fn restarting_unknown_step_errors() {

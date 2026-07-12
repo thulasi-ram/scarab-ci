@@ -306,6 +306,49 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("input_signature")))
     }
 
+    async fn set_step_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        inputs: &[StepId],
+    ) -> Result<(), DbError> {
+        let ids: Vec<&str> = inputs.iter().map(|s| s.0.as_str()).collect();
+        let json = serde_json::to_value(&ids).map_err(|e| DbError::Other(e.to_string()))?;
+        sqlx::query(
+            "UPDATE step_runs
+             SET explicit_inputs = $3,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE run_id = $1 AND step_id = $2",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(json)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn step_inputs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<Vec<StepId>>, DbError> {
+        let row =
+            sqlx::query("SELECT explicit_inputs FROM step_runs WHERE run_id = $1 AND step_id = $2")
+                .bind(&run.0)
+                .bind(&step.0)
+                .fetch_optional(self.pool()?)
+                .await
+                .map_err(db_err)?;
+        let Some(value) = row.and_then(|r| r.get::<Option<Value>, _>("explicit_inputs")) else {
+            return Ok(None);
+        };
+        let ids: Vec<String> =
+            serde_json::from_value(value).map_err(|e| DbError::Other(e.to_string()))?;
+        Ok(Some(ids.into_iter().map(StepId).collect()))
+    }
+
     async fn set_run_concurrency(
         &self,
         run: &RunId,

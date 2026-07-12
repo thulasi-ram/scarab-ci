@@ -651,6 +651,12 @@ async fn persist_run_from_ir(
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
         }
+        // Explicit input workspaces (ADR-0007), when the step declares a subset
+        // of its needs — sharpens restart skip-if-unchanged (ADR-0027).
+        if let Some(inputs) = &step.inputs {
+            let inputs: Vec<StepId> = inputs.iter().map(|i| StepId(i.clone())).collect();
+            db.set_step_inputs(run, &step_id, &inputs).await?;
+        }
     }
     Ok(())
 }

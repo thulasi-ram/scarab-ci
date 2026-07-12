@@ -425,7 +425,14 @@ impl<'a> Scheduler<'a> {
                 // target has its stored signature cleared, so it always re-runs;
                 // a side-effecting step (no output) has no stored output, so it
                 // never skips.
-                let cur = crate::input_signature(&step.needs, &output_of);
+                // Signature over the step's *consumed* inputs: its explicit
+                // `inputs:` if declared, else all its needs (implicit default).
+                let sig_inputs = self
+                    .db
+                    .step_inputs(run, &step.step)
+                    .await?
+                    .unwrap_or_else(|| step.needs.clone());
+                let cur = crate::input_signature(&sig_inputs, &output_of);
                 let prev = self.db.step_input(run, &step.step).await?;
                 let unchanged =
                     output_of.contains_key(&step.step) && prev.as_deref() == Some(cur.as_str());
