@@ -2413,6 +2413,7 @@ dependencies = [
  "async-trait",
  "scarab-engine",
  "scarab-pipeline",
+ "scarab-projects",
  "scarab-storage",
  "scarab-storage-s3",
  "scarab-testkit",
@@ -2498,8 +2499,10 @@ dependencies = [
 name = "scarab-projects"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "scarab-secrets",
  "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

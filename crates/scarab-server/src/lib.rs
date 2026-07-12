@@ -71,6 +71,9 @@ pub struct AppState {
     /// every request is allowed); when `Some`, run endpoints require a valid
     /// session with a sufficient role.
     pub sessions: Option<Arc<dyn scarab_identity::SessionStore>>,
+    /// Environments + deployment history store. `None` disables the environment
+    /// endpoints.
+    pub environments: Option<Arc<dyn scarab_projects::EnvironmentStore>>,
 }
 
 impl AppState {
@@ -83,7 +86,17 @@ impl AppState {
             forge: None,
             auth: None,
             sessions: None,
+            environments: None,
         }
+    }
+
+    /// Enable the environment / deployment endpoints.
+    pub fn with_environments(
+        mut self,
+        environments: Arc<dyn scarab_projects::EnvironmentStore>,
+    ) -> Self {
+        self.environments = Some(environments);
+        self
     }
 
     /// Set the GitHub webhook HMAC secret (from `SCARAB_GITHUB_WEBHOOK_SECRET`).
@@ -817,6 +830,76 @@ async fn approve_gate(
     }
 }
 
+/// Create/replace a protected environment (ADR-0024). Administering the
+/// deployment target requires the Administer capability.
+async fn put_environment(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((project, name)): Path<(String, String)>,
+    Json(protection): Json<scarab_projects::ProtectionRules>,
+) -> Result<StatusCode, ApiError> {
+    authorize(&st, &headers, Action::Administer).await?;
+    let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
+    let env = scarab_projects::Environment {
+        name: name.clone(),
+        protection,
+    };
+    store
+        .put_environment(&project, &env)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(StatusCode::OK)
+}
+
+/// `POST …/deploy` body: what's being deployed and who has approved it.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DeployRequest {
+    pub git_ref: String,
+    pub run: String,
+    #[serde(default)]
+    pub approvals: Vec<String>,
+}
+
+/// Deploy into a protected environment: enforce its protection rules (allowed
+/// refs + required approvers) at admission, and record the deployment in history
+/// on success (ADR-0024, 0011). Violations return 403 with the reasons.
+async fn deploy_environment(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((project, name)): Path<(String, String)>,
+    Json(req): Json<DeployRequest>,
+) -> Result<Response, ApiError> {
+    authorize(&st, &headers, Action::Write).await?;
+    let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
+    let env = store
+        .get_environment(&project, &name)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+
+    if let Err(violations) = env.protection.admits(&req.git_ref, &req.approvals) {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "violations": violations })),
+        )
+            .into_response());
+    }
+
+    let now = st.clock.now().await.0;
+    store
+        .record_deployment(&scarab_projects::Deployment {
+            project: project.clone(),
+            environment: name.clone(),
+            git_ref: req.git_ref,
+            run: req.run,
+            approved_by: req.approvals,
+            at: now,
+        })
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "deployed": true }))).into_response())
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -854,6 +937,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/{id}/logs", get(get_logs))
         .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
         .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
+        .route("/v1/environments/{project}/{name}", axum::routing::put(put_environment))
+        .route("/v1/environments/{project}/{name}/deploy", post(deploy_environment))
         .route("/webhooks/github", post(github_webhook))
         .with_state(state)
 }

@@ -24,6 +24,7 @@ use scarab_engine::{
     LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus,
     Timestamp,
 };
+use scarab_projects::{Deployment, Environment, EnvironmentStore, ProjectError};
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
 /// applies all pending ones (tracked in `_sqlx_migrations`); tests can also walk
@@ -817,6 +818,104 @@ impl Db for PostgresDb {
             }
         }
     }
+}
+
+#[async_trait::async_trait]
+impl EnvironmentStore for PostgresDb {
+    async fn put_environment(
+        &self,
+        project: &str,
+        env: &Environment,
+    ) -> Result<(), ProjectError> {
+        let protection = serde_json::to_value(&env.protection)
+            .map_err(|e| ProjectError::Store(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO environments (project, name, protection) VALUES ($1, $2, $3)
+             ON CONFLICT (project, name) DO UPDATE SET protection = EXCLUDED.protection",
+        )
+        .bind(project)
+        .bind(&env.name)
+        .bind(protection)
+        .execute(self.pool().map_err(proj_err)?)
+        .await
+        .map_err(|e| ProjectError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get_environment(
+        &self,
+        project: &str,
+        name: &str,
+    ) -> Result<Option<Environment>, ProjectError> {
+        let row = sqlx::query("SELECT protection FROM environments WHERE project = $1 AND name = $2")
+            .bind(project)
+            .bind(name)
+            .fetch_optional(self.pool().map_err(proj_err)?)
+            .await
+            .map_err(|e| ProjectError::Store(e.to_string()))?;
+        row.map(|r| {
+            let protection = serde_json::from_value(r.get::<Value, _>("protection"))
+                .map_err(|e| ProjectError::Store(e.to_string()))?;
+            Ok(Environment {
+                name: name.to_string(),
+                protection,
+            })
+        })
+        .transpose()
+    }
+
+    async fn record_deployment(&self, d: &Deployment) -> Result<(), ProjectError> {
+        let approved = serde_json::to_value(&d.approved_by)
+            .map_err(|e| ProjectError::Store(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO deployments (project, environment, git_ref, run_id, approved_by, at)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(&d.project)
+        .bind(&d.environment)
+        .bind(&d.git_ref)
+        .bind(&d.run)
+        .bind(approved)
+        .bind(d.at)
+        .execute(self.pool().map_err(proj_err)?)
+        .await
+        .map_err(|e| ProjectError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn deployments(
+        &self,
+        project: &str,
+        environment: &str,
+    ) -> Result<Vec<Deployment>, ProjectError> {
+        let rows = sqlx::query(
+            "SELECT git_ref, run_id, approved_by, at FROM deployments
+             WHERE project = $1 AND environment = $2 ORDER BY id DESC",
+        )
+        .bind(project)
+        .bind(environment)
+        .fetch_all(self.pool().map_err(proj_err)?)
+        .await
+        .map_err(|e| ProjectError::Store(e.to_string()))?;
+        rows.into_iter()
+            .map(|r| {
+                let approved_by = serde_json::from_value(r.get::<Value, _>("approved_by"))
+                    .map_err(|e| ProjectError::Store(e.to_string()))?;
+                Ok(Deployment {
+                    project: project.to_string(),
+                    environment: environment.to_string(),
+                    git_ref: r.get::<String, _>("git_ref"),
+                    run: r.get::<String, _>("run_id"),
+                    approved_by,
+                    at: r.get::<i64, _>("at"),
+                })
+            })
+            .collect()
+    }
+}
+
+fn proj_err(e: DbError) -> ProjectError {
+    ProjectError::Store(e.to_string())
 }
 
 // ---------------------------------------------------------------------------
