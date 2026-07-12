@@ -289,6 +289,7 @@ mod tests {
                 failure: None,
             }],
             needs: vec![],
+            gate_kind: None,
         }
     }
 

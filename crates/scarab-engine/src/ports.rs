@@ -135,6 +135,11 @@ pub trait Db: Send + Sync {
     /// (backpressure).
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError>;
 
+    /// Mark a step as a gate of `kind` (`manual`/`timer`/`external`) — a durable
+    /// suspend point that launches no Pod (ADR-0008).
+    async fn set_step_gate(&self, run: &RunId, step: &StepId, kind: &str)
+        -> Result<(), DbError>;
+
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;
 

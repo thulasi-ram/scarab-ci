@@ -788,6 +788,35 @@ fn session_id(headers: &HeaderMap) -> Option<String> {
         .next()
 }
 
+/// Release a manual gate, resuming its suspended run (ADR-0008, 0032). Authz'd
+/// as a write; exactly-once (a repeat approve is a no-op).
+#[utoipa::path(
+    post,
+    path = "/v1/runs/{id}/gates/{step}/approve",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "gate step id")
+    ),
+    responses(
+        (status = 202, description = "gate released"),
+        (status = 404, description = "no such run or gate")
+    )
+)]
+async fn approve_gate(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    authorize(&st, &headers, Action::Write).await?;
+    match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &RunId(id), &StepId(step))
+        .await
+    {
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
+        Err(RestartError::Db(e)) => Err(ApiError::Db(e)),
+    }
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -801,7 +830,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
 /// The generated OpenAPI document. The pipeline request schema is the IR subset.
 #[derive(OpenApi)]
 #[openapi(
-    paths(create_run, get_run, get_events, get_logs, restart_step),
+    paths(create_run, get_run, get_events, get_logs, restart_step, approve_gate),
     components(schemas(
         CreateRunRequest,
         PipelineDto,
@@ -824,6 +853,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/{id}/events", get(get_events))
         .route("/v1/runs/{id}/logs", get(get_logs))
         .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
+        .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
         .route("/webhooks/github", post(github_webhook))
         .with_state(state)
 }

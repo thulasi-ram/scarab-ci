@@ -64,6 +64,7 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
             failure: None,
         }],
         needs: vec![],
+        gate_kind: None,
     };
     let handle = FakeExecutor::handle_for(&fenced);
 

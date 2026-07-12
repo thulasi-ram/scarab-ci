@@ -140,7 +140,7 @@ impl Db for PostgresDb {
                  FOR UPDATE SKIP LOCKED
                  LIMIT $1
              )
-             RETURNING run_id, step_id, status, needs",
+             RETURNING run_id, step_id, status, needs, gate_kind",
         )
         .bind(limit as i64)
         .fetch_all(self.pool()?)
@@ -153,6 +153,7 @@ impl Db for PostgresDb {
             let step = StepId(r.get::<String, _>("step_id"));
             let status = step_status_from_str(r.get::<String, _>("status"))?;
             let needs = needs_from_value(r.get::<Value, _>("needs"))?;
+            let gate_kind = r.get::<Option<String>, _>("gate_kind");
             let attempts = self.attempts(&run, &step).await?;
             claimed.push(StepRun {
                 run,
@@ -160,6 +161,7 @@ impl Db for PostgresDb {
                 status,
                 attempts,
                 needs,
+                gate_kind,
             });
         }
         Ok(claimed)
@@ -443,6 +445,26 @@ impl Db for PostgresDb {
         Ok(row.get::<i64, _>("n") as u32)
     }
 
+    async fn set_step_gate(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        kind: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE step_runs SET gate_kind = $3,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE run_id = $1 AND step_id = $2",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(kind)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
         let row = sqlx::query("SELECT status FROM runs WHERE id = $1")
             .bind(&run.0)
@@ -489,7 +511,7 @@ impl Db for PostgresDb {
 
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
         let rows = sqlx::query(
-            "SELECT step_id, status, needs FROM step_runs WHERE run_id = $1 ORDER BY step_id",
+            "SELECT step_id, status, needs, gate_kind FROM step_runs WHERE run_id = $1 ORDER BY step_id",
         )
         .bind(&run.0)
         .fetch_all(self.pool()?)
@@ -500,6 +522,7 @@ impl Db for PostgresDb {
             let step = StepId(r.get::<String, _>("step_id"));
             let status = step_status_from_str(r.get::<String, _>("status"))?;
             let needs = needs_from_value(r.get::<Value, _>("needs"))?;
+            let gate_kind = r.get::<Option<String>, _>("gate_kind");
             let attempts = self.attempts(run, &step).await?;
             steps.push(StepRun {
                 run: run.clone(),
@@ -507,6 +530,7 @@ impl Db for PostgresDb {
                 status,
                 attempts,
                 needs,
+                gate_kind,
             });
         }
         Ok(steps)

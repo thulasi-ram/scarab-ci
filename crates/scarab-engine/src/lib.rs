@@ -22,7 +22,8 @@ pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor};
 pub use scheduler::{
-    restart_step, RestartError, Scheduler, SchedulerError, LAUNCH_STEP, RUN_STATUS_CHANGED,
+    release_gate, restart_step, RestartError, Scheduler, SchedulerError, LAUNCH_STEP,
+    RUN_STATUS_CHANGED,
 };
 
 use serde::{Deserialize, Serialize};
@@ -148,6 +149,11 @@ pub struct StepRun {
     /// of these have `Succeeded`.
     #[serde(default)]
     pub needs: Vec<StepId>,
+    /// If set (`manual`/`timer`/`external`), this is a **gate** step: it launches
+    /// no Pod; when its needs are satisfied the run suspends until released
+    /// (ADR-0008). `None` for ordinary executed steps.
+    #[serde(default)]
+    pub gate_kind: Option<String>,
 }
 
 /// One attempt at executing a step.
@@ -441,7 +447,13 @@ impl StepRun {
             status: StepStatus::Pending,
             attempts: Vec::new(),
             needs: Vec::new(),
+            gate_kind: None,
         }
+    }
+
+    /// Whether this step is a gate (suspends the run rather than launching).
+    pub fn is_gate(&self) -> bool {
+        self.gate_kind.is_some()
     }
 
     /// Mark a `Pending` step as `Ready` for admission.

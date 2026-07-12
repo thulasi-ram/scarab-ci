@@ -79,6 +79,8 @@ struct StepRec {
     attempts: Vec<Attempt>,
     /// Output workspace snapshot (CAS root hash) this step produced.
     output: Option<String>,
+    /// Gate kind (`manual`/`timer`/`external`), or `None` for an executed step.
+    gate_kind: Option<String>,
 }
 
 #[derive(Default)]
@@ -139,6 +141,7 @@ impl InMemoryDb {
                 needs: Vec::new(),
                 attempts: Vec::new(),
                 output: None,
+                gate_kind: None,
             },
         );
     }
@@ -155,6 +158,7 @@ impl InMemoryDb {
                     needs: s.needs,
                     attempts: s.attempts,
                     output: None,
+                    gate_kind: None,
                 },
             );
         }
@@ -189,6 +193,7 @@ impl Db for InMemoryDb {
                 status: StepStatus::Running,
                 attempts: rec.attempts.clone(),
                 needs: rec.needs.clone(),
+                gate_kind: rec.gate_kind.clone(),
             });
         }
         Ok(claimed)
@@ -223,6 +228,7 @@ impl Db for InMemoryDb {
                 needs: needs.to_vec(),
                 attempts: Vec::new(),
                 output: None,
+                gate_kind: None,
             },
         );
         Ok(())
@@ -357,6 +363,19 @@ impl Db for InMemoryDb {
         Ok(n as u32)
     }
 
+    async fn set_step_gate(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        kind: &str,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
+            rec.gate_kind = Some(kind.to_string());
+        }
+        Ok(())
+    }
+
     async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError> {
         self.state
             .lock()
@@ -455,6 +474,7 @@ impl Db for InMemoryDb {
                     status,
                     attempts: rec.attempts.clone(),
                     needs: rec.needs.clone(),
+                    gate_kind: rec.gate_kind.clone(),
                 })
             })
             .collect();

@@ -35,6 +35,7 @@ fn step() -> StepRun {
             failure: None,
         }],
         needs: vec![],
+        gate_kind: None,
     }
 }
 

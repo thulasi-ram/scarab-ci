@@ -136,6 +136,52 @@ pub async fn restart_step(
     Ok(())
 }
 
+/// Release a gate `step`: mark it Succeeded and resume its suspended run so the
+/// DAG continues (ADR-0008, 0011). Needs only the [`Db`] + [`Clock`] ports (no
+/// executor), so the API role calls it directly. Exactly-once — a second
+/// release finds the step already terminal (a no-op Conflict) and the run
+/// already Running, so it neither double-completes the gate nor double-resumes.
+pub async fn release_gate(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    step: &StepId,
+) -> Result<(), RestartError> {
+    // The target must be a known gate step.
+    let is_gate = db
+        .steps_of_run(run)
+        .await?
+        .iter()
+        .any(|s| &s.step == step && s.is_gate());
+    if !is_gate {
+        return Err(RestartError::StepNotFound(step.clone()));
+    }
+
+    match db
+        .record_step_transition(run, step, StepStatus::Pending, StepStatus::Succeeded)
+        .await
+    {
+        Ok(()) => {
+            let now = clock.now().await;
+            db.append_event(&EventKind {
+                version: EVENT_VERSION,
+                run: run.clone(),
+                kind: EventPayload::GateReleased { step: step.clone() },
+                at: now,
+            })
+            .await?;
+        }
+        // Already released (or never gated) — exactly-once: do not resume again.
+        Err(DbError::Conflict) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    }
+
+    if db.run_status(run).await? == Some(RunStatus::Suspended) {
+        reopen(db, clock, run, RunStatus::Suspended, RunStatus::Running).await?;
+    }
+    Ok(())
+}
+
 /// Move a run `from -> to` and append the transition event (used to reopen a
 /// settled run on restart).
 async fn reopen(
@@ -274,6 +320,10 @@ impl<'a> Scheduler<'a> {
         if status.is_terminal() {
             return Ok(());
         }
+        // A suspended run is waiting on a gate release; do no work until resumed.
+        if status == RunStatus::Suspended {
+            return Ok(());
+        }
 
         // Start a Pending run — subject to its concurrency group (ADR-0011,
         // 0032). If the group's slot is held by another active run, `queue`
@@ -321,19 +371,37 @@ impl<'a> Scheduler<'a> {
         let steps = self.db.steps_of_run(run).await?;
         let status_by_id: HashMap<&StepId, StepStatus> =
             steps.iter().map(|s| (&s.step, s.status)).collect();
+        let deps_satisfied = |step: &StepRun| {
+            step.needs
+                .iter()
+                .all(|d| status_by_id.get(d).copied() == Some(StepStatus::Succeeded))
+        };
+        let dep_dead = |step: &StepRun| {
+            step.needs.iter().any(|d| {
+                let s = status_by_id.get(d).copied().unwrap_or(StepStatus::Pending);
+                s.is_terminal() && s != StepStatus::Succeeded
+            })
+        };
+
+        // Gate pre-pass (ADR-0008): a Pending gate whose deps are satisfied
+        // suspends the whole run — a durable, near-zero-cost wait for approval /
+        // timer / external event. It launches no Pod; `release_gate` resumes.
         for step in &steps {
-            if step.status != StepStatus::Pending {
+            if step.status == StepStatus::Pending && step.is_gate() && deps_satisfied(step) {
+                self.transition_run(run, RunStatus::Running, RunStatus::Suspended)
+                    .await?;
+                return Ok(());
+            }
+        }
+
+        for step in &steps {
+            if step.status != StepStatus::Pending || step.is_gate() {
                 continue;
             }
-            let dep_states = || {
-                step.needs
-                    .iter()
-                    .map(|d| status_by_id.get(d).copied().unwrap_or(StepStatus::Pending))
-            };
-            if dep_states().all(|s| s == StepStatus::Succeeded) {
+            if deps_satisfied(step) {
                 self.transition_step(run, &step.step, StepStatus::Pending, StepStatus::Ready)
                     .await?;
-            } else if dep_states().any(|s| s.is_terminal() && s != StepStatus::Succeeded) {
+            } else if dep_dead(step) {
                 self.transition_step(run, &step.step, StepStatus::Pending, StepStatus::Skipped)
                     .await?;
             }
@@ -424,6 +492,7 @@ impl<'a> Scheduler<'a> {
                     failure: None,
                 }],
                 needs: Vec::new(),
+                gate_kind: None,
             };
             let handle = self.executor.launch(&step_run, &spec).await?;
 
