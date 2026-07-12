@@ -608,11 +608,15 @@ async fn persist_run_from_ir(
         db.set_run_concurrency(run, &c.group, ConcurrencyPolicy::from_wire(&c.policy))
             .await?;
     }
-    // Newest-wins auto-cancel (ADR-0032): key non-deploy runs by (repo, ref) so
-    // a newer run on the same ref supersedes older in-flight ones. Deploy
-    // pipelines (an Environment target — a later slice-4 issue) will opt out.
-    if let Some(key) = supersede_key(event, pipeline) {
-        db.set_supersede_key(run, &key).await?;
+    // Newest-wins auto-cancel (ADR-0032): key non-deploy runs by (repo, ref,
+    // pipeline) so a newer run supersedes older in-flight ones. A pipeline that
+    // targets an Environment is a *deploy* and opts out — a superseded deploy
+    // must not be silently cancelled; no key means `superseded_by` never returns
+    // it.
+    if ir.environment.is_none() {
+        if let Some(key) = supersede_key(event, pipeline) {
+            db.set_supersede_key(run, &key).await?;
+        }
     }
     db.append_event(&EventKind {
         version: EVENT_VERSION,

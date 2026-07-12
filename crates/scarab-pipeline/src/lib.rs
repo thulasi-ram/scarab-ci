@@ -52,6 +52,13 @@ pub struct PipelineIr {
     /// run is unconstrained. The engine wiring is `Db::set_run_concurrency`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<Concurrency>,
+    /// The deployment environment this pipeline targets, if any (ADR-0024, 0032).
+    /// A pipeline with an `environment:` is a **deploy**: its runs are enforced
+    /// against the environment's protection rules at admission, and they opt out
+    /// of newest-wins auto-cancel (a superseded deploy must not be silently
+    /// cancelled). Absent for ordinary CI pipelines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
     pub steps: Vec<StepSpec>,
 }
 
@@ -257,6 +264,7 @@ pub fn compile_yaml(yaml: &str) -> Result<PipelineIr, PipelineError> {
         ir_version: authored.ir_version,
         triggers: authored.triggers,
         concurrency: authored.concurrency,
+        environment: authored.environment,
         steps: expanded,
     };
 
@@ -439,6 +447,13 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         }
     }
 
+    // A declared environment target must name a non-empty environment.
+    if let Some(env) = &ir.environment {
+        if env.is_empty() {
+            diagnostics.push("environment: target must not be empty".to_string());
+        }
+    }
+
     // Cycle detection over needs edges (Kahn's algorithm). Only run when the
     // graph is well-formed enough to be meaningful (no dangling edges).
     if diagnostics.is_empty() {
@@ -550,6 +565,7 @@ pub fn select_steps(
         ir_version: ir.ir_version,
         triggers: ir.triggers.clone(),
         concurrency: ir.concurrency.clone(),
+        environment: ir.environment.clone(),
         steps: kept,
     })
 }
@@ -854,6 +870,38 @@ mod tests {
         );
         assert!(
             diags.iter().any(|d| d.contains("concurrency: group")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn environment_target_compiles_and_round_trips() {
+        let ir = compile(
+            r#"
+            environment: prod
+            steps: [{ id: deploy, image: busybox }]
+            "#,
+        );
+        assert_eq!(ir.environment.as_deref(), Some("prod"));
+        let back: PipelineIr =
+            serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+        assert_eq!(ir, back);
+
+        // A pipeline with no environment stays a plain CI pipeline.
+        let ci = compile("steps: [{ id: a, image: busybox }]");
+        assert!(ci.environment.is_none());
+    }
+
+    #[test]
+    fn empty_environment_target_is_rejected() {
+        let diags = errors(
+            r#"
+            environment: ""
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("environment: target must not be empty")),
             "got {diags:?}"
         );
     }

@@ -106,6 +106,60 @@ async fn committed_scarab_authors_concurrency_and_gate() {
     );
 }
 
+/// A deploy pipeline (one with an `environment:` target) opts out of newest-wins
+/// auto-cancel: a second run on the same ref does not supersede the first. A
+/// plain CI pipeline on the same ref does supersede its predecessor.
+#[tokio::test]
+async fn deploy_pipeline_opts_out_of_supersede() {
+    let deploy_forge = FakeForge::new().with_file(
+        ".scarab/deploy.yaml",
+        "on: { push: {} }\nenvironment: prod\nsteps: [{ id: ship, image: busybox }]",
+    );
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let first = trigger_run_from_event(&deploy_forge, db.as_ref(), clock.as_ref(), &push("main"))
+        .await
+        .expect("trigger")
+        .pop()
+        .expect("first deploy run");
+    clock.advance(1_000); // a strictly-later creation time for the second run
+    let second = trigger_run_from_event(&deploy_forge, db.as_ref(), clock.as_ref(), &push("main"))
+        .await
+        .expect("trigger")
+        .pop()
+        .expect("second deploy run");
+    assert!(
+        db.superseded_by(&second).await.unwrap().is_empty(),
+        "a newer deploy must not supersede the older one"
+    );
+    assert!(db.superseded_by(&first).await.unwrap().is_empty());
+
+    // Contrast: a plain CI pipeline does supersede its predecessor on the ref.
+    let ci_forge = FakeForge::new().with_file(
+        ".scarab/ci.yaml",
+        "on: { push: {} }\nsteps: [{ id: build, image: busybox }]",
+    );
+    let cdb = Arc::new(InMemoryDb::new());
+    let cclock = Arc::new(FakeClock::new(1_000));
+    let older = trigger_run_from_event(&ci_forge, cdb.as_ref(), cclock.as_ref(), &push("main"))
+        .await
+        .expect("trigger")
+        .pop()
+        .unwrap();
+    cclock.advance(1_000);
+    let newer = trigger_run_from_event(&ci_forge, cdb.as_ref(), cclock.as_ref(), &push("main"))
+        .await
+        .expect("trigger")
+        .pop()
+        .unwrap();
+    assert_eq!(
+        cdb.superseded_by(&newer).await.unwrap(),
+        vec![older],
+        "a newer CI run supersedes the older on the same ref"
+    );
+}
+
 #[tokio::test]
 async fn push_to_non_matching_ref_starts_no_run() {
     let (forge, db, clock) = setup().await;
