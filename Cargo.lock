@@ -2466,8 +2466,11 @@ name = "scarab-forge-github"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hmac",
  "reqwest",
  "scarab-forge",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

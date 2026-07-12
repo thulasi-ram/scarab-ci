@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -56,11 +57,25 @@ pub struct AppState {
     pub db: Arc<dyn Db>,
     pub clock: Arc<dyn Clock>,
     pub logs: Arc<LogService>,
+    /// HMAC secret for verifying inbound GitHub webhooks (ADR-0032). `None`
+    /// disables the ingest endpoint (rejects with 401).
+    pub github_webhook_secret: Option<Vec<u8>>,
 }
 
 impl AppState {
     pub fn new(db: Arc<dyn Db>, clock: Arc<dyn Clock>, logs: Arc<LogService>) -> Self {
-        Self { db, clock, logs }
+        Self {
+            db,
+            clock,
+            logs,
+            github_webhook_secret: None,
+        }
+    }
+
+    /// Set the GitHub webhook HMAC secret (from `SCARAB_GITHUB_WEBHOOK_SECRET`).
+    pub fn with_github_webhook_secret(mut self, secret: Vec<u8>) -> Self {
+        self.github_webhook_secret = Some(secret);
+        self
     }
 }
 
@@ -123,6 +138,8 @@ pub struct StepStatusDto {
 
 pub enum ApiError {
     NotFound,
+    Unauthorized,
+    BadRequest(String),
     Db(DbError),
 }
 
@@ -136,6 +153,10 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
+            ApiError::Unauthorized => {
+                (StatusCode::UNAUTHORIZED, "signature verification failed").into_response()
+            }
+            ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
             ApiError::Db(e) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response()
             }
@@ -336,6 +357,90 @@ async fn restart_step(
     }
 }
 
+/// Inbound GitHub webhook ingest (ADR-0010, 0032): verify the HMAC signature,
+/// normalize the payload to a canonical forge [`Event`](scarab_forge::Event),
+/// then durably create a Run triggered by it (its steps are populated when the
+/// in-repo `.scarab` config is read on trigger — a later slice-3 issue). The
+/// normalized trigger is persisted on the run's event log for that step to read.
+/// Unverified deliveries are rejected; administrative events (e.g. `ping`) are
+/// acknowledged and ignored.
+async fn github_webhook(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Verify HMAC-SHA256 over the raw body (ADR-0032). No secret configured =>
+    // the endpoint is closed.
+    let secret = st
+        .github_webhook_secret
+        .as_deref()
+        .ok_or(ApiError::Unauthorized)?;
+    let sig = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok());
+    scarab_forge_github::verify_signature(secret, body.as_ref(), sig)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    let payload: serde_json::Value = serde_json::from_slice(body.as_ref())
+        .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}")))?;
+    let delivery = scarab_forge::WebhookDelivery {
+        id: header_str(&headers, "x-github-delivery"),
+        event: header_str(&headers, "x-github-event"),
+        signature: sig.map(str::to_string),
+        payload,
+    };
+    let event = match scarab_forge_github::normalize(&delivery) {
+        Ok(e) => e,
+        // Acknowledge-and-ignore events we don't act on (ping, unsupported).
+        Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
+            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
+        }
+        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+    };
+
+    // Durably create the triggered run and record the normalized trigger on its
+    // event log (source for the in-repo-config step).
+    let now = st.clock.now().await;
+    let run = RunId(Uuid::new_v4().to_string());
+    st.db
+        .create_run(&run, scarab_pipeline::IR_VERSION, EVENT_VERSION, now)
+        .await?;
+    st.db
+        .append_event(&EventKind {
+            version: EVENT_VERSION,
+            run: run.clone(),
+            kind: EventPayload::RunCreated,
+            at: now,
+        })
+        .await?;
+    st.db
+        .append_event(&EventKind {
+            version: EVENT_VERSION,
+            run: run.clone(),
+            kind: EventPayload::Raw(serde_json::json!({
+                "trigger": serde_json::to_value(&event).unwrap_or(serde_json::Value::Null),
+            })),
+            at: now,
+        })
+        .await?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "run_id": run.0,
+            "trigger": event.trigger_kind(),
+        })),
+    ))
+}
+
+fn header_str(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -371,6 +476,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/{id}/events", get(get_events))
         .route("/v1/runs/{id}/logs", get(get_logs))
         .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
+        .route("/webhooks/github", post(github_webhook))
         .with_state(state)
 }
 

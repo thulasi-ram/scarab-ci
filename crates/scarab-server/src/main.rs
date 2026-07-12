@@ -127,7 +127,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let state = AppState::new(db, clock, logs);
+    let mut state = AppState::new(db, clock, logs);
+    if let Ok(secret) = std::env::var("SCARAB_GITHUB_WEBHOOK_SECRET") {
+        state = state.with_github_webhook_secret(secret.into_bytes());
+    }
     let app = router(state);
 
     if cli.serve {

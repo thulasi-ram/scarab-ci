@@ -162,6 +162,8 @@ pub enum ForgeError {
     BadSignature,
     #[error("unsupported event: {0}")]
     UnsupportedEvent(String),
+    #[error("malformed webhook payload: {0}")]
+    Malformed(String),
 }
 
 /// Outbound port to a code forge. `async-trait` keeps it `dyn`-safe.
