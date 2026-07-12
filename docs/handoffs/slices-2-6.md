@@ -95,7 +95,27 @@ Work top-to-bottom; finish a slice's ACCEPTANCE before the next slice. Skip clos
   The dev harness uses an isolated `dev/.kubeconfig` (kind only).
 
 ## The loop prompt
-Run `/loop` with the maintainer's slice-1 prompt, edited to: (a) point at the ids above in order,
-(b) reference this handoff and the locked decisions, and (c) use the **decide/document/continue**
-policy instead of hard-stop. End the loop when `3a0048b` is closed and `cargo check --workspace`
-is green.
+
+Paste this into a new session to resume the unattended run (ids are the dependency order above;
+verify against `git-bug bug` in case any are already closed):
+
+```
+/loop You are implementing "Scarab", a durable-execution k8s-native CI system, in this repo. Slice 1 is done and green. Now build slices 2–6.
+
+FIRST, every iteration, re-ground: read CONTEXT.md, docs/handoffs/slices-2-6.md (state + LOCKED DECISIONS + env notes), and docs/adr/README.md. Open the specific ADRs an issue cites before implementing it. Run `git-bug bug` for the backlog; `git-bug bug show <id>` for detail.
+
+WORK ONE ISSUE PER ITERATION in this dependency order (skip any already closed). Finish a slice's ACCEPTANCE before starting the next slice:
+  Slice 2: 6f38114, bcb2e8f, 174041b, 237466b, 3f8f596, 22035e7, 383e946
+  Slice 3: b832a52, d1e1e93, 281b370, 03f8fd2, 3930b15, a5bee19
+  Slice 4: e8fe6f7, edf20b8, 082cc92, af7344b, c851ffe, 320265e
+  Slice 5: c1373bf, 027f3f2, 6436943, 3c19b70, 71cf0f5, c233a6c
+  Slice 6: a698215, 3a0048b
+
+NON-NEGOTIABLE: hexagonal purity per ADR-0016/0031 (no I/O or infra crates in the pure domain crates; pure-computation deps like CEL are OK). Classical testing per ADR-0017 — real Postgres via SCARAB_TEST_DATABASE_URL=postgres://thulasiram@localhost:5432/postgres, mock only true externals, keep cluster/BuildKit/GitHub/UI-browser live-runs #[ignore]-gated + env-gated. Honor ALL locked decisions in docs/handoffs/slices-2-6.md and ADR-0031/0032 (cite them; don't re-decide). Never touch the ambient kubeconfig (it points at production); kind only via dev/.kubeconfig.
+
+EACH ITERATION: read cited ADRs → implement → keep `cargo check --workspace` green → add the minimal tests the acceptance implies → commit `<type>(<area>): <subject>` with a body, ending with the trailer `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>` → `git-bug bug status close <id>` → STOP (the loop re-invokes you for the next issue).
+
+WHEN BLOCKED (decide/document/continue): make the best ADR-consistent decision, write the assumption in the commit body, add a new ADR (0033+) if it is load-bearing, and leave a regression test or TODO(slice-N). If an issue genuinely cannot proceed, leave it OPEN with a `git-bug bug comment <id>` explaining why, and move to the next INDEPENDENT issue. Only hard-stop if `cargo check --workspace` is red and you cannot make it green — never leave the tree uncompilable between iterations.
+
+END THE LOOP when 3a0048b is closed and `cargo check --workspace` is green, or when the backlog is empty. Report a summary.
+```
