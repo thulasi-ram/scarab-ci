@@ -108,6 +108,16 @@ pub trait Db: Send + Sync {
     /// Release `group`'s slot if `run` holds it, letting a queued run acquire.
     async fn release_slot(&self, group: &str, run: &RunId) -> Result<(), DbError>;
 
+    /// Set a run's supersede key `(repo, ref, pipeline)` — the group within which
+    /// a newer run auto-cancels older in-flight ones (ADR-0011, 0032). Absent for
+    /// deploy pipelines, which are never auto-cancelled.
+    async fn set_supersede_key(&self, run: &RunId, key: &str) -> Result<(), DbError>;
+
+    /// The non-terminal runs that `run` supersedes: those sharing its supersede
+    /// key but created earlier. Empty if `run` has no key (newest-wins is opt-in
+    /// per run).
+    async fn superseded_by(&self, run: &RunId) -> Result<Vec<RunId>, DbError>;
+
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;
 

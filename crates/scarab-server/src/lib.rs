@@ -417,6 +417,20 @@ pub enum TriggerError {
     Db(#[from] DbError),
 }
 
+/// The `(repo, ref, pipeline)` auto-cancel key for an event, or `None` for
+/// events that shouldn't auto-cancel (cron/manual/api/…). Pipeline is singular
+/// in v1 (`.scarab/ci.yaml`), so the key is `owner/name:<ref-scope>`.
+fn supersede_key(event: &scarab_forge::Event) -> Option<String> {
+    use scarab_forge::Event;
+    let repo = event.repo()?;
+    let scope = match event {
+        Event::Push { r#ref, .. } => r#ref.clone(),
+        Event::PullRequest { number, .. } => format!("pr-{number}"),
+        _ => return None,
+    };
+    Some(format!("{}/{}:{scope}", repo.owner, repo.name))
+}
+
 /// The ref/SHA to read the pipeline config at — the event's commit where
 /// available (immutable, ADR-0032), else a branch/tag ref.
 fn config_ref(event: &scarab_forge::Event) -> String {
@@ -479,6 +493,12 @@ async fn persist_run_from_ir(
     db.create_run(run, ir.ir_version, EVENT_VERSION, now).await?;
     db.store_run_ir(run, &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null))
         .await?;
+    // Newest-wins auto-cancel (ADR-0032): key non-deploy runs by (repo, ref) so
+    // a newer run on the same ref supersedes older in-flight ones. Deploy
+    // pipelines (an Environment target — a later slice-4 issue) will opt out.
+    if let Some(key) = supersede_key(event) {
+        db.set_supersede_key(run, &key).await?;
+    }
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),

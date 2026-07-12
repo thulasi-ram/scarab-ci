@@ -263,6 +263,12 @@ impl<'a> Scheduler<'a> {
         // first (this run then acquires once the holder releases). A run that
         // has already started holds its slot, so we only gate on entry.
         if status == RunStatus::Pending {
+            // Newest-wins (ADR-0011, 0032): this run auto-cancels older in-flight
+            // runs sharing its supersede key. Deploy runs carry no key and so
+            // never supersede or get superseded.
+            for older in self.db.superseded_by(run).await? {
+                self.cancel_run(&older).await?;
+            }
             if let Some((group, policy)) = self.db.run_concurrency(run).await? {
                 if let Some(holder) = self.db.acquire_slot(&group, run).await? {
                     if policy == ConcurrencyPolicy::CancelInProgress {

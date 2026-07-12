@@ -368,6 +368,39 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn set_supersede_key(&self, run: &RunId, key: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE runs SET supersede_key = $2,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(key)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn superseded_by(&self, run: &RunId) -> Result<Vec<RunId>, DbError> {
+        // Older non-terminal runs sharing this run's key. If the run has no key,
+        // the `= (subquery)` is NULL for every row → empty result.
+        let rows = sqlx::query(
+            "SELECT id FROM runs
+             WHERE supersede_key IS NOT NULL
+               AND supersede_key = (SELECT supersede_key FROM runs WHERE id = $1)
+               AND id <> $1
+               AND created_at < (SELECT created_at FROM runs WHERE id = $1)
+               AND status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
+             ORDER BY created_at",
+        )
+        .bind(&run.0)
+        .fetch_all(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
+    }
+
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
         let row = sqlx::query("SELECT status FROM runs WHERE id = $1")
             .bind(&run.0)

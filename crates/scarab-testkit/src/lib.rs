@@ -99,6 +99,10 @@ struct InMemoryState {
     concurrency: HashMap<RunId, (String, ConcurrencyPolicy)>,
     /// The single slot holder per concurrency group.
     slots: HashMap<String, RunId>,
+    /// Per-run creation time (for supersede ordering).
+    run_created: HashMap<RunId, Timestamp>,
+    /// Per-run supersede key `(repo, ref, pipeline)`.
+    supersede_keys: HashMap<RunId, String>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -192,13 +196,11 @@ impl Db for InMemoryDb {
         run: &RunId,
         _ir_version: u32,
         _event_schema_version: u32,
-        _at: Timestamp,
+        at: Timestamp,
     ) -> Result<(), DbError> {
-        self.state
-            .lock()
-            .unwrap()
-            .runs
-            .insert(run.clone(), RunStatus::Pending);
+        let mut st = self.state.lock().unwrap();
+        st.runs.insert(run.clone(), RunStatus::Pending);
+        st.run_created.insert(run.clone(), at);
         Ok(())
     }
 
@@ -296,6 +298,33 @@ impl Db for InMemoryDb {
             st.slots.remove(group);
         }
         Ok(())
+    }
+
+    async fn set_supersede_key(&self, run: &RunId, key: &str) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .supersede_keys
+            .insert(run.clone(), key.to_string());
+        Ok(())
+    }
+
+    async fn superseded_by(&self, run: &RunId) -> Result<Vec<RunId>, DbError> {
+        let st = self.state.lock().unwrap();
+        let Some(key) = st.supersede_keys.get(run) else {
+            return Ok(Vec::new());
+        };
+        let my_created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
+        let mut older: Vec<RunId> = st
+            .supersede_keys
+            .iter()
+            .filter(|(r, k)| *r != run && *k == key)
+            .filter(|(r, _)| st.run_created.get(*r).copied().unwrap_or(Timestamp(0)) < my_created)
+            .filter(|(r, _)| st.runs.get(*r).map(|s| !s.is_terminal()).unwrap_or(false))
+            .map(|(r, _)| r.clone())
+            .collect();
+        older.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(older)
     }
 
     async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError> {
