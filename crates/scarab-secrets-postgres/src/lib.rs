@@ -13,13 +13,10 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use sqlx::{migrate::Migrator, PgPool, Row};
+use sqlx::{PgPool, Row};
 
 use async_trait::async_trait;
 use scarab_secrets::{Secret, SecretError, SecretProvider, SecretScope};
-
-/// Secret-store schema migrations (the `secrets` table).
-pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 /// A Postgres-backed, envelope-encrypting secret provider.
 pub struct PostgresSecrets {
@@ -56,12 +53,25 @@ impl PostgresSecrets {
         }
     }
 
-    /// Apply the secret-store migrations.
+    /// Ensure the `secrets` table exists. Idempotent (CREATE IF NOT EXISTS) so it
+    /// coexists with the main store's migrations on the same database without
+    /// contending over a shared migration-tracking table.
     pub async fn migrate(&self) -> Result<(), SecretError> {
-        MIGRATOR
-            .run(self.pool()?)
-            .await
-            .map_err(|e| SecretError::Backend(e.to_string()))
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS secrets (
+                scope       TEXT  NOT NULL,
+                key         TEXT  NOT NULL,
+                ciphertext  BYTEA NOT NULL,
+                value_nonce BYTEA NOT NULL,
+                wrapped_key BYTEA NOT NULL,
+                key_nonce   BYTEA NOT NULL,
+                PRIMARY KEY (scope, key)
+            )",
+        )
+        .execute(self.pool()?)
+        .await
+        .map_err(|e| SecretError::Backend(e.to_string()))?;
+        Ok(())
     }
 
     fn pool(&self) -> Result<&PgPool, SecretError> {
