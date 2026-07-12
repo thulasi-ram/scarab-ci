@@ -102,7 +102,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => PostgresDb::new(),
     };
-    let db: Arc<dyn Db> = Arc::new(pg);
+    // Keep a typed handle so the same Postgres adapter can back both the `Db`
+    // port and the `EnvironmentStore` port (it implements both).
+    let pg = Arc::new(pg);
+    let db: Arc<dyn Db> = pg.clone();
 
     // Object store: MinIO/S3 when SCARAB_S3_BUCKET is set (the dev harness /
     // prod), else a local directory (zero-dependency dev).
@@ -146,6 +149,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = AppState::new(db, clock, logs);
     if let Ok(secret) = std::env::var("SCARAB_GITHUB_WEBHOOK_SECRET") {
         state = state.with_github_webhook_secret(secret.into_bytes());
+    }
+    // Environments + deployment history: the Postgres adapter is the store. Only
+    // wired when actually connected — an unconnected PG would fail at request
+    // time. Enables /v1/environments/* and (with an EnvironmentStore present)
+    // admission enforcement for env-targeting runs (ADR-0024).
+    if connected {
+        state = state.with_environments(pg.clone());
+    }
+    // OIDC issuer for keyless federation (ADR-0014): serve JWKS + discovery so a
+    // cloud provider can verify Scarab-minted tokens. The issuer URL is the
+    // public base URL clouds are configured to trust; enabled only when set.
+    if let Ok(issuer_url) = std::env::var("SCARAB_OIDC_ISSUER") {
+        match scarab_server::oidc::Rs256Issuer::generate(issuer_url) {
+            Ok(issuer) => {
+                state = state.with_oidc(Arc::new(issuer));
+                tracing::info!("OIDC issuer enabled");
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to generate OIDC signing key; issuer disabled"),
+        }
     }
     let app = router(state);
 
