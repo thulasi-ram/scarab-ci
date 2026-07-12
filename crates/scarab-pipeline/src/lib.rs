@@ -1,22 +1,54 @@
 //! # scarab-pipeline — pipeline authoring & compilation
 //!
-//! Pure domain crate (serde / serde_json / thiserror only). Turns authored
-//! YAML into a validated, versioned [`PipelineIr`]. All bodies are stubs.
+//! Pure domain crate (serde / serde_json / serde_yaml / thiserror only — all
+//! pure-computation deps per ADR-0031; no I/O, no infra). Turns authored YAML
+//! into a validated, versioned [`PipelineIr`] — the *real* DSL (ADR-0009); YAML
+//! is merely one frontend.
+//!
+//! ## Submit-time, not run-time
+//!
+//! Compilation performs **static** matrix expansion (ADR-0023): the cartesian
+//! product of a step's matrix is materialised into concrete steps at
+//! [`compile_yaml`] time, so the run's DAG is fully known before it starts —
+//! bounded state for the engine, a fully drawable graph for the UI, and complete
+//! validation up front. Anything the author gets wrong (a cycle, a dangling
+//! `needs`, an empty matrix dimension) is rejected here with diagnostics, never
+//! discovered mid-run.
+//!
+//! `when:` guards are kept as raw CEL strings; binding/evaluation of CEL lives in
+//! the [`cel`] submodule and is wired up by a later slice.
 
 pub mod cel;
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
+/// Current schema version emitted by the compiler. Runs are self-describing
+/// (ADR-0022): the IR carries this so an engine can reason about older Runs.
+pub const IR_VERSION: u32 = 1;
+
+fn default_ir_version() -> u32 {
+    IR_VERSION
+}
+
 /// The compiled, versioned intermediate representation of a pipeline.
+///
+/// Post-compile invariant: every [`StepSpec::matrix`] is `None` (all matrices
+/// have been expanded) and step ids are unique.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PipelineIr {
     /// Schema version of the IR, for forward/backward compatibility.
+    #[serde(default = "default_ir_version")]
     pub ir_version: u32,
     pub steps: Vec<StepSpec>,
 }
 
-/// One authored step. The step contract (ADR-0008) is an OCI `image` + a
-/// `command`; the rest are DAG/placement modifiers.
+/// One step. The step contract (ADR-0008) is an OCI `image` + a `command`; the
+/// rest are DAG/placement modifiers. In authored YAML a step may carry a
+/// [`matrix`](StepSpec::matrix); after [`compile_yaml`] that field is always
+/// `None` and each concrete instance instead carries its
+/// [`matrix_values`](StepSpec::matrix_values).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepSpec {
     pub id: String,
@@ -30,26 +62,33 @@ pub struct StepSpec {
     pub env: Vec<(String, String)>,
     #[serde(default)]
     pub needs: Needs,
+    /// Authoring-only fan-out modifier; `None` on every compiled step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix: Option<Matrix>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<When>,
     #[serde(default)]
     pub runs_on: RunsOn,
     #[serde(default)]
     pub resources: Resources,
+    /// The concrete matrix coordinate this instance was expanded from (empty for
+    /// steps authored without a matrix). Consumed later by CEL interpolation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub matrix_values: BTreeMap<String, String>,
 }
 
 /// The upstream steps this step depends on (its DAG edges).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Needs(pub Vec<String>);
 
-/// A build matrix that fans a single spec into many concrete steps.
+/// A build matrix that fans a single spec into many concrete steps: a map from
+/// dimension name to its values. Expanded to the cartesian product at submit
+/// time (ADR-0023).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Matrix {
-    pub dimensions: std::collections::BTreeMap<String, Vec<String>>,
-}
+pub struct Matrix(pub BTreeMap<String, Vec<String>>);
 
 /// A conditional guard, expressed as a CEL expression (kept as a raw string
-/// for now; evaluated by the [`cel`] submodule).
+/// here; evaluated by the [`cel`] submodule).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct When(pub String);
 
@@ -71,20 +110,375 @@ pub struct Resources {
 pub enum PipelineError {
     #[error("yaml parse error: {0}")]
     Parse(String),
-    #[error("validation failed with {0} error(s)")]
-    Validation(usize),
+    #[error("pipeline validation failed:\n  - {}", .0.join("\n  - "))]
+    Validation(Vec<String>),
     #[error("not yet implemented")]
     NotImplemented,
 }
 
-/// Compile authored YAML into a [`PipelineIr`].
-pub fn compile_yaml(_yaml: &str) -> Result<PipelineIr, PipelineError> {
-    // TODO: parse + lower authored YAML into the versioned IR.
-    Err(PipelineError::NotImplemented)
+/// Compile authored YAML into a validated [`PipelineIr`].
+///
+/// Parses the YAML frontend, statically expands every matrix into concrete
+/// steps (ADR-0023), fans each `needs` edge onto every expanded instance of its
+/// target, then runs full [`validate`] over the result. All problems are
+/// reported together via [`PipelineError::Validation`].
+pub fn compile_yaml(yaml: &str) -> Result<PipelineIr, PipelineError> {
+    let authored: PipelineIr =
+        serde_yaml::from_str(yaml).map_err(|e| PipelineError::Parse(e.to_string()))?;
+
+    let mut diagnostics = Vec::new();
+    let mut expanded: Vec<StepSpec> = Vec::new();
+    // authored step id -> the concrete instance ids it expanded into.
+    let mut instances: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for step in &authored.steps {
+        match expand_step(step) {
+            Ok(concrete) => {
+                let ids = concrete.iter().map(|s| s.id.clone()).collect();
+                // A duplicate authored id shadows an earlier expansion; the
+                // resulting duplicate concrete ids are caught by validate().
+                instances.insert(step.id.clone(), ids);
+                expanded.extend(concrete);
+            }
+            Err(msg) => diagnostics.push(msg),
+        }
+    }
+
+    if !diagnostics.is_empty() {
+        return Err(PipelineError::Validation(diagnostics));
+    }
+
+    // Rewrite needs: a dependency on an authored step becomes a dependency on
+    // every concrete instance of it (fan-in over a matrix). Unknown targets are
+    // left untouched so validate() flags them as dangling.
+    for step in &mut expanded {
+        let mut resolved: Vec<String> = Vec::new();
+        for need in &step.needs.0 {
+            match instances.get(need) {
+                Some(ids) => {
+                    for id in ids {
+                        if !resolved.contains(id) {
+                            resolved.push(id.clone());
+                        }
+                    }
+                }
+                None => {
+                    if !resolved.contains(need) {
+                        resolved.push(need.clone());
+                    }
+                }
+            }
+        }
+        step.needs.0 = resolved;
+    }
+
+    let ir = PipelineIr {
+        ir_version: authored.ir_version,
+        steps: expanded,
+    };
+
+    validate(&ir).map_err(PipelineError::Validation)?;
+    Ok(ir)
 }
 
-/// Validate a compiled [`PipelineIr`], returning all discovered problems.
-pub fn validate(_ir: &PipelineIr) -> Result<(), Vec<String>> {
-    // TODO: DAG cycle detection, needs resolution, matrix expansion checks…
-    Err(vec!["validation not yet implemented".to_string()])
+/// Expand one authored step into its concrete instances.
+///
+/// A step without a matrix yields itself (with an explicitly cleared `matrix`).
+/// A step with a matrix yields the cartesian product of its dimensions; each
+/// instance gets a deterministic id `id[k1=v1,k2=v2]` (keys sorted) and its
+/// coordinate recorded in [`StepSpec::matrix_values`].
+fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
+    let Some(matrix) = &step.matrix else {
+        let mut base = step.clone();
+        base.matrix = None;
+        return Ok(vec![base]);
+    };
+
+    if matrix.0.is_empty() {
+        return Err(format!("step `{}`: matrix has no dimensions", step.id));
+    }
+    for (dim, values) in &matrix.0 {
+        if values.is_empty() {
+            return Err(format!(
+                "step `{}`: matrix dimension `{dim}` has no values",
+                step.id
+            ));
+        }
+    }
+
+    // Cartesian product over the (sorted) dimensions.
+    let mut combos: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
+    for (dim, values) in &matrix.0 {
+        let mut next = Vec::with_capacity(combos.len() * values.len());
+        for combo in &combos {
+            for value in values {
+                let mut c = combo.clone();
+                c.insert(dim.clone(), value.clone());
+                next.push(c);
+            }
+        }
+        combos = next;
+    }
+
+    Ok(combos
+        .into_iter()
+        .map(|coord| {
+            let suffix = coord
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut instance = step.clone();
+            instance.id = format!("{}[{suffix}]", step.id);
+            instance.matrix = None;
+            instance.matrix_values = coord;
+            instance
+        })
+        .collect())
+}
+
+/// Validate a compiled [`PipelineIr`], returning **all** discovered problems at
+/// once. Checks: unique step ids, no unexpanded matrix (a compile-invariant),
+/// `needs` resolve to real steps, and the `needs` graph is acyclic.
+pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
+    let mut diagnostics = Vec::new();
+
+    // Unique ids.
+    let mut seen = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    for step in &ir.steps {
+        if !seen.insert(step.id.as_str()) {
+            diagnostics.push(format!("duplicate step id `{}`", step.id));
+        }
+        ids.insert(step.id.as_str());
+    }
+
+    for step in &ir.steps {
+        // Compile invariant: matrices are gone by now.
+        if step.matrix.is_some() {
+            diagnostics.push(format!("step `{}`: matrix was not expanded", step.id));
+        }
+        // Dangling needs.
+        for need in &step.needs.0 {
+            if !ids.contains(need.as_str()) {
+                diagnostics.push(format!(
+                    "step `{}`: needs unknown step `{need}`",
+                    step.id
+                ));
+            }
+        }
+    }
+
+    // Cycle detection over needs edges (Kahn's algorithm). Only run when the
+    // graph is well-formed enough to be meaningful (no dangling edges).
+    if diagnostics.is_empty() {
+        if let Some(cycle) = find_cycle(&ir.steps) {
+            diagnostics.push(format!("dependency cycle among steps: {}", cycle.join(" -> ")));
+        }
+    }
+
+    if diagnostics.is_empty() {
+        Ok(())
+    } else {
+        Err(diagnostics)
+    }
+}
+
+/// Return the members of a dependency cycle if one exists (edge: step -> each of
+/// its `needs`). Uses Kahn's algorithm; the leftover nodes after repeatedly
+/// removing zero-indegree nodes are exactly those on or feeding a cycle.
+fn find_cycle(steps: &[StepSpec]) -> Option<Vec<String>> {
+    let mut indegree: BTreeMap<&str, usize> = steps.iter().map(|s| (s.id.as_str(), 0)).collect();
+    // dependents[x] = steps that need x (edges to relax when x is removed).
+    let mut dependents: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for step in steps {
+        for need in &step.needs.0 {
+            *indegree.get_mut(step.id.as_str()).unwrap() += 1;
+            dependents.entry(need.as_str()).or_default().push(step.id.as_str());
+        }
+    }
+
+    let mut queue: Vec<&str> = indegree
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(&id, _)| id)
+        .collect();
+    let mut removed = 0usize;
+    while let Some(node) = queue.pop() {
+        removed += 1;
+        for &dep in dependents.get(node).map(|v| v.as_slice()).unwrap_or(&[]) {
+            let d = indegree.get_mut(dep).unwrap();
+            *d -= 1;
+            if *d == 0 {
+                queue.push(dep);
+            }
+        }
+    }
+
+    if removed == steps.len() {
+        return None;
+    }
+    // Remaining nodes (indegree > 0) are on or feed the cycle; report them sorted
+    // for a deterministic diagnostic.
+    let mut in_cycle: Vec<String> = indegree
+        .iter()
+        .filter(|(_, &d)| d > 0)
+        .map(|(&id, _)| id.to_string())
+        .collect();
+    in_cycle.sort();
+    Some(in_cycle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compile(yaml: &str) -> PipelineIr {
+        compile_yaml(yaml).expect("expected valid pipeline")
+    }
+
+    fn errors(yaml: &str) -> Vec<String> {
+        match compile_yaml(yaml) {
+            Err(PipelineError::Validation(d)) => d,
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_diamond_dag_compiles_and_round_trips() {
+        let ir = compile(
+            r#"
+            ir_version: 1
+            steps:
+              - { id: a, image: busybox }
+              - { id: b, image: busybox, needs: [a] }
+              - { id: c, image: busybox, needs: [a] }
+              - { id: d, image: busybox, needs: [b, c] }
+            "#,
+        );
+        assert_eq!(ir.ir_version, 1);
+        assert_eq!(ir.steps.len(), 4);
+
+        // IR round-trips through serde_json unchanged.
+        let json = serde_json::to_string(&ir).unwrap();
+        let back: PipelineIr = serde_json::from_str(&json).unwrap();
+        assert_eq!(ir, back);
+    }
+
+    #[test]
+    fn ir_version_defaults_when_omitted() {
+        let ir = compile("steps: [{ id: a, image: busybox }]");
+        assert_eq!(ir.ir_version, IR_VERSION);
+    }
+
+    #[test]
+    fn matrix_expands_to_cartesian_product() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: build
+                image: rust
+                matrix:
+                  os: [linux, mac]
+                  arch: [amd64, arm64]
+            "#,
+        );
+        assert_eq!(ir.steps.len(), 4);
+        // No compiled step keeps its matrix; ids are deterministic (keys sorted).
+        assert!(ir.steps.iter().all(|s| s.matrix.is_none()));
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"build[arch=amd64,os=linux]"));
+        assert!(ids.contains(&"build[arch=arm64,os=mac]"));
+        // Coordinate is recorded for later CEL interpolation.
+        let linux_amd = ir
+            .steps
+            .iter()
+            .find(|s| s.id == "build[arch=amd64,os=linux]")
+            .unwrap();
+        assert_eq!(linux_amd.matrix_values.get("os").unwrap(), "linux");
+        assert_eq!(linux_amd.matrix_values.get("arch").unwrap(), "amd64");
+    }
+
+    #[test]
+    fn needs_on_a_matrixed_step_fans_into_all_instances() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: build
+                image: rust
+                matrix:
+                  os: [linux, mac]
+              - id: release
+                image: busybox
+                needs: [build]
+            "#,
+        );
+        let release = ir.steps.iter().find(|s| s.id == "release").unwrap();
+        assert_eq!(
+            release.needs.0,
+            vec!["build[os=linux]".to_string(), "build[os=mac]".to_string()]
+        );
+    }
+
+    #[test]
+    fn cyclic_dependencies_are_rejected() {
+        let diags = errors(
+            r#"
+            steps:
+              - { id: a, image: busybox, needs: [c] }
+              - { id: b, image: busybox, needs: [a] }
+              - { id: c, image: busybox, needs: [b] }
+            "#,
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("cycle")),
+            "expected a cycle diagnostic, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn dangling_needs_is_rejected() {
+        let diags = errors("steps: [{ id: a, image: busybox, needs: [ghost] }]");
+        assert!(
+            diags.iter().any(|d| d.contains("unknown step `ghost`")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn empty_matrix_dimension_is_rejected() {
+        let diags = errors(
+            r#"
+            steps:
+              - id: build
+                image: rust
+                matrix:
+                  os: []
+            "#,
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("dimension `os` has no values")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_step_ids_are_rejected() {
+        let diags = errors(
+            r#"
+            steps:
+              - { id: a, image: busybox }
+              - { id: a, image: alpine }
+            "#,
+        );
+        assert!(diags.iter().any(|d| d.contains("duplicate step id `a`")), "got {diags:?}");
+    }
+
+    #[test]
+    fn malformed_yaml_is_a_parse_error() {
+        match compile_yaml("steps: [ this is : not valid") {
+            Err(PipelineError::Parse(_)) => {}
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
 }
