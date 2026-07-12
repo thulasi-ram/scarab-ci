@@ -13,3 +13,6 @@ serde_json = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 scarab-testkit = { workspace = true }
+scarab-pipeline = { workspace = true }
+scarab-storage = { workspace = true }
+scarab-storage-s3 = { workspace = true }
