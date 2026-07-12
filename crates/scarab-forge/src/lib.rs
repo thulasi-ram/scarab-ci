@@ -85,7 +85,15 @@ pub struct WebhookDelivery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     Push { repo: Repo, r#ref: String, after: String },
-    PullRequest { repo: Repo, number: u64, head: String },
+    PullRequest {
+        repo: Repo,
+        number: u64,
+        head: String,
+        /// True when the PR's head repo differs from its base repo — an
+        /// untrusted fork PR (ADR-0015): such runs get no secrets and a
+        /// downgraded OIDC subject.
+        fork: bool,
+    },
     Tag { repo: Repo, tag: String },
     Release { repo: Repo, tag: String },
     Comment { repo: Repo, issue: u64, body: String },
@@ -148,6 +156,12 @@ impl Event {
         }
     }
 
+    /// Is this an untrusted fork pull request (head repo ≠ base repo)? Fork PRs
+    /// are locked out of secrets and get a restricted OIDC subject (ADR-0015).
+    pub fn is_fork_pr(&self) -> bool {
+        matches!(self, Event::PullRequest { fork: true, .. })
+    }
+
     /// The repository this event targets, if any. Repo-less events (`cron`,
     /// `manual`, `api`) return `None`.
     pub fn repo(&self) -> Option<&Repo> {
@@ -186,9 +200,10 @@ impl Event {
                 e.insert("tag".into(), json!(tag));
                 e.insert("ref".into(), json!(format!("refs/tags/{tag}")));
             }
-            Event::PullRequest { number, head, .. } => {
+            Event::PullRequest { number, head, fork, .. } => {
                 e.insert("number".into(), json!(number));
                 e.insert("sha".into(), json!(head));
+                e.insert("fork".into(), json!(fork));
             }
             Event::Release { tag, .. } => {
                 e.insert("tag".into(), json!(tag));
@@ -284,6 +299,7 @@ mod tests {
                     repo: repo(),
                     number: 7,
                     head: "cafe".into(),
+                    fork: false,
                 },
                 TriggerKind::PullRequest,
             ),
@@ -328,6 +344,32 @@ mod tests {
         for (event, kind) in cases {
             assert_eq!(event.trigger_kind(), kind);
         }
+    }
+
+    #[test]
+    fn fork_pr_is_detected() {
+        let fork = Event::PullRequest {
+            repo: repo(),
+            number: 1,
+            head: "x".into(),
+            fork: true,
+        };
+        let internal = Event::PullRequest {
+            repo: repo(),
+            number: 2,
+            head: "y".into(),
+            fork: false,
+        };
+        assert!(fork.is_fork_pr());
+        assert!(!internal.is_fork_pr());
+        assert!(fork.context()["event"]["fork"].as_bool().unwrap());
+        // Non-PR events are never fork PRs.
+        assert!(!Event::Push {
+            repo: repo(),
+            r#ref: "main".into(),
+            after: "z".into()
+        }
+        .is_fork_pr());
     }
 
     #[test]

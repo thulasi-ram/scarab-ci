@@ -24,7 +24,7 @@ async fn injected_secret_is_redacted_from_stored_and_streamed_logs() {
 
     // Resolve the step's secret: it comes back as env AND is registered with the
     // redactor.
-    let env = resolve_step_secrets(&secrets, &logs, &scope(), &["TOKEN".to_string()])
+    let env = resolve_step_secrets(&secrets, &logs, &scope(), &["TOKEN".to_string()], false)
         .await
         .unwrap();
     assert_eq!(env, vec![("TOKEN".to_string(), "sup3r-s3cret".to_string())]);

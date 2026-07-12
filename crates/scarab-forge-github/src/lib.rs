@@ -67,7 +67,22 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| ForgeError::Malformed("pull_request.head.sha".into()))?
                 .to_string();
-            Ok(Event::PullRequest { repo, number, head })
+            // Fork PR: the head repo differs from the base (this) repo.
+            let base_repo = p.pointer("/repository/full_name").and_then(Value::as_str);
+            let head_repo = p
+                .pointer("/pull_request/head/repo/full_name")
+                .and_then(Value::as_str);
+            let fork = match (base_repo, head_repo) {
+                (Some(base), Some(head_repo)) => head_repo != base,
+                // Absent head repo (deleted fork) → treat as a fork (untrusted).
+                _ => head_repo.is_none(),
+            };
+            Ok(Event::PullRequest {
+                repo,
+                number,
+                head,
+                fork,
+            })
         }
         "release" => {
             let repo = repo_of(p)?;
@@ -259,19 +274,35 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_pull_request() {
-        let payload = json!({
-            "pull_request": { "number": 42, "head": { "sha": "feedface" } },
-            "repository": { "name": "app", "owner": { "login": "acme" } }
+    fn normalizes_pull_request_and_detects_fork() {
+        // Same-repo PR (head repo == base) → not a fork.
+        let internal = json!({
+            "pull_request": {
+                "number": 42,
+                "head": { "sha": "feedface", "repo": { "full_name": "acme/app" } }
+            },
+            "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" }
         });
         assert_eq!(
-            normalize(&delivery("pull_request", payload)).unwrap(),
+            normalize(&delivery("pull_request", internal)).unwrap(),
             Event::PullRequest {
                 repo: Repo { owner: "acme".into(), name: "app".into() },
                 number: 42,
                 head: "feedface".into(),
+                fork: false,
             }
         );
+
+        // Head repo differs from base → a fork PR.
+        let fork = json!({
+            "pull_request": {
+                "number": 7,
+                "head": { "sha": "abc", "repo": { "full_name": "contributor/app" } }
+            },
+            "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" }
+        });
+        let event = normalize(&delivery("pull_request", fork)).unwrap();
+        assert!(event.is_fork_pr(), "head repo != base → fork");
     }
 
     #[test]

@@ -921,7 +921,13 @@ pub async fn resolve_step_secrets(
     logs: &LogService,
     scope: &scarab_secrets::SecretScope,
     keys: &[String],
+    locked_out: bool,
 ) -> Result<Vec<(String, String)>, scarab_secrets::SecretError> {
+    // Fork-PR lockout (ADR-0015): untrusted runs get NO secrets, so we never
+    // even read them from the provider.
+    if locked_out {
+        return Ok(Vec::new());
+    }
     let mut env = Vec::with_capacity(keys.len());
     for key in keys {
         let secret = provider.get(scope, key).await?;
@@ -946,6 +952,30 @@ async fn openid_configuration(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let issuer = st.oidc.as_ref().ok_or(ApiError::NotFound)?;
     Ok(Json(issuer.discovery()))
+}
+
+/// The security posture for a run triggered by `event` (ADR-0015, 0005). An
+/// untrusted fork PR is locked out of secrets and its OIDC subject environment
+/// is downgraded to `none`, so its token can never assume a real environment's
+/// cloud role; trusted events keep their `target_env`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkPolicy {
+    pub secrets_locked_out: bool,
+    pub oidc_env: String,
+}
+
+pub fn fork_policy(event: &scarab_forge::Event, target_env: &str) -> ForkPolicy {
+    if event.is_fork_pr() {
+        ForkPolicy {
+            secrets_locked_out: true,
+            oidc_env: "none".to_string(),
+        }
+    } else {
+        ForkPolicy {
+            secrets_locked_out: false,
+            oidc_env: target_env.to_string(),
+        }
+    }
 }
 
 async fn healthz() -> &'static str {
