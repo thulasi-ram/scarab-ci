@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Attempt, AttemptId, DbError, EventKind, ExecError, LogChunkMeta, OutboxId, OutboxMessage, RunId,
-    RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, ConcurrencyPolicy, DbError, EventKind, ExecError, LogChunkMeta, OutboxId,
+    OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -83,6 +83,30 @@ pub trait Db: Send + Sync {
     /// The output workspace snapshot a step produced, or `None` if it has not
     /// produced one (or the step is unknown).
     async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
+
+    /// Assign a run to a named concurrency group with a policy (ADR-0011, 0032).
+    async fn set_run_concurrency(
+        &self,
+        run: &RunId,
+        group: &str,
+        policy: ConcurrencyPolicy,
+    ) -> Result<(), DbError>;
+
+    /// A run's concurrency group + policy, if it belongs to one.
+    async fn run_concurrency(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<(String, ConcurrencyPolicy)>, DbError>;
+
+    /// Atomically try to take `group`'s single slot for `run`. Returns `None`
+    /// when `run` now holds the slot (freshly, or it already did, or the prior
+    /// holder had settled), or `Some(holder)` when a *different, still-active*
+    /// run holds it. The atomicity is what serializes a concurrency group across
+    /// replicas (ADR-0011).
+    async fn acquire_slot(&self, group: &str, run: &RunId) -> Result<Option<RunId>, DbError>;
+
+    /// Release `group`'s slot if `run` holds it, letting a queued run acquire.
+    async fn release_slot(&self, group: &str, run: &RunId) -> Result<(), DbError>;
 
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;

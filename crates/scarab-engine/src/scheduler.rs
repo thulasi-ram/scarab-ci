@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ports::ExecState;
 use crate::{
-    Attempt, AttemptId, Clock, Db, DbError, EventKind, EventPayload, ExecError, Executor,
-    FailureKind, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepStatus, Timestamp,
+    Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, ExecError,
+    Executor, FailureKind, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepStatus, Timestamp,
     TransitionError, EVENT_VERSION,
 };
 
@@ -257,8 +257,20 @@ impl<'a> Scheduler<'a> {
             return Ok(());
         }
 
-        // Start a Pending run.
+        // Start a Pending run — subject to its concurrency group (ADR-0011,
+        // 0032). If the group's slot is held by another active run, `queue`
+        // waits (retry next tick) and `cancel-in-progress` cancels the holder
+        // first (this run then acquires once the holder releases). A run that
+        // has already started holds its slot, so we only gate on entry.
         if status == RunStatus::Pending {
+            if let Some((group, policy)) = self.db.run_concurrency(run).await? {
+                if let Some(holder) = self.db.acquire_slot(&group, run).await? {
+                    if policy == ConcurrencyPolicy::CancelInProgress {
+                        self.cancel_run(&holder).await?;
+                    }
+                    return Ok(()); // slot busy — wait for it to free
+                }
+            }
             self.transition_run(run, RunStatus::Pending, RunStatus::Running)
                 .await?;
         }
@@ -421,7 +433,34 @@ impl<'a> Scheduler<'a> {
         if let Some(current) = self.db.run_status(run).await? {
             if !current.is_terminal() {
                 self.transition_run(run, current, outcome).await?;
+                // Free the concurrency slot so a queued run can start.
+                if let Some((group, _)) = self.db.run_concurrency(run).await? {
+                    self.db.release_slot(&group, run).await?;
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// Cancel a run: drive its non-terminal steps and the run itself to
+    /// `Cancelled` durably (no half-cancelled limbo, ADR-0020) and release its
+    /// concurrency slot. Terminating the underlying Pods (SIGTERM + grace →
+    /// kill) is the executor's job on the k8s-live path; the durable terminal
+    /// state recorded here is the guarantee the control plane owns.
+    pub async fn cancel_run(&self, run: &RunId) -> Result<(), SchedulerError> {
+        for step in self.db.steps_of_run(run).await? {
+            if !step.status.is_terminal() {
+                self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
+                    .await?;
+            }
+        }
+        if let Some(current) = self.db.run_status(run).await? {
+            if !current.is_terminal() {
+                self.transition_run(run, current, RunStatus::Cancelled).await?;
+            }
+        }
+        if let Some((group, _)) = self.db.run_concurrency(run).await? {
+            self.db.release_slot(&group, run).await?;
         }
         Ok(())
     }

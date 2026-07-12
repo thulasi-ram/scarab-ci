@@ -83,6 +83,34 @@ pub enum StepStatus {
     Cancelled,
 }
 
+/// How a concurrency group admits a new run when its single slot is already
+/// held by another active run (ADR-0011, 0032).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConcurrencyPolicy {
+    /// Wait: the new run stays Pending until the holder settles (serialize).
+    Queue,
+    /// Cancel the in-progress holder, then the new run takes the slot.
+    CancelInProgress,
+}
+
+impl ConcurrencyPolicy {
+    /// Wire token stored on the run.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConcurrencyPolicy::Queue => "queue",
+            ConcurrencyPolicy::CancelInProgress => "cancel-in-progress",
+        }
+    }
+
+    /// Parse the wire token; anything unrecognized defaults to the safe `Queue`.
+    pub fn from_wire(s: &str) -> ConcurrencyPolicy {
+        match s {
+            "cancel-in-progress" => ConcurrencyPolicy::CancelInProgress,
+            _ => ConcurrencyPolicy::Queue,
+        }
+    }
+}
+
 /// Classifies a failure so the engine can decide retry vs. dead-letter.
 ///
 /// `Infra` failures (node died, image pull, network) are retried on fresh

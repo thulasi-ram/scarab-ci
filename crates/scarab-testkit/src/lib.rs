@@ -17,8 +17,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Lease};
 use scarab_engine::{
-    Attempt, AttemptId, Clock, Db, DbError, EventKind, ExecError, Executor, LogChunkMeta, OutboxId,
-    OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, ExecError, Executor,
+    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus,
+    Timestamp,
 };
 use scarab_storage::{ObjectStore, StorageError};
 
@@ -94,6 +95,10 @@ struct InMemoryState {
     outbox: Vec<OutboxEntry>,
     /// Per-(run, step, attempt) log-chunk index (offsets only, no bodies).
     logs: HashMap<(RunId, StepId, AttemptId), Vec<LogChunkMeta>>,
+    /// Per-run concurrency group + policy.
+    concurrency: HashMap<RunId, (String, ConcurrencyPolicy)>,
+    /// The single slot holder per concurrency group.
+    slots: HashMap<String, RunId>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -241,6 +246,56 @@ impl Db for InMemoryDb {
             .steps
             .get(&(run.clone(), step.clone()))
             .and_then(|r| r.output.clone()))
+    }
+
+    async fn set_run_concurrency(
+        &self,
+        run: &RunId,
+        group: &str,
+        policy: ConcurrencyPolicy,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .concurrency
+            .insert(run.clone(), (group.to_string(), policy));
+        Ok(())
+    }
+
+    async fn run_concurrency(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<(String, ConcurrencyPolicy)>, DbError> {
+        Ok(self.state.lock().unwrap().concurrency.get(run).cloned())
+    }
+
+    async fn acquire_slot(&self, group: &str, run: &RunId) -> Result<Option<RunId>, DbError> {
+        let mut st = self.state.lock().unwrap();
+        match st.slots.get(group).cloned() {
+            None => {
+                st.slots.insert(group.to_string(), run.clone());
+                Ok(None)
+            }
+            Some(h) if &h == run => Ok(None),
+            Some(h) => {
+                // Reclaim if the current holder has settled (or vanished).
+                let terminal = st.runs.get(&h).map(|s| s.is_terminal()).unwrap_or(true);
+                if terminal {
+                    st.slots.insert(group.to_string(), run.clone());
+                    Ok(None)
+                } else {
+                    Ok(Some(h))
+                }
+            }
+        }
+    }
+
+    async fn release_slot(&self, group: &str, run: &RunId) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if st.slots.get(group) == Some(run) {
+            st.slots.remove(group);
+        }
+        Ok(())
     }
 
     async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError> {

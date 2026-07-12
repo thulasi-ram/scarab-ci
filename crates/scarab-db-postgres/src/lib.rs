@@ -20,8 +20,9 @@ use sqlx::{PgPool, Row};
 
 use scarab_engine::ports::Lease;
 use scarab_engine::{
-    Attempt, AttemptId, Db, DbError, EventKind, EventPayload, FailureKind, LogChunkMeta, OutboxId,
-    OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, FailureKind,
+    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus,
+    Timestamp,
 };
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
@@ -268,6 +269,103 @@ impl Db for PostgresDb {
                 .await
                 .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<String>, _>("output_snapshot")))
+    }
+
+    async fn set_run_concurrency(
+        &self,
+        run: &RunId,
+        group: &str,
+        policy: ConcurrencyPolicy,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE runs SET concurrency_group = $2, concurrency_policy = $3,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(group)
+        .bind(policy.as_str())
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_concurrency(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<(String, ConcurrencyPolicy)>, DbError> {
+        let row =
+            sqlx::query("SELECT concurrency_group, concurrency_policy FROM runs WHERE id = $1")
+                .bind(&run.0)
+                .fetch_optional(self.pool()?)
+                .await
+                .map_err(db_err)?;
+        Ok(row.and_then(|r| {
+            let group: Option<String> = r.get("concurrency_group");
+            let policy: Option<String> = r.get("concurrency_policy");
+            group.map(|g| (g, ConcurrencyPolicy::from_wire(policy.as_deref().unwrap_or("queue"))))
+        }))
+    }
+
+    async fn acquire_slot(&self, group: &str, run: &RunId) -> Result<Option<RunId>, DbError> {
+        // Serialize acquirers on this group with a row lock, so exactly one wins.
+        let mut tx = self.pool()?.begin().await.map_err(db_err)?;
+        let holder: Option<String> =
+            sqlx::query("SELECT holder FROM concurrency_slots WHERE group_key = $1 FOR UPDATE")
+                .bind(group)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .map(|r| r.get::<String, _>("holder"));
+
+        let result = match holder {
+            None => {
+                sqlx::query("INSERT INTO concurrency_slots (group_key, holder) VALUES ($1, $2)")
+                    .bind(group)
+                    .bind(&run.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(db_err)?;
+                None
+            }
+            Some(h) if h == run.0 => None, // already ours (idempotent)
+            Some(h) => {
+                // Reclaim the slot if the current holder has settled (or vanished).
+                let holder_terminal = sqlx::query("SELECT status FROM runs WHERE id = $1")
+                    .bind(&h)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?
+                    .map(|r| run_status_from_str(r.get::<String, _>("status")))
+                    .transpose()?
+                    .map(|s| s.is_terminal())
+                    .unwrap_or(true);
+                if holder_terminal {
+                    sqlx::query("UPDATE concurrency_slots SET holder = $2 WHERE group_key = $1")
+                        .bind(group)
+                        .bind(&run.0)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                    None
+                } else {
+                    Some(RunId(h))
+                }
+            }
+        };
+        tx.commit().await.map_err(db_err)?;
+        Ok(result)
+    }
+
+    async fn release_slot(&self, group: &str, run: &RunId) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM concurrency_slots WHERE group_key = $1 AND holder = $2")
+            .bind(group)
+            .bind(&run.0)
+            .execute(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        Ok(())
     }
 
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
