@@ -19,13 +19,20 @@ walking skeleton) is complete and green. Read `CONTEXT.md` and the cited ADRs be
 3. **Workspace on k8s (v1): whole-file CAS.** Init-container fetches the input tree from CAS
    before the step; a post-step wrapper uploads outputs. Chunking internals stay deferred
    (ADR-0029 leaves them open). Cluster round-trip tests are `#[ignore]`-gated.
-4. **Forge = GitHub-first** (ADR-0010); mock the forge HTTP boundary in tests (ADR-0017).
-5. **Secrets dev master key** from env `SCARAB_MASTER_KEY`; **OIDC signing keys** generated/loaded
-   from env for dev. KMS/real key management is pluggable later.
-6. **Slice 6 = scaffold only**: emit `openapi.json`, generate a TS client, and a minimal SolidJS
+4. **Slice 6 = scaffold only**: emit `openapi.json`, generate a TS client, and a minimal SolidJS
    project skeleton that type-checks. The rich live-DAG/SSE-logs/restart/time-travel UI is an
    **attended follow-up** (needs a Node/browser env this loop lacks). Put UI under `ui/` (a
    TS project, not a cargo member).
+5. **All slice 3–5 implementation choices are fixed in ADR-0032** — cite it, don't re-decide.
+   Highlights: **GitHub App** auth (App id + PEM private key from env → installation tokens);
+   webhook HMAC verify; `.scarab` read via contents API at the SHA; Check Runs posted via the
+   outbox; forge-agnostic identity (GitHub OAuth login → PG-backed session, native RBAC);
+   concurrency `queue|cancel-in-progress`; auto-cancel on for non-deploy; gate kinds
+   manual/timer/external; Environments with protection rules; AES-256-GCM envelope secrets
+   (`SCARAB_MASTER_KEY`); RS256 OIDC with **`sub = scarab:org/<org>/repo/<repo>/env/<env>/ref/
+   <ref>`**; fork-PR = head≠base → no secrets + restricted subject; `kind: build` rootless
+   BuildKit. Env-var names in ADR-0032 are the config contract. Live GitHub/BuildKit/cloud-OIDC
+   paths are `#[ignore]`/env-gated (untestable in this env).
 
 ## Unattended-loop policy (while the maintainer is away)
 - **Decide, document, continue.** On a genuinely blocking ambiguity: make the best architect-level
