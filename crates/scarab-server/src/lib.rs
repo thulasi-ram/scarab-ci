@@ -578,9 +578,18 @@ pub async fn trigger_run_from_event(
             continue;
         }
 
+        // Apply step-level `when:` guards against the event context (ADR-0009):
+        // only steps whose guard holds become part of the run; edges onto pruned
+        // steps are dropped. A pipeline left with no steps starts no run.
+        let selected = scarab_pipeline::select_steps(&ir, &ctx)
+            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+        if selected.steps.is_empty() {
+            continue;
+        }
+
         let now = clock.now().await;
         let run = RunId(Uuid::new_v4().to_string());
-        persist_run_from_ir(db, &run, &ir, event, path, now).await?;
+        persist_run_from_ir(db, &run, &selected, event, path, now).await?;
         runs.push(run);
     }
     Ok(runs)

@@ -160,6 +160,53 @@ async fn deploy_pipeline_opts_out_of_supersede() {
     );
 }
 
+/// Step-level `when:` guards are applied at run creation (ADR-0009): a deploy
+/// step guarded on `main` is included on a push to main and pruned on a feature
+/// branch (its dependents' edges onto it dropped).
+#[tokio::test]
+async fn step_when_guards_are_applied_when_the_run_is_created() {
+    const CI: &str = r#"
+on:
+  push: {}
+steps:
+  - { id: build, image: busybox }
+  - { id: deploy, image: busybox, needs: [build], when: "event.branch == 'main'" }
+"#;
+    let forge = FakeForge::new().with_file(".scarab/ci.yaml", CI);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    // Push to main: the guarded deploy step is included.
+    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
+        .await
+        .expect("trigger")
+        .pop()
+        .unwrap();
+    let ids: Vec<String> = db
+        .steps_of_run(&run)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.step.0.clone())
+        .collect();
+    assert!(ids.contains(&"deploy".to_string()), "deploy included on main: {ids:?}");
+
+    // Push to a feature branch: the guard fails, so deploy is pruned.
+    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("feature"))
+        .await
+        .expect("trigger")
+        .pop()
+        .unwrap();
+    let ids: Vec<String> = db
+        .steps_of_run(&run)
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.step.0.clone())
+        .collect();
+    assert_eq!(ids, vec!["build".to_string()], "deploy pruned off main: {ids:?}");
+}
+
 #[tokio::test]
 async fn push_to_non_matching_ref_starts_no_run() {
     let (forge, db, clock) = setup().await;
