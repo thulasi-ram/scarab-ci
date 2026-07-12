@@ -1,0 +1,324 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "scarab-server",
+    "description": "",
+    "license": {
+      "name": "MIT OR Apache-2.0",
+      "identifier": "MIT OR Apache-2.0"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/v1/runs": {
+      "post": {
+        "tags": [],
+        "summary": "Create and durably persist a new run from an inline pipeline.",
+        "operationId": "create_run",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Run created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateRunResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}": {
+      "get": {
+        "tags": [],
+        "summary": "Current status of a run and its steps.",
+        "operationId": "get_run",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such run"
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/events": {
+      "get": {
+        "tags": [],
+        "summary": "Server-Sent-Events tail of the run's append-only event log — the status\ntimeline (ADR-0013): RunCreated, transitions, attempt start/finish.",
+        "operationId": "get_events",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream of the run's event log"
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/gates/{step}/approve": {
+      "post": {
+        "tags": [],
+        "summary": "Release a manual gate, resuming its suspended run (ADR-0008, 0032). Authz'd\nas a write; exactly-once (a repeat approve is a no-op).",
+        "operationId": "approve_gate",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "gate step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "gate released"
+          },
+          "404": {
+            "description": "no such run or gate"
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/logs": {
+      "get": {
+        "tags": [],
+        "summary": "Server-Sent-Events of step **log bodies** (ADR-0013): replays every\ncommitted chunk (decompressed from the object store, indexed by Postgres\noffsets), then — while the run is still going — live-tails new chunks via the\nlog pipeline's broadcast. A terminal run yields the full log and closes.",
+        "operationId": "get_logs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream of step log output"
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/steps/{step}/restart": {
+      "post": {
+        "tags": [],
+        "summary": "Restart a step and its transitive descendants (ADR-0027 smart invalidation):\nthe target and every step depending on it are re-armed and re-run in\ndependency order; siblings and ancestors are left as-is.",
+        "operationId": "restart_step",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "restart accepted"
+          },
+          "404": {
+            "description": "no such run or step"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateRunRequest": {
+        "type": "object",
+        "description": "`POST /v1/runs` body: an inline pipeline to run immediately.",
+        "required": [
+          "pipeline"
+        ],
+        "properties": {
+          "pipeline": {
+            "$ref": "#/components/schemas/PipelineDto"
+          }
+        }
+      },
+      "CreateRunResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      },
+      "PipelineDto": {
+        "type": "object",
+        "description": "The inline pipeline (IR subset).",
+        "required": [
+          "ir_version",
+          "steps"
+        ],
+        "properties": {
+          "ir_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "IR schema version (ADR-0022).",
+            "minimum": 0
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StepDto"
+            }
+          }
+        }
+      },
+      "RunStatusResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "steps"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StepStatusDto"
+            }
+          }
+        }
+      },
+      "StepDto": {
+        "type": "object",
+        "description": "One step (IR subset): the step contract is an OCI `image` + `command`.",
+        "required": [
+          "id",
+          "image"
+        ],
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "id": {
+            "type": "string"
+          },
+          "image": {
+            "type": "string"
+          },
+          "needs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "StepStatusDto": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "attempts"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

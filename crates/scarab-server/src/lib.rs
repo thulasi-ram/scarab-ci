@@ -1003,6 +1003,15 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
 )]
 pub struct ApiDoc;
 
+/// The generated OpenAPI document as pretty JSON — the stable artifact clients
+/// generate from and CI diffs against (ADR-0012, 0028). This is the exact
+/// document served at `/openapi.json`.
+pub fn openapi_json() -> String {
+    ApiDoc::openapi()
+        .to_pretty_json()
+        .expect("OpenAPI document serializes")
+}
+
 /// Build the HTTP router bound to `state`.
 pub fn router(state: AppState) -> Router {
     Router::new()

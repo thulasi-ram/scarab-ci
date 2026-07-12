@@ -69,6 +69,11 @@ struct Cli {
     /// Kubernetes namespace the executor launches step Pods into.
     #[arg(long, env = "SCARAB_NAMESPACE", default_value = "scarab")]
     namespace: String,
+
+    /// Write the generated OpenAPI document to this path and exit (client
+    /// codegen / CI spec check). Does not connect to Postgres or serve.
+    #[arg(long, value_name = "PATH")]
+    emit_openapi: Option<String>,
 }
 
 #[tokio::main]
@@ -76,6 +81,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
+
+    // Spec export: write openapi.json and exit (no DB, no serving).
+    if let Some(path) = &cli.emit_openapi {
+        std::fs::write(path, scarab_server::openapi_json())?;
+        println!("wrote OpenAPI document to {path}");
+        return Ok(());
+    }
+
     tracing::info!(role = ?cli.role, "starting scarab-server");
     println!("scarab-server role = {:?}", cli.role);
 
