@@ -8,3 +8,6 @@
 /dev/server.log
 # local object-store backend (default dev fallback)
 /.scarab
+
+# UI (TS project, not a cargo member)
+/ui/node_modules
