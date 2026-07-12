@@ -76,6 +76,8 @@ struct StepRec {
     spec: Option<StepSpec>,
     needs: Vec<StepId>,
     attempts: Vec<Attempt>,
+    /// Output workspace snapshot (CAS root hash) this step produced.
+    output: Option<String>,
 }
 
 #[derive(Default)]
@@ -124,6 +126,7 @@ impl InMemoryDb {
                 spec,
                 needs: Vec::new(),
                 attempts: Vec::new(),
+                output: None,
             },
         );
     }
@@ -139,6 +142,7 @@ impl InMemoryDb {
                     spec: None,
                     needs: s.needs,
                     attempts: s.attempts,
+                    output: None,
                 },
             );
         }
@@ -208,9 +212,35 @@ impl Db for InMemoryDb {
                 spec: spec.cloned(),
                 needs: needs.to_vec(),
                 attempts: Vec::new(),
+                output: None,
             },
         );
         Ok(())
+    }
+
+    async fn set_step_output(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        snapshot: &str,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        let rec = st
+            .steps
+            .get_mut(&(run.clone(), step.clone()))
+            .ok_or(DbError::Conflict)?;
+        rec.output = Some(snapshot.to_string());
+        Ok(())
+    }
+
+    async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.output.clone()))
     }
 
     async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError> {

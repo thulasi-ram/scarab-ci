@@ -282,6 +282,23 @@ pub enum TransitionError {
 // A caller wires these into the [`Db`] port; the machine itself is I/O-free so
 // it can be exhaustively unit-tested with no infra (ADR-0002 / ADR-0017).
 
+/// Resolve a step's **input workspace** from its dependencies.
+///
+/// Implicit-by-default (ADR-0007, 0029): a step inherits the output workspace of
+/// each of its `needs`. Returns those needs' output snapshots (CAS merkle-root
+/// hashes), in `needs` order, skipping any dependency that produced no
+/// workspace. Explicit `inputs:`/`outputs:` selection is TODO(slice-2) — it
+/// needs the fields on the pipeline IR first.
+pub fn workspace_inputs(
+    needs: &[StepId],
+    output_of: &std::collections::HashMap<StepId, String>,
+) -> Vec<String> {
+    needs
+        .iter()
+        .filter_map(|n| output_of.get(n).cloned())
+        .collect()
+}
+
 /// Build an event stamped with the current [`EVENT_VERSION`].
 fn event(run: &RunId, kind: EventPayload, at: Timestamp) -> EventKind {
     EventKind {
@@ -509,5 +526,29 @@ impl StepRun {
             },
             at,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn workspace_inputs_inherit_needs_outputs_in_order() {
+        let outputs = HashMap::from([
+            (StepId("a".into()), "hash-a".to_string()),
+            (StepId("b".into()), "hash-b".to_string()),
+        ]);
+        let needs = vec![StepId("a".into()), StepId("b".into())];
+        assert_eq!(workspace_inputs(&needs, &outputs), vec!["hash-a", "hash-b"]);
+    }
+
+    #[test]
+    fn workspace_inputs_skip_needs_that_produced_nothing() {
+        // `b` never produced a workspace → it contributes no input.
+        let outputs = HashMap::from([(StepId("a".into()), "hash-a".to_string())]);
+        let needs = vec![StepId("a".into()), StepId("b".into())];
+        assert_eq!(workspace_inputs(&needs, &outputs), vec!["hash-a"]);
     }
 }

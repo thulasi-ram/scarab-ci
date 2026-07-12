@@ -16,7 +16,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore as OsObjectStore, ObjectStoreExt};
-use scarab_storage::{BlobHash, Cas, ObjectStore, StorageError, TreeEntry, TreeHash, TreeTarget};
+use scarab_storage::{
+    BlobHash, Cas, ObjectStore, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget,
+};
 use sha2::{Digest, Sha256};
 
 /// An object-store-backed store. Wraps an `object_store` backend behind our port.
@@ -123,6 +125,39 @@ impl S3Storage {
             Err(e) => Err(map_err(e)),
         }
     }
+
+    /// Snapshot one directory into a tree, recursing into sub-directories.
+    /// Bottom-up: children are hashed before the parent tree that names them.
+    /// Boxed because it recurses across an async boundary.
+    fn ingest_dir(
+        &self,
+        dir: std::path::PathBuf,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<TreeHash, StorageError>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            let mut items: Vec<std::fs::DirEntry> = std::fs::read_dir(&dir)
+                .map_err(io_err)?
+                .collect::<Result<_, _>>()
+                .map_err(io_err)?;
+            // Deterministic order (put_tree sorts too, but keep the walk stable).
+            items.sort_by_key(|e| e.file_name());
+
+            let mut entries = Vec::with_capacity(items.len());
+            for item in items {
+                let name = item.file_name().to_string_lossy().into_owned();
+                let file_type = item.file_type().map_err(io_err)?;
+                let target = if file_type.is_dir() {
+                    TreeTarget::Tree(self.ingest_dir(item.path()).await?)
+                } else {
+                    let data = std::fs::read(item.path()).map_err(io_err)?;
+                    TreeTarget::Blob(self.put_blob(&data).await?)
+                };
+                entries.push(TreeEntry { name, target });
+            }
+            self.put_tree(entries).await
+        })
+    }
 }
 
 #[async_trait]
@@ -201,5 +236,10 @@ impl Cas for S3Storage {
             }
         }
         Ok(())
+    }
+
+    async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
+        let root = self.ingest_dir(std::path::PathBuf::from(path)).await?;
+        Ok(Snapshot { root })
     }
 }

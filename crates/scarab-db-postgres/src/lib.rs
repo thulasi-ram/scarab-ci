@@ -238,6 +238,38 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<Value>, _>("ir")))
     }
 
+    async fn set_step_output(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        snapshot: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE step_runs
+             SET output_snapshot = $3,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE run_id = $1 AND step_id = $2",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(snapshot)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
+        let row =
+            sqlx::query("SELECT output_snapshot FROM step_runs WHERE run_id = $1 AND step_id = $2")
+                .bind(&run.0)
+                .bind(&step.0)
+                .fetch_optional(self.pool()?)
+                .await
+                .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("output_snapshot")))
+    }
+
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
         let row = sqlx::query("SELECT status FROM runs WHERE id = $1")
             .bind(&run.0)

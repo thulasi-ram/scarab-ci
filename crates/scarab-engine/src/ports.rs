@@ -70,6 +70,20 @@ pub trait Db: Send + Sync {
     /// The compiled IR stored on a run, or `None` if unset / the run is unknown.
     async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError>;
 
+    /// Record the output workspace snapshot (CAS merkle-root hash) a step
+    /// produced, so a dependent can materialize it as input (workspace flows
+    /// along `needs` edges — ADR-0029).
+    async fn set_step_output(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        snapshot: &str,
+    ) -> Result<(), DbError>;
+
+    /// The output workspace snapshot a step produced, or `None` if it has not
+    /// produced one (or the step is unknown).
+    async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
+
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;
 

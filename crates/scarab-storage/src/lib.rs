@@ -75,4 +75,11 @@ pub trait Cas: Send + Sync {
 
     /// Materialize a tree onto the filesystem at `path`.
     async fn materialize(&self, tree: &TreeHash, path: &str) -> Result<(), StorageError>;
+
+    /// Snapshot the filesystem directory at `path` into the store, returning its
+    /// merkle root. The dual of [`materialize`](Cas::materialize): together they
+    /// let a step's output workspace flow to a dependent's input (ADR-0029).
+    /// Files are stored as blobs and directories as trees; only content not
+    /// already present is uploaded (dedup).
+    async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError>;
 }
