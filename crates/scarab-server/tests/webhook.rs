@@ -10,16 +10,30 @@ use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
 use scarab_engine::{Db, RunId};
+use scarab_forge::ForgePort;
 use scarab_server::{router, AppState, LogService};
-use scarab_testkit::{FakeClock, InMemoryDb, InMemoryObjectStore};
+use scarab_testkit::{FakeClock, FakeForge, InMemoryDb, InMemoryObjectStore};
 
 const SECRET: &[u8] = b"topsecret";
+
+/// A `.scarab/ci.yaml` that runs one step on any push.
+const CI_YAML: &str = r#"
+on:
+  push: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#;
 
 fn app(db: Arc<InMemoryDb>) -> axum::Router {
     let clock = Arc::new(FakeClock::new(1_000));
     let store = Arc::new(InMemoryObjectStore::new());
     let logs = Arc::new(LogService::new(store, db.clone()));
-    router(AppState::new(db, clock, logs).with_github_webhook_secret(SECRET.to_vec()))
+    let forge: Arc<dyn ForgePort> = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    router(
+        AppState::new(db, clock, logs)
+            .with_github_webhook_secret(SECRET.to_vec())
+            .with_forge(forge),
+    )
 }
 
 fn push_body() -> Vec<u8> {

@@ -60,6 +60,10 @@ pub struct AppState {
     /// HMAC secret for verifying inbound GitHub webhooks (ADR-0032). `None`
     /// disables the ingest endpoint (rejects with 401).
     pub github_webhook_secret: Option<Vec<u8>>,
+    /// The forge port used to read in-repo `.scarab` config on a trigger. `None`
+    /// means the webhook ingest can verify+normalize but not start config-driven
+    /// runs.
+    pub forge: Option<Arc<dyn scarab_forge::ForgePort>>,
 }
 
 impl AppState {
@@ -69,12 +73,19 @@ impl AppState {
             clock,
             logs,
             github_webhook_secret: None,
+            forge: None,
         }
     }
 
     /// Set the GitHub webhook HMAC secret (from `SCARAB_GITHUB_WEBHOOK_SECRET`).
     pub fn with_github_webhook_secret(mut self, secret: Vec<u8>) -> Self {
         self.github_webhook_secret = Some(secret);
+        self
+    }
+
+    /// Set the forge port used to read in-repo config on a trigger.
+    pub fn with_forge(mut self, forge: Arc<dyn scarab_forge::ForgePort>) -> Self {
+        self.forge = Some(forge);
         self
     }
 }
@@ -357,6 +368,112 @@ async fn restart_step(
     }
 }
 
+/// Canonical in-repo config path read on a trigger (ADR-0010). Multi-file
+/// `.scarab/*.yaml` discovery is a follow-up; v1 reads one pipeline.
+pub const CONFIG_PATH: &str = ".scarab/ci.yaml";
+
+/// Error building a triggered run from a forge event.
+#[derive(Debug, thiserror::Error)]
+pub enum TriggerError {
+    #[error(transparent)]
+    Forge(scarab_forge::ForgeError),
+    #[error("pipeline: {0}")]
+    Pipeline(String),
+    #[error("config is not valid UTF-8")]
+    NotUtf8,
+    #[error(transparent)]
+    Db(#[from] DbError),
+}
+
+/// The ref/SHA to read the pipeline config at — the event's commit where
+/// available (immutable, ADR-0032), else a branch/tag ref.
+fn config_ref(event: &scarab_forge::Event) -> String {
+    use scarab_forge::Event;
+    match event {
+        Event::Push { after, .. } => after.clone(),
+        Event::PullRequest { head, .. } => head.clone(),
+        Event::Tag { tag, .. } | Event::Release { tag, .. } => format!("refs/tags/{tag}"),
+        _ => "HEAD".to_string(),
+    }
+}
+
+/// "Commit a file, done" (ADR-0010): on a normalized `event`, read the in-repo
+/// `.scarab` config at the triggering ref, compile it to IR, and — if the
+/// pipeline's `on:` matches this event — durably create the Run. Returns the new
+/// run id, or `None` when there is no config or no trigger matches.
+pub async fn trigger_run_from_event(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &dyn Db,
+    clock: &dyn Clock,
+    event: &scarab_forge::Event,
+) -> Result<Option<RunId>, TriggerError> {
+    // Repo-less events (cron/manual/api) don't carry in-repo config here.
+    let Some(repo) = event.repo() else {
+        return Ok(None);
+    };
+    let git_ref = config_ref(event);
+    let bytes = match forge.read_file_at_ref(repo, &git_ref, CONFIG_PATH).await {
+        Ok(b) => b,
+        // No config committed → nothing to run (not an error).
+        Err(scarab_forge::ForgeError::Api(_)) => return Ok(None),
+        Err(e) => return Err(TriggerError::Forge(e)),
+    };
+    let yaml = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
+    let ir = scarab_pipeline::compile_yaml(&yaml).map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+
+    let ctx = event.context();
+    let matched = scarab_pipeline::matches_trigger(&ir, event.trigger_kind().as_str(), &ctx)
+        .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+    if !matched {
+        return Ok(None);
+    }
+
+    let now = clock.now().await;
+    let run = RunId(Uuid::new_v4().to_string());
+    persist_run_from_ir(db, &run, &ir, event, now).await?;
+    Ok(Some(run))
+}
+
+/// Durably materialize a compiled pipeline IR into a Run: store the IR on the
+/// run (self-describing, ADR-0022), record RunCreated + the normalized trigger
+/// on the event log, and create each step with its `needs`.
+async fn persist_run_from_ir(
+    db: &dyn Db,
+    run: &RunId,
+    ir: &scarab_pipeline::PipelineIr,
+    event: &scarab_forge::Event,
+    now: Timestamp,
+) -> Result<(), TriggerError> {
+    db.create_run(run, ir.ir_version, EVENT_VERSION, now).await?;
+    db.store_run_ir(run, &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null))
+        .await?;
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::RunCreated,
+        at: now,
+    })
+    .await?;
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::Raw(serde_json::json!({ "trigger": event.context() })),
+        at: now,
+    })
+    .await?;
+    for step in &ir.steps {
+        let spec = StepSpec {
+            image: step.image.clone(),
+            command: step.command.clone(),
+            env: step.env.clone(),
+        };
+        let needs: Vec<StepId> = step.needs.0.iter().map(|n| StepId(n.clone())).collect();
+        db.create_step_run(run, &StepId(step.id.clone()), Some(&spec), &needs, now)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Inbound GitHub webhook ingest (ADR-0010, 0032): verify the HMAC signature,
 /// normalize the payload to a canonical forge [`Event`](scarab_forge::Event),
 /// then durably create a Run triggered by it (its steps are populated when the
@@ -398,39 +515,27 @@ async fn github_webhook(
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };
 
-    // Durably create the triggered run and record the normalized trigger on its
-    // event log (source for the in-repo-config step).
-    let now = st.clock.now().await;
-    let run = RunId(Uuid::new_v4().to_string());
-    st.db
-        .create_run(&run, scarab_pipeline::IR_VERSION, EVENT_VERSION, now)
-        .await?;
-    st.db
-        .append_event(&EventKind {
-            version: EVENT_VERSION,
-            run: run.clone(),
-            kind: EventPayload::RunCreated,
-            at: now,
-        })
-        .await?;
-    st.db
-        .append_event(&EventKind {
-            version: EVENT_VERSION,
-            run: run.clone(),
-            kind: EventPayload::Raw(serde_json::json!({
-                "trigger": serde_json::to_value(&event).unwrap_or(serde_json::Value::Null),
-            })),
-            at: now,
-        })
-        .await?;
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({
-            "run_id": run.0,
-            "trigger": event.trigger_kind(),
-        })),
-    ))
+    // Read in-repo `.scarab` config at the event ref, compile, and start a run
+    // if the pipeline's `on:` matches (ADR-0010). Without a forge wired, we can
+    // only acknowledge the delivery.
+    let Some(forge) = st.forge.as_ref() else {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "ignored": "no forge configured" })),
+        ));
+    };
+    match trigger_run_from_event(forge.as_ref(), st.db.as_ref(), st.clock.as_ref(), &event).await {
+        Ok(Some(run)) => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "run_id": run.0, "trigger": event.trigger_kind() })),
+        )),
+        Ok(None) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "ignored": "no matching pipeline" })),
+        )),
+        Err(TriggerError::Db(e)) => Err(ApiError::Db(e)),
+        Err(e) => Err(ApiError::BadRequest(e.to_string())),
+    }
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> String {

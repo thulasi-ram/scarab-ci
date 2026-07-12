@@ -114,6 +114,24 @@ pub enum TriggerKind {
     Upstream,
 }
 
+impl TriggerKind {
+    /// The canonical lowercase token (matches the pipeline IR's `on:` keys and
+    /// the serde representation).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TriggerKind::Push => "push",
+            TriggerKind::PullRequest => "pull_request",
+            TriggerKind::Tag => "tag",
+            TriggerKind::Release => "release",
+            TriggerKind::Comment => "comment",
+            TriggerKind::Cron => "cron",
+            TriggerKind::Manual => "manual",
+            TriggerKind::Api => "api",
+            TriggerKind::Upstream => "upstream",
+        }
+    }
+}
+
 impl Event {
     /// The trigger kind this event matches against a pipeline's `on:`.
     pub fn trigger_kind(&self) -> TriggerKind {
@@ -142,6 +160,54 @@ impl Event {
             | Event::Upstream { repo, .. } => Some(repo),
             Event::Cron { .. } | Event::Manual { .. } | Event::Api { .. } => None,
         }
+    }
+
+    /// A stable, flat JSON context for CEL trigger matching / interpolation
+    /// (ADR-0010): `{ "event": { "kind", "repo", … } }` with event-specific
+    /// fields (`branch`/`ref`/`sha` for push, `tag`, `number`, …). Authoring
+    /// reads e.g. `event.branch == 'main'`.
+    pub fn context(&self) -> serde_json::Value {
+        use serde_json::json;
+        let mut e = serde_json::Map::new();
+        e.insert("kind".into(), json!(self.trigger_kind().as_str()));
+        if let Some(r) = self.repo() {
+            e.insert("repo".into(), json!({ "owner": r.owner, "name": r.name }));
+        }
+        match self {
+            Event::Push { r#ref, after, .. } => {
+                e.insert("ref".into(), json!(r#ref));
+                e.insert(
+                    "branch".into(),
+                    json!(r#ref.strip_prefix("refs/heads/").unwrap_or(r#ref)),
+                );
+                e.insert("sha".into(), json!(after));
+            }
+            Event::Tag { tag, .. } => {
+                e.insert("tag".into(), json!(tag));
+                e.insert("ref".into(), json!(format!("refs/tags/{tag}")));
+            }
+            Event::PullRequest { number, head, .. } => {
+                e.insert("number".into(), json!(number));
+                e.insert("sha".into(), json!(head));
+            }
+            Event::Release { tag, .. } => {
+                e.insert("tag".into(), json!(tag));
+            }
+            Event::Comment { issue, body, .. } => {
+                e.insert("issue".into(), json!(issue));
+                e.insert("body".into(), json!(body));
+            }
+            Event::Cron { schedule } => {
+                e.insert("schedule".into(), json!(schedule));
+            }
+            Event::Manual { actor } | Event::Api { actor } => {
+                e.insert("actor".into(), json!(actor));
+            }
+            Event::Upstream { run, .. } => {
+                e.insert("run".into(), json!(run));
+            }
+        }
+        json!({ "event": serde_json::Value::Object(e) })
     }
 }
 
@@ -295,6 +361,27 @@ mod tests {
             assert_eq!(StatusState::from_wire(state.as_wire()), Some(state));
         }
         assert_eq!(StatusState::from_wire("bogus"), None);
+    }
+
+    #[test]
+    fn push_context_exposes_branch_and_sha_for_cel() {
+        let ctx = Event::Push {
+            repo: repo(),
+            r#ref: "refs/heads/main".into(),
+            after: "deadbeef".into(),
+        }
+        .context();
+        assert_eq!(ctx["event"]["kind"], "push");
+        assert_eq!(ctx["event"]["branch"], "main");
+        assert_eq!(ctx["event"]["ref"], "refs/heads/main");
+        assert_eq!(ctx["event"]["sha"], "deadbeef");
+        assert_eq!(ctx["event"]["repo"]["owner"], "acme");
+    }
+
+    #[test]
+    fn trigger_kind_as_str_matches_serde_token() {
+        assert_eq!(TriggerKind::PullRequest.as_str(), "pull_request");
+        assert_eq!(TriggerKind::Push.as_str(), "push");
     }
 
     #[test]

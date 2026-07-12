@@ -617,3 +617,102 @@ impl ObjectStore for InMemoryObjectStore {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// FakeForge — an in-memory ForgePort for trigger / checks tests
+// ---------------------------------------------------------------------------
+
+use scarab_forge::{
+    Commit, Event, ForgeError, ForgePort, Permissions, Repo, Status, WebhookDelivery,
+};
+
+/// An in-memory [`ForgePort`]: serves seeded in-repo files (by path, e.g.
+/// `.scarab/ci.yaml`) and records the statuses/comments pushed back, so trigger
+/// and check-posting tests need no network (ADR-0017).
+#[derive(Default)]
+pub struct FakeForge {
+    files: Mutex<HashMap<String, Vec<u8>>>,
+    statuses: Mutex<Vec<Status>>,
+    comments: Mutex<Vec<(u64, String)>>,
+}
+
+impl FakeForge {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed the content the forge returns for `path` at any ref.
+    pub fn with_file(self, path: impl Into<String>, content: impl Into<Vec<u8>>) -> Self {
+        self.files.lock().unwrap().insert(path.into(), content.into());
+        self
+    }
+
+    /// Statuses pushed back via [`set_status`](ForgePort::set_status).
+    pub fn statuses(&self) -> Vec<Status> {
+        self.statuses.lock().unwrap().clone()
+    }
+
+    /// Comments posted via [`post_comment`](ForgePort::post_comment).
+    pub fn comments(&self) -> Vec<(u64, String)> {
+        self.comments.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ForgePort for FakeForge {
+    async fn latest_commit(&self, _repo: &Repo, r#ref: &str) -> Result<Commit, ForgeError> {
+        Ok(Commit {
+            sha: r#ref.to_string(),
+            message: String::new(),
+        })
+    }
+
+    async fn read_file_at_ref(
+        &self,
+        _repo: &Repo,
+        _ref: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, ForgeError> {
+        self.files
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .ok_or_else(|| ForgeError::Api(format!("no such file: {path}")))
+    }
+
+    async fn register_webhook(&self, _repo: &Repo, _callback_url: &str) -> Result<(), ForgeError> {
+        Ok(())
+    }
+
+    async fn normalize_event(&self, _raw: WebhookDelivery) -> Result<Event, ForgeError> {
+        Err(ForgeError::UnsupportedEvent("fake forge does not normalize".into()))
+    }
+
+    async fn set_status(
+        &self,
+        _repo: &Repo,
+        _commit: &Commit,
+        status: Status,
+    ) -> Result<(), ForgeError> {
+        self.statuses.lock().unwrap().push(status);
+        Ok(())
+    }
+
+    async fn create_deployment(&self, _repo: &Repo, _environment: &str) -> Result<(), ForgeError> {
+        Ok(())
+    }
+
+    async fn post_comment(&self, _repo: &Repo, issue: u64, body: &str) -> Result<(), ForgeError> {
+        self.comments.lock().unwrap().push((issue, body.to_string()));
+        Ok(())
+    }
+
+    async fn get_permissions(&self, _repo: &Repo, _user: &str) -> Result<Permissions, ForgeError> {
+        Ok(Permissions {
+            read: true,
+            write: true,
+            admin: true,
+        })
+    }
+}

@@ -2584,6 +2584,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "scarab-engine",
+ "scarab-forge",
  "scarab-storage",
  "serde_json",
  "tokio",

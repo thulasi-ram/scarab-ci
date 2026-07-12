@@ -42,7 +42,32 @@ pub struct PipelineIr {
     /// Schema version of the IR, for forward/backward compatibility.
     #[serde(default = "default_ir_version")]
     pub ir_version: u32,
+    /// The events that start this pipeline (`on:`), keyed by trigger kind. Empty
+    /// means "no automatic triggers" (API/manual only). Matched against a
+    /// normalized forge event via [`matches_trigger`] (ADR-0009, 0010).
+    #[serde(default, rename = "on", skip_serializing_if = "Triggers::is_empty")]
+    pub triggers: Triggers,
     pub steps: Vec<StepSpec>,
+}
+
+/// A pipeline's `on:` block: trigger kind (e.g. `push`, `pull_request`) → filter.
+/// Kinds are the canonical vocabulary of `scarab_forge::TriggerKind`, kept as
+/// strings so this pure crate need not depend on the forge domain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Triggers(pub std::collections::BTreeMap<String, TriggerFilter>);
+
+impl Triggers {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A filter narrowing when a trigger kind fires: an optional CEL predicate over
+/// the event context (`when:`). Absent `when` means the kind always matches.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
 }
 
 /// One step. The step contract (ADR-0008) is an OCI `image` + a `command`; the
@@ -183,6 +208,7 @@ pub fn compile_yaml(yaml: &str) -> Result<PipelineIr, PipelineError> {
 
     let ir = PipelineIr {
         ir_version: authored.ir_version,
+        triggers: authored.triggers,
         steps: expanded,
     };
 
@@ -315,6 +341,15 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         }
     }
 
+    // Submit-time CEL: each trigger's `when:` predicate must parse now.
+    for (kind, filter) in &ir.triggers.0 {
+        if let Some(expr) = &filter.when {
+            if let Err(e) = cel::check(expr) {
+                diagnostics.push(format!("trigger `{kind}`: when {e}"));
+            }
+        }
+    }
+
     // Cycle detection over needs edges (Kahn's algorithm). Only run when the
     // graph is well-formed enough to be meaningful (no dangling edges).
     if diagnostics.is_empty() {
@@ -327,6 +362,28 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         Ok(())
     } else {
         Err(diagnostics)
+    }
+}
+
+/// Does this pipeline fire for an event of `kind` in the given `ctx`?
+///
+/// The pipeline must declare the trigger kind in its `on:`; if that trigger has
+/// a `when:` predicate, it must evaluate true against `ctx` (the event context,
+/// e.g. `{ "event": { "branch": "main", … } }`). `kind` is the canonical trigger
+/// token (`scarab_forge::TriggerKind::as_str`), passed as a string so this pure
+/// crate stays independent of the forge domain (ADR-0009, 0010). A bad predicate
+/// is a submit-time error (already rejected by [`validate`]).
+pub fn matches_trigger(
+    ir: &PipelineIr,
+    kind: &str,
+    ctx: &serde_json::Value,
+) -> Result<bool, PipelineError> {
+    match ir.triggers.0.get(kind) {
+        None => Ok(false),
+        Some(filter) => match &filter.when {
+            None => Ok(true),
+            Some(expr) => cel::eval_bool(expr, ctx),
+        },
     }
 }
 
@@ -402,6 +459,7 @@ pub fn select_steps(
     }
     Ok(PipelineIr {
         ir_version: ir.ir_version,
+        triggers: ir.triggers.clone(),
         steps: kept,
     })
 }
@@ -584,6 +642,45 @@ mod tests {
         // notify's edge onto the pruned `deploy` is dropped, not left dangling.
         let notify = on_feature.steps.iter().find(|s| s.id == "notify").unwrap();
         assert!(notify.needs.0.is_empty());
+    }
+
+    #[test]
+    fn on_triggers_compile_and_match_by_kind_and_predicate() {
+        let ir = compile(
+            r#"
+            on:
+              push:
+                when: "event.branch == 'main'"
+              pull_request: {}
+            steps:
+              - { id: a, image: busybox }
+            "#,
+        );
+
+        let on_main = json!({ "event": { "branch": "main" } });
+        let on_dev = json!({ "event": { "branch": "dev" } });
+
+        // push fires only when the predicate holds.
+        assert!(matches_trigger(&ir, "push", &on_main).unwrap());
+        assert!(!matches_trigger(&ir, "push", &on_dev).unwrap(), "ref filtered out");
+        // pull_request has no predicate → always fires when declared.
+        assert!(matches_trigger(&ir, "pull_request", &on_main).unwrap());
+        // a kind not in `on:` never fires.
+        assert!(!matches_trigger(&ir, "tag", &on_main).unwrap());
+    }
+
+    #[test]
+    fn bad_trigger_predicate_fails_at_submit() {
+        let diags = errors(
+            r#"
+            on:
+              push:
+                when: "1 +"
+            steps:
+              - { id: a, image: busybox }
+            "#,
+        );
+        assert!(diags.iter().any(|d| d.contains("trigger `push`")), "got {diags:?}");
     }
 
     #[test]
