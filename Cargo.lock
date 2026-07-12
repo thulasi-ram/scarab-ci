@@ -2565,6 +2565,8 @@ dependencies = [
  "async-trait",
  "object_store",
  "scarab-storage",
+ "serde_json",
+ "sha2",
  "tokio",
 ]
 
