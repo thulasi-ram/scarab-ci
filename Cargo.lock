@@ -2575,6 +2575,7 @@ dependencies = [
  "async-trait",
  "scarab-engine",
  "scarab-storage",
+ "serde_json",
  "tokio",
 ]
 

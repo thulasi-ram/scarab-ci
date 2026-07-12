@@ -8,6 +8,7 @@ license.workspace = true
 scarab-engine = { workspace = true }
 scarab-storage = { workspace = true }
 async-trait = { workspace = true }
+serde_json = { workspace = true }
 
 # Test-only: an async runtime to drive the async `Db`/`Clock` ports in tests.
 # This is a dev-dependency, so the testkit library itself stays infra-free.

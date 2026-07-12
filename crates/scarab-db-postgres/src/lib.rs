@@ -139,7 +139,7 @@ impl Db for PostgresDb {
                  FOR UPDATE SKIP LOCKED
                  LIMIT $1
              )
-             RETURNING run_id, step_id, status",
+             RETURNING run_id, step_id, status, needs",
         )
         .bind(limit as i64)
         .fetch_all(self.pool()?)
@@ -151,12 +151,14 @@ impl Db for PostgresDb {
             let run = RunId(r.get::<String, _>("run_id"));
             let step = StepId(r.get::<String, _>("step_id"));
             let status = step_status_from_str(r.get::<String, _>("status"))?;
+            let needs = needs_from_value(r.get::<Value, _>("needs"))?;
             let attempts = self.attempts(&run, &step).await?;
             claimed.push(StepRun {
                 run,
                 step,
                 status,
                 attempts,
+                needs,
             });
         }
         Ok(claimed)
@@ -189,24 +191,51 @@ impl Db for PostgresDb {
         run: &RunId,
         step: &StepId,
         spec: Option<&StepSpec>,
+        needs: &[StepId],
         at: Timestamp,
     ) -> Result<(), DbError> {
         let spec_json = spec
             .map(|s| serde_json::to_value(s).map_err(|e| DbError::Other(e.to_string())))
             .transpose()?;
+        let needs_json = needs_to_value(needs);
         sqlx::query(
-            "INSERT INTO step_runs (run_id, step_id, status, spec, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $5)",
+            "INSERT INTO step_runs (run_id, step_id, status, spec, needs, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $6)",
         )
         .bind(&run.0)
         .bind(&step.0)
         .bind(step_status_str(StepStatus::Pending))
         .bind(spec_json)
+        .bind(needs_json)
         .bind(at.0)
         .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE runs
+             SET ir = $2, updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(ir)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError> {
+        let row = sqlx::query("SELECT ir FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        // `ir` is itself nullable, so unwrap both the missing-row and NULL cases.
+        Ok(row.and_then(|r| r.get::<Option<Value>, _>("ir")))
     }
 
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
@@ -251,21 +280,25 @@ impl Db for PostgresDb {
     }
 
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
-        let rows = sqlx::query("SELECT step_id, status FROM step_runs WHERE run_id = $1 ORDER BY step_id")
-            .bind(&run.0)
-            .fetch_all(self.pool()?)
-            .await
-            .map_err(db_err)?;
+        let rows = sqlx::query(
+            "SELECT step_id, status, needs FROM step_runs WHERE run_id = $1 ORDER BY step_id",
+        )
+        .bind(&run.0)
+        .fetch_all(self.pool()?)
+        .await
+        .map_err(db_err)?;
         let mut steps = Vec::with_capacity(rows.len());
         for r in rows {
             let step = StepId(r.get::<String, _>("step_id"));
             let status = step_status_from_str(r.get::<String, _>("status"))?;
+            let needs = needs_from_value(r.get::<Value, _>("needs"))?;
             let attempts = self.attempts(run, &step).await?;
             steps.push(StepRun {
                 run: run.clone(),
                 step,
                 status,
                 attempts,
+                needs,
             });
         }
         Ok(steps)
@@ -579,6 +612,19 @@ fn run_status_from_str(s: String) -> Result<RunStatus, DbError> {
         "dead_lettered" => RunStatus::DeadLettered,
         other => return Err(DbError::Other(format!("unknown run status {other:?}"))),
     })
+}
+
+/// Serialize a step's dependency edges to the JSONB array stored in
+/// `step_runs.needs` (an array of step-id strings).
+fn needs_to_value(needs: &[StepId]) -> Value {
+    Value::Array(needs.iter().map(|s| Value::String(s.0.clone())).collect())
+}
+
+/// Parse the `step_runs.needs` JSONB array back into step ids.
+fn needs_from_value(v: Value) -> Result<Vec<StepId>, DbError> {
+    let ids: Vec<String> =
+        serde_json::from_value(v).map_err(|e| DbError::Other(e.to_string()))?;
+    Ok(ids.into_iter().map(StepId).collect())
 }
 
 fn step_status_str(s: StepStatus) -> &'static str {

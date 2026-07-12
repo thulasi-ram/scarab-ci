@@ -19,6 +19,8 @@
 //! step reads durable state and every transition is guarded by optimistic
 //! concurrency, so a restart re-drives without duplicating work.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ports::ExecState;
@@ -157,11 +159,30 @@ impl<'a> Scheduler<'a> {
                 .await?;
         }
 
-        // Promote dep-satisfied Pending steps to Ready. Slice-1 has no `needs`
-        // edges, so every Pending step is immediately eligible.
-        for step in self.db.steps_of_run(run).await? {
-            if step.status == StepStatus::Pending {
+        // Dependency-aware admission (ADR-0006, 0011): promote a Pending step to
+        // Ready only once ALL its `needs` have Succeeded — emergent parallelism
+        // falls out (steps with satisfied/empty needs promote together). If a
+        // dependency reached a terminal non-success state it can never succeed,
+        // so the dependent is Skipped and the run can settle rather than
+        // deadlock (default all-success join, ADR-0023). Richer join policies
+        // (all-complete / any-success) and gate/skip nuances are Slice 4.
+        let steps = self.db.steps_of_run(run).await?;
+        let status_by_id: HashMap<&StepId, StepStatus> =
+            steps.iter().map(|s| (&s.step, s.status)).collect();
+        for step in &steps {
+            if step.status != StepStatus::Pending {
+                continue;
+            }
+            let dep_states = || {
+                step.needs
+                    .iter()
+                    .map(|d| status_by_id.get(d).copied().unwrap_or(StepStatus::Pending))
+            };
+            if dep_states().all(|s| s == StepStatus::Succeeded) {
                 self.transition_step(run, &step.step, StepStatus::Pending, StepStatus::Ready)
+                    .await?;
+            } else if dep_states().any(|s| s.is_terminal() && s != StepStatus::Succeeded) {
+                self.transition_step(run, &step.step, StepStatus::Pending, StepStatus::Skipped)
                     .await?;
             }
         }
@@ -248,6 +269,7 @@ impl<'a> Scheduler<'a> {
                     started_at: self.clock.now().await,
                     failure: None,
                 }],
+                needs: Vec::new(),
             };
             let handle = self.executor.launch(&step_run, &spec).await?;
 

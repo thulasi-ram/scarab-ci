@@ -51,14 +51,24 @@ pub trait Db: Send + Sync {
         at: Timestamp,
     ) -> Result<(), DbError>;
 
-    /// Create a step projection in `Pending`, storing its durable launch `spec`.
+    /// Create a step projection in `Pending`, storing its durable launch `spec`
+    /// and its `needs` (dependency in-edges) for dependency-aware admission.
     async fn create_step_run(
         &self,
         run: &RunId,
         step: &StepId,
         spec: Option<&StepSpec>,
+        needs: &[StepId],
         at: Timestamp,
     ) -> Result<(), DbError>;
+
+    /// Store the compiled Pipeline IR on a run so it is self-describing (the
+    /// "what to run" travels with the run, surviving a control-plane upgrade —
+    /// ADR-0022). Overwrites any prior value.
+    async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError>;
+
+    /// The compiled IR stored on a run, or `None` if unset / the run is unknown.
+    async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError>;
 
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;

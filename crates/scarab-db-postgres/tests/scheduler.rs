@@ -40,7 +40,7 @@ async fn one_step_run_reaches_succeeded() {
     let run = scarab_engine::RunId("run-1".into());
     let step = StepId("build".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &step, Some(&spec()), Timestamp(0))
+    db.create_step_run(&run, &step, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
 
@@ -76,7 +76,7 @@ async fn scheduler_restart_redrives_without_duplication() {
     let run = scarab_engine::RunId("run-1".into());
     let step = StepId("build".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &step, Some(&spec()), Timestamp(0))
+    db.create_step_run(&run, &step, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
 

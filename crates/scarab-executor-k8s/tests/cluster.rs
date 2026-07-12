@@ -34,6 +34,7 @@ fn step() -> StepRun {
             started_at: Timestamp(0),
             failure: None,
         }],
+        needs: vec![],
     }
 }
 

@@ -29,7 +29,7 @@ async fn concurrent_claim_yields_no_double_dispatch() {
     let run = RunId("r".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
     for i in 0..N {
-        db.create_step_run(&run, &StepId(format!("s{i:02}")), None, Timestamp(0))
+        db.create_step_run(&run, &StepId(format!("s{i:02}")), None, &[], Timestamp(0))
             .await
             .unwrap();
     }

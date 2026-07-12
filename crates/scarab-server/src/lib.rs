@@ -77,7 +77,7 @@ pub struct CreateRunRequest {
 }
 
 /// The inline pipeline (IR subset).
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PipelineDto {
     /// IR schema version (ADR-0022).
     pub ir_version: u32,
@@ -85,7 +85,7 @@ pub struct PipelineDto {
 }
 
 /// One step (IR subset): the step contract is an OCI `image` + `command`.
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StepDto {
     pub id: String,
     pub image: String,
@@ -164,6 +164,10 @@ async fn create_run(
     st.db
         .create_run(&run, req.pipeline.ir_version, EVENT_VERSION, now)
         .await?;
+    // Store the compiled IR on the run — self-describing (ADR-0022).
+    let ir = serde_json::to_value(&req.pipeline)
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+    st.db.store_run_ir(&run, &ir).await?;
     st.db
         .append_event(&EventKind {
             version: EVENT_VERSION,
@@ -183,8 +187,9 @@ async fn create_run(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         };
+        let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
-            .create_step_run(&run, &StepId(step.id.clone()), Some(&spec), now)
+            .create_step_run(&run, &StepId(step.id.clone()), Some(&spec), &needs, now)
             .await?;
     }
 
@@ -277,7 +282,7 @@ async fn get_logs(
         for a in &s.attempts {
             let body = st.logs.read_all(&run, &s.step, &a.id).await.unwrap_or_default();
             if !body.is_empty() {
-                replay.push(Ok(Event::default().data(String::from_utf8_lossy(&body).into_owned())));
+                replay.push(Ok(Event::default().data(String::from_utf8_lossy(&body))));
             }
             if !status.is_terminal() {
                 receivers.push(st.logs.subscribe(&run, &s.step, &a.id));
@@ -294,7 +299,7 @@ async fn get_logs(
         let live = futures::stream::select_all(receivers.into_iter().map(|rx| {
             BroadcastStream::new(rx).map(|r| {
                 Ok(match r {
-                    Ok(bytes) => Event::default().data(String::from_utf8_lossy(&bytes).into_owned()),
+                    Ok(bytes) => Event::default().data(String::from_utf8_lossy(&bytes)),
                     // A slow reader that lagged the broadcast buffer: note the gap.
                     Err(_) => Event::default().comment("log stream lagged"),
                 })

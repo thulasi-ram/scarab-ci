@@ -69,11 +69,12 @@ struct OutboxEntry {
     dispatched: bool,
 }
 
-/// A step's in-memory row: status, durable spec, and attempts.
+/// A step's in-memory row: status, durable spec, dependency edges, and attempts.
 #[derive(Default)]
 struct StepRec {
     status: Option<StepStatus>,
     spec: Option<StepSpec>,
+    needs: Vec<StepId>,
     attempts: Vec<Attempt>,
 }
 
@@ -83,6 +84,8 @@ struct InMemoryState {
     events: Vec<EventKind>,
     /// Current run statuses — the "state table" the real store keeps.
     runs: HashMap<RunId, RunStatus>,
+    /// Compiled IR stored per run (self-describing runs, ADR-0022).
+    run_ir: HashMap<RunId, serde_json::Value>,
     /// Per-(run, step) rows: status, spec, attempts.
     steps: HashMap<(RunId, StepId), StepRec>,
     /// The transactional outbox.
@@ -119,6 +122,7 @@ impl InMemoryDb {
             StepRec {
                 status: Some(status),
                 spec,
+                needs: Vec::new(),
                 attempts: Vec::new(),
             },
         );
@@ -133,6 +137,7 @@ impl InMemoryDb {
                 StepRec {
                     status: Some(StepStatus::Ready),
                     spec: None,
+                    needs: s.needs,
                     attempts: s.attempts,
                 },
             );
@@ -167,6 +172,7 @@ impl Db for InMemoryDb {
                 step: key.1.clone(),
                 status: StepStatus::Running,
                 attempts: rec.attempts.clone(),
+                needs: rec.needs.clone(),
             });
         }
         Ok(claimed)
@@ -192,6 +198,7 @@ impl Db for InMemoryDb {
         run: &RunId,
         step: &StepId,
         spec: Option<&StepSpec>,
+        needs: &[StepId],
         _at: Timestamp,
     ) -> Result<(), DbError> {
         self.state.lock().unwrap().steps.insert(
@@ -199,10 +206,24 @@ impl Db for InMemoryDb {
             StepRec {
                 status: Some(StepStatus::Pending),
                 spec: spec.cloned(),
+                needs: needs.to_vec(),
                 attempts: Vec::new(),
             },
         );
         Ok(())
+    }
+
+    async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_ir
+            .insert(run.clone(), ir.clone());
+        Ok(())
+    }
+
+    async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError> {
+        Ok(self.state.lock().unwrap().run_ir.get(run).cloned())
     }
 
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
@@ -281,6 +302,7 @@ impl Db for InMemoryDb {
                     step: s.clone(),
                     status,
                     attempts: rec.attempts.clone(),
+                    needs: rec.needs.clone(),
                 })
             })
             .collect();

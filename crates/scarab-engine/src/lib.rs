@@ -104,12 +104,20 @@ pub struct Run {
 }
 
 /// The per-run projection of a single step.
+///
+/// Carries its `needs` (the step's DAG in-edges) so the DAG snapshot the
+/// scheduler folds is self-contained: dependency-aware admission reads `needs`
+/// directly rather than issuing a second query (ADR-0006, 0011).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepRun {
     pub run: RunId,
     pub step: StepId,
     pub status: StepStatus,
     pub attempts: Vec<Attempt>,
+    /// Upstream steps this step depends on. A step is admissible only once all
+    /// of these have `Succeeded`.
+    #[serde(default)]
+    pub needs: Vec<StepId>,
 }
 
 /// One attempt at executing a step.
@@ -354,13 +362,14 @@ impl StepStatus {
 }
 
 impl StepRun {
-    /// A step with no attempts yet, in `Pending`.
+    /// A step with no attempts yet and no dependencies, in `Pending`.
     pub fn new(run: RunId, step: StepId) -> StepRun {
         StepRun {
             run,
             step,
             status: StepStatus::Pending,
             attempts: Vec::new(),
+            needs: Vec::new(),
         }
     }
 

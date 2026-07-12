@@ -288,6 +288,7 @@ mod tests {
                 started_at: Timestamp(0),
                 failure: None,
             }],
+            needs: vec![],
         }
     }
 
