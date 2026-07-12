@@ -49,6 +49,9 @@ pub struct LogService {
     db: Arc<dyn Db>,
     /// Live broadcast channels, one per in-flight stream.
     live: Mutex<HashMap<StreamKey, broadcast::Sender<Vec<u8>>>>,
+    /// Secret values to scrub from every chunk before it is stored or streamed
+    /// (ADR-0013, 0032). Registered when secrets are injected into a step.
+    secrets: Mutex<Vec<Vec<u8>>>,
 }
 
 impl LogService {
@@ -57,7 +60,30 @@ impl LogService {
             store,
             db,
             live: Mutex::new(HashMap::new()),
+            secrets: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Register a secret value so it is redacted from all subsequent log chunks.
+    /// Empty values are ignored. Idempotent.
+    pub fn register_secret(&self, value: &[u8]) {
+        if value.is_empty() {
+            return;
+        }
+        let mut secrets = self.secrets.lock().unwrap();
+        if !secrets.iter().any(|v| v == value) {
+            secrets.push(value.to_vec());
+        }
+    }
+
+    /// Replace every registered secret value in `data` with `***`.
+    fn redact(&self, data: &[u8]) -> Vec<u8> {
+        let secrets = self.secrets.lock().unwrap();
+        let mut out = data.to_vec();
+        for value in secrets.iter() {
+            out = replace_bytes(&out, value, b"***");
+        }
+        out
     }
 
     fn sender(&self, key: &StreamKey) -> broadcast::Sender<Vec<u8>> {
@@ -86,13 +112,17 @@ impl LogService {
         attempt: &AttemptId,
         chunk: &[u8],
     ) -> Result<LogChunkMeta, LogError> {
+        // Scrub secrets before the bytes touch the store OR the live stream, so
+        // a value never reaches stored or streamed logs (ADR-0013, 0032).
+        let chunk = self.redact(chunk);
+
         // Next seq / cumulative uncompressed offset from the existing index.
         let existing = self.db.log_chunks(run, step, attempt).await?;
         let seq = existing.len() as u64;
         let byte_offset = existing.iter().map(|c| c.len).sum();
 
         let key = object_key(run, step, attempt, seq);
-        let compressed = gzip(chunk).map_err(|e| LogError::Gzip(e.to_string()))?;
+        let compressed = gzip(&chunk).map_err(|e| LogError::Gzip(e.to_string()))?;
         self.store.put(&key, compressed).await?;
 
         let meta = LogChunkMeta {
@@ -106,7 +136,7 @@ impl LogService {
         // Best-effort live fan-out (ignored if there are no subscribers).
         let _ = self
             .sender(&stream_key(run, step, attempt))
-            .send(chunk.to_vec());
+            .send(chunk.clone());
 
         Ok(meta)
     }
@@ -140,4 +170,23 @@ fn gunzip(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     d.read_to_end(&mut out)?;
     Ok(out)
+}
+
+/// Replace every occurrence of `needle` in `haystack` with `repl`.
+fn replace_bytes(haystack: &[u8], needle: &[u8], repl: &[u8]) -> Vec<u8> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < haystack.len() {
+        if i + needle.len() <= haystack.len() && &haystack[i..i + needle.len()] == needle {
+            out.extend_from_slice(repl);
+            i += needle.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out
 }

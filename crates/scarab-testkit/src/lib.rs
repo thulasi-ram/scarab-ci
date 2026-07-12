@@ -929,3 +929,78 @@ impl SessionStore for InMemorySessions {
         Ok(self.sessions.lock().unwrap().get(id).cloned())
     }
 }
+
+// ---------------------------------------------------------------------------
+// FakeSecrets — an in-memory SecretProvider
+// ---------------------------------------------------------------------------
+
+use scarab_secrets::{Secret, SecretError, SecretProvider, SecretScope};
+
+/// An in-memory [`SecretProvider`] for tests: values seeded per scope, resolved
+/// by exact scope (no crypto, no database).
+#[derive(Default)]
+pub struct FakeSecrets {
+    values: Mutex<HashMap<(String, String), Vec<u8>>>,
+}
+
+impl FakeSecrets {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed `key`=`value` at `scope`.
+    pub fn with_secret(self, scope: &SecretScope, key: &str, value: &[u8]) -> Self {
+        self.values
+            .lock()
+            .unwrap()
+            .insert((scope_key(scope), key.to_string()), value.to_vec());
+        self
+    }
+}
+
+fn scope_key(scope: &SecretScope) -> String {
+    match scope {
+        SecretScope::Org { org } => format!("org:{org}"),
+        SecretScope::Repo { org, repo } => format!("repo:{org}/{repo}"),
+        SecretScope::Environment {
+            org,
+            repo,
+            environment,
+        } => format!("env:{org}/{repo}/{environment}"),
+    }
+}
+
+#[async_trait]
+impl SecretProvider for FakeSecrets {
+    async fn get(&self, scope: &SecretScope, key: &str) -> Result<Secret, SecretError> {
+        self.values
+            .lock()
+            .unwrap()
+            .get(&(scope_key(scope), key.to_string()))
+            .map(|v| Secret {
+                key: key.to_string(),
+                value: v.clone(),
+            })
+            .ok_or(SecretError::NotFound)
+    }
+
+    async fn put(&self, scope: &SecretScope, secret: Secret) -> Result<(), SecretError> {
+        self.values
+            .lock()
+            .unwrap()
+            .insert((scope_key(scope), secret.key), secret.value);
+        Ok(())
+    }
+
+    async fn list_scoped(&self, scope: &SecretScope) -> Result<Vec<String>, SecretError> {
+        let sk = scope_key(scope);
+        Ok(self
+            .values
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(s, _)| s == &sk)
+            .map(|(_, k)| k.clone())
+            .collect())
+    }
+}

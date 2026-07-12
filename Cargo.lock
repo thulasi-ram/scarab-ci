@@ -2685,6 +2685,7 @@ dependencies = [
  "scarab-engine",
  "scarab-forge",
  "scarab-identity",
+ "scarab-secrets",
  "scarab-storage",
  "serde_json",
  "tokio",

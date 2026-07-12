@@ -9,6 +9,7 @@ scarab-engine = { workspace = true }
 scarab-storage = { workspace = true }
 scarab-forge = { workspace = true }
 scarab-identity = { workspace = true }
+scarab-secrets = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 

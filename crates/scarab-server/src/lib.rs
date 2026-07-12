@@ -900,6 +900,30 @@ async fn deploy_environment(
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "deployed": true }))).into_response())
 }
 
+/// Resolve a step's scoped secrets and prepare them for injection (ADR-0014,
+/// 0013): fetch each `key` at `scope` from `provider`, **register its value with
+/// the log redactor** so it can never appear in stored or streamed logs, and
+/// return the values as `(key, value)` env pairs for the Pod. The launch path
+/// merges these into the step's env (an executor detail; the live Pod wiring is
+/// k8s/`build_pod`).
+pub async fn resolve_step_secrets(
+    provider: &dyn scarab_secrets::SecretProvider,
+    logs: &LogService,
+    scope: &scarab_secrets::SecretScope,
+    keys: &[String],
+) -> Result<Vec<(String, String)>, scarab_secrets::SecretError> {
+    let mut env = Vec::with_capacity(keys.len());
+    for key in keys {
+        let secret = provider.get(scope, key).await?;
+        logs.register_secret(&secret.value);
+        env.push((
+            key.clone(),
+            String::from_utf8_lossy(&secret.value).into_owned(),
+        ));
+    }
+    Ok(env)
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
