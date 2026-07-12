@@ -1,7 +1,8 @@
 //! # scarab-pipeline — pipeline authoring & compilation
 //!
-//! Pure domain crate (serde / serde_json / serde_yaml / thiserror only — all
-//! pure-computation deps per ADR-0031; no I/O, no infra). Turns authored YAML
+//! Pure domain crate (serde / serde_json / serde_yaml / cel-interpreter /
+//! thiserror only — all pure-computation deps per ADR-0031; no I/O, no clock,
+//! no RNG, no infra). Turns authored YAML
 //! into a validated, versioned [`PipelineIr`] — the *real* DSL (ADR-0009); YAML
 //! is merely one frontend.
 //!
@@ -81,11 +82,19 @@ pub struct StepSpec {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Needs(pub Vec<String>);
 
-/// A build matrix that fans a single spec into many concrete steps: a map from
-/// dimension name to its values. Expanded to the cartesian product at submit
-/// time (ADR-0023).
+/// A build matrix that fans a single spec into many concrete steps. Expanded to
+/// the cartesian product of its `dimensions` at submit time (ADR-0023), minus
+/// any combination for which an `exclude` CEL predicate holds. Predicates are
+/// evaluated against the combination's own coordinate (each dimension bound as a
+/// variable), so expansion stays fully static.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Matrix(pub BTreeMap<String, Vec<String>>);
+pub struct Matrix {
+    pub dimensions: BTreeMap<String, Vec<String>>,
+    /// CEL predicates over the dimension variables; a combination is dropped if
+    /// any predicate is true (e.g. `os == 'windows' && arch == 'arm64'`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+}
 
 /// A conditional guard, expressed as a CEL expression (kept as a raw string
 /// here; evaluated by the [`cel`] submodule).
@@ -112,8 +121,8 @@ pub enum PipelineError {
     Parse(String),
     #[error("pipeline validation failed:\n  - {}", .0.join("\n  - "))]
     Validation(Vec<String>),
-    #[error("not yet implemented")]
-    NotImplemented,
+    #[error("cel error: {0}")]
+    Cel(String),
 }
 
 /// Compile authored YAML into a validated [`PipelineIr`].
@@ -194,10 +203,10 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
         return Ok(vec![base]);
     };
 
-    if matrix.0.is_empty() {
+    if matrix.dimensions.is_empty() {
         return Err(format!("step `{}`: matrix has no dimensions", step.id));
     }
-    for (dim, values) in &matrix.0 {
+    for (dim, values) in &matrix.dimensions {
         if values.is_empty() {
             return Err(format!(
                 "step `{}`: matrix dimension `{dim}` has no values",
@@ -208,7 +217,7 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
 
     // Cartesian product over the (sorted) dimensions.
     let mut combos: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
-    for (dim, values) in &matrix.0 {
+    for (dim, values) in &matrix.dimensions {
         let mut next = Vec::with_capacity(combos.len() * values.len());
         for combo in &combos {
             for value in values {
@@ -220,7 +229,29 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
         combos = next;
     }
 
-    Ok(combos
+    // Drop combinations excluded by a CEL predicate (evaluated against the
+    // combination's own coordinate — each dimension bound as a variable).
+    let mut kept = Vec::with_capacity(combos.len());
+    for coord in combos {
+        let ctx = serde_json::Value::Object(
+            coord
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect(),
+        );
+        let mut excluded = false;
+        for pred in &matrix.exclude {
+            if cel::eval_bool(pred, &ctx).map_err(|e| format!("step `{}`: {e}", step.id))? {
+                excluded = true;
+                break;
+            }
+        }
+        if !excluded {
+            kept.push(coord);
+        }
+    }
+
+    Ok(kept
         .into_iter()
         .map(|coord| {
             let suffix = coord
@@ -265,6 +296,21 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                     "step `{}`: needs unknown step `{need}`",
                     step.id
                 ));
+            }
+        }
+        // Submit-time CEL: `when:` guards and every `${{ … }}` interpolation
+        // must parse now, not fail mid-run (ADR-0009).
+        if let Some(When(expr)) = &step.when {
+            if let Err(e) = cel::check(expr) {
+                diagnostics.push(format!("step `{}`: when {e}", step.id));
+            }
+        }
+        let mut templates = vec![&step.image];
+        templates.extend(&step.command);
+        templates.extend(step.env.iter().map(|(_, v)| v));
+        for t in templates {
+            if let Err(e) = cel::check_interpolation(t) {
+                diagnostics.push(format!("step `{}`: {e}", step.id));
             }
         }
     }
@@ -329,9 +375,41 @@ fn find_cycle(steps: &[StepSpec]) -> Option<Vec<String>> {
     Some(in_cycle)
 }
 
+/// Return a copy of `ir` keeping only steps whose `when:` guard is true (or
+/// absent) under `ctx` — the include/exclude primitive (ADR-0009). `needs` edges
+/// onto pruned steps are dropped so the result stays well-formed.
+///
+/// Transitive skip propagation (a step whose *only* dependency was pruned) is
+/// the engine's concern, not this pure lowering — TODO(slice-4) when gate/skip
+/// semantics land.
+pub fn select_steps(
+    ir: &PipelineIr,
+    ctx: &serde_json::Value,
+) -> Result<PipelineIr, PipelineError> {
+    let mut kept: Vec<StepSpec> = Vec::new();
+    for step in &ir.steps {
+        let include = match &step.when {
+            Some(When(expr)) => cel::eval_bool(expr, ctx)?,
+            None => true,
+        };
+        if include {
+            kept.push(step.clone());
+        }
+    }
+    let kept_ids: BTreeSet<String> = kept.iter().map(|s| s.id.clone()).collect();
+    for step in &mut kept {
+        step.needs.0.retain(|n| kept_ids.contains(n));
+    }
+    Ok(PipelineIr {
+        ir_version: ir.ir_version,
+        steps: kept,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn compile(yaml: &str) -> PipelineIr {
         compile_yaml(yaml).expect("expected valid pipeline")
@@ -379,8 +457,9 @@ mod tests {
               - id: build
                 image: rust
                 matrix:
-                  os: [linux, mac]
-                  arch: [amd64, arm64]
+                  dimensions:
+                    os: [linux, mac]
+                    arch: [amd64, arm64]
             "#,
         );
         assert_eq!(ir.steps.len(), 4);
@@ -407,7 +486,8 @@ mod tests {
               - id: build
                 image: rust
                 matrix:
-                  os: [linux, mac]
+                  dimensions:
+                    os: [linux, mac]
               - id: release
                 image: busybox
                 needs: [build]
@@ -453,13 +533,66 @@ mod tests {
               - id: build
                 image: rust
                 matrix:
-                  os: []
+                  dimensions:
+                    os: []
             "#,
         );
         assert!(
             diags.iter().any(|d| d.contains("dimension `os` has no values")),
             "got {diags:?}"
         );
+    }
+
+    #[test]
+    fn matrix_exclude_predicate_drops_combinations() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: build
+                image: rust
+                matrix:
+                  dimensions:
+                    os: [linux, windows]
+                    arch: [amd64, arm64]
+                  exclude:
+                    - "os == 'windows' && arch == 'arm64'"
+            "#,
+        );
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ir.steps.len(), 3, "one combo excluded, got {ids:?}");
+        assert!(!ids.contains(&"build[arch=arm64,os=windows]"));
+        assert!(ids.contains(&"build[arch=amd64,os=windows]"));
+    }
+
+    #[test]
+    fn when_selects_steps_and_prunes_edges() {
+        let ir = compile(
+            r#"
+            steps:
+              - { id: build, image: busybox }
+              - { id: deploy, image: busybox, needs: [build], when: "event.branch == 'main'" }
+              - { id: notify, image: busybox, needs: [deploy] }
+            "#,
+        );
+
+        let on_main = select_steps(&ir, &json!({ "event": { "branch": "main" } })).unwrap();
+        assert_eq!(on_main.steps.len(), 3);
+
+        let on_feature = select_steps(&ir, &json!({ "event": { "branch": "feat" } })).unwrap();
+        let ids: Vec<&str> = on_feature.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["build", "notify"], "deploy excluded");
+        // notify's edge onto the pruned `deploy` is dropped, not left dangling.
+        let notify = on_feature.steps.iter().find(|s| s.id == "notify").unwrap();
+        assert!(notify.needs.0.is_empty());
+    }
+
+    #[test]
+    fn bad_cel_in_when_or_interpolation_fails_at_submit() {
+        let when = errors(r#"steps: [{ id: a, image: busybox, when: "1 +" }]"#);
+        assert!(when.iter().any(|d| d.contains("when")), "got {when:?}");
+
+        let interp = errors(r#"steps: [{ id: a, image: "img:${{ 1 + }}" }]"#);
+        assert!(!interp.is_empty(), "expected a submit-time CEL error");
     }
 
     #[test]
