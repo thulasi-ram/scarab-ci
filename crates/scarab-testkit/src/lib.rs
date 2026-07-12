@@ -103,6 +103,9 @@ struct InMemoryState {
     run_created: HashMap<RunId, Timestamp>,
     /// Per-run supersede key `(repo, ref, pipeline)`.
     supersede_keys: HashMap<RunId, String>,
+    /// Per-run project (fairness) and admission priority.
+    run_project: HashMap<RunId, String>,
+    run_priority: HashMap<RunId, i32>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -327,6 +330,33 @@ impl Db for InMemoryDb {
         Ok(older)
     }
 
+    async fn set_run_scheduling(
+        &self,
+        run: &RunId,
+        project: &str,
+        priority: i32,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        st.run_project.insert(run.clone(), project.to_string());
+        st.run_priority.insert(run.clone(), priority);
+        Ok(())
+    }
+
+    async fn run_project(&self, run: &RunId) -> Result<Option<String>, DbError> {
+        Ok(self.state.lock().unwrap().run_project.get(run).cloned())
+    }
+
+    async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
+        let st = self.state.lock().unwrap();
+        let n = st
+            .runs
+            .iter()
+            .filter(|(_, s)| matches!(s, RunStatus::Running | RunStatus::Suspended))
+            .filter(|(r, _)| project.is_none_or(|p| st.run_project.get(*r).map(String::as_str) == Some(p)))
+            .count();
+        Ok(n as u32)
+    }
+
     async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError> {
         self.state
             .lock()
@@ -352,7 +382,15 @@ impl Db for InMemoryDb {
             .filter(|(_, s)| !s.is_terminal())
             .map(|(r, _)| r.clone())
             .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
+        // Priority desc, then creation order, then id — matches the adapter so
+        // admission hands capacity to higher-priority runs first.
+        out.sort_by(|a, b| {
+            let pa = st.run_priority.get(a).copied().unwrap_or(0);
+            let pb = st.run_priority.get(b).copied().unwrap_or(0);
+            let ca = st.run_created.get(a).copied().unwrap_or(Timestamp(0));
+            let cb = st.run_created.get(b).copied().unwrap_or(Timestamp(0));
+            pb.cmp(&pa).then(ca.cmp(&cb)).then(a.0.cmp(&b.0))
+        });
         Ok(out)
     }
 

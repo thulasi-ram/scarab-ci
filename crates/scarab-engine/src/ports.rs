@@ -118,6 +118,23 @@ pub trait Db: Send + Sync {
     /// per run).
     async fn superseded_by(&self, run: &RunId) -> Result<Vec<RunId>, DbError>;
 
+    /// Set a run's `project` (for per-project fairness) and admission `priority`
+    /// (higher admits first) — ADR-0011, 0032.
+    async fn set_run_scheduling(
+        &self,
+        run: &RunId,
+        project: &str,
+        priority: i32,
+    ) -> Result<(), DbError>;
+
+    /// A run's project, if set.
+    async fn run_project(&self, run: &RunId) -> Result<Option<String>, DbError>;
+
+    /// How many runs are in-flight (started, not terminal). With `project`,
+    /// scoped to that project (fairness cap); without, the global count
+    /// (backpressure).
+    async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError>;
+
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;
 

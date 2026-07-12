@@ -167,6 +167,10 @@ struct Config {
     lease_ttl_ms: i64,
     outbox_batch: u32,
     outbox_visibility_ms: i64,
+    /// Max in-flight runs per project (fairness). Default 20 (ADR-0032).
+    project_run_cap: u32,
+    /// Max in-flight runs globally (backpressure). Default unbounded.
+    global_run_cap: u32,
 }
 
 /// The durable scheduler. Borrows the ports for the duration of a cycle.
@@ -194,8 +198,22 @@ impl<'a> Scheduler<'a> {
                 lease_ttl_ms: 30_000,
                 outbox_batch: 16,
                 outbox_visibility_ms: 30_000,
+                project_run_cap: 20,
+                global_run_cap: u32::MAX,
             },
         }
+    }
+
+    /// Override the per-project in-flight cap (fairness).
+    pub fn with_project_run_cap(mut self, cap: u32) -> Self {
+        self.cfg.project_run_cap = cap;
+        self
+    }
+
+    /// Override the global in-flight cap (backpressure).
+    pub fn with_global_run_cap(mut self, cap: u32) -> Self {
+        self.cfg.global_run_cap = cap;
+        self
     }
 
     /// Override the outbox claim-lease (visibility) window. Mainly for tests that
@@ -268,6 +286,18 @@ impl<'a> Scheduler<'a> {
             // never supersede or get superseded.
             for older in self.db.superseded_by(run).await? {
                 self.cancel_run(&older).await?;
+            }
+            // Backpressure + fairness (ADR-0011, 0032): hold the run Pending if
+            // the global or its project's in-flight cap is reached. tick_all
+            // admits in priority order, so scarce capacity goes to higher-
+            // priority work first; the rest wait durably.
+            if self.db.count_in_flight_runs(None).await? >= self.cfg.global_run_cap {
+                return Ok(());
+            }
+            if let Some(project) = self.db.run_project(run).await? {
+                if self.db.count_in_flight_runs(Some(&project)).await? >= self.cfg.project_run_cap {
+                    return Ok(());
+                }
             }
             if let Some((group, policy)) = self.db.run_concurrency(run).await? {
                 if let Some(holder) = self.db.acquire_slot(&group, run).await? {

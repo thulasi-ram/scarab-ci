@@ -401,6 +401,48 @@ impl Db for PostgresDb {
         Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
     }
 
+    async fn set_run_scheduling(
+        &self,
+        run: &RunId,
+        project: &str,
+        priority: i32,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE runs SET project = $2, priority = $3,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(project)
+        .bind(priority)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_project(&self, run: &RunId) -> Result<Option<String>, DbError> {
+        let row = sqlx::query("SELECT project FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("project")))
+    }
+
+    async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
+        let row = sqlx::query(
+            "SELECT count(*) AS n FROM runs
+             WHERE status IN ('running', 'suspended')
+               AND ($1::text IS NULL OR project = $1)",
+        )
+        .bind(project)
+        .fetch_one(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(row.get::<i64, _>("n") as u32)
+    }
+
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
         let row = sqlx::query("SELECT status FROM runs WHERE id = $1")
             .bind(&run.0)
@@ -412,8 +454,11 @@ impl Db for PostgresDb {
     }
 
     async fn active_runs(&self) -> Result<Vec<RunId>, DbError> {
+        // Priority order (higher first, then oldest) so the admission pass hands
+        // scarce capacity to higher-priority work before lower (ADR-0011, 0032).
         let rows = sqlx::query(
-            "SELECT id FROM runs WHERE status IN ('pending', 'running', 'suspended') ORDER BY created_at",
+            "SELECT id FROM runs WHERE status IN ('pending', 'running', 'suspended')
+             ORDER BY priority DESC, created_at",
         )
         .fetch_all(self.pool()?)
         .await
