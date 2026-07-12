@@ -28,6 +28,10 @@ uuid = { workspace = true }
 futures = { workspace = true }
 flate2 = { workspace = true }
 tokio-stream = { workspace = true }
+jsonwebtoken = { workspace = true }
+rsa = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
 
 # every scarab crate — the server is the composition root
 scarab-engine = { workspace = true }

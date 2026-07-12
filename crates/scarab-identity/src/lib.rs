@@ -132,13 +132,32 @@ pub trait SessionStore: Send + Sync {
     async fn get(&self, id: &str) -> Result<Option<Session>, IdentityError>;
 }
 
-/// Claims to embed in a minted per-run JWT.
+/// Claims to embed in a minted per-run OIDC JWT for keyless cloud federation
+/// (ADR-0015, 0032). Minted per **attempt**, short-lived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claims {
+    /// `iss` — the configured Scarab issuer URL.
+    pub issuer: String,
+    /// `sub` — `scarab:org/<org>/repo/<repo>/env/<env>/ref/<ref>` (see
+    /// [`Claims::run_subject`]).
     pub subject: String,
+    /// `aud` — configurable per cloud.
     pub audience: String,
     pub run_id: String,
+    pub attempt: String,
+    pub event: String,
+    pub git_ref: String,
+    pub sha: String,
+    /// `exp` — unix-seconds expiry (short TTL).
     pub expires_at: i64,
+}
+
+impl Claims {
+    /// The workload-identity subject a cloud's trust policy matches against
+    /// (ADR-0015, 0032): `scarab:org/<org>/repo/<repo>/env/<env>/ref/<ref>`.
+    pub fn run_subject(org: &str, repo: &str, env: &str, git_ref: &str) -> String {
+        format!("scarab:org/{org}/repo/{repo}/env/{env}/ref/{git_ref}")
+    }
 }
 
 /// A signed JSON Web Token (compact serialization).
@@ -230,6 +249,14 @@ mod tests {
         };
         assert!(p.can(Action::Write)); // via Member
         assert!(!p.can(Action::Administer));
+    }
+
+    #[test]
+    fn run_subject_encodes_org_repo_env_ref() {
+        assert_eq!(
+            Claims::run_subject("acme", "app", "prod", "refs/heads/main"),
+            "scarab:org/acme/repo/app/env/prod/ref/refs/heads/main"
+        );
     }
 
     #[test]

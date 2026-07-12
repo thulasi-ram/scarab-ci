@@ -36,6 +36,7 @@ use scarab_identity::{Action, Principal, Session};
 
 pub mod converged;
 pub mod logs;
+pub mod oidc;
 pub use logs::LogService;
 
 /// A wall-clock [`Clock`] for production wiring (tests inject `FakeClock`).
@@ -74,6 +75,8 @@ pub struct AppState {
     /// Environments + deployment history store. `None` disables the environment
     /// endpoints.
     pub environments: Option<Arc<dyn scarab_projects::EnvironmentStore>>,
+    /// The OIDC issuer. When set, serves JWKS + discovery for keyless federation.
+    pub oidc: Option<Arc<oidc::Rs256Issuer>>,
 }
 
 impl AppState {
@@ -87,7 +90,14 @@ impl AppState {
             auth: None,
             sessions: None,
             environments: None,
+            oidc: None,
         }
+    }
+
+    /// Enable the OIDC issuer (JWKS + discovery endpoints).
+    pub fn with_oidc(mut self, issuer: Arc<oidc::Rs256Issuer>) -> Self {
+        self.oidc = Some(issuer);
+        self
     }
 
     /// Enable the environment / deployment endpoints.
@@ -924,6 +934,20 @@ pub async fn resolve_step_secrets(
     Ok(env)
 }
 
+/// The JWKS a cloud fetches to verify Scarab-issued OIDC tokens (ADR-0015).
+async fn jwks(State(st): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let issuer = st.oidc.as_ref().ok_or(ApiError::NotFound)?;
+    Ok(Json(issuer.jwks()))
+}
+
+/// The OIDC discovery document.
+async fn openid_configuration(
+    State(st): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let issuer = st.oidc.as_ref().ok_or(ApiError::NotFound)?;
+    Ok(Json(issuer.discovery()))
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -954,6 +978,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/openapi.json", get(openapi))
+        .route("/.well-known/jwks.json", get(jwks))
+        .route("/.well-known/openid-configuration", get(openid_configuration))
         .route("/v1/auth/login", post(login))
         .route("/v1/runs", post(create_run))
         .route("/v1/runs/{id}", get(get_run))
