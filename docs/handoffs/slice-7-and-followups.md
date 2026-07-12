@@ -65,10 +65,13 @@ Each is a *thin* follow-up, not new design; all noted in commit bodies /
 `TODO(slice-N)` markers. Highest-leverage first:
 
 > **Progress (follow-up session after `24a570b`):** #1 (concurrency + gate +
-> environment authoring), #2 (`GET /v1/runs`), #6 (multi-file discovery), and
-> #7 (deploy supersede opt-out) are **done** — commits `63f3dcd`, `aba7456`,
-> `5149401`, `5366fe6`. #3 was investigated and found **blocked** — see its note.
-> Remaining: #4, #5, and the admission-enforcement tail of #7.
+> environment authoring), #2 (`GET /v1/runs`), #3 (restart skip-if-unchanged),
+> #6 (multi-file discovery), and #7 (deploy supersede opt-out) are **done** —
+> commits `63f3dcd`, `aba7456`, `c535630`, `5149401`, `5366fe6`. Production
+> wiring: `EnvironmentStore` + OIDC issuer now constructed in `main.rs`
+> (`e5fa736`). **Remaining:** #4, #5, the admission-enforcement tail of #7, and
+> the GitHub-App/OAuth/secrets production wiring (blocked on stub adapters +
+> live externals — see that section).
 
 1. ✅ **Pipeline authoring of the engine features** — `concurrency:`, `kind:
    gate`, and `environment:` all now author from a committed `.scarab`
@@ -76,15 +79,15 @@ Each is a *thin* follow-up, not new design; all noted in commit bodies /
 2. ✅ **`GET /v1/runs` list endpoint** — added (`aba7456`); `Db::list_runs`,
    OpenAPI + typed UI client regenerated. The SolidJS route still needs wiring
    to *call* it (attended UI follow-up).
-3. ⛔ **Restart skip-if-unchanged** (ADR-0027 default) — **blocked, not thin.**
-   The decision needs a step's output hash *before vs after* re-run, but the
-   production path never records outputs: `Scheduler::finalize_step` doesn't call
-   `set_step_output`, and `ExecState::Succeeded` carries no output hash. The
-   `set_step_output`/`step_output` *storage* substrate exists but is only ever
-   written from tests. Implementing just the decision logic now would land
-   inert, unexercised code. **Do this together with output-snapshot production
-   wiring** (the executor reporting an output hash + `finalize_step` recording
-   it) — i.e. after/with #4 and the live-workspace path.
+3. ✅ **Restart skip-if-unchanged** (ADR-0027 default) — done (`c535630`). Added
+   `Executor::output`, `Db::set_step_input`/`step_input` (migration 0013), a pure
+   `input_signature`, and the skip decision in `admit` (unchanged descendant →
+   `Succeeded` + `StepSkipped` event, output carried forward; explicit target
+   always re-runs; side-effecting/no-output steps never skip). **Note:** the k8s
+   executor's `output` still returns `None` until the live post-step CAS snapshot
+   is wired, so in a *real cluster run* skip won't trigger yet (safe cascade);
+   the engine logic is fully exercised via the FakeExecutor. Wire k8s
+   post-step output with the live-workspace path.
 4. **Explicit workspace `inputs:`/`outputs:`** — only implicit-by-default is done;
    needs IR fields. `engine/lib.rs` TODO(slice-2). (Consumer — workspace
    materialization — is still test-only; see #3's note.)
@@ -100,18 +103,21 @@ Each is a *thin* follow-up, not new design; all noted in commit bodies /
    `AppState`/`main.rs` (see Production wiring). The explicit
    `POST /v1/environments/.../deploy` endpoint already enforces them.
 
-## Production wiring not yet connected in `scarab-server/src/main.rs`
+## Production wiring in `scarab-server/src/main.rs`
 
-Built + tested, but the converged binary doesn't construct them (so these paths
-are inert in a running server):
-
-- **GitHub App auth** (App JWT → installation token) — until wired,
-  `AppState.forge = None` and the driver's forge is `None`, so the live webhook
-  `read_file_at_ref` and status-post paths don't run.
-- **Real OAuth + PG-backed `SessionStore`** (currently in-memory; API authz is
-  default-open when no store is configured).
-- **`SecretProvider` (PostgresSecrets) / `OidcIssuer` (Rs256Issuer) /
-  `EnvironmentStore`** — not yet placed in `AppState`/`main.rs`.
+- ✅ **`EnvironmentStore` + `OidcIssuer`** now constructed in `main.rs`
+  (`e5fa736`): the Postgres adapter backs `EnvironmentStore` (when connected);
+  an `Rs256Issuer` is generated when `SCARAB_OIDC_ISSUER` is set.
+- ⛔ **GitHub App auth** (App JWT → installation token) — **blocked, not mere
+  wiring:** `GithubForge`'s API methods (`read_file_at_ref`, `set_status`,
+  `latest_commit`, …) are all `unimplemented!()`. Needs a real GitHub HTTP
+  adapter + App-auth, verifiable only against live GitHub (`#[ignore]`). Until
+  then `AppState.forge = None` and the live webhook read / status-post don't run.
+- ⛔ **Real OAuth + PG-backed `SessionStore`** — only `FakeAuthenticator` /
+  `InMemorySessions` exist; both need new adapters (OAuth needs live creds).
+- ⚠️ **`SecretProvider` (PostgresSecrets)** — the adapter exists, but there is no
+  injection wiring in the driver (`converged.rs`/scheduler don't reference it).
+  Threading it into the executor step-launch path is the remaining work.
 
 ## Live paths gated `#[ignore]` (need a real cluster/registry)
 
