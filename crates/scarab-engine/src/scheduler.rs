@@ -58,6 +58,104 @@ pub enum SchedulerError {
     BadPayload(String),
 }
 
+/// Errors from a restart request.
+#[derive(Debug, thiserror::Error)]
+pub enum RestartError {
+    #[error(transparent)]
+    Db(#[from] DbError),
+    #[error("no such step {0:?} in run")]
+    StepNotFound(StepId),
+}
+
+/// Restart a step (ADR-0027): re-arm `target` and every step that transitively
+/// depends on it back to `Pending`, then reopen a settled run. A subsequent
+/// admission mints a fresh [`Attempt`] for each re-armed step and re-runs them
+/// in dependency order; siblings and ancestors are left untouched (smart
+/// invalidation — the cascade is scoped to the target's descendants).
+///
+/// Needs only the [`Db`] and [`Clock`] ports (no executor), so the API role can
+/// call it directly without an execution backend.
+///
+/// Content-addressed *skip*-if-unchanged (skip a descendant when the restarted
+/// step's new output hash equals its old one — ADR-0027's optimization over a
+/// plain cascade) is a fast-follow (TODO(slice-2)); the per-step output-snapshot
+/// substrate it needs is already in place. The re-armed descendants therefore
+/// re-run (the safe cascade branch) until that lands.
+pub async fn restart_step(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    target: &StepId,
+) -> Result<(), RestartError> {
+    let steps = db.steps_of_run(run).await?;
+    if !steps.iter().any(|s| &s.step == target) {
+        return Err(RestartError::StepNotFound(target.clone()));
+    }
+    let invalid = crate::invalidation_set(target, &steps);
+
+    // Reopen a settled run so admission picks the re-armed steps back up.
+    if let Some(current) = db.run_status(run).await? {
+        if current.is_terminal() {
+            reopen(db, clock, run, current, RunStatus::Running).await?;
+        }
+    }
+
+    // Re-arm each invalidated step (terminal or in-flight) to Pending. A peer
+    // that already moved it is a benign Conflict we skip.
+    for s in &steps {
+        if invalid.contains(&s.step) && s.status != StepStatus::Pending {
+            match db
+                .record_step_transition(run, &s.step, s.status, StepStatus::Pending)
+                .await
+            {
+                Ok(()) => {
+                    let now = clock.now().await;
+                    db.append_event(&EventKind {
+                        version: EVENT_VERSION,
+                        run: run.clone(),
+                        kind: EventPayload::StepTransitioned {
+                            step: s.step.clone(),
+                            from: s.status,
+                            to: StepStatus::Pending,
+                        },
+                        at: now,
+                    })
+                    .await?;
+                }
+                Err(DbError::Conflict) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Move a run `from -> to` and append the transition event (used to reopen a
+/// settled run on restart).
+async fn reopen(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    from: RunStatus,
+    to: RunStatus,
+) -> Result<(), RestartError> {
+    match db.record_transition(run, from, to).await {
+        Ok(()) => {
+            let now = clock.now().await;
+            db.append_event(&EventKind {
+                version: EVENT_VERSION,
+                run: run.clone(),
+                kind: EventPayload::RunTransitioned { from, to },
+                at: now,
+            })
+            .await?;
+            Ok(())
+        }
+        Err(DbError::Conflict) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Configuration knobs (sane slice-1 defaults via [`Scheduler::new`]).
 struct Config {
     lease_ttl_ms: i64,

@@ -28,8 +28,8 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use scarab_engine::{
-    Clock, Db, DbError, EventKind, EventPayload, RunId, RunStatus, StepId, StepSpec, StepStatus,
-    Timestamp, EVENT_VERSION,
+    Clock, Db, DbError, EventKind, EventPayload, RestartError, RunId, RunStatus, StepId, StepSpec,
+    StepStatus, Timestamp, EVENT_VERSION,
 };
 
 pub mod converged;
@@ -309,6 +309,33 @@ async fn get_logs(
     }
 }
 
+/// Restart a step and its transitive descendants (ADR-0027 smart invalidation):
+/// the target and every step depending on it are re-armed and re-run in
+/// dependency order; siblings and ancestors are left as-is.
+#[utoipa::path(
+    post,
+    path = "/v1/runs/{id}/steps/{step}/restart",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "step id")
+    ),
+    responses(
+        (status = 202, description = "restart accepted"),
+        (status = 404, description = "no such run or step")
+    )
+)]
+async fn restart_step(
+    State(st): State<AppState>,
+    Path((id, step)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let run = RunId(id);
+    match scarab_engine::restart_step(&*st.db, &*st.clock, &run, &StepId(step)).await {
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
+        Err(RestartError::Db(e)) => Err(ApiError::Db(e)),
+    }
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -322,7 +349,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
 /// The generated OpenAPI document. The pipeline request schema is the IR subset.
 #[derive(OpenApi)]
 #[openapi(
-    paths(create_run, get_run, get_events, get_logs),
+    paths(create_run, get_run, get_events, get_logs, restart_step),
     components(schemas(
         CreateRunRequest,
         PipelineDto,
@@ -343,6 +370,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))
         .route("/v1/runs/{id}/logs", get(get_logs))
+        .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
         .with_state(state)
 }
 

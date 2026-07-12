@@ -21,7 +21,7 @@ pub mod ports;
 pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor};
-pub use scheduler::{Scheduler, SchedulerError};
+pub use scheduler::{restart_step, RestartError, Scheduler, SchedulerError};
 
 use serde::{Deserialize, Serialize};
 
@@ -299,6 +299,30 @@ pub fn workspace_inputs(
         .collect()
 }
 
+/// The set of steps invalidated by restarting `target`: `target` itself plus
+/// every step that (transitively) `needs` it. Computed by reverse reachability
+/// over the DAG edges — so smart restart re-runs the target and its descendants,
+/// leaving siblings and ancestors intact (ADR-0027).
+pub fn invalidation_set(
+    target: &StepId,
+    steps: &[StepRun],
+) -> std::collections::HashSet<StepId> {
+    let mut invalid = std::collections::HashSet::new();
+    invalid.insert(target.clone());
+    // Fixpoint: a step joins the set once any of its needs is in the set.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for s in steps {
+            if !invalid.contains(&s.step) && s.needs.iter().any(|n| invalid.contains(n)) {
+                invalid.insert(s.step.clone());
+                changed = true;
+            }
+        }
+    }
+    invalid
+}
+
 /// Build an event stamped with the current [`EVENT_VERSION`].
 fn event(run: &RunId, kind: EventPayload, at: Timestamp) -> EventKind {
     EventKind {
@@ -550,5 +574,28 @@ mod tests {
         let outputs = HashMap::from([(StepId("a".into()), "hash-a".to_string())]);
         let needs = vec![StepId("a".into()), StepId("b".into())];
         assert_eq!(workspace_inputs(&needs, &outputs), vec!["hash-a"]);
+    }
+
+    /// Diamond: A -> {B, C} -> D. Restarting B invalidates B and its descendant
+    /// D, but not its sibling C nor its ancestor A.
+    #[test]
+    fn invalidation_set_is_target_plus_transitive_dependents() {
+        fn step(id: &str, needs: &[&str]) -> StepRun {
+            let mut s = StepRun::new(RunId("r".into()), StepId(id.into()));
+            s.needs = needs.iter().map(|n| StepId((*n).into())).collect();
+            s
+        }
+        let steps = vec![
+            step("A", &[]),
+            step("B", &["A"]),
+            step("C", &["A"]),
+            step("D", &["B", "C"]),
+        ];
+        let invalid = invalidation_set(&StepId("B".into()), &steps);
+        assert_eq!(invalid.len(), 2);
+        assert!(invalid.contains(&StepId("B".into())));
+        assert!(invalid.contains(&StepId("D".into())));
+        assert!(!invalid.contains(&StepId("A".into())), "ancestor untouched");
+        assert!(!invalid.contains(&StepId("C".into())), "sibling untouched");
     }
 }
