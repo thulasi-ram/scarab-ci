@@ -64,16 +64,15 @@ first. Starting points:
 Each is a *thin* follow-up, not new design; all noted in commit bodies /
 `TODO(slice-N)` markers. Highest-leverage first:
 
-> **Progress (follow-up session after `24a570b`):** #1 (concurrency + gate
-> authoring), #2 (`GET /v1/runs`), and #6 (multi-file discovery) are **done** —
-> commits `63f3dcd`, `aba7456`, `5149401`. Environment-target *authoring* (the
-> third leg of #1) was left with #7, which it belongs to. #3 was investigated
-> and found **blocked** — see its note.
+> **Progress (follow-up session after `24a570b`):** #1 (concurrency + gate +
+> environment authoring), #2 (`GET /v1/runs`), #6 (multi-file discovery), and
+> #7 (deploy supersede opt-out) are **done** — commits `63f3dcd`, `aba7456`,
+> `5149401`, `5366fe6`. #3 was investigated and found **blocked** — see its note.
+> Remaining: #4, #5, and the admission-enforcement tail of #7.
 
-1. ✅ **Pipeline authoring of the engine features** — `concurrency:` + `kind:
-   gate` now author from a committed `.scarab` (`63f3dcd`). The **environment
-   target** leg is still pending and folded into #7 (its `EnvironmentStore`
-   isn't in `AppState` yet — see Production wiring).
+1. ✅ **Pipeline authoring of the engine features** — `concurrency:`, `kind:
+   gate`, and `environment:` all now author from a committed `.scarab`
+   (`63f3dcd`, `5366fe6`).
 2. ✅ **`GET /v1/runs` list endpoint** — added (`aba7456`); `Db::list_runs`,
    OpenAPI + typed UI client regenerated. The SolidJS route still needs wiring
    to *call* it (attended UI follow-up).
@@ -94,9 +93,12 @@ Each is a *thin* follow-up, not new design; all noted in commit bodies /
 6. ✅ **Multi-file `.scarab/*.yaml`** discovery — added (`5149401`);
    `ForgePort::list_dir_at_ref`, `trigger_run_from_event` → `Vec<RunId>`,
    per-pipeline supersede key.
-7. **Deploy auto-cancel opt-out via a real Environment target** (currently:
-   keyless supersede == opt-out). Includes the environment-target *authoring*
-   leg deferred from #1.
+7. ⚠️ **Deploy auto-cancel opt-out via a real Environment target** — **core
+   done** (`5366fe6`): an authored `environment:` opts the run out of newest-wins
+   supersede. **Remaining:** enforce the environment's protection rules at
+   admission for *triggered* deploy pipelines — needs `EnvironmentStore` in
+   `AppState`/`main.rs` (see Production wiring). The explicit
+   `POST /v1/environments/.../deploy` endpoint already enforces them.
 
 ## Production wiring not yet connected in `scarab-server/src/main.rs`
 
