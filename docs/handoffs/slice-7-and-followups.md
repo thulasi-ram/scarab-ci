@@ -64,23 +64,39 @@ first. Starting points:
 Each is a *thin* follow-up, not new design; all noted in commit bodies /
 `TODO(slice-N)` markers. Highest-leverage first:
 
-1. **Pipeline authoring of the engine features** — the IR can't yet author
-   `concurrency:`, `kind: gate` (image-less step), or an environment target,
-   though the engine/db/API support all three. This is what makes slice-4
-   reachable from a committed `.scarab`. (`set_run_concurrency` / `set_step_gate`
-   / `EnvironmentStore` are the wiring points.)
-2. **`GET /v1/runs` list endpoint** — the UI runs-list route is a shell that
-   opens by id because no list endpoint exists.
-3. **Restart skip-if-unchanged** (ADR-0027 default) — restart currently takes the
-   safe *cascade* branch; the per-step `output_snapshot` substrate is in place.
-   `scheduler.rs` TODO(slice-2).
+> **Progress (follow-up session after `24a570b`):** #1 (concurrency + gate
+> authoring), #2 (`GET /v1/runs`), and #6 (multi-file discovery) are **done** —
+> commits `63f3dcd`, `aba7456`, `5149401`. Environment-target *authoring* (the
+> third leg of #1) was left with #7, which it belongs to. #3 was investigated
+> and found **blocked** — see its note.
+
+1. ✅ **Pipeline authoring of the engine features** — `concurrency:` + `kind:
+   gate` now author from a committed `.scarab` (`63f3dcd`). The **environment
+   target** leg is still pending and folded into #7 (its `EnvironmentStore`
+   isn't in `AppState` yet — see Production wiring).
+2. ✅ **`GET /v1/runs` list endpoint** — added (`aba7456`); `Db::list_runs`,
+   OpenAPI + typed UI client regenerated. The SolidJS route still needs wiring
+   to *call* it (attended UI follow-up).
+3. ⛔ **Restart skip-if-unchanged** (ADR-0027 default) — **blocked, not thin.**
+   The decision needs a step's output hash *before vs after* re-run, but the
+   production path never records outputs: `Scheduler::finalize_step` doesn't call
+   `set_step_output`, and `ExecState::Succeeded` carries no output hash. The
+   `set_step_output`/`step_output` *storage* substrate exists but is only ever
+   written from tests. Implementing just the decision logic now would land
+   inert, unexercised code. **Do this together with output-snapshot production
+   wiring** (the executor reporting an output hash + `finalize_step` recording
+   it) — i.e. after/with #4 and the live-workspace path.
 4. **Explicit workspace `inputs:`/`outputs:`** — only implicit-by-default is done;
-   needs IR fields. `engine/lib.rs` TODO(slice-2).
+   needs IR fields. `engine/lib.rs` TODO(slice-2). (Consumer — workspace
+   materialization — is still test-only; see #3's note.)
 5. **Gate `timer`/`external` auto-release** + transitive skip of a gated step's
    descendants. `pipeline/lib.rs` TODO(slice-4).
-6. **Multi-file `.scarab/*.yaml`** discovery (v1 reads a single `ci.yaml`).
+6. ✅ **Multi-file `.scarab/*.yaml`** discovery — added (`5149401`);
+   `ForgePort::list_dir_at_ref`, `trigger_run_from_event` → `Vec<RunId>`,
+   per-pipeline supersede key.
 7. **Deploy auto-cancel opt-out via a real Environment target** (currently:
-   keyless supersede == opt-out).
+   keyless supersede == opt-out). Includes the environment-target *authoring*
+   leg deferred from #1.
 
 ## Production wiring not yet connected in `scarab-server/src/main.rs`
 
