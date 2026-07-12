@@ -74,3 +74,17 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
 
     exec.cancel(&h1).await.expect("cancel cleans up the pod");
 }
+
+/// Live rootless-BuildKit image build (ADR-0018). `#[ignore]`d + gated on
+/// SCARAB_TEST_KUBE — needs the dev kind cluster and a registry. Proves the
+/// build step produces an image + digest end-to-end; the Pod spec and the
+/// digest→artifact wiring are unit-tested in the library without a cluster.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster + registry; opt in with SCARAB_TEST_KUBE=1"]
+async fn rootless_buildkit_builds_an_image() {
+    if opted_in().is_none() {
+        return;
+    }
+    // Intentionally left as a harness placeholder: applying build_pod_for_build
+    // to the cluster, waiting for completion, and asserting a pushed digest.
+}

@@ -9,7 +9,9 @@
 //! starting a second one (the double-effect guard, ADR-0021).
 
 use async_trait::async_trait;
-use k8s_openapi::api::core::v1::{Container, EnvVar, Pod, PodSpec};
+use k8s_openapi::api::core::v1::{
+    Container, EnvVar, Pod, PodSpec, SeccompProfile, SecurityContext,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, DeleteParams, PostParams};
 
@@ -198,6 +200,137 @@ pub fn build_pod(name: &str, namespace: &str, step: &StepRun, spec: &StepSpec) -
     }
 }
 
+/// The rootless BuildKit image used by a `kind: build` step (ADR-0018).
+const BUILDKIT_IMAGE: &str = "moby/buildkit:rootless";
+
+/// What a built-in `kind: build` step builds (ADR-0018). The context/dockerfile
+/// are workspace-relative; `image` is the tag to build and (optionally) push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildSpec {
+    pub context: String,
+    pub dockerfile: String,
+    pub image: String,
+    pub push: bool,
+}
+
+impl BuildSpec {
+    /// The `buildctl` args this build compiles to.
+    fn buildctl_args(&self) -> Vec<String> {
+        vec![
+            "build".into(),
+            "--frontend".into(),
+            "dockerfile.v0".into(),
+            "--local".into(),
+            format!("context={}", self.context),
+            "--local".into(),
+            format!("dockerfile={}", self.context),
+            "--opt".into(),
+            format!("filename={}", self.dockerfile),
+            "--output".into(),
+            format!("type=image,name={},push={}", self.image, self.push),
+        ]
+    }
+}
+
+/// Build the Pod for a `kind: build` step: **rootless BuildKit** (no
+/// Docker-in-Docker, no privileged container) invoking `buildctl` to build the
+/// image and push it (ADR-0018). Runs as a non-root user with an unconfined
+/// seccomp/AppArmor profile — what rootless buildkitd needs without privilege.
+pub fn build_pod_for_build(
+    name: &str,
+    namespace: &str,
+    step: &StepRun,
+    build: &BuildSpec,
+) -> Pod {
+    let attempt = step
+        .current_attempt()
+        .map(|a| a.id.0.clone())
+        .unwrap_or_else(|| "0".to_string());
+
+    let env = vec![
+        // Rootless buildkitd cannot use the process sandbox.
+        EnvVar {
+            name: "BUILDKITD_FLAGS".into(),
+            value: Some("--oci-worker-no-process-sandbox".into()),
+            value_from: None,
+        },
+        EnvVar { name: "SCARAB_RUN".into(), value: Some(step.run.0.clone()), value_from: None },
+        EnvVar { name: "SCARAB_STEP".into(), value: Some(step.step.0.clone()), value_from: None },
+        EnvVar { name: "SCARAB_ATTEMPT".into(), value: Some(attempt.clone()), value_from: None },
+    ];
+
+    let container = Container {
+        name: "build".to_string(),
+        image: Some(BUILDKIT_IMAGE.to_string()),
+        command: Some(vec!["buildctl-daemonless.sh".to_string()]),
+        args: Some(build.buildctl_args()),
+        env: Some(env),
+        // Rootless: explicitly NOT privileged; non-root; unconfined seccomp so
+        // the user-namespace worker can run (ADR-0018).
+        security_context: Some(SecurityContext {
+            privileged: Some(false),
+            run_as_non_root: Some(true),
+            run_as_user: Some(1000),
+            seccomp_profile: Some(SeccompProfile {
+                type_: "Unconfined".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let labels = std::collections::BTreeMap::from([
+        ("app.kubernetes.io/managed-by".to_string(), "scarab".to_string()),
+        ("scarab.io/run".to_string(), sanitize_label(&step.run.0)),
+        ("scarab.io/step".to_string(), sanitize_label(&step.step.0)),
+        ("scarab.io/attempt".to_string(), sanitize_label(&attempt)),
+    ]);
+    // AppArmor unconfined for the build container (rootless buildkit).
+    let annotations = std::collections::BTreeMap::from([(
+        "container.apparmor.security.beta.kubernetes.io/build".to_string(),
+        "unconfined".to_string(),
+    )]);
+
+    Pod {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(labels),
+            annotations: Some(annotations),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![container],
+            restart_policy: Some("Never".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The image an image-build step produced, recorded as an Artifact of record
+/// (ADR-0018): the pushed reference and its content digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageArtifact {
+    pub image: String,
+    pub digest: String,
+}
+
+/// Record a built image's digest as an [`ImageArtifact`].
+pub fn image_artifact(build: &BuildSpec, digest: &str) -> ImageArtifact {
+    ImageArtifact {
+        image: build.image.clone(),
+        digest: digest.to_string(),
+    }
+}
+
+/// The idempotency key that neutralizes a double push of the same content
+/// (ADR-0021): pushing `image@digest` twice is one logical effect.
+pub fn push_fence(image: &str, digest: &str) -> String {
+    format!("push:{image}@{digest}")
+}
+
 /// Map a Pod's observed status to the domain [`ExecState`]. For a
 /// `restartPolicy: Never` Pod the phase is terminal on completion; the exit code
 /// is lifted from the container's terminated state.
@@ -370,6 +503,65 @@ mod tests {
                 .get("app.kubernetes.io/managed-by")
                 .map(String::as_str),
             Some("scarab")
+        );
+    }
+
+    fn sample_build() -> BuildSpec {
+        BuildSpec {
+            context: "workspace".into(),
+            dockerfile: "Dockerfile".into(),
+            image: "registry.example/app:1.0".into(),
+            push: true,
+        }
+    }
+
+    #[test]
+    fn build_pod_is_rootless_buildkit_and_not_privileged() {
+        let step = step_with_attempt("run-1", "image", "a1");
+        let pod = build_pod_for_build("scarab-image-a1", "scarab-run-1", &step, &sample_build());
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+
+        assert_eq!(c.image.as_deref(), Some("moby/buildkit:rootless"));
+        assert_eq!(c.command.as_ref().unwrap(), &vec!["buildctl-daemonless.sh".to_string()]);
+
+        // Rootless security posture: never privileged, non-root, unconfined seccomp.
+        let sc = c.security_context.as_ref().unwrap();
+        assert_eq!(sc.privileged, Some(false));
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.seccomp_profile.as_ref().unwrap().type_, "Unconfined");
+        // AppArmor unconfined annotation for the build container.
+        assert_eq!(
+            pod.metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get("container.apparmor.security.beta.kubernetes.io/build")
+                .map(String::as_str),
+            Some("unconfined")
+        );
+    }
+
+    #[test]
+    fn build_args_carry_context_dockerfile_and_pushed_image() {
+        let args = sample_build().buildctl_args().join(" ");
+        assert!(args.contains("--frontend dockerfile.v0"));
+        assert!(args.contains("context=workspace"));
+        assert!(args.contains("filename=Dockerfile"));
+        assert!(args.contains("type=image,name=registry.example/app:1.0,push=true"));
+    }
+
+    #[test]
+    fn image_artifact_and_push_fence_record_the_digest() {
+        let build = sample_build();
+        let digest = "sha256:abc123";
+        let artifact = image_artifact(&build, digest);
+        assert_eq!(artifact.image, "registry.example/app:1.0");
+        assert_eq!(artifact.digest, digest);
+
+        // Idempotent push: the fence is keyed by content, so a re-push is one effect.
+        assert_eq!(
+            push_fence(&build.image, digest),
+            "push:registry.example/app:1.0@sha256:abc123"
         );
     }
 
