@@ -476,9 +476,15 @@ async fn restart_step(
     }
 }
 
-/// Canonical in-repo config path read on a trigger (ADR-0010). Multi-file
-/// `.scarab/*.yaml` discovery is a follow-up; v1 reads one pipeline.
-pub const CONFIG_PATH: &str = ".scarab/ci.yaml";
+/// In-repo directory holding pipeline definitions (ADR-0010). Every
+/// `*.yaml`/`*.yml` directly under it is a pipeline, discovered and evaluated on
+/// a trigger.
+pub const CONFIG_DIR: &str = ".scarab";
+
+/// Is `path` a pipeline definition file under [`CONFIG_DIR`] (a `.yaml`/`.yml`)?
+fn is_pipeline_file(path: &str) -> bool {
+    path.ends_with(".yaml") || path.ends_with(".yml")
+}
 
 /// Error building a triggered run from a forge event.
 #[derive(Debug, thiserror::Error)]
@@ -494,9 +500,11 @@ pub enum TriggerError {
 }
 
 /// The `(repo, ref, pipeline)` auto-cancel key for an event, or `None` for
-/// events that shouldn't auto-cancel (cron/manual/api/…). Pipeline is singular
-/// in v1 (`.scarab/ci.yaml`), so the key is `owner/name:<ref-scope>`.
-fn supersede_key(event: &scarab_forge::Event) -> Option<String> {
+/// events that shouldn't auto-cancel (cron/manual/api/…). Keyed by pipeline
+/// (`pipeline` = its `.scarab/*.yaml` path) so a newer run of one pipeline
+/// supersedes only older runs of the *same* pipeline on the same ref, not its
+/// siblings (ADR-0011, 0032).
+fn supersede_key(event: &scarab_forge::Event, pipeline: &str) -> Option<String> {
     use scarab_forge::Event;
     let repo = event.repo()?;
     let scope = match event {
@@ -504,7 +512,7 @@ fn supersede_key(event: &scarab_forge::Event) -> Option<String> {
         Event::PullRequest { number, .. } => format!("pr-{number}"),
         _ => return None,
     };
-    Some(format!("{}/{}:{scope}", repo.owner, repo.name))
+    Some(format!("{}/{}:{scope}:{pipeline}", repo.owner, repo.name))
 }
 
 /// The ref/SHA to read the pipeline config at — the event's commit where
@@ -519,41 +527,63 @@ fn config_ref(event: &scarab_forge::Event) -> String {
     }
 }
 
-/// "Commit a file, done" (ADR-0010): on a normalized `event`, read the in-repo
-/// `.scarab` config at the triggering ref, compile it to IR, and — if the
-/// pipeline's `on:` matches this event — durably create the Run. Returns the new
-/// run id, or `None` when there is no config or no trigger matches.
+/// "Commit a file, done" (ADR-0010): on a normalized `event`, discover every
+/// pipeline under `.scarab/` at the triggering ref, compile each, and durably
+/// create a Run for each whose `on:` matches this event. Returns the new run ids
+/// (empty when there is no config, or no pipeline's trigger matches).
+///
+/// Pipelines are evaluated independently and in a deterministic (path-sorted)
+/// order; a file that fails to compile fails the whole trigger (a broken
+/// pipeline is a submit-time error, ADR-0009), so a repo's CI is all-or-nothing
+/// per delivery rather than silently partial.
 pub async fn trigger_run_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
     event: &scarab_forge::Event,
-) -> Result<Option<RunId>, TriggerError> {
+) -> Result<Vec<RunId>, TriggerError> {
     // Repo-less events (cron/manual/api) don't carry in-repo config here.
     let Some(repo) = event.repo() else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     let git_ref = config_ref(event);
-    let bytes = match forge.read_file_at_ref(repo, &git_ref, CONFIG_PATH).await {
-        Ok(b) => b,
-        // No config committed → nothing to run (not an error).
-        Err(scarab_forge::ForgeError::Api(_)) => return Ok(None),
+
+    // Discover the pipeline files under `.scarab/`. An absent directory yields an
+    // empty listing → nothing to run (not an error).
+    let entries = match forge.list_dir_at_ref(repo, &git_ref, CONFIG_DIR).await {
+        Ok(e) => e,
+        Err(scarab_forge::ForgeError::Api(_)) => return Ok(Vec::new()),
         Err(e) => return Err(TriggerError::Forge(e)),
     };
-    let yaml = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
-    let ir = scarab_pipeline::compile_yaml(&yaml).map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+    let mut paths: Vec<String> = entries.into_iter().filter(|p| is_pipeline_file(p)).collect();
+    paths.sort();
 
     let ctx = event.context();
-    let matched = scarab_pipeline::matches_trigger(&ir, event.trigger_kind().as_str(), &ctx)
-        .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
-    if !matched {
-        return Ok(None);
-    }
+    let kind = event.trigger_kind();
+    let mut runs = Vec::new();
+    for path in &paths {
+        let bytes = match forge.read_file_at_ref(repo, &git_ref, path).await {
+            Ok(b) => b,
+            // A listed file that vanished between list and read → skip it.
+            Err(scarab_forge::ForgeError::Api(_)) => continue,
+            Err(e) => return Err(TriggerError::Forge(e)),
+        };
+        let yaml = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
+        let ir =
+            scarab_pipeline::compile_yaml(&yaml).map_err(|e| TriggerError::Pipeline(e.to_string()))?;
 
-    let now = clock.now().await;
-    let run = RunId(Uuid::new_v4().to_string());
-    persist_run_from_ir(db, &run, &ir, event, now).await?;
-    Ok(Some(run))
+        let matched = scarab_pipeline::matches_trigger(&ir, kind.as_str(), &ctx)
+            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+        if !matched {
+            continue;
+        }
+
+        let now = clock.now().await;
+        let run = RunId(Uuid::new_v4().to_string());
+        persist_run_from_ir(db, &run, &ir, event, path, now).await?;
+        runs.push(run);
+    }
+    Ok(runs)
 }
 
 /// Durably materialize a compiled pipeline IR into a Run: store the IR on the
@@ -564,6 +594,7 @@ async fn persist_run_from_ir(
     run: &RunId,
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,
+    pipeline: &str,
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     db.create_run(run, ir.ir_version, EVENT_VERSION, now).await?;
@@ -580,7 +611,7 @@ async fn persist_run_from_ir(
     // Newest-wins auto-cancel (ADR-0032): key non-deploy runs by (repo, ref) so
     // a newer run on the same ref supersedes older in-flight ones. Deploy
     // pipelines (an Environment target — a later slice-4 issue) will opt out.
-    if let Some(key) = supersede_key(event) {
+    if let Some(key) = supersede_key(event, pipeline) {
         db.set_supersede_key(run, &key).await?;
     }
     db.append_event(&EventKind {
@@ -755,11 +786,17 @@ async fn github_webhook(
         ));
     };
     match trigger_run_from_event(forge.as_ref(), st.db.as_ref(), st.clock.as_ref(), &event).await {
-        Ok(Some(run)) => Ok((
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "run_id": run.0, "trigger": event.trigger_kind() })),
-        )),
-        Ok(None) => Ok((
+        Ok(runs) if !runs.is_empty() => {
+            let run_ids: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
+            Ok((
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "run_ids": run_ids,
+                    "trigger": event.trigger_kind(),
+                })),
+            ))
+        }
+        Ok(_) => Ok((
             StatusCode::OK,
             Json(serde_json::json!({ "ignored": "no matching pipeline" })),
         )),

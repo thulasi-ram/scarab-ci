@@ -43,10 +43,11 @@ async fn setup() -> (FakeForge, Arc<InMemoryDb>, Arc<FakeClock>) {
 async fn push_matching_on_push_starts_a_run() {
     let (forge, db, clock) = setup().await;
 
-    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
         .await
         .expect("trigger");
-    let run = run.expect("a matching push starts a run");
+    assert_eq!(runs.len(), 1, "one pipeline matched");
+    let run = runs.into_iter().next().unwrap();
 
     // The run exists and was populated from the compiled config.
     assert!(db.run_status(&run).await.unwrap().is_some());
@@ -78,10 +79,11 @@ async fn committed_scarab_authors_concurrency_and_gate() {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
         .await
-        .expect("trigger")
-        .expect("a matching push starts a run");
+        .expect("trigger");
+    assert_eq!(runs.len(), 1, "one pipeline matched");
+    let run = runs.into_iter().next().unwrap();
 
     // Concurrency reached the engine: group + policy are set on the run.
     let (group, policy) = db
@@ -108,22 +110,60 @@ async fn committed_scarab_authors_concurrency_and_gate() {
 async fn push_to_non_matching_ref_starts_no_run() {
     let (forge, db, clock) = setup().await;
 
-    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("dev"))
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("dev"))
         .await
         .expect("trigger");
-    assert!(run.is_none(), "push to dev is filtered out by the on:push when");
+    assert!(runs.is_empty(), "push to dev is filtered out by the on:push when");
     assert!(db.active_runs().await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn no_in_repo_config_starts_no_run() {
-    // FakeForge with no seeded file → read_file_at_ref errors → no run.
+    // FakeForge with no seeded file → empty `.scarab/` listing → no run.
     let forge = FakeForge::new();
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
         .await
         .expect("trigger");
-    assert!(run.is_none(), "no .scarab config → nothing to run");
+    assert!(runs.is_empty(), "no .scarab config → nothing to run");
+}
+
+/// Multiple pipelines under `.scarab/` each start their own run on a matching
+/// trigger; a pipeline whose `on:` doesn't match is skipped.
+#[tokio::test]
+async fn multiple_pipelines_each_start_a_run() {
+    let forge = FakeForge::new()
+        .with_file(
+            ".scarab/ci.yaml",
+            "on: { push: {} }\nsteps: [{ id: build, image: busybox }]",
+        )
+        .with_file(
+            ".scarab/nightly.yaml",
+            "on: { push: {} }\nsteps: [{ id: bench, image: busybox }]",
+        )
+        // A deploy pipeline gated to tags — a push must NOT start it.
+        .with_file(
+            ".scarab/deploy.yaml",
+            "on: { tag: {} }\nsteps: [{ id: ship, image: busybox }]",
+        )
+        // A non-YAML file in the directory is ignored, not compiled.
+        .with_file(".scarab/README.md", "# pipelines");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
+        .await
+        .expect("trigger");
+    assert_eq!(runs.len(), 2, "ci + nightly match the push; deploy (tag) does not");
+
+    // Collect the single step id of each started run to confirm which pipelines ran.
+    let mut ran: Vec<String> = Vec::new();
+    for run in &runs {
+        let steps = db.steps_of_run(run).await.unwrap();
+        ran.push(steps[0].step.0.clone());
+    }
+    ran.sort();
+    assert_eq!(ran, vec!["bench".to_string(), "build".to_string()]);
 }

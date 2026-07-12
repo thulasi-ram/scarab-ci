@@ -51,6 +51,7 @@ async fn run_start_and_success_post_pending_then_success() {
     let run = trigger_run_from_event(forge.as_ref(), &db, &clock, &push())
         .await
         .unwrap()
+        .pop()
         .expect("push starts a run");
     let exec = FakeExecutor::new();
     exec.script_outcome(ExecState::Succeeded);
@@ -84,6 +85,7 @@ async fn run_failure_posts_failure_status() {
     let run = trigger_run_from_event(forge.as_ref(), &db, &clock, &push())
         .await
         .unwrap()
+        .pop()
         .expect("push starts a run");
     let exec = FakeExecutor::new();
     exec.script_outcome(ExecState::Failed { exit_code: Some(1) });

@@ -96,7 +96,7 @@ async fn push_webhook_runs_pipeline_posts_checks_and_login_authorizes() {
     // 1. A signed push webhook starts a run from the in-repo pipeline.
     let resp = app.clone().oneshot(signed_push_request()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
-    let run_id = json(resp).await["run_id"].as_str().unwrap().to_string();
+    let run_id = json(resp).await["run_ids"][0].as_str().unwrap().to_string();
     let run = RunId(run_id.clone());
 
     // 2. The converged driver runs it to success and posts statuses back.

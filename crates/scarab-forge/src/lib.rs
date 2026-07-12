@@ -259,6 +259,16 @@ pub trait ForgePort: Send + Sync {
         path: &str,
     ) -> Result<Vec<u8>, ForgeError>;
 
+    /// List the paths of entries directly under `dir` at `ref` (e.g. every file
+    /// in `.scarab/`). Used to discover the multiple pipelines a repo may commit.
+    /// Returns full repo-relative paths; an absent directory yields an empty list.
+    async fn list_dir_at_ref(
+        &self,
+        repo: &Repo,
+        r#ref: &str,
+        dir: &str,
+    ) -> Result<Vec<String>, ForgeError>;
+
     async fn register_webhook(&self, repo: &Repo, callback_url: &str) -> Result<(), ForgeError>;
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError>;

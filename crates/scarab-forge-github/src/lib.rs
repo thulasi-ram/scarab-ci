@@ -187,6 +187,15 @@ impl ForgePort for GithubForge {
         unimplemented!("GithubForge::read_file_at_ref")
     }
 
+    async fn list_dir_at_ref(
+        &self,
+        _repo: &Repo,
+        _ref: &str,
+        _dir: &str,
+    ) -> Result<Vec<String>, ForgeError> {
+        unimplemented!("GithubForge::list_dir_at_ref")
+    }
+
     async fn register_webhook(&self, _repo: &Repo, _callback_url: &str) -> Result<(), ForgeError> {
         unimplemented!("GithubForge::register_webhook")
     }

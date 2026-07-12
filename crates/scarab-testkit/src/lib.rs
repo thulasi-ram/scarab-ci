@@ -846,6 +846,29 @@ impl ForgePort for FakeForge {
             .ok_or_else(|| ForgeError::Api(format!("no such file: {path}")))
     }
 
+    async fn list_dir_at_ref(
+        &self,
+        _repo: &Repo,
+        _ref: &str,
+        dir: &str,
+    ) -> Result<Vec<String>, ForgeError> {
+        let prefix = format!("{}/", dir.trim_end_matches('/'));
+        let mut out: Vec<String> = self
+            .files
+            .lock()
+            .unwrap()
+            .keys()
+            // Direct children of `dir` only (no deeper nesting).
+            .filter(|k| {
+                k.strip_prefix(&prefix)
+                    .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+            })
+            .cloned()
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
     async fn register_webhook(&self, _repo: &Repo, _callback_url: &str) -> Result<(), ForgeError> {
         Ok(())
     }

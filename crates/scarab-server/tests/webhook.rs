@@ -72,7 +72,8 @@ async fn signed_push_creates_a_run() {
 
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let run_id = v["run_id"].as_str().unwrap().to_string();
+    let run_id = v["run_ids"][0].as_str().unwrap().to_string();
+    assert_eq!(v["run_ids"].as_array().unwrap().len(), 1);
     assert_eq!(v["trigger"], "push");
 
     // The run is durable, and its normalized trigger is on the event log.
