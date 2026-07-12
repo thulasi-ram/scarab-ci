@@ -47,6 +47,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0028](0028-ui-stack.md) | UI stack: SolidJS + TS + generated client | Accepted |
 | [0029](0029-workspace-cas.md) | Workspace content-addressing: per-file merkle CAS | Accepted |
 | [0030](0030-operational-defaults.md) | Operational defaults (isolation, retention, notifications, install, DR, limits) | Accepted |
+| [0031](0031-pure-computation-deps.md) | Purity = no I/O, not no deps: pure-computation crates allowed (amends 0016) | Accepted |
 
 ## Open / deferred (to be written when their slice begins)
 
