@@ -64,14 +64,15 @@ first. Starting points:
 Each is a *thin* follow-up, not new design; all noted in commit bodies /
 `TODO(slice-N)` markers. Highest-leverage first:
 
-> **Progress (follow-up session after `24a570b`):** #1 (concurrency + gate +
-> environment authoring), #2 (`GET /v1/runs`), #3 (restart skip-if-unchanged),
-> #6 (multi-file discovery), and #7 (deploy supersede opt-out) are **done** —
-> commits `63f3dcd`, `aba7456`, `c535630`, `5149401`, `5366fe6`. Production
-> wiring: `EnvironmentStore` + OIDC issuer now constructed in `main.rs`
-> (`e5fa736`). **Remaining:** #4, #5, the admission-enforcement tail of #7, and
-> the GitHub-App/OAuth/secrets production wiring (blocked on stub adapters +
-> live externals — see that section).
+> **Progress (follow-up session after `24a570b`):** #1, #2, #3, #4, #6, #7-core,
+> and #5-timer are **done**, plus `when:` runtime wiring and the
+> `EnvironmentStore`+OIDC production wiring — commits `63f3dcd`, `aba7456`,
+> `c535630`, `7bf9ae2`, `5149401`, `5366fe6`, `9483b88`, `fdf4502`, `e5fa736`.
+> **Remaining is now all either blocked on live externals or needs a decision:**
+> #4-`outputs:` (live CAS path), #5 transitive-skip (a semantic decision — see
+> note) and external-gate token-auth (needs a token model), the k8s post-step
+> output (cluster), and GitHub-App/OAuth/secrets (stub adapters + live
+> externals). Tree green: 141 tests, 4 `#[ignore]`, clippy clean.
 
 1. ✅ **Pipeline authoring of the engine features** — `concurrency:`, `kind:
    gate`, and `environment:` all now author from a committed `.scarab`
@@ -88,11 +89,21 @@ Each is a *thin* follow-up, not new design; all noted in commit bodies /
    is wired, so in a *real cluster run* skip won't trigger yet (safe cascade);
    the engine logic is fully exercised via the FakeExecutor. Wire k8s
    post-step output with the live-workspace path.
-4. **Explicit workspace `inputs:`/`outputs:`** — only implicit-by-default is done;
-   needs IR fields. `engine/lib.rs` TODO(slice-2). (Consumer — workspace
-   materialization — is still test-only; see #3's note.)
-5. **Gate `timer`/`external` auto-release** + transitive skip of a gated step's
-   descendants. `pipeline/lib.rs` TODO(slice-4).
+4. ⚠️ **Explicit workspace `inputs:`/`outputs:`** — `inputs:` **done** (`7bf9ae2`):
+   authored as a subset of needs, stored via `set_step_inputs`, and used to
+   compute a precise skip-if-unchanged signature. **Remaining:** `outputs:` (which
+   paths a step publishes) — a CAS-layer path filter at snapshot time, part of the
+   live-workspace path.
+5. ⚠️ **Gate auto-release + transitive skip.** **timer auto-release done**
+   (`9483b88`): a `timer` gate carries `gate_after` seconds and the scheduler
+   releases it once elapsed. Also **`when:` is now applied at run creation**
+   (`fdf4502`). **Remaining:** (a) *transitive skip* — a descendant of a pruned
+   step currently runs as a root (edges dropped); making it skip instead is a
+   **semantic reversal** of the documented `select_steps` behavior (the
+   `when_selects_steps_and_prunes_edges` test codifies "kept, runs as root") —
+   needs an explicit decision, likely an ADR. (b) *external-gate token auth* — an
+   external gate is releasable today via `POST …/gates/:step/approve` (RBAC);
+   releasing via an opaque token needs a token model.
 6. ✅ **Multi-file `.scarab/*.yaml`** discovery — added (`5149401`);
    `ForgePort::list_dir_at_ref`, `trigger_run_from_event` → `Vec<RunId>`,
    per-pipeline supersede key.
