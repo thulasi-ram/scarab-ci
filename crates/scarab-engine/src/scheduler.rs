@@ -99,6 +99,12 @@ pub async fn restart_step(
     }
     let invalid = crate::invalidation_set(target, &steps);
 
+    // Force the explicit target to re-run: clear its stored input signature so
+    // admission never mistakes it for an unchanged descendant and skips it
+    // (ADR-0027). Its descendants keep their signatures, so they skip-if-unchanged
+    // once the target has re-run and its output is known.
+    db.set_step_input(run, target, None).await?;
+
     // Reopen a settled run so admission picks the re-armed steps back up.
     if let Some(current) = db.run_status(run).await? {
         if current.is_terminal() {
@@ -394,13 +400,39 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        // Outputs recorded so far — the material for each step's input signature
+        // (restart skip-if-unchanged, ADR-0027).
+        let mut output_of: HashMap<StepId, String> = HashMap::new();
+        for s in &steps {
+            if let Some(out) = self.db.step_output(run, &s.step).await? {
+                output_of.insert(s.step.clone(), out);
+            }
+        }
+
         for step in &steps {
             if step.status != StepStatus::Pending || step.is_gate() {
                 continue;
             }
             if deps_satisfied(step) {
-                self.transition_step(run, &step.step, StepStatus::Pending, StepStatus::Ready)
-                    .await?;
+                // Skip-if-unchanged (ADR-0027): a re-armed step whose input
+                // signature matches the one it last consumed, and which produced
+                // a content-addressed output, is skipped — its prior output is
+                // carried forward rather than recomputed. The explicit restart
+                // target has its stored signature cleared, so it always re-runs;
+                // a side-effecting step (no output) has no stored output, so it
+                // never skips.
+                let cur = crate::input_signature(&step.needs, &output_of);
+                let prev = self.db.step_input(run, &step.step).await?;
+                let unchanged =
+                    output_of.contains_key(&step.step) && prev.as_deref() == Some(cur.as_str());
+                if unchanged {
+                    self.skip_unchanged(run, &step.step).await?;
+                } else {
+                    // Will run: record the input it consumes, then promote.
+                    self.db.set_step_input(run, &step.step, Some(&cur)).await?;
+                    self.transition_step(run, &step.step, StepStatus::Pending, StepStatus::Ready)
+                        .await?;
+                }
             } else if dep_dead(step) {
                 self.transition_step(run, &step.step, StepStatus::Pending, StepStatus::Skipped)
                     .await?;
@@ -498,6 +530,12 @@ impl<'a> Scheduler<'a> {
 
             match self.executor.poll(&handle).await? {
                 ExecState::Succeeded => {
+                    // Record the output workspace snapshot (if the backend
+                    // produced one) so dependents can materialize it and restart
+                    // can compare it for skip-if-unchanged (ADR-0027, 0029).
+                    if let Some(output) = self.executor.output(&handle).await? {
+                        self.db.set_step_output(&run, &step, &output).await?;
+                    }
                     self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
@@ -571,6 +609,44 @@ impl<'a> Scheduler<'a> {
     }
 
     // --- helpers -----------------------------------------------------------
+
+    /// Skip a re-armed step whose inputs are unchanged (ADR-0027): mark it
+    /// `Succeeded` (its prior output stays recorded and flows to dependents) and
+    /// surface the skip on the event log, minting no attempt. A peer that already
+    /// moved it is a benign `Conflict`.
+    async fn skip_unchanged(&self, run: &RunId, step: &StepId) -> Result<(), SchedulerError> {
+        match self
+            .db
+            .record_step_transition(run, step, StepStatus::Pending, StepStatus::Succeeded)
+            .await
+        {
+            Ok(()) => {
+                let now = self.clock.now().await;
+                self.append(
+                    run,
+                    EventPayload::StepSkipped {
+                        step: step.clone(),
+                        reason: "inputs unchanged".to_string(),
+                    },
+                    now,
+                )
+                .await?;
+                self.append(
+                    run,
+                    EventPayload::StepTransitioned {
+                        step: step.clone(),
+                        from: StepStatus::Pending,
+                        to: StepStatus::Succeeded,
+                    },
+                    now,
+                )
+                .await?;
+                Ok(())
+            }
+            Err(DbError::Conflict) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 
     async fn finalize_step(
         &self,

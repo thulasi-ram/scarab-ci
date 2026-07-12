@@ -269,6 +269,10 @@ pub enum EventPayload {
     AttemptStarted { step: StepId, attempt: AttemptId },
     AttemptFinished { step: StepId, attempt: AttemptId, failure: Option<FailureKind> },
     GateReleased { step: StepId },
+    /// A step was skipped on restart because its inputs were unchanged — its
+    /// prior output is carried forward rather than recomputed (ADR-0027). Surfaced
+    /// explicitly so a "smart" skip is never mysterious.
+    StepSkipped { step: StepId, reason: String },
     /// Escape hatch for forward-compatible payloads not yet modelled.
     Raw(serde_json::Value),
 }
@@ -343,6 +347,24 @@ pub fn workspace_inputs(
         .iter()
         .filter_map(|n| output_of.get(n).cloned())
         .collect()
+}
+
+/// A deterministic signature of the workspace a step will consume: its `needs`'
+/// output snapshots, in sorted-by-need order. Two runs of a step with the same
+/// upstream outputs produce the same signature — the basis for restart
+/// skip-if-unchanged (ADR-0027). A need that has produced no output contributes
+/// an empty slot, so "an upstream that gained/lost an output" also changes the
+/// signature.
+pub fn input_signature(
+    needs: &[StepId],
+    output_of: &std::collections::HashMap<StepId, String>,
+) -> String {
+    let mut parts: Vec<String> = needs
+        .iter()
+        .map(|n| format!("{}={}", n.0, output_of.get(n).map(|s| s.as_str()).unwrap_or("")))
+        .collect();
+    parts.sort();
+    parts.join(";")
 }
 
 /// The set of steps invalidated by restarting `target`: `target` itself plus
@@ -626,6 +648,36 @@ mod tests {
         let outputs = HashMap::from([(StepId("a".into()), "hash-a".to_string())]);
         let needs = vec![StepId("a".into()), StepId("b".into())];
         assert_eq!(workspace_inputs(&needs, &outputs), vec!["hash-a"]);
+    }
+
+    #[test]
+    fn input_signature_is_stable_and_order_independent() {
+        let outputs = HashMap::from([
+            (StepId("a".into()), "hash-a".to_string()),
+            (StepId("b".into()), "hash-b".to_string()),
+        ]);
+        // Order of `needs` does not change the signature (it is sorted).
+        let ab = input_signature(&[StepId("a".into()), StepId("b".into())], &outputs);
+        let ba = input_signature(&[StepId("b".into()), StepId("a".into())], &outputs);
+        assert_eq!(ab, ba);
+
+        // A changed upstream output changes the signature (→ cascade on restart).
+        let changed = HashMap::from([
+            (StepId("a".into()), "hash-a2".to_string()),
+            (StepId("b".into()), "hash-b".to_string()),
+        ]);
+        assert_ne!(
+            ab,
+            input_signature(&[StepId("a".into()), StepId("b".into())], &changed)
+        );
+
+        // A need that produced no output contributes an empty slot, so gaining an
+        // output also changes the signature.
+        let missing = HashMap::from([(StepId("b".into()), "hash-b".to_string())]);
+        assert_ne!(
+            ab,
+            input_signature(&[StepId("a".into()), StepId("b".into())], &missing)
+        );
     }
 
     /// Diamond: A -> {B, C} -> D. Restarting B invalidates B and its descendant

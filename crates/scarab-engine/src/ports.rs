@@ -84,6 +84,23 @@ pub trait Db: Send + Sync {
     /// produced one (or the step is unknown).
     async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
 
+    /// Record (or clear, with `None`) the **input signature** a step consumed on
+    /// the attempt that is about to run — a deterministic digest of its `needs`'
+    /// output snapshots (see `input_signature`). On a restart, comparing a
+    /// re-armed step's recomputed signature to this stored one is what lets an
+    /// unchanged descendant be skipped rather than re-run (ADR-0027). Clearing it
+    /// (`None`) forces the step to re-run — used for the explicit restart target.
+    async fn set_step_input(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        signature: Option<&str>,
+    ) -> Result<(), DbError>;
+
+    /// The input signature a step consumed on its last run, or `None` if it has
+    /// not run (or was cleared to force a re-run, or the step is unknown).
+    async fn step_input(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
+
     /// Assign a run to a named concurrency group with a policy (ADR-0011, 0032).
     async fn set_run_concurrency(
         &self,
@@ -262,4 +279,15 @@ pub trait Executor: Send + Sync {
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError>;
     async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError>;
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError>;
+
+    /// The content-addressed output workspace snapshot the (successfully
+    /// finished) unit produced — the CAS merkle-root hash the orchestrator
+    /// records so a dependent can materialize it and so restart can compare
+    /// outputs for skip-if-unchanged (ADR-0027, 0029). `None` when the unit
+    /// produced no workspace (a side-effecting step) or the backend does not
+    /// compute one. Default `None` so a backend that doesn't snapshot need not
+    /// implement it.
+    async fn output(&self, _handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
 }

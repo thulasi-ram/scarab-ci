@@ -274,6 +274,38 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("output_snapshot")))
     }
 
+    async fn set_step_input(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        signature: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE step_runs
+             SET input_signature = $3,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE run_id = $1 AND step_id = $2",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(signature)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn step_input(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
+        let row =
+            sqlx::query("SELECT input_signature FROM step_runs WHERE run_id = $1 AND step_id = $2")
+                .bind(&run.0)
+                .bind(&step.0)
+                .fetch_optional(self.pool()?)
+                .await
+                .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("input_signature")))
+    }
+
     async fn set_run_concurrency(
         &self,
         run: &RunId,

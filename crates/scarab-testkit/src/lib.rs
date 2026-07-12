@@ -79,6 +79,8 @@ struct StepRec {
     attempts: Vec<Attempt>,
     /// Output workspace snapshot (CAS root hash) this step produced.
     output: Option<String>,
+    /// Input signature consumed on the last run (restart skip-if-unchanged).
+    input: Option<String>,
     /// Gate kind (`manual`/`timer`/`external`), or `None` for an executed step.
     gate_kind: Option<String>,
 }
@@ -141,6 +143,7 @@ impl InMemoryDb {
                 needs: Vec::new(),
                 attempts: Vec::new(),
                 output: None,
+                input: None,
                 gate_kind: None,
             },
         );
@@ -158,6 +161,7 @@ impl InMemoryDb {
                     needs: s.needs,
                     attempts: s.attempts,
                     output: None,
+                    input: None,
                     gate_kind: None,
                 },
             );
@@ -228,6 +232,7 @@ impl Db for InMemoryDb {
                 needs: needs.to_vec(),
                 attempts: Vec::new(),
                 output: None,
+                input: None,
                 gate_kind: None,
             },
         );
@@ -257,6 +262,29 @@ impl Db for InMemoryDb {
             .steps
             .get(&(run.clone(), step.clone()))
             .and_then(|r| r.output.clone()))
+    }
+
+    async fn set_step_input(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        signature: Option<&str>,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
+            rec.input = signature.map(|s| s.to_string());
+        }
+        Ok(())
+    }
+
+    async fn step_input(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.input.clone()))
     }
 
     async fn set_run_concurrency(
@@ -647,6 +675,10 @@ struct FakeExecState {
     /// How many times each handle has been launched — proves idempotent
     /// re-attach (a second launch of the same fence does not relaunch).
     launches: HashMap<String, u32>,
+    /// Output snapshot each *step* produces, keyed by step id. A stable value
+    /// across a step's re-runs models an unchanged output (restart skips its
+    /// dependents); changing it models a changed output (dependents cascade).
+    outputs: HashMap<String, String>,
 }
 
 /// An [`Executor`] whose behaviour a test scripts: it can be told that a given
@@ -671,6 +703,17 @@ impl FakeExecutor {
     /// Declare that `handle` has died (the backend lost it).
     pub fn kill(&self, handle: ExecHandle) {
         self.inner.lock().unwrap().dead.push(handle);
+    }
+
+    /// Set the output snapshot that `step` (by id) produces on success — the hash
+    /// `output` reports for any of that step's attempts until reset. Stable across
+    /// re-runs = unchanged output; change it to model a changed output.
+    pub fn set_output(&self, step: &str, snapshot: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .outputs
+            .insert(step.to_string(), snapshot.to_string());
     }
 
     /// The deterministic handle a step's fence maps to.
@@ -729,6 +772,15 @@ impl Executor for FakeExecutor {
 
     async fn cancel(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
+    }
+
+    async fn output(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        // Handle format is `fake://{run}/{step}/{attempt}` — key outputs by step.
+        let step = handle
+            .0
+            .strip_prefix("fake://")
+            .and_then(|rest| rest.split('/').nth(1));
+        Ok(step.and_then(|s| self.inner.lock().unwrap().outputs.get(s).cloned()))
     }
 }
 
