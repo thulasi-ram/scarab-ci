@@ -72,6 +72,16 @@ pub enum RunStatus {
     DeadLettered,
 }
 
+/// A one-line summary of a run for a list view (`GET /v1/runs`): identity,
+/// current status, and creation time. Deliberately lean — the full run + its
+/// steps come from `run_status` / `steps_of_run`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSummary {
+    pub run: RunId,
+    pub status: RunStatus,
+    pub created_at: Timestamp,
+}
+
 /// Lifecycle status of a single step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepStatus {

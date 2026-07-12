@@ -110,6 +110,51 @@ async fn happy_path_post_run_then_scheduler_reaches_succeeded() {
 }
 
 #[tokio::test]
+async fn list_runs_returns_recent_runs_newest_first() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock: Arc<FakeClock> = Arc::new(FakeClock::new(1_000));
+    let app = router(app_state(db.clone(), clock.clone()));
+
+    // Create two runs with distinct creation times (advance the clock between).
+    db.create_run(&RunId("older".into()), 1, 1, scarab_engine::Timestamp(1_000))
+        .await
+        .unwrap();
+    db.create_run(&RunId("newer".into()), 1, 1, scarab_engine::Timestamp(2_000))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri("/v1/runs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc = body_json(resp).await;
+    let runs = doc["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    // Newest first.
+    assert_eq!(runs[0]["id"], "newer");
+    assert_eq!(runs[0]["status"], "pending");
+    assert_eq!(runs[0]["created_at"], 2_000);
+    assert_eq!(runs[1]["id"], "older");
+
+    // `limit` caps the page.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs?limit=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let doc = body_json(resp).await;
+    let runs = doc["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "limit=1 returns one run");
+    assert_eq!(runs[0]["id"], "newer");
+}
+
+#[tokio::test]
 async fn openapi_is_served_and_describes_the_ir_subset() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     let clock: Arc<FakeClock> = Arc::new(FakeClock::new(0));

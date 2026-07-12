@@ -16,7 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -179,6 +179,20 @@ pub struct RunStatusResponse {
     pub steps: Vec<StepStatusDto>,
 }
 
+/// `GET /v1/runs` body: the most recent runs, newest first.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RunListResponse {
+    pub runs: Vec<RunSummaryDto>,
+}
+
+/// One run in the list view: identity, status, and creation time (epoch millis).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RunSummaryDto {
+    pub id: String,
+    pub status: String,
+    pub created_at: i64,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StepStatusDto {
     pub id: String,
@@ -279,6 +293,45 @@ async fn create_run(
             status: run_status_name(RunStatus::Pending).to_string(),
         }),
     ))
+}
+
+/// Query for [`list_runs`]: an optional page size.
+#[derive(Debug, Deserialize)]
+pub struct ListRunsQuery {
+    /// Max runs to return (default [`DEFAULT_RUNS_LIMIT`], capped at [`MAX_RUNS_LIMIT`]).
+    pub limit: Option<u32>,
+}
+
+/// Default page size for `GET /v1/runs`.
+const DEFAULT_RUNS_LIMIT: u32 = 50;
+/// Upper bound so a client can't request an unbounded scan.
+const MAX_RUNS_LIMIT: u32 = 200;
+
+/// The most recent runs, newest first — the runs-list view (ADR-0013, 0028).
+#[utoipa::path(
+    get,
+    path = "/v1/runs",
+    params(("limit" = Option<u32>, Query, description = "max runs to return (default 50, max 200)")),
+    responses((status = 200, body = RunListResponse))
+)]
+async fn list_runs(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ListRunsQuery>,
+) -> Result<Json<RunListResponse>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
+    let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
+    let runs = st.db.list_runs(limit).await?;
+    Ok(Json(RunListResponse {
+        runs: runs
+            .into_iter()
+            .map(|s| RunSummaryDto {
+                id: s.run.0,
+                status: run_status_name(s.status).to_string(),
+                created_at: s.created_at.0,
+            })
+            .collect(),
+    }))
 }
 
 /// Current status of a run and its steps.
@@ -1007,12 +1060,14 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
 /// The generated OpenAPI document. The pipeline request schema is the IR subset.
 #[derive(OpenApi)]
 #[openapi(
-    paths(create_run, get_run, get_events, get_logs, restart_step, approve_gate),
+    paths(create_run, list_runs, get_run, get_events, get_logs, restart_step, approve_gate),
     components(schemas(
         CreateRunRequest,
         PipelineDto,
         StepDto,
         CreateRunResponse,
+        RunListResponse,
+        RunSummaryDto,
         RunStatusResponse,
         StepStatusDto
     ))
@@ -1036,7 +1091,7 @@ pub fn router(state: AppState) -> Router {
         .route("/.well-known/jwks.json", get(jwks))
         .route("/.well-known/openid-configuration", get(openid_configuration))
         .route("/v1/auth/login", post(login))
-        .route("/v1/runs", post(create_run))
+        .route("/v1/runs", post(create_run).get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))
         .route("/v1/runs/{id}/logs", get(get_logs))

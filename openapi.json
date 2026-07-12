@@ -11,6 +11,36 @@
   },
   "paths": {
     "/v1/runs": {
+      "get": {
+        "tags": [],
+        "summary": "The most recent runs, newest first — the runs-list view (ADR-0013, 0028).",
+        "operationId": "list_runs",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "max runs to return (default 50, max 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunListResponse"
+                }
+              }
+            }
+          }
+        }
+      },
       "post": {
         "tags": [],
         "summary": "Create and durably persist a new run from an inline pipeline.",
@@ -240,6 +270,21 @@
           }
         }
       },
+      "RunListResponse": {
+        "type": "object",
+        "description": "`GET /v1/runs` body: the most recent runs, newest first.",
+        "required": [
+          "runs"
+        ],
+        "properties": {
+          "runs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RunSummaryDto"
+            }
+          }
+        }
+      },
       "RunStatusResponse": {
         "type": "object",
         "required": [
@@ -259,6 +304,27 @@
             "items": {
               "$ref": "#/components/schemas/StepStatusDto"
             }
+          }
+        }
+      },
+      "RunSummaryDto": {
+        "type": "object",
+        "description": "One run in the list view: identity, status, and creation time (epoch millis).",
+        "required": [
+          "id",
+          "status",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
           }
         }
       },

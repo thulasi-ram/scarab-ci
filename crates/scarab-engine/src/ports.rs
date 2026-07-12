@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Attempt, AttemptId, ConcurrencyPolicy, DbError, EventKind, ExecError, LogChunkMeta, OutboxId,
-    OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -145,6 +145,10 @@ pub trait Db: Send + Sync {
 
     /// Ids of all non-terminal runs — the work list a converged scheduler drives.
     async fn active_runs(&self) -> Result<Vec<RunId>, DbError>;
+
+    /// The most recent runs (any status), newest first, capped at `limit` — the
+    /// source for the `GET /v1/runs` list view.
+    async fn list_runs(&self, limit: u32) -> Result<Vec<RunSummary>, DbError>;
 
     /// The run's append-only event log, in append order (the SSE tail source).
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError>;

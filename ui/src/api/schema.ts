@@ -11,7 +11,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** The most recent runs, newest first — the runs-list view (ADR-0013, 0028). */
+        get: operations["list_runs"];
         put?: never;
         /** Create and durably persist a new run from an inline pipeline. */
         post: operations["create_run"];
@@ -142,10 +143,21 @@ export interface components {
             ir_version: number;
             steps: components["schemas"]["StepDto"][];
         };
+        /** @description `GET /v1/runs` body: the most recent runs, newest first. */
+        RunListResponse: {
+            runs: components["schemas"]["RunSummaryDto"][];
+        };
         RunStatusResponse: {
             id: string;
             status: string;
             steps: components["schemas"]["StepStatusDto"][];
+        };
+        /** @description One run in the list view: identity, status, and creation time (epoch millis). */
+        RunSummaryDto: {
+            /** Format: int64 */
+            created_at: number;
+            id: string;
+            status: string;
         };
         /** @description One step (IR subset): the step contract is an OCI `image` + `command`. */
         StepDto: {
@@ -171,6 +183,28 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_runs: {
+        parameters: {
+            query?: {
+                /** @description max runs to return (default 50, max 200) */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunListResponse"];
+                };
+            };
+        };
+    };
     create_run: {
         parameters: {
             query?: never;
