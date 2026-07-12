@@ -32,6 +32,7 @@ use scarab_engine::{
     Clock, Db, DbError, EventKind, EventPayload, RestartError, RunId, RunStatus, StepId, StepSpec,
     StepStatus, Timestamp, EVENT_VERSION, RUN_STATUS_CHANGED,
 };
+use scarab_identity::{Action, Principal, Session};
 
 pub mod converged;
 pub mod logs;
@@ -64,6 +65,12 @@ pub struct AppState {
     /// means the webhook ingest can verify+normalize but not start config-driven
     /// runs.
     pub forge: Option<Arc<dyn scarab_forge::ForgePort>>,
+    /// Login provider (OAuth/OIDC). `None` leaves `/v1/auth/login` disabled.
+    pub auth: Option<Arc<dyn scarab_identity::Authenticator>>,
+    /// Session store. When `None`, API authz is **disabled** (dev/test default —
+    /// every request is allowed); when `Some`, run endpoints require a valid
+    /// session with a sufficient role.
+    pub sessions: Option<Arc<dyn scarab_identity::SessionStore>>,
 }
 
 impl AppState {
@@ -74,6 +81,8 @@ impl AppState {
             logs,
             github_webhook_secret: None,
             forge: None,
+            auth: None,
+            sessions: None,
         }
     }
 
@@ -86,6 +95,17 @@ impl AppState {
     /// Set the forge port used to read in-repo config on a trigger.
     pub fn with_forge(mut self, forge: Arc<dyn scarab_forge::ForgePort>) -> Self {
         self.forge = Some(forge);
+        self
+    }
+
+    /// Enable login + session-based API authz.
+    pub fn with_auth(
+        mut self,
+        auth: Arc<dyn scarab_identity::Authenticator>,
+        sessions: Arc<dyn scarab_identity::SessionStore>,
+    ) -> Self {
+        self.auth = Some(auth);
+        self.sessions = Some(sessions);
         self
     }
 }
@@ -150,6 +170,7 @@ pub struct StepStatusDto {
 pub enum ApiError {
     NotFound,
     Unauthorized,
+    Forbidden,
     BadRequest(String),
     Db(DbError),
 }
@@ -165,8 +186,9 @@ impl IntoResponse for ApiError {
         match self {
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
             ApiError::Unauthorized => {
-                (StatusCode::UNAUTHORIZED, "signature verification failed").into_response()
+                (StatusCode::UNAUTHORIZED, "authentication required").into_response()
             }
+            ApiError::Forbidden => (StatusCode::FORBIDDEN, "insufficient role").into_response(),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
             ApiError::Db(e) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response()
@@ -188,8 +210,10 @@ impl IntoResponse for ApiError {
 )]
 async fn create_run(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateRunRequest>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), ApiError> {
+    authorize(&st, &headers, Action::Write).await?;
     let now = st.clock.now().await;
     let run = RunId(Uuid::new_v4().to_string());
 
@@ -243,8 +267,10 @@ async fn create_run(
 )]
 async fn get_run(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<RunStatusResponse>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
     let run = RunId(id);
     let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
     let steps = st.db.steps_of_run(&run).await?;
@@ -272,8 +298,10 @@ async fn get_run(
 )]
 async fn get_events(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
     let run = RunId(id);
     if st.db.run_status(&run).await?.is_none() {
         return Err(ApiError::NotFound);
@@ -302,8 +330,10 @@ async fn get_events(
 )]
 async fn get_logs(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Sse<BoxStream<'static, Result<Event, Infallible>>>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
     let run = RunId(id);
     let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
     let steps = st.db.steps_of_run(&run).await?;
@@ -358,8 +388,10 @@ async fn get_logs(
 )]
 async fn restart_step(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
+    authorize(&st, &headers, Action::Write).await?;
     let run = RunId(id);
     match scarab_engine::restart_step(&*st.db, &*st.clock, &run, &StepId(step)).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
@@ -632,6 +664,110 @@ fn header_str(headers: &HeaderMap, name: &str) -> String {
         .to_string()
 }
 
+/// How long an issued session stays valid (24h).
+const SESSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// `POST /v1/auth/login` body: an OAuth/OIDC credential (e.g. a GitHub code).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct LoginRequest {
+    pub credential: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LoginResponse {
+    pub session: String,
+    pub subject: String,
+}
+
+/// Exchange an OAuth/OIDC credential for a Scarab session (ADR-0010, 0032):
+/// authenticate to a forge-agnostic [`Principal`], mint a server-side
+/// [`Session`], and return its id (also set as an httpOnly cookie).
+async fn login(
+    State(st): State<AppState>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Response, ApiError> {
+    let (Some(auth), Some(sessions)) = (st.auth.as_ref(), st.sessions.as_ref()) else {
+        return Err(ApiError::NotFound); // login not configured
+    };
+    let principal = auth
+        .authenticate(&req.credential)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
+    let now = st.clock.now().await.0;
+    let session = Session {
+        id: Uuid::new_v4().to_string(),
+        principal: principal.clone(),
+        expires_at: now + SESSION_TTL_MS,
+    };
+    sessions.put(&session).await.map_err(|_| ApiError::Unauthorized)?;
+
+    let cookie = format!(
+        "scarab_session={}; HttpOnly; Path=/; SameSite=Lax",
+        session.id
+    );
+    let mut resp = (
+        StatusCode::OK,
+        Json(LoginResponse {
+            session: session.id.clone(),
+            subject: principal.subject,
+        }),
+    )
+        .into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().insert(axum::http::header::SET_COOKIE, v);
+    }
+    Ok(resp)
+}
+
+/// Authorize the request for `action`. With no session store configured, authz
+/// is **disabled** (dev/test) and every caller is treated as an Owner. Otherwise
+/// a valid session bearer token / cookie is required and its principal must
+/// grant `action` (ADR-0032 RBAC).
+async fn authorize(
+    st: &AppState,
+    headers: &HeaderMap,
+    action: Action,
+) -> Result<Principal, ApiError> {
+    let Some(sessions) = st.sessions.as_ref() else {
+        return Ok(Principal {
+            subject: "anonymous".into(),
+            display_name: None,
+            roles: vec![scarab_identity::Role::Owner],
+        });
+    };
+    let sid = session_id(headers).ok_or(ApiError::Unauthorized)?;
+    let session = sessions
+        .get(&sid)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?
+        .ok_or(ApiError::Unauthorized)?;
+    if !session.is_valid(st.clock.now().await.0) {
+        return Err(ApiError::Unauthorized);
+    }
+    if !session.principal.can(action) {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(session.principal)
+}
+
+/// Extract a session id from `Authorization: Bearer <id>` or a
+/// `scarab_session=<id>` cookie.
+fn session_id(headers: &HeaderMap) -> Option<String> {
+    if let Some(tok) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        return Some(tok.to_string());
+    }
+    let cookie = headers.get("cookie").and_then(|v| v.to_str().ok())?;
+    cookie
+        .split(';')
+        .filter_map(|p| p.trim().strip_prefix("scarab_session="))
+        .map(str::to_string)
+        .next()
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -662,6 +798,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/openapi.json", get(openapi))
+        .route("/v1/auth/login", post(login))
         .route("/v1/runs", post(create_run))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))

@@ -718,3 +718,72 @@ impl ForgePort for FakeForge {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// FakeAuthenticator + InMemorySessions — identity fakes
+// ---------------------------------------------------------------------------
+
+use scarab_identity::{
+    Authenticator, IdentityError, Principal, Session, SessionStore,
+};
+
+/// An [`Authenticator`] that maps a seeded credential string to a [`Principal`]
+/// — the login boundary mocked for tests (no real OAuth round-trip).
+#[derive(Default)]
+pub struct FakeAuthenticator {
+    principals: Mutex<HashMap<String, Principal>>,
+}
+
+impl FakeAuthenticator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Seed `credential` to resolve to `principal`.
+    pub fn with_credential(self, credential: impl Into<String>, principal: Principal) -> Self {
+        self.principals
+            .lock()
+            .unwrap()
+            .insert(credential.into(), principal);
+        self
+    }
+}
+
+#[async_trait]
+impl Authenticator for FakeAuthenticator {
+    async fn authenticate(&self, credential: &str) -> Result<Principal, IdentityError> {
+        self.principals
+            .lock()
+            .unwrap()
+            .get(credential)
+            .cloned()
+            .ok_or(IdentityError::AuthFailed)
+    }
+}
+
+/// An in-memory [`SessionStore`] for tests (the PG-backed store is a follow-up).
+#[derive(Default)]
+pub struct InMemorySessions {
+    sessions: Mutex<HashMap<String, Session>>,
+}
+
+impl InMemorySessions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl SessionStore for InMemorySessions {
+    async fn put(&self, session: &Session) -> Result<(), IdentityError> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), session.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<Session>, IdentityError> {
+        Ok(self.sessions.lock().unwrap().get(id).cloned())
+    }
+}
