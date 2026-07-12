@@ -33,6 +33,12 @@ use crate::{
 /// Outbox `kind` for "launch this step".
 pub const LAUNCH_STEP: &str = "launch_step";
 
+/// Outbox `kind` for "this run changed status" — the notification a forge-status
+/// drainer consumes to post commit statuses/checks back (ADR-0010, 0013). The
+/// payload is `{ "to": <RunStatus> }`; the key is unique per (run, state) so the
+/// same transition enqueues exactly one post.
+pub const RUN_STATUS_CHANGED: &str = "run_status_changed";
+
 /// The payload of a [`LAUNCH_STEP`] outbox message — the step's fence.
 #[derive(Debug, Serialize, Deserialize)]
 struct LaunchIntent {
@@ -338,12 +344,14 @@ impl<'a> Scheduler<'a> {
     pub async fn reconcile(&self) -> Result<(), SchedulerError> {
         let msgs = self
             .db
-            .claim_outbox(&self.owner, self.cfg.outbox_batch, self.cfg.outbox_visibility_ms)
+            .claim_outbox(
+                &self.owner,
+                Some(LAUNCH_STEP),
+                self.cfg.outbox_batch,
+                self.cfg.outbox_visibility_ms,
+            )
             .await?;
         for msg in msgs {
-            if msg.kind != LAUNCH_STEP {
-                continue;
-            }
             let intent: LaunchIntent = serde_json::from_value(msg.payload.clone())
                 .map_err(|e| SchedulerError::BadPayload(e.to_string()))?;
             let run = RunId(intent.run);
@@ -475,7 +483,21 @@ impl<'a> Scheduler<'a> {
             Ok(()) => {
                 let now = self.clock.now().await;
                 self.append(run, EventPayload::RunTransitioned { from, to }, now)
-                    .await
+                    .await?;
+                // Notify external observers (e.g. forge commit-status posting)
+                // exactly-once via the outbox. The key is unique per (run, state),
+                // so a re-driven transition enqueues at most one post.
+                self.db
+                    .enqueue_outbox(&OutboxMessage {
+                        id: crate::OutboxId(0),
+                        run: run.clone(),
+                        kind: RUN_STATUS_CHANGED.to_string(),
+                        payload: serde_json::json!({ "to": to }),
+                        idempotency_key: format!("status:{}:{to:?}", run.0),
+                        at: now,
+                    })
+                    .await?;
+                Ok(())
             }
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),

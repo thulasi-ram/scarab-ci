@@ -127,7 +127,7 @@ async fn outbox_delivers_exactly_once() {
             loop {
                 // Long visibility so a claimed-but-undispatched row stays hidden
                 // from peers; each claimer dispatches what it claimed.
-                let batch = db.claim_outbox(&owner, 5, 60_000).await.unwrap();
+                let batch = db.claim_outbox(&owner, None, 5, 60_000).await.unwrap();
                 if batch.is_empty() {
                     break;
                 }

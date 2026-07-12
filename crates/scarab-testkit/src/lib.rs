@@ -436,6 +436,7 @@ impl Db for InMemoryDb {
     async fn claim_outbox(
         &self,
         _owner: &str,
+        kind: Option<&str>,
         limit: u32,
         _visibility_ms: i64,
     ) -> Result<Vec<OutboxMessage>, DbError> {
@@ -445,7 +446,8 @@ impl Db for InMemoryDb {
             if out.len() as u32 >= limit {
                 break;
             }
-            if !entry.dispatched && !entry.claimed {
+            let kind_ok = kind.is_none_or(|k| entry.msg.kind == k);
+            if !entry.dispatched && !entry.claimed && kind_ok {
                 entry.claimed = true;
                 out.push(entry.msg.clone());
             }

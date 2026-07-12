@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use scarab_engine::{
     Clock, Db, DbError, EventKind, EventPayload, RestartError, RunId, RunStatus, StepId, StepSpec,
-    StepStatus, Timestamp, EVENT_VERSION,
+    StepStatus, Timestamp, EVENT_VERSION, RUN_STATUS_CHANGED,
 };
 
 pub mod converged;
@@ -472,6 +472,92 @@ async fn persist_run_from_ir(
             .await?;
     }
     Ok(())
+}
+
+/// Drain "run status changed" outbox notifications and post the matching commit
+/// status back to the forge (ADR-0010, 0013). Exactly-once by the outbox: a
+/// message is retired (`mark_dispatched`) only after a successful post; a post
+/// that fails is left for redelivery (at-least-once, and `set_status` is
+/// idempotent on the forge). Returns how many statuses were posted.
+pub async fn drain_forge_statuses(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &dyn Db,
+    owner: &str,
+    limit: u32,
+    visibility_ms: i64,
+) -> Result<usize, DbError> {
+    let msgs = db
+        .claim_outbox(owner, Some(RUN_STATUS_CHANGED), limit, visibility_ms)
+        .await?;
+    let mut posted = 0;
+    for msg in msgs {
+        // A run with no forge trigger (API/manual) has nothing to post — retire it.
+        let Some((repo, sha)) = run_forge_coords(db, &msg.run).await? else {
+            db.mark_dispatched(msg.id).await?;
+            continue;
+        };
+        let to = msg
+            .payload
+            .get("to")
+            .and_then(|v| serde_json::from_value::<RunStatus>(v.clone()).ok());
+        let Some(to) = to else {
+            db.mark_dispatched(msg.id).await?; // malformed payload → drop, don't loop
+            continue;
+        };
+        let status = scarab_forge::Status {
+            context: "scarab".into(),
+            state: run_status_to_forge(to),
+            target_url: None,
+        };
+        let commit = scarab_forge::Commit {
+            sha,
+            message: String::new(),
+        };
+        // Leave a failed post unclaimed for redelivery rather than dropping it.
+        if forge.set_status(&repo, &commit, status).await.is_ok() {
+            db.mark_dispatched(msg.id).await?;
+            posted += 1;
+        }
+    }
+    Ok(posted)
+}
+
+/// Map a run's lifecycle status to a forge commit-status state (ADR-0010).
+fn run_status_to_forge(s: RunStatus) -> scarab_forge::StatusState {
+    use scarab_forge::StatusState;
+    match s {
+        RunStatus::Pending | RunStatus::Running | RunStatus::Suspended => StatusState::Pending,
+        RunStatus::Succeeded => StatusState::Success,
+        RunStatus::Failed | RunStatus::DeadLettered => StatusState::Failure,
+        RunStatus::Cancelled => StatusState::Error,
+    }
+}
+
+/// Recover a run's `(repo, sha)` from the normalized trigger recorded on its
+/// event log (persisted by [`persist_run_from_ir`]).
+async fn run_forge_coords(
+    db: &dyn Db,
+    run: &RunId,
+) -> Result<Option<(scarab_forge::Repo, String)>, DbError> {
+    for e in db.events(run).await? {
+        if let EventPayload::Raw(v) = &e.kind {
+            let ev = &v["trigger"]["event"];
+            if let (Some(owner), Some(name), Some(sha)) = (
+                ev["repo"]["owner"].as_str(),
+                ev["repo"]["name"].as_str(),
+                ev["sha"].as_str(),
+            ) {
+                return Ok(Some((
+                    scarab_forge::Repo {
+                        owner: owner.to_string(),
+                        name: name.to_string(),
+                    },
+                    sha.to_string(),
+                )));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Inbound GitHub webhook ingest (ADR-0010, 0032): verify the HMAC signature,

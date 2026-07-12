@@ -11,17 +11,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use scarab_engine::{Clock, Db, Executor, Scheduler, SchedulerError};
+use scarab_forge::ForgePort;
 
-/// Run one converged cycle across all active runs.
+/// Run one converged cycle across all active runs: tick the scheduler, then (if a
+/// `forge` is wired) post any pending commit statuses back.
 pub async fn tick_once(
     db: &Arc<dyn Db>,
     clock: &Arc<dyn Clock>,
     executor: &Arc<dyn Executor>,
+    forge: Option<&Arc<dyn ForgePort>>,
     owner: &str,
 ) -> Result<(), SchedulerError> {
     Scheduler::new(&**db, &**clock, &**executor, owner)
         .tick_all()
-        .await
+        .await?;
+    if let Some(forge) = forge {
+        // Status posting is best-effort within a tick; a failed post stays on the
+        // outbox for the next cycle (at-least-once, idempotent).
+        if let Err(e) = crate::drain_forge_statuses(&**forge, &**db, owner, 32, 30_000).await {
+            tracing::warn!(error = %e, "forge status drain failed");
+        }
+    }
+    Ok(())
 }
 
 /// Spawn the background driver: tick, sleep `interval`, repeat. Returns the task
@@ -31,12 +42,13 @@ pub fn spawn_driver(
     db: Arc<dyn Db>,
     clock: Arc<dyn Clock>,
     executor: Arc<dyn Executor>,
+    forge: Option<Arc<dyn ForgePort>>,
     owner: String,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = tick_once(&db, &clock, &executor, &owner).await {
+            if let Err(e) = tick_once(&db, &clock, &executor, forge.as_ref(), &owner).await {
                 tracing::warn!(error = %e, "converged driver tick failed");
             }
             tokio::time::sleep(interval).await;

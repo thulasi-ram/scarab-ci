@@ -521,13 +521,15 @@ impl Db for PostgresDb {
     async fn claim_outbox(
         &self,
         owner: &str,
+        kind: Option<&str>,
         limit: u32,
         visibility_ms: i64,
     ) -> Result<Vec<OutboxMessage>, DbError> {
         // Hand out undispatched rows whose claim (if any) has expired, hiding
         // them for `visibility_ms`. SKIP LOCKED keeps concurrent drainers on
         // disjoint sets; the visibility timeout makes a crashed drainer's rows
-        // reclaimable rather than lost.
+        // reclaimable rather than lost. `kind` (when set) scopes the claim so
+        // distinct drainers don't contend over each other's messages.
         let rows = sqlx::query(
             "UPDATE outbox
              SET claimed_by = $1,
@@ -535,6 +537,7 @@ impl Db for PostgresDb {
              WHERE id IN (
                  SELECT id FROM outbox
                  WHERE dispatched_at IS NULL
+                   AND ($4::text IS NULL OR kind = $4)
                    AND (claimed_until IS NULL
                         OR claimed_until < (extract(epoch from now()) * 1000)::bigint)
                  ORDER BY id
@@ -546,6 +549,7 @@ impl Db for PostgresDb {
         .bind(owner)
         .bind(limit as i64)
         .bind(visibility_ms)
+        .bind(kind)
         .fetch_all(self.pool()?)
         .await
         .map_err(db_err)?;

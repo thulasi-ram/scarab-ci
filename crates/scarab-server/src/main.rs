@@ -112,10 +112,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match K8sExecutor::connect(cli.namespace.clone()).await {
             Ok(exec) => {
                 let executor: Arc<dyn Executor> = Arc::new(exec);
+                // Forge-status posting is wired once GitHub App auth lands; until
+                // then the driver ticks without a forge.
                 converged::spawn_driver(
                     db.clone(),
                     clock.clone(),
                     executor,
+                    None,
                     "scarab-server".to_string(),
                     Duration::from_millis(500),
                 );

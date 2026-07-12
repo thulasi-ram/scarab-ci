@@ -153,15 +153,18 @@ pub trait Db: Send + Sync {
     async fn enqueue_outbox(&self, msg: &OutboxMessage) -> Result<(), DbError>;
 
     /// Claim up to `limit` undispatched outbox messages for `owner`, hiding them
-    /// from other drainers for `visibility_ms` (a claim lease). Uses
-    /// `FOR UPDATE SKIP LOCKED` so concurrent drainers get disjoint sets — no
-    /// message is handed to two drainers at once. If the owner crashes before
+    /// from other drainers for `visibility_ms` (a claim lease). When `kind` is
+    /// `Some`, only messages of that kind are claimed — so independent drainers
+    /// (launch intents vs. forge-status posts) never steal each other's work.
+    /// Uses `FOR UPDATE SKIP LOCKED` so concurrent drainers get disjoint sets —
+    /// no message is handed to two drainers at once. If the owner crashes before
     /// [`mark_dispatched`](Db::mark_dispatched), the claim expires and the
     /// message is redelivered (at-least-once); the consumer's fence makes the
     /// duplicate a no-op (ADR-0021).
     async fn claim_outbox(
         &self,
         owner: &str,
+        kind: Option<&str>,
         limit: u32,
         visibility_ms: i64,
     ) -> Result<Vec<OutboxMessage>, DbError>;

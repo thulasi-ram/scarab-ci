@@ -21,7 +21,9 @@ pub mod ports;
 pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor};
-pub use scheduler::{restart_step, RestartError, Scheduler, SchedulerError};
+pub use scheduler::{
+    restart_step, RestartError, Scheduler, SchedulerError, LAUNCH_STEP, RUN_STATUS_CHANGED,
+};
 
 use serde::{Deserialize, Serialize};
 
