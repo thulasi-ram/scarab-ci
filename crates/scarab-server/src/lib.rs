@@ -29,8 +29,8 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use scarab_engine::{
-    Clock, Db, DbError, EventKind, EventPayload, RestartError, RunId, RunStatus, StepId, StepSpec,
-    StepStatus, Timestamp, EVENT_VERSION, RUN_STATUS_CHANGED,
+    Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RestartError, RunId, RunStatus,
+    StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION, RUN_STATUS_CHANGED,
 };
 use scarab_identity::{Action, Principal, Session};
 
@@ -516,6 +516,14 @@ async fn persist_run_from_ir(
     db.create_run(run, ir.ir_version, EVENT_VERSION, now).await?;
     db.store_run_ir(run, &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null))
         .await?;
+    // Concurrency group (ADR-0011, 0032): serialize this run against others in the
+    // same group under its policy. `${{ … }}` interpolation of the group against
+    // the event context is a later slice (kept literal here, matching where step
+    // interpolation stands). Only the engine wiring is exercised now.
+    if let Some(c) = &ir.concurrency {
+        db.set_run_concurrency(run, &c.group, ConcurrencyPolicy::from_wire(&c.policy))
+            .await?;
+    }
     // Newest-wins auto-cancel (ADR-0032): key non-deploy runs by (repo, ref) so
     // a newer run on the same ref supersedes older in-flight ones. Deploy
     // pipelines (an Environment target — a later slice-4 issue) will opt out.
@@ -537,14 +545,22 @@ async fn persist_run_from_ir(
     })
     .await?;
     for step in &ir.steps {
-        let spec = StepSpec {
-            image: step.image.clone(),
-            command: step.command.clone(),
-            env: step.env.clone(),
-        };
         let needs: Vec<StepId> = step.needs.0.iter().map(|n| StepId(n.clone())).collect();
-        db.create_step_run(run, &StepId(step.id.clone()), Some(&spec), &needs, now)
-            .await?;
+        let step_id = StepId(step.id.clone());
+        if let Some(kind) = &step.gate {
+            // A gate step launches no unit — create it spec-less, then mark it a
+            // durable suspend point of this kind (ADR-0008; engine: set_step_gate).
+            db.create_step_run(run, &step_id, None, &needs, now).await?;
+            db.set_step_gate(run, &step_id, kind).await?;
+        } else {
+            let spec = StepSpec {
+                image: step.image.clone(),
+                command: step.command.clone(),
+                env: step.env.clone(),
+            };
+            db.create_step_run(run, &step_id, Some(&spec), &needs, now)
+                .await?;
+        }
     }
     Ok(())
 }

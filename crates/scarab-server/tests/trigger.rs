@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use scarab_engine::{Db, StepStatus};
+use scarab_engine::{ConcurrencyPolicy, Db, StepStatus};
 use scarab_forge::{Event, Repo};
 use scarab_server::trigger_run_from_event;
 use scarab_testkit::{FakeClock, FakeForge, InMemoryDb};
@@ -56,6 +56,52 @@ async fn push_matching_on_push_starts_a_run() {
     assert_eq!(steps[0].status, StepStatus::Pending);
     // The IR was stored on the run (self-describing).
     assert!(db.run_ir(&run).await.unwrap().is_some());
+}
+
+/// A committed `.scarab` authoring slice-4 engine features: a concurrency group
+/// and an image-less gate between two executed steps.
+const CI_YAML_CONCURRENCY_GATE: &str = r#"
+on:
+  push: {}
+concurrency:
+  group: deploy-prod
+  policy: cancel-in-progress
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+  - { id: approve, gate: manual, needs: [build] }
+  - { id: deploy, image: busybox, command: ["true"], needs: [approve] }
+"#;
+
+#[tokio::test]
+async fn committed_scarab_authors_concurrency_and_gate() {
+    let forge = FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML_CONCURRENCY_GATE);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
+        .await
+        .expect("trigger")
+        .expect("a matching push starts a run");
+
+    // Concurrency reached the engine: group + policy are set on the run.
+    let (group, policy) = db
+        .run_concurrency(&run)
+        .await
+        .unwrap()
+        .expect("run is in a concurrency group");
+    assert_eq!(group, "deploy-prod");
+    assert_eq!(policy, ConcurrencyPolicy::CancelInProgress);
+
+    // The gate reached the engine: `approve` is a durable suspend point, the
+    // other two are ordinary executed steps.
+    let steps = db.steps_of_run(&run).await.unwrap();
+    let approve = steps.iter().find(|s| s.step.0 == "approve").unwrap();
+    assert!(approve.is_gate(), "approve should be a gate step");
+    assert_eq!(approve.gate_kind.as_deref(), Some("manual"));
+    assert!(
+        steps.iter().find(|s| s.step.0 == "build").unwrap().gate_kind.is_none(),
+        "build is an ordinary step"
+    );
 }
 
 #[tokio::test]

@@ -47,8 +47,39 @@ pub struct PipelineIr {
     /// normalized forge event via [`matches_trigger`] (ADR-0009, 0010).
     #[serde(default, rename = "on", skip_serializing_if = "Triggers::is_empty")]
     pub triggers: Triggers,
+    /// Optional concurrency group: serializes this run against others in the same
+    /// group under a [`Concurrency::policy`] (ADR-0011, 0032). Absent means the
+    /// run is unconstrained. The engine wiring is `Db::set_run_concurrency`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<Concurrency>,
     pub steps: Vec<StepSpec>,
 }
+
+/// A pipeline's `concurrency:` block (ADR-0011, 0032). The `group` is a (possibly
+/// `${{ … }}`-interpolated) key; runs sharing a resolved group contend for its
+/// single slot, admitted per `policy`. Kept as strings so this pure crate stays
+/// independent of the engine's `ConcurrencyPolicy` — the server maps `policy` via
+/// `ConcurrencyPolicy::from_wire` at the wiring boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Concurrency {
+    pub group: String,
+    /// `queue` (wait for the slot, the safe default) or `cancel-in-progress`
+    /// (cancel the current holder). Validated at submit time.
+    #[serde(default = "default_policy")]
+    pub policy: String,
+}
+
+fn default_policy() -> String {
+    "queue".to_string()
+}
+
+/// The concurrency policies the engine understands (mirrors the wire tokens of
+/// `scarab_engine::ConcurrencyPolicy`; duplicated here to keep the crate pure).
+const CONCURRENCY_POLICIES: [&str; 2] = ["queue", "cancel-in-progress"];
+
+/// The gate kinds a `gate:` step may declare (ADR-0008, 0032): `manual`
+/// (approval), `timer` (wait a duration), `external` (release via API/webhook).
+const GATE_KINDS: [&str; 3] = ["manual", "timer", "external"];
 
 /// A pipeline's `on:` block: trigger kind (e.g. `push`, `pull_request`) → filter.
 /// Kinds are the canonical vocabulary of `scarab_forge::TriggerKind`, kept as
@@ -78,8 +109,17 @@ pub struct TriggerFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepSpec {
     pub id: String,
-    /// OCI image the step runs in.
+    /// OCI image the step runs in. Empty (and defaulted) for a [`gate`](StepSpec::gate)
+    /// step, which launches nothing; required for every executed step (enforced
+    /// by [`validate`]).
+    #[serde(default)]
     pub image: String,
+    /// If set, this is a **gate** step (ADR-0008's `kind: gate`): an image-less
+    /// durable suspend point of this kind (`manual`/`timer`/`external`). It
+    /// launches no unit; when its `needs` are satisfied the run suspends until
+    /// released. The engine wiring is `Db::set_step_gate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
     /// Entrypoint/command (empty = the image default).
     #[serde(default)]
     pub command: Vec<String>,
@@ -101,6 +141,13 @@ pub struct StepSpec {
     /// steps authored without a matrix). Consumed later by CEL interpolation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub matrix_values: BTreeMap<String, String>,
+}
+
+impl StepSpec {
+    /// Is this an image-less gate step (a durable suspend point)?
+    pub fn is_gate(&self) -> bool {
+        self.gate.is_some()
+    }
 }
 
 /// The upstream steps this step depends on (its DAG edges).
@@ -209,6 +256,7 @@ pub fn compile_yaml(yaml: &str) -> Result<PipelineIr, PipelineError> {
     let ir = PipelineIr {
         ir_version: authored.ir_version,
         triggers: authored.triggers,
+        concurrency: authored.concurrency,
         steps: expanded,
     };
 
@@ -315,6 +363,30 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         if step.matrix.is_some() {
             diagnostics.push(format!("step `{}`: matrix was not expanded", step.id));
         }
+        // Step kind: a gate launches nothing (image-less); every other step must
+        // name an image. A gate with an image/command is a contradiction.
+        match &step.gate {
+            Some(kind) => {
+                if !GATE_KINDS.contains(&kind.as_str()) {
+                    diagnostics.push(format!(
+                        "step `{}`: unknown gate kind `{kind}` (expected one of {})",
+                        step.id,
+                        GATE_KINDS.join(", ")
+                    ));
+                }
+                if !step.image.is_empty() || !step.command.is_empty() {
+                    diagnostics.push(format!(
+                        "step `{}`: a gate step launches nothing — it must not set an image or command",
+                        step.id
+                    ));
+                }
+            }
+            None => {
+                if step.image.is_empty() {
+                    diagnostics.push(format!("step `{}`: missing image", step.id));
+                }
+            }
+        }
         // Dangling needs.
         for need in &step.needs.0 {
             if !ids.contains(need.as_str()) {
@@ -347,6 +419,23 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
             if let Err(e) = cel::check(expr) {
                 diagnostics.push(format!("trigger `{kind}`: when {e}"));
             }
+        }
+    }
+
+    // Concurrency: a non-empty group, a known policy, and a group whose `${{ … }}`
+    // interpolation parses now (it is resolved per-run at admission, ADR-0032).
+    if let Some(c) = &ir.concurrency {
+        if c.group.is_empty() {
+            diagnostics.push("concurrency: group must not be empty".to_string());
+        } else if let Err(e) = cel::check_interpolation(&c.group) {
+            diagnostics.push(format!("concurrency: group {e}"));
+        }
+        if !CONCURRENCY_POLICIES.contains(&c.policy.as_str()) {
+            diagnostics.push(format!(
+                "concurrency: unknown policy `{}` (expected one of {})",
+                c.policy,
+                CONCURRENCY_POLICIES.join(", ")
+            ));
         }
     }
 
@@ -460,6 +549,7 @@ pub fn select_steps(
     Ok(PipelineIr {
         ir_version: ir.ir_version,
         triggers: ir.triggers.clone(),
+        concurrency: ir.concurrency.clone(),
         steps: kept,
     })
 }
@@ -702,6 +792,111 @@ mod tests {
             "#,
         );
         assert!(diags.iter().any(|d| d.contains("duplicate step id `a`")), "got {diags:?}");
+    }
+
+    #[test]
+    fn concurrency_block_compiles_and_defaults_policy_to_queue() {
+        let ir = compile(
+            r#"
+            concurrency:
+              group: deploy-prod
+            steps:
+              - { id: a, image: busybox }
+            "#,
+        );
+        let c = ir.concurrency.clone().expect("concurrency present");
+        assert_eq!(c.group, "deploy-prod");
+        assert_eq!(c.policy, "queue", "policy defaults to the safe queue");
+
+        // Round-trips through serde_json unchanged (self-describing IR).
+        let back: PipelineIr =
+            serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+        assert_eq!(ir, back);
+    }
+
+    #[test]
+    fn concurrency_accepts_cancel_in_progress_and_rejects_unknown_policy() {
+        let ir = compile(
+            r#"
+            concurrency: { group: pr-42, policy: cancel-in-progress }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert_eq!(ir.concurrency.unwrap().policy, "cancel-in-progress");
+
+        let diags = errors(
+            r#"
+            concurrency: { group: g, policy: nonsense }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("unknown policy `nonsense`")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn concurrency_group_interpolation_is_checked_at_submit() {
+        // A well-formed interpolated group compiles.
+        compile(
+            r#"
+            concurrency: { group: "deploy-${{ event.branch }}" }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        // A broken interpolation is a submit-time error.
+        let diags = errors(
+            r#"
+            concurrency: { group: "deploy-${{ 1 + }}" }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert!(
+            diags.iter().any(|d| d.contains("concurrency: group")),
+            "got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn gate_step_compiles_without_an_image() {
+        let ir = compile(
+            r#"
+            steps:
+              - { id: build, image: busybox }
+              - { id: approve, gate: manual, needs: [build] }
+              - { id: deploy, image: busybox, needs: [approve] }
+            "#,
+        );
+        let approve = ir.steps.iter().find(|s| s.id == "approve").unwrap();
+        assert!(approve.is_gate());
+        assert_eq!(approve.gate.as_deref(), Some("manual"));
+        assert!(approve.image.is_empty());
+        // The gate keeps its DAG position between build and deploy.
+        assert_eq!(approve.needs.0, vec!["build".to_string()]);
+    }
+
+    #[test]
+    fn gate_step_rejects_unknown_kind_and_a_stray_image() {
+        let unknown = errors(r#"steps: [{ id: g, gate: whenever }]"#);
+        assert!(
+            unknown.iter().any(|d| d.contains("unknown gate kind `whenever`")),
+            "got {unknown:?}"
+        );
+        let with_image = errors(r#"steps: [{ id: g, gate: manual, image: busybox }]"#);
+        assert!(
+            with_image.iter().any(|d| d.contains("launches nothing")),
+            "got {with_image:?}"
+        );
+    }
+
+    #[test]
+    fn non_gate_step_without_an_image_is_rejected() {
+        let diags = errors(r#"steps: [{ id: a }]"#);
+        assert!(
+            diags.iter().any(|d| d.contains("step `a`: missing image")),
+            "got {diags:?}"
+        );
     }
 
     #[test]
