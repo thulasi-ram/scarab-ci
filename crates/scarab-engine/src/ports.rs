@@ -153,9 +153,21 @@ pub trait Db: Send + Sync {
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError>;
 
     /// Mark a step as a gate of `kind` (`manual`/`timer`/`external`) — a durable
-    /// suspend point that launches no Pod (ADR-0008).
-    async fn set_step_gate(&self, run: &RunId, step: &StepId, kind: &str)
-        -> Result<(), DbError>;
+    /// suspend point that launches no Pod (ADR-0008). For a `timer` gate,
+    /// `timer_seconds` is the wait after which the run auto-releases; `None` for
+    /// other kinds.
+    async fn set_step_gate(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        kind: &str,
+        timer_seconds: Option<i64>,
+    ) -> Result<(), DbError>;
+
+    /// The wait (seconds) of a `timer` gate, or `None` if the step is not a timer
+    /// gate (or is unknown). Read at admission to decide auto-release.
+    async fn gate_timer_seconds(&self, run: &RunId, step: &StepId)
+        -> Result<Option<i64>, DbError>;
 
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;

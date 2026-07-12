@@ -638,8 +638,10 @@ async fn persist_run_from_ir(
         if let Some(kind) = &step.gate {
             // A gate step launches no unit — create it spec-less, then mark it a
             // durable suspend point of this kind (ADR-0008; engine: set_step_gate).
+            // A `timer` gate carries its wait so the scheduler can auto-release.
             db.create_step_run(run, &step_id, None, &needs, now).await?;
-            db.set_step_gate(run, &step_id, kind).await?;
+            let timer = step.gate_after.map(|s| s as i64);
+            db.set_step_gate(run, &step_id, kind, timer).await?;
         } else {
             let spec = StepSpec {
                 image: step.image.clone(),

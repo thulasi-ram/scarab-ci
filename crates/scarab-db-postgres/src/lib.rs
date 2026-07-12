@@ -483,19 +483,37 @@ impl Db for PostgresDb {
         run: &RunId,
         step: &StepId,
         kind: &str,
+        timer_seconds: Option<i64>,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "UPDATE step_runs SET gate_kind = $3,
+            "UPDATE step_runs SET gate_kind = $3, gate_timer_seconds = $4,
                  updated_at = (extract(epoch from now()) * 1000)::bigint
              WHERE run_id = $1 AND step_id = $2",
         )
         .bind(&run.0)
         .bind(&step.0)
         .bind(kind)
+        .bind(timer_seconds)
         .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn gate_timer_seconds(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<i64>, DbError> {
+        let row = sqlx::query(
+            "SELECT gate_timer_seconds FROM step_runs WHERE run_id = $1 AND step_id = $2",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .fetch_optional(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<i64>, _>("gate_timer_seconds")))
     }
 
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {

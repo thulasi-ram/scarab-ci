@@ -45,7 +45,7 @@ async fn prod_group_serializes_with_gate_resume_across_restart() {
     db.set_run_concurrency(&r1, "deploy-prod", ConcurrencyPolicy::Queue).await.unwrap();
     let gate = StepId("approve".into());
     db.create_step_run(&r1, &gate, None, &[], Timestamp(1)).await.unwrap();
-    db.set_step_gate(&r1, &gate, "manual").await.unwrap();
+    db.set_step_gate(&r1, &gate, "manual", None).await.unwrap();
     db.create_step_run(&r1, &StepId("deploy".into()), Some(&spec()), std::slice::from_ref(&gate), Timestamp(1))
         .await
         .unwrap();

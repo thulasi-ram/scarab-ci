@@ -127,6 +127,11 @@ pub struct StepSpec {
     /// released. The engine wiring is `Db::set_step_gate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
+    /// For a `timer` gate, how long (seconds) to wait before the run
+    /// auto-releases and resumes (ADR-0008). Required for `timer`; forbidden on
+    /// any other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_after: Option<u32>,
     /// Entrypoint/command (empty = the image default).
     #[serde(default)]
     pub command: Vec<String>,
@@ -388,10 +393,32 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                         step.id
                     ));
                 }
+                // A `timer` gate needs a positive wait; other kinds must not set one.
+                match (kind.as_str(), step.gate_after) {
+                    ("timer", None) => diagnostics.push(format!(
+                        "step `{}`: a timer gate must set `gate_after` (seconds)",
+                        step.id
+                    )),
+                    ("timer", Some(0)) => diagnostics.push(format!(
+                        "step `{}`: `gate_after` must be greater than zero",
+                        step.id
+                    )),
+                    (other, Some(_)) if other != "timer" => diagnostics.push(format!(
+                        "step `{}`: `gate_after` is only valid on a timer gate",
+                        step.id
+                    )),
+                    _ => {}
+                }
             }
             None => {
                 if step.image.is_empty() {
                     diagnostics.push(format!("step `{}`: missing image", step.id));
+                }
+                if step.gate_after.is_some() {
+                    diagnostics.push(format!(
+                        "step `{}`: `gate_after` is only valid on a timer gate",
+                        step.id
+                    ));
                 }
             }
         }
@@ -936,6 +963,36 @@ mod tests {
             with_image.iter().any(|d| d.contains("launches nothing")),
             "got {with_image:?}"
         );
+    }
+
+    #[test]
+    fn timer_gate_requires_a_positive_gate_after() {
+        // A timer gate compiles with a wait.
+        let ir = compile(r#"steps: [{ id: wait, gate: timer, gate_after: 3600 }]"#);
+        let g = ir.steps.iter().find(|s| s.id == "wait").unwrap();
+        assert_eq!(g.gate.as_deref(), Some("timer"));
+        assert_eq!(g.gate_after, Some(3600));
+
+        // Missing / zero wait is rejected.
+        assert!(errors(r#"steps: [{ id: w, gate: timer }]"#)
+            .iter()
+            .any(|d| d.contains("must set `gate_after`")));
+        assert!(errors(r#"steps: [{ id: w, gate: timer, gate_after: 0 }]"#)
+            .iter()
+            .any(|d| d.contains("greater than zero")));
+    }
+
+    #[test]
+    fn gate_after_only_valid_on_a_timer_gate() {
+        for yaml in [
+            r#"steps: [{ id: w, gate: manual, gate_after: 60 }]"#,
+            r#"steps: [{ id: w, image: busybox, gate_after: 60 }]"#,
+        ] {
+            assert!(
+                errors(yaml).iter().any(|d| d.contains("only valid on a timer gate")),
+                "expected rejection for {yaml}"
+            );
+        }
     }
 
     #[test]

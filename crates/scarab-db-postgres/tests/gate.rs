@@ -29,6 +29,65 @@ fn step_status(steps: &[scarab_engine::StepRun], id: &str) -> StepStatus {
     steps.iter().find(|s| s.step.0 == id).unwrap().status
 }
 
+/// A -> timer-gate(60s) -> B: the run suspends at the gate and stays suspended
+/// until the wait elapses, then the scheduler auto-releases it (no manual
+/// approval) and the DAG completes (ADR-0008).
+#[tokio::test]
+async fn timer_gate_auto_releases_after_its_wait() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let run = RunId("run-timer".into());
+    let (a, g, b) = (StepId("a".into()), StepId("wait".into()), StepId("b".into()));
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &a, Some(&spec()), &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &g, None, std::slice::from_ref(&a), Timestamp(0)).await.unwrap();
+    db.set_step_gate(&run, &g, "timer", Some(60)).await.unwrap(); // 60s wait
+    db.create_step_run(&run, &b, Some(&spec()), std::slice::from_ref(&g), Timestamp(0))
+        .await
+        .unwrap();
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.script_outcome(ExecState::Succeeded); // A
+    exec.script_outcome(ExecState::Succeeded); // B (after auto-release)
+    let sched = Scheduler::new(&db, &clock, &exec, "sched");
+
+    // Run A, then reach the gate and suspend (at clock = 1_000ms).
+    sched.tick(&run).await.unwrap();
+    sched.tick(&run).await.unwrap();
+    assert_eq!(status(&db, "run-timer").await, RunStatus::Suspended, "suspends at the timer gate");
+
+    // Before the wait elapses, a tick does NOT release it.
+    clock.advance(59_000);
+    sched.tick(&run).await.unwrap();
+    assert_eq!(
+        status(&db, "run-timer").await,
+        RunStatus::Suspended,
+        "still waiting — timer not yet elapsed"
+    );
+
+    // Once the 60s wait has passed, the next tick auto-releases and resumes.
+    clock.advance(2_000); // now 1_000 + 61_000 = 62_000ms >= 1_000 + 60_000
+    sched.tick(&run).await.unwrap();
+    assert_eq!(
+        step_status(&db.steps_of_run(&run).await.unwrap(), "wait"),
+        StepStatus::Succeeded,
+        "timer gate auto-released"
+    );
+
+    // Drive to completion: B runs and the run settles.
+    sched.tick(&run).await.unwrap();
+    assert_eq!(status(&db, "run-timer").await, RunStatus::Succeeded);
+    assert_eq!(step_status(&db.steps_of_run(&run).await.unwrap(), "b"), StepStatus::Succeeded);
+
+    tdb.cleanup().await;
+}
+
 /// A -> gate -> B: the run suspends at the gate, survives a restart, and resumes
 /// exactly once on approval.
 #[tokio::test]
@@ -46,7 +105,7 @@ async fn gate_suspends_survives_restart_and_resumes_once() {
     db.create_step_run(&run, &a, Some(&spec()), &[], Timestamp(0)).await.unwrap();
     // The gate: no launch spec, depends on A.
     db.create_step_run(&run, &g, None, std::slice::from_ref(&a), Timestamp(0)).await.unwrap();
-    db.set_step_gate(&run, &g, "manual").await.unwrap();
+    db.set_step_gate(&run, &g, "manual", None).await.unwrap();
     db.create_step_run(&run, &b, Some(&spec()), std::slice::from_ref(&g), Timestamp(0))
         .await
         .unwrap();

@@ -83,6 +83,8 @@ struct StepRec {
     input: Option<String>,
     /// Gate kind (`manual`/`timer`/`external`), or `None` for an executed step.
     gate_kind: Option<String>,
+    /// For a `timer` gate, the wait (seconds) before auto-release.
+    gate_timer_seconds: Option<i64>,
 }
 
 #[derive(Default)]
@@ -145,6 +147,7 @@ impl InMemoryDb {
                 output: None,
                 input: None,
                 gate_kind: None,
+                gate_timer_seconds: None,
             },
         );
     }
@@ -163,6 +166,7 @@ impl InMemoryDb {
                     output: None,
                     input: None,
                     gate_kind: None,
+                    gate_timer_seconds: None,
                 },
             );
         }
@@ -234,6 +238,7 @@ impl Db for InMemoryDb {
                 output: None,
                 input: None,
                 gate_kind: None,
+                gate_timer_seconds: None,
             },
         );
         Ok(())
@@ -396,12 +401,28 @@ impl Db for InMemoryDb {
         run: &RunId,
         step: &StepId,
         kind: &str,
+        timer_seconds: Option<i64>,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
         if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
             rec.gate_kind = Some(kind.to_string());
+            rec.gate_timer_seconds = timer_seconds;
         }
         Ok(())
+    }
+
+    async fn gate_timer_seconds(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<i64>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.gate_timer_seconds))
     }
 
     async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError> {

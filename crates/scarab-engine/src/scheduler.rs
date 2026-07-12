@@ -326,8 +326,12 @@ impl<'a> Scheduler<'a> {
         if status.is_terminal() {
             return Ok(());
         }
-        // A suspended run is waiting on a gate release; do no work until resumed.
+        // A suspended run is waiting on a gate. A `timer` gate releases itself
+        // once its wait has elapsed (ADR-0008); everything else waits for an
+        // explicit release. Either way, do no admission this pass — the resumed
+        // run is picked up next tick.
         if status == RunStatus::Suspended {
+            self.auto_release_elapsed_timer(run).await?;
             return Ok(());
         }
 
@@ -604,6 +608,57 @@ impl<'a> Scheduler<'a> {
         }
         if let Some((group, _)) = self.db.run_concurrency(run).await? {
             self.db.release_slot(&group, run).await?;
+        }
+        Ok(())
+    }
+
+    /// Release a `timer` gate whose wait has elapsed and resume the run
+    /// (ADR-0008). The wait counts from when the run suspended (the latest
+    /// `RunTransitioned → Suspended` on the event log). A no-op when the active
+    /// gate is not a timer or the wait has not elapsed — so a manual/external gate
+    /// still waits for an explicit release.
+    async fn auto_release_elapsed_timer(&self, run: &RunId) -> Result<(), SchedulerError> {
+        let steps = self.db.steps_of_run(run).await?;
+        let done: HashMap<&StepId, StepStatus> =
+            steps.iter().map(|s| (&s.step, s.status)).collect();
+        // The gate blocking the run: a Pending timer gate whose deps are satisfied.
+        let Some(gate) = steps.iter().find(|s| {
+            s.status == StepStatus::Pending
+                && s.gate_kind.as_deref() == Some("timer")
+                && s.needs
+                    .iter()
+                    .all(|d| done.get(d).copied() == Some(StepStatus::Succeeded))
+        }) else {
+            return Ok(());
+        };
+        let Some(wait_secs) = self.db.gate_timer_seconds(run, &gate.step).await? else {
+            return Ok(());
+        };
+
+        // Suspension time: the most recent transition into Suspended.
+        let suspended_at = self
+            .db
+            .events(run)
+            .await?
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventPayload::RunTransitioned { to: RunStatus::Suspended, .. }
+                )
+            })
+            .map(|e| e.at.0)
+            .max();
+        let Some(suspended_at) = suspended_at else {
+            return Ok(());
+        };
+
+        let now = self.clock.now().await;
+        if now.0 >= suspended_at + wait_secs.saturating_mul(1000) {
+            // Reuse the manual-release path: marks the gate Succeeded and resumes.
+            release_gate(self.db, self.clock, run, &gate.step)
+                .await
+                .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
         }
         Ok(())
     }
