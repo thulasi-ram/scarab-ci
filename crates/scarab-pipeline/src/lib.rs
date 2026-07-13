@@ -148,6 +148,13 @@ pub struct StepSpec {
     /// not force it to re-run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Vec<String>>,
+    /// Explicit output workspace paths (ADR-0007): the workspace-relative paths
+    /// this step publishes downstream. Absent = the whole workspace (the implicit
+    /// default). Naming a subset restricts what flows and gives a precise output
+    /// hash. Enforced by the post-step CAS snapshot on the live-workspace path
+    /// (ADR-0029); authored + validated here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<String>>,
     /// Authoring-only fan-out modifier; `None` on every compiled step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix: Option<Matrix>,
@@ -456,6 +463,24 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 if !step.needs.0.contains(input) {
                     diagnostics.push(format!(
                         "step `{}`: input `{input}` is not among its needs",
+                        step.id
+                    ));
+                }
+            }
+        }
+        // Explicit outputs must be workspace-relative, non-empty paths (ADR-0007):
+        // no empty entry, no absolute path, no `..` traversal out of the workspace.
+        if let Some(outputs) = &step.outputs {
+            if outputs.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: `outputs` must list at least one path (omit it for the whole workspace)",
+                    step.id
+                ));
+            }
+            for path in outputs {
+                if path.is_empty() || path.starts_with('/') || path.split('/').any(|c| c == "..") {
+                    diagnostics.push(format!(
+                        "step `{}`: output path `{path}` must be workspace-relative (no leading `/`, no `..`)",
                         step.id
                     ));
                 }
@@ -1048,6 +1073,24 @@ mod tests {
             diags.iter().any(|d| d.contains("input `c` is not among its needs")),
             "got {diags:?}"
         );
+    }
+
+    #[test]
+    fn explicit_outputs_compile_and_must_be_workspace_relative() {
+        let ir = compile(r#"steps: [{ id: build, image: rust, outputs: [dist/, VERSION] }]"#);
+        let b = ir.steps.iter().find(|s| s.id == "build").unwrap();
+        assert_eq!(b.outputs.as_deref(), Some(["dist/".to_string(), "VERSION".to_string()].as_slice()));
+
+        // Absolute paths, `..` traversal, and an empty list are rejected.
+        assert!(errors(r#"steps: [{ id: b, image: rust, outputs: ["/etc/passwd"] }]"#)
+            .iter()
+            .any(|d| d.contains("workspace-relative")));
+        assert!(errors(r#"steps: [{ id: b, image: rust, outputs: ["../x"] }]"#)
+            .iter()
+            .any(|d| d.contains("workspace-relative")));
+        assert!(errors(r#"steps: [{ id: b, image: rust, outputs: [] }]"#)
+            .iter()
+            .any(|d| d.contains("at least one path")));
     }
 
     #[test]
