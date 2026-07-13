@@ -55,16 +55,23 @@ enum ExecutorKind {
 #[command(name = "scarab-server", about = "Scarab durable CI — server process")]
 struct Cli {
     /// The role this process runs as.
-    #[arg(long, value_enum, default_value_t = Role::Converged)]
+    #[arg(long, value_enum, env = "SCARAB_ROLE", default_value_t = Role::Converged)]
     role: Role,
 
-    /// Actually bind and serve HTTP. Without this the process reports its role
-    /// and exits (so `--help` and smoke checks never hang).
+    /// Report the resolved role and exit WITHOUT binding a socket. Serving is the
+    /// default now; this is the escape hatch for smoke checks / image
+    /// healthchecks that must not hang.
     #[arg(long)]
+    dry_run: bool,
+
+    /// Deprecated no-op: serving is the default. Kept so existing scripts and
+    /// muscle memory (`--serve`) keep working.
+    #[arg(long, hide = true)]
     serve: bool,
 
-    /// Address to bind when `--serve` is set.
-    #[arg(long, default_value = "0.0.0.0:8080")]
+    /// Address to bind. Override per-environment via `SCARAB_ADDR` (e.g. a dev
+    /// `.env.local` sets `127.0.0.1:8899`).
+    #[arg(long, env = "SCARAB_ADDR", default_value = "0.0.0.0:8080")]
     addr: String,
 
     /// Postgres connection URL. When set, the durable store is connected and the
@@ -234,12 +241,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let app = router(state);
 
-    if cli.serve {
+    // Serve by default; `--serve` still forces it, `--dry-run` opts out.
+    let serve = cli.serve || !cli.dry_run;
+    if serve {
         let listener = tokio::net::TcpListener::bind(&cli.addr).await?;
         println!("listening on {}", cli.addr);
         axum::serve(listener, app).await?;
     } else {
-        println!("(dry run — pass --serve to bind {})", cli.addr);
+        println!("(dry run — omit --dry-run to bind {})", cli.addr);
     }
 
     Ok(())

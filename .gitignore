@@ -9,6 +9,10 @@
 # local object-store backend (default dev fallback)
 /.scarab
 
+# machine-specific dev env (direnv loads it; see .env.local.example)
+/.env.local
+/.direnv
+
 # UI (TS project, not a cargo member)
 /ui/node_modules
 /ui/dist

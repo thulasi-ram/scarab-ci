@@ -69,7 +69,26 @@ cargo check --workspace
 cargo run -p scarab-server -- --help
 ```
 
-## Local dev stack
+## Local dev (cluster-free)
+
+For laptop iteration you need only a local Postgres. Config is env-driven, so
+set it once via direnv and run each process with no flags:
+
+```sh
+cp .env.local.example .env.local   # edit DB url etc.
+direnv allow                       # exports .env.local on cd (see .envrc)
+
+just server   # cargo run -p scarab-server   (binds SCARAB_ADDR, host executor)
+just ui       # Vite dev server on http://localhost:5173, proxies /v1 → server
+```
+
+`just server` is just `cargo run -p scarab-server` — every knob
+(`SCARAB_ADDR`, `SCARAB_DATABASE_URL`, `SCARAB_EXECUTOR`, `SCARAB_MASTER_KEY`, …)
+comes from the environment. Serving is the default; pass `--dry-run` to report
+the resolved role and exit without binding. Auth is disabled in dev, so every
+request is an Owner.
+
+## Full dev stack (k8s)
 
 One command brings up the two stateful dependencies (Postgres + MinIO), a
 [kind](https://kind.sigs.k8s.io/) cluster for step Pods, and `scarab-server` in

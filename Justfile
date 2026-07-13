@@ -10,6 +10,16 @@
 default:
     @just --list
 
+# Run scarab-server for local dev. Config comes from the environment — `cd` into
+# the repo with direnv set up (see .env.local.example) and this needs no flags.
+server:
+    cargo run -p scarab-server
+
+# Run the UI dev server (Vite on http://localhost:5173, proxies /v1 → server).
+ui:
+    npm --prefix ui install
+    npm --prefix ui run dev
+
 # Bring up the full dev stack and start scarab-server against it.
 up:
     bash dev/up.sh
