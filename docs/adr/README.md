@@ -41,7 +41,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0022](0022-upgrades-and-versioning.md) | Upgrades & schema evolution: version-tolerant from day one | Accepted |
 | [0023](0023-dag-shape.md) | DAG shape: static matrix v1, dynamic reserved | Accepted |
 | [0024](0024-environments.md) | Environments: first-class with protection rules | Accepted |
-| [0025](0025-cross-pipeline-orchestration.md) | Cross-pipeline orchestration: nest vs trigger | Accepted |
+| [0025](0025-cross-pipeline-orchestration.md) | Cross-pipeline orchestration: nest vs trigger | Accepted (amended by 0038) |
 | [0026](0026-resource-and-placement.md) | Resource & placement model | Accepted |
 | [0027](0027-restart-semantics.md) | Restart semantics: content-addressed smart invalidation | Accepted |
 | [0028](0028-ui-stack.md) | UI stack: SolidJS + TS + generated client | Accepted |
@@ -49,6 +49,13 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0030](0030-operational-defaults.md) | Operational defaults (isolation, retention, notifications, install, DR, limits) | Accepted |
 | [0031](0031-pure-computation-deps.md) | Purity = no I/O, not no deps: pure-computation crates allowed (amends 0016) | Accepted |
 | [0032](0032-slices-3-5-implementation-decisions.md) | Slice 3–5 implementation decisions (forge/identity, scheduler/gates, secrets/OIDC/BuildKit) | Accepted |
+| [0033](0033-transitive-skip.md) | Transitive skip: `when:false` step kept-but-skipped, descendants cascade | Accepted |
+| [0034](0034-external-gate-token.md) | External gate release via HMAC token | Accepted |
+| [0035](0035-explicit-outputs.md) | Explicit workspace `outputs:` | Accepted |
+| [0036](0036-local-execution-dev-backend.md) | Local execution dev backend | Accepted |
+| [0037](0037-environment-governance.md) | Environment governance: approval-as-gate, scoped secrets, admission at point-of-use | Accepted |
+| [0038](0038-invoke-and-local-reuse.md) | `invoke` = compile-time inlining; local `.scarab/lib`, third-party via OCI images (amends 0025) | Accepted |
+| [0039](0039-privileged-images.md) | Privileged step images: hardened baseline + governed capability grants per Environment | Accepted |
 
 ## Open / deferred (to be written when their slice begins)
 

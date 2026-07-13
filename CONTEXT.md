@@ -64,12 +64,14 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 | **Pipeline** | Top-level authored unit: a **flat recursive DAG** of Steps. Lives in-repo (`.scarab/`), read at the triggering ref, compiled to IR. |
 | **Step** | The atomic unit and the **Pod boundary**. An OCI image + command + I/O convention. The unit of re-execution. |
 | **`needs`** | A dependency edge between Steps. Parallelism is *emergent* from the DAG (anything not transitively dependent runs concurrently). |
-| **`invoke`** | A built-in Step kind that runs **another Pipeline in the same Run** (nesting). Composition = recursion; replaces "reusable workflows" and "composite actions". |
-| **Matrix** | An orthogonal *modifier* on a Step: expands to N instances (cartesian product) at **submit time** (static in v1). |
+| **`invoke`** | A built-in Step kind that references **another Pipeline in the same Run**. **Compile-time inlining, not a runtime object** (ADR-0025): the referenced Pipeline's Steps are flattened into the caller's DAG, id-namespaced by the invoke-step id (`deploy/build`). Composition = recursion; replaces "reusable workflows" and "composite actions". A "job" is a named subgraph — sugar, not structure. |
+| **Library pipeline** | A Pipeline authored under **`.scarab/lib/`** that exists to be `invoke`d, not triggered. Referenced by repo-relative path, read at the caller's ref (atomic git versioning; no registry, no semver). Out of trigger discovery by convention (subdir) and by carrying no matching `on:`. |
+| **Matrix** | An orthogonal *modifier* on a Step: expands to N instances (cartesian product) at **submit time** (static in v1). Applied to an `invoke` step, it fans out N copies of the whole referenced subgraph — "run this reusable subgraph once per coordinate". |
 | **Trigger (`on:`)** | What starts a Pipeline: `push`, `pull_request`, `tag`, `release`, comment-command, `cron`, `manual`, `api`, `upstream`. Matched against the normalized **Event** via CEL. |
 | **Gate** | A built-in Step kind: a **durable suspend point** awaiting human approval, a timer, or an external event. |
 | **Service** | A built-in Step kind: a sidecar (db/redis) alive for the duration of dependent Steps. |
-| **Environment** | A first-class deployment target (staging/prod) with **protection rules**: approvers, wait timer, allowed refs, concurrency, secret scope, OIDC subject, deployment history. |
+| **Environment** | A first-class deployment target (staging/prod) with **protection rules**: approvers, wait timer, allowed refs, concurrency, secret scope, OIDC subject, deployment history, and a **privilege whitelist** (which image digests may run with which governed grants — ADR-0039). |
+| **Grant** | A named, closed-vocabulary escalation above the hardened "restricted" step baseline (ADR-0039). `run-as-root` (self-service — does not escape the sandbox); `add-capabilities` and `privileged` (**governed** — require an Environment whitelist entry keyed on the image **digest**, Administer-only). Requested by the pipeline author, granted by the Environment admin, admitted fail-closed. A grant is a ceiling, not a default. |
 
 ### 4.2 Data plane (four distinct concepts — never conflate)
 
