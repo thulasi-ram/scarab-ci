@@ -44,6 +44,7 @@ fn rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
             environment: "prod".into(),
         },
         oidc_subject: "scarab:acme/web/prod".into(),
+        privileged_images: Vec::new(),
     }
 }
 
