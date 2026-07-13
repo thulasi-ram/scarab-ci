@@ -1152,4 +1152,12 @@ impl SecretProvider for FakeSecrets {
             .map(|(_, k)| k.clone())
             .collect())
     }
+
+    async fn delete(&self, scope: &SecretScope, key: &str) -> Result<(), SecretError> {
+        self.values
+            .lock()
+            .unwrap()
+            .remove(&(scope_key(scope), key.to_string()));
+        Ok(())
+    }
 }

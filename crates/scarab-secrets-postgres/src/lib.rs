@@ -45,6 +45,15 @@ impl PostgresSecrets {
         }
     }
 
+    /// Connect a fresh pool from `url`, taking the master key from
+    /// `SCARAB_MASTER_KEY` (as [`with_pool`](Self::with_pool)).
+    pub async fn connect(url: &str) -> Result<Self, SecretError> {
+        let pool = PgPool::connect(url)
+            .await
+            .map_err(|e| SecretError::Backend(e.to_string()))?;
+        Ok(Self::with_pool(pool))
+    }
+
     /// Wire a pool with an explicit master key (tests / a KMS provider).
     pub fn with_master(pool: PgPool, master: [u8; 32]) -> Self {
         Self {
@@ -155,6 +164,16 @@ impl SecretProvider for PostgresSecrets {
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(rows.into_iter().map(|r| r.get::<String, _>("key")).collect())
+    }
+
+    async fn delete(&self, scope: &SecretScope, key: &str) -> Result<(), SecretError> {
+        sqlx::query("DELETE FROM secrets WHERE scope = $1 AND key = $2")
+            .bind(scope_key(scope))
+            .bind(key)
+            .execute(self.pool()?)
+            .await
+            .map_err(|e| SecretError::Backend(e.to_string()))?;
+        Ok(())
     }
 }
 

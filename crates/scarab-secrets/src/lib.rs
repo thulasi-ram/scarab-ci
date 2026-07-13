@@ -48,4 +48,6 @@ pub trait SecretProvider: Send + Sync {
     async fn get(&self, scope: &SecretScope, key: &str) -> Result<Secret, SecretError>;
     async fn put(&self, scope: &SecretScope, secret: Secret) -> Result<(), SecretError>;
     async fn list_scoped(&self, scope: &SecretScope) -> Result<Vec<String>, SecretError>;
+    /// Delete a secret at `scope`. Idempotent: deleting an absent key is Ok.
+    async fn delete(&self, scope: &SecretScope, key: &str) -> Result<(), SecretError>;
 }

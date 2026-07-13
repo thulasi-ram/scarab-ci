@@ -193,6 +193,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if connected {
         state = state.with_environments(pg.clone());
     }
+    // Secrets store (envelope-encrypted, ADR-0014): the master key comes from
+    // SCARAB_MASTER_KEY. Enables /v1/secrets management. Only when connected.
+    if let (true, Some(url)) = (connected, &cli.database_url) {
+        let secrets = scarab_secrets_postgres::PostgresSecrets::connect(url).await?;
+        secrets.migrate().await?;
+        state = state.with_secrets(Arc::new(secrets));
+    }
     // OIDC issuer for keyless federation (ADR-0014): serve JWKS + discovery so a
     // cloud provider can verify Scarab-minted tokens. The issuer URL is the
     // public base URL clouds are configured to trust; enabled only when set.

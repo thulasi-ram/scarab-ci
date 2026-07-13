@@ -80,6 +80,9 @@ pub struct AppState {
     /// HMAC secret for external-gate release tokens (ADR-0034). `None` disables
     /// the token-release endpoint (rejects with 404).
     pub gate_token_secret: Option<Vec<u8>>,
+    /// Secret store (envelope-encrypted, ADR-0014). `None` disables the secrets
+    /// management endpoints.
+    pub secrets: Option<Arc<dyn scarab_secrets::SecretProvider>>,
 }
 
 impl AppState {
@@ -95,12 +98,19 @@ impl AppState {
             environments: None,
             oidc: None,
             gate_token_secret: None,
+            secrets: None,
         }
     }
 
     /// Set the HMAC secret for external-gate release tokens (ADR-0034).
     pub fn with_gate_token_secret(mut self, secret: Vec<u8>) -> Self {
         self.gate_token_secret = Some(secret);
+        self
+    }
+
+    /// Enable the secrets management endpoints, backed by `secrets`.
+    pub fn with_secrets(mut self, secrets: Arc<dyn scarab_secrets::SecretProvider>) -> Self {
+        self.secrets = Some(secrets);
         self
     }
 
@@ -201,6 +211,41 @@ pub struct RunSummaryDto {
     pub id: String,
     pub status: String,
     pub created_at: i64,
+}
+
+/// `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
+/// `value` is **write-only** — no endpoint ever returns it.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct PutSecretRequest {
+    /// Owning org (required).
+    pub org: String,
+    /// Repo, for a repo- or environment-scoped secret.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Environment, for an environment-scoped secret (requires `repo`).
+    #[serde(default)]
+    pub environment: Option<String>,
+    /// Secret name (the key steps reference).
+    pub name: String,
+    /// Secret value — stored envelope-encrypted, never returned.
+    pub value: String,
+}
+
+/// Scope selector for listing/deleting secrets (query params).
+#[derive(Debug, Deserialize)]
+pub struct SecretScopeQuery {
+    pub org: String,
+    pub repo: Option<String>,
+    pub environment: Option<String>,
+    /// Secret name — required for delete, ignored for list.
+    pub name: Option<String>,
+}
+
+/// `GET /v1/secrets` body: the secret **names** at a scope. Values are never
+/// listed.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SecretListResponse {
+    pub names: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1055,6 +1100,134 @@ async fn release_gate_external(
     }
 }
 
+/// Build a [`SecretScope`] from the flat org/repo/environment selector,
+/// enforcing that an environment scope names a repo (ADR-0014, 0024).
+fn secret_scope(
+    org: String,
+    repo: Option<String>,
+    environment: Option<String>,
+) -> Result<scarab_secrets::SecretScope, ApiError> {
+    use scarab_secrets::SecretScope;
+    if org.is_empty() {
+        return Err(ApiError::BadRequest("org is required".into()));
+    }
+    match (repo, environment) {
+        (None, None) => Ok(SecretScope::Org { org }),
+        (Some(repo), None) => Ok(SecretScope::Repo { org, repo }),
+        (Some(repo), Some(environment)) => Ok(SecretScope::Environment {
+            org,
+            repo,
+            environment,
+        }),
+        (None, Some(_)) => Err(ApiError::BadRequest(
+            "environment-scoped secret requires a repo".into(),
+        )),
+    }
+}
+
+fn secret_err(e: scarab_secrets::SecretError) -> ApiError {
+    use scarab_secrets::SecretError;
+    match e {
+        SecretError::NotFound => ApiError::NotFound,
+        SecretError::Denied => ApiError::Forbidden,
+        SecretError::Backend(m) => ApiError::Db(DbError::Other(m)),
+    }
+}
+
+/// Define (or overwrite) a secret at a scope (ADR-0014). The value is stored
+/// envelope-encrypted and is **never** returned by any endpoint. Administering
+/// secrets requires the Administer capability.
+#[utoipa::path(
+    post,
+    path = "/v1/secrets",
+    request_body = PutSecretRequest,
+    responses(
+        (status = 204, description = "secret stored"),
+        (status = 404, description = "secrets not configured")
+    )
+)]
+async fn put_secret(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<PutSecretRequest>,
+) -> Result<StatusCode, ApiError> {
+    authorize(&st, &headers, Action::Administer).await?;
+    let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
+    if req.name.is_empty() {
+        return Err(ApiError::BadRequest("name is required".into()));
+    }
+    let scope = secret_scope(req.org, req.repo, req.environment)?;
+    secrets
+        .put(
+            &scope,
+            scarab_secrets::Secret {
+                key: req.name,
+                value: req.value.into_bytes(),
+            },
+        )
+        .await
+        .map_err(secret_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// List the secret **names** at a scope (ADR-0014) — never the values.
+#[utoipa::path(
+    get,
+    path = "/v1/secrets",
+    params(
+        ("org" = String, Query, description = "owning org"),
+        ("repo" = Option<String>, Query, description = "repo (repo/env scope)"),
+        ("environment" = Option<String>, Query, description = "environment (env scope)")
+    ),
+    responses(
+        (status = 200, body = SecretListResponse),
+        (status = 404, description = "secrets not configured")
+    )
+)]
+async fn list_secrets(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SecretScopeQuery>,
+) -> Result<Json<SecretListResponse>, ApiError> {
+    authorize(&st, &headers, Action::Administer).await?;
+    let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
+    let scope = secret_scope(q.org, q.repo, q.environment)?;
+    let names = secrets.list_scoped(&scope).await.map_err(secret_err)?;
+    Ok(Json(SecretListResponse { names }))
+}
+
+/// Delete a secret at a scope (ADR-0014). Idempotent.
+#[utoipa::path(
+    delete,
+    path = "/v1/secrets",
+    params(
+        ("org" = String, Query, description = "owning org"),
+        ("repo" = Option<String>, Query, description = "repo (repo/env scope)"),
+        ("environment" = Option<String>, Query, description = "environment (env scope)"),
+        ("name" = String, Query, description = "secret name to delete")
+    ),
+    responses(
+        (status = 204, description = "deleted (idempotent)"),
+        (status = 404, description = "secrets not configured")
+    )
+)]
+async fn delete_secret(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<SecretScopeQuery>,
+) -> Result<StatusCode, ApiError> {
+    authorize(&st, &headers, Action::Administer).await?;
+    let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
+    let name = q
+        .name
+        .clone()
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("name is required".into()))?;
+    let scope = secret_scope(q.org, q.repo, q.environment)?;
+    secrets.delete(&scope, &name).await.map_err(secret_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Create/replace a protected environment (ADR-0024). Administering the
 /// deployment target requires the Administer capability.
 async fn put_environment(
@@ -1214,7 +1387,10 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         get_logs,
         restart_step,
         approve_gate,
-        release_gate_external
+        release_gate_external,
+        put_secret,
+        list_secrets,
+        delete_secret
     ),
     components(schemas(
         CreateRunRequest,
@@ -1224,7 +1400,9 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         RunListResponse,
         RunSummaryDto,
         RunStatusResponse,
-        StepStatusDto
+        StepStatusDto,
+        PutSecretRequest,
+        SecretListResponse
     ))
 )]
 pub struct ApiDoc;
@@ -1253,6 +1431,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
         .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
         .route("/v1/runs/{id}/gates/{step}/release", post(release_gate_external))
+        .route(
+            "/v1/secrets",
+            post(put_secret).get(list_secrets).delete(delete_secret),
+        )
         .route("/v1/environments/{project}/{name}", axum::routing::put(put_environment))
         .route("/v1/environments/{project}/{name}/deploy", post(deploy_environment))
         .route("/webhooks/github", post(github_webhook))

@@ -255,6 +255,131 @@
           }
         }
       }
+    },
+    "/v1/secrets": {
+      "get": {
+        "tags": [],
+        "summary": "List the secret **names** at a scope (ADR-0014) — never the values.",
+        "operationId": "list_secrets",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "query",
+            "description": "owning org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "query",
+            "description": "repo (repo/env scope)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "description": "environment (env scope)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretListResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "secrets not configured"
+          }
+        }
+      },
+      "post": {
+        "tags": [],
+        "summary": "Define (or overwrite) a secret at a scope (ADR-0014). The value is stored\nenvelope-encrypted and is **never** returned by any endpoint. Administering\nsecrets requires the Administer capability.",
+        "operationId": "put_secret",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutSecretRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "secret stored"
+          },
+          "404": {
+            "description": "secrets not configured"
+          }
+        }
+      },
+      "delete": {
+        "tags": [],
+        "summary": "Delete a secret at a scope (ADR-0014). Idempotent.",
+        "operationId": "delete_secret",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "query",
+            "description": "owning org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "query",
+            "description": "repo (repo/env scope)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "description": "environment (env scope)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "description": "secret name to delete",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "deleted (idempotent)"
+          },
+          "404": {
+            "description": "secrets not configured"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -305,6 +430,43 @@
             "items": {
               "$ref": "#/components/schemas/StepDto"
             }
+          }
+        }
+      },
+      "PutSecretRequest": {
+        "type": "object",
+        "description": "`POST /v1/secrets` body: define (or overwrite) a secret at a scope. The\n`value` is **write-only** — no endpoint ever returns it.",
+        "required": [
+          "org",
+          "name",
+          "value"
+        ],
+        "properties": {
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Environment, for an environment-scoped secret (requires `repo`)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Secret name (the key steps reference)."
+          },
+          "org": {
+            "type": "string",
+            "description": "Owning org (required)."
+          },
+          "repo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Repo, for a repo- or environment-scoped secret."
+          },
+          "value": {
+            "type": "string",
+            "description": "Secret value — stored envelope-encrypted, never returned."
           }
         }
       },
@@ -363,6 +525,21 @@
           },
           "status": {
             "type": "string"
+          }
+        }
+      },
+      "SecretListResponse": {
+        "type": "object",
+        "description": "`GET /v1/secrets` body: the secret **names** at a scope. Values are never\nlisted.",
+        "required": [
+          "names"
+        ],
+        "properties": {
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           }
         }
       },
