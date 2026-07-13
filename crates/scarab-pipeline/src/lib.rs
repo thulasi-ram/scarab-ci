@@ -143,6 +143,13 @@ pub struct StepSpec {
     /// fork-PR run is locked out and receives none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// Privilege escalation this step *requests* above the hardened baseline
+    /// (ADR-0039). Absent = the restricted default. A request carries no
+    /// authority: `run-as-root` is self-service, but `add_capabilities` and
+    /// `privileged` take effect only if the run's target Environment whitelists
+    /// the image digest at admission (else the step is rejected, fail-closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<StepSecurity>,
     #[serde(default)]
     pub needs: Needs,
     /// Explicit input workspaces (ADR-0007): the subset of `needs` whose output
@@ -180,6 +187,37 @@ impl StepSpec {
     pub fn is_gate(&self) -> bool {
         self.gate.is_some()
     }
+}
+
+/// The privilege escalation a step requests above the hardened "restricted"
+/// baseline (ADR-0039). This is the author's *request*; the Environment's
+/// whitelist decides what is actually admitted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepSecurity {
+    /// Run as uid 0 (opt out of the baseline `runAsNonRoot`). Self-service —
+    /// root inside the caps-dropped, unprivileged, seccomp-confined sandbox does
+    /// not escape it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub run_as_root: bool,
+    /// Linux capabilities to add (e.g. `NET_ADMIN`). Governed: each must be
+    /// whitelisted for the image digest by the Environment admin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub add_capabilities: Vec<String>,
+    /// Run as a privileged container. Governed and digest-keyed forever — the
+    /// node-escape hammer.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub privileged: bool,
+}
+
+impl StepSecurity {
+    /// Does this request any escalation at all?
+    pub fn is_baseline(&self) -> bool {
+        !self.run_as_root && !self.privileged && self.add_capabilities.is_empty()
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The upstream steps this step depends on (its DAG edges).
@@ -423,6 +461,13 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                         step.id
                     ));
                 }
+                // A gate launches no Pod, so a privilege request is meaningless.
+                if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
+                    diagnostics.push(format!(
+                        "step `{}`: a gate step launches nothing — it must not set `security`",
+                        step.id
+                    ));
+                }
                 // A `timer` gate needs a positive wait; other kinds must not set one.
                 match (kind.as_str(), step.gate_after) {
                     ("timer", None) => diagnostics.push(format!(
@@ -449,6 +494,18 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                         "step `{}`: `gate_after` is only valid on a timer gate",
                         step.id
                     ));
+                }
+                // Capability names must be non-empty (ADR-0039). They are compared
+                // verbatim against the Environment whitelist at admission.
+                if let Some(sec) = &step.security {
+                    for cap in &sec.add_capabilities {
+                        if cap.trim().is_empty() {
+                            diagnostics.push(format!(
+                                "step `{}`: `add_capabilities` entries must be non-empty capability names",
+                                step.id
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -660,6 +717,56 @@ mod tests {
             Err(PipelineError::Validation(d)) => d,
             other => panic!("expected validation error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn step_security_request_parses_and_round_trips() {
+        let ir = compile(
+            r#"
+            ir_version: 1
+            steps:
+              - id: deploy
+                image: ghcr.io/acme/deployer@sha256:aaaa
+                security:
+                  run_as_root: true
+                  privileged: true
+                  add_capabilities: [NET_ADMIN]
+            "#,
+        );
+        let sec = ir.steps[0].security.as_ref().unwrap();
+        assert!(sec.run_as_root && sec.privileged);
+        assert_eq!(sec.add_capabilities, vec!["NET_ADMIN".to_string()]);
+        // A baseline step omits `security` entirely (skipped on serialize).
+        let ir2 = compile("steps: [{ id: a, image: busybox }]");
+        assert!(ir2.steps[0].security.is_none());
+        let json = serde_json::to_string(&ir2).unwrap();
+        assert!(!json.contains("security"));
+    }
+
+    #[test]
+    fn gate_may_not_request_security() {
+        let errs = errors(
+            r#"
+            steps:
+              - id: g
+                gate: manual
+                security: { privileged: true }
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.contains("must not set `security`")));
+    }
+
+    #[test]
+    fn empty_capability_name_is_rejected() {
+        let errs = errors(
+            r#"
+            steps:
+              - id: s
+                image: busybox
+                security: { add_capabilities: [""] }
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.contains("non-empty capability")));
     }
 
     #[test]
