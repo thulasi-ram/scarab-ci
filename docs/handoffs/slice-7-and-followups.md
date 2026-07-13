@@ -64,15 +64,26 @@ first. Starting points:
 Each is a *thin* follow-up, not new design; all noted in commit bodies /
 `TODO(slice-N)` markers. Highest-leverage first:
 
-> **Progress (follow-up session after `24a570b`):** #1, #2, #3, #4, #6, #7-core,
-> and #5-timer are **done**, plus `when:` runtime wiring and the
-> `EnvironmentStore`+OIDC production wiring — commits `63f3dcd`, `aba7456`,
-> `c535630`, `7bf9ae2`, `5149401`, `5366fe6`, `9483b88`, `fdf4502`, `e5fa736`.
-> **Remaining is now all either blocked on live externals or needs a decision:**
-> #4-`outputs:` (live CAS path), #5 transitive-skip (a semantic decision — see
-> note) and external-gate token-auth (needs a token model), the k8s post-step
-> output (cluster), and GitHub-App/OAuth/secrets (stub adapters + live
-> externals). Tree green: 141 tests, 4 `#[ignore]`, clippy clean.
+> **Progress (follow-up session after `24a570b`):** deferred follow-ups #1–#7 are
+> **all done** (including the three ratified design decisions — transitive skip
+> ADR-0033, external-gate token ADR-0034, `outputs:` ADR-0035), plus `when:`
+> runtime wiring and the `EnvironmentStore`+OIDC production wiring. Tree green:
+> **147 tests**, 4 `#[ignore]`, clippy clean.
+>
+> **What actually remains — all blocked on live externals or a cluster, none a
+> thin follow-up:**
+> - **k8s post-step output** — makes restart skip-if-unchanged (#3) and
+>   `outputs:` (#4) fire on a real cluster; needs the pod post-step CAS snapshot
+>   (live-workspace path, `SCARAB_TEST_KUBE=1`).
+> - **GitHub App auth** — `GithubForge` API methods are `unimplemented!()`; a real
+>   HTTP + App-JWT adapter, verifiable only against GitHub.
+> - **Real OAuth + PG `SessionStore`** — only fakes exist; new adapters + live
+>   OAuth.
+> - **`SecretProvider` into the driver** — the injection point doesn't exist in
+>   `converged.rs`/scheduler yet.
+> - **Slice 7 proper** (CONTEXT §9.7): local executor + CLI + provenance/signing —
+>   the roadmap's next slice; break down with `to-issues`.
+> - **`always()`/`if:` skip opt-out** (ADR-0033 tail) — optional.
 
 1. ✅ **Pipeline authoring of the engine features** — `concurrency:`, `kind:
    gate`, and `environment:` all now author from a committed `.scarab`
@@ -89,21 +100,18 @@ Each is a *thin* follow-up, not new design; all noted in commit bodies /
    is wired, so in a *real cluster run* skip won't trigger yet (safe cascade);
    the engine logic is fully exercised via the FakeExecutor. Wire k8s
    post-step output with the live-workspace path.
-4. ⚠️ **Explicit workspace `inputs:`/`outputs:`** — `inputs:` **done** (`7bf9ae2`):
-   authored as a subset of needs, stored via `set_step_inputs`, and used to
-   compute a precise skip-if-unchanged signature. **Remaining:** `outputs:` (which
-   paths a step publishes) — a CAS-layer path filter at snapshot time, part of the
-   live-workspace path.
-5. ⚠️ **Gate auto-release + transitive skip.** **timer auto-release done**
-   (`9483b88`): a `timer` gate carries `gate_after` seconds and the scheduler
-   releases it once elapsed. Also **`when:` is now applied at run creation**
-   (`fdf4502`). **Remaining:** (a) *transitive skip* — a descendant of a pruned
-   step currently runs as a root (edges dropped); making it skip instead is a
-   **semantic reversal** of the documented `select_steps` behavior (the
-   `when_selects_steps_and_prunes_edges` test codifies "kept, runs as root") —
-   needs an explicit decision, likely an ADR. (b) *external-gate token auth* — an
-   external gate is releasable today via `POST …/gates/:step/approve` (RBAC);
-   releasing via an opaque token needs a token model.
+4. ✅ **Explicit workspace `inputs:`/`outputs:`** — `inputs:` (`7bf9ae2`) and
+   `outputs:` (`1b92b3a`, ADR-0035) both **authored + validated**. `inputs:`
+   feeds a precise skip-if-unchanged signature. `outputs:` enforcement (post-step
+   CAS snapshot restricted to the declared paths) lands with the live-workspace
+   path — authored/stored now, the executor reads it from the run IR.
+5. ✅ **Gate auto-release + transitive skip** — all resolved. timer auto-release
+   (`9483b88`); `when:` applied at run creation (`fdf4502`); **transitive skip**
+   (`e37507f`, ADR-0033) — a `when:false` step is kept-but-Skipped and its
+   descendants transitively skip via the existing cascade, run still succeeds;
+   **external-gate token release** (`54b0ee6`, ADR-0034) — `POST …/gates/:step/
+   release` with an HMAC token. (An `always()`-style skip opt-out is the only
+   open sub-item, noted in ADR-0033.)
 6. ✅ **Multi-file `.scarab/*.yaml`** discovery — added (`5149401`);
    `ForgePort::list_dir_at_ref`, `trigger_run_from_event` → `Vec<RunId>`,
    per-pipeline supersede key.
