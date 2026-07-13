@@ -94,4 +94,5 @@ until a cluster is reachable.
 
 ## License
 
-TBD.
+[GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`). Running a
+modified Scarab as a network service obliges you to offer users its source.
