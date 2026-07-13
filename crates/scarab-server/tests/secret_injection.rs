@@ -49,6 +49,9 @@ fn spec_with_secret() -> StepSpec {
         command: vec!["true".into()],
         env: vec![("PLAIN".into(), "1".into())],
         secrets: vec!["TOKEN".into()],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
     }
 }
 fn logs(db: Arc<dyn Db>) -> Arc<LogService> {

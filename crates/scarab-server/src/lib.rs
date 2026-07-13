@@ -366,6 +366,12 @@ async fn create_run(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             secrets: step.secrets.clone(),
+            // Inline API runs carry no Environment, so they are baseline-only
+            // (ADR-0039): request governed grants via a committed `.scarab` that
+            // targets an Environment. The hardened floor still applies in the pod.
+            run_as_root: false,
+            add_capabilities: Vec::new(),
+            privileged: false,
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -678,39 +684,100 @@ pub async fn trigger_run_from_event(
             continue;
         }
 
-        // ADR-0037: a deploy pipeline's run is rejected at creation if this git
-        // ref is not allowed to deploy to the target environment — enforced even
-        // when the environment has no approver gate. An undefined environment is
-        // permissive (protection is opt-in).
-        if let (Some(env_name), Some(store)) = (&ir.environment, environments) {
-            if let Some(env) = store
+        // ADR-0037/0039: fetch the target Environment's protection rules once (a
+        // deploy pipeline only). Used both to reject a disallowed ref at creation
+        // (ADR-0037 — enforced even without an approver gate) and to admit
+        // per-step privilege grants (ADR-0039). An undefined environment is
+        // permissive for refs but forbids governed grants.
+        let protection = if let (Some(env_name), Some(store)) = (&ir.environment, environments) {
+            store
                 .get_environment(&repo.owner, &repo.name, env_name)
                 .await
                 .map_err(|e| TriggerError::Pipeline(e.to_string()))?
-            {
-                if !env.protection.ref_allowed(&git_ref) {
-                    continue;
-                }
+                .map(|e| e.protection)
+        } else {
+            None
+        };
+        if let Some(p) = &protection {
+            if !p.ref_allowed(&git_ref) {
+                continue;
             }
         }
+        // A fork PR locked out of the environment's secrets is also locked out of
+        // its governed grants (ADR-0039).
+        let locked_out = ir
+            .environment
+            .as_ref()
+            .is_some_and(|e| fork_policy(event, e).secrets_locked_out);
 
         let now = clock.now().await;
         let run = RunId(Uuid::new_v4().to_string());
-        persist_run_from_ir(db, &run, &ir, event, path, &excluded, now).await?;
+        persist_run_from_ir(
+            db,
+            &run,
+            &ir,
+            event,
+            path,
+            protection.as_ref(),
+            locked_out,
+            &excluded,
+            now,
+        )
+        .await?;
         runs.push(run);
     }
     Ok(runs)
 }
 
+/// Admit a step's privilege request (ADR-0039) against the run's target
+/// Environment, **fail-closed**. Returns the escalations the executor may apply,
+/// or the violations (which must reject the run — never downgrade).
+///
+/// - No request (or a baseline one) → the restricted baseline (no grants).
+/// - With an Environment → delegate to [`ProtectionRules::admit_grants`] (digest
+///   whitelist, fork-lockout, capability bounds).
+/// - Without an Environment → governed grants (`add-capabilities`/`privileged`)
+///   are impossible ("privileged requires an Environment"); self-service
+///   `run-as-root` is still allowed (it cannot escape the sandbox).
+fn admit_step_grants(
+    protection: Option<&scarab_projects::ProtectionRules>,
+    security: Option<&scarab_pipeline::StepSecurity>,
+    image: &str,
+    locked_out: bool,
+) -> Result<scarab_projects::AdmittedGrants, Vec<String>> {
+    let Some(sec) = security.filter(|s| !s.is_baseline()) else {
+        return Ok(scarab_projects::AdmittedGrants::default());
+    };
+    let req = scarab_projects::GrantRequest {
+        run_as_root: sec.run_as_root,
+        add_capabilities: sec.add_capabilities.clone(),
+        privileged: sec.privileged,
+    };
+    match protection {
+        Some(p) => p.admit_grants(&req, image, locked_out),
+        None if req.privileged || !req.add_capabilities.is_empty() => Err(vec![
+            "governed grants (add-capabilities/privileged) require a target Environment"
+                .to_string(),
+        ]),
+        None => Ok(scarab_projects::AdmittedGrants {
+            run_as_root: req.run_as_root,
+            ..Default::default()
+        }),
+    }
+}
+
 /// Durably materialize a compiled pipeline IR into a Run: store the IR on the
 /// run (self-describing, ADR-0022), record RunCreated + the normalized trigger
 /// on the event log, and create each step with its `needs`.
+#[allow(clippy::too_many_arguments)] // a cohesive persist routine; splitting hides the flow
 async fn persist_run_from_ir(
     db: &dyn Db,
     run: &RunId,
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,
     pipeline: &str,
+    protection: Option<&scarab_projects::ProtectionRules>,
+    locked_out: bool,
     excluded: &[String],
     now: Timestamp,
 ) -> Result<(), TriggerError> {
@@ -728,8 +795,9 @@ async fn persist_run_from_ir(
                 repo: repo.name.clone(),
                 environment: env_name.clone(),
                 git_ref: config_ref(event),
-                // A fork PR is locked out of this environment's secrets (ADR-0015).
-                locked_out: fork_policy(event, env_name).secrets_locked_out,
+                // A fork PR is locked out of this environment's secrets (ADR-0015)
+                // and — by extension — its governed privilege grants (ADR-0039).
+                locked_out,
             },
         )
         .await?;
@@ -777,11 +845,26 @@ async fn persist_run_from_ir(
             let timer = step.gate_after.map(|s| s as i64);
             db.set_step_gate(run, &step_id, kind, timer).await?;
         } else {
+            // ADR-0039: admit the step's privilege request against the target
+            // Environment's whitelist, fail-closed. A rejected request aborts the
+            // whole run creation with a diagnostic — never a silent downgrade.
+            let admitted =
+                admit_step_grants(protection, step.security.as_ref(), &step.image, locked_out)
+                    .map_err(|v| {
+                        TriggerError::Pipeline(format!(
+                            "step `{}`: privilege request rejected: {}",
+                            step.id,
+                            v.join("; ")
+                        ))
+                    })?;
             let spec = StepSpec {
                 image: step.image.clone(),
                 command: step.command.clone(),
                 env: step.env.clone(),
                 secrets: step.secrets.clone(),
+                run_as_root: admitted.run_as_root,
+                add_capabilities: admitted.add_capabilities,
+                privileged: admitted.privileged,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -1744,5 +1827,59 @@ fn step_status_name(s: StepStatus) -> &'static str {
         StepStatus::Failed => "failed",
         StepStatus::Skipped => "skipped",
         StepStatus::Cancelled => "cancelled",
+    }
+}
+
+#[cfg(test)]
+mod grant_admission_tests {
+    use super::admit_step_grants;
+    use scarab_pipeline::StepSecurity;
+    use scarab_projects::{ImageGrant, ProtectionRules};
+    use scarab_secrets::SecretScope;
+
+    const IMG: &str = "ghcr.io/acme/deployer@sha256:aaaa";
+
+    fn rules(images: Vec<ImageGrant>) -> ProtectionRules {
+        ProtectionRules {
+            approvers: vec![],
+            wait_timer: 0,
+            allowed_refs: vec![],
+            concurrency: 1,
+            secret_scope: SecretScope::Org { org: "acme".into() },
+            oidc_subject: String::new(),
+            privileged_images: images,
+        }
+    }
+
+    #[test]
+    fn no_request_is_baseline() {
+        let g = admit_step_grants(None, None, IMG, false).unwrap();
+        assert!(!g.run_as_root && !g.privileged && g.add_capabilities.is_empty());
+    }
+
+    #[test]
+    fn run_as_root_is_self_service_without_environment() {
+        let sec = StepSecurity { run_as_root: true, ..Default::default() };
+        let g = admit_step_grants(None, Some(&sec), IMG, false).unwrap();
+        assert!(g.run_as_root);
+    }
+
+    #[test]
+    fn governed_grant_without_environment_is_rejected() {
+        let sec = StepSecurity { privileged: true, ..Default::default() };
+        let err = admit_step_grants(None, Some(&sec), IMG, false).unwrap_err();
+        assert!(err.iter().any(|v| v.contains("require a target Environment")));
+    }
+
+    #[test]
+    fn governed_grant_admitted_for_whitelisted_digest() {
+        let sec = StepSecurity { privileged: true, ..Default::default() };
+        let p = rules(vec![ImageGrant {
+            image_digest: "sha256:aaaa".into(),
+            privileged: true,
+            capabilities: vec![],
+        }]);
+        let g = admit_step_grants(Some(&p), Some(&sec), IMG, false).unwrap();
+        assert!(g.privileged);
     }
 }
