@@ -5,8 +5,20 @@ import type { paths, components } from "./schema";
 
 export type RunStatus = components["schemas"]["RunStatusResponse"];
 export type CreateRunRequest = components["schemas"]["CreateRunRequest"];
+export type RunSummary = components["schemas"]["RunSummaryDto"];
 
 export const api = createClient<paths>({ baseUrl: "/" });
+
+/** List recent runs, newest first (dogfoods `GET /v1/runs`). */
+export async function listRuns(limit = 50): Promise<RunSummary[]> {
+  const { data, error } = await api.GET("/v1/runs", {
+    params: { query: { limit } },
+  });
+  if (error || !data) {
+    throw new Error("failed to list runs");
+  }
+  return data.runs;
+}
 
 /** Fetch a run's status + steps (dogfoods `GET /v1/runs/{id}`). */
 export async function getRun(id: string): Promise<RunStatus> {
