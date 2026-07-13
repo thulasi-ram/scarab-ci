@@ -156,3 +156,22 @@ export async function deleteSecret(scope: SecretScope, name: string): Promise<vo
     throw new Error("failed to delete secret");
   }
 }
+
+// --- Secret parity matrix (ADR-0037). Advisory: each key's *effective* status
+// per environment after inheritance — never a value. Not yet in the generated
+// OpenAPI client, so plain-fetched (as the events snapshot is). ---
+
+export type SecretCellStatus = "set" | "inherited" | "unset";
+export type SecretMatrix = {
+  environments: string[];
+  keys: { key: string; status: Record<string, SecretCellStatus> }[];
+};
+
+/** Fetch a repo's advisory secret parity matrix (`GET …/secrets/matrix`). */
+export async function fetchSecretMatrix(org: string, repo: string): Promise<SecretMatrix> {
+  const res = await fetch(
+    `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/secrets/matrix`,
+  );
+  if (!res.ok) throw new Error("failed to load secret matrix");
+  return (await res.json()) as SecretMatrix;
+}

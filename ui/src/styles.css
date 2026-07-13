@@ -1000,3 +1000,40 @@ h2 {
 .run-title { font-size: 21px; font-weight: 600; letter-spacing: -0.4px; margin: 0; }
 .prov .cell .v .sha { color: var(--copper); }
 .prov .tglyph { color: var(--copper); }
+
+/* Secret parity matrix (advisory, ADR-0037) — status is informational, so an
+   `unset` cell is neutral (muted), never an alarming red. */
+.matrix-scroll {
+  overflow-x: auto;
+}
+.secret-matrix {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+.secret-matrix th,
+.secret-matrix td {
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  text-align: center;
+  white-space: nowrap;
+}
+.secret-matrix th {
+  color: var(--muted-sage);
+  font-weight: 500;
+}
+.secret-matrix .mkey {
+  text-align: left;
+}
+.secret-matrix .mcell {
+  font-size: 15px;
+}
+.secret-matrix .m-set {
+  color: var(--ok);
+}
+.secret-matrix .m-inherited {
+  color: var(--copper);
+}
+.secret-matrix .m-unset {
+  color: var(--muted-sage);
+}

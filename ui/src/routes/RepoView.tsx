@@ -6,7 +6,15 @@
 // inputs and creates a run.
 import { createResource, createSignal, For, Show } from "solid-js";
 import { useParams, useNavigate } from "@solidjs/router";
-import { listRuns, createRun, listSecrets, putSecret, deleteSecret } from "../api/client";
+import {
+  listRuns,
+  createRun,
+  listSecrets,
+  putSecret,
+  deleteSecret,
+  fetchSecretMatrix,
+  type SecretCellStatus,
+} from "../api/client";
 import {
   enrichProvenance,
   environments,
@@ -196,6 +204,7 @@ export default function RepoView() {
       {/* ---- Secrets ---- */}
       <Show when={tab() === "secrets"}>
         <RepoSecrets org={org()} repo={repo()} />
+        <SecretMatrix org={org()} repo={repo()} />
       </Show>
 
       {/* ---- Settings ---- */}
@@ -337,6 +346,73 @@ function RepoSecrets(props: { org: string; repo: string }) {
             <button class="btn btn-primary" type="submit" disabled={!name().trim()}>Save</button>
           </form>
           <p class="subtle"><small>Encrypted at rest, never displayed — overwrite but never read back.</small></p>
+        </Show>
+      </div>
+    </div>
+  );
+}
+
+// ---- secret parity matrix (ADR-0037, advisory) ---------------------------
+// Each key's *effective* status per environment after inheritance. A shared key
+// defined once at repo/org scope reads as `inherited` everywhere (never
+// missing); a per-env key is `set` where defined and `unset` elsewhere. Purely
+// advisory — it never blocks a deploy, and never shows a value.
+
+const CELL: Record<SecretCellStatus, { glyph: string; label: string }> = {
+  set: { glyph: "●", label: "set here" },
+  inherited: { glyph: "○", label: "inherited" },
+  unset: { glyph: "–", label: "unset" },
+};
+
+function SecretMatrix(props: { org: string; repo: string }) {
+  const key = () => ({ org: props.org, repo: props.repo });
+  const [matrix] = createResource(key, ({ org, repo }) => fetchSecretMatrix(org, repo));
+
+  return (
+    <div class="panel">
+      <div class="panel-h"><span>Secret coverage</span></div>
+      <div class="secrets-body">
+        <Show when={!matrix.loading} fallback={<p class="empty">loading…</p>}>
+          <Show
+            when={(matrix()?.keys.length ?? 0) > 0}
+            fallback={<p class="empty">No environment secrets to compare.</p>}
+          >
+            <div class="matrix-scroll">
+              <table class="secret-matrix">
+                <thead>
+                  <tr>
+                    <th class="mkey">key</th>
+                    <For each={matrix()!.environments}>{(e) => <th>{e}</th>}</For>
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={matrix()!.keys}>
+                    {(row) => (
+                      <tr>
+                        <td class="mkey"><code class="mono">{row.key}</code></td>
+                        <For each={matrix()!.environments}>
+                          {(e) => {
+                            const s = (row.status[e] ?? "unset") as SecretCellStatus;
+                            return (
+                              <td class={`mcell m-${s}`} title={CELL[s].label}>
+                                {CELL[s].glyph}
+                              </td>
+                            );
+                          }}
+                        </For>
+                      </tr>
+                    )}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+            <p class="subtle">
+              <small>
+                Advisory, after inheritance: <b>●</b> set here · <b>○</b> inherited from
+                repo/org · <b>–</b> unset. A gap may be intentional — deploys aren't blocked.
+              </small>
+            </p>
+          </Show>
         </Show>
       </div>
     </div>
