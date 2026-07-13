@@ -150,6 +150,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(secret) = std::env::var("SCARAB_GITHUB_WEBHOOK_SECRET") {
         state = state.with_github_webhook_secret(secret.into_bytes());
     }
+    // External-gate release tokens (ADR-0034): enables POST …/gates/:step/release.
+    if let Ok(secret) = std::env::var("SCARAB_GATE_TOKEN_SECRET") {
+        state = state.with_gate_token_secret(secret.into_bytes());
+    }
     // Environments + deployment history: the Postgres adapter is the store. Only
     // wired when actually connected — an unconnected PG would fail at request
     // time. Enables /v1/environments/* and (with an EnvironmentStore present)

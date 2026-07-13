@@ -77,6 +77,9 @@ pub struct AppState {
     pub environments: Option<Arc<dyn scarab_projects::EnvironmentStore>>,
     /// The OIDC issuer. When set, serves JWKS + discovery for keyless federation.
     pub oidc: Option<Arc<oidc::Rs256Issuer>>,
+    /// HMAC secret for external-gate release tokens (ADR-0034). `None` disables
+    /// the token-release endpoint (rejects with 404).
+    pub gate_token_secret: Option<Vec<u8>>,
 }
 
 impl AppState {
@@ -91,7 +94,14 @@ impl AppState {
             sessions: None,
             environments: None,
             oidc: None,
+            gate_token_secret: None,
         }
+    }
+
+    /// Set the HMAC secret for external-gate release tokens (ADR-0034).
+    pub fn with_gate_token_secret(mut self, secret: Vec<u8>) -> Self {
+        self.gate_token_secret = Some(secret);
+        self
     }
 
     /// Enable the OIDC issuer (JWKS + discovery endpoints).
@@ -987,6 +997,64 @@ async fn approve_gate(
     }
 }
 
+/// HTTP header carrying an external-gate release token (`sha256=<hex>`).
+const GATE_TOKEN_HEADER: &str = "x-scarab-gate-token";
+
+/// Release an **external** gate by presenting its token (ADR-0034) — the path an
+/// outside system (a deploy webhook, a change-management tool) uses instead of an
+/// interactive approval. The token is `HMAC-SHA256(secret, "{run}:{step}")`
+/// (`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint
+/// is 404 when no token secret is configured, and only releases gates of kind
+/// `external` (manual gates stay approval-only).
+#[utoipa::path(
+    post,
+    path = "/v1/runs/{id}/gates/{step}/release",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "gate step id")
+    ),
+    responses(
+        (status = 202, description = "gate released"),
+        (status = 401, description = "bad or missing token"),
+        (status = 404, description = "no such external gate, or token release disabled")
+    )
+)]
+async fn release_gate_external(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    // Token release is opt-in: without a configured secret the endpoint 404s.
+    let Some(secret) = st.gate_token_secret.as_ref() else {
+        return Err(ApiError::NotFound);
+    };
+    let run = RunId(id);
+    let step = StepId(step);
+
+    // Only external gates are token-releasable; manual/timer are not.
+    let is_external = st
+        .db
+        .steps_of_run(&run)
+        .await?
+        .iter()
+        .any(|s| s.step == step && s.gate_kind.as_deref() == Some("external"));
+    if !is_external {
+        return Err(ApiError::NotFound);
+    }
+
+    // Verify the token = HMAC(secret, "{run}:{step}"), constant-time.
+    let message = format!("{}:{}", run.0, step.0);
+    let token = headers.get(GATE_TOKEN_HEADER).and_then(|v| v.to_str().ok());
+    scarab_forge_github::verify_signature(secret, message.as_bytes(), token)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
+        Err(RestartError::Db(e)) => Err(ApiError::Db(e)),
+    }
+}
+
 /// Create/replace a protected environment (ADR-0024). Administering the
 /// deployment target requires the Administer capability.
 async fn put_environment(
@@ -1138,7 +1206,16 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
 /// The generated OpenAPI document. The pipeline request schema is the IR subset.
 #[derive(OpenApi)]
 #[openapi(
-    paths(create_run, list_runs, get_run, get_events, get_logs, restart_step, approve_gate),
+    paths(
+        create_run,
+        list_runs,
+        get_run,
+        get_events,
+        get_logs,
+        restart_step,
+        approve_gate,
+        release_gate_external
+    ),
     components(schemas(
         CreateRunRequest,
         PipelineDto,
@@ -1175,6 +1252,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/{id}/logs", get(get_logs))
         .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
         .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
+        .route("/v1/runs/{id}/gates/{step}/release", post(release_gate_external))
         .route("/v1/environments/{project}/{name}", axum::routing::put(put_environment))
         .route("/v1/environments/{project}/{name}/deploy", post(deploy_environment))
         .route("/webhooks/github", post(github_webhook))

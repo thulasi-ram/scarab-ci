@@ -160,6 +160,44 @@
         }
       }
     },
+    "/v1/runs/{id}/gates/{step}/release": {
+      "post": {
+        "tags": [],
+        "summary": "Release an **external** gate by presenting its token (ADR-0034) — the path an\noutside system (a deploy webhook, a change-management tool) uses instead of an\ninteractive approval. The token is `HMAC-SHA256(secret, \"{run}:{step}\")`\n(`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint\nis 404 when no token secret is configured, and only releases gates of kind\n`external` (manual gates stay approval-only).",
+        "operationId": "release_gate_external",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "gate step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "gate released"
+          },
+          "401": {
+            "description": "bad or missing token"
+          },
+          "404": {
+            "description": "no such external gate, or token release disabled"
+          }
+        }
+      }
+    },
     "/v1/runs/{id}/logs": {
       "get": {
         "tags": [],

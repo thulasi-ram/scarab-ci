@@ -79,6 +79,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/runs/{id}/gates/{step}/release": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Release an **external** gate by presenting its token (ADR-0034) — the path an
+         *     outside system (a deploy webhook, a change-management tool) uses instead of an
+         *     interactive approval. The token is `HMAC-SHA256(secret, "{run}:{step}")`
+         *     (`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint
+         *     is 404 when no token secret is configured, and only releases gates of kind
+         *     `external` (manual gates stay approval-only).
+         */
+        post: operations["release_gate_external"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/runs/{id}/logs": {
         parameters: {
             query?: never;
@@ -301,6 +325,43 @@ export interface operations {
                 content?: never;
             };
             /** @description no such run or gate */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    release_gate_external: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description gate step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description gate released */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description bad or missing token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such external gate, or token release disabled */
             404: {
                 headers: {
                     [name: string]: unknown;
