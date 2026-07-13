@@ -48,7 +48,7 @@ async fn run_start_and_success_post_pending_then_success() {
     let clock = FakeClock::new(1_000);
 
     // Trigger a run from a push; then drive it to success.
-    let run = trigger_run_from_event(forge.as_ref(), &db, &clock, &push())
+    let run = trigger_run_from_event(forge.as_ref(), &db, &clock, None, &push())
         .await
         .unwrap()
         .pop()
@@ -82,7 +82,7 @@ async fn run_failure_posts_failure_status() {
     let db = InMemoryDb::new();
     let clock = FakeClock::new(1_000);
 
-    let run = trigger_run_from_event(forge.as_ref(), &db, &clock, &push())
+    let run = trigger_run_from_event(forge.as_ref(), &db, &clock, None, &push())
         .await
         .unwrap()
         .pop()

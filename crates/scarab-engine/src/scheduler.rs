@@ -188,6 +188,59 @@ pub async fn release_gate(
     Ok(())
 }
 
+/// Record a single approval against a `manual` gate `step` by principal `by`
+/// (ADR-0037). This is **append-only**: it emits a [`GateApproved`] event and
+/// does *not* transition the step or resume the run — accumulation toward a
+/// quorum and the decision to [`release_gate`] belong to the policy layer
+/// (the server, which knows the environment's approver rules).
+///
+/// Idempotent per `(step, by)`: a repeat approval from the same principal is a
+/// no-op, so a retried request never inflates the approver count.
+///
+/// [`GateApproved`]: EventPayload::GateApproved
+pub async fn record_gate_approval(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    step: &StepId,
+    by: &str,
+) -> Result<(), RestartError> {
+    // The target must be a known `manual` gate step (timer/external gates are
+    // released by other means, ADR-0034).
+    let is_manual_gate = db
+        .steps_of_run(run)
+        .await?
+        .iter()
+        .any(|s| &s.step == step && s.gate_kind.as_deref() == Some("manual"));
+    if !is_manual_gate {
+        return Err(RestartError::StepNotFound(step.clone()));
+    }
+
+    // Best-effort dedup: skip if this principal already approved this gate. The
+    // authoritative dedup is distinct-subject counting at read time, so a race
+    // here is harmless — it can only append a duplicate the reader collapses.
+    let already = db.events(run).await?.into_iter().any(|e| {
+        matches!(e.kind, EventPayload::GateApproved { step: s, by: b }
+            if &s == step && b == by)
+    });
+    if already {
+        return Ok(());
+    }
+
+    let now = clock.now().await;
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::GateApproved {
+            step: step.clone(),
+            by: by.to_string(),
+        },
+        at: now,
+    })
+    .await?;
+    Ok(())
+}
+
 /// Move a run `from -> to` and append the transition event (used to reopen a
 /// settled run on restart).
 async fn reopen(

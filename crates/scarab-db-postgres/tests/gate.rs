@@ -10,7 +10,8 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    release_gate, Db, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
+    record_gate_approval, release_gate, Db, EventPayload, RunId, RunStatus, Scheduler, StepId,
+    StepSpec, StepStatus, Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor};
 
@@ -19,6 +20,7 @@ fn spec() -> StepSpec {
         image: "busybox:latest".into(),
         command: vec!["true".into()],
         env: vec![],
+        secrets: vec![],
     }
 }
 
@@ -27,6 +29,14 @@ async fn status(db: &PostgresDb, id: &str) -> RunStatus {
 }
 fn step_status(steps: &[scarab_engine::StepRun], id: &str) -> StepStatus {
     steps.iter().find(|s| s.step.0 == id).unwrap().status
+}
+async fn approval_count(db: &PostgresDb, run: &RunId) -> usize {
+    db.events(run)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| matches!(e.kind, EventPayload::GateApproved { .. }))
+        .count()
 }
 
 /// A -> timer-gate(60s) -> B: the run suspends at the gate and stays suspended
@@ -84,6 +94,62 @@ async fn timer_gate_auto_releases_after_its_wait() {
     sched.tick(&run).await.unwrap();
     assert_eq!(status(&db, "run-timer").await, RunStatus::Succeeded);
     assert_eq!(step_status(&db.steps_of_run(&run).await.unwrap(), "b"), StepStatus::Succeeded);
+
+    tdb.cleanup().await;
+}
+
+/// `record_gate_approval` accumulates approvals as events WITHOUT resuming the
+/// run (ADR-0037): the gate stays Pending and the run stays Suspended after each
+/// approval, and a repeat approval by the same principal is a no-op (idempotent
+/// per (step, by)). Only an explicit `release_gate` finalizes the gate.
+#[tokio::test]
+async fn record_gate_approval_accumulates_without_resuming() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let run = RunId("run-accum".into());
+    let (a, g, b) = (StepId("a".into()), StepId("gate".into()), StepId("b".into()));
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &a, Some(&spec()), &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &g, None, std::slice::from_ref(&a), Timestamp(0)).await.unwrap();
+    db.set_step_gate(&run, &g, "manual", None).await.unwrap();
+    db.create_step_run(&run, &b, Some(&spec()), std::slice::from_ref(&g), Timestamp(0))
+        .await
+        .unwrap();
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.script_outcome(ExecState::Succeeded); // A
+
+    // Reach the gate and suspend.
+    let sched = Scheduler::new(&db, &clock, &exec, "sched");
+    sched.tick(&run).await.unwrap();
+    sched.tick(&run).await.unwrap();
+    assert_eq!(status(&db, "run-accum").await, RunStatus::Suspended);
+
+    // Alice approves: recorded as an event, but the gate does NOT resume.
+    record_gate_approval(&db, &clock, &run, &g, "alice").await.unwrap();
+    assert_eq!(status(&db, "run-accum").await, RunStatus::Suspended, "one approval does not resume");
+    assert_eq!(step_status(&db.steps_of_run(&run).await.unwrap(), "gate"), StepStatus::Pending);
+    assert_eq!(approval_count(&db, &run).await, 1);
+
+    // Alice approves again: idempotent, still exactly one approval event.
+    record_gate_approval(&db, &clock, &run, &g, "alice").await.unwrap();
+    assert_eq!(approval_count(&db, &run).await, 1, "repeat approval by same principal is a no-op");
+
+    // Bob approves: a second distinct approval; run still suspended.
+    record_gate_approval(&db, &clock, &run, &g, "bob").await.unwrap();
+    assert_eq!(approval_count(&db, &run).await, 2);
+    assert_eq!(status(&db, "run-accum").await, RunStatus::Suspended);
+
+    // Only an explicit release finalizes and resumes.
+    release_gate(&db, &clock, &run, &g).await.unwrap();
+    assert_eq!(status(&db, "run-accum").await, RunStatus::Running);
+    assert_eq!(step_status(&db.steps_of_run(&run).await.unwrap(), "gate"), StepStatus::Succeeded);
 
     tdb.cleanup().await;
 }

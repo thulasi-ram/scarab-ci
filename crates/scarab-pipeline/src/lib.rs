@@ -138,6 +138,11 @@ pub struct StepSpec {
     /// Environment overrides for the step.
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    /// Secret keys to resolve and inject as env vars at launch (ADR-0014, 0037).
+    /// Resolved against the run's scope with `env → repo → org` inheritance; a
+    /// fork-PR run is locked out and receives none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
     #[serde(default)]
     pub needs: Needs,
     /// Explicit input workspaces (ADR-0007): the subset of `needs` whose output

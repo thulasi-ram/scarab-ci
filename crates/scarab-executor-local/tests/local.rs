@@ -16,6 +16,7 @@ fn spec(cmd: &[&str]) -> StepSpec {
         image: String::new(),
         command: cmd.iter().map(|s| s.to_string()).collect(),
         env: vec![],
+        secrets: vec![],
     }
 }
 

@@ -43,7 +43,7 @@ async fn setup() -> (FakeForge, Arc<InMemoryDb>, Arc<FakeClock>) {
 async fn push_matching_on_push_starts_a_run() {
     let (forge, db, clock) = setup().await;
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
         .await
         .expect("trigger");
     assert_eq!(runs.len(), 1, "one pipeline matched");
@@ -79,7 +79,7 @@ async fn committed_scarab_authors_concurrency_and_gate() {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
         .await
         .expect("trigger");
     assert_eq!(runs.len(), 1, "one pipeline matched");
@@ -118,13 +118,13 @@ async fn deploy_pipeline_opts_out_of_supersede() {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let first = trigger_run_from_event(&deploy_forge, db.as_ref(), clock.as_ref(), &push("main"))
+    let first = trigger_run_from_event(&deploy_forge, db.as_ref(), clock.as_ref(), None, &push("main"))
         .await
         .expect("trigger")
         .pop()
         .expect("first deploy run");
     clock.advance(1_000); // a strictly-later creation time for the second run
-    let second = trigger_run_from_event(&deploy_forge, db.as_ref(), clock.as_ref(), &push("main"))
+    let second = trigger_run_from_event(&deploy_forge, db.as_ref(), clock.as_ref(), None, &push("main"))
         .await
         .expect("trigger")
         .pop()
@@ -142,13 +142,13 @@ async fn deploy_pipeline_opts_out_of_supersede() {
     );
     let cdb = Arc::new(InMemoryDb::new());
     let cclock = Arc::new(FakeClock::new(1_000));
-    let older = trigger_run_from_event(&ci_forge, cdb.as_ref(), cclock.as_ref(), &push("main"))
+    let older = trigger_run_from_event(&ci_forge, cdb.as_ref(), cclock.as_ref(), None, &push("main"))
         .await
         .expect("trigger")
         .pop()
         .unwrap();
     cclock.advance(1_000);
-    let newer = trigger_run_from_event(&ci_forge, cdb.as_ref(), cclock.as_ref(), &push("main"))
+    let newer = trigger_run_from_event(&ci_forge, cdb.as_ref(), cclock.as_ref(), None, &push("main"))
         .await
         .expect("trigger")
         .pop()
@@ -178,7 +178,7 @@ steps:
     let clock = Arc::new(FakeClock::new(1_000));
 
     // Push to main: the guarded deploy step is included and Pending.
-    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
+    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
         .await
         .expect("trigger")
         .pop()
@@ -187,7 +187,7 @@ steps:
     assert_eq!(deploy.map(|s| s.status), Some(StepStatus::Pending), "deploy runs on main");
 
     // Push to a feature branch: the guard fails, so deploy is present but Skipped.
-    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("feature"))
+    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("feature"))
         .await
         .expect("trigger")
         .pop()
@@ -214,7 +214,7 @@ steps:
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("feature"))
+    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("feature"))
         .await
         .expect("trigger")
         .pop()
@@ -255,7 +255,7 @@ async fn db_steps_status(db: &InMemoryDb, run: &scarab_engine::RunId, id: &str) 
 async fn push_to_non_matching_ref_starts_no_run() {
     let (forge, db, clock) = setup().await;
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("dev"))
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("dev"))
         .await
         .expect("trigger");
     assert!(runs.is_empty(), "push to dev is filtered out by the on:push when");
@@ -269,7 +269,7 @@ async fn no_in_repo_config_starts_no_run() {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
         .await
         .expect("trigger");
     assert!(runs.is_empty(), "no .scarab config → nothing to run");
@@ -298,7 +298,7 @@ async fn multiple_pipelines_each_start_a_run() {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
         .await
         .expect("trigger");
     assert_eq!(runs.len(), 2, "ci + nightly match the push; deploy (tag) does not");

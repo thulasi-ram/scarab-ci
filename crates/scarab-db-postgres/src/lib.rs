@@ -242,6 +242,64 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<Value>, _>("ir")))
     }
 
+    async fn set_run_deploy_context(
+        &self,
+        run: &RunId,
+        ctx: &scarab_engine::DeployContext,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE runs SET deploy_org = $2, deploy_repo = $3, deploy_environment = $4,
+                 deploy_git_ref = $5, deploy_locked_out = $6,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(&ctx.org)
+        .bind(&ctx.repo)
+        .bind(&ctx.environment)
+        .bind(&ctx.git_ref)
+        .bind(ctx.locked_out)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_deploy_context(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::DeployContext>, DbError> {
+        let row = sqlx::query(
+            "SELECT deploy_org, deploy_repo, deploy_environment, deploy_git_ref, deploy_locked_out
+             FROM runs WHERE id = $1",
+        )
+        .bind(&run.0)
+        .fetch_optional(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(row.and_then(|r| {
+            // The four scope columns are set together (or all NULL for a
+            // non-deploy run); `deploy_locked_out` defaults false.
+            match (
+                r.get::<Option<String>, _>("deploy_org"),
+                r.get::<Option<String>, _>("deploy_repo"),
+                r.get::<Option<String>, _>("deploy_environment"),
+                r.get::<Option<String>, _>("deploy_git_ref"),
+            ) {
+                (Some(org), Some(repo), Some(environment), Some(git_ref)) => {
+                    Some(scarab_engine::DeployContext {
+                        org,
+                        repo,
+                        environment,
+                        git_ref,
+                        locked_out: r.get::<bool, _>("deploy_locked_out"),
+                    })
+                }
+                _ => None,
+            }
+        }))
+    }
+
     async fn set_step_output(
         &self,
         run: &RunId,
@@ -938,16 +996,18 @@ impl Db for PostgresDb {
 impl EnvironmentStore for PostgresDb {
     async fn put_environment(
         &self,
-        project: &str,
+        org: &str,
+        repo: &str,
         env: &Environment,
     ) -> Result<(), ProjectError> {
         let protection = serde_json::to_value(&env.protection)
             .map_err(|e| ProjectError::Store(e.to_string()))?;
         sqlx::query(
-            "INSERT INTO environments (project, name, protection) VALUES ($1, $2, $3)
-             ON CONFLICT (project, name) DO UPDATE SET protection = EXCLUDED.protection",
+            "INSERT INTO environments (org, repo, name, protection) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (org, repo, name) DO UPDATE SET protection = EXCLUDED.protection",
         )
-        .bind(project)
+        .bind(org)
+        .bind(repo)
         .bind(&env.name)
         .bind(protection)
         .execute(self.pool().map_err(proj_err)?)
@@ -958,15 +1018,19 @@ impl EnvironmentStore for PostgresDb {
 
     async fn get_environment(
         &self,
-        project: &str,
+        org: &str,
+        repo: &str,
         name: &str,
     ) -> Result<Option<Environment>, ProjectError> {
-        let row = sqlx::query("SELECT protection FROM environments WHERE project = $1 AND name = $2")
-            .bind(project)
-            .bind(name)
-            .fetch_optional(self.pool().map_err(proj_err)?)
-            .await
-            .map_err(|e| ProjectError::Store(e.to_string()))?;
+        let row = sqlx::query(
+            "SELECT protection FROM environments WHERE org = $1 AND repo = $2 AND name = $3",
+        )
+        .bind(org)
+        .bind(repo)
+        .bind(name)
+        .fetch_optional(self.pool().map_err(proj_err)?)
+        .await
+        .map_err(|e| ProjectError::Store(e.to_string()))?;
         row.map(|r| {
             let protection = serde_json::from_value(r.get::<Value, _>("protection"))
                 .map_err(|e| ProjectError::Store(e.to_string()))?;
@@ -978,14 +1042,56 @@ impl EnvironmentStore for PostgresDb {
         .transpose()
     }
 
+    async fn list_environments(
+        &self,
+        org: &str,
+        repo: &str,
+    ) -> Result<Vec<Environment>, ProjectError> {
+        let rows = sqlx::query(
+            "SELECT name, protection FROM environments WHERE org = $1 AND repo = $2 ORDER BY name",
+        )
+        .bind(org)
+        .bind(repo)
+        .fetch_all(self.pool().map_err(proj_err)?)
+        .await
+        .map_err(|e| ProjectError::Store(e.to_string()))?;
+        rows.into_iter()
+            .map(|r| {
+                let protection = serde_json::from_value(r.get::<Value, _>("protection"))
+                    .map_err(|e| ProjectError::Store(e.to_string()))?;
+                Ok(Environment {
+                    name: r.get::<String, _>("name"),
+                    protection,
+                })
+            })
+            .collect()
+    }
+
+    async fn delete_environment(
+        &self,
+        org: &str,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), ProjectError> {
+        sqlx::query("DELETE FROM environments WHERE org = $1 AND repo = $2 AND name = $3")
+            .bind(org)
+            .bind(repo)
+            .bind(name)
+            .execute(self.pool().map_err(proj_err)?)
+            .await
+            .map_err(|e| ProjectError::Store(e.to_string()))?;
+        Ok(())
+    }
+
     async fn record_deployment(&self, d: &Deployment) -> Result<(), ProjectError> {
         let approved = serde_json::to_value(&d.approved_by)
             .map_err(|e| ProjectError::Store(e.to_string()))?;
         sqlx::query(
-            "INSERT INTO deployments (project, environment, git_ref, run_id, approved_by, at)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO deployments (org, repo, environment, git_ref, run_id, approved_by, at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
-        .bind(&d.project)
+        .bind(&d.org)
+        .bind(&d.repo)
         .bind(&d.environment)
         .bind(&d.git_ref)
         .bind(&d.run)
@@ -999,14 +1105,16 @@ impl EnvironmentStore for PostgresDb {
 
     async fn deployments(
         &self,
-        project: &str,
+        org: &str,
+        repo: &str,
         environment: &str,
     ) -> Result<Vec<Deployment>, ProjectError> {
         let rows = sqlx::query(
             "SELECT git_ref, run_id, approved_by, at FROM deployments
-             WHERE project = $1 AND environment = $2 ORDER BY id DESC",
+             WHERE org = $1 AND repo = $2 AND environment = $3 ORDER BY id DESC",
         )
-        .bind(project)
+        .bind(org)
+        .bind(repo)
         .bind(environment)
         .fetch_all(self.pool().map_err(proj_err)?)
         .await
@@ -1016,7 +1124,8 @@ impl EnvironmentStore for PostgresDb {
                 let approved_by = serde_json::from_value(r.get::<Value, _>("approved_by"))
                     .map_err(|e| ProjectError::Store(e.to_string()))?;
                 Ok(Deployment {
-                    project: project.to_string(),
+                    org: org.to_string(),
+                    repo: repo.to_string(),
                     environment: environment.to_string(),
                     git_ref: r.get::<String, _>("git_ref"),
                     run: r.get::<String, _>("run_id"),

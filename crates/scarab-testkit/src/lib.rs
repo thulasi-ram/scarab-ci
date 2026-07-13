@@ -97,6 +97,8 @@ struct InMemoryState {
     runs: HashMap<RunId, RunStatus>,
     /// Compiled IR stored per run (self-describing runs, ADR-0022).
     run_ir: HashMap<RunId, serde_json::Value>,
+    /// Per-run deploy context (ADR-0037); set only for deploy runs.
+    run_deploy: HashMap<RunId, scarab_engine::DeployContext>,
     /// Per-(run, step) rows: status, spec, attempts.
     steps: HashMap<(RunId, StepId), StepRec>,
     /// The transactional outbox.
@@ -468,6 +470,26 @@ impl Db for InMemoryDb {
 
     async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError> {
         Ok(self.state.lock().unwrap().run_ir.get(run).cloned())
+    }
+
+    async fn set_run_deploy_context(
+        &self,
+        run: &RunId,
+        ctx: &scarab_engine::DeployContext,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_deploy
+            .insert(run.clone(), ctx.clone());
+        Ok(())
+    }
+
+    async fn run_deploy_context(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::DeployContext>, DbError> {
+        Ok(self.state.lock().unwrap().run_deploy.get(run).cloned())
     }
 
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {

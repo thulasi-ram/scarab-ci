@@ -37,6 +37,9 @@ use scarab_identity::{Action, Principal, Session};
 pub mod converged;
 pub mod logs;
 pub mod oidc;
+pub mod secret_executor;
+
+pub use secret_executor::SecretInjectingExecutor;
 pub use logs::LogService;
 
 /// A wall-clock [`Clock`] for production wiring (tests inject `FakeClock`).
@@ -182,6 +185,9 @@ pub struct StepDto {
     pub command: Vec<String>,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Secret keys to resolve and inject at launch (ADR-0037).
+    #[serde(default)]
+    pub secrets: Vec<String>,
     #[serde(default)]
     pub needs: Vec<String>,
 }
@@ -342,6 +348,7 @@ async fn create_run(
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            secrets: step.secrets.clone(),
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -605,6 +612,7 @@ pub async fn trigger_run_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
+    environments: Option<&dyn scarab_projects::EnvironmentStore>,
     event: &scarab_forge::Event,
 ) -> Result<Vec<RunId>, TriggerError> {
     // Repo-less events (cron/manual/api) don't carry in-repo config here.
@@ -653,6 +661,22 @@ pub async fn trigger_run_from_event(
             continue;
         }
 
+        // ADR-0037: a deploy pipeline's run is rejected at creation if this git
+        // ref is not allowed to deploy to the target environment — enforced even
+        // when the environment has no approver gate. An undefined environment is
+        // permissive (protection is opt-in).
+        if let (Some(env_name), Some(store)) = (&ir.environment, environments) {
+            if let Some(env) = store
+                .get_environment(&repo.owner, &repo.name, env_name)
+                .await
+                .map_err(|e| TriggerError::Pipeline(e.to_string()))?
+            {
+                if !env.protection.ref_allowed(&git_ref) {
+                    continue;
+                }
+            }
+        }
+
         let now = clock.now().await;
         let run = RunId(Uuid::new_v4().to_string());
         persist_run_from_ir(db, &run, &ir, event, path, &excluded, now).await?;
@@ -676,6 +700,23 @@ async fn persist_run_from_ir(
     db.create_run(run, ir.ir_version, EVENT_VERSION, now).await?;
     db.store_run_ir(run, &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null))
         .await?;
+    // ADR-0037: record the deploy context (repo + environment + git ref) so
+    // gate-approval-time admission can look up the environment's protection
+    // rules directly, without parsing the stored IR blob. Deploy runs only.
+    if let (Some(env_name), Some(repo)) = (&ir.environment, event.repo()) {
+        db.set_run_deploy_context(
+            run,
+            &scarab_engine::DeployContext {
+                org: repo.owner.clone(),
+                repo: repo.name.clone(),
+                environment: env_name.clone(),
+                git_ref: config_ref(event),
+                // A fork PR is locked out of this environment's secrets (ADR-0015).
+                locked_out: fork_policy(event, env_name).secrets_locked_out,
+            },
+        )
+        .await?;
+    }
     // Concurrency group (ADR-0011, 0032): serialize this run against others in the
     // same group under its policy. `${{ … }}` interpolation of the group against
     // the event context is a later slice (kept literal here, matching where step
@@ -723,6 +764,7 @@ async fn persist_run_from_ir(
                 image: step.image.clone(),
                 command: step.command.clone(),
                 env: step.env.clone(),
+                secrets: step.secrets.clone(),
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -891,7 +933,15 @@ async fn github_webhook(
             Json(serde_json::json!({ "ignored": "no forge configured" })),
         ));
     };
-    match trigger_run_from_event(forge.as_ref(), st.db.as_ref(), st.clock.as_ref(), &event).await {
+    match trigger_run_from_event(
+        forge.as_ref(),
+        st.db.as_ref(),
+        st.clock.as_ref(),
+        st.environments.as_deref(),
+        &event,
+    )
+    .await
+    {
         Ok(runs) if !runs.is_empty() => {
             let run_ids: Vec<&str> = runs.iter().map(|r| r.0.as_str()).collect();
             Ok((
@@ -1023,8 +1073,26 @@ fn session_id(headers: &HeaderMap) -> Option<String> {
         .next()
 }
 
-/// Release a manual gate, resuming its suspended run (ADR-0008, 0032). Authz'd
-/// as a write; exactly-once (a repeat approve is a no-op).
+/// The distinct principals who have approved a `manual` gate `step`, in approval
+/// order — the accumulated `GateApproved` events (ADR-0037).
+fn gate_approvers(events: &[EventKind], step: &StepId) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for e in events {
+        if let EventPayload::GateApproved { step: s, by } = &e.kind {
+            if s == step && !seen.contains(by) {
+                seen.push(by.clone());
+            }
+        }
+    }
+    seen
+}
+
+/// Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
+/// approval is recorded on the event log (append-only, idempotent). For a
+/// **deploy** run (one with a target environment), the gate is released only
+/// once the accumulated approvers satisfy the environment's protection rules
+/// (`admits`); on release the deployment is written to history. A plain gate (no
+/// environment) releases on the first approval. Authz'd as a write.
 #[utoipa::path(
     post,
     path = "/v1/runs/{id}/gates/{step}/approve",
@@ -1033,7 +1101,7 @@ fn session_id(headers: &HeaderMap) -> Option<String> {
         ("step" = String, Path, description = "gate step id")
     ),
     responses(
-        (status = 202, description = "gate released"),
+        (status = 202, description = "approval recorded (released or awaiting more approvals)"),
         (status = 404, description = "no such run or gate")
     )
 )]
@@ -1041,15 +1109,95 @@ async fn approve_gate(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
-) -> Result<StatusCode, ApiError> {
-    authorize(&st, &headers, Action::Write).await?;
-    match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &RunId(id), &StepId(step))
-        .await
+) -> Result<Response, ApiError> {
+    let principal = authorize(&st, &headers, Action::Write).await?;
+    let run = RunId(id);
+    let step = StepId(step);
+
+    // 1. Record this principal's approval — append-only, no resume, idempotent
+    //    per (step, subject).
+    match scarab_engine::record_gate_approval(
+        st.db.as_ref(),
+        st.clock.as_ref(),
+        &run,
+        &step,
+        &principal.subject,
+    )
+    .await
     {
-        Ok(()) => Ok(StatusCode::ACCEPTED),
-        Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
-        Err(RestartError::Db(e)) => Err(ApiError::Db(e)),
+        Ok(()) => {}
+        Err(RestartError::StepNotFound(_)) => return Err(ApiError::NotFound),
+        Err(RestartError::Db(e)) => return Err(ApiError::Db(e)),
     }
+
+    // If the gate is already released, this is a late/duplicate approval — the
+    // deploy already happened; nothing more to do (avoids double history).
+    let released_already = st
+        .db
+        .steps_of_run(&run)
+        .await
+        .map_err(ApiError::Db)?
+        .iter()
+        .any(|s| s.step == step && s.status == StepStatus::Succeeded);
+    if released_already {
+        return Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "released": true }))).into_response());
+    }
+
+    // 2. Gather the accumulated approvers and the governing environment's rules.
+    let approvers = gate_approvers(&st.db.events(&run).await.map_err(ApiError::Db)?, &step);
+    let ctx = st.db.run_deploy_context(&run).await.map_err(ApiError::Db)?;
+    let rules = match (&ctx, st.environments.as_ref()) {
+        (Some(c), Some(store)) => store
+            .get_environment(&c.org, &c.repo, &c.environment)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?
+            .map(|e| e.protection),
+        _ => None,
+    };
+
+    // 3. A protected deploy releases only when admits() passes over the
+    //    accumulated approvers; an unprotected/plain gate releases now.
+    let admitted = match (&ctx, &rules) {
+        (Some(c), Some(r)) => r.admits(&c.git_ref, &approvers).is_ok(),
+        _ => true,
+    };
+    if !admitted {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "released": false, "approvals": approvers })),
+        )
+            .into_response());
+    }
+
+    // 4. Finalize the gate and resume the run (exactly-once).
+    match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
+        Ok(()) => {}
+        Err(RestartError::StepNotFound(_)) => return Err(ApiError::NotFound),
+        Err(RestartError::Db(e)) => return Err(ApiError::Db(e)),
+    }
+
+    // 5. Record the deployment in history (ADR-0024, 0037).
+    if let (Some(c), Some(store)) = (&ctx, st.environments.as_ref()) {
+        let now = st.clock.now().await.0;
+        store
+            .record_deployment(&scarab_projects::Deployment {
+                org: c.org.clone(),
+                repo: c.repo.clone(),
+                environment: c.environment.clone(),
+                git_ref: c.git_ref.clone(),
+                run: run.0.clone(),
+                approved_by: approvers.clone(),
+                at: now,
+            })
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "released": true, "approvals": approvers })),
+    )
+        .into_response())
 }
 
 /// HTTP header carrying an external-gate release token (`sha256=<hex>`).
@@ -1238,12 +1386,13 @@ async fn delete_secret(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Create/replace a protected environment (ADR-0024). Administering the
-/// deployment target requires the Administer capability.
+/// Create/replace a repo's protected environment (ADR-0024, 0037). Editing the
+/// deployment target's rules requires the Administer capability — so a pipeline
+/// author (Write) cannot grant themselves deploy access by changing the YAML.
 async fn put_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((project, name)): Path<(String, String)>,
+    Path((org, repo, name)): Path<(String, String, String)>,
     Json(protection): Json<scarab_projects::ProtectionRules>,
 ) -> Result<StatusCode, ApiError> {
     authorize(&st, &headers, Action::Administer).await?;
@@ -1253,59 +1402,73 @@ async fn put_environment(
         protection,
     };
     store
-        .put_environment(&project, &env)
+        .put_environment(&org, &repo, &env)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(StatusCode::OK)
 }
 
-/// `POST …/deploy` body: what's being deployed and who has approved it.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct DeployRequest {
-    pub git_ref: String,
-    pub run: String,
-    #[serde(default)]
-    pub approvals: Vec<String>,
-}
-
-/// Deploy into a protected environment: enforce its protection rules (allowed
-/// refs + required approvers) at admission, and record the deployment in history
-/// on success (ADR-0024, 0011). Violations return 403 with the reasons.
-async fn deploy_environment(
+/// Fetch one environment's definition (rules). Read capability.
+async fn get_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
-    Path((project, name)): Path<(String, String)>,
-    Json(req): Json<DeployRequest>,
-) -> Result<Response, ApiError> {
-    authorize(&st, &headers, Action::Write).await?;
+    Path((org, repo, name)): Path<(String, String, String)>,
+) -> Result<Json<scarab_projects::Environment>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let env = store
-        .get_environment(&project, &name)
+        .get_environment(&org, &repo, &name)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?
         .ok_or(ApiError::NotFound)?;
+    Ok(Json(env))
+}
 
-    if let Err(violations) = env.protection.admits(&req.git_ref, &req.approvals) {
-        return Ok((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "violations": violations })),
-        )
-            .into_response());
-    }
-
-    let now = st.clock.now().await.0;
-    store
-        .record_deployment(&scarab_projects::Deployment {
-            project: project.clone(),
-            environment: name.clone(),
-            git_ref: req.git_ref,
-            run: req.run,
-            approved_by: req.approvals,
-            at: now,
-        })
+/// List a repo's environments. Read capability.
+async fn list_environments(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo)): Path<(String, String)>,
+) -> Result<Json<Vec<scarab_projects::Environment>>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
+    let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
+    let envs = store
+        .list_environments(&org, &repo)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "deployed": true }))).into_response())
+    Ok(Json(envs))
+}
+
+/// Delete an environment (idempotent). Administer capability.
+async fn delete_environment(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo, name)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    authorize(&st, &headers, Action::Administer).await?;
+    let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
+    store
+        .delete_environment(&org, &repo, &name)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// An environment's deployment history, most recent first (ADR-0037). This
+/// replaces the old `POST …/deploy` admission endpoint: admission now happens in
+/// the run's gate-approval path, so this surface is **read-only**. Read cap.
+async fn list_deployments(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo, name)): Path<(String, String, String)>,
+) -> Result<Json<Vec<scarab_projects::Deployment>>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
+    let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
+    let history = store
+        .deployments(&org, &repo, &name)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(history))
 }
 
 /// Resolve a step's scoped secrets and prepare them for injection (ADR-0014,
@@ -1328,7 +1491,9 @@ pub async fn resolve_step_secrets(
     }
     let mut env = Vec::with_capacity(keys.len());
     for key in keys {
-        let secret = provider.get(scope, key).await?;
+        // `resolve` (not `get`) so an env-scoped run inherits repo/org secrets
+        // (ADR-0037); the exact scope is tried first, so exact hits are unchanged.
+        let secret = provider.resolve(scope, key).await?;
         logs.register_secret(&secret.value);
         env.push((
             key.clone(),
@@ -1445,8 +1610,20 @@ pub fn router(state: AppState) -> Router {
             "/v1/secrets",
             post(put_secret).get(list_secrets).delete(delete_secret),
         )
-        .route("/v1/environments/{project}/{name}", axum::routing::put(put_environment))
-        .route("/v1/environments/{project}/{name}/deploy", post(deploy_environment))
+        .route(
+            "/v1/repos/{org}/{repo}/environments",
+            get(list_environments),
+        )
+        .route(
+            "/v1/repos/{org}/{repo}/environments/{name}",
+            axum::routing::put(put_environment)
+                .get(get_environment)
+                .delete(delete_environment),
+        )
+        .route(
+            "/v1/repos/{org}/{repo}/environments/{name}/deployments",
+            get(list_deployments),
+        )
         .route("/webhooks/github", post(github_webhook))
         .with_state(state)
 }

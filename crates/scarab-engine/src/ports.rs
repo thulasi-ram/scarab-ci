@@ -70,6 +70,21 @@ pub trait Db: Send + Sync {
     /// The compiled IR stored on a run, or `None` if unset / the run is unknown.
     async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError>;
 
+    /// Record a run's **deploy context** (ADR-0037) — set once at creation for a
+    /// run whose pipeline declared an `environment:`. Lets gate-approval-time
+    /// admission look up the environment's protection rules directly.
+    async fn set_run_deploy_context(
+        &self,
+        run: &RunId,
+        ctx: &crate::DeployContext,
+    ) -> Result<(), DbError>;
+
+    /// A run's deploy context, or `None` for an ordinary (non-deploy) run.
+    async fn run_deploy_context(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<crate::DeployContext>, DbError>;
+
     /// Record the output workspace snapshot (CAS merkle-root hash) a step
     /// produced, so a dependent can materialize it as input (workspace flows
     /// along `needs` edges — ADR-0029).

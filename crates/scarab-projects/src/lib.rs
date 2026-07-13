@@ -69,9 +69,7 @@ impl ProtectionRules {
     pub fn admits(&self, git_ref: &str, approvals: &[String]) -> Result<(), Vec<String>> {
         let mut violations = Vec::new();
 
-        if !self.allowed_refs.is_empty()
-            && !self.allowed_refs.iter().any(|p| glob_match(p, git_ref))
-        {
+        if !self.ref_allowed(git_ref) {
             violations.push(format!("ref `{git_ref}` is not allowed to deploy here"));
         }
         for approver in &self.approvers {
@@ -86,13 +84,22 @@ impl ProtectionRules {
             Err(violations)
         }
     }
+
+    /// Whether `git_ref` is permitted to deploy here — the allowed-refs half of
+    /// [`admits`], checked on its own at run creation (ADR-0037) so a disallowed
+    /// ref is rejected even when the environment has no approver gate. An empty
+    /// `allowed_refs` permits any ref.
+    pub fn ref_allowed(&self, git_ref: &str) -> bool {
+        self.allowed_refs.is_empty() || self.allowed_refs.iter().any(|p| glob_match(p, git_ref))
+    }
 }
 
 /// A recorded deployment into an [`Environment`] — the deployment history
-/// (ADR-0024).
+/// (ADR-0024, 0037). Scoped to the owning repo (`org`/`repo`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deployment {
-    pub project: String,
+    pub org: String,
+    pub repo: String,
     pub environment: String,
     pub git_ref: String,
     pub run: String,
@@ -109,19 +116,40 @@ pub enum ProjectError {
 }
 
 /// Durable store for environments (with their protection rules) and the
-/// deployment history recorded against them.
+/// deployment history recorded against them. Environments are scoped to the
+/// owning repo (`org`/`repo`) — the key a run knows from its trigger (ADR-0037).
 #[async_trait]
 pub trait EnvironmentStore: Send + Sync {
-    /// Create or replace an environment's definition within a project.
-    async fn put_environment(&self, project: &str, env: &Environment)
-        -> Result<(), ProjectError>;
+    /// Create or replace an environment's definition within a repo.
+    async fn put_environment(
+        &self,
+        org: &str,
+        repo: &str,
+        env: &Environment,
+    ) -> Result<(), ProjectError>;
 
-    /// Fetch an environment by project + name.
+    /// Fetch an environment by repo + name.
     async fn get_environment(
         &self,
-        project: &str,
+        org: &str,
+        repo: &str,
         name: &str,
     ) -> Result<Option<Environment>, ProjectError>;
+
+    /// List the environments defined in a repo.
+    async fn list_environments(
+        &self,
+        org: &str,
+        repo: &str,
+    ) -> Result<Vec<Environment>, ProjectError>;
+
+    /// Remove an environment. Idempotent: removing an absent one is Ok.
+    async fn delete_environment(
+        &self,
+        org: &str,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), ProjectError>;
 
     /// Append a deployment to an environment's history.
     async fn record_deployment(&self, deployment: &Deployment) -> Result<(), ProjectError>;
@@ -129,7 +157,8 @@ pub trait EnvironmentStore: Send + Sync {
     /// The deployment history for an environment, most recent first.
     async fn deployments(
         &self,
-        project: &str,
+        org: &str,
+        repo: &str,
         environment: &str,
     ) -> Result<Vec<Deployment>, ProjectError>;
 }

@@ -431,6 +431,7 @@ mod tests {
             image: "busybox:latest".into(),
             command: vec!["echo".into(), "hi".into()],
             env: vec![("FOO".into(), "bar".into())],
+            secrets: vec![],
         }
     }
 

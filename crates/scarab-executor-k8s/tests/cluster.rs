@@ -51,6 +51,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         image: "busybox:latest".into(),
         command: vec!["sh".into(), "-c".into(), "echo hello scarab".into()],
         env: vec![],
+        secrets: vec![],
     };
 
     // launch, then launch again — the second call must re-attach, not relaunch.

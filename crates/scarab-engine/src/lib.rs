@@ -22,8 +22,8 @@ pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor};
 pub use scheduler::{
-    release_gate, restart_step, RestartError, Scheduler, SchedulerError, LAUNCH_STEP,
-    RUN_STATUS_CHANGED,
+    record_gate_approval, release_gate, restart_step, RestartError, Scheduler, SchedulerError,
+    LAUNCH_STEP, RUN_STATUS_CHANGED,
 };
 
 use serde::{Deserialize, Serialize};
@@ -184,6 +184,11 @@ pub struct StepSpec {
     pub image: String,
     pub command: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Secret keys the step wants injected at launch (ADR-0037). Resolved (with
+    /// inheritance) and merged into `env` by the launch path just before the Pod
+    /// starts — never persisted with a value. Empty for most steps.
+    #[serde(default)]
+    pub secrets: Vec<String>,
 }
 
 /// A manual/approval gate that suspends a run until released.
@@ -260,6 +265,23 @@ pub struct LogChunkMeta {
     pub object_key: String,
 }
 
+/// A deploy run's durable target: the repo it deploys, the environment it
+/// targets, and the git ref it ships (ADR-0037). Recorded at run creation for
+/// runs whose pipeline declared an `environment:`; absent for ordinary CI runs.
+/// Lets admission find the environment's protection rules at gate-approval time
+/// without parsing the stored IR blob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeployContext {
+    pub org: String,
+    pub repo: String,
+    pub environment: String,
+    pub git_ref: String,
+    /// Whether this run is locked out of secrets (a fork PR, ADR-0015/0037). When
+    /// true the launch path injects no secrets even for env-scoped steps.
+    #[serde(default)]
+    pub locked_out: bool,
+}
+
 /// The discriminated payload carried by an [`EventKind`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventPayload {
@@ -268,6 +290,11 @@ pub enum EventPayload {
     StepTransitioned { step: StepId, from: StepStatus, to: StepStatus },
     AttemptStarted { step: StepId, attempt: AttemptId },
     AttemptFinished { step: StepId, attempt: AttemptId, failure: Option<FailureKind> },
+    /// A single approval was recorded against a `manual` gate by the named
+    /// principal (ADR-0037). Append-only, accumulating — the run stays suspended
+    /// until enough distinct approvers satisfy the environment's rules, at which
+    /// point [`GateReleased`](EventPayload::GateReleased) finalizes the gate.
+    GateApproved { step: StepId, by: String },
     GateReleased { step: StepId },
     /// A step was skipped on restart because its inputs were unchanged — its
     /// prior output is carried forward rather than recomputed (ADR-0027). Surfaced

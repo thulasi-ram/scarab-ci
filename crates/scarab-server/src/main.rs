@@ -15,7 +15,7 @@ use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
 use scarab_executor_k8s::K8sExecutor;
 use scarab_executor_local::LocalExecutor;
-use scarab_server::{converged, router, AppState, LogService, SystemClock};
+use scarab_server::{converged, router, AppState, LogService, SecretInjectingExecutor, SystemClock};
 use scarab_storage::ObjectStore;
 use scarab_storage_s3::S3Storage;
 
@@ -138,6 +138,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logs = Arc::new(LogService::new(store, db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
+    // Secrets store (envelope-encrypted, ADR-0014): built up-front — before the
+    // driver — so the launch path can resolve and inject env-scoped secrets
+    // (ADR-0037). Master key from SCARAB_MASTER_KEY. Only when connected.
+    let secrets: Option<Arc<dyn scarab_secrets::SecretProvider>> =
+        if let (true, Some(url)) = (connected, &cli.database_url) {
+            let s = scarab_secrets_postgres::PostgresSecrets::connect(url).await?;
+            s.migrate().await?;
+            Some(Arc::new(s))
+        } else {
+            None
+        };
+
     // Background scheduler + executor loop. The k8s backend best-effort connects
     // (without a cluster the driver is skipped, API-only); the local backend
     // needs nothing but a working host (dev/CLI, ADR-0036).
@@ -156,6 +168,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         };
         if let Some(executor) = executor {
+            // Inject env-scoped secrets into deploy-run pods at launch (ADR-0037)
+            // when a secrets store is wired; otherwise launch unchanged.
+            let executor: Arc<dyn Executor> = match &secrets {
+                Some(sec) => Arc::new(SecretInjectingExecutor::new(
+                    executor,
+                    db.clone(),
+                    sec.clone(),
+                    logs.clone(),
+                )),
+                None => executor,
+            };
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.
             // A short window is safe either way — `launch` is idempotent (ADR-0021).
@@ -193,12 +216,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if connected {
         state = state.with_environments(pg.clone());
     }
-    // Secrets store (envelope-encrypted, ADR-0014): the master key comes from
-    // SCARAB_MASTER_KEY. Enables /v1/secrets management. Only when connected.
-    if let (true, Some(url)) = (connected, &cli.database_url) {
-        let secrets = scarab_secrets_postgres::PostgresSecrets::connect(url).await?;
-        secrets.migrate().await?;
-        state = state.with_secrets(Arc::new(secrets));
+    // Enable /v1/secrets management with the secrets store built above (ADR-0014).
+    if let Some(sec) = &secrets {
+        state = state.with_secrets(sec.clone());
     }
     // OIDC issuer for keyless federation (ADR-0014): serve JWKS + discovery so a
     // cloud provider can verify Scarab-minted tokens. The issuer URL is the

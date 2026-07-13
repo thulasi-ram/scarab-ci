@@ -19,6 +19,7 @@ fn spec() -> StepSpec {
         image: "busybox:latest".into(),
         command: vec!["echo".into(), "hi".into()],
         env: vec![],
+        secrets: vec![],
     }
 }
 
