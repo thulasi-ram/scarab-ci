@@ -189,6 +189,16 @@ pub struct StepSpec {
     /// starts — never persisted with a value. Empty for most steps.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// The privilege escalations **admitted** for this step (ADR-0039) — already
+    /// authorized against the run's Environment whitelist and fork-lockout at run
+    /// creation. The executor applies *exactly* these above the hardened baseline
+    /// and nothing more (fail-closed). Default = the restricted baseline.
+    #[serde(default)]
+    pub run_as_root: bool,
+    #[serde(default)]
+    pub add_capabilities: Vec<String>,
+    #[serde(default)]
+    pub privileged: bool,
 }
 
 /// A manual/approval gate that suspends a run until released.

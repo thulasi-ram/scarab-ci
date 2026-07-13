@@ -21,6 +21,9 @@ fn spec() -> StepSpec {
         command: vec!["true".into()],
         env: vec![],
         secrets: vec![],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
     }
 }
 

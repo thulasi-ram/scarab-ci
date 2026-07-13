@@ -10,7 +10,7 @@
 
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::{
-    Container, EnvVar, Pod, PodSpec, SeccompProfile, SecurityContext,
+    Capabilities, Container, EnvVar, Pod, PodSpec, SeccompProfile, SecurityContext,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, DeleteParams, PostParams};
@@ -171,6 +171,7 @@ pub fn build_pod(name: &str, namespace: &str, step: &StepRun, spec: &StepSpec) -
         image: Some(spec.image.clone()),
         command: (!spec.command.is_empty()).then(|| spec.command.clone()),
         env: Some(env),
+        security_context: Some(step_security_context(spec)),
         ..Default::default()
     };
 
@@ -194,6 +195,34 @@ pub fn build_pod(name: &str, namespace: &str, step: &StepRun, spec: &StepSpec) -
         spec: Some(PodSpec {
             containers: vec![container],
             restart_policy: Some("Never".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// The container `SecurityContext` for a step (ADR-0039): a hardened, Kubernetes
+/// "restricted"-equivalent **baseline** — `runAsNonRoot`, drop **ALL**
+/// capabilities, `RuntimeDefault` seccomp, `allowPrivilegeEscalation: false` — on
+/// top of which only the **admitted** grants on `spec` are applied. Anything not
+/// admitted stays at the baseline (fail-closed); the executor never escalates
+/// beyond what admission blessed.
+fn step_security_context(spec: &StepSpec) -> SecurityContext {
+    SecurityContext {
+        // Baseline non-root; only an admitted `run_as_root` opts out (and then we
+        // pin uid 0 explicitly).
+        run_as_non_root: Some(!spec.run_as_root),
+        run_as_user: spec.run_as_root.then_some(0),
+        // Baseline drops everything; admitted capabilities are added back.
+        capabilities: Some(Capabilities {
+            drop: Some(vec!["ALL".to_string()]),
+            add: (!spec.add_capabilities.is_empty()).then(|| spec.add_capabilities.clone()),
+        }),
+        // Privilege escalation stays off unless the container is privileged.
+        allow_privilege_escalation: Some(spec.privileged),
+        privileged: Some(spec.privileged),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "RuntimeDefault".to_string(),
             ..Default::default()
         }),
         ..Default::default()
@@ -432,7 +461,67 @@ mod tests {
             command: vec!["echo".into(), "hi".into()],
             env: vec![("FOO".into(), "bar".into())],
             secrets: vec![],
+            run_as_root: false,
+            add_capabilities: vec![],
+            privileged: false,
         }
+    }
+
+    #[test]
+    fn step_pod_is_hardened_restricted_by_default() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox());
+        let sc = pod.spec.unwrap().containers[0]
+            .security_context
+            .clone()
+            .expect("baseline security context must be set");
+        // ADR-0039 restricted floor.
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.run_as_user, None);
+        assert_eq!(sc.privileged, Some(false));
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        assert_eq!(sc.capabilities.as_ref().unwrap().drop, Some(vec!["ALL".to_string()]));
+        assert!(sc.capabilities.as_ref().unwrap().add.is_none());
+        assert_eq!(sc.seccomp_profile.unwrap().type_, "RuntimeDefault");
+    }
+
+    #[test]
+    fn admitted_grants_are_applied_as_exceptions() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let spec = StepSpec {
+            image: "ghcr.io/acme/deployer@sha256:aaaa".into(),
+            command: vec![],
+            env: vec![],
+            secrets: vec![],
+            run_as_root: true,
+            add_capabilities: vec!["NET_ADMIN".into()],
+            privileged: true,
+        };
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec);
+        let sc = pod.spec.unwrap().containers[0].security_context.clone().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(false));
+        assert_eq!(sc.run_as_user, Some(0));
+        assert_eq!(sc.privileged, Some(true));
+        assert_eq!(sc.allow_privilege_escalation, Some(true));
+        // Still drops ALL, then adds only the admitted capability.
+        let caps = sc.capabilities.unwrap();
+        assert_eq!(caps.drop, Some(vec!["ALL".to_string()]));
+        assert_eq!(caps.add, Some(vec!["NET_ADMIN".to_string()]));
+    }
+
+    #[test]
+    fn run_as_root_alone_does_not_enable_privilege_escalation() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let spec = StepSpec {
+            run_as_root: true,
+            ..busybox()
+        };
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec);
+        let sc = pod.spec.unwrap().containers[0].security_context.clone().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(false));
+        assert_eq!(sc.privileged, Some(false));
+        // Self-service root stays unprivileged and non-escalating.
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
     }
 
     #[test]

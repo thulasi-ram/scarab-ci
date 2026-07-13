@@ -17,6 +17,9 @@ fn spec(cmd: &[&str]) -> StepSpec {
         command: cmd.iter().map(|s| s.to_string()).collect(),
         env: vec![],
         secrets: vec![],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
     }
 }
 
