@@ -39,3 +39,34 @@ export async function createRun(req: CreateRunRequest): Promise<string> {
   }
   return data.id;
 }
+
+// --- Secrets (ADR-0014). Values are write-only; the API never returns them. ---
+
+export type SecretScope = { org: string; repo?: string; environment?: string };
+
+/** List secret NAMES at a scope (`GET /v1/secrets`). Never returns values. */
+export async function listSecrets(scope: SecretScope): Promise<string[]> {
+  const { data, error } = await api.GET("/v1/secrets", { params: { query: scope } });
+  if (error || !data) {
+    throw new Error("failed to list secrets");
+  }
+  return data.names;
+}
+
+/** Define/overwrite a secret (`POST /v1/secrets`). */
+export async function putSecret(req: SecretScope & { name: string; value: string }): Promise<void> {
+  const { error } = await api.POST("/v1/secrets", { body: req });
+  if (error) {
+    throw new Error("failed to save secret");
+  }
+}
+
+/** Delete a secret (`DELETE /v1/secrets`). */
+export async function deleteSecret(scope: SecretScope, name: string): Promise<void> {
+  const { error } = await api.DELETE("/v1/secrets", {
+    params: { query: { ...scope, name } },
+  });
+  if (error) {
+    throw new Error("failed to delete secret");
+  }
+}

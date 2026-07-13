@@ -146,6 +146,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/secrets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the secret **names** at a scope (ADR-0014) — never the values. */
+        get: operations["list_secrets"];
+        put?: never;
+        /**
+         * Define (or overwrite) a secret at a scope (ADR-0014). The value is stored
+         *     envelope-encrypted and is **never** returned by any endpoint. Administering
+         *     secrets requires the Administer capability.
+         */
+        post: operations["put_secret"];
+        /** Delete a secret at a scope (ADR-0014). Idempotent. */
+        delete: operations["delete_secret"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -167,6 +190,22 @@ export interface components {
             ir_version: number;
             steps: components["schemas"]["StepDto"][];
         };
+        /**
+         * @description `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
+         *     `value` is **write-only** — no endpoint ever returns it.
+         */
+        PutSecretRequest: {
+            /** @description Environment, for an environment-scoped secret (requires `repo`). */
+            environment?: string | null;
+            /** @description Secret name (the key steps reference). */
+            name: string;
+            /** @description Owning org (required). */
+            org: string;
+            /** @description Repo, for a repo- or environment-scoped secret. */
+            repo?: string | null;
+            /** @description Secret value — stored envelope-encrypted, never returned. */
+            value: string;
+        };
         /** @description `GET /v1/runs` body: the most recent runs, newest first. */
         RunListResponse: {
             runs: components["schemas"]["RunSummaryDto"][];
@@ -182,6 +221,13 @@ export interface components {
             created_at: number;
             id: string;
             status: string;
+        };
+        /**
+         * @description `GET /v1/secrets` body: the secret **names** at a scope. Values are never
+         *     listed.
+         */
+        SecretListResponse: {
+            names: string[];
         };
         /** @description One step (IR subset): the step contract is an OCI `image` + `command`. */
         StepDto: {
@@ -413,6 +459,102 @@ export interface operations {
                 content?: never;
             };
             /** @description no such run or step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_secrets: {
+        parameters: {
+            query: {
+                /** @description owning org */
+                org: string;
+                /** @description repo (repo/env scope) */
+                repo?: string;
+                /** @description environment (env scope) */
+                environment?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SecretListResponse"];
+                };
+            };
+            /** @description secrets not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    put_secret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutSecretRequest"];
+            };
+        };
+        responses: {
+            /** @description secret stored */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description secrets not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_secret: {
+        parameters: {
+            query: {
+                /** @description owning org */
+                org: string;
+                /** @description repo (repo/env scope) */
+                repo?: string;
+                /** @description environment (env scope) */
+                environment?: string;
+                /** @description secret name to delete */
+                name: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description deleted (idempotent) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description secrets not configured */
             404: {
                 headers: {
                     [name: string]: unknown;
