@@ -21,8 +21,10 @@ pub async fn tick_once(
     executor: &Arc<dyn Executor>,
     forge: Option<&Arc<dyn ForgePort>>,
     owner: &str,
+    visibility_ms: i64,
 ) -> Result<(), SchedulerError> {
     Scheduler::new(&**db, &**clock, &**executor, owner)
+        .with_outbox_visibility_ms(visibility_ms)
         .tick_all()
         .await?;
     if let Some(forge) = forge {
@@ -45,10 +47,13 @@ pub fn spawn_driver(
     forge: Option<Arc<dyn ForgePort>>,
     owner: String,
     interval: Duration,
+    visibility_ms: i64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = tick_once(&db, &clock, &executor, forge.as_ref(), &owner).await {
+            if let Err(e) =
+                tick_once(&db, &clock, &executor, forge.as_ref(), &owner, visibility_ms).await
+            {
                 tracing::warn!(error = %e, "converged driver tick failed");
             }
             tokio::time::sleep(interval).await;

@@ -14,6 +14,7 @@ use clap::{Parser, ValueEnum};
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
 use scarab_executor_k8s::K8sExecutor;
+use scarab_executor_local::LocalExecutor;
 use scarab_server::{converged, router, AppState, LogService, SystemClock};
 use scarab_storage::ObjectStore;
 use scarab_storage_s3::S3Storage;
@@ -38,6 +39,16 @@ impl Role {
     fn runs_driver(self) -> bool {
         matches!(self, Role::Converged | Role::Scheduler | Role::Executor)
     }
+}
+
+/// Which execution backend the driver uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExecutorKind {
+    /// Kubernetes: one Pod per step (production; ADR-0005).
+    K8s,
+    /// Local host processes — a dev/CLI backend for laptop runs without a
+    /// cluster (ADR-0036). Never a production deployment mode.
+    Local,
 }
 
 #[derive(Debug, Parser)]
@@ -69,6 +80,11 @@ struct Cli {
     /// Kubernetes namespace the executor launches step Pods into.
     #[arg(long, env = "SCARAB_NAMESPACE", default_value = "scarab")]
     namespace: String,
+
+    /// Execution backend for the driver. `k8s` (default, production) or `local`
+    /// (host processes — a cluster-free dev/CLI loop, ADR-0036).
+    #[arg(long, value_enum, env = "SCARAB_EXECUTOR", default_value_t = ExecutorKind::K8s)]
+    executor: ExecutorKind,
 
     /// Write the generated OpenAPI document to this path and exit (client
     /// codegen / CI spec check). Does not connect to Postgres or serve.
@@ -122,27 +138,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logs = Arc::new(LogService::new(store, db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
-    // Background scheduler + executor loop. Best-effort kube connect: without a
-    // cluster the driver is skipped and the process serves API-only.
+    // Background scheduler + executor loop. The k8s backend best-effort connects
+    // (without a cluster the driver is skipped, API-only); the local backend
+    // needs nothing but a working host (dev/CLI, ADR-0036).
     if cli.role.runs_driver() && connected {
-        match K8sExecutor::connect(cli.namespace.clone()).await {
-            Ok(exec) => {
-                let executor: Arc<dyn Executor> = Arc::new(exec);
-                // Forge-status posting is wired once GitHub App auth lands; until
-                // then the driver ticks without a forge.
-                converged::spawn_driver(
-                    db.clone(),
-                    clock.clone(),
-                    executor,
-                    None,
-                    "scarab-server".to_string(),
-                    Duration::from_millis(500),
-                );
-                tracing::info!("converged driver started");
+        let executor: Option<Arc<dyn Executor>> = match cli.executor {
+            ExecutorKind::Local => {
+                tracing::info!("using the local (host-process) executor — dev/CLI backend");
+                Some(Arc::new(LocalExecutor::new()))
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "no kubernetes cluster reachable; driver not started (API-only)");
-            }
+            ExecutorKind::K8s => match K8sExecutor::connect(cli.namespace.clone()).await {
+                Ok(exec) => Some(Arc::new(exec)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no kubernetes cluster reachable; driver not started (API-only)");
+                    None
+                }
+            },
+        };
+        if let Some(executor) = executor {
+            // Local host processes finish instantly, so re-poll them quickly; k8s
+            // Pods take time, so the default window avoids thundering re-claims.
+            // A short window is safe either way — `launch` is idempotent (ADR-0021).
+            let visibility_ms = match cli.executor {
+                ExecutorKind::Local => 1_000,
+                ExecutorKind::K8s => 30_000,
+            };
+            // Forge-status posting is wired once GitHub App auth lands; until then
+            // the driver ticks without a forge.
+            converged::spawn_driver(
+                db.clone(),
+                clock.clone(),
+                executor,
+                None,
+                "scarab-server".to_string(),
+                Duration::from_millis(500),
+                visibility_ms,
+            );
+            tracing::info!("converged driver started");
         }
     }
 

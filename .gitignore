@@ -11,3 +11,4 @@
 
 # UI (TS project, not a cargo member)
 /ui/node_modules
+/ui/dist
