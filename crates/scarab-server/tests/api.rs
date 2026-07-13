@@ -190,3 +190,57 @@ async fn unknown_run_is_404() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn get_run_exposes_step_needs_for_the_dag() {
+    // The run detail view renders a DAG, so GET /v1/runs/:id must surface each
+    // step's `needs` in-edges (ADR-0006), not just id/status/attempts.
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock: Arc<FakeClock> = Arc::new(FakeClock::new(1_000));
+    let app = router(app_state(db, clock));
+
+    let body = serde_json::json!({
+        "pipeline": {
+            "ir_version": 1,
+            "steps": [
+                { "id": "build", "image": "busybox:latest", "command": ["echo", "b"] },
+                { "id": "test", "image": "busybox:latest", "command": ["echo", "t"], "needs": ["build"] }
+            ]
+        }
+    })
+    .to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/runs")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id = body_json(resp).await["id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/runs/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let status = body_json(resp).await;
+    let steps = status["steps"].as_array().unwrap();
+    let test = steps
+        .iter()
+        .find(|s| s["id"] == "test")
+        .expect("test step present");
+    assert_eq!(test["needs"], serde_json::json!(["build"]), "DAG in-edges surfaced");
+    let build = steps.iter().find(|s| s["id"] == "build").unwrap();
+    assert_eq!(build["needs"], serde_json::json!([]), "root step has no needs");
+}

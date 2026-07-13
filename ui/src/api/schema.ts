@@ -241,7 +241,17 @@ export interface components {
         };
         StepStatusDto: {
             attempts: number;
+            /**
+             * @description `manual`/`timer`/`external` if this step is a gate (ADR-0008), else absent.
+             *     Gates launch no pod and suspend the run until released.
+             */
+            gate?: string | null;
             id: string;
+            /**
+             * @description Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The
+             *     UI folds these into the run's graph view.
+             */
+            needs?: string[];
             status: string;
         };
     };

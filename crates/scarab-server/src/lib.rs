@@ -253,6 +253,14 @@ pub struct StepStatusDto {
     pub id: String,
     pub status: String,
     pub attempts: usize,
+    /// Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The
+    /// UI folds these into the run's graph view.
+    #[serde(default)]
+    pub needs: Vec<String>,
+    /// `manual`/`timer`/`external` if this step is a gate (ADR-0008), else absent.
+    /// Gates launch no pod and suspend the run until released.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +422,8 @@ async fn get_run(
                 id: s.step.0,
                 status: step_status_name(s.status).to_string(),
                 attempts: s.attempts.len(),
+                needs: s.needs.into_iter().map(|n| n.0).collect(),
+                gate: s.gate_kind,
             })
             .collect(),
     }))

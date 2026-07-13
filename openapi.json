@@ -592,8 +592,22 @@
             "type": "integer",
             "minimum": 0
           },
+          "gate": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`manual`/`timer`/`external` if this step is a gate (ADR-0008), else absent.\nGates launch no pod and suspend the run until released."
+          },
           "id": {
             "type": "string"
+          },
+          "needs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The\nUI folds these into the run's graph view."
           },
           "status": {
             "type": "string"
