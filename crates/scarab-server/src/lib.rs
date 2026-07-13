@@ -254,6 +254,23 @@ pub struct SecretListResponse {
     pub names: Vec<String>,
 }
 
+/// `GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory parity view
+/// (ADR-0037). For each secret key, its **effective** status per environment
+/// after inheritance — never a value. `unset` where the key resolves to nothing.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SecretMatrix {
+    /// The repo's environments, in the order the columns should render.
+    pub environments: Vec<String>,
+    pub keys: Vec<SecretMatrixRow>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SecretMatrixRow {
+    pub key: String,
+    /// `environment name -> "set" | "inherited" | "unset"`.
+    pub status: std::collections::BTreeMap<String, String>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StepStatusDto {
     pub id: String,
@@ -1265,14 +1282,13 @@ fn secret_scope(
     repo: Option<String>,
     environment: Option<String>,
 ) -> Result<scarab_secrets::SecretScope, ApiError> {
-    use scarab_secrets::SecretScope;
     if org.is_empty() {
         return Err(ApiError::BadRequest("org is required".into()));
     }
     match (repo, environment) {
-        (None, None) => Ok(SecretScope::Org { org }),
-        (Some(repo), None) => Ok(SecretScope::Repo { org, repo }),
-        (Some(repo), Some(environment)) => Ok(SecretScope::Environment {
+        (None, None) => Ok(scarab_secrets::SecretScope::Org { org }),
+        (Some(repo), None) => Ok(scarab_secrets::SecretScope::Repo { org, repo }),
+        (Some(repo), Some(environment)) => Ok(scarab_secrets::SecretScope::Environment {
             org,
             repo,
             environment,
@@ -1471,6 +1487,80 @@ async fn list_deployments(
     Ok(Json(history))
 }
 
+/// The advisory secret parity matrix for a repo (ADR-0037): each key's effective
+/// status per environment — `set` (defined at that env's scope), `inherited`
+/// (resolves from repo/org scope), or `unset`. Post-inheritance, so a shared key
+/// defined once at repo scope never reads as missing. Names + status only, never
+/// values — same `Administer` capability as listing secrets.
+async fn secret_matrix(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo)): Path<(String, String)>,
+) -> Result<Json<SecretMatrix>, ApiError> {
+    authorize(&st, &headers, Action::Administer).await?;
+    let envs_store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
+    let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
+
+    let environments = envs_store
+        .list_environments(&org, &repo)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let env_names: Vec<String> = environments.iter().map(|e| e.name.clone()).collect();
+
+    // Keys resolvable by *any* environment via inheritance (repo + org scope).
+    let mut inherited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for scope in [
+        scarab_secrets::SecretScope::Org { org: org.clone() },
+        scarab_secrets::SecretScope::Repo {
+            org: org.clone(),
+            repo: repo.clone(),
+        },
+    ] {
+        inherited.extend(secrets.list_scoped(&scope).await.map_err(secret_err)?);
+    }
+
+    // Keys defined directly at each environment's scope.
+    let mut env_keys: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    let mut all_keys: std::collections::BTreeSet<String> = inherited.clone();
+    for name in &env_names {
+        let scope = scarab_secrets::SecretScope::Environment {
+            org: org.clone(),
+            repo: repo.clone(),
+            environment: name.clone(),
+        };
+        let keys: std::collections::BTreeSet<String> =
+            secrets.list_scoped(&scope).await.map_err(secret_err)?.into_iter().collect();
+        all_keys.extend(keys.iter().cloned());
+        env_keys.insert(name.clone(), keys);
+    }
+
+    let keys = all_keys
+        .into_iter()
+        .map(|key| {
+            let status = env_names
+                .iter()
+                .map(|env| {
+                    let s = if env_keys.get(env).is_some_and(|k| k.contains(&key)) {
+                        "set"
+                    } else if inherited.contains(&key) {
+                        "inherited"
+                    } else {
+                        "unset"
+                    };
+                    (env.clone(), s.to_string())
+                })
+                .collect();
+            SecretMatrixRow { key, status }
+        })
+        .collect();
+
+    Ok(Json(SecretMatrix {
+        environments: env_names,
+        keys,
+    }))
+}
+
 /// Resolve a step's scoped secrets and prepare them for injection (ADR-0014,
 /// 0013): fetch each `key` at `scope` from `provider`, **register its value with
 /// the log redactor** so it can never appear in stored or streamed logs, and
@@ -1624,6 +1714,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/repos/{org}/{repo}/environments/{name}/deployments",
             get(list_deployments),
         )
+        .route("/v1/repos/{org}/{repo}/secrets/matrix", get(secret_matrix))
         .route("/webhooks/github", post(github_webhook))
         .with_state(state)
 }

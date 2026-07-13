@@ -28,9 +28,9 @@ use scarab_engine::{
     Db, DeployContext, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
 };
 use scarab_projects::{EnvironmentStore, ProtectionRules};
-use scarab_secrets::SecretScope;
+use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
-use scarab_testkit::{FakeClock, FakeExecutor, InMemoryObjectStore};
+use scarab_testkit::{FakeClock, FakeExecutor, FakeSecrets, InMemoryObjectStore};
 
 fn rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
     ProtectionRules {
@@ -213,6 +213,61 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
     assert_eq!(history.len(), 1, "the admitted deploy is recorded once");
     assert_eq!(history[0].git_ref, "refs/heads/main");
     assert_eq!(history[0].approved_by, vec!["anonymous".to_string()]);
+
+    tdb.cleanup().await;
+}
+
+/// The advisory secret parity matrix reports effective status per environment
+/// (ADR-0037): a key defined at the repo scope is `inherited` by every env; a
+/// key defined only at one env's scope is `set` there and `unset` elsewhere.
+#[tokio::test]
+async fn secret_matrix_reports_effective_status() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    for name in ["prod", "staging"] {
+        pg.put_environment(
+            "acme",
+            "web",
+            &scarab_projects::Environment { name: name.into(), protection: rules(&[], &[]) },
+        )
+        .await
+        .unwrap();
+    }
+    // SHARED lives once at repo scope; PROD_ONLY only at prod's env scope.
+    let secrets = FakeSecrets::new()
+        .with_secret(&SecretScope::Repo { org: "acme".into(), repo: "web".into() }, "SHARED", b"x")
+        .with_secret(
+            &SecretScope::Environment {
+                org: "acme".into(),
+                repo: "web".into(),
+                environment: "prod".into(),
+            },
+            "PROD_ONLY",
+            b"y",
+        );
+    let db: Arc<dyn Db> = pg.clone();
+    let envs: Arc<dyn EnvironmentStore> = pg.clone();
+    let clock = Arc::new(FakeClock::new(1_000));
+    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), pg.clone()));
+    let secrets: Arc<dyn SecretProvider> = Arc::new(secrets);
+    let app = router(
+        AppState::new(db, clock, logs).with_environments(envs).with_secrets(secrets),
+    );
+
+    let resp = app.oneshot(get_req("/v1/repos/acme/web/secrets/matrix")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let m: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(m["environments"], serde_json::json!(["prod", "staging"]));
+    let rows = m["keys"].as_array().unwrap();
+    let row = |k: &str| rows.iter().find(|r| r["key"] == k).unwrap()["status"].clone();
+    assert_eq!(row("SHARED"), serde_json::json!({ "prod": "inherited", "staging": "inherited" }));
+    assert_eq!(row("PROD_ONLY"), serde_json::json!({ "prod": "set", "staging": "unset" }));
 
     tdb.cleanup().await;
 }
