@@ -593,41 +593,27 @@ fn find_cycle(steps: &[StepSpec]) -> Option<Vec<String>> {
     Some(in_cycle)
 }
 
-/// Return a copy of `ir` keeping only steps whose `when:` guard is true (or
-/// absent) under `ctx` — the include/exclude primitive (ADR-0009). `needs` edges
-/// onto pruned steps are dropped so the result stays well-formed.
+/// Return the ids of steps whose `when:` guard is **false** under `ctx` — the
+/// steps to prune (ADR-0009, 0033). A step with no `when:` is always included.
 ///
-/// Transitive skip propagation (a step whose *only* dependency was pruned) is
-/// the engine's concern, not this pure lowering — TODO(slice-4) when gate/skip
-/// semantics land.
-pub fn select_steps(
+/// The run keeps the *full* DAG (edges intact) and marks these steps `Skipped`,
+/// so the engine's dep cascade transitively skips their descendants (ADR-0033) —
+/// pruning here does not drop edges, which is what makes transitive skip work.
+pub fn excluded_steps(
     ir: &PipelineIr,
     ctx: &serde_json::Value,
-) -> Result<PipelineIr, PipelineError> {
-    let mut kept: Vec<StepSpec> = Vec::new();
+) -> Result<Vec<String>, PipelineError> {
+    let mut excluded = Vec::new();
     for step in &ir.steps {
         let include = match &step.when {
             Some(When(expr)) => cel::eval_bool(expr, ctx)?,
             None => true,
         };
-        if include {
-            kept.push(step.clone());
+        if !include {
+            excluded.push(step.id.clone());
         }
     }
-    let kept_ids: BTreeSet<String> = kept.iter().map(|s| s.id.clone()).collect();
-    for step in &mut kept {
-        step.needs.0.retain(|n| kept_ids.contains(n));
-        if let Some(inputs) = &mut step.inputs {
-            inputs.retain(|n| kept_ids.contains(n));
-        }
-    }
-    Ok(PipelineIr {
-        ir_version: ir.ir_version,
-        triggers: ir.triggers.clone(),
-        concurrency: ir.concurrency.clone(),
-        environment: ir.environment.clone(),
-        steps: kept,
-    })
+    Ok(excluded)
 }
 
 #[cfg(test)]
@@ -789,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn when_selects_steps_and_prunes_edges() {
+    fn excluded_steps_reports_when_false_steps() {
         let ir = compile(
             r#"
             steps:
@@ -799,15 +785,15 @@ mod tests {
             "#,
         );
 
-        let on_main = select_steps(&ir, &json!({ "event": { "branch": "main" } })).unwrap();
-        assert_eq!(on_main.steps.len(), 3);
+        // On main the guard holds — nothing excluded.
+        assert!(excluded_steps(&ir, &json!({ "event": { "branch": "main" } }))
+            .unwrap()
+            .is_empty());
 
-        let on_feature = select_steps(&ir, &json!({ "event": { "branch": "feat" } })).unwrap();
-        let ids: Vec<&str> = on_feature.steps.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["build", "notify"], "deploy excluded");
-        // notify's edge onto the pruned `deploy` is dropped, not left dangling.
-        let notify = on_feature.steps.iter().find(|s| s.id == "notify").unwrap();
-        assert!(notify.needs.0.is_empty());
+        // Off main only `deploy` (the guarded step) is excluded; the DAG keeps its
+        // edges so the engine transitively skips `notify` (ADR-0033).
+        let excluded = excluded_steps(&ir, &json!({ "event": { "branch": "feat" } })).unwrap();
+        assert_eq!(excluded, vec!["deploy".to_string()]);
     }
 
     #[test]

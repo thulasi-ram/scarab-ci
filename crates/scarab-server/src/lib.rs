@@ -578,18 +578,19 @@ pub async fn trigger_run_from_event(
             continue;
         }
 
-        // Apply step-level `when:` guards against the event context (ADR-0009):
-        // only steps whose guard holds become part of the run; edges onto pruned
-        // steps are dropped. A pipeline left with no steps starts no run.
-        let selected = scarab_pipeline::select_steps(&ir, &ctx)
+        // Step-level `when:` guards against the event context (ADR-0009, 0033):
+        // guarded-off steps are kept in the DAG but marked Skipped, so the engine
+        // transitively skips their descendants. A pipeline whose every step is
+        // excluded starts no run.
+        let excluded = scarab_pipeline::excluded_steps(&ir, &ctx)
             .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
-        if selected.steps.is_empty() {
+        if excluded.len() == ir.steps.len() {
             continue;
         }
 
         let now = clock.now().await;
         let run = RunId(Uuid::new_v4().to_string());
-        persist_run_from_ir(db, &run, &selected, event, path, now).await?;
+        persist_run_from_ir(db, &run, &ir, event, path, &excluded, now).await?;
         runs.push(run);
     }
     Ok(runs)
@@ -604,6 +605,7 @@ async fn persist_run_from_ir(
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,
     pipeline: &str,
+    excluded: &[String],
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     db.create_run(run, ir.ir_version, EVENT_VERSION, now).await?;
@@ -665,6 +667,24 @@ async fn persist_run_from_ir(
         if let Some(inputs) = &step.inputs {
             let inputs: Vec<StepId> = inputs.iter().map(|i| StepId(i.clone())).collect();
             db.set_step_inputs(run, &step_id, &inputs).await?;
+        }
+
+        // A `when:`-excluded step is kept in the DAG (edges intact) but starts
+        // Skipped, so the scheduler transitively skips its descendants (ADR-0033).
+        if excluded.iter().any(|e| e == &step.id) {
+            db.record_step_transition(run, &step_id, StepStatus::Pending, StepStatus::Skipped)
+                .await?;
+            db.append_event(&EventKind {
+                version: EVENT_VERSION,
+                run: run.clone(),
+                kind: EventPayload::StepTransitioned {
+                    step: step_id.clone(),
+                    from: StepStatus::Pending,
+                    to: StepStatus::Skipped,
+                },
+                at: now,
+            })
+            .await?;
         }
     }
     Ok(())

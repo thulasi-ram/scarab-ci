@@ -578,11 +578,16 @@ impl<'a> Scheduler<'a> {
         if steps.is_empty() || !steps.iter().all(|s| s.status.is_terminal()) {
             return Ok(());
         }
-        let all_ok = steps.iter().all(|s| s.status == StepStatus::Succeeded);
-        let outcome = if all_ok {
-            RunStatus::Succeeded
-        } else {
+        // A run fails only if a step actually failed or was cancelled; a Skipped
+        // step (a `when:`-guarded-off step or a transitively-skipped descendant,
+        // ADR-0033) is not a failure — the run still succeeds.
+        let failed = steps
+            .iter()
+            .any(|s| matches!(s.status, StepStatus::Failed | StepStatus::Cancelled));
+        let outcome = if failed {
             RunStatus::Failed
+        } else {
+            RunStatus::Succeeded
         };
         if let Some(current) = self.db.run_status(run).await? {
             if !current.is_terminal() {

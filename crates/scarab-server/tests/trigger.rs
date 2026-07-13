@@ -160,11 +160,12 @@ async fn deploy_pipeline_opts_out_of_supersede() {
     );
 }
 
-/// Step-level `when:` guards are applied at run creation (ADR-0009): a deploy
-/// step guarded on `main` is included on a push to main and pruned on a feature
-/// branch (its dependents' edges onto it dropped).
+/// Step-level `when:` guards are applied at run creation (ADR-0009, 0033): a
+/// guarded-off step is kept in the DAG but marked Skipped (not removed), so the
+/// full graph — and thus transitive skip — is preserved.
 #[tokio::test]
 async fn step_when_guards_are_applied_when_the_run_is_created() {
+    use scarab_engine::StepStatus;
     const CI: &str = r#"
 on:
   push: {}
@@ -176,35 +177,78 @@ steps:
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    // Push to main: the guarded deploy step is included.
+    // Push to main: the guarded deploy step is included and Pending.
     let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("main"))
         .await
         .expect("trigger")
         .pop()
         .unwrap();
-    let ids: Vec<String> = db
-        .steps_of_run(&run)
-        .await
-        .unwrap()
-        .iter()
-        .map(|s| s.step.0.clone())
-        .collect();
-    assert!(ids.contains(&"deploy".to_string()), "deploy included on main: {ids:?}");
+    let deploy = db.steps_of_run(&run).await.unwrap().into_iter().find(|s| s.step.0 == "deploy");
+    assert_eq!(deploy.map(|s| s.status), Some(StepStatus::Pending), "deploy runs on main");
 
-    // Push to a feature branch: the guard fails, so deploy is pruned.
+    // Push to a feature branch: the guard fails, so deploy is present but Skipped.
     let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("feature"))
         .await
         .expect("trigger")
         .pop()
         .unwrap();
-    let ids: Vec<String> = db
-        .steps_of_run(&run)
+    let deploy = db.steps_of_run(&run).await.unwrap().into_iter().find(|s| s.step.0 == "deploy");
+    assert_eq!(deploy.map(|s| s.status), Some(StepStatus::Skipped), "deploy skipped off main");
+}
+
+/// Transitive skip (ADR-0033): a `when:`-guarded-off step and every descendant
+/// that (only) depended on it are skipped, and the run still succeeds.
+#[tokio::test]
+async fn when_false_step_transitively_skips_descendants_and_run_succeeds() {
+    use scarab_engine::{Clock, Scheduler, StepStatus};
+    use scarab_testkit::FakeExecutor;
+    const CI: &str = r#"
+on:
+  push: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+  - { id: deploy, image: busybox, command: ["true"], needs: [build], when: "event.branch == 'main'" }
+  - { id: notify, image: busybox, command: ["true"], needs: [deploy] }
+"#;
+    let forge = FakeForge::new().with_file(".scarab/ci.yaml", CI);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), &push("feature"))
         .await
-        .unwrap()
-        .iter()
-        .map(|s| s.step.0.clone())
-        .collect();
-    assert_eq!(ids, vec!["build".to_string()], "deploy pruned off main: {ids:?}");
+        .expect("trigger")
+        .pop()
+        .unwrap();
+
+    // Drive to terminal.
+    let exec = FakeExecutor::new();
+    for _ in 0..10 {
+        exec.script_outcome(scarab_engine::ports::ExecState::Succeeded);
+    }
+    let sched = Scheduler::new(db.as_ref(), clock.as_ref() as &dyn Clock, &exec, "sched");
+    for _ in 0..10 {
+        sched.tick(&run).await.unwrap();
+        if db.run_status(&run).await.unwrap().unwrap().is_terminal() {
+            break;
+        }
+    }
+
+    assert_eq!(db_steps_status(&db, &run, "build").await, StepStatus::Succeeded, "build ran");
+    assert_eq!(db_steps_status(&db, &run, "deploy").await, StepStatus::Skipped, "deploy guarded off");
+    assert_eq!(
+        db_steps_status(&db, &run, "notify").await,
+        StepStatus::Skipped,
+        "notify transitively skipped"
+    );
+    assert_eq!(
+        db.run_status(&run).await.unwrap().unwrap(),
+        scarab_engine::RunStatus::Succeeded,
+        "a run with only skips (no failures) succeeds"
+    );
+}
+
+async fn db_steps_status(db: &InMemoryDb, run: &scarab_engine::RunId, id: &str) -> scarab_engine::StepStatus {
+    db.steps_of_run(run).await.unwrap().into_iter().find(|s| s.step.0 == id).unwrap().status
 }
 
 #[tokio::test]
