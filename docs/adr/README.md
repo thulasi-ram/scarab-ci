@@ -57,6 +57,9 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0038](0038-invoke-and-local-reuse.md) | `invoke` = compile-time inlining; local `.scarab/lib`, third-party via OCI images (amends 0025) | Accepted |
 | [0039](0039-privileged-images.md) | Privileged step images: hardened baseline + governed capability grants per Environment | Accepted |
 
+> For *features* deliberately deferred until demand appears (as opposed to ADRs
+> to be written), see [`docs/followups.md`](../followups.md).
+
 ## Open / deferred (to be written when their slice begins)
 
 Workspace CAS internals (chunking) · multi-cluster remote-agent protocol · install Operator ·
