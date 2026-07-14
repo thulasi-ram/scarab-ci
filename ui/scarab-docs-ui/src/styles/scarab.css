@@ -39,49 +39,6 @@
   --ring: var(--scarab-emerald);
 }
 
-/* ---- Signature: the primary CTA IS a "fence" ----
- * Not a solid shadcn button with a decoration — the copper brackets ARE the
- * control. Transparent fill, ink label, four copper corner ticks framing it
- * like a fenced region (the product's fence-scoped durability). The !important
- * flags override Lucode's scoped solid-fill primary styling. */
-.link-button.primary,
-.sl-link-button.primary {
-  position: relative;
-  overflow: visible;
-  background: transparent !important;
-  color: var(--foreground) !important;
-  border: none !important;
-  border-radius: 0;
-  padding: 0.66rem 1.35rem !important;
-  font-weight: 600;
-  transition: background 0.15s ease;
-}
-.link-button.primary:hover,
-.sl-link-button.primary:hover {
-  background: color-mix(in oklab, var(--scarab-copper) 10%, transparent) !important;
-}
-/* A full copper frame masked down to just its four corners → corner brackets. */
-.link-button.primary::before,
-.sl-link-button.primary::before {
-  content: '';
-  position: absolute;
-  inset: -3px;
-  border: 1.5px solid var(--scarab-copper);
-  border-radius: 0; /* sharp corner brackets */
-  pointer-events: none;
-  --bracket: 14px;
-  -webkit-mask:
-    linear-gradient(#000 0 0) 0 0 / var(--bracket) var(--bracket) no-repeat,
-    linear-gradient(#000 0 0) 100% 0 / var(--bracket) var(--bracket) no-repeat,
-    linear-gradient(#000 0 0) 0 100% / var(--bracket) var(--bracket) no-repeat,
-    linear-gradient(#000 0 0) 100% 100% / var(--bracket) var(--bracket) no-repeat;
-  mask:
-    linear-gradient(#000 0 0) 0 0 / var(--bracket) var(--bracket) no-repeat,
-    linear-gradient(#000 0 0) 100% 0 / var(--bracket) var(--bracket) no-repeat,
-    linear-gradient(#000 0 0) 0 100% / var(--bracket) var(--bracket) no-repeat,
-    linear-gradient(#000 0 0) 100% 100% / var(--bracket) var(--bracket) no-repeat;
-}
-
 /* ---- Splash: line the body up with the (already constrained) hero ----
  * Starlight leaves splash markdown full-bleed; our hero is capped at ~1024px,
  * so the cards/status below it ran edge-to-edge. Match them. */

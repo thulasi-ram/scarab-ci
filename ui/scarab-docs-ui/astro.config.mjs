@@ -35,10 +35,12 @@ export default defineConfig({
         // typography, a subtle active-nav rail (no solid fill). Scarab identity
         // (emerald links, copper fence-bracket edge) is layered in scarab.css.
         lucode({
+          // Links are relative to the site root; Starlight prepends `base`
+          // (/scarab-ci/) itself — including it here would double it.
           navLinks: [
-            { label: 'Get Started', link: '/scarab-ci/get-started/run-locally/' },
-            { label: 'Guides', link: '/scarab-ci/guides/authoring/' },
-            { label: 'Tech', link: '/scarab-ci/tech/context/' },
+            { label: 'Get Started', link: '/get-started/run-locally/' },
+            { label: 'Guides', link: '/guides/authoring/' },
+            { label: 'Tech', link: '/tech/context/' },
           ],
           footerText:
             'Scarab — durable-execution, Kubernetes-native CI. Themed with [Lucode Starlight](https://github.com/lucas-labs/lucode-starlight-theme).',

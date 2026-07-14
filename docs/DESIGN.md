@@ -332,9 +332,9 @@ green). Green is used **sparingly, especially in light.**
 - **Emerald** — prose links (underlined), the TOC current item, the active-page
   nav rail, and the focus ring. That's it. No emerald fills, no emerald blocks
   (the old solid-emerald active-nav block is gone).
-- **Copper** — the **"fence brackets"**: copper corner ticks framing the hero's
-  primary CTA, a nod to the product's *fence-scoped durability*. Also the `tip`
-  aside's edge. One signature, one or two places.
+- **Copper** — the `tip` aside's edge and the faint background doodles (§5).
+  Kept rare; the primary CTA uses Lucode's default solid button (a bracket-framed
+  CTA was tried and dropped — it read as a gimmick next to shadcn's clean button).
 - Asides: `note` → emerald edge, `tip` → copper edge; `caution`/`danger` keep
   semantic **orange/red** — a warning must read as a warning.
 
@@ -355,7 +355,7 @@ an invention. No third display face. JetBrains Mono stays for machine tokens.
 ### Docs iteration checklist
 1. Light default; dark stays neutral. Never make the docs lead with green.
 2. Emerald only on links / TOC-current / active-rail / focus. Copper only on the
-   CTA brackets + `tip`. No fills.
+   `tip` aside + doodles. No fills; use Lucode's default buttons.
 3. Geist + JetBrains Mono. Don't reintroduce Inter or a display face here.
 4. Override brand tokens **unlayered**, or `@layer lucode` will beat you.
-5. Keep it a reading surface: quiet, high-contrast, one signature (the brackets).
+5. Keep it a reading surface: quiet, high-contrast, no gimmicks.
