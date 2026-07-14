@@ -96,7 +96,7 @@ pub fn interpolate(template: &str, ctx: &serde_json::Value) -> Result<String, Pi
 
 /// Extract the (trimmed) expressions inside each `${{ … }}` in `template`,
 /// erroring if any is unterminated.
-fn interpolations(template: &str) -> Result<Vec<&str>, PipelineError> {
+pub(crate) fn interpolations(template: &str) -> Result<Vec<&str>, PipelineError> {
     let mut exprs = Vec::new();
     let mut rest = template;
     while let Some(start) = rest.find("${{") {

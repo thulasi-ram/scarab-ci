@@ -59,7 +59,32 @@ pub struct PipelineIr {
     /// cancelled). Absent for ordinary CI pipelines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// The reuse **interface** of a Library pipeline (ADR-0038): the parameter
+    /// names it requires and the output names it exposes to an `invoke:` caller.
+    /// Only meaningful when this pipeline is invoked (it is authoring metadata for
+    /// a `.scarab/lib/**` module); irrelevant on a top-level triggered pipeline.
+    /// Distinct from the per-step workspace `inputs:`/`outputs:` (ADR-0007, 0035).
+    #[serde(default, skip_serializing_if = "Interface::is_empty")]
+    pub interface: Interface,
     pub steps: Vec<StepSpec>,
+}
+
+/// A Library pipeline's reuse interface (ADR-0038) — its explicit contract with
+/// an `invoke:` caller. `inputs` are the required parameter names the caller must
+/// supply via `with:` (all are required in v1 — no defaults); `outputs` are the
+/// names the library exposes, each of which must be one of its step ids.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interface {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<String>,
+}
+
+impl Interface {
+    pub fn is_empty(&self) -> bool {
+        self.inputs.is_empty() && self.outputs.is_empty()
+    }
 }
 
 /// A pipeline's `concurrency:` block (ADR-0011, 0032). The `group` is a (possibly
@@ -137,6 +162,14 @@ pub struct StepSpec {
     /// cross-repo. After compile this field is always `None` (like `matrix`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invoke: Option<String>,
+    /// Inputs supplied to an invoked library (ADR-0038), `name → value`. Only
+    /// meaningful on an [`invoke`](StepSpec::invoke) step. Validated at compile
+    /// against the library's [`Interface::inputs`] (every required input present,
+    /// no unknown extras), then injected into every inlined step as a
+    /// `SCARAB_PARAM_<NAME>` env var (ADR-0008's param convention). Consumed by
+    /// inlining — no compiled step retains it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub with: BTreeMap<String, String>,
     /// For a `timer` gate, how long (seconds) to wait before the run
     /// auto-releases and resumes (ADR-0008). Required for `timer`; forbidden on
     /// any other kind.
@@ -379,6 +412,7 @@ pub fn compile_yaml_with_libs(
         triggers: authored.triggers,
         concurrency: authored.concurrency,
         environment: authored.environment,
+        interface: authored.interface,
         steps: expanded,
     };
 
@@ -498,6 +532,13 @@ fn inline_level(
 
     for step in steps {
         let Some(raw_path) = &step.invoke else {
+            // `with:` supplies inputs to a library — meaningless off an invoke step.
+            if !step.with.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: `with:` supplies inputs to an invoked library and is only valid on an `invoke` step",
+                    step.id
+                ));
+            }
             out.push(step.clone());
             continue;
         };
@@ -567,6 +608,10 @@ fn inline_level(
             continue;
         }
 
+        // Interface (ADR-0038): validate the caller's `with:` inputs and the
+        // library's declared/exposed outputs at compile — explicit over ambient.
+        validate_interface(step, &key, &lib, steps, diagnostics);
+
         // Recurse: resolve the library's own invokes first, so `resolved` is a
         // flat list in the library's namespace (ids may already contain `/`).
         // Coordinate-independent, so it runs once even under a matrix.
@@ -624,6 +669,19 @@ fn inline_level(
                 for (k, v) in &inv.matrix_values {
                     inst.matrix_values.entry(k.clone()).or_insert_with(|| v.clone());
                 }
+                // Inject the caller's inputs as `SCARAB_PARAM_<NAME>` env
+                // (ADR-0008 param convention). Prepended so a library step's own
+                // explicit env of the same name still wins (applied later).
+                let params: Vec<(String, String)> = step
+                    .with
+                    .iter()
+                    .map(|(k, v)| (format!("SCARAB_PARAM_{}", k.to_uppercase()), v.clone()))
+                    .collect();
+                if !params.is_empty() {
+                    let mut env = params;
+                    env.append(&mut inst.env);
+                    inst.env = env;
+                }
                 out.push(inst);
             }
         }
@@ -674,6 +732,136 @@ fn rewrite_through_seam(refs: &[String], seam: &BTreeMap<String, Vec<String>>) -
         }
     }
     out
+}
+
+/// Validate an invoke step against its library's reuse [`Interface`] (ADR-0038):
+/// every required input present, no unknown extras, every exposed output naming a
+/// real library step, and no sibling referencing an output the library does not
+/// expose. Reports every problem it finds (does not short-circuit).
+fn validate_interface(
+    step: &StepSpec,
+    key: &str,
+    lib: &PipelineIr,
+    siblings: &[StepSpec],
+    diagnostics: &mut Vec<String>,
+) {
+    let iface = &lib.interface;
+
+    // Declared inputs become `SCARAB_PARAM_<NAME>` env, so they must be env-safe.
+    for name in &iface.inputs {
+        if !is_identifier(name) {
+            diagnostics.push(format!(
+                "step `{}`: library `{key}` declares input `{name}`, which is not a valid identifier",
+                step.id
+            ));
+        }
+    }
+    // Every required input must be supplied; no unknown extras.
+    for name in &iface.inputs {
+        if !step.with.contains_key(name) {
+            diagnostics.push(format!(
+                "step `{}`: missing required input `{name}` for library `{key}`",
+                step.id
+            ));
+        }
+    }
+    for k in step.with.keys() {
+        if !iface.inputs.contains(k) {
+            diagnostics.push(format!(
+                "step `{}`: unknown input `{k}` (library `{key}` declares inputs: [{}])",
+                step.id,
+                iface.inputs.join(", ")
+            ));
+        }
+    }
+    // Each exposed output must name a real library step.
+    let lib_ids: BTreeSet<&str> = lib.steps.iter().map(|s| s.id.as_str()).collect();
+    for name in &iface.outputs {
+        if !lib_ids.contains(name.as_str()) {
+            diagnostics.push(format!(
+                "step `{}`: library `{key}` exposes output `{name}` but has no step `{name}`",
+                step.id
+            ));
+        }
+    }
+    // A sibling referencing `<invoke-id>.<output>` for an output the library does
+    // not expose is a compile error (validation only; runtime binding is a
+    // follow-up).
+    let exposed: BTreeSet<&str> = iface.outputs.iter().map(String::as_str).collect();
+    for t in siblings {
+        if t.id == step.id {
+            continue;
+        }
+        for text in interpolatable_strings(t) {
+            for expr in cel::interpolations(text).unwrap_or_default() {
+                for field in field_accesses(expr, &step.id) {
+                    if !exposed.contains(field.as_str()) {
+                        diagnostics.push(format!(
+                            "step `{}`: references undeclared output `{}.{field}` (library `{key}` exposes: [{}])",
+                            t.id,
+                            step.id,
+                            iface.outputs.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The step strings that may carry `${{ … }}` interpolations (image, command,
+/// env values) — the surfaces scanned for invoke-output references.
+fn interpolatable_strings(step: &StepSpec) -> Vec<&str> {
+    let mut out: Vec<&str> = vec![step.image.as_str()];
+    out.extend(step.command.iter().map(String::as_str));
+    out.extend(step.env.iter().map(|(_, v)| v.as_str()));
+    out
+}
+
+/// The field names accessed on `base` in a CEL expression (`base.<field>`), where
+/// `base` stands alone (not itself the tail of a longer `x.base` access). Used to
+/// find `<invoke-id>.<output>` references.
+fn field_accesses(expr: &str, base: &str) -> Vec<String> {
+    let bytes = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = expr[i..].find(base) {
+        let start = i + rel;
+        let end = start + base.len();
+        // A standalone `base`: the char before is neither an identifier char nor
+        // a `.` (which would make it `x.base`, a field of something else).
+        let before_ok = start == 0 || {
+            let prev = bytes[start - 1];
+            !is_ident_byte(prev) && prev != b'.'
+        };
+        if before_ok && end < bytes.len() && bytes[end] == b'.' {
+            let fstart = end + 1;
+            let mut fend = fstart;
+            while fend < bytes.len() && is_ident_byte(bytes[fend]) {
+                fend += 1;
+            }
+            if fend > fstart {
+                out.push(expr[fstart..fend].to_string());
+            }
+        }
+        i = end.max(start + 1);
+    }
+    out
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Is `s` a valid identifier (`[A-Za-z_][A-Za-z0-9_]*`)? Used to keep declared
+/// input names env-var-safe.
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Expand one authored step into its concrete instances.
@@ -1915,6 +2103,135 @@ mod tests {
             invoke_refs(yaml),
             vec![".scarab/lib/one.yaml".to_string(), ".scarab/lib/two.yaml".to_string()]
         );
+    }
+
+    // --- invoke interface (ADR-0038 slice 3) ----------------------------------
+
+    /// A library declaring required inputs and an exposed output.
+    const IFACE_LIB: &str = r#"
+        interface:
+          inputs:  [region, replicas]
+          outputs: [url]
+        steps:
+          - { id: plan, image: tf, command: ["plan"] }
+          - { id: url, image: tf, command: ["apply"], needs: [plan] }
+    "#;
+
+    #[test]
+    fn a_satisfied_interface_compiles_and_injects_params() {
+        let ir = compile_with(
+            r#"
+            steps:
+              - id: deploy
+                invoke: .scarab/lib/deploy.yaml
+                with: { region: us-east-1, replicas: "3" }
+              - { id: notify, image: busybox, command: ["echo", "${{ deploy.url }}"], needs: [deploy] }
+            "#,
+            &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
+        );
+        // Inputs reach every inlined step as SCARAB_PARAM_* env (ADR-0008).
+        let plan = ir.steps.iter().find(|s| s.id == "deploy/plan").unwrap();
+        assert!(plan.env.contains(&("SCARAB_PARAM_REGION".to_string(), "us-east-1".to_string())));
+        assert!(plan.env.contains(&("SCARAB_PARAM_REPLICAS".to_string(), "3".to_string())));
+        // The invoke step is gone; the exposed-output reference compiled fine.
+        assert!(ir.steps.iter().all(|s| !s.is_invoke()));
+        assert!(ir.steps.iter().any(|s| s.id == "deploy/url"));
+    }
+
+    #[test]
+    fn a_missing_required_input_is_rejected() {
+        let errs = errors_with(
+            r#"
+            steps:
+              - id: deploy
+                invoke: .scarab/lib/deploy.yaml
+                with: { region: us-east-1 }
+            "#,
+            &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("missing required input `replicas`")),
+            "got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_extra_input_is_rejected() {
+        let errs = errors_with(
+            r#"
+            steps:
+              - id: deploy
+                invoke: .scarab/lib/deploy.yaml
+                with: { region: us-east-1, replicas: "3", bogus: x }
+            "#,
+            &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
+        );
+        assert!(errs.iter().any(|e| e.contains("unknown input `bogus`")), "got {errs:?}");
+    }
+
+    #[test]
+    fn a_reference_to_an_undeclared_output_is_a_compile_error() {
+        let errs = errors_with(
+            r#"
+            steps:
+              - id: deploy
+                invoke: .scarab/lib/deploy.yaml
+                with: { region: us-east-1, replicas: "3" }
+              - { id: notify, image: busybox, command: ["echo", "${{ deploy.secret_ip }}"], needs: [deploy] }
+            "#,
+            &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("references undeclared output `deploy.secret_ip`")),
+            "got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn an_exposed_output_that_is_not_a_step_is_rejected() {
+        let bad_lib = r#"
+            interface:
+              outputs: [ghost]
+            steps:
+              - { id: run, image: busybox }
+        "#;
+        let errs = errors_with(
+            "steps: [{ id: s, invoke: .scarab/lib/bad.yaml }]",
+            &libs(&[(".scarab/lib/bad.yaml", bad_lib)]),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("exposes output `ghost` but has no step `ghost`")),
+            "got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn with_on_a_non_invoke_step_is_rejected() {
+        let errs = errors_with(
+            r#"steps: [{ id: a, image: busybox, with: { x: y } }]"#,
+            &BTreeMap::new(),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("only valid on an `invoke` step")),
+            "got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn interface_round_trips_on_a_library_pipeline() {
+        // A library authored with an interface parses and the interface survives
+        // serialization when the pipeline is compiled on its own (as a top-level).
+        let ir = compile(
+            r#"
+            interface: { inputs: [region], outputs: [url] }
+            steps: [{ id: url, image: busybox }]
+            "#,
+        );
+        assert_eq!(ir.interface.inputs, vec!["region".to_string()]);
+        assert_eq!(ir.interface.outputs, vec!["url".to_string()]);
+        let back: PipelineIr =
+            serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+        assert_eq!(ir, back);
     }
 
     #[test]
