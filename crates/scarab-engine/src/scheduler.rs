@@ -576,7 +576,7 @@ impl<'a> Scheduler<'a> {
                 .await?
                 .ok_or_else(|| SchedulerError::MissingSpec(step.clone()))?;
 
-            // Launch-time interpolation (ADR-0040): resolve `${{ outputs.… }}`
+            // Launch-time interpolation (ADR-0041): resolve `${{ outputs.… }}`
             // against this step's upstream results before launch. The upstreams
             // are all `Succeeded` before the step is ready, so their results
             // exist; a reference to a missing result fails fast — as a *step*
@@ -622,7 +622,7 @@ impl<'a> Scheduler<'a> {
                     if let Some(output) = self.executor.output(&handle).await? {
                         self.db.set_step_output(&run, &step, &output).await?;
                     }
-                    // Capture the step's named results (ADR-0040) under the fence,
+                    // Capture the step's named results (ADR-0041) under the fence,
                     // so a dependent can read them via `${{ outputs.<step>.… }}`.
                     let results = self.executor.results(&handle).await?;
                     if !results.is_empty() {
@@ -654,7 +654,7 @@ impl<'a> Scheduler<'a> {
     }
 
     /// Resolve `${{ … }}` interpolations in a step's launch spec against its
-    /// upstream results (ADR-0040), returning the launchable spec — or the
+    /// upstream results (ADR-0041), returning the launchable spec — or the
     /// interpolation error string (`Ok(Err(_))`) when a reference is bad, which
     /// the caller turns into a *step* failure (fail-fast, not a scheduler error).
     /// A `DbError` (infra) propagates as `Err(_)` so it retries.
@@ -674,7 +674,7 @@ impl<'a> Scheduler<'a> {
 
         // Build the `outputs` context from this step's upstream results, keyed by
         // step id. Only `needs` are gathered — the compile-time check guarantees
-        // a reference names a step the caller `needs` (ADR-0040 §4).
+        // a reference names a step the caller `needs` (ADR-0041 §4).
         let needs = self
             .db
             .steps_of_run(run)

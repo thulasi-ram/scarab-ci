@@ -530,7 +530,7 @@ fn inline_level(
     // invoke-step id -> the namespaced leaf ids that a `needs: [that id]` maps to.
     let mut seam: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Non-matrixed invoke id -> its exposed output names, for the output-reference
-    // rewrite (ADR-0040): `outputs.<id>.<name>` -> `outputs["<id>/<name>"].<name>`.
+    // rewrite (ADR-0041): `outputs.<id>.<name>` -> `outputs["<id>/<name>"].<name>`.
     let mut output_aliases: Vec<(String, Vec<String>)> = Vec::new();
 
     for step in steps {
@@ -614,7 +614,7 @@ fn inline_level(
         // Interface (ADR-0038): validate the caller's `with:` inputs and the
         // library's declared/exposed outputs at compile — explicit over ambient.
         validate_interface(step, &key, &lib, steps, diagnostics);
-        // Record exposed outputs for the reference rewrite (ADR-0040). A matrixed
+        // Record exposed outputs for the reference rewrite (ADR-0041). A matrixed
         // invoke's outputs are unaddressable (validate_interface errors on any
         // reference), so it contributes no alias.
         if step.matrix.is_none() && !lib.interface.outputs.is_empty() {
@@ -705,7 +705,7 @@ fn inline_level(
         }
     }
 
-    // Output-reference rewrite (ADR-0040): resolve `outputs.<invoke-id>.<name>`
+    // Output-reference rewrite (ADR-0041): resolve `outputs.<invoke-id>.<name>`
     // to the concrete inlined backing step so the launch context stays generic
     // (just `outputs[<step-id>] = <that step's results>`). The backing step of a
     // non-matrixed invoke's exposed output `<name>` is `<invoke-id>/<name>`.
@@ -726,7 +726,7 @@ fn inline_level(
 
 /// Rewrite `outputs.<invoke_id>.<name>` references (for each exposed `<name>`) to
 /// `outputs["<invoke_id>/<name>"].<name>` — pointing at the concrete inlined
-/// backing step (ADR-0040). Boundary-guarded so `url` does not match `urls`.
+/// backing step (ADR-0041). Boundary-guarded so `url` does not match `urls`.
 fn rewrite_output_refs(text: &str, invoke_id: &str, exposed: &[String]) -> String {
     let mut result = text.to_string();
     for name in exposed {
@@ -845,7 +845,7 @@ fn validate_interface(
             ));
         }
     }
-    // Output references (ADR-0040): a sibling reads an exposed output as
+    // Output references (ADR-0041): a sibling reads an exposed output as
     // `${{ outputs.<invoke-id>.<name> }}`. Validate each reference — undeclared
     // output, referencing without `needs`, or referencing a matrixed invoke
     // (ambiguous per-coordinate) — at compile.
@@ -861,7 +861,7 @@ fn validate_interface(
                 for field in field_accesses(expr, &outputs_base) {
                     if matrixed {
                         diagnostics.push(format!(
-                            "step `{}`: references output `outputs.{}.{field}` of a matrixed invoke — per-coordinate output references are not supported (ADR-0040)",
+                            "step `{}`: references output `outputs.{}.{field}` of a matrixed invoke — per-coordinate output references are not supported (ADR-0041)",
                             t.id, step.id
                         ));
                     } else if !exposed.contains(field.as_str()) {
@@ -873,7 +873,7 @@ fn validate_interface(
                         ));
                     } else if !t.needs.0.contains(&step.id) {
                         // The value is only guaranteed to exist at launch if `t`
-                        // depends on the invoke (ADR-0040 §4).
+                        // depends on the invoke (ADR-0041 §4).
                         diagnostics.push(format!(
                             "step `{}`: reads `outputs.{}.{field}` but does not `needs: [{}]`",
                             t.id, step.id, step.id
@@ -1305,13 +1305,13 @@ pub fn excluded_steps(
 }
 
 /// Resolve `${{ … }}` interpolations in a step's launchable surfaces — `image`,
-/// `command`, and `env` values — against `ctx` (ADR-0040). Pure: the engine
+/// `command`, and `env` values — against `ctx` (ADR-0041). Pure: the engine
 /// builds `ctx` at launch from the step's upstream results (`outputs`) and its
 /// own matrix coordinate (`matrix`), then launches the returned spec.
 ///
 /// **Fail-fast:** a bad reference — an unbound name, a type error in a guard —
 /// is a hard error that fails the step; it never renders empty or degrades
-/// silently (ADR-0040 §5). A surface with no `${{ … }}` is returned verbatim.
+/// silently (ADR-0041 §5). A surface with no `${{ … }}` is returned verbatim.
 pub fn interpolate_spec(
     spec: &StepSpec,
     ctx: &serde_json::Value,
@@ -2239,7 +2239,7 @@ mod tests {
         // The invoke step is gone; the exposed-output reference compiled fine.
         assert!(ir.steps.iter().all(|s| !s.is_invoke()));
         assert!(ir.steps.iter().any(|s| s.id == "deploy/url"));
-        // The output reference is rewritten to the concrete backing step (ADR-0040),
+        // The output reference is rewritten to the concrete backing step (ADR-0041),
         // so the launch context stays generic (keyed by step id).
         let notify = ir.steps.iter().find(|s| s.id == "notify").unwrap();
         assert_eq!(notify.command[1], "${{ outputs[\"deploy/url\"].url }}");

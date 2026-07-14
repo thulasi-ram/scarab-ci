@@ -99,7 +99,7 @@ pub trait Db: Send + Sync {
     /// produced one (or the step is unknown).
     async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
 
-    /// Record a step's **named results** (ADR-0040) — the typed `name → value`
+    /// Record a step's **named results** (ADR-0041) — the typed `name → value`
     /// map it emitted via the results channel (ADR-0008), captured on successful
     /// completion under the fence. Distinct from the workspace snapshot: these
     /// are small consumable values a dependent reads through
@@ -355,7 +355,7 @@ pub trait Executor: Send + Sync {
 
     /// The **named results** the (successfully finished) unit emitted via the
     /// results channel (ADR-0008: its `/scarab/results/*.json`), read back
-    /// **before teardown** and returned as a typed `name → value` map (ADR-0040).
+    /// **before teardown** and returned as a typed `name → value` map (ADR-0041).
     /// The orchestrator persists them so a dependent can read them through
     /// `${{ outputs.<step>.<name> }}`. Default empty so a backend that captures
     /// none need not implement it.

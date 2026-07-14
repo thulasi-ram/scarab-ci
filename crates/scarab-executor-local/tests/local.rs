@@ -90,7 +90,7 @@ async fn cancel_kills_a_running_child() {
     assert!(matches!(exec.poll(&handle).await.unwrap(), ExecState::Failed { .. }));
 }
 
-/// ADR-0040: a step writes `$SCARAB_RESULTS/<name>.json`, and the executor reads
+/// ADR-0041: a step writes `$SCARAB_RESULTS/<name>.json`, and the executor reads
 /// it back as a typed named result after the step completes.
 #[tokio::test]
 async fn named_results_are_read_back_from_the_results_dir() {

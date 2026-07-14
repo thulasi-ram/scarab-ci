@@ -79,7 +79,7 @@ struct StepRec {
     attempts: Vec<Attempt>,
     /// Output workspace snapshot (CAS root hash) this step produced.
     output: Option<String>,
-    /// Named results (ADR-0040) this step emitted, captured on success.
+    /// Named results (ADR-0041) this step emitted, captured on success.
     results: std::collections::BTreeMap<String, serde_json::Value>,
     /// Input signature consumed on the last run (restart skip-if-unchanged).
     input: Option<String>,
@@ -789,10 +789,10 @@ struct FakeExecState {
     /// across a step's re-runs models an unchanged output (restart skips its
     /// dependents); changing it models a changed output (dependents cascade).
     outputs: HashMap<String, String>,
-    /// Named results (ADR-0040) each *step* emits on success, keyed by step id.
+    /// Named results (ADR-0041) each *step* emits on success, keyed by step id.
     results: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
     /// The most recent spec each handle was launched with — lets a test assert
-    /// launch-time interpolation (ADR-0040) rewrote `${{ … }}` before launch.
+    /// launch-time interpolation (ADR-0041) rewrote `${{ … }}` before launch.
     launched_specs: HashMap<String, StepSpec>,
 }
 
@@ -831,7 +831,7 @@ impl FakeExecutor {
             .insert(step.to_string(), snapshot.to_string());
     }
 
-    /// Set the named results `step` (by id) emits on success (ADR-0040).
+    /// Set the named results `step` (by id) emits on success (ADR-0041).
     pub fn set_results(
         &self,
         step: &str,
@@ -854,7 +854,7 @@ impl FakeExecutor {
     }
 
     /// The spec `handle` was most recently launched with (after launch-time
-    /// interpolation, ADR-0040), or `None` if it was never launched.
+    /// interpolation, ADR-0041), or `None` if it was never launched.
     pub fn launched_spec(&self, handle: &ExecHandle) -> Option<StepSpec> {
         self.inner.lock().unwrap().launched_specs.get(&handle.0).cloned()
     }
@@ -1257,7 +1257,7 @@ mod tests {
     use super::*;
     use scarab_engine::{Db, RunId, StepId, Timestamp};
 
-    /// The InMemoryDb round-trips a step's typed named results (ADR-0040): absent
+    /// The InMemoryDb round-trips a step's typed named results (ADR-0041): absent
     /// is the empty map, and a set map reads back with types preserved.
     #[tokio::test]
     async fn in_memory_db_round_trips_named_results() {

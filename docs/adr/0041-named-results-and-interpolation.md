@@ -1,4 +1,4 @@
-# 0040. Named step results + launch-time interpolation (`${{ outputs.<id>.<name> }}`)
+# 0041. Named step results + launch-time interpolation (`${{ outputs.<id>.<name> }}`)
 
 - **Status:** Accepted
 - **Date:** 2026-07-14
@@ -162,6 +162,11 @@ continue with a wrong or empty value.
   the pure `interpolate_spec`, the `outputs.<id>.<name>` CEL binding, and the
   compile-time "reference only what you `needs`" check + exposed-name→inlined-step
   record in the IR (self-describing, [0022](0022-upgrades-and-versioning.md)).
+- **Backend capture split:** the local backend reads results files directly; the
+  **k8s** backend cannot (an ephemeral, untrusted Pod with a lossy log surface),
+  so its `Executor::results` capture is specified separately in
+  [0042](0042-trusted-egress-sidecar.md) (a trusted per-Pod egress sidecar → a
+  fence-scoped results API → Postgres).
 - **Matrixed-invoke output references are deferred.** `outputs.<invoke-id>.<name>`
   is ambiguous when the invoke fans out over a matrix ([0038](0038-invoke-and-local-reuse.md)
   slice 4) — which copy? A reference to an output of a matrixed invoke is a

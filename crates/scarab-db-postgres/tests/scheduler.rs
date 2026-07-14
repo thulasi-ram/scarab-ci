@@ -123,7 +123,7 @@ async fn scheduler_restart_redrives_without_duplication() {
     tdb.cleanup().await;
 }
 
-/// ADR-0040 value chain (end-to-end): a producer step emits a named result, the
+/// ADR-0041 value chain (end-to-end): a producer step emits a named result, the
 /// scheduler captures it on success, and a downstream consumer's
 /// `${{ outputs.producer.url }}` is interpolated *at launch* from that captured
 /// result — the reference goes live, not literal.

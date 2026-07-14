@@ -113,12 +113,13 @@ impl Executor for K8sExecutor {
         }
     }
 
-    // `results` (ADR-0040) uses the port default (empty) for now. A
+    // `results` (ADR-0041) uses the port default (empty) for now. A
     // `restartPolicy: Never` Pod is torn down after completion, so its
-    // `/scarab/results/*.json` cannot be scraped post-hoc; capturing them needs
-    // the emit channel to stream results out before teardown (the injected
-    // `scarab` CLI → log/result sidecar, ADR-0008). Tracked as a follow-up — the
-    // local backend already captures results end-to-end.
+    // `/scarab/results/*.json` cannot be scraped post-hoc, and the k8s log stream
+    // is best-effort (lossy under rotation) so results must not ride it. Capture
+    // is a trusted per-Pod egress sidecar that reads the shared results volume and
+    // does a confirmed write to a fence-scoped results API → Postgres (ADR-0042).
+    // Tracked as a follow-up — the local backend already captures end-to-end.
 }
 
 // ---------------------------------------------------------------------------

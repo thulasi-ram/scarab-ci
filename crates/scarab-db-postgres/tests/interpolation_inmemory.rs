@@ -1,4 +1,4 @@
-//! ADR-0040 launch-time interpolation, driven over the in-memory store so it
+//! ADR-0041 launch-time interpolation, driven over the in-memory store so it
 //! runs without Postgres. Proves the value chain end-to-end: a producer emits a
 //! named result, the scheduler captures it on success, and a downstream
 //! consumer's `${{ outputs.producer.url }}` is resolved *at launch* — plus the
@@ -95,7 +95,7 @@ async fn a_missing_result_fails_the_consumer_fast() {
         sched.tick(&run).await.expect("tick");
     }
 
-    // The consumer fails (fail-fast, ADR-0040 §5) rather than launching empty; the
+    // The consumer fails (fail-fast, ADR-0041 §5) rather than launching empty; the
     // run is therefore Failed.
     let consumer_status = db
         .steps_of_run(&run)

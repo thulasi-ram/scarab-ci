@@ -67,7 +67,7 @@ impl LocalExecutor {
         )
     }
 
-    /// The results directory inside a step's workdir (ADR-0008/0040): the step
+    /// The results directory inside a step's workdir (ADR-0008/0041): the step
     /// writes `<name>.json` files here and the orchestrator reads them back.
     fn results_dir(workdir: &std::path::Path) -> std::path::PathBuf {
         workdir.join("scarab").join("results")
@@ -119,7 +119,7 @@ impl Executor for LocalExecutor {
             .join(sanitize(&handle.0));
         std::fs::create_dir_all(&workdir)
             .map_err(|e| ExecError::Launch(format!("workdir: {e}")))?;
-        // Results channel (ADR-0008/0040): the step writes `<name>.json` files
+        // Results channel (ADR-0008/0041): the step writes `<name>.json` files
         // under `$SCARAB_RESULTS`, read back on success as named results.
         let results_dir = Self::results_dir(&workdir);
         std::fs::create_dir_all(&results_dir)
@@ -190,7 +190,7 @@ impl Executor for LocalExecutor {
 
     // `output` uses the port default (`None`): no workspace CAS locally (ADR-0036).
 
-    /// Read the step's named results (ADR-0040) from its results dir: every
+    /// Read the step's named results (ADR-0041) from its results dir: every
     /// `<name>.json` file becomes result `<name>` with the file's parsed JSON
     /// value. An absent dir (the step emitted nothing) yields an empty map; a
     /// malformed result file fails fast (surfaces rather than being swallowed).
