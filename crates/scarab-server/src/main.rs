@@ -13,7 +13,7 @@ use clap::{Parser, ValueEnum};
 
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
-use scarab_executor_k8s::K8sExecutor;
+use scarab_executor_k8s::{K8sExecutor, ResultsEgress};
 use scarab_executor_local::LocalExecutor;
 use scarab_server::{converged, router, AppState, LogService, SecretInjectingExecutor, SystemClock};
 use scarab_storage::ObjectStore;
@@ -160,6 +160,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Background scheduler + executor loop. The k8s backend best-effort connects
     // (without a cluster the driver is skipped, API-only); the local backend
     // needs nothing but a working host (dev/CLI, ADR-0036).
+    // Results egress (ADR-0042): a shared HMAC secret both mints the k8s sidecar's
+    // fence token and verifies it at the ingest endpoint. Absent = no capture.
+    let results_token_secret = std::env::var("SCARAB_RESULTS_TOKEN_SECRET")
+        .ok()
+        .map(String::into_bytes);
+    let results_egress = results_token_secret.as_ref().map(|secret| ResultsEgress {
+        base_url: std::env::var("SCARAB_RESULTS_API_URL")
+            .unwrap_or_else(|_| "http://scarab-server".to_string()),
+        token_secret: secret.clone(),
+        sidecar_image: std::env::var("SCARAB_SIDECAR_IMAGE")
+            .unwrap_or_else(|_| "ghcr.io/scarab/sidecar:latest".to_string()),
+    });
+
     if cli.role.runs_driver() && connected {
         let executor: Option<Arc<dyn Executor>> = match cli.executor {
             ExecutorKind::Local => {
@@ -167,7 +180,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Arc::new(LocalExecutor::new()))
             }
             ExecutorKind::K8s => match K8sExecutor::connect(cli.namespace.clone()).await {
-                Ok(exec) => Some(Arc::new(exec)),
+                Ok(mut exec) => {
+                    if let Some(egress) = results_egress.clone() {
+                        exec = exec.with_results_egress(egress);
+                        tracing::info!("results egress sidecar enabled (ADR-0042)");
+                    }
+                    Some(Arc::new(exec))
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "no kubernetes cluster reachable; driver not started (API-only)");
                     None
@@ -211,6 +230,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = AppState::new(db, clock, logs);
     if let Ok(secret) = std::env::var("SCARAB_GITHUB_WEBHOOK_SECRET") {
         state = state.with_github_webhook_secret(secret.into_bytes());
+    }
+    // Results ingest (ADR-0042): enables POST …/steps/:step/results for the
+    // egress sidecar, verified with the same secret that minted its token.
+    if let Some(secret) = results_token_secret {
+        state = state.with_results_token_secret(secret);
     }
     // External-gate release tokens (ADR-0034): enables POST …/gates/:step/release.
     if let Ok(secret) = std::env::var("SCARAB_GATE_TOKEN_SECRET") {

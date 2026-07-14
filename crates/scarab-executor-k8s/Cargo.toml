@@ -9,6 +9,10 @@ scarab-engine = { workspace = true }
 async-trait = { workspace = true }
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
+# Reused only for `sign_hex` — the single source of truth for the fence-token
+# format the server's results endpoint verifies (ADR-0042), so the two sides
+# cannot drift.
+scarab-forge-github = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

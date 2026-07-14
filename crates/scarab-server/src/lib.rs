@@ -86,6 +86,10 @@ pub struct AppState {
     /// Secret store (envelope-encrypted, ADR-0014). `None` disables the secrets
     /// management endpoints.
     pub secrets: Option<Arc<dyn scarab_secrets::SecretProvider>>,
+    /// HMAC secret for the fence-scoped step-results ingest token (ADR-0042).
+    /// `None` disables the results-ingest endpoint (rejects with 404). Shared with
+    /// the k8s executor, which mints the per-step token the egress sidecar presents.
+    pub results_token_secret: Option<Vec<u8>>,
 }
 
 impl AppState {
@@ -102,12 +106,19 @@ impl AppState {
             oidc: None,
             gate_token_secret: None,
             secrets: None,
+            results_token_secret: None,
         }
     }
 
     /// Set the HMAC secret for external-gate release tokens (ADR-0034).
     pub fn with_gate_token_secret(mut self, secret: Vec<u8>) -> Self {
         self.gate_token_secret = Some(secret);
+        self
+    }
+
+    /// Set the HMAC secret for fence-scoped step-results ingest tokens (ADR-0042).
+    pub fn with_results_token_secret(mut self, secret: Vec<u8>) -> Self {
+        self.results_token_secret = Some(secret);
         self
     }
 
@@ -1385,6 +1396,89 @@ async fn release_gate_external(
     }
 }
 
+/// HTTP header carrying the fence-scoped step-results ingest token (`sha256=<hex>`).
+const RESULTS_TOKEN_HEADER: &str = "x-scarab-results-token";
+/// HTTP header carrying the attempt id the token is scoped to.
+const RESULTS_ATTEMPT_HEADER: &str = "x-scarab-attempt";
+/// Cap on an ingested results body — results are small consumable values
+/// (ADR-0041), not blobs.
+const RESULTS_MAX_BYTES: usize = 64 * 1024;
+
+/// The message an ADR-0042 results token signs: the `{run}:{step}:{attempt}`
+/// fence. The k8s executor mints `HMAC-SHA256(secret, this)`; this endpoint
+/// verifies it. Kept as one function so both sides format the fence identically.
+pub fn results_token_message(run: &str, step: &str, attempt: &str) -> String {
+    format!("{run}:{step}:{attempt}")
+}
+
+/// Ingest a step's named results (ADR-0040/0042): the trusted per-Pod egress
+/// sidecar POSTs `{ name: value, … }` here, authenticated by a fence-scoped
+/// token, and the control plane persists them to `step_runs.results`. The
+/// untrusted step never calls this — only the sidecar holds the token.
+///
+/// 404 when no token secret is configured; 401 on a bad/missing token; 404 for
+/// an unknown step; 413 for an over-large body. The write is idempotent on the
+/// fence (a re-drive overwrites deterministically, ADR-0021).
+#[utoipa::path(
+    post,
+    path = "/v1/runs/{id}/steps/{step}/results",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "step id")
+    ),
+    responses(
+        (status = 202, description = "results recorded"),
+        (status = 401, description = "bad or missing token"),
+        (status = 404, description = "no such step, or results ingest disabled")
+    )
+)]
+async fn ingest_step_results(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+    Json(results): Json<std::collections::BTreeMap<String, serde_json::Value>>,
+) -> Result<StatusCode, ApiError> {
+    // Ingest is opt-in: without a configured secret the endpoint 404s.
+    let Some(secret) = st.results_token_secret.as_ref() else {
+        return Err(ApiError::NotFound);
+    };
+    let run = RunId(id);
+    let step = StepId(step);
+
+    // Verify the fence-scoped token = HMAC(secret, "{run}:{step}:{attempt}").
+    let attempt = headers
+        .get(RESULTS_ATTEMPT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("0");
+    let message = results_token_message(&run.0, &step.0, attempt);
+    let token = headers.get(RESULTS_TOKEN_HEADER).and_then(|v| v.to_str().ok());
+    scarab_forge_github::verify_signature(secret, message.as_bytes(), token)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    // Bound the payload — results are small values, not blobs.
+    let encoded = serde_json::to_vec(&results).unwrap_or_default();
+    if encoded.len() > RESULTS_MAX_BYTES {
+        return Err(ApiError::BadRequest(format!(
+            "results exceed {RESULTS_MAX_BYTES} bytes"
+        )));
+    }
+
+    // The token authenticates the fence; still require the step to exist so a
+    // stray token can't create phantom rows.
+    let exists = st
+        .db
+        .steps_of_run(&run)
+        .await?
+        .iter()
+        .any(|s| s.step == step);
+    if !exists {
+        return Err(ApiError::NotFound);
+    }
+
+    st.db.set_step_results(&run, &step, &results).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+
 /// Build a [`SecretScope`] from the flat org/repo/environment selector,
 /// enforcing that an environment scope names a repo (ADR-0014, 0024).
 fn secret_scope(
@@ -1806,6 +1900,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
         .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
         .route("/v1/runs/{id}/gates/{step}/release", post(release_gate_external))
+        .route("/v1/runs/{id}/steps/{step}/results", post(ingest_step_results))
         .route(
             "/v1/secrets",
             post(put_secret).get(list_secrets).delete(delete_secret),

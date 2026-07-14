@@ -2575,6 +2575,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "scarab-engine",
+ "scarab-forge-github",
  "tokio",
 ]
 
