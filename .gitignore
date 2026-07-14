@@ -13,6 +13,8 @@
 /.env.local
 /.direnv
 
-# UI (TS project, not a cargo member)
-/ui/node_modules
-/ui/dist
+# Front-end projects (TS, not cargo members): scarab-web-ui, scarab-docs-ui
+/ui/**/node_modules
+/ui/**/dist
+# Astro build output
+/ui/**/.astro

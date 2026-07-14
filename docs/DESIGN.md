@@ -8,7 +8,7 @@ personality is a scattering of **hand-drawn (rough.js) line-icon doodles** in th
 background of each page. The chrome stays out of the way; the doodles give it a
 signature no other CI tool has.
 
-> Stack note: the UI is **SolidJS** (`ui/`, ADR-0028), styled with plain CSS
+> Stack note: the UI is **SolidJS** (`ui/scarab-web-ui/`, ADR-0028), styled with plain CSS
 > variables. There is no server-rendered templating. All decorations are inline
 > SVG rendered by a Solid component (see §5).
 

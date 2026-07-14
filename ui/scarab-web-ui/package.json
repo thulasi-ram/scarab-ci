@@ -5,7 +5,7 @@
   "description": "Scarab UI (SolidJS) — dogfoods the generated OpenAPI client. Scaffold; the rich live-DAG / SSE-logs / time-travel UI is an attended follow-up.",
   "type": "module",
   "scripts": {
-    "gen": "openapi-typescript ../openapi.json -o src/api/schema.ts",
+    "gen": "openapi-typescript ../../openapi.json -o src/api/schema.ts",
     "typecheck": "tsc --noEmit",
     "dev": "vite",
     "build": "vite build",

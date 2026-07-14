@@ -15,10 +15,15 @@ default:
 server:
     cargo run -p scarab-server
 
-# Run the UI dev server (Vite on http://localhost:5173, proxies /v1 → server).
+# Run the web UI dev server (Vite on http://localhost:5173, proxies /v1 → server).
 ui:
-    npm --prefix ui install
-    npm --prefix ui run dev
+    npm --prefix ui/scarab-web-ui install
+    npm --prefix ui/scarab-web-ui run dev
+
+# Run the docs site dev server (Astro Starlight; ADR-0040).
+docs:
+    npm --prefix ui/scarab-docs-ui install
+    npm --prefix ui/scarab-docs-ui run dev
 
 # Bring up the full dev stack and start scarab-server against it.
 up:
