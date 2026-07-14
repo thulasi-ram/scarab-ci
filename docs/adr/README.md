@@ -56,6 +56,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0037](0037-environment-governance.md) | Environment governance: approval-as-gate, scoped secrets, admission at point-of-use | Accepted |
 | [0038](0038-invoke-and-local-reuse.md) | `invoke` = compile-time inlining; local `.scarab/lib`, third-party via OCI images (amends 0025) | Accepted |
 | [0039](0039-privileged-images.md) | Privileged step images: hardened baseline + governed capability grants per Environment | Accepted |
+| [0040](0040-named-results-and-interpolation.md) | Named step results + launch-time interpolation (`${{ outputs.<id>.<name> }}`); makes 0038 outputs live | Accepted |
 
 > For *features* deliberately deferred until demand appears (as opposed to ADRs
 > to be written), see [`docs/followups.md`](../followups.md).

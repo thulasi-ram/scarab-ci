@@ -529,6 +529,9 @@ fn inline_level(
     let mut out: Vec<StepSpec> = Vec::new();
     // invoke-step id -> the namespaced leaf ids that a `needs: [that id]` maps to.
     let mut seam: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Non-matrixed invoke id -> its exposed output names, for the output-reference
+    // rewrite (ADR-0040): `outputs.<id>.<name>` -> `outputs["<id>/<name>"].<name>`.
+    let mut output_aliases: Vec<(String, Vec<String>)> = Vec::new();
 
     for step in steps {
         let Some(raw_path) = &step.invoke else {
@@ -611,6 +614,12 @@ fn inline_level(
         // Interface (ADR-0038): validate the caller's `with:` inputs and the
         // library's declared/exposed outputs at compile — explicit over ambient.
         validate_interface(step, &key, &lib, steps, diagnostics);
+        // Record exposed outputs for the reference rewrite (ADR-0040). A matrixed
+        // invoke's outputs are unaddressable (validate_interface errors on any
+        // reference), so it contributes no alias.
+        if step.matrix.is_none() && !lib.interface.outputs.is_empty() {
+            output_aliases.push((step.id.clone(), lib.interface.outputs.clone()));
+        }
 
         // Recurse: resolve the library's own invokes first, so `resolved` is a
         // flat list in the library's namespace (ids may already contain `/`).
@@ -696,6 +705,58 @@ fn inline_level(
         }
     }
 
+    // Output-reference rewrite (ADR-0040): resolve `outputs.<invoke-id>.<name>`
+    // to the concrete inlined backing step so the launch context stays generic
+    // (just `outputs[<step-id>] = <that step's results>`). The backing step of a
+    // non-matrixed invoke's exposed output `<name>` is `<invoke-id>/<name>`.
+    for (invoke_id, exposed) in &output_aliases {
+        for step in &mut out {
+            step.image = rewrite_output_refs(&step.image, invoke_id, exposed);
+            for c in &mut step.command {
+                *c = rewrite_output_refs(c, invoke_id, exposed);
+            }
+            for (_, v) in &mut step.env {
+                *v = rewrite_output_refs(v, invoke_id, exposed);
+            }
+        }
+    }
+
+    out
+}
+
+/// Rewrite `outputs.<invoke_id>.<name>` references (for each exposed `<name>`) to
+/// `outputs["<invoke_id>/<name>"].<name>` — pointing at the concrete inlined
+/// backing step (ADR-0040). Boundary-guarded so `url` does not match `urls`.
+fn rewrite_output_refs(text: &str, invoke_id: &str, exposed: &[String]) -> String {
+    let mut result = text.to_string();
+    for name in exposed {
+        let needle = format!("outputs.{invoke_id}.{name}");
+        let replacement = format!("outputs[\"{invoke_id}/{name}\"].{name}");
+        result = replace_token(&result, &needle, &replacement);
+    }
+    result
+}
+
+/// Replace each occurrence of `needle` in `text` with `replacement`, but only
+/// where `needle` is not immediately followed by an identifier char (so
+/// `outputs.x.url` does not match inside `outputs.x.urls`).
+fn replace_token(text: &str, needle: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = text[i..].find(needle) {
+        let start = i + rel;
+        let end = start + needle.len();
+        let boundary_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        out.push_str(&text[i..start]);
+        if boundary_ok {
+            out.push_str(replacement);
+        } else {
+            out.push_str(needle);
+        }
+        i = end;
+    }
+    out.push_str(&text[i..]);
     out
 }
 
@@ -784,23 +845,38 @@ fn validate_interface(
             ));
         }
     }
-    // A sibling referencing `<invoke-id>.<output>` for an output the library does
-    // not expose is a compile error (validation only; runtime binding is a
-    // follow-up).
+    // Output references (ADR-0040): a sibling reads an exposed output as
+    // `${{ outputs.<invoke-id>.<name> }}`. Validate each reference — undeclared
+    // output, referencing without `needs`, or referencing a matrixed invoke
+    // (ambiguous per-coordinate) — at compile.
     let exposed: BTreeSet<&str> = iface.outputs.iter().map(String::as_str).collect();
+    let outputs_base = format!("outputs.{}", step.id);
+    let matrixed = step.matrix.is_some();
     for t in siblings {
         if t.id == step.id {
             continue;
         }
         for text in interpolatable_strings(t) {
             for expr in cel::interpolations(text).unwrap_or_default() {
-                for field in field_accesses(expr, &step.id) {
-                    if !exposed.contains(field.as_str()) {
+                for field in field_accesses(expr, &outputs_base) {
+                    if matrixed {
                         diagnostics.push(format!(
-                            "step `{}`: references undeclared output `{}.{field}` (library `{key}` exposes: [{}])",
+                            "step `{}`: references output `outputs.{}.{field}` of a matrixed invoke — per-coordinate output references are not supported (ADR-0040)",
+                            t.id, step.id
+                        ));
+                    } else if !exposed.contains(field.as_str()) {
+                        diagnostics.push(format!(
+                            "step `{}`: references undeclared output `outputs.{}.{field}` (library `{key}` exposes: [{}])",
                             t.id,
                             step.id,
                             iface.outputs.join(", ")
+                        ));
+                    } else if !t.needs.0.contains(&step.id) {
+                        // The value is only guaranteed to exist at launch if `t`
+                        // depends on the invoke (ADR-0040 §4).
+                        diagnostics.push(format!(
+                            "step `{}`: reads `outputs.{}.{field}` but does not `needs: [{}]`",
+                            t.id, step.id, step.id
                         ));
                     }
                 }
@@ -1226,6 +1302,33 @@ pub fn excluded_steps(
         }
     }
     Ok(excluded)
+}
+
+/// Resolve `${{ … }}` interpolations in a step's launchable surfaces — `image`,
+/// `command`, and `env` values — against `ctx` (ADR-0040). Pure: the engine
+/// builds `ctx` at launch from the step's upstream results (`outputs`) and its
+/// own matrix coordinate (`matrix`), then launches the returned spec.
+///
+/// **Fail-fast:** a bad reference — an unbound name, a type error in a guard —
+/// is a hard error that fails the step; it never renders empty or degrades
+/// silently (ADR-0040 §5). A surface with no `${{ … }}` is returned verbatim.
+pub fn interpolate_spec(
+    spec: &StepSpec,
+    ctx: &serde_json::Value,
+) -> Result<StepSpec, PipelineError> {
+    let mut out = spec.clone();
+    out.image = cel::interpolate(&spec.image, ctx)?;
+    out.command = spec
+        .command
+        .iter()
+        .map(|c| cel::interpolate(c, ctx))
+        .collect::<Result<Vec<_>, _>>()?;
+    out.env = spec
+        .env
+        .iter()
+        .map(|(k, v)| cel::interpolate(v, ctx).map(|v| (k.clone(), v)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2118,14 +2221,14 @@ mod tests {
     "#;
 
     #[test]
-    fn a_satisfied_interface_compiles_and_injects_params() {
+    fn a_satisfied_interface_compiles_injects_params_and_rewrites_output_refs() {
         let ir = compile_with(
             r#"
             steps:
               - id: deploy
                 invoke: .scarab/lib/deploy.yaml
                 with: { region: us-east-1, replicas: "3" }
-              - { id: notify, image: busybox, command: ["echo", "${{ deploy.url }}"], needs: [deploy] }
+              - { id: notify, image: busybox, command: ["echo", "${{ outputs.deploy.url }}"], needs: [deploy] }
             "#,
             &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
         );
@@ -2136,6 +2239,10 @@ mod tests {
         // The invoke step is gone; the exposed-output reference compiled fine.
         assert!(ir.steps.iter().all(|s| !s.is_invoke()));
         assert!(ir.steps.iter().any(|s| s.id == "deploy/url"));
+        // The output reference is rewritten to the concrete backing step (ADR-0040),
+        // so the launch context stays generic (keyed by step id).
+        let notify = ir.steps.iter().find(|s| s.id == "notify").unwrap();
+        assert_eq!(notify.command[1], "${{ outputs[\"deploy/url\"].url }}");
     }
 
     #[test]
@@ -2177,14 +2284,71 @@ mod tests {
               - id: deploy
                 invoke: .scarab/lib/deploy.yaml
                 with: { region: us-east-1, replicas: "3" }
-              - { id: notify, image: busybox, command: ["echo", "${{ deploy.secret_ip }}"], needs: [deploy] }
+              - { id: notify, image: busybox, command: ["echo", "${{ outputs.deploy.secret_ip }}"], needs: [deploy] }
             "#,
             &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
         );
         assert!(
-            errs.iter().any(|e| e.contains("references undeclared output `deploy.secret_ip`")),
+            errs.iter().any(|e| e.contains("references undeclared output `outputs.deploy.secret_ip`")),
             "got {errs:?}"
         );
+    }
+
+    #[test]
+    fn reading_an_output_without_needing_the_invoke_is_a_compile_error() {
+        let errs = errors_with(
+            r#"
+            steps:
+              - id: deploy
+                invoke: .scarab/lib/deploy.yaml
+                with: { region: us-east-1, replicas: "3" }
+              - { id: notify, image: busybox, command: ["echo", "${{ outputs.deploy.url }}"] }
+            "#,
+            &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("does not `needs: [deploy]`")),
+            "got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn referencing_the_output_of_a_matrixed_invoke_is_rejected() {
+        let errs = errors_with(
+            r#"
+            steps:
+              - id: deploy
+                invoke: .scarab/lib/deploy.yaml
+                with: { region: us-east-1, replicas: "3" }
+                matrix: { dimensions: { region: [a, b] } }
+              - { id: notify, image: busybox, command: ["${{ outputs.deploy.url }}"], needs: [deploy] }
+            "#,
+            &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("matrixed invoke")),
+            "got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn interpolate_spec_resolves_outputs_and_matrix_and_fails_fast() {
+        use serde_json::json;
+        let mut spec = compile("steps: [{ id: notify, image: busybox }]").steps.pop().unwrap();
+        spec.command = vec!["post".into(), r#"${{ outputs["deploy/url"].url }}"#.into()];
+        spec.env = vec![("TARGET".into(), "${{ matrix.region }}".into())];
+
+        let ctx = json!({
+            "outputs": { "deploy/url": { "url": "https://svc.example" } },
+            "matrix": { "region": "us-east-1" },
+        });
+        let out = interpolate_spec(&spec, &ctx).unwrap();
+        assert_eq!(out.command[1], "https://svc.example");
+        assert_eq!(out.env[0].1, "us-east-1");
+
+        // Fail-fast: an unbound reference is a hard error, never empty.
+        let bad = json!({ "outputs": {} });
+        assert!(interpolate_spec(&spec, &bad).is_err());
     }
 
     #[test]
