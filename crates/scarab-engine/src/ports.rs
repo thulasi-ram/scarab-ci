@@ -322,19 +322,6 @@ pub trait Db: Send + Sync {
     ) -> Result<Lease, DbError>;
 }
 
-/// A best-effort **live tail** of a running unit's combined stdout/stderr, pulled
-/// by the control plane (ADR-0013). Chunk boundaries are arbitrary — whatever the
-/// backend hands over — so the consumer (the log pipeline) treats the
-/// concatenation of chunks as the byte stream. [`next_chunk`](LogChunks::next_chunk)
-/// returns `Ok(None)` at end of stream: the unit finished and the backend closed
-/// the log. Errors are non-fatal to the run (logs are best-effort, unlike the
-/// acked results channel — ADR-0042); the caller logs and drops the tail.
-#[async_trait]
-pub trait LogChunks: Send {
-    /// The next chunk of log bytes, or `Ok(None)` when the stream is exhausted.
-    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ExecError>;
-}
-
 /// The only source of "now" in the domain. Behind this port a real clock uses
 /// the wall clock; the fake clock advances virtual time manually (DST).
 #[async_trait]
@@ -377,17 +364,5 @@ pub trait Executor: Send + Sync {
         _handle: &ExecHandle,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ExecError> {
         Ok(std::collections::BTreeMap::new())
-    }
-
-    /// Open a best-effort **live tail** of the unit's stdout/stderr for `step`,
-    /// keyed by its fence (ADR-0013). The control plane drains the returned
-    /// [`LogChunks`] into the log pipeline while the step runs. `Ok(None)` means
-    /// this backend has no log source — the default, so a backend without one need
-    /// not implement it (the local/dev backend inherits the parent's stdio and
-    /// does not tail). Takes the fenced [`StepRun`] rather than an [`ExecHandle`]
-    /// because the source is derived from the fence — the same derivation `launch`
-    /// uses — so the caller needs no handle bookkeeping to start a tail.
-    async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        Ok(None)
     }
 }

@@ -13,9 +13,6 @@ k8s-openapi = { workspace = true }
 # format the server's results endpoint verifies (ADR-0042), so the two sides
 # cannot drift.
 scarab-forge-github = { workspace = true }
-# The k8s log tail (ADR-0013): kube's `log_stream` yields a `futures::AsyncBufRead`
-# we chunk with `AsyncReadExt`.
-futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -219,8 +219,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 clock.clone(),
                 executor,
                 None,
-                // Feed the log pipeline from the executor's live tail (ADR-0013).
-                Some(logs.clone()),
                 "scarab-server".to_string(),
                 Duration::from_millis(500),
                 visibility_ms,

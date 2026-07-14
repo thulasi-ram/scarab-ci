@@ -18,6 +18,3 @@
 /ui/**/dist
 # Astro build output
 /ui/**/.astro
-
-# Git worktrees for parallel agents (local, not shared)
-.workspaces/

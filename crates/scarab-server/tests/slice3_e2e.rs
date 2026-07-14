@@ -106,7 +106,7 @@ async fn push_webhook_runs_pipeline_posts_checks_and_login_authorizes() {
     }
     let exec_dyn: Arc<dyn Executor> = exec.clone();
     for _ in 0..10 {
-        converged::tick_once(&db_dyn, &clock_dyn, &exec_dyn, Some(&forge_dyn), None, "e2e", 30_000)
+        converged::tick_once(&db_dyn, &clock_dyn, &exec_dyn, Some(&forge_dyn), "e2e", 30_000)
             .await
             .unwrap();
         if pg.run_status(&run).await.unwrap().unwrap().is_terminal() {

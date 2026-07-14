@@ -20,7 +20,7 @@
 pub mod ports;
 pub mod scheduler;
 
-pub use ports::{Clock, Db, Executor, LogChunks};
+pub use ports::{Clock, Db, Executor};
 pub use scheduler::{
     record_gate_approval, release_gate, restart_step, RestartError, Scheduler, SchedulerError,
     LAUNCH_STEP, RUN_STATUS_CHANGED,

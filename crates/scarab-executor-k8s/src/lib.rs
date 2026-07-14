@@ -9,26 +9,15 @@
 //! starting a second one (the double-effect guard, ADR-0021).
 
 use async_trait::async_trait;
-use futures::io::AsyncBufRead;
-use futures::AsyncReadExt;
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, EmptyDirVolumeSource, EnvVar, Pod, PodSpec, SeccompProfile,
     SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{Api, DeleteParams, LogParams, PostParams};
+use kube::api::{Api, DeleteParams, PostParams};
 
-use scarab_engine::ports::{ExecHandle, ExecState, LogChunks};
+use scarab_engine::ports::{ExecHandle, ExecState};
 use scarab_engine::{ExecError, Executor, StepRun, StepSpec};
-
-/// The step container's name in every step Pod (see [`build_pod`]). The log tail
-/// pins the source to this container so a results-egress sidecar (ADR-0042) never
-/// pollutes the step's log stream.
-const STEP_CONTAINER: &str = "step";
-
-/// How many bytes the log tail reads per chunk before handing it to the pipeline.
-/// A modest buffer keeps live-tail latency low without a syscall per line.
-const LOG_CHUNK_BYTES: usize = 8 * 1024;
 
 /// Default graceful-cancel window: SIGTERM, then SIGKILL after this many seconds.
 const CANCEL_GRACE_SECS: i64 = 30;
@@ -158,53 +147,6 @@ impl Executor for K8sExecutor {
     // best-effort, so post-hoc scraping is not an option; hence the sidecar.)
     // Remaining to make this live end-to-end: the sidecar image (the `scarab` CLI
     // that drains + POSTs on shutdown) and a real-cluster lifecycle test.
-
-    /// Open a live tail of the step Pod's stdout/stderr via the k8s log endpoint
-    /// (ADR-0013): `follow: true` on the deterministic `{run, step, attempt}` Pod,
-    /// pinned to the `step` container so the egress sidecar's output never mixes
-    /// in. The control plane drains the returned [`LogChunks`] into the log
-    /// pipeline. Best-effort: if the Pod's log is not yet available (still Pending,
-    /// container not started) this errors and the caller retries on a later tick.
-    async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        let pods = self.pods()?;
-        let name = pod_name(step);
-        let params = LogParams {
-            follow: true,
-            container: Some(STEP_CONTAINER.to_string()),
-            ..LogParams::default()
-        };
-        let reader = pods
-            .log_stream(&name, &params)
-            .await
-            .map_err(|e| ExecError::Other(e.to_string()))?;
-        Ok(Some(Box::new(PodLogChunks {
-            reader: Box::pin(reader),
-        })))
-    }
-}
-
-/// A [`LogChunks`] over a k8s Pod's followed log stream. Wraps kube's
-/// `AsyncBufRead` and reads it in [`LOG_CHUNK_BYTES`]-sized bites; an empty read
-/// is end-of-stream (the followed Pod finished and the API closed the log).
-struct PodLogChunks {
-    reader: std::pin::Pin<Box<dyn AsyncBufRead + Send>>,
-}
-
-#[async_trait]
-impl LogChunks for PodLogChunks {
-    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ExecError> {
-        let mut buf = vec![0u8; LOG_CHUNK_BYTES];
-        let n = self
-            .reader
-            .read(&mut buf)
-            .await
-            .map_err(|e| ExecError::Other(e.to_string()))?;
-        if n == 0 {
-            return Ok(None);
-        }
-        buf.truncate(n);
-        Ok(Some(buf))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +232,7 @@ pub fn build_pod(
     });
 
     let container = Container {
-        name: STEP_CONTAINER.to_string(),
+        name: "step".to_string(),
         image: Some(spec.image.clone()),
         command: (!spec.command.is_empty()).then(|| spec.command.clone()),
         env: Some(env),
@@ -585,7 +527,7 @@ fn container_exit_code(pod: &Pod) -> Option<i32> {
         .container_statuses
         .as_ref()?
         .iter()
-        .find(|c| c.name == STEP_CONTAINER)
+        .find(|c| c.name == "step")
         .or_else(|| pod.status.as_ref().unwrap().container_statuses.as_ref().unwrap().first())?
         .state
         .as_ref()?

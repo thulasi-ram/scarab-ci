@@ -16,16 +16,6 @@ use scarab_engine::ports::{ExecHandle, ExecState};
 use scarab_engine::{Attempt, AttemptId, Executor, RunId, StepId, StepRun, StepStatus, StepSpec, Timestamp};
 use scarab_executor_k8s::{pod_name, K8sExecutor};
 
-/// Fully drain a [`scarab_engine::LogChunks`] into one `Vec<u8>`.
-#[cfg(test)]
-async fn drain_to_end(mut chunks: Box<dyn scarab_engine::LogChunks>) -> Vec<u8> {
-    let mut out = Vec::new();
-    while let Some(c) = chunks.next_chunk().await.expect("chunk") {
-        out.extend(c);
-    }
-    out
-}
-
 fn opted_in() -> Option<String> {
     if std::env::var("SCARAB_TEST_KUBE").is_err() {
         eprintln!("skipping: set SCARAB_TEST_KUBE=1 to run against a dev cluster");
@@ -87,53 +77,6 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
     assert_eq!(terminal, Some(ExecState::Succeeded), "busybox echo exits 0");
 
     exec.cancel(&h1).await.expect("cancel cleans up the pod");
-}
-
-/// Live log tail (ADR-0013): `log_stream` follows a Pod's stdout and yields the
-/// step's output. `#[ignore]`d + gated on SCARAB_TEST_KUBE — needs the dev kind
-/// cluster. The chunking/drain loop itself is unit-tested cluster-free in
-/// `scarab-server`'s `log_tail` tests; this proves the real k8s log endpoint
-/// wiring end-to-end.
-#[tokio::test]
-#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
-async fn log_stream_tails_pod_stdout() {
-    let Some(ns) = opted_in() else { return };
-
-    let client = kube::Client::try_default().await.expect("kube client");
-    let exec = K8sExecutor::with_client(ns, client);
-    let step = step();
-    let spec = StepSpec {
-        image: "busybox:latest".into(),
-        command: vec!["sh".into(), "-c".into(), "echo hello scarab logs".into()],
-        env: vec![],
-        secrets: vec![],
-        run_as_root: false,
-        add_capabilities: vec![],
-        privileged: false,
-    };
-
-    let h = exec.launch(&step, &spec).await.expect("launch");
-
-    // Follow the log until the stream closes (the Pod finished), retrying the
-    // open while the container is still starting (Pending → no log yet).
-    let mut logs = Vec::new();
-    for _ in 0..60 {
-        if let Ok(Some(chunks)) = exec.log_stream(&step).await {
-            logs = drain_to_end(chunks).await;
-            if !logs.is_empty() {
-                break;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-
-    assert!(
-        String::from_utf8_lossy(&logs).contains("hello scarab logs"),
-        "tailed logs should contain the step's stdout, got: {:?}",
-        String::from_utf8_lossy(&logs)
-    );
-
-    exec.cancel(&h).await.expect("cancel cleans up the pod");
 }
 
 /// Live rootless-BuildKit image build (ADR-0018). `#[ignore]`d + gated on

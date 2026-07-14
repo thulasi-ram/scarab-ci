@@ -2,6 +2,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightOpenAPI, { openAPISidebarGroups } from 'starlight-openapi';
+import lucode from 'lucode-starlight';
 
 // Scarab documentation site — ADR-0040.
 // - Operator-primary IA, published honestly (stubs are explicit).
@@ -19,16 +20,29 @@ export default defineConfig({
       tagline: 'Your pipeline is a workflow that survives crashes.',
       logo: { src: './src/assets/logo.svg', alt: 'Scarab' },
       customCss: [
-        '@fontsource/inter/400.css',
-        '@fontsource/inter/500.css',
-        '@fontsource/inter/600.css',
+        // Geist is the face shadcn/ui (and thus the Lucode base) is drawn with —
+        // JetBrains Mono stays for machine tokens (ids, logs, durations).
+        '@fontsource-variable/geist/index.css',
         '@fontsource/jetbrains-mono/400.css',
+        '@fontsource/jetbrains-mono/500.css',
         './src/styles/scarab.css',
       ],
       social: [
         { icon: 'github', label: 'GitHub', href: 'https://github.com/thulasi-ram/scarab-ci' },
       ],
       plugins: [
+        // Lucode: shadcn/ui-inspired Starlight theme — light-default, restrained
+        // typography, a subtle active-nav rail (no solid fill). Scarab identity
+        // (emerald links, copper fence-bracket edge) is layered in scarab.css.
+        lucode({
+          navLinks: [
+            { label: 'Get Started', link: '/scarab-ci/get-started/run-locally/' },
+            { label: 'Guides', link: '/scarab-ci/guides/authoring/' },
+            { label: 'Tech', link: '/scarab-ci/tech/context/' },
+          ],
+          footerText:
+            'Scarab — durable-execution, Kubernetes-native CI. Themed with [Lucode Starlight](https://github.com/lucas-labs/lucode-starlight-theme).',
+        }),
         // API reference generated from the canonical spec, in place.
         starlightOpenAPI([
           { base: 'reference/api', label: 'API', schema: '../../openapi.json' },

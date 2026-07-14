@@ -1,103 +1,134 @@
-/* Scarab docs theme — ADR-0040. Ports docs/DESIGN.md onto Starlight tokens,
- * tuned for documentation. Dark = the carapace signature (screenshots blend);
- * light = emerald-on-near-white for long-form reading. Starlight respects the
- * OS preference by default. Copper is OUTLINE-ONLY. Zero shadows, depth by shade. */
+/* Scarab identity layer over the Lucode (shadcn/ui) Starlight theme — ADR-0040.
+ *
+ * Lucode carries the heavy lifting: light-default, restrained typography, a
+ * neutral shadcn palette, and an active-nav treatment that is already a subtle
+ * wash + rail (not the old solid-emerald block). We DON'T re-theme it. We only
+ * add the Scarab wink at the EDGES, exactly as docs/DESIGN.md asks:
+ *   - links + the active-page rail carry a single restrained EMERALD;
+ *   - COPPER appears once, as "fence brackets" on the hero's primary action —
+ *     a nod to the product's fence-scoped durability;
+ *   - everything else stays Lucode-neutral. Green is sparing, especially light.
+ *
+ * Token overrides live in @layer lucode (per the theme's guidance); the bracket
+ * signature is unlayered so it always lands. */
 
-:root {
-  --sl-font: 'Inter', ui-sans-serif, system-ui, sans-serif;
-  --sl-font-mono: 'JetBrains Mono', ui-monospace, monospace;
-
-  /* DESIGN.md palette (literals, so tables/badges can reference them). */
-  --carapace-black: #0e1310;
-  --pine-deep: #12241a;
-  --pine: #163a2b;
-  --emerald-surface: #1b5240;
-  --emerald-elevated: #236149;
-  --emerald: #2ea77f;
-  --emerald-bright: #3fc79a;
-  --copper: #c0873f;
-  --soft-white: #f4f8f4;
-  --sage: #a8c0b3;
-  --muted-sage: #6f8579;
-  --scarab-border: #26443a;
-
-  /* Zero shadows — depth is shade (DESIGN.md §7). */
-  --sl-shadow-sm: none;
-  --sl-shadow-md: none;
-  --sl-shadow-lg: none;
-}
-
-/* ---- Dark: the carapace ladder (default signature) ---- */
+/* Tokens are set UNLAYERED on purpose: Starlight core defines
+ * --sl-color-text-accent unlayered (its default blue), which outranks anything
+ * in @layer lucode. To win, our brand tokens must also be unlayered — loaded
+ * after Starlight, so source order decides. */
 :root,
-:root[data-theme='dark'] {
-  --sl-color-accent-low: #163a2b;
-  --sl-color-accent: #2ea77f;
-  --sl-color-accent-high: #3fc79a;
-
-  --sl-color-white: #f4f8f4;
-  --sl-color-gray-1: #eef3ef;
-  --sl-color-gray-2: #c3d3ca;
-  --sl-color-gray-3: #a8c0b3; /* sage */
-  --sl-color-gray-4: #6f8579; /* muted-sage */
-  --sl-color-gray-5: #26443a; /* border */
-  --sl-color-gray-6: #12241a; /* chrome */
-  --sl-color-black: #0e1310;  /* page base */
-
-  --sl-color-bg: #0e1310;
-  --sl-color-bg-nav: #0e1310;
-  --sl-color-bg-sidebar: #12241a;
-  --sl-color-bg-inline-code: #163a2b;
-  --sl-color-bg-accent: #163a2b;
-  --sl-color-hairline: #26443a;
-  --sl-color-hairline-shade: #26443a;
-  --sl-color-hairline-light: #26443a;
-  --sl-color-text-accent: #3fc79a;
-}
-
-/* ---- Light: emerald on near-white, tuned for reading ---- */
 :root[data-theme='light'] {
-  --sl-color-accent-low: #d3ece1;
-  --sl-color-accent: #17795a;
-  --sl-color-accent-high: #0f4f3b;
+  --sl-font: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
 
-  --sl-color-white: #0e1310;  /* darkest text token */
-  --sl-color-gray-1: #16211c;
-  --sl-color-gray-2: #2b3b33;
-  --sl-color-gray-3: #4c5f55;
-  --sl-color-gray-4: #6f8579;
-  --sl-color-gray-5: #cdd8d1;
-  --sl-color-gray-6: #eef3ef;
-  --sl-color-gray-7: #f6f9f6;
-  --sl-color-black: #ffffff;
+  /* Deep pine-emerald — AA on paper. Copper deep enough to read on white. */
+  --scarab-emerald: oklch(52% 0.1 162);
+  --scarab-copper: oklch(52% 0.098 66);
 
-  --sl-color-bg: #f6f9f6;
-  --sl-color-bg-nav: #ffffff;
-  --sl-color-bg-sidebar: #eef3ef;
-  --sl-color-bg-inline-code: #e5efe8;
-  --sl-color-hairline: #cdd8d1;
-  --sl-color-hairline-shade: #cdd8d1;
-  --sl-color-text-accent: #17795a;
+  /* Green, used sparingly: links, the TOC current item, and the active edge. */
+  --sl-color-text-accent: var(--scarab-emerald);
+  --ring: var(--scarab-emerald); /* active-nav rail + focus ring → emerald */
 }
 
-/* Tuned for docs: looser reading rhythm than the dense control plane. */
-.sl-markdown-content { line-height: 1.7; }
-.sl-markdown-content :is(h1, h2, h3) { letter-spacing: -0.4px; }
+:root[data-theme='dark'] {
+  /* Brighter on the carapace so the same two accents read on near-black. */
+  --scarab-emerald: oklch(80% 0.13 162);
+  --scarab-copper: oklch(72% 0.11 66);
 
-/* Uppercase micro-labels for structure (DESIGN.md §3). */
-.sl-markdown-content h2 { text-transform: none; }
-
-/* Screenshots as first-class cards: hairline border, radius, zero shadow — so a
- * dark product shot never floats, especially in light mode (DESIGN.md §4). */
-.sl-markdown-content img {
-  border: 1px solid var(--sl-color-hairline);
-  border-radius: 8px;
-  background: var(--sl-color-bg-inline-code);
+  --sl-color-text-accent: var(--scarab-emerald);
+  --ring: var(--scarab-emerald);
 }
 
-/* Copper as an EDGE, never a fill: featured asides get a copper hairline. */
+/* ---- Signature: the primary CTA IS a "fence" ----
+ * Not a solid shadcn button with a decoration — the copper brackets ARE the
+ * control. Transparent fill, ink label, four copper corner ticks framing it
+ * like a fenced region (the product's fence-scoped durability). The !important
+ * flags override Lucode's scoped solid-fill primary styling. */
+.link-button.primary,
+.sl-link-button.primary {
+  position: relative;
+  overflow: visible;
+  background: transparent !important;
+  color: var(--foreground) !important;
+  border: none !important;
+  border-radius: 0;
+  padding: 0.66rem 1.35rem !important;
+  font-weight: 600;
+  transition: background 0.15s ease;
+}
+.link-button.primary:hover,
+.sl-link-button.primary:hover {
+  background: color-mix(in oklab, var(--scarab-copper) 10%, transparent) !important;
+}
+/* A full copper frame masked down to just its four corners → corner brackets. */
+.link-button.primary::before,
+.sl-link-button.primary::before {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border: 1.5px solid var(--scarab-copper);
+  border-radius: 0; /* sharp corner brackets */
+  pointer-events: none;
+  --bracket: 14px;
+  -webkit-mask:
+    linear-gradient(#000 0 0) 0 0 / var(--bracket) var(--bracket) no-repeat,
+    linear-gradient(#000 0 0) 100% 0 / var(--bracket) var(--bracket) no-repeat,
+    linear-gradient(#000 0 0) 0 100% / var(--bracket) var(--bracket) no-repeat,
+    linear-gradient(#000 0 0) 100% 100% / var(--bracket) var(--bracket) no-repeat;
+  mask:
+    linear-gradient(#000 0 0) 0 0 / var(--bracket) var(--bracket) no-repeat,
+    linear-gradient(#000 0 0) 100% 0 / var(--bracket) var(--bracket) no-repeat,
+    linear-gradient(#000 0 0) 0 100% / var(--bracket) var(--bracket) no-repeat,
+    linear-gradient(#000 0 0) 100% 100% / var(--bracket) var(--bracket) no-repeat;
+}
+
+/* ---- Splash: line the body up with the (already constrained) hero ----
+ * Starlight leaves splash markdown full-bleed; our hero is capped at ~1024px,
+ * so the cards/status below it ran edge-to-edge. Match them. */
+body:has(.hero) .sl-markdown-content {
+  max-width: 1024px;
+  margin-inline: auto;
+  padding-inline: 1.5rem;
+}
+
+/* Prose links carry the emerald (a "highlight" use, per DESIGN.md). Lucode's
+ * shadcn base leaves them ink; this is the one place green shows up in running
+ * text — sparingly, and always underlined. Aside links keep the aside accent
+ * (higher specificity), so this doesn't touch them. */
+.sl-markdown-content a {
+  color: var(--scarab-emerald);
+  text-decoration-color: color-mix(in oklab, var(--scarab-emerald) 40%, transparent);
+}
+.sl-markdown-content a:hover {
+  text-decoration-color: var(--scarab-emerald);
+}
+
+/* Asides on-brand: the two informational callouts carry Scarab's two accents
+ * (note → emerald, tip → copper) instead of Lucode's blue/purple. Caution and
+ * danger keep their semantic orange/red — warnings should read as warnings. */
+.sl-markdown-content .starlight-aside--note {
+  --aside-border: color-mix(in oklab, var(--scarab-emerald) 42%, var(--border));
+  --aside-title: var(--scarab-emerald);
+  --aside-content: var(--muted-foreground);
+}
 .sl-markdown-content .starlight-aside--tip {
-  border-inline-start-color: var(--copper);
+  --aside-border: color-mix(in oklab, var(--scarab-copper) 44%, var(--border));
+  --aside-title: var(--scarab-copper);
+  --aside-content: var(--muted-foreground);
 }
 
-/* Hero (landing): keep it flat; copper hairline under the tagline only. */
-.hero .tagline { color: var(--sl-color-gray-2); }
+/* Sidebar fix: Lucode fixes each entry to height:30px, so our long ADR titles
+ * ("0002. Durability model: durable DAG orchestrator + at-least-once steps")
+ * wrap to two lines and overflow onto the next item. Let entries grow. */
+/* !important: Lucode sets the height in an Astro-scoped component style, which
+ * outranks a plain class selector — so we have to force the growth. */
+.entry-link {
+  height: auto !important;
+  min-height: 1.875rem; /* keep the single-line rhythm */
+  align-items: flex-start;
+  padding-block: 0.28rem;
+  line-height: 1.35;
+}
+
+/* Keep background doodles behind prose (Doodle.astro renders them). */
+.sl-markdown-content { position: relative; z-index: 1; }

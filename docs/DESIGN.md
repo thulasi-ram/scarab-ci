@@ -308,3 +308,54 @@ hand to feel warm — matching the restrained, durable tone.
 4. Exactly 1–2 background doodles per page: Lucide → rough.js (0.1 / 5 / 1.6),
    copper, faint, rotated, scaled, page-relevant, never on controls.
 5. Inter + JetBrains Mono; uppercase micro-labels with positive tracking.
+
+## 10. Documentation surface (a distinct skin)
+
+Sections §1–9 describe the **control plane** (the SolidJS app): a dark carapace
+you operate. The **docs site** is a different job — long-form *reading*, not
+operating — so it gets its own skin. The rule that carries across both is not a
+palette; it's the *restraint*: **Scarab shows up at the edges, never as a fill.**
+
+**Base: Lucode Starlight, not a hand-rolled theme.** The docs are Astro
+Starlight themed with [`lucode-starlight`](https://github.com/lucas-labs/lucode-starlight-theme)
+(a shadcn/ui-inspired theme). We do **not** re-theme it — we layer a thin Scarab
+identity over it (`ui/scarab-docs-ui/src/styles/scarab.css`). Adopting a proven
+theme beats inventing docs typography from scratch.
+
+**Light is the default; dark is opt-in and neutral.** The carapace-green dark of
+the app is deliberately *not* carried into the docs — leading with dark + heavy
+emerald made the docs feel like a product chrome, not a place to read. Docs
+default to paper-white ink-dark; dark mode is Lucode's neutral shadcn dark (not
+green). Green is used **sparingly, especially in light.**
+
+**Where the two accents are allowed (and nowhere else):**
+- **Emerald** — prose links (underlined), the TOC current item, the active-page
+  nav rail, and the focus ring. That's it. No emerald fills, no emerald blocks
+  (the old solid-emerald active-nav block is gone).
+- **Copper** — the **"fence brackets"**: copper corner ticks framing the hero's
+  primary CTA, a nod to the product's *fence-scoped durability*. Also the `tip`
+  aside's edge. One signature, one or two places.
+- Asides: `note` → emerald edge, `tip` → copper edge; `caution`/`danger` keep
+  semantic **orange/red** — a warning must read as a warning.
+
+**Typography: Geist + JetBrains Mono** (not the app's Inter). Geist is the face
+shadcn/ui — and therefore Lucode — is drawn with, so it's a faithful match, not
+an invention. No third display face. JetBrains Mono stays for machine tokens.
+
+**Implementation notes (so future edits don't fight the cascade):**
+- Brand token overrides (`--sl-color-text-accent`, `--ring`, `--scarab-emerald`,
+  `--scarab-copper`) are set **unlayered**. Starlight core defines
+  `--sl-color-text-accent` unlayered (its default blue), which outranks anything
+  in `@layer lucode`; our tokens must be unlayered too, loaded after Starlight.
+- Lucode fixes each sidebar entry to `height: 30px`; our long ADR titles wrap to
+  two lines and overflow, so `.entry-link` is forced to `height: auto` (the fixed
+  height comes from an Astro-scoped style, hence `!important`).
+- Doodles (§5) still apply — faint copper rough.js motifs, unchanged.
+
+### Docs iteration checklist
+1. Light default; dark stays neutral. Never make the docs lead with green.
+2. Emerald only on links / TOC-current / active-rail / focus. Copper only on the
+   CTA brackets + `tip`. No fills.
+3. Geist + JetBrains Mono. Don't reintroduce Inter or a display face here.
+4. Override brand tokens **unlayered**, or `@layer lucode` will beat you.
+5. Keep it a reading surface: quiet, high-contrast, one signature (the brackets).

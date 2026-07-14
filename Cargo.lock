@@ -2572,7 +2572,6 @@ name = "scarab-executor-k8s"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "futures",
  "k8s-openapi",
  "kube",
  "scarab-engine",

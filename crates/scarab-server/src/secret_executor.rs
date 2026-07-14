@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use scarab_engine::ports::{ExecHandle, ExecState, Executor, LogChunks};
+use scarab_engine::ports::{ExecHandle, ExecState, Executor};
 use scarab_engine::{Db, ExecError, StepRun, StepSpec};
 use scarab_secrets::{SecretProvider, SecretScope};
 
@@ -95,21 +95,5 @@ impl Executor for SecretInjectingExecutor {
 
     async fn output(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
         self.inner.output(handle).await
-    }
-
-    async fn results(
-        &self,
-        handle: &ExecHandle,
-    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ExecError> {
-        // Forward to the wrapped executor — this decorator only augments `launch`;
-        // named-results capture (ADR-0041) must pass straight through, or a
-        // secrets-wired deployment would silently drop every step's results.
-        self.inner.results(handle).await
-    }
-
-    async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
-        // Forward the log tail unchanged (ADR-0013); redaction happens downstream
-        // in the pipeline, not here.
-        self.inner.log_stream(step).await
     }
 }
