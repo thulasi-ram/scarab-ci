@@ -1,0 +1,26 @@
+---
+title: Pipeline authoring
+description: Writing Scarab pipelines — YAML frontend, the typed IR, CEL expressions, invoke, and matrix.
+---
+
+import Doodle from '../../../components/Doodle.astro';
+
+<Doodle icon="git-branch" size={210} rotate={-12} opacity={0.07} top="7rem" right="-2rem" />
+
+:::note[Work in progress]
+Authoring guides grow as the DSL surface lands in vertical slices. The authoritative model lives in
+the ADRs today; this section will turn that into task-oriented how-tos.
+:::
+
+## The model, in brief
+
+A Scarab pipeline is a **flat recursive DAG** (`Pipeline → Step`)
+([ADR-0006](/scarab-ci/tech/adr/0006-pipeline-ontology/)). The real DSL is a **typed IR**; YAML is a
+frontend and **CEL** provides expressions ([ADR-0009](/scarab-ci/tech/adr/0009-dsl-ir-yaml-cel/)).
+
+- **`invoke`** is reuse — compile-time inlining of a library pipeline into the caller's DAG
+  ([ADR-0038](/scarab-ci/tech/adr/0038-invoke-and-local-reuse/)).
+- **`matrix`** is a modifier that fans a step out over a set of inputs.
+- A **step** is an OCI image plus a contract ([ADR-0008](/scarab-ci/tech/adr/0008-step-contract/)).
+
+Start from [Run locally](/scarab-ci/get-started/run-locally/) to submit your first pipeline.

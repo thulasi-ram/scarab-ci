@@ -1,0 +1,26 @@
+---
+title: Deploy with Helm
+description: Deploying Scarab to a real cluster via a packaged Helm chart.
+---
+
+import Doodle from '../../../components/Doodle.astro';
+
+<Doodle icon="package" size={210} rotate={11} opacity={0.06} top="7rem" right="-2rem" />
+
+:::caution[Stub — lands with the chart]
+A packaged, distributed Helm chart is **not built yet** (ADR-0040 scopes the chart itself as
+separate product work). This page is a placeholder so the deployment story has a home; it fills in
+when the chart ships.
+:::
+
+## Planned shape
+
+Scarab is Kubernetes-only by design ([ADR-0005](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)),
+so a Helm chart is the intended install path for a real cluster:
+
+- A published chart (chart repo or OCI registry) with a versioned `values.yaml`.
+- Wiring for the durability substrate (Postgres) and the blob/object store.
+- Namespace-per-run tenancy and the hardened step baseline
+  ([ADR-0039](/scarab-ci/tech/adr/0039-privileged-images/)).
+
+Until then, use [Run locally](/scarab-ci/get-started/run-locally/) to exercise the system.

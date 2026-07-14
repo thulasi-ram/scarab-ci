@@ -1,0 +1,31 @@
+{
+  "name": "scarab-docs-ui",
+  "type": "module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Scarab documentation site (Astro Starlight; ADR-0040). Operator-primary docs; sources docs/adr + openapi.json in place. DESIGN.md-branded with an offline rough.js doodle generator.",
+  "scripts": {
+    "gen:content": "node scripts/sync-content.mjs",
+    "gen:doodles": "node scripts/gen-doodles.mjs",
+    "gen": "npm run gen:content && npm run gen:doodles",
+    "predev": "npm run gen",
+    "prebuild": "npm run gen",
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.41.3",
+    "@fontsource/inter": "^5.2.8",
+    "@fontsource/jetbrains-mono": "^5.2.8",
+    "astro": "^7.0.2",
+    "sharp": "^0.34.5",
+    "starlight-openapi": "^0.26.0"
+  },
+  "devDependencies": {
+    "lucide": "^1.24.0",
+    "roughjs": "^4.6.6"
+  }
+}

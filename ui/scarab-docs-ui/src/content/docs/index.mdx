@@ -1,0 +1,69 @@
+---
+title: Scarab
+description: A durable-execution, Kubernetes-native CI system — a forge-integrated alternative to GitHub Actions, written in Rust.
+template: splash
+hero:
+  tagline: Your pipeline is a workflow that survives crashes, not a fire-and-forget batch job.
+  image:
+    file: ../../assets/logo.svg
+  actions:
+    - text: Run it locally
+      link: /scarab-ci/get-started/run-locally/
+      icon: right-arrow
+    - text: Why durable execution
+      link: /scarab-ci/tech/adr/0001-ci-as-durable-execution/
+      icon: open-book
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+import Doodle from '../../components/Doodle.astro';
+
+<Doodle icon="bug" size={260} rotate={-14} opacity={0.07} top="6rem" right="-3rem" />
+
+Scarab treats a pipeline as a **resumable, inspectable, mutable-mid-flight workflow**. Because the
+orchestrator is a crash-safe durable state machine on Postgres, **resume**, **restart-a-step**,
+**time-travel**, and long-lived **approval gates** are native — not bolted on.
+
+![The Scarab control plane — live DAG, SSE logs, time-travel (placeholder)](../../assets/screenshot-placeholder.svg)
+
+## The wedge
+
+<CardGrid>
+  <Card title="Durable by construction" icon="approve-check">
+    A DBOS-pattern durable state machine on Postgres. A mid-run control-plane kill resumes exactly
+    where it left off — durability is the product, not a feature.
+  </Card>
+  <Card title="Kubernetes-native" icon="puzzle">
+    Pod-per-step execution on a content-addressed workspace (per-file merkle CAS). k8s-only, no
+    bespoke runner fleet to babysit.
+  </Card>
+  <Card title="Forge-integrated, keyless" icon="seti:lock">
+    Forge-agnostic OIDC identity, with Scarab itself as an OIDC issuer for keyless federation to
+    your cloud.
+  </Card>
+  <Card title="A real DSL" icon="seti:config">
+    A typed IR (the actual DSL) with a YAML frontend and CEL expressions — a flat recursive DAG
+    where <code>invoke</code> is reuse and matrix is a modifier.
+  </Card>
+</CardGrid>
+
+<Doodle icon="workflow" size={200} rotate={12} opacity={0.06} bottom="2rem" left="-2rem" />
+
+## Where to go next
+
+<CardGrid>
+  <Card title="Run it locally" icon="rocket">
+    Bring up Postgres + MinIO + a kind cluster and watch a pipeline complete — [Run
+    locally](/scarab-ci/get-started/run-locally/).
+  </Card>
+  <Card title="Read the design" icon="open-book">
+    The thesis, the durability contract, and the ubiquitous language live in the
+    [Tech](/scarab-ci/tech/context/) section — 40+ ADRs on the *why* behind every choice.
+  </Card>
+</CardGrid>
+
+:::note[Status]
+Scarab is **design + scaffolding** (🌱). The API reference and the Tech section are real today; the
+Guides and Configure sections grow as vertical slices land, and Helm packaging is on the way.
+:::

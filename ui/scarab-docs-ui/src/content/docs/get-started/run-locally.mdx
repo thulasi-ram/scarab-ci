@@ -1,0 +1,57 @@
+---
+title: Run locally
+description: Bring up the full Scarab dev stack — Postgres, MinIO, a kind cluster, and scarab-server — and watch a pipeline complete.
+---
+
+import Doodle from '../../../components/Doodle.astro';
+
+<Doodle icon="terminal" size={200} rotate={-10} opacity={0.07} top="7rem" right="-2rem" />
+
+The repo ships a one-command dev harness (a `Justfile` over `dev/`). This is the path that works
+**today** — it runs the durable core end-to-end on your machine.
+
+## Prerequisites
+
+- **docker**, **kind**, **kubectl** — the stack runs `scarab-server` against a local kind cluster.
+- **cargo** (Rust toolchain, see `rust-toolchain.toml`) — the server is built from source.
+- **python3** — the demo submits a pipeline over the REST API.
+- [`just`](https://github.com/casey/just) — the task runner.
+
+## Bring up the stack
+
+```sh
+just up      # Postgres + MinIO + kind + scarab-server (background)
+```
+
+`just up` starts Postgres and MinIO (via `dev/compose.yaml`), creates a kind cluster
+(`dev/kind.yaml`), and runs `scarab-server` in converged mode against them.
+
+## Submit a pipeline and watch it complete
+
+```sh
+just demo    # submit a one-step pipeline and watch it run to completion
+```
+
+This posts a pipeline to the running server and follows it to a terminal state — the walking
+skeleton that survives a mid-run control-plane kill.
+
+## Iterate
+
+```sh
+just serve   # run scarab-server in the FOREGROUND against the dev stack (Ctrl-C to stop)
+just logs    # tail the background server log
+just down    # tear the whole stack down
+```
+
+:::tip[See the UI]
+`just ui` starts the SolidJS web UI (Vite on <code>http://localhost:5173</code>), which proxies
+`/v1` to the running server. It's an early scaffold today — the rich live-DAG / SSE-logs UI is a
+follow-up.
+:::
+
+## What just happened
+
+The server persisted every step transition to Postgres as a durable state machine. Kill the
+control plane mid-run and bring it back — the run resumes from where it stopped rather than
+restarting. That durability contract is the whole point; see
+[ADR-0002](/scarab-ci/tech/adr/0002-durability-model/).

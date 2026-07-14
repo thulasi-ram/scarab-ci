@@ -1,0 +1,103 @@
+/* Scarab docs theme — ADR-0040. Ports docs/DESIGN.md onto Starlight tokens,
+ * tuned for documentation. Dark = the carapace signature (screenshots blend);
+ * light = emerald-on-near-white for long-form reading. Starlight respects the
+ * OS preference by default. Copper is OUTLINE-ONLY. Zero shadows, depth by shade. */
+
+:root {
+  --sl-font: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  /* DESIGN.md palette (literals, so tables/badges can reference them). */
+  --carapace-black: #0e1310;
+  --pine-deep: #12241a;
+  --pine: #163a2b;
+  --emerald-surface: #1b5240;
+  --emerald-elevated: #236149;
+  --emerald: #2ea77f;
+  --emerald-bright: #3fc79a;
+  --copper: #c0873f;
+  --soft-white: #f4f8f4;
+  --sage: #a8c0b3;
+  --muted-sage: #6f8579;
+  --scarab-border: #26443a;
+
+  /* Zero shadows — depth is shade (DESIGN.md §7). */
+  --sl-shadow-sm: none;
+  --sl-shadow-md: none;
+  --sl-shadow-lg: none;
+}
+
+/* ---- Dark: the carapace ladder (default signature) ---- */
+:root,
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #163a2b;
+  --sl-color-accent: #2ea77f;
+  --sl-color-accent-high: #3fc79a;
+
+  --sl-color-white: #f4f8f4;
+  --sl-color-gray-1: #eef3ef;
+  --sl-color-gray-2: #c3d3ca;
+  --sl-color-gray-3: #a8c0b3; /* sage */
+  --sl-color-gray-4: #6f8579; /* muted-sage */
+  --sl-color-gray-5: #26443a; /* border */
+  --sl-color-gray-6: #12241a; /* chrome */
+  --sl-color-black: #0e1310;  /* page base */
+
+  --sl-color-bg: #0e1310;
+  --sl-color-bg-nav: #0e1310;
+  --sl-color-bg-sidebar: #12241a;
+  --sl-color-bg-inline-code: #163a2b;
+  --sl-color-bg-accent: #163a2b;
+  --sl-color-hairline: #26443a;
+  --sl-color-hairline-shade: #26443a;
+  --sl-color-hairline-light: #26443a;
+  --sl-color-text-accent: #3fc79a;
+}
+
+/* ---- Light: emerald on near-white, tuned for reading ---- */
+:root[data-theme='light'] {
+  --sl-color-accent-low: #d3ece1;
+  --sl-color-accent: #17795a;
+  --sl-color-accent-high: #0f4f3b;
+
+  --sl-color-white: #0e1310;  /* darkest text token */
+  --sl-color-gray-1: #16211c;
+  --sl-color-gray-2: #2b3b33;
+  --sl-color-gray-3: #4c5f55;
+  --sl-color-gray-4: #6f8579;
+  --sl-color-gray-5: #cdd8d1;
+  --sl-color-gray-6: #eef3ef;
+  --sl-color-gray-7: #f6f9f6;
+  --sl-color-black: #ffffff;
+
+  --sl-color-bg: #f6f9f6;
+  --sl-color-bg-nav: #ffffff;
+  --sl-color-bg-sidebar: #eef3ef;
+  --sl-color-bg-inline-code: #e5efe8;
+  --sl-color-hairline: #cdd8d1;
+  --sl-color-hairline-shade: #cdd8d1;
+  --sl-color-text-accent: #17795a;
+}
+
+/* Tuned for docs: looser reading rhythm than the dense control plane. */
+.sl-markdown-content { line-height: 1.7; }
+.sl-markdown-content :is(h1, h2, h3) { letter-spacing: -0.4px; }
+
+/* Uppercase micro-labels for structure (DESIGN.md §3). */
+.sl-markdown-content h2 { text-transform: none; }
+
+/* Screenshots as first-class cards: hairline border, radius, zero shadow — so a
+ * dark product shot never floats, especially in light mode (DESIGN.md §4). */
+.sl-markdown-content img {
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 8px;
+  background: var(--sl-color-bg-inline-code);
+}
+
+/* Copper as an EDGE, never a fill: featured asides get a copper hairline. */
+.sl-markdown-content .starlight-aside--tip {
+  border-inline-start-color: var(--copper);
+}
+
+/* Hero (landing): keep it flat; copper hairline under the tagline only. */
+.hero .tagline { color: var(--sl-color-gray-2); }
