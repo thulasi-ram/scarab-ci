@@ -1,41 +1,100 @@
-/* Scarab design system (docs/DESIGN.md). Beetle carapace: a ladder of near-black
-   greens for depth-by-shade, zero shadows, copper reserved strictly for outlines
-   and doodle strokes. Inter for UI, JetBrains Mono for machine tokens. */
+/* Scarab design system (docs/DESIGN.md).
+   Light-first "engineering-blueprint" skin (Convey-influenced): warm paper base,
+   near-black pine ink, technical corner-bracket frames + registration dots, a
+   faint dot-grid texture, and mono for every label/annotation. Pine + black stay
+   the identity (dark terminal panels + dark mode carry the carapace); emerald is
+   the one interactive accent and gold shows up ONLY as edges — hairlines, corner
+   marks, doodle strokes, and the rare accented token. Never a fill.
+
+   Theming: light is the default (:root). `<html data-theme="dark">` restores the
+   beetle carapace. Every rule reads the semantic aliases below, so a theme swap
+   is just re-pointing the tokens. */
 
 :root {
-  /* Surfaces — the carapace ladder (depth via shade) */
-  --carapace-black: #0e1310;
-  --pine-deep: #12241a;
-  --pine: #163a2b;
-  --emerald-surface: #1b5240;
-  --emerald-elevated: #236149;
+  /* ── Surfaces (cool light ladder — clean, never warm/beige) ──────────── */
+  --carapace-black: #f1f4f3; /* page + top-bar base (cool near-white, faint green) */
+  --pine-deep: #e7ecea;      /* secondary chrome: table head, inputs, steps, panel headers */
+  --pine: #14241b;           /* primary-button fill (dark pine — high contrast on white) */
+  --emerald-surface: #ffffff; /* cards / panels */
+  --emerald-elevated: #ffffff; /* elevated: modal, popover */
 
-  /* Accent — green only (no gold fills) */
-  --emerald: #2ea77f;
-  --emerald-bright: #3fc79a;
+  /* Dark "terminal" panels (logs + DAG canvas) keep the pine/black identity
+     even in light mode — a black-green console reads as intentional here. */
+  --terminal: #0e1a14;
+  --terminal-elev: #16281e;  /* dag nodes */
+  --terminal-ink: #cfe2d6;
+  --terminal-line: #263d31;
 
-  /* Outline — copper-gold (strokes & doodles ONLY, never a fill) */
-  --copper: #c0873f;
-  --border-copper: rgba(192, 135, 63, 0.4);
+  /* ── Accent — emerald (interactive/active/success) ───────────────────── */
+  --emerald: #137a52;        /* links, active nav, focus — deepened for white contrast */
+  --emerald-bright: #0f6644; /* hover */
 
-  /* Text on dark surfaces */
-  --soft-white: #f4f8f4;
-  --sage: #a8c0b3;
-  --muted-sage: #6f8579;
+  /* ── Edge — gold (strokes, rivets, doodles, rare accent text) ────────── */
+  --copper: #8a6416;         /* deepened so gold text/edges read on white. Never a fill. */
+  --border-copper: rgba(138, 100, 22, 0.5);
+  --rivet: var(--copper);    /* registration-rivet color (§4) */
 
-  /* Borders */
-  --border: #26443a;
+  /* ── Text (ink on light) ─────────────────────────────────────────────── */
+  --soft-white: #0f1a15;     /* primary ink (near-black pine) */
+  --sage: #46504a;           /* secondary */
+  --muted-sage: #79837c;     /* metadata, timestamps, disabled */
+  --on-pine: #f2f6f4;        /* text on the dark pine primary button (light in both themes) */
 
-  /* Status */
-  --ok: #34b37e;
-  --running: #2f9e8f;
-  --danger: #d1584f;
+  /* ── Lines ───────────────────────────────────────────────────────────── */
+  --border: #dbe1de;         /* default hairline (cool gray) */
+  --border-soft: #e8ecea;    /* softer hairline */
+  --dot: rgba(15, 26, 21, 0.05); /* dot-grid texture ink */
+
+  /* ── Status ──────────────────────────────────────────────────────────── */
+  --ok: #1f8f5c;
+  --running: #1c8a7c;
+  --danger: #c4443b;
+  --badge-ink: #f6f9f6;      /* text on solid status pills */
 
   --radius: 8px;
   --radius-sm: 6px;
 
+  --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
   --font-ui: "Inter", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  color-scheme: light;
+}
+
+/* ── Dark carapace (opt-in) ────────────────────────────────────────────── */
+[data-theme="dark"] {
+  --carapace-black: #0e1310;
+  --pine-deep: #12211a;
+  --pine: #17392a;
+  --emerald-surface: #14261d;
+  --emerald-elevated: #183024;
+
+  --terminal: #090e0b;
+  --terminal-elev: #14231b;
+  --terminal-ink: #a8c0b3;
+  --terminal-line: #21372c;
+
+  --emerald: #2ea77f;
+  --emerald-bright: #3fc79a;
+
+  --copper: #c0873f;
+  --border-copper: rgba(192, 135, 63, 0.42);
+
+  --soft-white: #f4f8f4;
+  --sage: #a8c0b3;
+  --muted-sage: #6f8579;
+  --on-pine: #f3f7f2;
+
+  --border: #244036;
+  --border-soft: #1b3228;
+  --dot: rgba(200, 224, 208, 0.05);
+
+  --ok: #34b37e;
+  --running: #2f9e8f;
+  --danger: #d1584f;
+  --badge-ink: #0b120e;
+
+  color-scheme: dark;
 }
 
 * {
@@ -56,6 +115,7 @@ body {
   line-height: 1.5;
   letter-spacing: -0.16px;
   -webkit-font-smoothing: antialiased;
+  transition: background 0.2s ease, color 0.2s ease;
 }
 
 code,
@@ -64,7 +124,7 @@ code,
   letter-spacing: 0;
 }
 
-/* ---- Navigation ------------------------------------------------------- */
+/* ---- Navigation (legacy .nav block, kept for safety) ------------------ */
 
 .nav {
   display: flex;
@@ -80,7 +140,7 @@ code,
   align-items: center;
   gap: 9px;
   font-size: 18px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: -0.4px;
   color: var(--soft-white);
   text-decoration: none;
@@ -124,9 +184,20 @@ code,
   position: relative;
   max-width: 1200px;
   margin: 0 auto;
-  padding: 40px 32px 80px;
+  padding: 44px 32px 80px;
   overflow: hidden; /* keep rotated doodles from spawning scrollbars */
   min-height: calc(100vh - 57px);
+}
+
+/* Faint engineering dot-grid — texture, never noise. Behind all content. */
+.page::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: radial-gradient(var(--dot) 1px, transparent 1.4px);
+  background-size: 24px 24px;
 }
 
 .page > * {
@@ -142,17 +213,19 @@ code,
 }
 
 h1 {
+  font-family: var(--font-display);
   font-size: 40px;
-  font-weight: 500;
-  line-height: 1.05;
-  letter-spacing: -0.8px;
+  font-weight: 700;
+  line-height: 1.02;
+  letter-spacing: -1.4px;
   margin: 0 0 24px;
 }
 
 h2 {
+  font-family: var(--font-display);
   font-size: 20px;
-  font-weight: 500;
-  letter-spacing: -0.2px;
+  font-weight: 600;
+  letter-spacing: -0.4px;
   margin: 32px 0 12px;
 }
 
@@ -165,6 +238,36 @@ h2 {
 
 .subtle {
   color: var(--muted-sage);
+}
+
+/* ---- Registration rivets (the house signature) ------------------------ */
+/* Four small square "rivets" at the corners, drawn as a single ::after overlay
+   so they sit cleanly on ANY element regardless of its own border or fill (the
+   old inset L-brackets fought bordered/filled cards). The overlay spans the box
+   and paints one 3px square in each corner. Rivet color defaults to gold but is
+   overridable per element via --rivet (e.g. light rivets on the dark button). */
+.riveted {
+  position: relative;
+}
+.riveted::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  border-radius: inherit;
+  background-image:
+    linear-gradient(var(--rivet) 0 0),
+    linear-gradient(var(--rivet) 0 0),
+    linear-gradient(var(--rivet) 0 0),
+    linear-gradient(var(--rivet) 0 0);
+  background-size: 3px 3px;
+  background-position:
+    var(--rivet-inset, 5px) var(--rivet-inset, 5px),
+    calc(100% - var(--rivet-inset, 5px)) var(--rivet-inset, 5px),
+    var(--rivet-inset, 5px) calc(100% - var(--rivet-inset, 5px)),
+    calc(100% - var(--rivet-inset, 5px)) calc(100% - var(--rivet-inset, 5px));
+  background-repeat: no-repeat;
 }
 
 /* ---- Buttons ---------------------------------------------------------- */
@@ -185,13 +288,16 @@ h2 {
   cursor: default;
 }
 
-/* Primary: pine fill, hover lifts toward emerald-surface */
+/* Primary: dark pine fill, light text, hover lifts toward emerald */
 .btn-primary {
   background: var(--pine);
-  color: var(--soft-white);
+  color: var(--on-pine);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .btn-primary:not(:disabled):hover {
-  background: var(--emerald-surface);
+  background: var(--emerald-bright);
 }
 
 /* Ghost: transparent, hairline border, hover border → emerald */
@@ -229,10 +335,7 @@ h2 {
 .table {
   width: 100%;
   border-collapse: collapse;
-  /* Sit on the page base as a contained panel — not a saturated emerald slab.
-     Depth comes from a hairline border + a subtle header band, per the calm
-     control-plane read (docs/DESIGN.md §4). */
-  background: transparent;
+  background: var(--emerald-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
@@ -240,10 +343,11 @@ h2 {
 
 .table thead th {
   text-align: left;
-  font-size: 11px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
   font-weight: 500;
   text-transform: uppercase;
-  letter-spacing: 0.4px;
+  letter-spacing: 1px;
   color: var(--muted-sage);
   padding: 11px 16px;
   background: var(--pine-deep);
@@ -254,7 +358,7 @@ h2 {
   padding: 12px 16px;
   font-size: 14px;
   color: var(--sage);
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-soft);
 }
 
 .table tbody tr:last-child td {
@@ -267,8 +371,7 @@ h2 {
 }
 
 .table tbody tr:hover {
-  /* gentle emerald wash on hover rather than a flat fill */
-  background: rgba(46, 167, 127, 0.07);
+  background: color-mix(in srgb, var(--emerald) 8%, transparent);
 }
 
 .table td .mono {
@@ -281,13 +384,13 @@ h2 {
   display: inline-block;
   padding: 2px 10px;
   border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 500;
   text-transform: lowercase;
-  font-variant: small-caps;
   letter-spacing: 0.3px;
   border: 1px solid transparent;
-  color: var(--carapace-black);
+  color: var(--badge-ink);
 }
 
 .badge-succeeded {
@@ -311,6 +414,7 @@ h2 {
 /* ---- Cards & forms ---------------------------------------------------- */
 
 .card {
+  position: relative;
   background: var(--emerald-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -335,22 +439,23 @@ h2 {
 }
 
 .field-label {
-  font-size: 11px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
   font-weight: 500;
   text-transform: uppercase;
-  letter-spacing: 0.4px;
+  letter-spacing: 1px;
   color: var(--muted-sage);
 }
 
 .input {
   font-family: var(--font-mono);
   font-size: 13px;
-  background: var(--pine-deep);
+  background: var(--emerald-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   color: var(--soft-white);
   padding: 8px 10px;
-  transition: border-color 0.12s ease;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
 }
 
 .input::placeholder {
@@ -360,6 +465,7 @@ h2 {
 .input:focus {
   outline: none;
   border-color: var(--emerald);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--emerald) 18%, transparent);
 }
 
 .form-row {
@@ -414,7 +520,20 @@ h2 {
   display: flex;
   align-items: center;
   gap: 14px;
-  margin-bottom: 24px;
+  margin-bottom: 12px;
+}
+
+/* Action buttons sit one level below the breadcrumb, not inline with it. */
+.run-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+.run-toolbar .btn-sm {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .run-id {
@@ -427,9 +546,10 @@ h2 {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 11px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
   text-transform: uppercase;
-  letter-spacing: 0.4px;
+  letter-spacing: 1px;
   color: var(--running);
 }
 
@@ -491,7 +611,7 @@ h2 {
   gap: 12px;
   padding: 6px 4px;
   font-size: 13px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-soft);
 }
 
 .timeline-row:last-child {
@@ -520,16 +640,17 @@ h2 {
   margin-bottom: 8px;
 }
 
+/* Logs = dark pine terminal, in both themes (the pine/black identity's home). */
 .logs {
   margin: 0;
-  background: var(--carapace-black);
-  border: 1px solid var(--border);
+  background: var(--terminal);
+  border: 1px solid var(--terminal-line);
   border-radius: var(--radius);
   padding: 16px 18px;
   font-family: var(--font-mono);
   font-size: 12.5px;
   line-height: 1.55;
-  color: var(--sage);
+  color: var(--terminal-ink);
   height: 62vh;
   overflow: auto;
   white-space: pre-wrap;
@@ -573,10 +694,12 @@ h2 {
 /* ---- Run detail v2: provenance + DAG + panels ------------------------ */
 
 .panel {
+  position: relative;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   overflow: hidden;
   margin-bottom: 16px;
+  background: var(--emerald-surface);
 }
 
 .panel-h {
@@ -595,13 +718,14 @@ h2 {
 }
 
 .prov {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   gap: 12px 32px;
-  padding: 16px 18px;
+  padding: 18px 20px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  background: var(--pine-deep);
+  background: var(--emerald-surface);
   margin-bottom: 16px;
 }
 
@@ -628,12 +752,12 @@ h2 {
   color: var(--muted-sage);
 }
 
-/* DAG */
+/* DAG = dark terminal canvas (like logs). */
 .dag {
   position: relative;
   overflow-x: auto;
   padding: 22px 20px;
-  background: var(--carapace-black);
+  background: var(--terminal);
 }
 
 .dag-edges {
@@ -647,7 +771,7 @@ h2 {
 }
 
 .dag-edges path {
-  stroke: #3a5d4e;
+  stroke: var(--terminal-line);
   stroke-width: 1.5;
 }
 
@@ -673,10 +797,10 @@ h2 {
   align-items: center;
   gap: 8px;
   padding: 8px 13px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--terminal-line);
   border-radius: 8px;
-  background: var(--pine-deep);
-  color: var(--soft-white);
+  background: var(--terminal-elev);
+  color: var(--terminal-ink);
   font-family: var(--font-ui);
   cursor: pointer;
   transition: border-color 0.12s ease, background 0.12s ease;
@@ -684,13 +808,12 @@ h2 {
 }
 
 .dnode:hover {
-  border-color: var(--emerald);
+  border-color: var(--emerald-bright);
 }
 
 .dnode.sel {
-  border-color: var(--emerald);
-  box-shadow: inset 0 0 0 1px var(--emerald);
-  background: var(--emerald-surface);
+  border-color: var(--emerald-bright);
+  box-shadow: inset 0 0 0 1px var(--emerald-bright);
 }
 
 .dnode.running {
@@ -718,7 +841,8 @@ h2 {
 .sdot.failed { background: var(--danger); }
 .sdot.running {
   background: var(--running);
-  box-shadow: 0 0 0 3px rgba(47, 158, 143, 0.18), 0 0 0 4px var(--border-copper);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--running) 22%, transparent),
+    0 0 0 4px var(--border-copper);
 }
 .sdot.pending,
 .sdot.ready,
@@ -727,20 +851,39 @@ h2 {
   background: transparent;
   box-shadow: inset 0 0 0 1px var(--muted-sage);
 }
-.sdot.cancelled { background: #7a5a5a; }
+.sdot.cancelled { background: #9a7a7a; }
 
-/* run-detail two-column body */
+/* run-detail two-column body — DAG and Logs share the same height. */
 .rd-grid {
   display: grid;
   grid-template-columns: 1.1fr 1fr;
   gap: 16px;
-  align-items: start;
+  align-items: stretch;
+}
+/* The panels stretch to the tallest (Logs); each lays out as a column so its
+   body fills the leftover height below the header. */
+.rd-grid > .panel {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+.dag-panel .dag {
+  flex: 1;
+  display: flex;
+  align-items: center; /* center a small graph in the taller canvas */
+}
+.logs-panel .logs {
+  flex: 1;
+  height: auto; /* fill instead of the fixed 54vh */
+  min-height: 54vh;
 }
 
 @media (max-width: 860px) {
   .rd-grid {
     grid-template-columns: 1fr;
+    align-items: start;
   }
+  .rd-grid > .panel { margin-bottom: 16px; }
 }
 
 .step-detail-body {
@@ -812,7 +955,7 @@ h2 {
 }
 .logtool {
   background: none;
-  border: 1px solid var(--border-soft, #1d3329);
+  border: 1px solid var(--border-soft);
   border-radius: 5px;
   color: var(--muted-sage);
   font-family: var(--font-mono);
@@ -823,7 +966,7 @@ h2 {
   text-transform: lowercase;
 }
 .logtool:hover { border-color: var(--border); color: var(--sage); }
-.logtool.on { border-color: var(--emerald); color: var(--emerald-bright); }
+.logtool.on { border-color: var(--emerald); color: var(--emerald); }
 
 /* selected-step meta above the log body */
 .log-substep {
@@ -833,8 +976,8 @@ h2 {
   padding: 8px 16px;
   font-size: 12px;
   color: var(--sage);
-  border-bottom: 1px solid var(--border-soft, #1d3329);
-  background: var(--carapace-black);
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--pine-deep);
 }
 
 .timeline {
@@ -849,7 +992,7 @@ h2 {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   Repo-first shell + surfaces (matches the UI audit)
+   Repo-first shell + surfaces
    ════════════════════════════════════════════════════════════════════════ */
 
 .app { min-height: 100vh; }
@@ -866,59 +1009,155 @@ h2 {
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: -0.4px;
+  gap: 9px;
+  font-family: var(--font-display);
+  font-size: 21px;
+  font-weight: 700;
+  letter-spacing: -0.6px;
   color: var(--soft-white);
   text-decoration: none;
 }
 .brand svg { color: var(--copper); }
 .crumbs { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 13px; }
 .crumb { color: var(--sage); text-decoration: none; }
-.crumb:hover { color: var(--emerald-bright); }
+.crumb:hover { color: var(--emerald); text-decoration: underline; text-underline-offset: 3px; }
 .crumb.mono { color: var(--muted-sage); }
-.crumb-sep { color: #3a4d44; }
+.crumb-sep { color: var(--muted-sage); }
 .topbar-spacer { margin-left: auto; }
 .search-chip {
   display: inline-flex; align-items: center; gap: 8px;
   font-family: var(--font-mono); font-size: 11.5px; color: var(--muted-sage);
-  background: var(--carapace-black); border: 1px solid var(--border-soft, #1d3329);
+  background: var(--emerald-surface); border: 1px solid var(--border);
   border-radius: 7px; padding: 5px 11px; cursor: pointer;
 }
-.search-chip:hover { border-color: var(--border); color: var(--sage); }
+.search-chip:hover { border-color: var(--emerald); color: var(--sage); }
+.theme-toggle {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; border-radius: 7px; cursor: pointer;
+  background: var(--emerald-surface); border: 1px solid var(--border);
+  color: var(--muted-sage); transition: color 0.12s ease, border-color 0.12s ease;
+}
+.theme-toggle:hover { color: var(--copper); border-color: var(--copper); }
 .avatar {
   width: 26px; height: 26px; border-radius: 50%;
-  background: linear-gradient(135deg, var(--emerald-surface), var(--pine));
+  background: var(--pine);
   border: 1px solid var(--border);
 }
 
 /* ---- page head ---- */
 .page-head { display: flex; align-items: center; gap: 16px; }
 .page-head h1 { margin: 0; flex: 1; }
-.page-sub { margin: 4px 0 24px; }
+.page-sub { margin: 6px 0 26px; font-family: var(--font-mono); font-size: 12.5px; color: var(--muted-sage); }
+/* Contextual CTA sits one level below the header, not inline with it. */
+.page-toolbar { display: flex; justify-content: flex-end; margin-top: 12px; }
+.page-toolbar + .tabs { margin-top: 16px; }
+/* org prefix inside a repo header, e.g. "acme / web" (context, now that the
+   top-bar breadcrumb is gone) */
+.head-org { color: var(--muted-sage); font-weight: 400; }
+
+/* ---- run-screen breadcrumb heading ---- */
+/* The repo name is the header on the repo screen; on a run it stays at header
+   size as a breadcrumb link, followed by the run title. */
+.crumb-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0;
+  flex: 0 1 auto;
+  min-width: 0;
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.6px;
+}
+.crumb-head-link { color: var(--muted-sage); text-decoration: none; flex: none; }
+.crumb-head-link:hover { color: var(--emerald); }
+.crumb-head-sep { color: var(--muted-sage); align-self: center; flex: none; }
+.crumb-head-title {
+  flex: 1;
+  min-width: 0;
+  color: var(--soft-white);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- filter selects (branch / trigger — the old Branches/PRs tabs) ---- */
+.fselect {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted-sage);
+  background: var(--emerald-surface);
+}
+.fselect:focus-within { border-color: var(--emerald); }
+.fselect select {
+  border: none;
+  background: none;
+  outline: none;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--sage);
+  cursor: pointer;
+  padding-right: 2px;
+}
 
 /* ---- buttons additions ---- */
-.btn-copper { background: transparent; border-color: var(--copper); color: var(--copper); display: inline-flex; align-items: center; gap: 6px; }
-.btn-copper:hover { background: rgba(192,135,63,0.08); }
-.btn-primary { display: inline-flex; align-items: center; gap: 6px; }
+.btn-copper {
+  background: transparent; border-color: var(--copper); color: var(--copper);
+  display: inline-flex; align-items: center; gap: 6px;
+}
+.btn-copper:hover { background: color-mix(in srgb, var(--copper) 10%, transparent); }
 .btn-sm { padding: 5px 11px; font-size: 12px; }
+
+/* Riveted CTAs (Convey button motif): four corner rivets. The dark-pine primary
+   gets light rivets; the gold-outline featured button gets gold rivets. Gold
+   stays an edge, never a fill. */
+.btn-primary,
+.btn-copper {
+  position: relative;
+}
+.btn-primary { --btn-rivet: rgba(242, 246, 244, 0.8); }
+.btn-copper { --btn-rivet: var(--copper); }
+.btn-primary::after,
+.btn-copper::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  border-radius: inherit;
+  background-image:
+    linear-gradient(var(--btn-rivet) 0 0),
+    linear-gradient(var(--btn-rivet) 0 0),
+    linear-gradient(var(--btn-rivet) 0 0),
+    linear-gradient(var(--btn-rivet) 0 0);
+  background-size: 2.5px 2.5px;
+  background-position: 4px 4px, calc(100% - 4px) 4px, 4px calc(100% - 4px),
+    calc(100% - 4px) calc(100% - 4px);
+  background-repeat: no-repeat;
+}
 
 /* ---- repo cards ---- */
 .repo-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
 @media (max-width: 720px) { .repo-grid { grid-template-columns: 1fr; } }
 .repo-card {
+  position: relative;
   display: block; text-decoration: none; color: inherit;
-  background: var(--pine-deep); border: 1px solid var(--border); border-radius: 12px;
-  padding: 16px 18px; transition: border-color 0.12s ease, background 0.12s ease;
+  background: var(--emerald-surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 18px 20px; transition: border-color 0.12s ease, background 0.12s ease;
 }
-.repo-card:hover { border-color: var(--emerald); background: #14291d; }
+.repo-card:hover { border-color: var(--emerald); }
 .repo-card-head { display: flex; align-items: center; gap: 10px; }
-.repo-name { font-size: 15px; font-weight: 600; color: var(--soft-white); }
+.repo-name { font-family: var(--font-display); font-size: 15px; font-weight: 600; letter-spacing: -0.3px; color: var(--soft-white); }
 .repo-org { color: var(--muted-sage); font-weight: 400; }
 .repo-go { margin-left: auto; color: var(--muted-sage); }
+.repo-card:hover .repo-go { color: var(--emerald); }
 .repo-meta { display: flex; align-items: center; gap: 6px; margin-top: 12px; font-size: 12px; color: var(--muted-sage); }
-.dotsep { color: #3a4d44; }
+.dotsep { color: var(--muted-sage); }
 .facet.succeeded { color: var(--ok); }
 .facet.failed { color: var(--danger); }
 .facet.running { color: var(--running); }
@@ -930,36 +1169,36 @@ h2 {
 .spark-bar.succeeded { background: var(--ok); }
 .spark-bar.failed { background: var(--danger); }
 .spark-bar.running { background: var(--running); }
-.spark-bar.pending { background: var(--muted-sage); }
+.spark-bar.pending { background: var(--border); }
 
 /* ---- tabs ---- */
 .tabs { display: flex; gap: 22px; border-bottom: 1px solid var(--border); margin-top: 24px; margin-bottom: 18px; overflow-x: auto; }
 .tab {
   background: none; border: none; cursor: pointer; font-family: var(--font-ui);
   font-size: 14px; color: var(--muted-sage); padding: 0 0 11px; white-space: nowrap;
-  border-bottom: 2px solid transparent;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
 }
 .tab:hover { color: var(--sage); }
-.tab.on { color: var(--emerald); border-bottom-color: var(--emerald); font-weight: 500; }
+.tab.on { color: var(--emerald); border-bottom-color: var(--emerald); font-weight: 600; }
 
 /* ---- filters ---- */
 .filters { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
 .fpill {
   background: none; cursor: pointer; font-family: var(--font-mono); font-size: 11.5px;
-  color: var(--sage); border: 1px solid var(--border-soft, #1d3329); border-radius: 6px; padding: 4px 11px;
+  color: var(--sage); border: 1px solid var(--border); border-radius: 6px; padding: 4px 11px;
 }
-.fpill:hover { border-color: var(--border); }
-.fpill.on { border-color: var(--emerald); color: var(--emerald-bright); }
+.fpill:hover { border-color: var(--emerald); }
+.fpill.on { border-color: var(--emerald); color: var(--emerald); }
 .filters-refresh { margin-left: auto; }
 
 /* ---- run list rows ---- */
-.runlist { border: 1px solid var(--border); border-radius: 11px; overflow: hidden; }
+.runlist { border: 1px solid var(--border); border-radius: 11px; overflow: hidden; background: var(--emerald-surface); }
 .runrow {
   display: grid; grid-template-columns: 16px 1.8fr 1fr 0.7fr 0.7fr; gap: 14px; align-items: center;
-  padding: 12px 16px; border-bottom: 1px solid var(--border-soft, #1d3329); cursor: pointer;
+  padding: 12px 16px; border-bottom: 1px solid var(--border-soft); cursor: pointer;
 }
 .runrow:last-child { border-bottom: none; }
-.runrow:hover { background: rgba(46,167,127,0.05); }
+.runrow:hover { background: color-mix(in srgb, var(--emerald) 7%, transparent); }
 .runrow.head { background: var(--pine-deep); cursor: default; padding: 9px 16px; }
 .runrow.head:hover { background: var(--pine-deep); }
 .runrow.head span { font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted-sage); }
@@ -987,22 +1226,28 @@ h2 {
 
 /* ---- modal ---- */
 .modal-scrim {
-  position: fixed; inset: 0; background: rgba(4,8,6,0.66); z-index: 50;
+  position: fixed; inset: 0; background: rgba(10, 18, 14, 0.5); z-index: 50;
+  backdrop-filter: blur(2px);
   display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh;
 }
-.modal { width: min(460px, 92vw); background: var(--pine-deep); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; box-shadow: 0 30px 70px -30px rgba(0,0,0,0.85); }
+.modal {
+  position: relative;
+  width: min(460px, 92vw); background: var(--emerald-elevated); border: 1px solid var(--border);
+  border-radius: 12px; overflow: hidden;
+  box-shadow: 0 24px 60px -28px rgba(10, 20, 14, 0.45);
+}
 .modal-body { padding: 18px; display: flex; flex-direction: column; gap: 12px; }
+.modal-body label { font-family: var(--font-mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted-sage); display: block; margin-bottom: 5px; }
 .select-like { display: flex; align-items: center; justify-content: space-between; color: var(--sage); }
 .modal-actions { display: flex; gap: 10px; margin-top: 6px; }
 .modal-note { margin: 0; }
 
 /* ---- run title (human, not mono) ---- */
-.run-title { font-size: 21px; font-weight: 600; letter-spacing: -0.4px; margin: 0; }
+.run-title { font-family: var(--font-display); font-size: 22px; font-weight: 700; letter-spacing: -0.6px; margin: 0; }
 .prov .cell .v .sha { color: var(--copper); }
 .prov .tglyph { color: var(--copper); }
 
-/* Secret parity matrix (advisory, ADR-0037) — status is informational, so an
-   `unset` cell is neutral (muted), never an alarming red. */
+/* Secret parity matrix (advisory, ADR-0037) — `unset` stays neutral (muted). */
 .matrix-scroll {
   overflow-x: auto;
 }
@@ -1014,11 +1259,15 @@ h2 {
 .secret-matrix th,
 .secret-matrix td {
   padding: 6px 14px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-soft);
   text-align: center;
   white-space: nowrap;
 }
 .secret-matrix th {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
   color: var(--muted-sage);
   font-weight: 500;
 }
@@ -1036,4 +1285,28 @@ h2 {
 }
 .secret-matrix .m-unset {
   color: var(--muted-sage);
+}
+
+/* ---- Rivet signature (used sparingly, docs/DESIGN.md §4) --------------- */
+/* Only the landing repo cards and the run *summary* block get container rivets
+   — panels, the run list, environments, and secrets stay clean (their CTAs
+   carry the rivet motif instead). Both selectors are position:relative already. */
+.repo-card::after,
+.prov::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  border-radius: inherit;
+  background-image:
+    linear-gradient(var(--rivet) 0 0),
+    linear-gradient(var(--rivet) 0 0),
+    linear-gradient(var(--rivet) 0 0),
+    linear-gradient(var(--rivet) 0 0);
+  background-size: 3px 3px;
+  background-position: 7px 7px, calc(100% - 7px) 7px, 7px calc(100% - 7px),
+    calc(100% - 7px) calc(100% - 7px);
+  background-repeat: no-repeat;
+  opacity: 0.6;
 }

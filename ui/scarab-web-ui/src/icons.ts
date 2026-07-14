@@ -29,6 +29,8 @@ import {
   ArrowUp,
   ArrowLeft,
   RotateCw,
+  Sun,
+  Moon,
 } from "lucide";
 
 // IconNode = Array<[tagName, attributes]>.
@@ -60,6 +62,8 @@ const ICONS: Record<string, IconNode> = {
   "arrow-up": ArrowUp as IconNode,
   "arrow-left": ArrowLeft as IconNode,
   "rotate-cw": RotateCw as IconNode,
+  sun: Sun as IconNode,
+  moon: Moon as IconNode,
 };
 
 export function iconNode(name: string): IconNode | undefined {

@@ -4,6 +4,18 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Scarab</title>
+    <script>
+      // Pre-paint theme guard (docs/DESIGN.md §1): light is the default; honor a
+      // stored choice before first paint to avoid a flash.
+      (function () {
+        try {
+          var t = localStorage.getItem("scarab-theme");
+          document.documentElement.setAttribute("data-theme", t === "dark" ? "dark" : "light");
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "light");
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

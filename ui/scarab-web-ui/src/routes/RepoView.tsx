@@ -1,10 +1,9 @@
-// Repo dashboard (tier 2) — tabs over one repository: Runs (default), Branches,
-// Pull requests, Environments, Secrets, Settings. The runs table shows real
-// backend runs enriched with representative provenance (commit/branch/trigger/
-// author/duration) until the forge slice lands; clicking a run opens the real,
-// live run detail. "Run pipeline" opens a manual-trigger dialog with typed
-// inputs and creates a run.
-import { createResource, createSignal, For, Show } from "solid-js";
+// Repo dashboard (tier 2) — tabs over one repository: Runs (default),
+// Environments, Secrets, Settings. Branches and pull requests aren't their own
+// tabs anymore — they're just ways of slicing runs, so they live as a branch
+// filter and a trigger filter on the runs list. The header CTA is contextual to
+// the active tab (run a pipeline, add an environment, add a secret).
+import { createResource, createSignal, createEffect, For, Show } from "solid-js";
 import { useParams, useNavigate } from "@solidjs/router";
 import {
   listRuns,
@@ -27,7 +26,15 @@ import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 
 type Row = { id: string; status: string; created_at: number; prov: Provenance };
-type Tab = "runs" | "branches" | "prs" | "environments" | "secrets" | "settings";
+type Tab = "runs" | "environments" | "secrets" | "settings";
+type Trigger = "all" | "push" | "pull_request" | "tag" | "manual";
+
+const TABS: [Tab, string][] = [
+  ["runs", "Runs"],
+  ["environments", "Environments"],
+  ["secrets", "Secrets"],
+  ["settings", "Settings"],
+];
 
 export default function RepoView() {
   const params = useParams();
@@ -45,36 +52,60 @@ export default function RepoView() {
 
   const [tab, setTab] = createSignal<Tab>("runs");
   const [statusFilter, setStatusFilter] = createSignal<"all" | "running" | "failed">("all");
+  const [branchFilter, setBranchFilter] = createSignal<string>("all");
+  const [triggerFilter, setTriggerFilter] = createSignal<Trigger>("all");
   const [showDialog, setShowDialog] = createSignal(false);
-
-  const filtered = () => {
-    const all = rows() ?? [];
-    const f = statusFilter();
-    return f === "all" ? all : all.filter((r) => r.status === f);
-  };
+  const [showEnvDialog, setShowEnvDialog] = createSignal(false);
+  const [secretFocus, setSecretFocus] = createSignal(0);
 
   const branches = () => [...new Set((rows() ?? []).map((r) => r.prov.branch))];
+
+  const filtered = () => {
+    let all = rows() ?? [];
+    const s = statusFilter();
+    if (s !== "all") all = all.filter((r) => r.status === s);
+    const b = branchFilter();
+    if (b !== "all") all = all.filter((r) => r.prov.branch === b);
+    const t = triggerFilter();
+    if (t !== "all") all = all.filter((r) => r.prov.trigger === t);
+    return all;
+  };
+
+  // The header CTA follows the tab: what you'd create in this context.
+  const cta = () => {
+    switch (tab()) {
+      case "runs":
+        return { label: "Run pipeline", icon: "play", onClick: () => setShowDialog(true) };
+      case "environments":
+        return { label: "New environment", icon: "plus", onClick: () => setShowEnvDialog(true) };
+      case "secrets":
+        return { label: "New secret", icon: "plus", onClick: () => setSecretFocus((n) => n + 1) };
+      default:
+        return null;
+    }
+  };
 
   return (
     <section class="page">
       <Doodle icon="workflow" size={230} rotate={12} opacity={0.05} bottom="40px" right="60px" />
 
       <div class="page-head">
-        <h1>{repo()}</h1>
-        <button class="btn btn-primary" onClick={() => setShowDialog(true)}>
-          <Icon icon="play" size={14} /> Run pipeline
-        </button>
+        <h1>
+          <span class="head-org">{org()} /</span> {repo()}
+        </h1>
       </div>
+      <Show when={cta()}>
+        {(c) => (
+          <div class="page-toolbar">
+            <button class="btn btn-primary" onClick={() => c().onClick()}>
+              <Icon icon={c().icon} size={14} /> {c().label}
+            </button>
+          </div>
+        )}
+      </Show>
 
       <div class="tabs">
-        <For each={[
-          ["runs", "Runs"],
-          ["branches", "Branches"],
-          ["prs", "Pull requests"],
-          ["environments", "Environments"],
-          ["secrets", "Secrets"],
-          ["settings", "Settings"],
-        ] as [Tab, string][]}>
+        <For each={TABS}>
           {([key, label]) => (
             <button class={`tab ${tab() === key ? "on" : ""}`} onClick={() => setTab(key)}>
               {label}
@@ -96,13 +127,33 @@ export default function RepoView() {
               </button>
             )}
           </For>
+          <label class="fselect">
+            <Icon icon="git-branch" size={12} />
+            <select value={branchFilter()} onChange={(e) => setBranchFilter(e.currentTarget.value)}>
+              <option value="all">all branches</option>
+              <For each={branches()}>{(b) => <option value={b}>{b}</option>}</For>
+            </select>
+          </label>
+          <label class="fselect">
+            <Icon icon="git-pull-request" size={12} />
+            <select
+              value={triggerFilter()}
+              onChange={(e) => setTriggerFilter(e.currentTarget.value as Trigger)}
+            >
+              <option value="all">all triggers</option>
+              <option value="push">push</option>
+              <option value="pull_request">pull request</option>
+              <option value="tag">tag</option>
+              <option value="manual">manual</option>
+            </select>
+          </label>
           <button class="btn btn-ghost btn-sm filters-refresh" onClick={() => refetch()}>
             <Icon icon="rotate-cw" size={13} /> Refresh
           </button>
         </div>
 
         <Show when={!rows.loading} fallback={<p class="empty">loading…</p>}>
-          <Show when={filtered().length > 0} fallback={<p class="empty">No runs match.</p>}>
+          <Show when={filtered().length > 0} fallback={<p class="empty">No runs match these filters.</p>}>
             <div class="runlist">
               <div class="runrow head">
                 <span></span><span>commit</span><span>trigger · branch</span><span>duration</span><span>when</span>
@@ -132,42 +183,6 @@ export default function RepoView() {
             </div>
           </Show>
         </Show>
-      </Show>
-
-      {/* ---- Branches ---- */}
-      <Show when={tab() === "branches"}>
-        <div class="runlist">
-          <For each={branches()} fallback={<p class="empty">no branches</p>}>
-            {(b) => (
-              <div class="runrow" style={{ "grid-template-columns": "16px 1fr auto" }}>
-                <Icon icon="git-branch" size={14} />
-                <span class="rr-msg mono">{b}</span>
-                <span class="rr-when mono">
-                  {(rows() ?? []).filter((r) => r.prov.branch === b).length} runs
-                </span>
-              </div>
-            )}
-          </For>
-        </div>
-      </Show>
-
-      {/* ---- Pull requests ---- */}
-      <Show when={tab() === "prs"}>
-        <div class="runlist">
-          <For
-            each={(rows() ?? []).filter((r) => r.prov.trigger === "pull_request")}
-            fallback={<p class="empty">no open pull requests</p>}
-          >
-            {(r) => (
-              <div class="runrow" onClick={() => nav(`/${org()}/${repo()}/runs/${r.id}`)}
-                style={{ "grid-template-columns": "16px 1fr auto" }}>
-                <span class={`sdot ${r.status}`} />
-                <span class="rr-msg">PR #{r.prov.prNumber} · {r.prov.message}</span>
-                <span class="rr-when mono">{r.prov.branch}</span>
-              </div>
-            )}
-          </For>
-        </div>
       </Show>
 
       {/* ---- Environments ---- */}
@@ -203,7 +218,7 @@ export default function RepoView() {
 
       {/* ---- Secrets ---- */}
       <Show when={tab() === "secrets"}>
-        <RepoSecrets org={org()} repo={repo()} />
+        <RepoSecrets org={org()} repo={repo()} focusPing={secretFocus()} />
         <SecretMatrix org={org()} repo={repo()} />
       </Show>
 
@@ -238,6 +253,10 @@ export default function RepoView() {
             nav(`/${org()}/${repo()}/runs/${id}`);
           }}
         />
+      </Show>
+
+      <Show when={showEnvDialog()}>
+        <EnvDialog repo={repo()} onClose={() => setShowEnvDialog(false)} />
       </Show>
     </section>
   );
@@ -305,13 +324,61 @@ function RunDialog(props: { repo: string; onClose: () => void; onRun: () => Prom
   );
 }
 
+// ---- new-environment dialog (representative) ------------------------------
+// Mirrors the run dialog's honesty: the fields are real (name, gate policy,
+// allowed refs) but binding lands with the environments backend.
+
+function EnvDialog(props: { repo: string; onClose: () => void }) {
+  return (
+    <div class="modal-scrim" onClick={props.onClose}>
+      <div class="modal" onClick={(e) => e.stopPropagation()}>
+        <div class="panel-h"><span>New environment</span></div>
+        <div class="modal-body">
+          <div class="form-r">
+            <label>name</label>
+            <input class="input" placeholder="e.g. production" />
+          </div>
+          <div class="form-r">
+            <label>required approvers</label>
+            <div class="input select-like">1 <Icon icon="chevron-down" size={13} /></div>
+          </div>
+          <div class="form-r">
+            <label>allowed refs</label>
+            <div class="input select-like">main only <Icon icon="chevron-down" size={13} /></div>
+          </div>
+          <div class="modal-actions">
+            <button class="btn btn-primary" onClick={props.onClose}>
+              <Icon icon="plus" size={14} /> Create
+            </button>
+            <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
+          </div>
+          <p class="subtle modal-note">
+            Defines a deploy gate (approvers, wait, allowed refs). Persists once the
+            environments backend lands (ADR-0037).
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ---- repo-scoped secrets (real API) --------------------------------------
 
-function RepoSecrets(props: { org: string; repo: string }) {
+function RepoSecrets(props: { org: string; repo: string; focusPing: number }) {
   const scope = () => ({ org: props.org, repo: props.repo });
   const [names, { refetch }] = createResource(scope, listSecrets);
   const [name, setName] = createSignal("");
   const [value, setValue] = createSignal("");
+  let nameRef: HTMLInputElement | undefined;
+
+  // The header "New secret" CTA pings us to focus the add-secret form. Guard on
+  // > 0 so we don't grab focus/scroll on the initial mount.
+  createEffect(() => {
+    if (props.focusPing > 0 && nameRef) {
+      nameRef.scrollIntoView({ block: "center", behavior: "smooth" });
+      nameRef.focus();
+    }
+  });
 
   return (
     <div class="panel">
@@ -341,7 +408,7 @@ function RepoSecrets(props: { org: string; repo: string }) {
               setName(""); setValue(""); refetch();
             }}
           >
-            <input class="input" placeholder="NAME" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
+            <input ref={nameRef} class="input" placeholder="NAME" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
             <input class="input" type="password" placeholder="value (write-only)" value={value()} onInput={(e) => setValue(e.currentTarget.value)} />
             <button class="btn btn-primary" type="submit" disabled={!name().trim()}>Save</button>
           </form>
@@ -353,10 +420,6 @@ function RepoSecrets(props: { org: string; repo: string }) {
 }
 
 // ---- secret parity matrix (ADR-0037, advisory) ---------------------------
-// Each key's *effective* status per environment after inheritance. A shared key
-// defined once at repo/org scope reads as `inherited` everywhere (never
-// missing); a per-env key is `set` where defined and `unset` elsewhere. Purely
-// advisory — it never blocks a deploy, and never shows a value.
 
 const CELL: Record<SecretCellStatus, { glyph: string; label: string }> = {
   set: { glyph: "●", label: "set here" },

@@ -5,7 +5,7 @@
 // with the forge + log-source backend slices; this view is built to show them
 // the moment they exist.
 import { createSignal, createEffect, onMount, onCleanup, For, Show } from "solid-js";
-import { useParams, useNavigate } from "@solidjs/router";
+import { A, useParams } from "@solidjs/router";
 import {
   getRun,
   fetchEvents,
@@ -27,7 +27,6 @@ const POLL_MS = 1200;
 
 export default function RunDetail() {
   const params = useParams();
-  const nav = useNavigate();
   const id = () => params.id!;
   const org = () => params.org!;
   const repo = () => params.repo!;
@@ -126,17 +125,15 @@ export default function RunDetail() {
     <section class="page">
       <Doodle icon="container" size={230} rotate={14} opacity={0.05} bottom="40px" right="60px" />
 
-      <button class="btn btn-ghost back" onClick={() => nav(`/${org()}/${repo()}`)}>
-        <Icon icon="arrow-left" size={15} /> {repo()}
-      </button>
-
       <Show when={run()} fallback={<p class="empty">loading…</p>}>
         {(r) => (
           <>
             <div class="run-head">
               <span class={`sdot lg ${r().status}`} />
-              <h1 class="run-title" title={id()}>
-                {prov().message}
+              <h1 class="crumb-head">
+                <A href={`/${org()}/${repo()}`} class="crumb-head-link">{repo()}</A>
+                <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
+                <span class="crumb-head-title" title={id()}>{prov().message}</span>
               </h1>
               <StatusBadge status={r().status} />
               <Show when={live()}>
@@ -144,19 +141,20 @@ export default function RunDetail() {
                   <span class="dot" /> live
                 </span>
               </Show>
-              <span class="run-actions">
-                <button
-                  class="btn btn-ghost btn-sm"
-                  onClick={() => sel() && onRestart(sel()!)}
-                  disabled={restarting() !== null || !sel()}
-                  title={sel() ? `restart ${sel()} and its descendants` : "select a step"}
-                >
-                  <Icon icon="rotate-cw" size={13} /> {restarting() ? "restarting…" : "Restart"}
-                </button>
-                <button class="btn btn-ghost btn-sm" disabled title="cancel lands with scheduler support">
-                  Cancel
-                </button>
-              </span>
+            </div>
+
+            <div class="run-toolbar">
+              <button
+                class="btn btn-ghost btn-sm"
+                onClick={() => sel() && onRestart(sel()!)}
+                disabled={restarting() !== null || !sel()}
+                title={sel() ? `restart ${sel()} and its descendants` : "select a step"}
+              >
+                <Icon icon="rotate-cw" size={13} /> {restarting() ? "restarting…" : "Restart"}
+              </button>
+              <button class="btn btn-ghost btn-sm" disabled title="cancel lands with scheduler support">
+                Cancel
+              </button>
             </div>
 
             <div class="prov">
