@@ -79,6 +79,8 @@ struct StepRec {
     attempts: Vec<Attempt>,
     /// Output workspace snapshot (CAS root hash) this step produced.
     output: Option<String>,
+    /// Named results (ADR-0040) this step emitted, captured on success.
+    results: std::collections::BTreeMap<String, serde_json::Value>,
     /// Input signature consumed on the last run (restart skip-if-unchanged).
     input: Option<String>,
     /// Gate kind (`manual`/`timer`/`external`), or `None` for an executed step.
@@ -149,6 +151,7 @@ impl InMemoryDb {
                 needs: Vec::new(),
                 attempts: Vec::new(),
                 output: None,
+                results: Default::default(),
                 input: None,
                 gate_kind: None,
                 gate_timer_seconds: None,
@@ -169,6 +172,7 @@ impl InMemoryDb {
                     needs: s.needs,
                     attempts: s.attempts,
                     output: None,
+                    results: Default::default(),
                     input: None,
                     gate_kind: None,
                     gate_timer_seconds: None,
@@ -242,6 +246,7 @@ impl Db for InMemoryDb {
                 needs: needs.to_vec(),
                 attempts: Vec::new(),
                 output: None,
+                results: Default::default(),
                 input: None,
                 gate_kind: None,
                 gate_timer_seconds: None,
@@ -274,6 +279,36 @@ impl Db for InMemoryDb {
             .steps
             .get(&(run.clone(), step.clone()))
             .and_then(|r| r.output.clone()))
+    }
+
+    async fn set_step_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        results: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        let rec = st
+            .steps
+            .get_mut(&(run.clone(), step.clone()))
+            .ok_or(DbError::Conflict)?;
+        rec.results = results.clone();
+        Ok(())
+    }
+
+    async fn step_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .map(|r| r.results.clone())
+            .unwrap_or_default())
     }
 
     async fn set_step_input(
@@ -754,6 +789,11 @@ struct FakeExecState {
     /// across a step's re-runs models an unchanged output (restart skips its
     /// dependents); changing it models a changed output (dependents cascade).
     outputs: HashMap<String, String>,
+    /// Named results (ADR-0040) each *step* emits on success, keyed by step id.
+    results: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
+    /// The most recent spec each handle was launched with — lets a test assert
+    /// launch-time interpolation (ADR-0040) rewrote `${{ … }}` before launch.
+    launched_specs: HashMap<String, StepSpec>,
 }
 
 /// An [`Executor`] whose behaviour a test scripts: it can be told that a given
@@ -791,6 +831,19 @@ impl FakeExecutor {
             .insert(step.to_string(), snapshot.to_string());
     }
 
+    /// Set the named results `step` (by id) emits on success (ADR-0040).
+    pub fn set_results(
+        &self,
+        step: &str,
+        results: std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .results
+            .insert(step.to_string(), results);
+    }
+
     /// The deterministic handle a step's fence maps to.
     pub fn handle_for(step: &StepRun) -> ExecHandle {
         let attempt = step
@@ -798,6 +851,12 @@ impl FakeExecutor {
             .map(|a| a.id.0.as_str())
             .unwrap_or("0");
         ExecHandle(format!("fake://{}/{}/{}", step.run.0, step.step.0, attempt))
+    }
+
+    /// The spec `handle` was most recently launched with (after launch-time
+    /// interpolation, ADR-0040), or `None` if it was never launched.
+    pub fn launched_spec(&self, handle: &ExecHandle) -> Option<StepSpec> {
+        self.inner.lock().unwrap().launched_specs.get(&handle.0).cloned()
     }
 
     /// How many times the given handle was launched (0 if never).
@@ -820,15 +879,11 @@ impl Default for FakeExecutor {
 
 #[async_trait]
 impl Executor for FakeExecutor {
-    async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+    async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
         let handle = Self::handle_for(step);
-        *self
-            .inner
-            .lock()
-            .unwrap()
-            .launches
-            .entry(handle.0.clone())
-            .or_insert(0) += 1;
+        let mut st = self.inner.lock().unwrap();
+        *st.launches.entry(handle.0.clone()).or_insert(0) += 1;
+        st.launched_specs.insert(handle.0.clone(), spec.clone());
         Ok(handle)
     }
 
@@ -856,6 +911,19 @@ impl Executor for FakeExecutor {
             .strip_prefix("fake://")
             .and_then(|rest| rest.split('/').nth(1));
         Ok(step.and_then(|s| self.inner.lock().unwrap().outputs.get(s).cloned()))
+    }
+
+    async fn results(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ExecError> {
+        let step = handle
+            .0
+            .strip_prefix("fake://")
+            .and_then(|rest| rest.split('/').nth(1));
+        Ok(step
+            .and_then(|s| self.inner.lock().unwrap().results.get(s).cloned())
+            .unwrap_or_default())
     }
 }
 
@@ -1181,5 +1249,33 @@ impl SecretProvider for FakeSecrets {
             .unwrap()
             .remove(&(scope_key(scope), key.to_string()));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scarab_engine::{Db, RunId, StepId, Timestamp};
+
+    /// The InMemoryDb round-trips a step's typed named results (ADR-0040): absent
+    /// is the empty map, and a set map reads back with types preserved.
+    #[tokio::test]
+    async fn in_memory_db_round_trips_named_results() {
+        let db = InMemoryDb::new();
+        let run = RunId("r".into());
+        let step = StepId("build".into());
+        db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+        db.create_step_run(&run, &step, None, &[], Timestamp(0)).await.unwrap();
+
+        assert!(db.step_results(&run, &step).await.unwrap().is_empty(), "no results yet");
+
+        let mut results = std::collections::BTreeMap::new();
+        results.insert("url".to_string(), serde_json::json!("https://svc"));
+        results.insert("replicas".to_string(), serde_json::json!(3));
+        db.set_step_results(&run, &step, &results).await.unwrap();
+
+        let got = db.step_results(&run, &step).await.unwrap();
+        assert_eq!(got.get("url").unwrap(), &serde_json::json!("https://svc"));
+        assert_eq!(got.get("replicas").unwrap(), &serde_json::json!(3), "int type preserved");
     }
 }

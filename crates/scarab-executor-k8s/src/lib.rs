@@ -112,6 +112,13 @@ impl Executor for K8sExecutor {
             Err(e) => Err(ExecError::Other(e.to_string())),
         }
     }
+
+    // `results` (ADR-0040) uses the port default (empty) for now. A
+    // `restartPolicy: Never` Pod is torn down after completion, so its
+    // `/scarab/results/*.json` cannot be scraped post-hoc; capturing them needs
+    // the emit channel to stream results out before teardown (the injected
+    // `scarab` CLI → log/result sidecar, ADR-0008). Tracked as a follow-up — the
+    // local backend already captures results end-to-end.
 }
 
 // ---------------------------------------------------------------------------

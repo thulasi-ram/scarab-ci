@@ -122,3 +122,76 @@ async fn scheduler_restart_redrives_without_duplication() {
 
     tdb.cleanup().await;
 }
+
+/// ADR-0040 value chain (end-to-end): a producer step emits a named result, the
+/// scheduler captures it on success, and a downstream consumer's
+/// `${{ outputs.producer.url }}` is interpolated *at launch* from that captured
+/// result — the reference goes live, not literal.
+#[tokio::test]
+async fn named_result_flows_into_a_downstream_interpolation() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    let run = scarab_engine::RunId("run-1".into());
+    let producer = StepId("producer".into());
+    let consumer = StepId("consumer".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &producer, Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+    // The consumer reads the producer's `url` result. A plain-step reference
+    // (`producer` is a real step id) needs no rewrite; the launch context is
+    // keyed by step id.
+    let consumer_spec = StepSpec {
+        image: "busybox:latest".into(),
+        command: vec!["echo".into(), "${{ outputs.producer.url }}".into()],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
+    };
+    db.create_step_run(
+        &run,
+        &consumer,
+        Some(&consumer_spec),
+        std::slice::from_ref(&producer),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    for _ in 0..2 {
+        exec.script_outcome(ExecState::Succeeded);
+    }
+    let mut result = std::collections::BTreeMap::new();
+    result.insert("url".to_string(), serde_json::json!("https://svc.example"));
+    exec.set_results("producer", result);
+
+    let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
+    // Drive until the two-step run settles (producer, then consumer).
+    for _ in 0..4 {
+        sched.tick(&run).await.expect("tick");
+    }
+
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    // The producer's result was captured under the fence.
+    let captured = db.step_results(&run, &producer).await.unwrap();
+    assert_eq!(captured.get("url").unwrap(), &serde_json::json!("https://svc.example"));
+    // The consumer launched with the *interpolated* command — the value flowed.
+    let handle = ExecHandle("fake://run-1/consumer/a1".into());
+    let launched = exec.launched_spec(&handle).expect("consumer launched");
+    assert_eq!(
+        launched.command,
+        vec!["echo".to_string(), "https://svc.example".to_string()],
+        "the reference was resolved at launch, not left literal"
+    );
+
+    tdb.cleanup().await;
+}

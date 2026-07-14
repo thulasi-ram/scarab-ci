@@ -89,3 +89,38 @@ async fn cancel_kills_a_running_child() {
     // ...and after cancel it is terminal (not Running).
     assert!(matches!(exec.poll(&handle).await.unwrap(), ExecState::Failed { .. }));
 }
+
+/// ADR-0040: a step writes `$SCARAB_RESULTS/<name>.json`, and the executor reads
+/// it back as a typed named result after the step completes.
+#[tokio::test]
+async fn named_results_are_read_back_from_the_results_dir() {
+    let exec = LocalExecutor::new();
+    let s = step("r1", "emit");
+    // The step writes a string result `url` and a numeric result `replicas`.
+    let handle = exec
+        .launch(
+            &s,
+            &spec(&[
+                "sh",
+                "-c",
+                "printf '\"https://svc\"' > \"$SCARAB_RESULTS/url.json\"; printf '3' > \"$SCARAB_RESULTS/replicas.json\"",
+            ]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(drive(&exec, &handle).await, ExecState::Succeeded);
+
+    let results = exec.results(&handle).await.unwrap();
+    assert_eq!(results.get("url").unwrap(), &serde_json::json!("https://svc"));
+    assert_eq!(results.get("replicas").unwrap(), &serde_json::json!(3), "int type preserved");
+}
+
+/// A step that emits nothing yields an empty result map (not an error).
+#[tokio::test]
+async fn no_results_emitted_is_an_empty_map() {
+    let exec = LocalExecutor::new();
+    let s = step("r1", "silent");
+    let handle = exec.launch(&s, &spec(&["sh", "-c", "exit 0"])).await.unwrap();
+    assert_eq!(drive(&exec, &handle).await, ExecState::Succeeded);
+    assert!(exec.results(&handle).await.unwrap().is_empty());
+}

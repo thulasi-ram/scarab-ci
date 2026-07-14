@@ -2561,6 +2561,7 @@ name = "scarab-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "scarab-pipeline",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2583,6 +2584,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "scarab-engine",
+ "serde_json",
  "tokio",
 ]
 

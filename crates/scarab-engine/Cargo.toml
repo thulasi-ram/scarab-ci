@@ -9,3 +9,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+# Pure (ADR-0031) home of the CEL evaluator, reused for launch-time `${{ … }}`
+# interpolation of upstream results (ADR-0040). No cycle: pipeline never depends
+# on the engine.
+scarab-pipeline = { workspace = true }

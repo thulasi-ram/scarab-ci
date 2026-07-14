@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use crate::ports::ExecState;
 use crate::{
     Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, ExecError,
-    Executor, FailureKind, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepStatus, Timestamp,
-    TransitionError, EVENT_VERSION,
+    Executor, FailureKind, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus,
+    Timestamp, TransitionError, EVENT_VERSION,
 };
 
 /// Outbox `kind` for "launch this step".
@@ -576,6 +576,28 @@ impl<'a> Scheduler<'a> {
                 .await?
                 .ok_or_else(|| SchedulerError::MissingSpec(step.clone()))?;
 
+            // Launch-time interpolation (ADR-0040): resolve `${{ outputs.… }}`
+            // against this step's upstream results before launch. The upstreams
+            // are all `Succeeded` before the step is ready, so their results
+            // exist; a reference to a missing result fails fast — as a *step*
+            // failure (not a scheduler error), so the run settles as Failed.
+            // Deterministic on re-drive: results are re-derived from the store.
+            let spec = match self.interpolate_spec(&run, &step, spec).await? {
+                Ok(spec) => spec,
+                Err(_reason) => {
+                    self.finalize_step(
+                        &run,
+                        &step,
+                        &attempt,
+                        StepStatus::Failed,
+                        Some(FailureKind::Step),
+                    )
+                    .await?;
+                    self.db.mark_dispatched(msg.id).await?;
+                    continue;
+                }
+            };
+
             // Reconstruct the fenced StepRun the executor needs. launch is
             // idempotent on this fence, so a re-drive re-attaches.
             let step_run = StepRun {
@@ -600,6 +622,12 @@ impl<'a> Scheduler<'a> {
                     if let Some(output) = self.executor.output(&handle).await? {
                         self.db.set_step_output(&run, &step, &output).await?;
                     }
+                    // Capture the step's named results (ADR-0040) under the fence,
+                    // so a dependent can read them via `${{ outputs.<step>.… }}`.
+                    let results = self.executor.results(&handle).await?;
+                    if !results.is_empty() {
+                        self.db.set_step_results(&run, &step, &results).await?;
+                    }
                     self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
@@ -623,6 +651,65 @@ impl<'a> Scheduler<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Resolve `${{ … }}` interpolations in a step's launch spec against its
+    /// upstream results (ADR-0040), returning the launchable spec — or the
+    /// interpolation error string (`Ok(Err(_))`) when a reference is bad, which
+    /// the caller turns into a *step* failure (fail-fast, not a scheduler error).
+    /// A `DbError` (infra) propagates as `Err(_)` so it retries.
+    async fn interpolate_spec(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        spec: StepSpec,
+    ) -> Result<Result<StepSpec, String>, SchedulerError> {
+        // Fast path: no interpolation → launch verbatim (the common case).
+        let has_interp = spec.image.contains("${{")
+            || spec.command.iter().any(|c| c.contains("${{"))
+            || spec.env.iter().any(|(_, v)| v.contains("${{"));
+        if !has_interp {
+            return Ok(Ok(spec));
+        }
+
+        // Build the `outputs` context from this step's upstream results, keyed by
+        // step id. Only `needs` are gathered — the compile-time check guarantees
+        // a reference names a step the caller `needs` (ADR-0040 §4).
+        let needs = self
+            .db
+            .steps_of_run(run)
+            .await?
+            .into_iter()
+            .find(|s| &s.step == step)
+            .map(|s| s.needs)
+            .unwrap_or_default();
+        let mut outputs = serde_json::Map::new();
+        for need in &needs {
+            let results = self.db.step_results(run, need).await?;
+            if !results.is_empty() {
+                outputs.insert(
+                    need.0.clone(),
+                    serde_json::Value::Object(results.into_iter().collect()),
+                );
+            }
+        }
+        let ctx = serde_json::json!({ "outputs": outputs });
+
+        let interp = |s: &str| scarab_pipeline::cel::interpolate(s, &ctx).map_err(|e| e.to_string());
+        let mut out = spec;
+        match (|| {
+            out.image = interp(&out.image)?;
+            for c in &mut out.command {
+                *c = interp(c)?;
+            }
+            for (_, v) in &mut out.env {
+                *v = interp(v)?;
+            }
+            Ok::<(), String>(())
+        })() {
+            Ok(()) => Ok(Ok(out)),
+            Err(reason) => Ok(Err(reason)),
+        }
     }
 
     /// Settle the run once every step is terminal.

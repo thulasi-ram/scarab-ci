@@ -99,6 +99,26 @@ pub trait Db: Send + Sync {
     /// produced one (or the step is unknown).
     async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
 
+    /// Record a step's **named results** (ADR-0040) — the typed `name → value`
+    /// map it emitted via the results channel (ADR-0008), captured on successful
+    /// completion under the fence. Distinct from the workspace snapshot: these
+    /// are small consumable values a dependent reads through
+    /// `${{ outputs.<step>.<name> }}`. Overwrites any prior value (a re-run of the
+    /// same fenced step re-emits deterministically).
+    async fn set_step_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        results: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), DbError>;
+
+    /// A step's named results, or an empty map if it emitted none (or is unknown).
+    async fn step_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError>;
+
     /// Record (or clear, with `None`) the **input signature** a step consumed on
     /// the attempt that is about to run — a deterministic digest of its `needs`'
     /// output snapshots (see `input_signature`). On a restart, comparing a
@@ -331,5 +351,18 @@ pub trait Executor: Send + Sync {
     /// implement it.
     async fn output(&self, _handle: &ExecHandle) -> Result<Option<String>, ExecError> {
         Ok(None)
+    }
+
+    /// The **named results** the (successfully finished) unit emitted via the
+    /// results channel (ADR-0008: its `/scarab/results/*.json`), read back
+    /// **before teardown** and returned as a typed `name → value` map (ADR-0040).
+    /// The orchestrator persists them so a dependent can read them through
+    /// `${{ outputs.<step>.<name> }}`. Default empty so a backend that captures
+    /// none need not implement it.
+    async fn results(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ExecError> {
+        Ok(std::collections::BTreeMap::new())
     }
 }
