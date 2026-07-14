@@ -35,11 +35,13 @@ use scarab_engine::{
 use scarab_identity::{Action, Principal, Session};
 
 pub mod converged;
+pub mod log_tail;
 pub mod logs;
 pub mod oidc;
 pub mod secret_executor;
 
 pub use secret_executor::SecretInjectingExecutor;
+pub use log_tail::{pump_log_stream, LogTailer};
 pub use logs::LogService;
 
 /// A wall-clock [`Clock`] for production wiring (tests inject `FakeClock`).

@@ -65,6 +65,7 @@ async fn background_driver_runs_a_pipeline_end_to_end() {
         clock_dyn,
         exec_dyn,
         None,
+        None,
         "conv-1".to_string(),
         Duration::from_millis(10),
         30_000,
