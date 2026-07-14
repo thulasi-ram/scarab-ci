@@ -312,3 +312,88 @@ async fn multiple_pipelines_each_start_a_run() {
     ran.sort();
     assert_eq!(ran, vec!["bench".to_string(), "build".to_string()]);
 }
+
+/// ADR-0038: a top-level pipeline that `invoke:`s a library under `.scarab/lib/`
+/// has the library's steps inlined into its persisted DAG — id-namespaced by the
+/// invoke-step id, with `needs` rewritten across the seam. The server pre-fetches
+/// the library source at the caller's ref and hands it to the pure compiler.
+#[tokio::test]
+async fn invoke_inlines_library_into_the_persisted_dag() {
+    let caller = r#"
+on: { push: {} }
+steps:
+  - { id: checkout, image: busybox }
+  - { id: ci, invoke: .scarab/lib/ci.yaml, needs: [checkout] }
+  - { id: publish, image: busybox, needs: [ci] }
+"#;
+    let library = r#"
+steps:
+  - { id: build, image: rust }
+  - { id: test, image: rust, needs: [build] }
+"#;
+    let forge = FakeForge::new()
+        .with_file(".scarab/main.yaml", caller)
+        .with_file(".scarab/lib/ci.yaml", library);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
+        .await
+        .expect("trigger");
+    assert_eq!(runs.len(), 1, "only the top-level pipeline is triggered");
+    let run = runs.into_iter().next().unwrap();
+
+    let mut ids: Vec<String> = db
+        .steps_of_run(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.step.0)
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "checkout".to_string(),
+            "ci/build".to_string(),
+            "ci/test".to_string(),
+            "publish".to_string(),
+        ],
+        "the library's steps are inlined and namespaced; no `ci` invoke step survives"
+    );
+
+    // The persisted IR (self-describing) carries the flattened DAG with a valid
+    // seam: `ci/build` inherits `checkout`, `publish` depends on the leaf `ci/test`.
+    let ir: scarab_pipeline::PipelineIr =
+        serde_json::from_value(db.run_ir(&run).await.unwrap().expect("ir persisted")).unwrap();
+    let build = ir.steps.iter().find(|s| s.id == "ci/build").unwrap();
+    assert_eq!(build.needs.0, vec!["checkout".to_string()]);
+    let publish = ir.steps.iter().find(|s| s.id == "publish").unwrap();
+    assert_eq!(publish.needs.0, vec!["ci/test".to_string()]);
+}
+
+/// ADR-0038: a Library pipeline lives under `.scarab/lib/` — referenced, never
+/// triggered. Even carrying a matching `on:`, a file below `.scarab/` is not a
+/// top-level pipeline: trigger discovery is flat (direct children of `.scarab/`).
+#[tokio::test]
+async fn a_library_under_scarab_lib_is_not_triggered() {
+    let library_with_trigger = r#"
+on: { push: {} }
+steps:
+  - { id: build, image: busybox }
+"#;
+    let forge = FakeForge::new()
+        .with_file(".scarab/ci.yaml", CI_YAML)
+        .with_file(".scarab/lib/deploy.yaml", library_with_trigger);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
+        .await
+        .expect("trigger");
+    assert_eq!(runs.len(), 1, "only `.scarab/ci.yaml` triggers; the lib file does not");
+    let run = runs.into_iter().next().unwrap();
+    let steps = db.steps_of_run(&run).await.unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].step.0, "build", "the run is ci.yaml's, not the lib's");
+}

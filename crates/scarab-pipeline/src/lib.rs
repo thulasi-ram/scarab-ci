@@ -127,6 +127,16 @@ pub struct StepSpec {
     /// released. The engine wiring is `Db::set_step_gate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
+    /// If set, this is an **invoke** step (ADR-0038): a repo-relative path to a
+    /// Library pipeline (under `.scarab/lib/` by convention) that is *inlined at
+    /// compile time*, not a runtime object. The step launches nothing itself;
+    /// [`compile_yaml_with_libs`] flattens the referenced pipeline's steps into
+    /// the caller's DAG, id-namespaced by this step's id (`deploy/build`), with
+    /// `needs` rewritten across the seam. Local-only forever: repo-relative,
+    /// read at the caller's ref — no absolute paths, no `../` escape, no
+    /// cross-repo. After compile this field is always `None` (like `matrix`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoke: Option<String>,
     /// For a `timer` gate, how long (seconds) to wait before the run
     /// auto-releases and resumes (ADR-0008). Required for `timer`; forbidden on
     /// any other kind.
@@ -186,6 +196,13 @@ impl StepSpec {
     /// Is this an image-less gate step (a durable suspend point)?
     pub fn is_gate(&self) -> bool {
         self.gate.is_some()
+    }
+
+    /// Is this an image-less invoke step (a compile-time library inline point)?
+    /// True only in authored YAML — [`compile_yaml_with_libs`] resolves every
+    /// invoke step away, so a compiled IR never contains one.
+    pub fn is_invoke(&self) -> bool {
+        self.invoke.is_some()
     }
 }
 
@@ -267,22 +284,46 @@ pub enum PipelineError {
     Cel(String),
 }
 
-/// Compile authored YAML into a validated [`PipelineIr`].
-///
-/// Parses the YAML frontend, statically expands every matrix into concrete
-/// steps (ADR-0023), fans each `needs` edge onto every expanded instance of its
-/// target, then runs full [`validate`] over the result. All problems are
-/// reported together via [`PipelineError::Validation`].
+/// Compile authored YAML into a validated [`PipelineIr`], with no libraries
+/// available — a convenience over [`compile_yaml_with_libs`] for pipelines that
+/// use no `invoke:` steps (an invoke would fail to resolve against the empty
+/// library map).
 pub fn compile_yaml(yaml: &str) -> Result<PipelineIr, PipelineError> {
+    compile_yaml_with_libs(yaml, &BTreeMap::new())
+}
+
+/// Compile authored YAML into a validated [`PipelineIr`], resolving `invoke:`
+/// steps against a pre-fetched `{repo-relative path → source}` map of the
+/// repo's `.scarab/**` library files (ADR-0038).
+///
+/// Compilation is **pure** (ADR-0031): the caller (a server trigger path) does
+/// the I/O — fetching the library sources at the caller's ref via `ForgePort` —
+/// and passes them in here as `libs`. This function performs no I/O.
+///
+/// Pipeline: parse → **inline every `invoke:` step** by flattening its
+/// referenced library's steps into the DAG, id-namespaced by the invoke-step id
+/// and with `needs` rewritten across the seam → statically expand every matrix
+/// into concrete steps (ADR-0023) → fan each `needs` edge onto every expanded
+/// instance of its target → run full [`validate`]. All problems are reported
+/// together via [`PipelineError::Validation`].
+pub fn compile_yaml_with_libs(
+    yaml: &str,
+    libs: &BTreeMap<String, String>,
+) -> Result<PipelineIr, PipelineError> {
     let authored: PipelineIr =
         serde_yaml::from_str(yaml).map_err(|e| PipelineError::Parse(e.to_string()))?;
+
+    // Inline `invoke:` steps first (ADR-0038): the result is a flat step list
+    // with no invoke steps, over which matrix expansion and validation run
+    // unchanged. A library's own matrices thus expand normally.
+    let authored_steps = inline_invokes(&authored.steps, libs).map_err(PipelineError::Validation)?;
 
     let mut diagnostics = Vec::new();
     let mut expanded: Vec<StepSpec> = Vec::new();
     // authored step id -> the concrete instance ids it expanded into.
     let mut instances: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
-    for step in &authored.steps {
+    for step in &authored_steps {
         match expand_step(step) {
             Ok(concrete) => {
                 let ids = concrete.iter().map(|s| s.id.clone()).collect();
@@ -343,6 +384,250 @@ pub fn compile_yaml(yaml: &str) -> Result<PipelineIr, PipelineError> {
 
     validate(&ir).map_err(PipelineError::Validation)?;
     Ok(ir)
+}
+
+/// The library paths an authored pipeline's `invoke:` steps reference, so an
+/// I/O edge (the server trigger path) can pre-fetch their sources before the
+/// pure [`compile_yaml_with_libs`] (ADR-0038). Returns the normalized,
+/// safety-checked repo-relative keys (the same keys [`compile_yaml_with_libs`]
+/// looks up in its `libs` map), in declaration order and de-duplicated.
+///
+/// Best-effort: yaml that does not parse, and paths that fail the path-safety
+/// check, are silently omitted here — [`compile_yaml_with_libs`] is the sole
+/// authority that turns those into diagnostics. This function only answers
+/// "what is safe to fetch?".
+pub fn invoke_refs(yaml: &str) -> Vec<String> {
+    let Ok(authored) = serde_yaml::from_str::<PipelineIr>(yaml) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for step in &authored.steps {
+        if let Some(raw) = &step.invoke {
+            if let Ok(key) = resolve_lib_path(raw) {
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Normalize and safety-check a repo-relative library path referenced by an
+/// `invoke:` step (ADR-0038), returning the canonical key used to look its
+/// source up in the pre-fetched `{path → source}` map.
+///
+/// `invoke` is **local-only, forever**: the path must be repo-relative and
+/// resolve inside the repo tree. Absolute paths, `..` traversal, and cross-repo
+/// / remote references are rejected — cross-repo *causation* is `on: upstream`,
+/// not `invoke`. A single leading `./` is accepted and stripped.
+fn resolve_lib_path(raw: &str) -> Result<String, String> {
+    let path = raw.trim();
+    if path.is_empty() {
+        return Err("`invoke` path must not be empty".to_string());
+    }
+    // Cross-repo / remote forms (`scheme://…`, `github.com/org/repo//lib@sha`).
+    if path.contains("://") || path.contains('@') {
+        return Err(format!(
+            "invoke path `{raw}` looks like a cross-repo/remote reference — `invoke` is local-only; use `on: upstream` for cross-repo causation"
+        ));
+    }
+    if path.starts_with('/') {
+        return Err(format!("invoke path `{raw}` must be repo-relative (no leading `/`)"));
+    }
+    if path.contains('\\') {
+        return Err(format!("invoke path `{raw}` must use `/` path separators"));
+    }
+    let path = path.strip_prefix("./").unwrap_or(path);
+    let mut components: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" => return Err(format!("invoke path `{raw}` has an empty path segment")),
+            "." => return Err(format!(
+                "invoke path `{raw}` must be a plain repo-relative path (no `.` segments)"
+            )),
+            ".." => return Err(format!(
+                "invoke path `{raw}` must not escape the repo tree with `..`"
+            )),
+            c => components.push(c),
+        }
+    }
+    Ok(components.join("/"))
+}
+
+/// Inline every `invoke:` step (ADR-0038) into a flat step list with no invoke
+/// steps left. Single-level only in this slice: a library that itself invokes
+/// is rejected (nesting is a follow-up).
+///
+/// For an invoke step `S` referencing library `L`:
+/// - each library step `x` is emitted with id `S.id/x`, its internal `needs`
+///   (and explicit `inputs`) namespaced likewise;
+/// - the library's **root** steps (no `needs`) inherit `S`'s upstream `needs`
+///   (entry seam);
+/// - the library's **leaf** steps (needed by nothing inside `L`) become what a
+///   downstream `needs: [S.id]` resolves to (exit seam).
+///
+/// The seam rewrite runs as a second pass over *all* emitted steps, so an
+/// invoke step depending on another invoke step resolves correctly.
+fn inline_invokes(
+    steps: &[StepSpec],
+    libs: &BTreeMap<String, String>,
+) -> Result<Vec<StepSpec>, Vec<String>> {
+    let mut diagnostics = Vec::new();
+    let mut out: Vec<StepSpec> = Vec::new();
+    // invoke-step id -> the namespaced leaf ids that a `needs: [that id]` maps to.
+    let mut seam: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for step in steps {
+        let Some(raw_path) = &step.invoke else {
+            out.push(step.clone());
+            continue;
+        };
+
+        // An invoke step inlines a library; it launches nothing itself.
+        if !step.image.is_empty() || !step.command.is_empty() {
+            diagnostics.push(format!(
+                "step `{}`: an invoke step inlines a library — it must not set an image or command",
+                step.id
+            ));
+        }
+        if step.gate.is_some() {
+            diagnostics.push(format!(
+                "step `{}`: a step is either a gate or an invoke, not both",
+                step.id
+            ));
+        }
+        if step.matrix.is_some() {
+            diagnostics.push(format!(
+                "step `{}`: `matrix` on an invoke step is not yet supported (ADR-0038 follow-up)",
+                step.id
+            ));
+        }
+        if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
+            diagnostics.push(format!(
+                "step `{}`: an invoke step launches nothing — it must not set `security`",
+                step.id
+            ));
+        }
+
+        let key = match resolve_lib_path(raw_path) {
+            Ok(k) => k,
+            Err(msg) => {
+                diagnostics.push(format!("step `{}`: {msg}", step.id));
+                continue;
+            }
+        };
+        let Some(src) = libs.get(&key) else {
+            diagnostics.push(format!(
+                "step `{}`: no library found at `{key}` (invoke is local-only; read at the caller's ref)",
+                step.id
+            ));
+            continue;
+        };
+        let lib: PipelineIr = match serde_yaml::from_str(src) {
+            Ok(ir) => ir,
+            Err(e) => {
+                diagnostics.push(format!("step `{}`: library `{key}` failed to parse: {e}", step.id));
+                continue;
+            }
+        };
+        if lib.steps.is_empty() {
+            diagnostics.push(format!("step `{}`: library `{key}` has no steps", step.id));
+            continue;
+        }
+        // Single-level only in this slice.
+        if lib.steps.iter().any(|s| s.invoke.is_some()) {
+            diagnostics.push(format!(
+                "step `{}`: library `{key}` itself uses `invoke` — nested invoke is not yet supported (ADR-0038 follow-up)",
+                step.id
+            ));
+            continue;
+        }
+
+        let prefix = &step.id;
+        let ns = |id: &str| format!("{prefix}/{id}");
+        let internal: BTreeSet<&str> = lib.steps.iter().map(|s| s.id.as_str()).collect();
+        let needed_inside: BTreeSet<&str> = lib
+            .steps
+            .iter()
+            .flat_map(|s| s.needs.0.iter().map(String::as_str))
+            .collect();
+
+        // Exit seam: a downstream `needs: [S.id]` fans onto the library's leaves.
+        let leaves: Vec<String> = lib
+            .steps
+            .iter()
+            .filter(|s| !needed_inside.contains(s.id.as_str()))
+            .map(|s| ns(&s.id))
+            .collect();
+        seam.insert(step.id.clone(), leaves);
+
+        for ls in &lib.steps {
+            let mut inst = ls.clone();
+            inst.id = ns(&ls.id);
+            // Entry seam: a library root inherits the invoke step's upstreams;
+            // an internal need is namespaced.
+            inst.needs = if ls.needs.0.is_empty() {
+                step.needs.clone()
+            } else {
+                Needs(ls.needs.0.iter().map(|n| namespace_ref(n, &internal, &ns)).collect())
+            };
+            if let Some(inputs) = &ls.inputs {
+                inst.inputs =
+                    Some(inputs.iter().map(|n| namespace_ref(n, &internal, &ns)).collect());
+            }
+            out.push(inst);
+        }
+    }
+
+    // Second pass: rewrite every reference to an invoke-step id onto its leaves.
+    for step in &mut out {
+        step.needs = Needs(rewrite_through_seam(&step.needs.0, &seam));
+        if let Some(inputs) = &step.inputs {
+            step.inputs = Some(rewrite_through_seam(inputs, &seam));
+        }
+    }
+
+    if diagnostics.is_empty() {
+        Ok(out)
+    } else {
+        Err(diagnostics)
+    }
+}
+
+/// Namespace one `needs`/`inputs` reference of a library step: prefix it if it
+/// points at a sibling library step, leave it otherwise (a library is meant to
+/// be self-contained; a stray external ref is left for `validate` to flag).
+fn namespace_ref(r: &str, internal: &BTreeSet<&str>, ns: &impl Fn(&str) -> String) -> String {
+    if internal.contains(r) {
+        ns(r)
+    } else {
+        r.to_string()
+    }
+}
+
+/// Rewrite a `needs`/`inputs` list through the invoke seam: a reference to an
+/// invoke-step id becomes its library's leaf ids (de-duplicated, order-stable);
+/// any other reference passes through unchanged.
+fn rewrite_through_seam(refs: &[String], seam: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for r in refs {
+        match seam.get(r) {
+            Some(leaves) => {
+                for leaf in leaves {
+                    if !out.contains(leaf) {
+                        out.push(leaf.clone());
+                    }
+                }
+            }
+            None => {
+                if !out.contains(r) {
+                    out.push(r.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Expand one authored step into its concrete instances.
@@ -440,9 +725,12 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
     }
 
     for step in &ir.steps {
-        // Compile invariant: matrices are gone by now.
+        // Compile invariants: matrices and invokes are resolved away by now.
         if step.matrix.is_some() {
             diagnostics.push(format!("step `{}`: matrix was not expanded", step.id));
+        }
+        if step.invoke.is_some() {
+            diagnostics.push(format!("step `{}`: invoke was not inlined", step.id));
         }
         // Step kind: a gate launches nothing (image-less); every other step must
         // name an image. A gate with an image/command is a contradiction.
@@ -1222,6 +1510,225 @@ mod tests {
             Some(["build[os=linux]".to_string(), "build[os=mac]".to_string()].as_slice()),
             "an input on a matrixed need fans to all its instances"
         );
+    }
+
+    // --- invoke / local reuse (ADR-0038) --------------------------------------
+
+    fn libs(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn compile_with(yaml: &str, libs: &BTreeMap<String, String>) -> PipelineIr {
+        compile_yaml_with_libs(yaml, libs).expect("expected valid pipeline")
+    }
+
+    fn errors_with(yaml: &str, libs: &BTreeMap<String, String>) -> Vec<String> {
+        match compile_yaml_with_libs(yaml, libs) {
+            Err(PipelineError::Validation(d)) => d,
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invoke_inlines_library_steps_namespaced_and_rewrites_the_seam() {
+        let lib = r#"
+            steps:
+              - { id: build, image: rust }
+              - { id: test, image: rust, needs: [build] }
+        "#;
+        let ir = compile_with(
+            r#"
+            steps:
+              - { id: checkout, image: busybox }
+              - { id: ci, invoke: .scarab/lib/ci.yaml, needs: [checkout] }
+              - { id: publish, image: busybox, needs: [ci] }
+            "#,
+            &libs(&[(".scarab/lib/ci.yaml", lib)]),
+        );
+
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        // Library steps are inlined, id-namespaced by the invoke-step id; no
+        // invoke step survives.
+        assert!(ids.contains(&"ci/build"));
+        assert!(ids.contains(&"ci/test"));
+        assert!(!ids.contains(&"ci"), "the invoke step itself is gone");
+        assert!(ir.steps.iter().all(|s| !s.is_invoke()));
+
+        // Entry seam: the library root inherits the invoke step's upstream.
+        let build = ir.steps.iter().find(|s| s.id == "ci/build").unwrap();
+        assert_eq!(build.needs.0, vec!["checkout".to_string()]);
+        // Internal edge is namespaced.
+        let test = ir.steps.iter().find(|s| s.id == "ci/test").unwrap();
+        assert_eq!(test.needs.0, vec!["ci/build".to_string()]);
+        // Exit seam: `needs: [ci]` resolves to the library's leaf (`ci/test`).
+        let publish = ir.steps.iter().find(|s| s.id == "publish").unwrap();
+        assert_eq!(publish.needs.0, vec!["ci/test".to_string()]);
+
+        // The result is a single valid flat DAG that round-trips.
+        let back: PipelineIr =
+            serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+        assert_eq!(ir, back);
+    }
+
+    #[test]
+    fn invoke_seam_fans_multiple_roots_and_leaves() {
+        // A library with two roots and two leaves (a diamond with split ends).
+        let lib = r#"
+            steps:
+              - { id: a, image: busybox }
+              - { id: b, image: busybox }
+              - { id: c, image: busybox, needs: [a, b] }
+              - { id: d, image: busybox, needs: [a] }
+        "#;
+        let ir = compile_with(
+            r#"
+            steps:
+              - { id: prep, image: busybox }
+              - { id: mod, invoke: .scarab/lib/x.yaml, needs: [prep] }
+              - { id: after, image: busybox, needs: [mod] }
+            "#,
+            &libs(&[(".scarab/lib/x.yaml", lib)]),
+        );
+        // Both roots (a, b) inherit `prep`.
+        for root in ["mod/a", "mod/b"] {
+            let s = ir.steps.iter().find(|s| s.id == root).unwrap();
+            assert_eq!(s.needs.0, vec!["prep".to_string()], "{root} inherits prep");
+        }
+        // Both leaves (c, d — nothing inside needs them) anchor the exit seam.
+        let after = ir.steps.iter().find(|s| s.id == "after").unwrap();
+        assert_eq!(after.needs.0, vec!["mod/c".to_string(), "mod/d".to_string()]);
+    }
+
+    #[test]
+    fn invoke_composes_with_a_matrix_inside_the_library() {
+        // matrix × invoke is a follow-up, but a matrix *inside* the library must
+        // expand normally after inlining.
+        let lib = r#"
+            steps:
+              - id: build
+                image: rust
+                matrix: { dimensions: { os: [linux, mac] } }
+        "#;
+        let ir = compile_with(
+            "steps: [{ id: ci, invoke: .scarab/lib/m.yaml }]",
+            &libs(&[(".scarab/lib/m.yaml", lib)]),
+        );
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"ci/build[os=linux]"));
+        assert!(ids.contains(&"ci/build[os=mac]"));
+        assert!(ir.steps.iter().all(|s| s.matrix.is_none()));
+    }
+
+    #[test]
+    fn invoke_chains_through_the_seam() {
+        // An invoke step whose `needs` is another invoke step resolves across
+        // both seams (second-pass rewrite).
+        let a = "steps: [{ id: x, image: busybox }]";
+        let b = "steps: [{ id: y, image: busybox }]";
+        let ir = compile_with(
+            r#"
+            steps:
+              - { id: first, invoke: .scarab/lib/a.yaml }
+              - { id: second, invoke: .scarab/lib/b.yaml, needs: [first] }
+            "#,
+            &libs(&[(".scarab/lib/a.yaml", a), (".scarab/lib/b.yaml", b)]),
+        );
+        let y = ir.steps.iter().find(|s| s.id == "second/y").unwrap();
+        assert_eq!(y.needs.0, vec!["first/x".to_string()], "second's root chains onto first's leaf");
+    }
+
+    #[test]
+    fn invoke_rejects_absolute_traversal_and_cross_repo_paths() {
+        let lib = "steps: [{ id: a, image: busybox }]";
+        let l = libs(&[(".scarab/lib/a.yaml", lib)]);
+        for (path, needle) in [
+            ("/etc/passwd", "no leading `/`"),
+            ("../secrets.yaml", "escape the repo"),
+            (".scarab/../../x.yaml", "escape the repo"),
+            ("github.com/org/repo//lib@sha", "cross-repo"),
+            ("https://evil.example/x.yaml", "cross-repo"),
+        ] {
+            let yaml = format!("steps: [{{ id: s, invoke: \"{path}\" }}]");
+            let errs = errors_with(&yaml, &l);
+            assert!(
+                errs.iter().any(|e| e.contains(needle)),
+                "path {path} should be rejected with `{needle}`, got {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invoke_of_a_missing_library_is_a_diagnostic_not_a_panic() {
+        let errs = errors_with(
+            "steps: [{ id: s, invoke: .scarab/lib/absent.yaml }]",
+            &BTreeMap::new(),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("no library found at `.scarab/lib/absent.yaml`")),
+            "got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn nested_invoke_is_rejected_in_this_slice() {
+        let inner = "steps: [{ id: a, image: busybox }]";
+        let outer = "steps: [{ id: deeper, invoke: .scarab/lib/inner.yaml }]";
+        let errs = errors_with(
+            "steps: [{ id: s, invoke: .scarab/lib/outer.yaml }]",
+            &libs(&[(".scarab/lib/outer.yaml", outer), (".scarab/lib/inner.yaml", inner)]),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("nested invoke is not yet supported")),
+            "got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn invoke_step_must_not_carry_an_image_or_matrix() {
+        let lib = "steps: [{ id: a, image: busybox }]";
+        let l = libs(&[(".scarab/lib/a.yaml", lib)]);
+        let with_image = errors_with(
+            "steps: [{ id: s, invoke: .scarab/lib/a.yaml, image: busybox }]",
+            &l,
+        );
+        assert!(with_image.iter().any(|e| e.contains("must not set an image")), "got {with_image:?}");
+
+        let with_matrix = errors_with(
+            r#"
+            steps:
+              - id: s
+                invoke: .scarab/lib/a.yaml
+                matrix: { dimensions: { os: [linux] } }
+            "#,
+            &l,
+        );
+        assert!(
+            with_matrix.iter().any(|e| e.contains("`matrix` on an invoke step")),
+            "got {with_matrix:?}"
+        );
+    }
+
+    #[test]
+    fn invoke_refs_lists_safe_fetchable_paths_only() {
+        let yaml = r#"
+            steps:
+              - { id: a, invoke: ./.scarab/lib/one.yaml }
+              - { id: b, invoke: .scarab/lib/two.yaml }
+              - { id: c, invoke: ../escape.yaml }
+              - { id: d, image: busybox }
+        "#;
+        // `./` is normalized; the traversal path is omitted (unsafe → not fetched).
+        assert_eq!(
+            invoke_refs(yaml),
+            vec![".scarab/lib/one.yaml".to_string(), ".scarab/lib/two.yaml".to_string()]
+        );
+    }
+
+    #[test]
+    fn compile_yaml_still_works_without_libraries() {
+        // The no-library convenience entrypoint compiles an invoke-free pipeline.
+        let ir = compile("steps: [{ id: a, image: busybox }]");
+        assert_eq!(ir.steps.len(), 1);
     }
 
     #[test]

@@ -665,8 +665,26 @@ pub async fn trigger_run_from_event(
             Err(e) => return Err(TriggerError::Forge(e)),
         };
         let yaml = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
-        let ir =
-            scarab_pipeline::compile_yaml(&yaml).map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+
+        // ADR-0038: `invoke:` steps are resolved by compile-time inlining, but
+        // compile is pure — so pre-fetch the referenced `.scarab/**` library
+        // sources here (at the caller's ref) and hand them to the pure compiler
+        // as a `{path → source}` map. `invoke_refs` returns only path-safe keys;
+        // a library that vanished between list and read surfaces as a compile
+        // diagnostic ("no library found at …"), not a fetch error.
+        let mut libs = std::collections::BTreeMap::new();
+        for lib_path in scarab_pipeline::invoke_refs(&yaml) {
+            match forge.read_file_at_ref(repo, &git_ref, &lib_path).await {
+                Ok(bytes) => {
+                    let src = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
+                    libs.insert(lib_path, src);
+                }
+                Err(scarab_forge::ForgeError::Api(_)) => continue,
+                Err(e) => return Err(TriggerError::Forge(e)),
+            }
+        }
+        let ir = scarab_pipeline::compile_yaml_with_libs(&yaml, &libs)
+            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
 
         let matched = scarab_pipeline::matches_trigger(&ir, kind.as_str(), &ctx)
             .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
