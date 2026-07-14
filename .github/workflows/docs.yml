@@ -1,0 +1,44 @@
+# Build and deploy the Scarab docs site to GitHub Pages — ADR-0040.
+#
+# Release-gated: publishes on a v* tag (the production path) plus a manual
+# workflow_dispatch (the escape hatch while pre-tag). NOT on every push to main.
+# The build runs from ui/scarab-docs-ui but checks out the whole repo, so it can
+# source ../../docs (ADRs, CONTEXT) and ../../openapi.json in place.
+name: docs
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+# Least privilege for Pages deploys via OIDC.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One in-flight deploy at a time; don't cancel a publish midway.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: withastro/action@v3
+        with:
+          path: ui/scarab-docs-ui
+          package-manager: npm
+          node-version: 24
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
