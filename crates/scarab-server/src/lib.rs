@@ -670,13 +670,22 @@ pub async fn trigger_run_from_event(
         // compile is pure — so pre-fetch the referenced `.scarab/**` library
         // sources here (at the caller's ref) and hand them to the pure compiler
         // as a `{path → source}` map. `invoke_refs` returns only path-safe keys;
-        // a library that vanished between list and read surfaces as a compile
+        // fetching is **transitive** (a nested library referenced by a library
+        // must also be fetched) via a worklist, `seen`-guarded so an invoke cycle
+        // terminates the fetch (the cycle itself is reported by compile). A
+        // library that vanished between list and read surfaces as a compile
         // diagnostic ("no library found at …"), not a fetch error.
         let mut libs = std::collections::BTreeMap::new();
-        for lib_path in scarab_pipeline::invoke_refs(&yaml) {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut worklist: Vec<String> = scarab_pipeline::invoke_refs(&yaml);
+        while let Some(lib_path) = worklist.pop() {
+            if !seen.insert(lib_path.clone()) {
+                continue;
+            }
             match forge.read_file_at_ref(repo, &git_ref, &lib_path).await {
                 Ok(bytes) => {
                     let src = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
+                    worklist.extend(scarab_pipeline::invoke_refs(&src));
                     libs.insert(lib_path, src);
                 }
                 Err(scarab_forge::ForgeError::Api(_)) => continue,

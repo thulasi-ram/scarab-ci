@@ -455,25 +455,43 @@ fn resolve_lib_path(raw: &str) -> Result<String, String> {
     Ok(components.join("/"))
 }
 
+/// Hard cap on `invoke` nesting depth (ADR-0038 termination corollary). A chain
+/// deeper than this is rejected at compile — real libraries nest 1–3 levels; the
+/// cap is a backstop against pathological (or generated) recursion, alongside
+/// cycle detection.
+const MAX_INVOKE_DEPTH: usize = 8;
+
 /// Inline every `invoke:` step (ADR-0038) into a flat step list with no invoke
-/// steps left. Single-level only in this slice: a library that itself invokes
-/// is rejected (nesting is a follow-up).
+/// steps left. **Recursive**: a library that itself invokes is expanded to full
+/// depth, ids namespacing correctly at each level (`deploy/db/migrate`).
 ///
-/// For an invoke step `S` referencing library `L`:
-/// - each library step `x` is emitted with id `S.id/x`, its internal `needs`
-///   (and explicit `inputs`) namespaced likewise;
-/// - the library's **root** steps (no `needs`) inherit `S`'s upstream `needs`
-///   (entry seam);
-/// - the library's **leaf** steps (needed by nothing inside `L`) become what a
-///   downstream `needs: [S.id]` resolves to (exit seam).
-///
-/// The seam rewrite runs as a second pass over *all* emitted steps, so an
-/// invoke step depending on another invoke step resolves correctly.
+/// Termination (ADR-0038): a direct or indirect invoke **cycle** is rejected
+/// with a diagnostic naming the offending path, and a hard **depth cap**
+/// ([`MAX_INVOKE_DEPTH`]) bounds nesting.
 fn inline_invokes(
     steps: &[StepSpec],
     libs: &BTreeMap<String, String>,
 ) -> Result<Vec<StepSpec>, Vec<String>> {
     let mut diagnostics = Vec::new();
+    let mut stack: Vec<String> = Vec::new();
+    let out = inline_level(steps, libs, &mut stack, &mut diagnostics);
+    if diagnostics.is_empty() {
+        Ok(out)
+    } else {
+        Err(diagnostics)
+    }
+}
+
+/// Resolve every `invoke:` in `steps` into a flat list, ids relative to *this*
+/// level (an outer caller applies its own prefix). `stack` holds the library
+/// keys currently being expanded on this DFS path — used both for cycle
+/// detection (a key already on the stack) and the depth cap (its length).
+fn inline_level(
+    steps: &[StepSpec],
+    libs: &BTreeMap<String, String>,
+    stack: &mut Vec<String>,
+    diagnostics: &mut Vec<String>,
+) -> Vec<StepSpec> {
     let mut out: Vec<StepSpec> = Vec::new();
     // invoke-step id -> the namespaced leaf ids that a `needs: [that id]` maps to.
     let mut seam: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -517,6 +535,25 @@ fn inline_invokes(
                 continue;
             }
         };
+        // Cycle: this library is already being expanded on the current path.
+        if let Some(pos) = stack.iter().position(|k| k == &key) {
+            let mut path = stack[pos..].to_vec();
+            path.push(key.clone());
+            diagnostics.push(format!(
+                "step `{}`: invoke cycle detected: {}",
+                step.id,
+                path.join(" -> ")
+            ));
+            continue;
+        }
+        // Depth cap: refuse to nest deeper than the backstop.
+        if stack.len() >= MAX_INVOKE_DEPTH {
+            diagnostics.push(format!(
+                "step `{}`: invoke nesting exceeds the depth cap of {MAX_INVOKE_DEPTH} (at `{key}`)",
+                step.id
+            ));
+            continue;
+        }
         let Some(src) = libs.get(&key) else {
             diagnostics.push(format!(
                 "step `{}`: no library found at `{key}` (invoke is local-only; read at the caller's ref)",
@@ -535,34 +572,30 @@ fn inline_invokes(
             diagnostics.push(format!("step `{}`: library `{key}` has no steps", step.id));
             continue;
         }
-        // Single-level only in this slice.
-        if lib.steps.iter().any(|s| s.invoke.is_some()) {
-            diagnostics.push(format!(
-                "step `{}`: library `{key}` itself uses `invoke` — nested invoke is not yet supported (ADR-0038 follow-up)",
-                step.id
-            ));
-            continue;
-        }
+
+        // Recurse: resolve the library's own invokes first, so `resolved` is a
+        // flat list in the library's namespace (ids may already contain `/`).
+        stack.push(key.clone());
+        let resolved = inline_level(&lib.steps, libs, stack, diagnostics);
+        stack.pop();
 
         let prefix = &step.id;
         let ns = |id: &str| format!("{prefix}/{id}");
-        let internal: BTreeSet<&str> = lib.steps.iter().map(|s| s.id.as_str()).collect();
-        let needed_inside: BTreeSet<&str> = lib
-            .steps
+        let internal: BTreeSet<&str> = resolved.iter().map(|s| s.id.as_str()).collect();
+        let needed_inside: BTreeSet<&str> = resolved
             .iter()
             .flat_map(|s| s.needs.0.iter().map(String::as_str))
             .collect();
 
         // Exit seam: a downstream `needs: [S.id]` fans onto the library's leaves.
-        let leaves: Vec<String> = lib
-            .steps
+        let leaves: Vec<String> = resolved
             .iter()
             .filter(|s| !needed_inside.contains(s.id.as_str()))
             .map(|s| ns(&s.id))
             .collect();
         seam.insert(step.id.clone(), leaves);
 
-        for ls in &lib.steps {
+        for ls in &resolved {
             let mut inst = ls.clone();
             inst.id = ns(&ls.id);
             // Entry seam: a library root inherits the invoke step's upstreams;
@@ -588,11 +621,7 @@ fn inline_invokes(
         }
     }
 
-    if diagnostics.is_empty() {
-        Ok(out)
-    } else {
-        Err(diagnostics)
-    }
+    out
 }
 
 /// Namespace one `needs`/`inputs` reference of a library step: prefix it if it
@@ -1670,16 +1699,113 @@ mod tests {
     }
 
     #[test]
-    fn nested_invoke_is_rejected_in_this_slice() {
-        let inner = "steps: [{ id: a, image: busybox }]";
-        let outer = "steps: [{ id: deeper, invoke: .scarab/lib/inner.yaml }]";
+    fn nested_invoke_inlines_recursively_with_deep_namespacing() {
+        // deploy.yaml invokes db.yaml (as step `db`); db.yaml has a `migrate`
+        // step. Top-level invokes deploy.yaml as step `deploy`.
+        let db = r#"
+            steps:
+              - { id: migrate, image: postgres }
+        "#;
+        let deploy = r#"
+            steps:
+              - { id: db, invoke: .scarab/lib/db.yaml }
+              - { id: app, image: busybox, needs: [db] }
+        "#;
+        let ir = compile_with(
+            "steps: [{ id: deploy, invoke: .scarab/lib/deploy.yaml }]",
+            &libs(&[(".scarab/lib/deploy.yaml", deploy), (".scarab/lib/db.yaml", db)]),
+        );
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        // Two levels of namespacing compose: `deploy` / `db` / `migrate`.
+        assert!(ids.contains(&"deploy/db/migrate"), "got {ids:?}");
+        assert!(ids.contains(&"deploy/app"), "got {ids:?}");
+        // The inner seam survives the outer inline: `app` depends on db's leaf.
+        let app = ir.steps.iter().find(|s| s.id == "deploy/app").unwrap();
+        assert_eq!(app.needs.0, vec!["deploy/db/migrate".to_string()]);
+        assert!(ir.steps.iter().all(|s| !s.is_invoke()));
+    }
+
+    #[test]
+    fn a_direct_invoke_cycle_is_rejected() {
+        // A library that invokes itself.
+        let selfref = "steps: [{ id: loop, invoke: .scarab/lib/self.yaml }]";
         let errs = errors_with(
-            "steps: [{ id: s, invoke: .scarab/lib/outer.yaml }]",
-            &libs(&[(".scarab/lib/outer.yaml", outer), (".scarab/lib/inner.yaml", inner)]),
+            "steps: [{ id: s, invoke: .scarab/lib/self.yaml }]",
+            &libs(&[(".scarab/lib/self.yaml", selfref)]),
         );
         assert!(
-            errs.iter().any(|e| e.contains("nested invoke is not yet supported")),
+            errs.iter().any(|e| e.contains("invoke cycle detected")
+                && e.contains(".scarab/lib/self.yaml -> .scarab/lib/self.yaml")),
             "got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn an_indirect_invoke_cycle_is_rejected_with_its_path() {
+        // a -> b -> a.
+        let a = "steps: [{ id: x, invoke: .scarab/lib/b.yaml }]";
+        let b = "steps: [{ id: y, invoke: .scarab/lib/a.yaml }]";
+        let errs = errors_with(
+            "steps: [{ id: s, invoke: .scarab/lib/a.yaml }]",
+            &libs(&[(".scarab/lib/a.yaml", a), (".scarab/lib/b.yaml", b)]),
+        );
+        assert!(
+            errs.iter().any(|e| e.contains("invoke cycle detected")
+                && e.contains(".scarab/lib/a.yaml -> .scarab/lib/b.yaml -> .scarab/lib/a.yaml")),
+            "got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_diamond_of_invokes_is_not_a_cycle() {
+        // top invokes A and B, both invoke C — C appears twice but on separate
+        // DFS paths, so it must NOT be rejected as a cycle.
+        let c = "steps: [{ id: leaf, image: busybox }]";
+        let a = "steps: [{ id: x, invoke: .scarab/lib/c.yaml }]";
+        let b = "steps: [{ id: y, invoke: .scarab/lib/c.yaml }]";
+        let ir = compile_with(
+            r#"
+            steps:
+              - { id: pa, invoke: .scarab/lib/a.yaml }
+              - { id: pb, invoke: .scarab/lib/b.yaml }
+            "#,
+            &libs(&[
+                (".scarab/lib/a.yaml", a),
+                (".scarab/lib/b.yaml", b),
+                (".scarab/lib/c.yaml", c),
+            ]),
+        );
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&"pa/x/leaf") && ids.contains(&"pb/y/leaf"), "got {ids:?}");
+    }
+
+    #[test]
+    fn invoke_nesting_respects_the_depth_cap() {
+        // Build a chain lib0 -> lib1 -> ... where libN invokes lib(N+1). The top
+        // pipeline invokes lib0, so a chain of length L nests L levels deep.
+        fn chain(len: usize) -> BTreeMap<String, String> {
+            let mut m = BTreeMap::new();
+            for i in 0..len {
+                let src = if i + 1 < len {
+                    format!("steps: [{{ id: s{i}, invoke: .scarab/lib/l{}.yaml }}]", i + 1)
+                } else {
+                    format!("steps: [{{ id: s{i}, image: busybox }}]")
+                };
+                m.insert(format!(".scarab/lib/l{i}.yaml"), src);
+            }
+            m
+        }
+        let top = "steps: [{ id: t, invoke: .scarab/lib/l0.yaml }]";
+
+        // At the cap (stack never reaches MAX_INVOKE_DEPTH before the leaf) it
+        // compiles; one deeper is rejected.
+        let ok = compile_yaml_with_libs(top, &chain(MAX_INVOKE_DEPTH));
+        assert!(ok.is_ok(), "a chain at the cap compiles: {ok:?}");
+
+        let too_deep = errors_with(top, &chain(MAX_INVOKE_DEPTH + 1));
+        assert!(
+            too_deep.iter().any(|e| e.contains("exceeds the depth cap")),
+            "got {too_deep:?}"
         );
     }
 

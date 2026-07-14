@@ -397,3 +397,50 @@ steps:
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0].step.0, "build", "the run is ci.yaml's, not the lib's");
 }
+
+/// ADR-0038 (nesting): a library that itself `invoke:`s another library is
+/// fetched *transitively* by the trigger path and inlined to full depth, ids
+/// namespacing at each level (`deploy/db/migrate`).
+#[tokio::test]
+async fn nested_invoke_is_fetched_transitively_and_inlined() {
+    let caller = r#"
+on: { push: {} }
+steps:
+  - { id: deploy, invoke: .scarab/lib/deploy.yaml }
+"#;
+    let deploy_lib = r#"
+steps:
+  - { id: db, invoke: .scarab/lib/db.yaml }
+  - { id: app, image: busybox, needs: [db] }
+"#;
+    let db_lib = r#"
+steps:
+  - { id: migrate, image: postgres }
+"#;
+    let forge = FakeForge::new()
+        .with_file(".scarab/main.yaml", caller)
+        .with_file(".scarab/lib/deploy.yaml", deploy_lib)
+        .with_file(".scarab/lib/db.yaml", db_lib);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
+        .await
+        .expect("trigger");
+    assert_eq!(runs.len(), 1);
+    let run = runs.into_iter().next().unwrap();
+
+    let mut ids: Vec<String> = db
+        .steps_of_run(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.step.0)
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec!["deploy/app".to_string(), "deploy/db/migrate".to_string()],
+        "the two-level nesting is inlined and deeply namespaced"
+    );
+}
