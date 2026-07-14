@@ -515,12 +515,6 @@ fn inline_level(
                 step.id
             ));
         }
-        if step.matrix.is_some() {
-            diagnostics.push(format!(
-                "step `{}`: `matrix` on an invoke step is not yet supported (ADR-0038 follow-up)",
-                step.id
-            ));
-        }
         if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
             diagnostics.push(format!(
                 "step `{}`: an invoke step launches nothing — it must not set `security`",
@@ -575,42 +569,65 @@ fn inline_level(
 
         // Recurse: resolve the library's own invokes first, so `resolved` is a
         // flat list in the library's namespace (ids may already contain `/`).
+        // Coordinate-independent, so it runs once even under a matrix.
         stack.push(key.clone());
         let resolved = inline_level(&lib.steps, libs, stack, diagnostics);
         stack.pop();
 
-        let prefix = &step.id;
-        let ns = |id: &str| format!("{prefix}/{id}");
+        // `matrix` × `invoke` (ADR-0038): a matrix on the invoke step fans out N
+        // copies of the whole subgraph, once per coordinate. `expand_step` gives
+        // the coordinate instances (id `deploy[svc=api]`, `matrix_values` set,
+        // `exclude` applied); a step without a matrix yields exactly one instance
+        // whose id is the step id — the single-copy path falls out for free.
+        let invoke_instances = match expand_step(step) {
+            Ok(v) => v,
+            Err(msg) => {
+                diagnostics.push(msg);
+                continue;
+            }
+        };
+
         let internal: BTreeSet<&str> = resolved.iter().map(|s| s.id.as_str()).collect();
         let needed_inside: BTreeSet<&str> = resolved
             .iter()
             .flat_map(|s| s.needs.0.iter().map(String::as_str))
             .collect();
 
-        // Exit seam: a downstream `needs: [S.id]` fans onto the library's leaves.
-        let leaves: Vec<String> = resolved
-            .iter()
-            .filter(|s| !needed_inside.contains(s.id.as_str()))
-            .map(|s| ns(&s.id))
-            .collect();
-        seam.insert(step.id.clone(), leaves);
-
-        for ls in &resolved {
-            let mut inst = ls.clone();
-            inst.id = ns(&ls.id);
-            // Entry seam: a library root inherits the invoke step's upstreams;
-            // an internal need is namespaced.
-            inst.needs = if ls.needs.0.is_empty() {
-                step.needs.clone()
-            } else {
-                Needs(ls.needs.0.iter().map(|n| namespace_ref(n, &internal, &ns)).collect())
-            };
-            if let Some(inputs) = &ls.inputs {
-                inst.inputs =
-                    Some(inputs.iter().map(|n| namespace_ref(n, &internal, &ns)).collect());
+        // A downstream `needs: [S.id]` fans onto every copy's leaves (exit seam),
+        // keyed by the *authored* id since that is all a downstream can name.
+        let mut all_leaves: Vec<String> = Vec::new();
+        for inv in &invoke_instances {
+            let prefix = &inv.id;
+            let ns = |id: &str| format!("{prefix}/{id}");
+            for ls in &resolved {
+                if !needed_inside.contains(ls.id.as_str()) {
+                    all_leaves.push(ns(&ls.id));
+                }
             }
-            out.push(inst);
+            for ls in &resolved {
+                let mut inst = ls.clone();
+                inst.id = ns(&ls.id);
+                // Entry seam: a library root inherits the invoke step's upstreams;
+                // an internal need is namespaced.
+                inst.needs = if ls.needs.0.is_empty() {
+                    inv.needs.clone()
+                } else {
+                    Needs(ls.needs.0.iter().map(|n| namespace_ref(n, &internal, &ns)).collect())
+                };
+                if let Some(inputs) = &ls.inputs {
+                    inst.inputs =
+                        Some(inputs.iter().map(|n| namespace_ref(n, &internal, &ns)).collect());
+                }
+                // Propagate the invoke coordinate so CEL inside the subgraph can
+                // read it; a library step's own coordinate (added later by the
+                // main matrix pass) wins on key conflict.
+                for (k, v) in &inv.matrix_values {
+                    inst.matrix_values.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+                out.push(inst);
+            }
         }
+        seam.insert(step.id.clone(), all_leaves);
     }
 
     // Second pass: rewrite every reference to an invoke-step id onto its leaves.
@@ -731,7 +748,10 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
             let mut instance = step.clone();
             instance.id = format!("{}[{suffix}]", step.id);
             instance.matrix = None;
-            instance.matrix_values = coord;
+            // Merge onto any coordinate the step already carries (an invoke
+            // step's coordinate propagated onto an inlined library step, ADR-0038)
+            // rather than replacing it; for an ordinary step the map starts empty.
+            instance.matrix_values.extend(coord);
             instance
         })
         .collect())
@@ -1810,28 +1830,75 @@ mod tests {
     }
 
     #[test]
-    fn invoke_step_must_not_carry_an_image_or_matrix() {
+    fn invoke_step_must_not_carry_an_image() {
         let lib = "steps: [{ id: a, image: busybox }]";
-        let l = libs(&[(".scarab/lib/a.yaml", lib)]);
         let with_image = errors_with(
             "steps: [{ id: s, invoke: .scarab/lib/a.yaml, image: busybox }]",
-            &l,
+            &libs(&[(".scarab/lib/a.yaml", lib)]),
         );
         assert!(with_image.iter().any(|e| e.contains("must not set an image")), "got {with_image:?}");
+    }
 
-        let with_matrix = errors_with(
+    #[test]
+    fn matrix_on_an_invoke_fans_out_the_subgraph_per_coordinate() {
+        let lib = r#"
+            steps:
+              - { id: build, image: rust }
+              - { id: test, image: rust, needs: [build] }
+        "#;
+        let ir = compile_with(
             r#"
             steps:
-              - id: s
-                invoke: .scarab/lib/a.yaml
-                matrix: { dimensions: { os: [linux] } }
+              - id: svc
+                invoke: .scarab/lib/ci.yaml
+                matrix: { dimensions: { svc: [api, web] } }
+              - { id: gate, image: busybox, needs: [svc] }
             "#,
-            &l,
+            &libs(&[(".scarab/lib/ci.yaml", lib)]),
         );
-        assert!(
-            with_matrix.iter().any(|e| e.contains("`matrix` on an invoke step")),
-            "got {with_matrix:?}"
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        // Each copy's ids carry both the coordinate and the invoke namespace,
+        // uniquely.
+        for id in ["svc[svc=api]/build", "svc[svc=api]/test", "svc[svc=web]/build", "svc[svc=web]/test"] {
+            assert!(ids.contains(&id), "missing {id} in {ids:?}");
+        }
+        // Internal edges rewrite per copy.
+        let api_test = ir.steps.iter().find(|s| s.id == "svc[svc=api]/test").unwrap();
+        assert_eq!(api_test.needs.0, vec!["svc[svc=api]/build".to_string()]);
+        // The coordinate is visible to the inlined steps (for CEL interpolation).
+        let api_build = ir.steps.iter().find(|s| s.id == "svc[svc=api]/build").unwrap();
+        assert_eq!(api_build.matrix_values.get("svc").map(String::as_str), Some("api"));
+        // Exit seam: `needs: [svc]` fans onto every copy's leaf.
+        let gate = ir.steps.iter().find(|s| s.id == "gate").unwrap();
+        assert_eq!(
+            gate.needs.0,
+            vec!["svc[svc=api]/test".to_string(), "svc[svc=web]/test".to_string()]
         );
+    }
+
+    #[test]
+    fn matrix_on_an_invoke_is_two_dimensional_and_honours_exclude() {
+        let lib = "steps: [{ id: run, image: busybox }]";
+        let ir = compile_with(
+            r#"
+            steps:
+              - id: m
+                invoke: .scarab/lib/x.yaml
+                matrix:
+                  dimensions:
+                    os: [linux, windows]
+                    arch: [amd64, arm64]
+                  exclude:
+                    - "os == 'windows' && arch == 'arm64'"
+            "#,
+            &libs(&[(".scarab/lib/x.yaml", lib)]),
+        );
+        let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
+        // 2x2 minus one excluded combination = 3 copies, each a unique id.
+        assert_eq!(ir.steps.len(), 3, "got {ids:?}");
+        assert!(!ids.contains(&"m[arch=arm64,os=windows]/run"), "excluded combo absent");
+        assert!(ids.contains(&"m[arch=amd64,os=windows]/run"));
+        assert!(ids.contains(&"m[arch=arm64,os=linux]/run"));
     }
 
     #[test]
