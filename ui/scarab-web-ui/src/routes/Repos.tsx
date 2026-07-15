@@ -1,29 +1,165 @@
-// Repositories — the landing tier. Enabled repos with a status dot, last-run
-// provenance, and a run-history sparkline (representative until the forge/repo
-// backend lands; see data/catalog). Clicking a card opens the repo's runs.
-import { For } from "solid-js";
-import { A } from "@solidjs/router";
-import { listRepos } from "../data/catalog";
+// Dashboard — the engineer's landing tier. First-person, keyed on the signed-in
+// actor: (1) an ACTION INBOX of things frozen until you act, (2) YOUR ACTIVITY
+// across all repos with in-flight runs pinned, (3) YOUR REPOS as the navigation
+// floor. When the inbox and in-flight list are both empty the page collapses to
+// a deliberate "all clear" state + the repo grid — never an idle/blank surface.
+//
+// Representative until the forge/RepoStore + ADR-0037 gate backends land (see
+// data/catalog). The `state:` pill is a PROTOTYPE-ONLY control to preview the
+// active vs all-clear layouts side by side; it goes away once data is real.
+import { For, Show, createSignal, createMemo } from "solid-js";
+import { A, useNavigate } from "@solidjs/router";
+import {
+  listRepos,
+  actionInbox,
+  myActivity,
+  ORG,
+  ME,
+  TRIGGER_GLYPH,
+  type InboxKind,
+  type InboxItem,
+  type ActivityRow,
+} from "../data/catalog";
 import Icon from "../components/Icon";
 import Sparkline from "../components/Sparkline";
 import Doodle from "../components/Doodle";
 
+// Per-kind presentation for an inbox row: the verb chip carries the row (the
+// leading icon was redundant with it), plus the action button + its weight.
+const KIND: Record<InboxKind, { verb: string; action: string; btn: string }> = {
+  approve: { verb: "approve", action: "Approve", btn: "btn-primary" },
+  input: { verb: "input", action: "Provide input", btn: "btn-copper" },
+  rerun: { verb: "re-run", action: "Re-run", btn: "btn-ghost" },
+  resume: { verb: "resume", action: "Resume", btn: "btn-ghost" },
+};
+
+type DemoState = "active" | "allclear";
+
 export default function Repos() {
+  const nav = useNavigate();
   const repos = listRepos();
+
+  // Prototype-only: flip the whole page between populated and all-clear.
+  const [state, setState] = createSignal<DemoState>("active");
+  const inbox = createMemo<InboxItem[]>(() => (state() === "active" ? actionInbox() : []));
+  // The feed is "observe", the inbox is "act" — a run that's waiting on you shows
+  // in one place, not both. Suppress inbox runs from the activity feed by id.
+  const activity = createMemo<ActivityRow[]>(() => {
+    if (state() !== "active") return [];
+    const inInbox = new Set(inbox().map((it) => it.id));
+    return myActivity().filter((r) => !inInbox.has(r.id));
+  });
+  const inFlight = createMemo(() => activity().filter((r) => r.status === "running" || r.status === "pending").length);
+  const calm = createMemo(() => inbox().length === 0 && inFlight() === 0);
+
+  const openRun = (repo: string, id: string) => nav(`/${ORG}/${repo}/runs/${id}`);
+
   return (
     <section class="page">
       <Doodle icon="boxes" size={240} rotate={-12} opacity={0.06} top="60px" right="40px" />
 
       <div class="page-head">
-        <h1>Repositories</h1>
-        <button class="btn btn-copper">
-          <Icon icon="plus" size={15} /> Enable repository
-        </button>
+        <h1>Dashboard</h1>
+        <div class="dash-toggle">
+          <For each={["active", "allclear"] as DemoState[]}>
+            {(s) => (
+              <button class={`fpill ${state() === s ? "on" : ""}`} onClick={() => setState(s)}>
+                {s === "active" ? "active" : "all clear"}
+              </button>
+            )}
+          </For>
+        </div>
       </div>
       <p class="subtle page-sub">
-        {repos.length} enabled · triggered by push, pull request, tag &amp; manual
+        {ORG} · signed in as {ME} <span class="repr-tag">prototype state</span>
       </p>
 
+      {/* ── Waiting on you (action inbox) ─────────────────────────────────── */}
+      <Show
+        when={inbox().length > 0}
+        fallback={
+          <div class="allclear">
+            <Icon icon="shield-check" size={22} class="ac-ico" />
+            <div>
+              <div class="ac-title">All clear — nothing needs you</div>
+              <div class="ac-sub">
+                No approvals, inputs, or held runs waiting. New work will surface here.
+              </div>
+            </div>
+          </div>
+        }
+      >
+        <div class="dash-label">
+          waiting on you <span class="count">· {inbox().length}</span>
+        </div>
+        <div class="inbox">
+          <For each={inbox()}>
+            {(it) => {
+              const k = KIND[it.kind];
+              return (
+                <div class="inbox-row" onClick={() => openRun(it.repo, it.id)}>
+                  <span class={`inbox-verb verb-${it.kind}`}>{k.verb}</span>
+                  <span class="inbox-what">
+                    <span class="inbox-msg">
+                      <span class="sha mono">{it.sha}</span>
+                      <span class="repo">{it.repo}</span> · {it.message}
+                    </span>
+                    <span class="inbox-detail">
+                      {it.detail}
+                      <Show when={!it.real}><span class="repr-tag">representative</span></Show>
+                    </span>
+                  </span>
+                  <span class="inbox-age">{it.age}</span>
+                  <button
+                    class={`btn btn-sm ${k.btn}`}
+                    onClick={(e) => { e.stopPropagation(); openRun(it.repo, it.id); }}
+                  >
+                    {k.action}
+                  </button>
+                </div>
+              );
+            }}
+          </For>
+        </div>
+      </Show>
+
+      {/* ── Your activity (in-flight pinned) ──────────────────────────────── */}
+      <Show when={activity().length > 0}>
+        <div class="dash-label">
+          your activity
+          <Show when={inFlight() > 0}>
+            <span class="count">· {inFlight()} in flight</span>
+          </Show>
+        </div>
+        <div class="runlist">
+          <div class="runrow head">
+            <span></span><span>commit</span><span>trigger · branch</span><span>duration</span><span>when</span>
+          </div>
+          <For each={activity()}>
+            {(r) => (
+              <div class="runrow" onClick={() => openRun(r.repo, r.id)}>
+                <span class={`sdot ${r.status}`} />
+                <span class="rr-commit">
+                  <span class="rr-sha mono">{r.sha}</span>
+                  <span class="rr-msg"><span class="rr-repo">{r.repo}</span> {r.message}</span>
+                </span>
+                <span class="rr-trigger mono">
+                  <span class="tglyph">{TRIGGER_GLYPH[r.trigger]}</span>
+                  {r.trigger}
+                  <span class="rr-branch"> · {r.branch}</span>
+                </span>
+                <span class="rr-dur mono">{r.duration}</span>
+                <span class="rr-when mono">{r.age}</span>
+              </div>
+            )}
+          </For>
+        </div>
+      </Show>
+
+      {/* ── Your repos (navigation floor) ─────────────────────────────────── */}
+      <div class="dash-label">
+        your repos <span class="count">· {repos.length}</span>
+      </div>
       <div class="repo-grid">
         <For each={repos}>
           {(r) => (

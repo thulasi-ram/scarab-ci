@@ -1310,3 +1310,62 @@ h2 {
   background-repeat: no-repeat;
   opacity: 0.6;
 }
+
+/* ════════════════════════════════════════════════════════════════════════
+   Dashboard (engineer landing): action inbox · activity · all-clear
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* Prototype-only state switcher lives in the header, right-aligned. */
+.dash-toggle { display: inline-flex; gap: 6px; }
+
+/* Section eyebrow above each dashboard block. */
+.dash-label {
+  display: flex; align-items: center; gap: 7px;
+  font-family: var(--font-mono); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 1px; color: var(--muted-sage); margin: 30px 0 11px;
+}
+.dash-label:first-of-type { margin-top: 8px; }
+.dash-label .count { color: var(--sage); letter-spacing: 0.5px; }
+
+/* Representative/prototype tag — a dashed gold edge, never a fill (§edges). */
+.repr-tag {
+  font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase;
+  letter-spacing: 0.5px; color: var(--copper); border: 1px dashed var(--border-copper);
+  border-radius: 4px; padding: 1px 5px; margin-left: 8px; vertical-align: middle;
+}
+
+/* ---- action inbox ---- */
+.inbox { border: 1px solid var(--border); border-radius: 11px; overflow: hidden; background: var(--emerald-surface); }
+.inbox-row {
+  display: grid; grid-template-columns: 84px 1fr auto auto; gap: 14px; align-items: center;
+  padding: 13px 16px; border-bottom: 1px solid var(--border-soft); cursor: pointer;
+}
+.inbox-row:last-child { border-bottom: none; }
+.inbox-row:hover { background: color-mix(in srgb, var(--emerald) 7%, transparent); }
+.inbox-verb {
+  font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+  text-align: center; padding: 3px 6px; border-radius: 5px; border: 1px solid currentColor;
+}
+.verb-approve { color: var(--emerald); }
+.verb-rerun  { color: var(--danger); }
+.verb-input  { color: var(--copper); }
+.verb-resume { color: var(--muted-sage); }
+.inbox-what { display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
+.inbox-msg { font-size: 13.5px; color: var(--soft-white); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.inbox-msg .sha { color: var(--copper); font-size: 12px; margin-right: 9px; }
+.inbox-msg .repo { color: var(--sage); }
+.inbox-detail { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted-sage); }
+.inbox-age { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted-sage); }
+
+/* ---- all-clear (calm state) ---- */
+.allclear {
+  display: flex; align-items: center; gap: 15px; margin-top: 8px;
+  padding: 20px 22px; border: 1px solid var(--border); border-radius: 11px;
+  background: var(--emerald-surface);
+}
+.allclear .ac-ico { color: var(--emerald); flex: none; }
+.allclear .ac-title { font-family: var(--font-display); font-size: 15px; font-weight: 600; color: var(--soft-white); }
+.allclear .ac-sub { font-size: 13px; color: var(--muted-sage); margin-top: 2px; }
+
+/* cross-repo activity: the repo prefix on the commit message */
+.rr-repo { color: var(--sage); font-weight: 600; margin-right: 5px; }

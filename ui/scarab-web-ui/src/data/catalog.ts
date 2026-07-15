@@ -107,6 +107,100 @@ export function listRepos(): RepoCard[] {
   ];
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// DASHBOARD (engineer landing) — first-person surfaces keyed on the signed-in
+// actor. Representative until the forge/RepoStore + gate-governance backends
+// land: the activity feed swaps to `listRuns` filtered by actor; the inbox's
+// approve/input/resume rows need the ADR-0037 gate backend (only `rerun` maps
+// to a wired action today — RunDetail restart).
+// ─────────────────────────────────────────────────────────────────────────
+
+/** The signed-in engineer (matches the top-bar avatar + AUTHORS). */
+export const ME = "t.ram";
+
+/** An item frozen until *you* act. `real` = backed by a wired action today. */
+export type InboxKind = "approve" | "input" | "rerun" | "resume";
+export type InboxItem = {
+  id: string;
+  kind: InboxKind;
+  repo: string;
+  sha: string;
+  message: string;
+  detail: string; // gate/env/failure context, mono
+  age: string;
+  real: boolean;
+};
+
+/** "Waiting on you" — every stalled item that needs a decision from you. */
+export function actionInbox(): InboxItem[] {
+  return [
+    {
+      id: "run-3f9a2c1",
+      kind: "approve",
+      repo: "billing",
+      sha: "3f9a2c1",
+      message: "perf: batch SKIP LOCKED lease claim",
+      detail: "deploy gate · production · 2 approvers",
+      age: "18m",
+      real: false,
+    },
+    {
+      id: "run-a1b2c3d",
+      kind: "input",
+      repo: "api",
+      sha: "a1b2c3d",
+      message: "feat: checkout summary card",
+      detail: "manual gate · needs environment, reason",
+      age: "42m",
+      real: false,
+    },
+    {
+      id: "run-7e4d5f6",
+      kind: "rerun",
+      repo: "infra",
+      sha: "7e4d5f6",
+      message: "test: gate timer auto-release",
+      detail: "failed · step `plan` exited 1",
+      age: "1h",
+      real: true,
+    },
+    {
+      id: "run-9c8b7a6",
+      kind: "resume",
+      repo: "web",
+      sha: "9c8b7a6",
+      message: "chore: bump sqlx to 0.8",
+      detail: "held · timer gate, 24h wait remaining",
+      age: "3h",
+      real: false,
+    },
+  ];
+}
+
+/** Your recent runs across all repos — in-flight pinned first, newest after. */
+export type ActivityRow = {
+  id: string;
+  status: RunFacet;
+  repo: string;
+  sha: string;
+  message: string;
+  trigger: TriggerKind;
+  branch: string;
+  duration: string; // "—" while in flight
+  age: string;
+};
+
+export function myActivity(): ActivityRow[] {
+  return [
+    { id: "run-11aa22b", status: "running", repo: "api", sha: "11aa22b", message: "fix: retry idempotency on outbox drain", trigger: "push", branch: "main", duration: "—", age: "2m ago" },
+    { id: "run-a1b2c3d", status: "pending", repo: "api", sha: "a1b2c3d", message: "feat: checkout summary card", trigger: "pull_request", branch: "feat/checkout", duration: "—", age: "5m ago" },
+    { id: "run-55cc66d", status: "succeeded", repo: "billing", sha: "55cc66d", message: "chore: bump sqlx to 0.8", trigger: "push", branch: "main", duration: "1m12s", age: "22m ago" },
+    { id: "run-7e4d5f6", status: "failed", repo: "infra", sha: "7e4d5f6", message: "test: gate timer auto-release", trigger: "push", branch: "fix/outbox", duration: "48s", age: "1h ago" },
+    { id: "run-88ee99f", status: "succeeded", repo: "api", sha: "88ee99f", message: "perf: batch SKIP LOCKED lease claim", trigger: "tag", branch: "main", duration: "2m03s", age: "2h ago" },
+    { id: "run-00ff11a", status: "succeeded", repo: "web", sha: "00ff11a", message: "docs: ADR-0040 log source wiring", trigger: "push", branch: "main", duration: "55s", age: "3h ago" },
+  ];
+}
+
 export type EnvRow = {
   name: string;
   approvers: number;
