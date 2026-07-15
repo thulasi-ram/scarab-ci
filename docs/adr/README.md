@@ -58,6 +58,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0039](0039-privileged-images.md) | Privileged step images: hardened baseline + governed capability grants per Environment | Accepted |
 | [0041](0041-named-results-and-interpolation.md) | Named step results + launch-time interpolation (`${{ outputs.<id>.<name> }}`); makes 0038 outputs live | Accepted |
 | [0042](0042-trusted-egress-sidecar.md) | Trusted per-Pod egress sidecar → fence-scoped results API → Postgres (how k8s captures results) | Accepted |
+| [0043](0043-launch-parameters-and-manual-dispatch.md) | Launch parameters (typed `interface.inputs`) + manual dispatch as a repo-aware trigger | Proposed |
 
 > For *features* deliberately deferred until demand appears (as opposed to ADRs
 > to be written), see [`docs/followups.md`](../followups.md).

@@ -83,10 +83,11 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 | **Environment** | A first-class deployment target (staging/prod) with **protection rules**: approvers, wait timer, allowed refs, concurrency, secret scope, OIDC subject, deployment history, and a **privilege whitelist** (which image digests may run with which governed grants — ADR-0039). |
 | **Grant** | A named, closed-vocabulary escalation above the hardened "restricted" step baseline (ADR-0039). `run-as-root` (self-service — does not escape the sandbox); `add-capabilities` and `privileged` (**governed** — require an Environment whitelist entry keyed on the image **digest**, Administer-only). Requested by the pipeline author, granted by the Environment admin, admitted fail-closed. A grant is a ceiling, not a default. |
 
-### 4.2 Data plane (four distinct concepts — never conflate)
+### 4.2 Data plane (five distinct concepts — never conflate)
 
 | Term | Scope | Lifetime | Purpose |
 |---|---|---|---|
+| **Parameter** | launch-time input, supplied from *outside* the run | resolved once at launch, then persisted for the run's life | a typed value a launcher supplies to start a Pipeline. Declared in the Pipeline's `interface.inputs`; each is `required` (static bool) with an optional `default` and optional `validate:` CEL predicate. Supplied by a human/API on a `manual`/`api` launch **and** by an `invoke:` caller's `with:` — one declaration, one env rail (`SCARAB_PARAM_<NAME>`), one launch-time CEL binding `${{ inputs.<name> }}`. **Not** the per-Step workspace `inputs:` (ADR-0007), which is a different concept sharing the word. |
 | **Workspace** | intra-run, flows along DAG edges | ephemeral (per run) | the filesystem/checkout Steps build on. **Content-addressed** (per-file merkle CAS). Implicit-by-default (inherit `needs`), explicit-on-demand (`inputs:`/`outputs:`). |
 | **Result** | intra-run, flows along DAG edges | ephemeral | small typed values (a version, a bool) for params/conditionals. |
 | **Artifact** | output of record | retained (TTL), downloadable, UI-visible | binaries, reports, coverage, images. |
