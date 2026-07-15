@@ -1,17 +1,17 @@
 ---
 title: Scarab
-description: A durable-execution, Kubernetes-native CI system — a forge-integrated alternative to GitHub Actions, written in Rust.
+description: A modern CI engine for Kubernetes — forge-native, on a durable core. The cohesion of a forge CI, on a control plane that treats a run as state, not a process. Written in Rust.
 template: splash
 hero:
   layout: split-left
-  tagline: Your pipeline is a workflow that survives crashes, not a fire-and-forget batch job.
+  tagline: A modern CI engine for Kubernetes — forge-native, on a durable core. It treats your run as state, not a process.
   image:
     file: ../../assets/logo.svg
   actions:
     - text: Run it locally
       link: /scarab-ci/get-started/run-locally/
       icon: right-arrow
-    - text: Why durable execution
+    - text: Why an engine, not a runner
       link: /scarab-ci/tech/adr/0001-ci-as-durable-execution/
       icon: open-book
       variant: minimal
@@ -22,26 +22,30 @@ import Doodle from '../../components/Doodle.astro';
 
 <Doodle icon="bug" size={260} rotate={-14} opacity={0.07} top="6rem" right="-3rem" />
 
-Scarab treats a pipeline as a **resumable, inspectable, mutable-mid-flight workflow**. Because the
-orchestrator is a crash-safe durable state machine on Postgres, **resume**, **restart-a-step**,
-**time-travel**, and long-lived **approval gates** are native — not bolted on.
+CI tools fall into two camps. **Workflow engines** — Argo, Tekton, Temporal — have a durable,
+crash-safe core, but they aren't CI: forge integration, in-repo config, PR checks, identity,
+secrets, DSL, and UI are yours to build. **Forge-native CIs** — GitHub Actions, GitLab,
+Woodpecker, Drone — hand you all of that, but the orchestrator is a job runner: if the control
+plane restarts mid-run, the run is orphaned or starts over. Scarab is built to be **both at
+once** — the batteries-included feel of a forge CI, on a control plane that treats a run as
+durable **state**, not a fire-and-forget process.
 
-![The Scarab control plane — live DAG, SSE logs, time-travel (placeholder)](../../assets/screenshot-placeholder.svg)
+![The Scarab control plane — live DAG, SSE logs, event timeline (placeholder)](../../assets/screenshot-placeholder.svg)
 
-## The wedge
+## What makes it different
 
 <CardGrid>
-  <Card title="Durable by construction" icon="approve-check">
-    A DBOS-pattern durable state machine on Postgres. A mid-run control-plane kill resumes exactly
-    where it left off — durability is the product, not a feature.
+  <Card title="Cohesion, not assembly" icon="puzzle">
+    One forge-native CI product — DSL, secrets, approvals, identity, UI — on a durable engine.
+    Not a workflow engine you build a CI on top of, nor a job-runner CI with no durable core.
   </Card>
-  <Card title="Kubernetes-native" icon="puzzle">
-    Pod-per-step execution on a content-addressed workspace (per-file merkle CAS). k8s-only, no
-    bespoke runner fleet to babysit.
+  <Card title="Runs are state, not processes" icon="approve-check">
+    A DBOS-pattern durable state machine on Postgres. A control-plane restart resumes the run
+    from its last completed step, with exactly-once step execution — the architecture, not a boast.
   </Card>
-  <Card title="Forge-integrated, keyless" icon="seti:lock">
-    Forge-agnostic OIDC identity, with Scarab itself as an OIDC issuer for keyless federation to
-    your cloud.
+  <Card title="Keyless identity" icon="seti:lock">
+    Forge-agnostic OIDC, with Scarab itself as an OIDC issuer for keyless federation to your
+    cloud. (Designed forge-native; the live GitHub adapter is in progress — see Status.)
   </Card>
   <Card title="A real DSL" icon="seti:config">
     A typed IR (the actual DSL) with a YAML frontend and CEL expressions — a flat recursive DAG
@@ -50,6 +54,23 @@ orchestrator is a crash-safe durable state machine on Postgres, **resume**, **re
 </CardGrid>
 
 <Doodle icon="workflow" size={200} rotate={12} opacity={0.06} bottom="2rem" left="-2rem" />
+
+## Why now
+
+As pipelines get longer and more autonomous — agents, long review gates, multi-day workflows —
+"the job died, click re-run" stops being good enough. Scarab holds a suspended run at near-zero
+cost and resumes exactly where it paused, with an append-only event log of everything that
+happened. That's where a durable core earns its keep — and it's the substrate agent-driven
+development wants, not a nicer YAML dialect. Scarab is also *built* AI-first: ambitious systems
+software from a small team, at a pace that used to need a room full of people.
+
+:::tip[Lineage]
+Scarab owes its shape to [Woodpecker](https://woodpecker-ci.org/) — lean, forge-native CI with
+no enterprise ceremony. It's inspired at least as much by Woodpecker's *limits*: the many-backend
+surface it carries, and the pace a volunteer project can sustain. Kubernetes-only is us shedding
+that backend baggage on purpose ([ADR-0005](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)); the
+pace is what a small AI-first team can now hold.
+:::
 
 ## Where to go next
 
@@ -64,7 +85,11 @@ orchestrator is a crash-safe durable state machine on Postgres, **resume**, **re
   </Card>
 </CardGrid>
 
-:::note[Status]
-Scarab is **design + scaffolding** (🌱). The API reference and the Tech section are real today; the
-Guides and Configure sections grow as vertical slices land, and Helm packaging is on the way.
+:::note[Status — honest]
+A proven core, with the live-I/O edges being wired. **Proven against real Postgres:** the durable
+engine — crash/resume, exactly-once, restart-a-step, gates, content-addressed workspace,
+`invoke`, secrets, OIDC issuer (~230 tests). **Proven against a *fake* forge:** the full flow
+(webhook → in-repo `.scarab` → run → checks → login). **In progress:** the live GitHub adapter
+(outbound calls are `unimplemented!()` today), live-Kubernetes Pod execution, the results sidecar
+image, and CI that runs the Rust suite on push. Read a proven state machine, not a shipped product.
 :::

@@ -17,7 +17,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: 'Scarab',
-      tagline: 'Your pipeline is a workflow that survives crashes.',
+      tagline: 'A modern CI engine for Kubernetes — forge-native, on a durable core.',
       logo: { src: './src/assets/logo.svg', alt: 'Scarab' },
       customCss: [
         // Geist is the face shadcn/ui (and thus the Lucode base) is drawn with —
@@ -43,7 +43,7 @@ export default defineConfig({
             { label: 'Tech', link: '/tech/context/' },
           ],
           footerText:
-            'Scarab — durable-execution, Kubernetes-native CI. Themed with [Lucode Starlight](https://github.com/lucas-labs/lucode-starlight-theme).',
+            'Scarab — a modern CI engine for Kubernetes: forge-native, on a durable core. Themed with [Lucode Starlight](https://github.com/lucas-labs/lucode-starlight-theme).',
         }),
         // API reference generated from the canonical spec, in place.
         starlightOpenAPI([

@@ -1,20 +1,53 @@
 # Scarab
 
-**A durable-execution, Kubernetes-native CI system** — a forge-integrated alternative to
-GitHub Actions, written in Rust.
+**A modern CI engine for Kubernetes — forge-native, on a durable core.** Written in Rust.
 
-> *Your pipeline is a workflow that survives crashes, not a fire-and-forget batch job.*
+CI tools fall into two camps, and neither covers the whole job. **Workflow engines** — Argo,
+Tekton, Temporal — have a durable, crash-safe core, but they aren't CI: the forge
+integration, in-repo config, PR checks, identity, secrets, DSL, and UI are yours to build.
+**Forge-native CIs** — GitHub Actions, GitLab, Woodpecker, Drone — hand you all of that, but
+the orchestrator underneath is a job runner: if the control plane restarts mid-run, the run
+is orphaned or starts from scratch.
 
-Scarab treats a pipeline as a **resumable, inspectable, mutable-mid-flight workflow**. Because
-the orchestrator is a crash-safe durable state machine on Postgres, **resume**,
-**restart-a-step**, **time-travel**, and long-lived **approval gates** are native, not
-bolted-on.
+Scarab is built to be **both at once** — the batteries-included feel of a forge-native CI, on
+a control plane that treats a run as durable **state**, not a fire-and-forget process. The
+engine is a crash-safe state machine on Postgres (the DBOS/Temporal pattern): a control-plane
+restart resumes the run from its last completed step, with exactly-once step execution. Where
+self-hosted CIs like Woodpecker and Drone strand in-flight builds on a restart — stuck
+`running`, containers left dangling ([woodpecker-ci#3427](https://github.com/woodpecker-ci/woodpecker/issues/3427),
+[drone#2189](https://github.com/harness/drone/issues/2189)) — a Scarab run picks up where it
+left off.
 
-## Status
+Durability is the *architecture*, not the headline: resume, restart-a-step, durable approval
+gates, and an inspectable event log all fall out of it. It earns its keep as pipelines get
+longer and more autonomous — agents, multi-day workflows, long review gates — where "the job
+died, click re-run" stops being good enough: Scarab holds a suspended run at near-zero cost
+and resumes exactly where it paused.
 
-🌱 **Design + scaffolding.** The full design is captured — see below — and the workspace is a
-compiling skeleton. Implementation proceeds in tracer-bullet vertical slices, starting with a
-durable-core walking skeleton that survives a mid-run control-plane kill.
+**Lineage.** Scarab owes its shape to [Woodpecker](https://woodpecker-ci.org/) — lean,
+forge-native CI, no enterprise ceremony — and is inspired as much by its *limits*: the
+many-backend surface it carries, and the pace a volunteer project can sustain. Kubernetes-only
+sheds the backend baggage on purpose ([ADR-0005](docs/adr/0005-tenancy-and-k8s-only.md)); the
+pace is what a small team building AI-first can now hold.
+
+## Status (honest)
+
+Read this as *a proven core with the live-I/O edges being wired*, not a shipped product.
+
+- **Proven (against real Postgres).** The durable engine: crash-mid-run → resume, exactly-once
+  step execution, restart-a-step, durable gates, content-addressed workspace, `invoke`
+  inlining, scheduler (concurrency/fairness/supersede), secrets + fork-PR lockout, and a
+  self-hosted OIDC issuer. ~230 tests pass locally.
+- **Proven against a *fake* forge.** The forge-native flow end-to-end: signed webhook →
+  in-repo `.scarab` config → run → checks posted back → OAuth-gated reads.
+- **In progress.** The live GitHub adapter (outbound calls are currently `unimplemented!()`),
+  live-Kubernetes Pod execution and re-attach (tested only via `#[ignore]`d live-cluster
+  paths), the results-egress sidecar image, and a CI job that runs the Rust suite on push.
+
+So: the hard core (the durable state machine) is real and tested; the claims scoped to *a
+live forge* and *a live cluster* are not yet demonstrated. Implementation proceeds in
+tracer-bullet vertical slices. See [docs/positioning.md](docs/positioning.md) for what we do
+and don't claim, and why.
 
 ## Start here
 
@@ -25,10 +58,14 @@ durable-core walking skeleton that survives a mid-run control-plane kill.
 - **Issues** — tracked in [git-bug](https://github.com/git-bug/git-bug) (embedded in this
   repo): `git-bug bug` to list, `git-bug termui` for the TUI.
 
-## What makes it different (the wedge)
+## What makes it different
 
-Durable execution. Everything else — k8s-native execution, forge integration — is a *means*.
-See [ADR-0001](docs/adr/0001-ci-as-durable-execution.md).
+**Cohesion.** One forge-native CI product — DSL, secrets, approvals, identity, UI — on a
+durable engine, rather than a workflow engine (Argo/Tekton/Temporal) you assemble a CI on top
+of, or a job-runner CI (Actions/Woodpecker) with no durable engine underneath. The durable
+core is the *architectural* wedge ([ADR-0001](docs/adr/0001-ci-as-durable-execution.md)) — the
+thing every other decision is judged against — but the *public* pitch is the cohesion. See
+[docs/positioning.md](docs/positioning.md) for how we talk about it, and the honest boundaries.
 
 ## Design at a glance
 

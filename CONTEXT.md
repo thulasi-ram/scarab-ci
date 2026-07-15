@@ -1,9 +1,19 @@
 # Scarab — Context & Ubiquitous Language
 
-> Scarab is a **durable-execution, Kubernetes-native CI system** written in Rust —
-> a forge-integrated alternative to GitHub Actions.
+> Scarab is a **forge-native CI engine for Kubernetes, built on a durable core** — written in
+> Rust. The field splits in two: durable *workflow engines* (Argo, Tekton, Temporal) that
+> aren't CI, and forge-native *CIs* (GitHub Actions, Woodpecker) whose orchestrator is a job
+> runner. Scarab is designed to be both — a cohesive forge-native CI on a crash-safe state
+> machine (Postgres; the DBOS/Temporal pattern).
 >
-> **Thesis:** *Your pipeline is a workflow that survives crashes, not a fire-and-forget batch job.*
+> **Thesis:** *A run is durable state, not a fire-and-forget process.*
+>
+> **Architectural wedge vs public headline:** durable execution is the *architectural* wedge —
+> the hard core every ADR is judged against ([ADR-0001](docs/adr/0001-ci-as-durable-execution.md)).
+> It is **not** the public headline: it's table stakes against Argo/Tekton/Temporal, so we sell
+> **cohesion** (forge-native product on a durable engine), not the bare word "durable". Taglines,
+> the AI-era angle, the Woodpecker lineage, and the honest red lines live in
+> [docs/positioning.md](docs/positioning.md). This doc is the internal anchor.
 
 This document is the **anchor** for the codebase: the ubiquitous language every crate,
 API, ADR, and UI view must use, plus the system overview and non-goals. If a term here
