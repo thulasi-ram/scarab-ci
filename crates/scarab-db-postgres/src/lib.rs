@@ -242,6 +242,40 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<Value>, _>("ir")))
     }
 
+    async fn set_run_params(
+        &self,
+        run: &RunId,
+        params: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), DbError> {
+        let json = serde_json::to_value(params).map_err(|e| DbError::Other(e.to_string()))?;
+        sqlx::query(
+            "UPDATE runs
+             SET params = $2, updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(json)
+        .execute(self.pool()?)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_params(
+        &self,
+        run: &RunId,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError> {
+        let row = sqlx::query("SELECT params FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool()?)
+            .await
+            .map_err(db_err)?;
+        match row.and_then(|r| r.get::<Option<Value>, _>("params")) {
+            Some(v) => serde_json::from_value(v).map_err(|e| DbError::Other(e.to_string())),
+            None => Ok(std::collections::BTreeMap::new()),
+        }
+    }
+
     async fn set_run_deploy_context(
         &self,
         run: &RunId,

@@ -175,10 +175,17 @@ impl AppState {
 // into a pure crate), so the server mirrors the subset and converts.
 // ---------------------------------------------------------------------------
 
-/// `POST /v1/runs` body: an inline pipeline to run immediately.
+/// `POST /v1/runs` body: an inline pipeline to run immediately, plus any launch
+/// parameters (ADR-0043) declared by the pipeline's `interface`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateRunRequest {
     pub pipeline: PipelineDto,
+    /// Supplied launch parameters, `name → value` (ADR-0043). Resolved against
+    /// `pipeline.interface.inputs` at creation: coerced to the declared types,
+    /// defaults applied, validated fail-closed. Absent = none supplied.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub params: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// The inline pipeline (IR subset).
@@ -186,6 +193,13 @@ pub struct CreateRunRequest {
 pub struct PipelineDto {
     /// IR schema version (ADR-0022).
     pub ir_version: u32,
+    /// The pipeline's launch/reuse interface (ADR-0038, 0043) — its declared
+    /// typed parameters (`inputs`) and exposed outputs. Carried as the pure
+    /// `scarab_pipeline::Interface` (opaque object in the schema; the pure crate
+    /// cannot derive `ToSchema`). Absent = no parameters.
+    #[serde(default, skip_serializing_if = "scarab_pipeline::Interface::is_empty")]
+    #[schema(value_type = Object)]
+    pub interface: scarab_pipeline::Interface,
     pub steps: Vec<StepDto>,
 }
 
@@ -350,6 +364,14 @@ async fn create_run(
     Json(req): Json<CreateRunRequest>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), ApiError> {
     authorize(&st, &headers, Action::Write).await?;
+
+    // Resolve launch parameters against the declared interface BEFORE creating
+    // the run (ADR-0043): coerce to declared types, apply defaults, validate
+    // fail-closed, reject unknown/missing. A bad supply is a 400 with a
+    // per-parameter message and creates **no** run.
+    let resolved = scarab_pipeline::params::resolve_params(&req.pipeline.interface, &req.params)
+        .map_err(|e| ApiError::BadRequest(format!("invalid launch parameters: {e}")))?;
+
     let now = st.clock.now().await;
     let run = RunId(Uuid::new_v4().to_string());
 
@@ -360,6 +382,9 @@ async fn create_run(
     let ir = serde_json::to_value(&req.pipeline)
         .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
     st.db.store_run_ir(&run, &ir).await?;
+    // Freeze the resolved params on the run so every step's interpolation
+    // (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive deterministically.
+    st.db.set_run_params(&run, &resolved).await?;
     st.db
         .append_event(&EventKind {
             version: EVENT_VERSION,

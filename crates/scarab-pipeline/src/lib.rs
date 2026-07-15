@@ -20,6 +20,7 @@
 //! the [`cel`] submodule and is wired up by a later slice.
 
 pub mod cel;
+pub mod params;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,7 +28,12 @@ use serde::{Deserialize, Serialize};
 
 /// Current schema version emitted by the compiler. Runs are self-describing
 /// (ADR-0022): the IR carries this so an engine can reason about older Runs.
-pub const IR_VERSION: u32 = 1;
+///
+/// Bumped to `2` for ADR-0043: `interface.inputs` grew from a list of bare
+/// parameter names into a list of typed [`ParamSpec`]s. Old IRs (`ir_version:
+/// 1`, bare-string inputs) still load — the custom [`ParamSpec`] deserialize
+/// accepts a bare string as `{ name, type: string, required: true }`.
+pub const IR_VERSION: u32 = 2;
 
 fn default_ir_version() -> u32 {
     IR_VERSION
@@ -37,7 +43,10 @@ fn default_ir_version() -> u32 {
 ///
 /// Post-compile invariant: every [`StepSpec::matrix`] is `None` (all matrices
 /// have been expanded) and step ids are unique.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Note: no `Eq` — a [`ParamSpec::default`] may hold an arbitrary
+// `serde_json::Value` (which is `PartialEq` but not `Eq`), so the whole IR is
+// only `PartialEq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PipelineIr {
     /// Schema version of the IR, for forward/backward compatibility.
     #[serde(default = "default_ir_version")]
@@ -69,14 +78,15 @@ pub struct PipelineIr {
     pub steps: Vec<StepSpec>,
 }
 
-/// A Library pipeline's reuse interface (ADR-0038) — its explicit contract with
-/// an `invoke:` caller. `inputs` are the required parameter names the caller must
-/// supply via `with:` (all are required in v1 — no defaults); `outputs` are the
-/// names the library exposes, each of which must be one of its step ids.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A pipeline's reuse / launch interface (ADR-0038, ADR-0043) — its explicit
+/// contract with an `invoke:` caller *and* with a launch (`POST /v1/runs`,
+/// manual dispatch). `inputs` are the **typed launch parameters** the caller
+/// supplies (via `with:` for an invoke, or a launch `params` map); `outputs` are
+/// the names the pipeline exposes, each of which must be one of its step ids.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Interface {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inputs: Vec<String>,
+    pub inputs: Vec<ParamSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<String>,
 }
@@ -85,6 +95,111 @@ impl Interface {
     pub fn is_empty(&self) -> bool {
         self.inputs.is_empty() && self.outputs.is_empty()
     }
+}
+
+/// The declared type of a launch parameter (ADR-0043) — a **closed vocabulary**
+/// so a supplied value can be coerced to a known shape and validated
+/// fail-closed. Serialized lowercase (`string`, `boolean`, `number`, `choice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ParamType {
+    /// A free-form string (the default, and what a bare-string input becomes).
+    #[default]
+    String,
+    /// A boolean; `"true"`/`"false"`/`"yes"`/`"no"` string forms coerce.
+    Boolean,
+    /// A JSON number; numeric string forms coerce.
+    Number,
+    /// A string constrained to one of a fixed `options` list.
+    Choice,
+}
+
+/// A single typed launch parameter (ADR-0043). Backward compatible with the
+/// bare-name inputs of ADR-0038: a YAML/JSON **string** deserializes to
+/// `ParamSpec { name, type: string, required: true, .. }`, while a **map**
+/// deserializes to the full form. Serialization always emits the map form.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ParamSpec {
+    /// The parameter name — must be env-safe (`SCARAB_PARAM_<NAME>`).
+    pub name: String,
+    /// The declared type. Defaults to [`ParamType::String`].
+    #[serde(rename = "type")]
+    pub r#type: ParamType,
+    /// Whether the caller must supply a value. Defaults to `true`. An optional
+    /// param (`required: false`) **must** carry a `default` — this makes the
+    /// resolved parameter set *total* (ADR-0043).
+    pub required: bool,
+    /// A default value, used when an optional param is not supplied. Mandatory
+    /// for `required: false`; nonsensical (and rejected) for `required: true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+    /// For `type: choice`, the allowed values (non-empty). A supplied value must
+    /// be a string in this list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+    /// An optional CEL predicate over the resolved value (bound as `value`),
+    /// evaluated at resolve time; `false`/non-bool fails the launch fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate: Option<String>,
+    /// Human-facing description (for a later describe/catalog surface).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ParamSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// The full map form; every field defaulted so a partial map fills in.
+        #[derive(Deserialize)]
+        struct Full {
+            name: String,
+            #[serde(rename = "type", default)]
+            r#type: ParamType,
+            #[serde(default = "default_true")]
+            required: bool,
+            #[serde(default)]
+            default: Option<serde_json::Value>,
+            #[serde(default)]
+            options: Option<Vec<String>>,
+            #[serde(default)]
+            validate: Option<String>,
+            #[serde(default)]
+            description: Option<String>,
+        }
+        /// A bare string (backward-compat) *or* the full map (ADR-0043).
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Bare(String),
+            Full(Full),
+        }
+        Ok(match Raw::deserialize(deserializer)? {
+            Raw::Bare(name) => ParamSpec {
+                name,
+                r#type: ParamType::String,
+                required: true,
+                default: None,
+                options: None,
+                validate: None,
+                description: None,
+            },
+            Raw::Full(f) => ParamSpec {
+                name: f.name,
+                r#type: f.r#type,
+                required: f.required,
+                default: f.default,
+                options: f.options,
+                validate: f.validate,
+                description: f.description,
+            },
+        })
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A pipeline's `concurrency:` block (ADR-0011, 0032). The `group` is a (possibly
@@ -315,6 +430,10 @@ pub enum PipelineError {
     Validation(Vec<String>),
     #[error("cel error: {0}")]
     Cel(String),
+    /// A launch-parameter coercion / resolution failure (ADR-0043). Carries a
+    /// caller-facing message; composed per-param by [`params::resolve_params`].
+    #[error("{0}")]
+    Param(String),
 }
 
 /// Compile authored YAML into a validated [`PipelineIr`], with no libraries
@@ -679,15 +798,29 @@ fn inline_level(
                     inst.matrix_values.entry(k.clone()).or_insert_with(|| v.clone());
                 }
                 // Inject the caller's inputs as `SCARAB_PARAM_<NAME>` env
-                // (ADR-0008 param convention). Prepended so a library step's own
-                // explicit env of the same name still wins (applied later).
-                let params: Vec<(String, String)> = step
+                // (ADR-0008 param convention), coerced to their declared types
+                // and with optional defaults applied — the same typed resolution
+                // the launch path uses (ADR-0043). Prepended so a library step's
+                // own explicit env of the same name still wins (applied later).
+                let supplied: BTreeMap<String, serde_json::Value> = step
                     .with
                     .iter()
-                    .map(|(k, v)| (format!("SCARAB_PARAM_{}", k.to_uppercase()), v.clone()))
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect();
-                if !params.is_empty() {
-                    let mut env = params;
+                let param_env: Vec<(String, String)> =
+                    match params::resolve_params(&lib.interface, &supplied) {
+                        Ok(resolved) => resolved
+                            .iter()
+                            .map(|(k, v)| {
+                                (format!("SCARAB_PARAM_{}", k.to_uppercase()), params::stringify(v))
+                            })
+                            .collect(),
+                        // A resolution error was already reported by
+                        // `validate_interface`; the compile fails, so inject nothing.
+                        Err(_) => Vec::new(),
+                    };
+                if !param_env.is_empty() {
+                    let mut env = param_env;
                     env.append(&mut inst.env);
                     inst.env = env;
                 }
@@ -808,30 +941,41 @@ fn validate_interface(
 ) {
     let iface = &lib.interface;
 
-    // Declared inputs become `SCARAB_PARAM_<NAME>` env, so they must be env-safe.
-    for name in &iface.inputs {
-        if !is_identifier(name) {
-            diagnostics.push(format!(
-                "step `{}`: library `{key}` declares input `{name}`, which is not a valid identifier",
-                step.id
-            ));
-        }
-    }
-    // Every required input must be supplied; no unknown extras.
-    for name in &iface.inputs {
-        if !step.with.contains_key(name) {
-            diagnostics.push(format!(
-                "step `{}`: missing required input `{name}` for library `{key}`",
-                step.id
-            ));
+    // Declared param specs must be well-formed (env-safe names, sensible
+    // required/default/choice, a parsable `validate:`) — ADR-0043 §2.
+    params::validate_param_specs(&iface.inputs, &format!("library `{key}`"), diagnostics);
+
+    // Every required input must be supplied; a supplied value must coerce to the
+    // declared type (and be a valid choice / pass `validate:`); no unknown extras.
+    // Optional inputs (a `default`) may be omitted — the default is injected.
+    for p in &iface.inputs {
+        match step.with.get(&p.name) {
+            None => {
+                if p.required {
+                    diagnostics.push(format!(
+                        "step `{}`: missing required input `{}` for library `{key}`",
+                        step.id, p.name
+                    ));
+                }
+            }
+            Some(raw) => {
+                // `with:` values are authored as strings; coerce to the type.
+                let supplied = serde_json::Value::String(raw.clone());
+                if let Err(e) = params::resolve_one(p, &supplied) {
+                    diagnostics.push(format!(
+                        "step `{}`: input `{}` for library `{key}`: {e}",
+                        step.id, p.name
+                    ));
+                }
+            }
         }
     }
     for k in step.with.keys() {
-        if !iface.inputs.contains(k) {
+        if !iface.inputs.iter().any(|p| &p.name == k) {
             diagnostics.push(format!(
                 "step `{}`: unknown input `{k}` (library `{key}` declares inputs: [{}])",
                 step.id,
-                iface.inputs.join(", ")
+                iface.inputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
             ));
         }
     }
@@ -931,7 +1075,7 @@ fn is_ident_byte(b: u8) -> bool {
 
 /// Is `s` a valid identifier (`[A-Za-z_][A-Za-z0-9_]*`)? Used to keep declared
 /// input names env-var-safe.
-fn is_identifier(s: &str) -> bool {
+pub(crate) fn is_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
@@ -1198,6 +1342,12 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
             diagnostics.push("environment: target must not be empty".to_string());
         }
     }
+
+    // Launch-parameter interface (ADR-0043): each declared param spec must be
+    // well-formed — env-safe unique names, coherent required/default, a
+    // non-empty `options` for a choice, a default within those options, and a
+    // parsable `validate:` predicate.
+    params::validate_param_specs(&ir.interface.inputs, "interface", &mut diagnostics);
 
     // Cycle detection over needs edges (Kahn's algorithm). Only run when the
     // graph is well-formed enough to be meaningful (no dangling edges).
@@ -2391,11 +2541,145 @@ mod tests {
             steps: [{ id: url, image: busybox }]
             "#,
         );
-        assert_eq!(ir.interface.inputs, vec!["region".to_string()]);
+        // A bare-string input (ADR-0038 back-compat) becomes a required string
+        // param (ADR-0043).
+        assert_eq!(ir.interface.inputs.len(), 1);
+        assert_eq!(ir.interface.inputs[0].name, "region");
+        assert_eq!(ir.interface.inputs[0].r#type, ParamType::String);
+        assert!(ir.interface.inputs[0].required);
         assert_eq!(ir.interface.outputs, vec!["url".to_string()]);
         let back: PipelineIr =
             serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
         assert_eq!(ir, back);
+    }
+
+    // --- typed launch parameters (ADR-0043) -----------------------------------
+
+    #[test]
+    fn bare_string_inputs_deserialize_as_required_string_params() {
+        // Back-compat (ADR-0038): `inputs: [region, replicas]` still parses.
+        let ir = compile(
+            r#"
+            interface: { inputs: [region, replicas] }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert_eq!(ir.interface.inputs.len(), 2);
+        for p in &ir.interface.inputs {
+            assert_eq!(p.r#type, ParamType::String);
+            assert!(p.required);
+            assert!(p.default.is_none());
+        }
+    }
+
+    #[test]
+    fn a_typed_param_map_compiles_and_survives_round_trip() {
+        let ir = compile(
+            r#"
+            interface:
+              inputs:
+                - { name: region, type: string }
+                - { name: replicas, type: number, required: false, default: 2 }
+                - { name: env, type: choice, options: [staging, prod], required: false, default: staging }
+                - { name: force, type: boolean, required: false, default: false, description: "skip checks" }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        let by = |n: &str| ir.interface.inputs.iter().find(|p| p.name == n).unwrap();
+        assert_eq!(by("replicas").r#type, ParamType::Number);
+        assert_eq!(by("env").options.as_ref().unwrap().len(), 2);
+        assert_eq!(by("force").r#type, ParamType::Boolean);
+        // Round-trips through JSON (serialize emits the map form).
+        let back: PipelineIr =
+            serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+        assert_eq!(ir, back);
+    }
+
+    #[test]
+    fn required_param_with_a_default_is_a_compile_error() {
+        let errs = errors(
+            r#"
+            interface: { inputs: [{ name: x, type: string, required: true, default: d }] }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.contains("also declares a `default`")), "{errs:?}");
+    }
+
+    #[test]
+    fn optional_param_without_a_default_is_a_compile_error() {
+        let errs = errors(
+            r#"
+            interface: { inputs: [{ name: x, type: string, required: false }] }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.contains("must declare a `default`")), "{errs:?}");
+    }
+
+    #[test]
+    fn choice_without_options_is_a_compile_error() {
+        let errs = errors(
+            r#"
+            interface: { inputs: [{ name: x, type: choice }] }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.contains("non-empty `options`")), "{errs:?}");
+    }
+
+    #[test]
+    fn duplicate_param_name_is_a_compile_error() {
+        let errs = errors(
+            r#"
+            interface: { inputs: [region, region] }
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.contains("duplicate parameter")), "{errs:?}");
+    }
+
+    #[test]
+    fn invoke_with_coerces_supplied_values_to_declared_types() {
+        // A library declaring a number input; the caller supplies a string that
+        // coerces, and it reaches inlined steps stringified (ADR-0043 typed path).
+        let lib = r#"
+            interface:
+              inputs:
+                - { name: replicas, type: number }
+            steps: [{ id: run, image: busybox }]
+        "#;
+        let ir = compile_with(
+            r#"
+            steps:
+              - id: deploy
+                invoke: .scarab/lib/x.yaml
+                with: { replicas: "3" }
+            "#,
+            &libs(&[(".scarab/lib/x.yaml", lib)]),
+        );
+        let run = ir.steps.iter().find(|s| s.id == "deploy/run").unwrap();
+        assert!(run.env.contains(&("SCARAB_PARAM_REPLICAS".to_string(), "3".to_string())));
+    }
+
+    #[test]
+    fn invoke_with_rejects_a_value_that_does_not_coerce() {
+        let lib = r#"
+            interface:
+              inputs:
+                - { name: replicas, type: number }
+            steps: [{ id: run, image: busybox }]
+        "#;
+        let errs = errors_with(
+            r#"
+            steps:
+              - id: deploy
+                invoke: .scarab/lib/x.yaml
+                with: { replicas: "not-a-number" }
+            "#,
+            &libs(&[(".scarab/lib/x.yaml", lib)]),
+        );
+        assert!(errs.iter().any(|e| e.contains("is not a number")), "{errs:?}");
     }
 
     #[test]

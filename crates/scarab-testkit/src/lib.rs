@@ -99,6 +99,8 @@ struct InMemoryState {
     runs: HashMap<RunId, RunStatus>,
     /// Compiled IR stored per run (self-describing runs, ADR-0022).
     run_ir: HashMap<RunId, serde_json::Value>,
+    /// Resolved launch parameters per run (ADR-0043).
+    run_params: HashMap<RunId, std::collections::BTreeMap<String, serde_json::Value>>,
     /// Per-run deploy context (ADR-0037); set only for deploy runs.
     run_deploy: HashMap<RunId, scarab_engine::DeployContext>,
     /// Per-(run, step) rows: status, spec, attempts.
@@ -505,6 +507,33 @@ impl Db for InMemoryDb {
 
     async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError> {
         Ok(self.state.lock().unwrap().run_ir.get(run).cloned())
+    }
+
+    async fn set_run_params(
+        &self,
+        run: &RunId,
+        params: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_params
+            .insert(run.clone(), params.clone());
+        Ok(())
+    }
+
+    async fn run_params(
+        &self,
+        run: &RunId,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .run_params
+            .get(run)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn set_run_deploy_context(

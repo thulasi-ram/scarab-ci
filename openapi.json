@@ -4,8 +4,8 @@
     "title": "scarab-server",
     "description": "",
     "license": {
-      "name": "MIT OR Apache-2.0",
-      "identifier": "MIT OR Apache-2.0"
+      "name": "AGPL-3.0-only",
+      "identifier": "AGPL-3.0-only"
     },
     "version": "0.1.0"
   },
@@ -128,7 +128,7 @@
     "/v1/runs/{id}/gates/{step}/approve": {
       "post": {
         "tags": [],
-        "summary": "Release a manual gate, resuming its suspended run (ADR-0008, 0032). Authz'd\nas a write; exactly-once (a repeat approve is a no-op).",
+        "summary": "Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's\napproval is recorded on the event log (append-only, idempotent). For a\n**deploy** run (one with a target environment), the gate is released only\nonce the accumulated approvers satisfy the environment's protection rules\n(`admits`); on release the deployment is written to history. A plain gate (no\nenvironment) releases on the first approval. Authz'd as a write.",
         "operationId": "approve_gate",
         "parameters": [
           {
@@ -152,7 +152,7 @@
         ],
         "responses": {
           "202": {
-            "description": "gate released"
+            "description": "approval recorded (released or awaiting more approvals)"
           },
           "404": {
             "description": "no such run or gate"
@@ -386,11 +386,15 @@
     "schemas": {
       "CreateRunRequest": {
         "type": "object",
-        "description": "`POST /v1/runs` body: an inline pipeline to run immediately.",
+        "description": "`POST /v1/runs` body: an inline pipeline to run immediately, plus any launch\nparameters (ADR-0043) declared by the pipeline's `interface`.",
         "required": [
           "pipeline"
         ],
         "properties": {
+          "params": {
+            "type": "object",
+            "description": "Supplied launch parameters, `name → value` (ADR-0043). Resolved against\n`pipeline.interface.inputs` at creation: coerced to the declared types,\ndefaults applied, validated fail-closed. Absent = none supplied."
+          },
           "pipeline": {
             "$ref": "#/components/schemas/PipelineDto"
           }
@@ -419,6 +423,10 @@
           "steps"
         ],
         "properties": {
+          "interface": {
+            "type": "object",
+            "description": "The pipeline's launch/reuse interface (ADR-0038, 0043) — its declared\ntyped parameters (`inputs`) and exposed outputs. Carried as the pure\n`scarab_pipeline::Interface` (opaque object in the schema; the pure crate\ncannot derive `ToSchema`). Absent = no parameters."
+          },
           "ir_version": {
             "type": "integer",
             "format": "int32",
@@ -577,6 +585,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "secrets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Secret keys to resolve and inject at launch (ADR-0037)."
           }
         }
       },

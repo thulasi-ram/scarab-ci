@@ -61,6 +61,15 @@ async fn tables_round_trip_via_adapter() {
     db.create_run(&run, 1, EVENT_VERSION, at).await.unwrap();
     assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Pending));
 
+    // run_params (ADR-0043): empty by default, then round-trips the typed blob.
+    assert!(db.run_params(&run).await.unwrap().is_empty());
+    let params = std::collections::BTreeMap::from([
+        ("region".to_string(), serde_json::json!("us-east-1")),
+        ("replicas".to_string(), serde_json::json!(3)),
+    ]);
+    db.set_run_params(&run, &params).await.unwrap();
+    assert_eq!(db.run_params(&run).await.unwrap(), params);
+
     // record_transition (state-table update + exactly-once guard)
     db.record_transition(&run, RunStatus::Pending, RunStatus::Running)
         .await

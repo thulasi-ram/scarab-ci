@@ -70,6 +70,24 @@ pub trait Db: Send + Sync {
     /// The compiled IR stored on a run, or `None` if unset / the run is unknown.
     async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError>;
 
+    /// Record a run's **resolved launch parameters** (ADR-0043) — the fully
+    /// typed `name → value` map produced by
+    /// `scarab_pipeline::params::resolve_params` at creation. Frozen for the life
+    /// of the run so a re-launched step re-derives byte-identical interpolation
+    /// (restart determinism, ADR-0027). Overwrites any prior value.
+    async fn set_run_params(
+        &self,
+        run: &RunId,
+        params: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<(), DbError>;
+
+    /// A run's resolved launch parameters, or an empty map if it has none (or the
+    /// run is unknown).
+    async fn run_params(
+        &self,
+        run: &RunId,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError>;
+
     /// Record a run's **deploy context** (ADR-0037) — set once at creation for a
     /// run whose pipeline declared an `environment:`. Lets gate-approval-time
     /// admission look up the environment's protection rules directly.

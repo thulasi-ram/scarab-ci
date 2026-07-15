@@ -664,7 +664,30 @@ impl<'a> Scheduler<'a> {
         step: &StepId,
         spec: StepSpec,
     ) -> Result<Result<StepSpec, String>, SchedulerError> {
-        // Fast path: no interpolation → launch verbatim (the common case).
+        // Launch parameters (ADR-0043) are frozen on the run at creation. Every
+        // launched step receives them as `SCARAB_PARAM_<NAME>` env (stringified),
+        // even one it never references — unreferenced params still reach the step
+        // (ADR-0008 param convention). Injected values are concrete (no `${{`), so
+        // they are unaffected by the interpolation pass below.
+        let params = self.db.run_params(run).await?;
+        let mut spec = spec;
+        if !params.is_empty() {
+            // Prepend so a step's own explicit env of the same name still wins.
+            let mut env: Vec<(String, String)> = params
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        format!("SCARAB_PARAM_{}", k.to_uppercase()),
+                        scarab_pipeline::params::stringify(v),
+                    )
+                })
+                .collect();
+            env.append(&mut spec.env);
+            spec.env = env;
+        }
+
+        // Fast path: no interpolation → launch verbatim (the common case). Params
+        // env has already been injected above.
         let has_interp = spec.image.contains("${{")
             || spec.command.iter().any(|c| c.contains("${{"))
             || spec.env.iter().any(|(_, v)| v.contains("${{"));
@@ -693,7 +716,10 @@ impl<'a> Scheduler<'a> {
                 );
             }
         }
-        let ctx = serde_json::json!({ "outputs": outputs });
+        // `inputs` exposes the resolved launch params (typed), so `${{ inputs.x }}`
+        // resolves and a numeric guard like `inputs.n > 80` compares numerically.
+        let inputs = serde_json::Value::Object(params.into_iter().collect());
+        let ctx = serde_json::json!({ "outputs": outputs, "inputs": inputs });
 
         let interp = |s: &str| scarab_pipeline::cel::interpolate(s, &ctx).map_err(|e| e.to_string());
         let mut out = spec;
