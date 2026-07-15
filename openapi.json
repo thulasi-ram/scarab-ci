@@ -10,6 +10,55 @@
     "version": "0.1.0"
   },
   "paths": {
+    "/v1/repos/{org}/{repo}/dispatch": {
+      "post": {
+        "tags": [],
+        "summary": "Dispatch a named repo pipeline at a ref (ADR-0043 \"World B\"). Authorized as a\nwrite (like [`create_run`]); a dispatch is a *trigger*, so a deploy pipeline\nstill hits its Environment's protection rules at admission. Returns the new\nrun id (mirrors [`CreateRunResponse`]); creates **no** run on any error.",
+        "operationId": "dispatch",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DispatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Run created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateRunResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/runs": {
       "get": {
         "tags": [],
@@ -412,6 +461,40 @@
           },
           "status": {
             "type": "string"
+          }
+        }
+      },
+      "DispatchKind": {
+        "type": "string",
+        "description": "Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)\ndispatch (the default) or its programmatic [`Api`](DispatchKind::Api) sibling\n(ADR-0043 §4). The named pipeline must declare the matching `on:` trigger to\nbe dispatchable.",
+        "enum": [
+          "manual",
+          "api"
+        ]
+      },
+      "DispatchRequest": {
+        "type": "object",
+        "description": "`POST /v1/repos/{org}/{repo}/dispatch` body: dispatch a **named** pipeline at\na `ref`, supplying its declared launch parameters (ADR-0043 \"World B\"). Unlike\nthe inline `POST /v1/runs` escape hatch, this rides the read-at-ref → compile\n→ admission machinery — a dispatched deploy hits Environment governance.",
+        "required": [
+          "ref",
+          "pipeline"
+        ],
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/DispatchKind",
+            "description": "Which trigger to dispatch: `manual` (default) or `api`. The pipeline must\ndeclare the matching `on:`."
+          },
+          "params": {
+            "type": "object",
+            "description": "Supplied launch parameters, `name → value` (ADR-0043). Resolved against\nthe pipeline's `interface.inputs` at the resolved commit: coerced,\ndefaulted, validated fail-closed. Absent = none supplied."
+          },
+          "pipeline": {
+            "type": "string",
+            "description": "The pipeline to run — a `.scarab` name (e.g. `deploy`) or a full\n`.scarab/*.yaml` path."
+          },
+          "ref": {
+            "type": "string",
+            "description": "The ref to dispatch at (branch/tag/sha). Resolved to a concrete commit;\nthe run pins to that commit."
           }
         }
       },

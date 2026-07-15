@@ -1023,6 +1023,10 @@ pub struct FakeForge {
     files: Mutex<HashMap<String, Vec<u8>>>,
     statuses: Mutex<Vec<Status>>,
     comments: Mutex<Vec<(u64, String)>>,
+    /// Seeded `ref → resolved sha` mappings for [`latest_commit`](ForgePort::latest_commit).
+    /// A ref with no mapping resolves to itself (identity) — the default that
+    /// keeps ref-agnostic tests simple.
+    commits: Mutex<HashMap<String, String>>,
 }
 
 impl FakeForge {
@@ -1033,6 +1037,14 @@ impl FakeForge {
     /// Seed the content the forge returns for `path` at any ref.
     pub fn with_file(self, path: impl Into<String>, content: impl Into<Vec<u8>>) -> Self {
         self.files.lock().unwrap().insert(path.into(), content.into());
+        self
+    }
+
+    /// Seed the resolved commit sha [`latest_commit`](ForgePort::latest_commit)
+    /// returns for `git_ref` — lets a test assert a run pins to a resolved sha
+    /// distinct from the branch ref it dispatched (ADR-0043).
+    pub fn with_commit(self, git_ref: impl Into<String>, sha: impl Into<String>) -> Self {
+        self.commits.lock().unwrap().insert(git_ref.into(), sha.into());
         self
     }
 
@@ -1050,8 +1062,15 @@ impl FakeForge {
 #[async_trait]
 impl ForgePort for FakeForge {
     async fn latest_commit(&self, _repo: &Repo, r#ref: &str) -> Result<Commit, ForgeError> {
+        let sha = self
+            .commits
+            .lock()
+            .unwrap()
+            .get(r#ref)
+            .cloned()
+            .unwrap_or_else(|| r#ref.to_string());
         Ok(Commit {
-            sha: r#ref.to_string(),
+            sha,
             message: String::new(),
         })
     }

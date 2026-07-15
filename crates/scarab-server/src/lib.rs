@@ -225,6 +225,30 @@ pub struct CreateRunResponse {
     pub status: String,
 }
 
+/// `POST /v1/repos/{org}/{repo}/dispatch` body: dispatch a **named** pipeline at
+/// a `ref`, supplying its declared launch parameters (ADR-0043 "World B"). Unlike
+/// the inline `POST /v1/runs` escape hatch, this rides the read-at-ref → compile
+/// → admission machinery — a dispatched deploy hits Environment governance.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DispatchRequest {
+    /// The ref to dispatch at (branch/tag/sha). Resolved to a concrete commit;
+    /// the run pins to that commit.
+    pub r#ref: String,
+    /// The pipeline to run — a `.scarab` name (e.g. `deploy`) or a full
+    /// `.scarab/*.yaml` path.
+    pub pipeline: String,
+    /// Supplied launch parameters, `name → value` (ADR-0043). Resolved against
+    /// the pipeline's `interface.inputs` at the resolved commit: coerced,
+    /// defaulted, validated fail-closed. Absent = none supplied.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub params: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Which trigger to dispatch: `manual` (default) or `api`. The pipeline must
+    /// declare the matching `on:`.
+    #[serde(default)]
+    pub kind: DispatchKind,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunStatusResponse {
     pub id: String,
@@ -331,6 +355,18 @@ impl From<DbError> for ApiError {
     }
 }
 
+impl From<DispatchError> for ApiError {
+    fn from(e: DispatchError) -> Self {
+        match e {
+            // A DB failure is a 500; everything else is a caller-facing 4xx
+            // (fail-closed, no run created).
+            DispatchError::Db(d) => ApiError::Db(d),
+            DispatchError::PipelineNotFound(_) => ApiError::NotFound,
+            other => ApiError::BadRequest(other.to_string()),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         match self {
@@ -416,6 +452,58 @@ async fn create_run(
             .create_step_run(&run, &StepId(step.id.clone()), Some(&spec), &needs, now)
             .await?;
     }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateRunResponse {
+            id: run.0,
+            status: run_status_name(RunStatus::Pending).to_string(),
+        }),
+    ))
+}
+
+/// Dispatch a named repo pipeline at a ref (ADR-0043 "World B"). Authorized as a
+/// write (like [`create_run`]); a dispatch is a *trigger*, so a deploy pipeline
+/// still hits its Environment's protection rules at admission. Returns the new
+/// run id (mirrors [`CreateRunResponse`]); creates **no** run on any error.
+#[utoipa::path(
+    post,
+    path = "/v1/repos/{org}/{repo}/dispatch",
+    params(
+        ("org" = String, Path, description = "repo owner"),
+        ("repo" = String, Path, description = "repo name")
+    ),
+    request_body = DispatchRequest,
+    responses((status = 201, description = "Run created", body = CreateRunResponse))
+)]
+async fn dispatch(
+    State(st): State<AppState>,
+    Path((org, repo)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(req): Json<DispatchRequest>,
+) -> Result<(StatusCode, Json<CreateRunResponse>), ApiError> {
+    let principal = authorize(&st, &headers, Action::Write).await?;
+
+    // Dispatch rides the read-at-ref machinery, so a forge must be wired.
+    let forge = st
+        .forge
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
+
+    let run = dispatch_run(
+        forge.as_ref(),
+        st.db.as_ref(),
+        st.clock.as_ref(),
+        st.environments.as_deref(),
+        principal.subject,
+        scarab_forge::Repo { owner: org, name: repo },
+        req.r#ref,
+        req.pipeline,
+        req.params,
+        req.kind,
+    )
+    .await
+    .map_err(ApiError::from)?;
 
     Ok((
         StatusCode::CREATED,
@@ -656,6 +744,9 @@ fn config_ref(event: &scarab_forge::Event) -> String {
         Event::Push { after, .. } => after.clone(),
         Event::PullRequest { head, .. } => head.clone(),
         Event::Tag { tag, .. } | Event::Release { tag, .. } => format!("refs/tags/{tag}"),
+        // A manual/api dispatch carries the resolved commit it runs against
+        // (ADR-0043): the config is read — and the Run pinned — at that ref.
+        Event::Manual { r#ref, .. } | Event::Api { r#ref, .. } => r#ref.clone(),
         _ => "HEAD".to_string(),
     }
 }
@@ -704,34 +795,10 @@ pub async fn trigger_run_from_event(
         };
         let yaml = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
 
-        // ADR-0038: `invoke:` steps are resolved by compile-time inlining, but
-        // compile is pure — so pre-fetch the referenced `.scarab/**` library
-        // sources here (at the caller's ref) and hand them to the pure compiler
-        // as a `{path → source}` map. `invoke_refs` returns only path-safe keys;
-        // fetching is **transitive** (a nested library referenced by a library
-        // must also be fetched) via a worklist, `seen`-guarded so an invoke cycle
-        // terminates the fetch (the cycle itself is reported by compile). A
-        // library that vanished between list and read surfaces as a compile
-        // diagnostic ("no library found at …"), not a fetch error.
-        let mut libs = std::collections::BTreeMap::new();
-        let mut seen = std::collections::BTreeSet::new();
-        let mut worklist: Vec<String> = scarab_pipeline::invoke_refs(&yaml);
-        while let Some(lib_path) = worklist.pop() {
-            if !seen.insert(lib_path.clone()) {
-                continue;
-            }
-            match forge.read_file_at_ref(repo, &git_ref, &lib_path).await {
-                Ok(bytes) => {
-                    let src = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
-                    worklist.extend(scarab_pipeline::invoke_refs(&src));
-                    libs.insert(lib_path, src);
-                }
-                Err(scarab_forge::ForgeError::Api(_)) => continue,
-                Err(e) => return Err(TriggerError::Forge(e)),
-            }
-        }
-        let ir = scarab_pipeline::compile_yaml_with_libs(&yaml, &libs)
-            .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+        // Pre-fetch transitive `invoke:` libraries at this ref and compile
+        // (ADR-0038) — the shared read-at-ref → compile primitive also used by
+        // the manual/api dispatch path.
+        let ir = prefetch_libs_and_compile(forge, repo, &git_ref, &yaml).await?;
 
         let matched = scarab_pipeline::matches_trigger(&ir, kind.as_str(), &ctx)
             .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
@@ -749,49 +816,332 @@ pub async fn trigger_run_from_event(
             continue;
         }
 
-        // ADR-0037/0039: fetch the target Environment's protection rules once (a
-        // deploy pipeline only). Used both to reject a disallowed ref at creation
-        // (ADR-0037 — enforced even without an approver gate) and to admit
-        // per-step privilege grants (ADR-0039). An undefined environment is
-        // permissive for refs but forbids governed grants.
-        let protection = if let (Some(env_name), Some(store)) = (&ir.environment, environments) {
-            store
-                .get_environment(&repo.owner, &repo.name, env_name)
-                .await
-                .map_err(|e| TriggerError::Pipeline(e.to_string()))?
-                .map(|e| e.protection)
-        } else {
-            None
-        };
-        if let Some(p) = &protection {
-            if !p.ref_allowed(&git_ref) {
-                continue;
-            }
+        // Fetch protection rules, reject a disallowed ref, admit privilege
+        // grants, and durably create the run — the shared admission primitive the
+        // dispatch path also rides (ADR-0037/0039). A ref the Environment
+        // disallows yields `None` here → skip this pipeline (a webhook trigger is
+        // silent; the dispatch path turns the same `None` into a fail-closed
+        // error). Webhook-triggered runs supply no launch parameters.
+        if let Some(run) =
+            admit_and_create_run(db, clock, environments, event, &ir, path, &excluded, None).await?
+        {
+            runs.push(run);
         }
-        // A fork PR locked out of the environment's secrets is also locked out of
-        // its governed grants (ADR-0039).
-        let locked_out = ir
-            .environment
-            .as_ref()
-            .is_some_and(|e| fork_policy(event, e).secrets_locked_out);
-
-        let now = clock.now().await;
-        let run = RunId(Uuid::new_v4().to_string());
-        persist_run_from_ir(
-            db,
-            &run,
-            &ir,
-            event,
-            path,
-            protection.as_ref(),
-            locked_out,
-            &excluded,
-            now,
-        )
-        .await?;
-        runs.push(run);
     }
     Ok(runs)
+}
+
+/// Pre-fetch a pipeline's transitive `invoke:` library sources at `read_ref`
+/// (ADR-0038) and compile the authored `yaml` against them. Compilation is pure;
+/// the I/O — fetching the referenced `.scarab/**` sources at the ref — happens
+/// here. `invoke_refs` returns only path-safe keys; the fetch is **transitive**
+/// (a library referenced by a library is fetched too) via a `seen`-guarded
+/// worklist so an invoke cycle terminates (the cycle itself is reported by
+/// compile). A library that vanished between list and read surfaces as a compile
+/// diagnostic ("no library found at …"), not a fetch error.
+///
+/// Shared by [`trigger_run_from_event`] (looping over discovered pipelines) and
+/// [`dispatch_run`] (one named pipeline) so both produce byte-identical IR.
+async fn prefetch_libs_and_compile(
+    forge: &dyn scarab_forge::ForgePort,
+    repo: &scarab_forge::Repo,
+    read_ref: &str,
+    yaml: &str,
+) -> Result<scarab_pipeline::PipelineIr, TriggerError> {
+    let mut libs = std::collections::BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut worklist: Vec<String> = scarab_pipeline::invoke_refs(yaml);
+    while let Some(lib_path) = worklist.pop() {
+        if !seen.insert(lib_path.clone()) {
+            continue;
+        }
+        match forge.read_file_at_ref(repo, read_ref, &lib_path).await {
+            Ok(bytes) => {
+                let src = String::from_utf8(bytes).map_err(|_| TriggerError::NotUtf8)?;
+                worklist.extend(scarab_pipeline::invoke_refs(&src));
+                libs.insert(lib_path, src);
+            }
+            Err(scarab_forge::ForgeError::Api(_)) => continue,
+            Err(e) => return Err(TriggerError::Forge(e)),
+        }
+    }
+    scarab_pipeline::compile_yaml_with_libs(yaml, &libs)
+        .map_err(|e| TriggerError::Pipeline(e.to_string()))
+}
+
+/// Fetch the target Environment's protection rules, enforce allowed-refs
+/// fail-closed, admit per-step privilege grants, and durably create the run for
+/// a single compiled pipeline — the admission primitive shared by the webhook
+/// trigger path and [`dispatch_run`]. Returns `Ok(None)` when the Environment
+/// disallows the event's ref (the caller decides whether that is a silent skip
+/// or a hard error), `Ok(Some(run))` on success.
+///
+/// A dispatch is a *trigger, never authority* (ADR-0043 §6): it rides the exact
+/// same Environment protection (approvers, wait timer, allowed-refs, concurrency)
+/// as a webhook deploy — there is no gate-bypass here. `params`, when supplied,
+/// are the already-resolved launch parameters frozen onto the run (ADR-0043 §5).
+#[allow(clippy::too_many_arguments)] // a cohesive admission routine; splitting hides the flow
+async fn admit_and_create_run(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    environments: Option<&dyn scarab_projects::EnvironmentStore>,
+    event: &scarab_forge::Event,
+    ir: &scarab_pipeline::PipelineIr,
+    path: &str,
+    excluded: &[String],
+    params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
+) -> Result<Option<RunId>, TriggerError> {
+    // Both callers pass a repo-aware event (webhook events carry a repo; dispatch
+    // builds a repo+ref Manual/Api event, ADR-0043).
+    let repo = event
+        .repo()
+        .ok_or_else(|| TriggerError::Pipeline("event carries no repository".into()))?;
+    let git_ref = config_ref(event);
+
+    // ADR-0037/0039: fetch the target Environment's protection rules once (a
+    // deploy pipeline only). Used both to reject a disallowed ref at creation
+    // (ADR-0037 — enforced even without an approver gate) and to admit per-step
+    // privilege grants (ADR-0039). An undefined environment is permissive for
+    // refs but forbids governed grants.
+    let protection = if let (Some(env_name), Some(store)) = (&ir.environment, environments) {
+        store
+            .get_environment(&repo.owner, &repo.name, env_name)
+            .await
+            .map_err(|e| TriggerError::Pipeline(e.to_string()))?
+            .map(|e| e.protection)
+    } else {
+        None
+    };
+    if let Some(p) = &protection {
+        if !p.ref_allowed(&git_ref) {
+            return Ok(None);
+        }
+    }
+    // A fork PR locked out of the environment's secrets is also locked out of its
+    // governed grants (ADR-0039).
+    let locked_out = ir
+        .environment
+        .as_ref()
+        .is_some_and(|e| fork_policy(event, e).secrets_locked_out);
+
+    let now = clock.now().await;
+    let run = RunId(Uuid::new_v4().to_string());
+    persist_run_from_ir(
+        db,
+        &run,
+        ir,
+        event,
+        path,
+        protection.as_ref(),
+        locked_out,
+        excluded,
+        now,
+    )
+    .await?;
+    // Freeze the resolved launch parameters on the run so every step's
+    // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
+    // deterministically (ADR-0043 §5).
+    if let Some(params) = params {
+        db.set_run_params(&run, params).await?;
+    }
+    Ok(Some(run))
+}
+
+/// Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
+/// dispatch (the default) or its programmatic [`Api`](DispatchKind::Api) sibling
+/// (ADR-0043 §4). The named pipeline must declare the matching `on:` trigger to
+/// be dispatchable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchKind {
+    #[default]
+    Manual,
+    Api,
+}
+
+impl DispatchKind {
+    fn trigger_kind(self) -> scarab_forge::TriggerKind {
+        match self {
+            DispatchKind::Manual => scarab_forge::TriggerKind::Manual,
+            DispatchKind::Api => scarab_forge::TriggerKind::Api,
+        }
+    }
+
+    /// Build the repo+ref-aware dispatch event (ADR-0043): the `ref` carried is
+    /// the resolved commit, so read-at-ref, admission, and the self-describing
+    /// Run all pin to it.
+    fn into_event(self, actor: String, repo: scarab_forge::Repo, r#ref: String) -> scarab_forge::Event {
+        match self {
+            DispatchKind::Manual => scarab_forge::Event::Manual { actor, repo, r#ref },
+            DispatchKind::Api => scarab_forge::Event::Api { actor, repo, r#ref },
+        }
+    }
+}
+
+/// Error dispatching a named pipeline (ADR-0043 "World B"). Distinct from
+/// [`TriggerError`] so the HTTP layer can map each cause to a precise status and
+/// a caller-facing, fail-closed message; a dispatch creates **no** run on any
+/// error.
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    #[error(transparent)]
+    Forge(scarab_forge::ForgeError),
+    /// No `.scarab` pipeline by that name exists at the resolved commit.
+    #[error("no pipeline `{0}` found at the requested ref")]
+    PipelineNotFound(String),
+    #[error("config is not valid UTF-8")]
+    NotUtf8,
+    #[error("pipeline: {0}")]
+    Pipeline(String),
+    /// The pipeline does not opt into this dispatch trigger — no matching
+    /// `on: manual` / `on: api` (ADR-0043 §4). Not dispatchable, fail-closed.
+    #[error("pipeline `{pipeline}` is not dispatchable: it declares no matching `on: {kind}`")]
+    NotDispatchable { pipeline: String, kind: &'static str },
+    /// A supplied launch parameter failed coercion/validation (ADR-0043 §6). The
+    /// inner error carries the per-parameter detail the form renders.
+    #[error("invalid launch parameters: {0}")]
+    Params(scarab_pipeline::PipelineError),
+    /// The dispatch ref is not permitted by the target Environment's allowed-refs
+    /// (ADR-0043 §6) — the same guardrail a webhook deploy hits, fail-closed.
+    #[error("ref `{0}` is not allowed to deploy to this environment")]
+    RefNotAllowed(String),
+    #[error(transparent)]
+    Db(DbError),
+}
+
+impl From<TriggerError> for DispatchError {
+    fn from(e: TriggerError) -> Self {
+        match e {
+            TriggerError::Forge(f) => DispatchError::Forge(f),
+            TriggerError::Pipeline(m) => DispatchError::Pipeline(m),
+            TriggerError::NotUtf8 => DispatchError::NotUtf8,
+            TriggerError::Db(d) => DispatchError::Db(d),
+        }
+    }
+}
+
+/// Candidate `.scarab` paths a dispatch `pipeline` identifier resolves to. A full
+/// `.scarab/**.yaml`/`.yml` path (or any path containing `/`) is taken verbatim;
+/// a bare name maps to `.scarab/<name>.yaml` then `.yml`.
+fn dispatch_candidate_paths(pipeline: &str) -> Vec<String> {
+    if pipeline.contains('/') || is_pipeline_file(pipeline) {
+        vec![pipeline.to_string()]
+    } else {
+        vec![
+            format!("{CONFIG_DIR}/{pipeline}.yaml"),
+            format!("{CONFIG_DIR}/{pipeline}.yml"),
+        ]
+    }
+}
+
+/// Dispatch a single named pipeline at a repo + ref — the manual/api trigger
+/// path (ADR-0043 "World B"), the sibling of [`trigger_run_from_event`]. Both
+/// share the read-at-ref → compile ([`prefetch_libs_and_compile`]) and
+/// admission → create ([`admit_and_create_run`]) primitives, so a dispatched
+/// deploy inherits Environment governance identically to a webhook deploy.
+///
+/// The flow: resolve `ref` to a concrete commit SHA (`forge.latest_commit`),
+/// read and compile the **named** pipeline at that SHA (the Run pins to it,
+/// reproducible and self-describing per ADR-0022), require the compiled pipeline
+/// to opt in via a matching `on: manual` / `on: api` (else
+/// [`DispatchError::NotDispatchable`]), resolve the supplied `params` against the
+/// declared interface **fail-closed** before any run exists (else
+/// [`DispatchError::Params`]), then create the run through the shared admission
+/// path, freezing the resolved params on it.
+///
+/// A dispatch is a *trigger, never authority* (§6): there is no gate-bypass — a
+/// disallowed ref, a missing approver, a wait timer all bite exactly as they
+/// would on a webhook deploy.
+#[allow(clippy::too_many_arguments)] // the dispatch coordinates are irreducible
+pub async fn dispatch_run(
+    forge: &dyn scarab_forge::ForgePort,
+    db: &dyn Db,
+    clock: &dyn Clock,
+    environments: Option<&dyn scarab_projects::EnvironmentStore>,
+    actor: String,
+    repo: scarab_forge::Repo,
+    r#ref: String,
+    pipeline: String,
+    params: std::collections::BTreeMap<String, serde_json::Value>,
+    kind: DispatchKind,
+) -> Result<RunId, DispatchError> {
+    // Resolve the dispatch ref to a concrete commit — the form and the run see
+    // byte-identical config (no branch-moved skew), and the Run is reproducible
+    // (ADR-0043 §4).
+    let commit = forge
+        .latest_commit(&repo, &r#ref)
+        .await
+        .map_err(DispatchError::Forge)?;
+    let sha = commit.sha;
+
+    // Read the named pipeline at the resolved commit.
+    let (path, yaml) = {
+        let mut found = None;
+        for candidate in dispatch_candidate_paths(&pipeline) {
+            match forge.read_file_at_ref(&repo, &sha, &candidate).await {
+                Ok(bytes) => {
+                    let yaml = String::from_utf8(bytes).map_err(|_| DispatchError::NotUtf8)?;
+                    found = Some((candidate, yaml));
+                    break;
+                }
+                Err(scarab_forge::ForgeError::Api(_)) => continue,
+                Err(e) => return Err(DispatchError::Forge(e)),
+            }
+        }
+        found.ok_or_else(|| DispatchError::PipelineNotFound(pipeline.clone()))?
+    };
+
+    // Compile at the resolved commit (transitive `invoke:` libraries pre-fetched
+    // there) — the shared read-at-ref → compile primitive.
+    let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml).await?;
+
+    // Build the repo+ref-aware event pinned to the resolved commit.
+    let event = kind.into_event(actor, repo, sha);
+    let ctx = event.context();
+
+    // Opt-in (ADR-0043 §4): the pipeline is dispatchable only if it declares a
+    // matching `on: manual` / `on: api` (a `when:` on that trigger is honoured
+    // too). No opt-in ⇒ not dispatchable, fail-closed, no run.
+    let dispatchable = scarab_pipeline::matches_trigger(&ir, kind.trigger_kind().as_str(), &ctx)
+        .map_err(|e| DispatchError::Pipeline(e.to_string()))?;
+    if !dispatchable {
+        return Err(DispatchError::NotDispatchable {
+            pipeline,
+            kind: kind.trigger_kind().as_str(),
+        });
+    }
+
+    // Validate launch parameters against the declared interface BEFORE creating
+    // the run (ADR-0043 §6): coerce to declared types, apply defaults, run each
+    // `validate:` predicate, reject unknown/missing — all fail-closed. A bad
+    // supply creates **no** run.
+    let resolved = scarab_pipeline::params::resolve_params(&ir.interface, &params)
+        .map_err(DispatchError::Params)?;
+
+    // Step-level `when:` guards, applied at creation exactly as the webhook path
+    // does (ADR-0033).
+    let excluded = scarab_pipeline::excluded_steps(&ir, &ctx)
+        .map_err(|e| DispatchError::Pipeline(e.to_string()))?;
+
+    // Create the run through the shared admission path (Environment protection,
+    // privilege admission), freezing the resolved params. A ref the Environment
+    // disallows comes back as `None` → a fail-closed error here (the webhook path
+    // skips silently; a dispatch is an explicit, answerable request).
+    match admit_and_create_run(
+        db,
+        clock,
+        environments,
+        &event,
+        &ir,
+        &path,
+        &excluded,
+        Some(&resolved),
+    )
+    .await?
+    {
+        Some(run) => Ok(run),
+        None => Err(DispatchError::RefNotAllowed(config_ref(&event))),
+    }
 }
 
 /// Admit a step's privilege request (ADR-0039) against the run's target
@@ -1877,6 +2227,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
 #[openapi(
     paths(
         create_run,
+        dispatch,
         list_runs,
         get_run,
         get_events,
@@ -1890,6 +2241,8 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
     ),
     components(schemas(
         CreateRunRequest,
+        DispatchRequest,
+        DispatchKind,
         PipelineDto,
         StepDto,
         CreateRunResponse,
@@ -1947,6 +2300,7 @@ pub fn router(state: AppState) -> Router {
             get(list_deployments),
         )
         .route("/v1/repos/{org}/{repo}/secrets/matrix", get(secret_matrix))
+        .route("/v1/repos/{org}/{repo}/dispatch", post(dispatch))
         .route("/webhooks/github", post(github_webhook))
         .with_state(state)
 }

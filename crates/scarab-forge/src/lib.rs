@@ -98,10 +98,16 @@ pub enum Event {
     Release { repo: Repo, tag: String },
     Comment { repo: Repo, issue: u64, body: String },
     Cron { schedule: String },
-    Manual { actor: String },
+    /// A human dispatch of a named pipeline at a repo + ref (ADR-0043 "World B").
+    /// Unlike a webhook event, the target is chosen by the launcher, so the event
+    /// carries the `repo` and the dispatch `ref` explicitly — the read-at-ref /
+    /// compile / admission machinery then treats it exactly like any other
+    /// repo-aware trigger. `ref` is the resolved commit the dispatch runs against.
+    Manual { actor: String, repo: Repo, r#ref: String },
     /// Started programmatically via the REST API (CLI / third party), as opposed
-    /// to a human [`Manual`](Event::Manual) trigger.
-    Api { actor: String },
+    /// to a human [`Manual`](Event::Manual) trigger. Repo + ref-aware for the same
+    /// reason (ADR-0043).
+    Api { actor: String, repo: Repo, r#ref: String },
     Upstream { repo: Repo, run: String },
 }
 
@@ -162,8 +168,8 @@ impl Event {
         matches!(self, Event::PullRequest { fork: true, .. })
     }
 
-    /// The repository this event targets, if any. Repo-less events (`cron`,
-    /// `manual`, `api`) return `None`.
+    /// The repository this event targets, if any. Only `cron` is truly repo-less;
+    /// `manual`/`api` dispatch carry their target repo (ADR-0043).
     pub fn repo(&self) -> Option<&Repo> {
         match self {
             Event::Push { repo, .. }
@@ -171,8 +177,10 @@ impl Event {
             | Event::Tag { repo, .. }
             | Event::Release { repo, .. }
             | Event::Comment { repo, .. }
+            | Event::Manual { repo, .. }
+            | Event::Api { repo, .. }
             | Event::Upstream { repo, .. } => Some(repo),
-            Event::Cron { .. } | Event::Manual { .. } | Event::Api { .. } => None,
+            Event::Cron { .. } => None,
         }
     }
 
@@ -215,8 +223,16 @@ impl Event {
             Event::Cron { schedule } => {
                 e.insert("schedule".into(), json!(schedule));
             }
-            Event::Manual { actor } | Event::Api { actor } => {
+            Event::Manual { actor, r#ref, .. } | Event::Api { actor, r#ref, .. } => {
                 e.insert("actor".into(), json!(actor));
+                // The dispatch ref (a resolved commit) — exposed like push's so a
+                // `when:` guard on `manual`/`api` and the self-describing Run both
+                // see it (ADR-0043).
+                e.insert("ref".into(), json!(r#ref));
+                e.insert(
+                    "branch".into(),
+                    json!(r#ref.strip_prefix("refs/heads/").unwrap_or(r#ref)),
+                );
             }
             Event::Upstream { run, .. } => {
                 e.insert("run".into(), json!(run));
@@ -341,8 +357,22 @@ mod tests {
                 },
                 TriggerKind::Cron,
             ),
-            (Event::Manual { actor: "u".into() }, TriggerKind::Manual),
-            (Event::Api { actor: "bot".into() }, TriggerKind::Api),
+            (
+                Event::Manual {
+                    actor: "u".into(),
+                    repo: repo(),
+                    r#ref: "refs/heads/main".into(),
+                },
+                TriggerKind::Manual,
+            ),
+            (
+                Event::Api {
+                    actor: "bot".into(),
+                    repo: repo(),
+                    r#ref: "refs/heads/main".into(),
+                },
+                TriggerKind::Api,
+            ),
             (
                 Event::Upstream {
                     repo: repo(),
@@ -383,14 +413,34 @@ mod tests {
     }
 
     #[test]
-    fn repo_less_events_have_no_repo() {
+    fn only_cron_is_repo_less() {
+        // `cron` is the sole repo-less event.
         assert!(Event::Cron {
             schedule: "@daily".into()
         }
         .repo()
         .is_none());
-        assert!(Event::Manual { actor: "u".into() }.repo().is_none());
-        assert!(Event::Api { actor: "bot".into() }.repo().is_none());
+        // `manual`/`api` dispatch now carry (and return) their target repo + ref,
+        // and `context()` still exposes the actor (ADR-0043).
+        for event in [
+            Event::Manual {
+                actor: "u".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+            },
+            Event::Api {
+                actor: "bot".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+            },
+        ] {
+            assert_eq!(event.repo(), Some(&repo()));
+            let ctx = event.context();
+            assert_eq!(ctx["event"]["repo"]["owner"], "acme");
+            assert_eq!(ctx["event"]["ref"], "refs/heads/main");
+            assert_eq!(ctx["event"]["branch"], "main");
+            assert!(ctx["event"]["actor"].is_string(), "actor still exposed");
+        }
         assert_eq!(
             Event::Push {
                 repo: repo(),
