@@ -19,6 +19,14 @@ export default defineConfig({
       title: 'Scarab',
       tagline: 'A modern CI engine for Kubernetes — forge-native, on a durable core.',
       logo: { src: './src/assets/logo.svg', alt: 'Scarab' },
+      // Brand favicon (ui/brand): theme-aware SVG (ink outline on light, gold on
+      // dark), with .ico + apple-touch fallbacks. Starlight prepends `base` to
+      // `favicon`; the `head` hrefs are written with the /scarab-ci/ base inline.
+      favicon: '/favicon.svg',
+      head: [
+        { tag: 'link', attrs: { rel: 'icon', href: '/scarab-ci/favicon.ico', sizes: 'any' } },
+        { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/scarab-ci/apple-touch-icon.png' } },
+      ],
       customCss: [
         // Geist is the face shadcn/ui (and thus the Lucode base) is drawn with —
         // JetBrains Mono stays for machine tokens (ids, logs, durations).
