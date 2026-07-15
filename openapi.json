@@ -59,6 +59,117 @@
         }
       }
     },
+    "/v1/repos/{org}/{repo}/pipelines": {
+      "get": {
+        "tags": [],
+        "summary": "The manually-dispatchable catalog at a ref (ADR-0043 §4). Resolves `ref` to a\nconcrete commit (echoed back), enumerates every `.scarab/*.{yaml,yml}` at it\n(direct children only — `.scarab/lib/**` is excluded, mirroring webhook\ndiscovery), and reports each pipeline's `manual`/`api` opt-in from a\n**lightweight `on:`-only parse** (no `invoke:` pre-fetch, no full compile —\nthat cost is deferred to the on-selection interface read). A single file that\nfails to parse is flagged with an `error` rather than failing the whole list;\nan absent `.scarab/` yields an empty catalog, not an error. Read capability.",
+        "operationId": "list_pipelines",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ref",
+            "in": "query",
+            "description": "ref to read the config at (default HEAD)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "dispatch catalog at the resolved commit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PipelineCatalogResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/repos/{org}/{repo}/pipelines/{name}/interface": {
+      "get": {
+        "tags": [],
+        "summary": "The compiled, typed launch-parameter schema for one selected pipeline\n(ADR-0043 §4) — the on-selection describe. Resolves `ref` to a concrete\ncommit (echoed back), reads the named pipeline there, and **fully compiles**\nit (reusing the shared [`prefetch_libs_and_compile`] — this is where the\nlib-prefetch cost is justified), returning `interface.inputs` as typed\n[`ParamSpec`](scarab_pipeline::ParamSpec)s. The response is a pure function of\nthe compiled IR — the same path dispatch rides, no parallel parser — so a\ncompile error surfaces as a structured 4xx (never a 500), identical to\ndispatch. Read capability.",
+        "operationId": "pipeline_interface",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "pipeline name (bare, e.g. `deploy`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "ref",
+            "in": "query",
+            "description": "ref to read the config at (default HEAD)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the compiled typed parameter schema",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PipelineInterfaceResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "the pipeline failed to compile (structured diagnostic)"
+          },
+          "404": {
+            "description": "no pipeline by that name at the ref"
+          }
+        }
+      }
+    },
     "/v1/runs": {
       "get": {
         "tags": [],
@@ -433,6 +544,36 @@
   },
   "components": {
     "schemas": {
+      "CatalogEntry": {
+        "type": "object",
+        "description": "One pipeline in the dispatch catalog: its selection `name` and whether it\nopts into `manual` / `api` dispatch (its `on:` includes that trigger).",
+        "required": [
+          "name",
+          "manual",
+          "api"
+        ],
+        "properties": {
+          "api": {
+            "type": "boolean",
+            "description": "This pipeline declares `on: api` — its programmatic dispatch sibling."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set when this single file failed to parse — the rest of the catalog still\nlists (a broken sibling does not fail the whole listing, ADR-0043 §4)."
+          },
+          "manual": {
+            "type": "boolean",
+            "description": "This pipeline declares `on: manual` — it appears in the human catalog."
+          },
+          "name": {
+            "type": "string",
+            "description": "The bare selection name (e.g. `deploy`) — what a describe/dispatch call\npasses as `pipeline`."
+          }
+        }
+      },
       "CreateRunRequest": {
         "type": "object",
         "description": "`POST /v1/runs` body: an inline pipeline to run immediately, plus any launch\nparameters (ADR-0043) declared by the pipeline's `interface`.",
@@ -498,6 +639,27 @@
           }
         }
       },
+      "PipelineCatalogResponse": {
+        "type": "object",
+        "description": "`GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable\ncatalog at a ref (ADR-0043 §4). Lightweight — each entry is an `on:`-only\nread, not a full compile. `sha` is the ref resolved to a concrete commit.",
+        "required": [
+          "sha",
+          "pipelines"
+        ],
+        "properties": {
+          "pipelines": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogEntry"
+            },
+            "description": "Every `.scarab/*.{yaml,yml}` at the commit (excluding `.scarab/lib/**`),\npath-sorted."
+          },
+          "sha": {
+            "type": "string",
+            "description": "The ref resolved to a concrete commit — the catalog reflects this exact\ncommit, and a subsequent describe/dispatch should pin to it."
+          }
+        }
+      },
       "PipelineDto": {
         "type": "object",
         "description": "The inline pipeline (IR subset).",
@@ -521,6 +683,37 @@
             "items": {
               "$ref": "#/components/schemas/StepDto"
             }
+          }
+        }
+      },
+      "PipelineInterfaceResponse": {
+        "type": "object",
+        "description": "`GET /v1/repos/{org}/{repo}/pipelines/{name}/interface?ref=` body: the\ncompiled, typed launch-parameter schema for ONE selected pipeline (ADR-0043\n§4). A pure function of the compiled IR — the same compile path dispatch\nrides — so the form and the run validate against byte-identical specs.",
+        "required": [
+          "sha",
+          "manual",
+          "api",
+          "inputs"
+        ],
+        "properties": {
+          "api": {
+            "type": "boolean",
+            "description": "This pipeline opts into `api` dispatch (`on: api`)."
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "The declared typed launch parameters (name, type, required, default,\noptions, validate, description) — the compiled `interface.inputs`."
+          },
+          "manual": {
+            "type": "boolean",
+            "description": "This pipeline opts into `manual` dispatch (`on: manual`)."
+          },
+          "sha": {
+            "type": "string",
+            "description": "The ref resolved to a concrete commit — the interface reflects this exact\ncommit; a subsequent dispatch should pin to it."
           }
         }
       },

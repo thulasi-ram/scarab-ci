@@ -249,6 +249,69 @@ pub struct DispatchRequest {
     pub kind: DispatchKind,
 }
 
+/// Query for the manual-dispatch catalog + interface describe endpoints
+/// (ADR-0043 §4): the ref to read the config at. Resolved to a concrete commit
+/// SHA, which is echoed back so the form and the eventual dispatch see
+/// byte-identical config. Absent = `HEAD`.
+#[derive(Debug, Deserialize)]
+pub struct PipelineRefQuery {
+    #[serde(default = "default_pipeline_ref")]
+    pub r#ref: String,
+}
+
+fn default_pipeline_ref() -> String {
+    "HEAD".to_string()
+}
+
+/// `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
+/// catalog at a ref (ADR-0043 §4). Lightweight — each entry is an `on:`-only
+/// read, not a full compile. `sha` is the ref resolved to a concrete commit.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PipelineCatalogResponse {
+    /// The ref resolved to a concrete commit — the catalog reflects this exact
+    /// commit, and a subsequent describe/dispatch should pin to it.
+    pub sha: String,
+    /// Every `.scarab/*.{yaml,yml}` at the commit (excluding `.scarab/lib/**`),
+    /// path-sorted.
+    pub pipelines: Vec<CatalogEntry>,
+}
+
+/// One pipeline in the dispatch catalog: its selection `name` and whether it
+/// opts into `manual` / `api` dispatch (its `on:` includes that trigger).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CatalogEntry {
+    /// The bare selection name (e.g. `deploy`) — what a describe/dispatch call
+    /// passes as `pipeline`.
+    pub name: String,
+    /// This pipeline declares `on: manual` — it appears in the human catalog.
+    pub manual: bool,
+    /// This pipeline declares `on: api` — its programmatic dispatch sibling.
+    pub api: bool,
+    /// Set when this single file failed to parse — the rest of the catalog still
+    /// lists (a broken sibling does not fail the whole listing, ADR-0043 §4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `GET /v1/repos/{org}/{repo}/pipelines/{name}/interface?ref=` body: the
+/// compiled, typed launch-parameter schema for ONE selected pipeline (ADR-0043
+/// §4). A pure function of the compiled IR — the same compile path dispatch
+/// rides — so the form and the run validate against byte-identical specs.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PipelineInterfaceResponse {
+    /// The ref resolved to a concrete commit — the interface reflects this exact
+    /// commit; a subsequent dispatch should pin to it.
+    pub sha: String,
+    /// This pipeline opts into `manual` dispatch (`on: manual`).
+    pub manual: bool,
+    /// This pipeline opts into `api` dispatch (`on: api`).
+    pub api: bool,
+    /// The declared typed launch parameters (name, type, required, default,
+    /// options, validate, description) — the compiled `interface.inputs`.
+    #[schema(value_type = Vec<Object>)]
+    pub inputs: Vec<scarab_pipeline::ParamSpec>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunStatusResponse {
     pub id: String,
@@ -512,6 +575,162 @@ async fn dispatch(
             status: run_status_name(RunStatus::Pending).to_string(),
         }),
     ))
+}
+
+/// The bare selection name of a `.scarab/<name>.{yaml,yml}` pipeline (ADR-0043
+/// catalog): strip the `.scarab/` prefix and the extension. This is what the
+/// catalog reports and what the describe/dispatch calls accept as `pipeline`
+/// (the path-addressable interface endpoint needs a slash-free segment, and
+/// [`dispatch_candidate_paths`] re-derives the `.yaml`/`.yml` candidates).
+fn bare_pipeline_name(path: &str) -> String {
+    let p = path
+        .strip_prefix(&format!("{CONFIG_DIR}/"))
+        .unwrap_or(path);
+    p.strip_suffix(".yaml")
+        .or_else(|| p.strip_suffix(".yml"))
+        .unwrap_or(p)
+        .to_string()
+}
+
+/// The manually-dispatchable catalog at a ref (ADR-0043 §4). Resolves `ref` to a
+/// concrete commit (echoed back), enumerates every `.scarab/*.{yaml,yml}` at it
+/// (direct children only — `.scarab/lib/**` is excluded, mirroring webhook
+/// discovery), and reports each pipeline's `manual`/`api` opt-in from a
+/// **lightweight `on:`-only parse** (no `invoke:` pre-fetch, no full compile —
+/// that cost is deferred to the on-selection interface read). A single file that
+/// fails to parse is flagged with an `error` rather than failing the whole list;
+/// an absent `.scarab/` yields an empty catalog, not an error. Read capability.
+#[utoipa::path(
+    get,
+    path = "/v1/repos/{org}/{repo}/pipelines",
+    params(
+        ("org" = String, Path, description = "repo owner"),
+        ("repo" = String, Path, description = "repo name"),
+        ("ref" = Option<String>, Query, description = "ref to read the config at (default HEAD)")
+    ),
+    responses((status = 200, description = "dispatch catalog at the resolved commit", body = PipelineCatalogResponse))
+)]
+async fn list_pipelines(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo)): Path<(String, String)>,
+    Query(q): Query<PipelineRefQuery>,
+) -> Result<Json<PipelineCatalogResponse>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
+    let forge = st
+        .forge
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
+    let repo = scarab_forge::Repo { owner: org, name: repo };
+
+    // Resolve the ref to a concrete commit; the catalog reflects exactly it.
+    let sha = forge
+        .latest_commit(&repo, &q.r#ref)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .sha;
+
+    // Enumerate the pipeline files. An absent `.scarab/` (a forge API miss) is an
+    // empty catalog, not an error — the same tolerance webhook discovery has.
+    let entries = match forge.list_dir_at_ref(&repo, &sha, CONFIG_DIR).await {
+        Ok(e) => e,
+        Err(scarab_forge::ForgeError::Api(_)) => Vec::new(),
+        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+    };
+    let mut paths: Vec<String> = entries.into_iter().filter(|p| is_pipeline_file(p)).collect();
+    paths.sort();
+
+    let mut pipelines = Vec::with_capacity(paths.len());
+    for path in paths {
+        let name = bare_pipeline_name(&path);
+        let entry = match forge.read_file_at_ref(&repo, &sha, &path).await {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                // Lightweight: parse only the `on:` block (ADR-0043 §4).
+                Ok(yaml) => match scarab_pipeline::triggers_of(&yaml) {
+                    Ok(triggers) => CatalogEntry {
+                        name,
+                        manual: triggers.0.contains_key("manual"),
+                        api: triggers.0.contains_key("api"),
+                        error: None,
+                    },
+                    Err(e) => CatalogEntry { name, manual: false, api: false, error: Some(e.to_string()) },
+                },
+                Err(_) => CatalogEntry {
+                    name,
+                    manual: false,
+                    api: false,
+                    error: Some("config is not valid UTF-8".into()),
+                },
+            },
+            // A file that vanished between list and read → skip it.
+            Err(scarab_forge::ForgeError::Api(_)) => continue,
+            Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+        };
+        pipelines.push(entry);
+    }
+
+    Ok(Json(PipelineCatalogResponse { sha, pipelines }))
+}
+
+/// The compiled, typed launch-parameter schema for one selected pipeline
+/// (ADR-0043 §4) — the on-selection describe. Resolves `ref` to a concrete
+/// commit (echoed back), reads the named pipeline there, and **fully compiles**
+/// it (reusing the shared [`prefetch_libs_and_compile`] — this is where the
+/// lib-prefetch cost is justified), returning `interface.inputs` as typed
+/// [`ParamSpec`](scarab_pipeline::ParamSpec)s. The response is a pure function of
+/// the compiled IR — the same path dispatch rides, no parallel parser — so a
+/// compile error surfaces as a structured 4xx (never a 500), identical to
+/// dispatch. Read capability.
+#[utoipa::path(
+    get,
+    path = "/v1/repos/{org}/{repo}/pipelines/{name}/interface",
+    params(
+        ("org" = String, Path, description = "repo owner"),
+        ("repo" = String, Path, description = "repo name"),
+        ("name" = String, Path, description = "pipeline name (bare, e.g. `deploy`)"),
+        ("ref" = Option<String>, Query, description = "ref to read the config at (default HEAD)")
+    ),
+    responses(
+        (status = 200, description = "the compiled typed parameter schema", body = PipelineInterfaceResponse),
+        (status = 404, description = "no pipeline by that name at the ref"),
+        (status = 400, description = "the pipeline failed to compile (structured diagnostic)")
+    )
+)]
+async fn pipeline_interface(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo, name)): Path<(String, String, String)>,
+    Query(q): Query<PipelineRefQuery>,
+) -> Result<Json<PipelineInterfaceResponse>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
+    let forge = st
+        .forge
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
+    let forge = forge.as_ref();
+    let repo = scarab_forge::Repo { owner: org, name: repo };
+
+    // Resolve the ref → SHA (echoed back), read the named pipeline there, and
+    // fully compile — mapping each failure to a structured 4xx via DispatchError
+    // (the same shape dispatch uses: not-found → 404, compile/forge → 400).
+    let interface = async {
+        let sha = forge
+            .latest_commit(&repo, &q.r#ref)
+            .await
+            .map_err(DispatchError::Forge)?
+            .sha;
+        let (_, yaml) = read_named_pipeline(forge, &repo, &sha, &name).await?;
+        let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml).await?;
+        Ok::<_, DispatchError>(PipelineInterfaceResponse {
+            sha,
+            manual: ir.triggers.0.contains_key("manual"),
+            api: ir.triggers.0.contains_key("api"),
+            inputs: ir.interface.inputs,
+        })
+    }
+    .await?;
+
+    Ok(Json(interface))
 }
 
 /// Query for [`list_runs`]: an optional page size.
@@ -1034,6 +1253,31 @@ fn dispatch_candidate_paths(pipeline: &str) -> Vec<String> {
     }
 }
 
+/// Read the authored YAML of a named pipeline at a resolved commit, trying each
+/// [`dispatch_candidate_paths`] candidate in turn. Returns the `(path, yaml)`
+/// that resolved, or [`DispatchError::PipelineNotFound`] if no candidate exists
+/// at `sha`. Shared by [`dispatch_run`] (before compile+admit) and the interface
+/// describe endpoint (before compile-for-interface) so both address a pipeline
+/// identically (a bare name or a full `.scarab/*.yaml` path).
+async fn read_named_pipeline(
+    forge: &dyn scarab_forge::ForgePort,
+    repo: &scarab_forge::Repo,
+    sha: &str,
+    pipeline: &str,
+) -> Result<(String, String), DispatchError> {
+    for candidate in dispatch_candidate_paths(pipeline) {
+        match forge.read_file_at_ref(repo, sha, &candidate).await {
+            Ok(bytes) => {
+                let yaml = String::from_utf8(bytes).map_err(|_| DispatchError::NotUtf8)?;
+                return Ok((candidate, yaml));
+            }
+            Err(scarab_forge::ForgeError::Api(_)) => continue,
+            Err(e) => return Err(DispatchError::Forge(e)),
+        }
+    }
+    Err(DispatchError::PipelineNotFound(pipeline.to_string()))
+}
+
 /// Dispatch a single named pipeline at a repo + ref — the manual/api trigger
 /// path (ADR-0043 "World B"), the sibling of [`trigger_run_from_event`]. Both
 /// share the read-at-ref → compile ([`prefetch_libs_and_compile`]) and
@@ -1075,21 +1319,7 @@ pub async fn dispatch_run(
     let sha = commit.sha;
 
     // Read the named pipeline at the resolved commit.
-    let (path, yaml) = {
-        let mut found = None;
-        for candidate in dispatch_candidate_paths(&pipeline) {
-            match forge.read_file_at_ref(&repo, &sha, &candidate).await {
-                Ok(bytes) => {
-                    let yaml = String::from_utf8(bytes).map_err(|_| DispatchError::NotUtf8)?;
-                    found = Some((candidate, yaml));
-                    break;
-                }
-                Err(scarab_forge::ForgeError::Api(_)) => continue,
-                Err(e) => return Err(DispatchError::Forge(e)),
-            }
-        }
-        found.ok_or_else(|| DispatchError::PipelineNotFound(pipeline.clone()))?
-    };
+    let (path, yaml) = read_named_pipeline(forge, &repo, &sha, &pipeline).await?;
 
     // Compile at the resolved commit (transitive `invoke:` libraries pre-fetched
     // there) — the shared read-at-ref → compile primitive.
@@ -2228,6 +2458,8 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
     paths(
         create_run,
         dispatch,
+        list_pipelines,
+        pipeline_interface,
         list_runs,
         get_run,
         get_events,
@@ -2243,6 +2475,9 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         CreateRunRequest,
         DispatchRequest,
         DispatchKind,
+        PipelineCatalogResponse,
+        CatalogEntry,
+        PipelineInterfaceResponse,
         PipelineDto,
         StepDto,
         CreateRunResponse,
@@ -2300,6 +2535,11 @@ pub fn router(state: AppState) -> Router {
             get(list_deployments),
         )
         .route("/v1/repos/{org}/{repo}/secrets/matrix", get(secret_matrix))
+        .route("/v1/repos/{org}/{repo}/pipelines", get(list_pipelines))
+        .route(
+            "/v1/repos/{org}/{repo}/pipelines/{name}/interface",
+            get(pipeline_interface),
+        )
         .route("/v1/repos/{org}/{repo}/dispatch", post(dispatch))
         .route("/webhooks/github", post(github_webhook))
         .with_state(state)

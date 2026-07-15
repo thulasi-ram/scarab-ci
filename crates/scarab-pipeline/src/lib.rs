@@ -566,6 +566,28 @@ pub fn invoke_refs(yaml: &str) -> Vec<String> {
     out
 }
 
+/// A lightweight, `on:`-only read of an authored pipeline (ADR-0043 catalog).
+/// Parses **just the trigger block** — no `invoke:` pre-fetch, no matrix
+/// expansion, no full compile — so the manual-dispatch catalog can list what a
+/// ref exposes cheaply, deferring the (lib-prefetch + compile) cost to the
+/// on-selection [`compile_yaml_with_libs`] interface read. The pipeline→trigger
+/// mapping is thus knowable from a single file read: a catalog entry reports
+/// `manual`/`api` from `triggers.0.contains_key(..)`. A malformed file surfaces
+/// as [`PipelineError::Parse`], which the caller marks per-file rather than
+/// failing the whole listing.
+pub fn triggers_of(yaml: &str) -> Result<Triggers, PipelineError> {
+    /// Only the `on:` block; every other field (`steps`, `interface`, …) is
+    /// ignored, so this never needs the libraries a full compile would.
+    #[derive(Deserialize)]
+    struct ShallowOn {
+        #[serde(default, rename = "on")]
+        on: Triggers,
+    }
+    serde_yaml::from_str::<ShallowOn>(yaml)
+        .map(|s| s.on)
+        .map_err(|e| PipelineError::Parse(e.to_string()))
+}
+
 /// Normalize and safety-check a repo-relative library path referenced by an
 /// `invoke:` step (ADR-0038), returning the canonical key used to look its
 /// source up in the pre-fetched `{path → source}` map.
