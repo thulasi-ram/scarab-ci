@@ -4,6 +4,81 @@
  */
 
 export interface paths {
+    "/v1/repos/{org}/{repo}/dispatch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dispatch a named repo pipeline at a ref (ADR-0043 "World B"). Authorized as a
+         *     write (like [`create_run`]); a dispatch is a *trigger*, so a deploy pipeline
+         *     still hits its Environment's protection rules at admission. Returns the new
+         *     run id (mirrors [`CreateRunResponse`]); creates **no** run on any error.
+         */
+        post: operations["dispatch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/repos/{org}/{repo}/pipelines": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The manually-dispatchable catalog at a ref (ADR-0043 §4). Resolves `ref` to a
+         *     concrete commit (echoed back), enumerates every `.scarab/*.{yaml,yml}` at it
+         *     (direct children only — `.scarab/lib/**` is excluded, mirroring webhook
+         *     discovery), and reports each pipeline's `manual`/`api` opt-in from a
+         *     **lightweight `on:`-only parse** (no `invoke:` pre-fetch, no full compile —
+         *     that cost is deferred to the on-selection interface read). A single file that
+         *     fails to parse is flagged with an `error` rather than failing the whole list;
+         *     an absent `.scarab/` yields an empty catalog, not an error. Read capability.
+         */
+        get: operations["list_pipelines"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/repos/{org}/{repo}/pipelines/{name}/interface": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The compiled, typed launch-parameter schema for one selected pipeline
+         *     (ADR-0043 §4) — the on-selection describe. Resolves `ref` to a concrete
+         *     commit (echoed back), reads the named pipeline there, and **fully compiles**
+         *     it (reusing the shared [`prefetch_libs_and_compile`] — this is where the
+         *     lib-prefetch cost is justified), returning `interface.inputs` as typed
+         *     [`ParamSpec`](scarab_pipeline::ParamSpec)s. The response is a pure function of
+         *     the compiled IR — the same path dispatch rides, no parallel parser — so a
+         *     compile error surfaces as a structured 4xx (never a 500), identical to
+         *     dispatch. Read capability.
+         */
+        get: operations["pipeline_interface"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/runs": {
         parameters: {
             query?: never;
@@ -69,8 +144,12 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Release a manual gate, resuming its suspended run (ADR-0008, 0032). Authz'd
-         *     as a write; exactly-once (a repeat approve is a no-op).
+         * Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's
+         *     approval is recorded on the event log (append-only, idempotent). For a
+         *     **deploy** run (one with a target environment), the gate is released only
+         *     once the accumulated approvers satisfy the environment's protection rules
+         *     (`admits`); on release the deployment is written to history. A plain gate (no
+         *     environment) releases on the first approval. Authz'd as a write.
          */
         post: operations["approve_gate"];
         delete?: never;
@@ -173,22 +252,134 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /** @description `POST /v1/runs` body: an inline pipeline to run immediately. */
+        /**
+         * @description One pipeline in the dispatch catalog: its selection `name` and whether it
+         *     opts into `manual` / `api` dispatch (its `on:` includes that trigger).
+         */
+        CatalogEntry: {
+            /** @description This pipeline declares `on: api` — its programmatic dispatch sibling. */
+            api: boolean;
+            /**
+             * @description Set when this single file failed to parse — the rest of the catalog still
+             *     lists (a broken sibling does not fail the whole listing, ADR-0043 §4).
+             */
+            error?: string | null;
+            /** @description This pipeline declares `on: manual` — it appears in the human catalog. */
+            manual: boolean;
+            /**
+             * @description The bare selection name (e.g. `deploy`) — what a describe/dispatch call
+             *     passes as `pipeline`.
+             */
+            name: string;
+        };
+        /**
+         * @description `POST /v1/runs` body: an inline pipeline to run immediately, plus any launch
+         *     parameters (ADR-0043) declared by the pipeline's `interface`.
+         */
         CreateRunRequest: {
+            /**
+             * @description Supplied launch parameters, `name → value` (ADR-0043). Resolved against
+             *     `pipeline.interface.inputs` at creation: coerced to the declared types,
+             *     defaults applied, validated fail-closed. Absent = none supplied.
+             */
+            params?: Record<string, never>;
             pipeline: components["schemas"]["PipelineDto"];
         };
         CreateRunResponse: {
             id: string;
             status: string;
         };
+        /**
+         * @description Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
+         *     dispatch (the default) or its programmatic [`Api`](DispatchKind::Api) sibling
+         *     (ADR-0043 §4). The named pipeline must declare the matching `on:` trigger to
+         *     be dispatchable.
+         * @enum {string}
+         */
+        DispatchKind: "manual" | "api";
+        /**
+         * @description `POST /v1/repos/{org}/{repo}/dispatch` body: dispatch a **named** pipeline at
+         *     a `ref`, supplying its declared launch parameters (ADR-0043 "World B"). Unlike
+         *     the inline `POST /v1/runs` escape hatch, this rides the read-at-ref → compile
+         *     → admission machinery — a dispatched deploy hits Environment governance.
+         */
+        DispatchRequest: {
+            /**
+             * @description Which trigger to dispatch: `manual` (default) or `api`. The pipeline must
+             *     declare the matching `on:`.
+             */
+            kind?: components["schemas"]["DispatchKind"];
+            /**
+             * @description Supplied launch parameters, `name → value` (ADR-0043). Resolved against
+             *     the pipeline's `interface.inputs` at the resolved commit: coerced,
+             *     defaulted, validated fail-closed. Absent = none supplied.
+             */
+            params?: Record<string, never>;
+            /**
+             * @description The pipeline to run — a `.scarab` name (e.g. `deploy`) or a full
+             *     `.scarab/*.yaml` path.
+             */
+            pipeline: string;
+            /**
+             * @description The ref to dispatch at (branch/tag/sha). Resolved to a concrete commit;
+             *     the run pins to that commit.
+             */
+            ref: string;
+        };
+        /**
+         * @description `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
+         *     catalog at a ref (ADR-0043 §4). Lightweight — each entry is an `on:`-only
+         *     read, not a full compile. `sha` is the ref resolved to a concrete commit.
+         */
+        PipelineCatalogResponse: {
+            /**
+             * @description Every `.scarab/*.{yaml,yml}` at the commit (excluding `.scarab/lib/**`),
+             *     path-sorted.
+             */
+            pipelines: components["schemas"]["CatalogEntry"][];
+            /**
+             * @description The ref resolved to a concrete commit — the catalog reflects this exact
+             *     commit, and a subsequent describe/dispatch should pin to it.
+             */
+            sha: string;
+        };
         /** @description The inline pipeline (IR subset). */
         PipelineDto: {
+            /**
+             * @description The pipeline's launch/reuse interface (ADR-0038, 0043) — its declared
+             *     typed parameters (`inputs`) and exposed outputs. Carried as the pure
+             *     `scarab_pipeline::Interface` (opaque object in the schema; the pure crate
+             *     cannot derive `ToSchema`). Absent = no parameters.
+             */
+            interface?: Record<string, never>;
             /**
              * Format: int32
              * @description IR schema version (ADR-0022).
              */
             ir_version: number;
             steps: components["schemas"]["StepDto"][];
+        };
+        /**
+         * @description `GET /v1/repos/{org}/{repo}/pipelines/{name}/interface?ref=` body: the
+         *     compiled, typed launch-parameter schema for ONE selected pipeline (ADR-0043
+         *     §4). A pure function of the compiled IR — the same compile path dispatch
+         *     rides — so the form and the run validate against byte-identical specs.
+         */
+        PipelineInterfaceResponse: {
+            /** @description This pipeline opts into `api` dispatch (`on: api`). */
+            api: boolean;
+            /**
+             * @description The declared typed launch parameters (name, type, required, default,
+             *     options, validate, description) — the compiled `interface.inputs`.
+             */
+            inputs: Record<string, never>[];
+            /** @description This pipeline opts into `manual` dispatch (`on: manual`). */
+            manual: boolean;
+            /**
+             * @description The ref resolved to a concrete commit — the interface reflects this exact
+             *     commit; a subsequent dispatch should pin to it.
+             */
+            sha: string;
         };
         /**
          * @description `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
@@ -212,6 +403,13 @@ export interface components {
         };
         RunStatusResponse: {
             id: string;
+            /**
+             * @description The run's frozen launch parameters, `name → typed value` (ADR-0043 §5).
+             *     A run-level constant resolved once at creation; non-secret by contract
+             *     (§6), so safe to expose. Empty when the run took none. Lets the UI's
+             *     re-run flow pre-fill the form from the prior run's params.
+             */
+            params?: Record<string, never>;
             status: string;
             steps: components["schemas"]["StepStatusDto"][];
         };
@@ -238,6 +436,8 @@ export interface components {
             id: string;
             image: string;
             needs?: string[];
+            /** @description Secret keys to resolve and inject at launch (ADR-0037). */
+            secrets?: string[];
         };
         StepStatusDto: {
             attempts: number;
@@ -263,6 +463,107 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    dispatch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DispatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Run created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreateRunResponse"];
+                };
+            };
+        };
+    };
+    list_pipelines: {
+        parameters: {
+            query?: {
+                /** @description ref to read the config at (default HEAD) */
+                ref?: string;
+            };
+            header?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description dispatch catalog at the resolved commit */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PipelineCatalogResponse"];
+                };
+            };
+        };
+    };
+    pipeline_interface: {
+        parameters: {
+            query?: {
+                /** @description ref to read the config at (default HEAD) */
+                ref?: string;
+            };
+            header?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+                /** @description pipeline name (bare, e.g. `deploy`) */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description the compiled typed parameter schema */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PipelineInterfaceResponse"];
+                };
+            };
+            /** @description the pipeline failed to compile (structured diagnostic) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no pipeline by that name at the ref */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_runs: {
         parameters: {
             query?: {
@@ -373,7 +674,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description gate released */
+            /** @description approval recorded (released or awaiting more approvals) */
             202: {
                 headers: {
                     [name: string]: unknown;

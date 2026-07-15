@@ -2,10 +2,13 @@
 // schema (ADR-0012, 0028). The UI eats the same API as every other client.
 import createClient from "openapi-fetch";
 import type { paths, components } from "./schema";
+import type { ParamSpec } from "../params";
 
 export type RunStatus = components["schemas"]["RunStatusResponse"];
 export type CreateRunRequest = components["schemas"]["CreateRunRequest"];
 export type RunSummary = components["schemas"]["RunSummaryDto"];
+export type CatalogEntry = components["schemas"]["CatalogEntry"];
+export type DispatchKind = components["schemas"]["DispatchKind"];
 
 export const api = createClient<paths>({ baseUrl: "/" });
 
@@ -38,6 +41,108 @@ export async function createRun(req: CreateRunRequest): Promise<string> {
     throw new Error("failed to create run");
   }
   return data.id;
+}
+
+/** A prior run's frozen launch parameters, `name → value` (ADR-0043 §5) — used
+ * to pre-fill a re-run. The generated schema types this opaquely; the values
+ * are plain JSON scalars. Empty when the run took none. */
+export function runParams(run: RunStatus): Record<string, unknown> {
+  return (run.params ?? {}) as Record<string, unknown>;
+}
+
+// --- Run-Pipeline flow (ADR-0043 "World B"): repo → ref → catalog → pipeline →
+// typed params → dispatch. One ref threads through; describe/catalog resolve it
+// to a SHA the dispatch pins to. The UI eats the same endpoints the CLI does
+// (invariant #5) — no client-side CEL, static validation only. ---
+
+export type PipelineCatalog = { sha: string; pipelines: CatalogEntry[] };
+export type PipelineInterface = {
+  sha: string;
+  manual: boolean;
+  api: boolean;
+  inputs: ParamSpec[];
+};
+/** Dispatch outcome: the new run id, or the server's fail-closed 4xx message
+ * (parsed onto the offending field by the caller). No run is created on error. */
+export type DispatchResult =
+  | { ok: true; id: string }
+  | { ok: false; status: number; message: string };
+
+/** The manually-dispatchable catalog at a ref (`GET …/pipelines?ref=`). */
+export async function listPipelines(
+  org: string,
+  repo: string,
+  ref: string,
+): Promise<PipelineCatalog> {
+  const { data, error } = await api.GET("/v1/repos/{org}/{repo}/pipelines", {
+    params: { path: { org, repo }, query: { ref } },
+  });
+  if (error || !data) {
+    throw new Error("failed to list pipelines");
+  }
+  return data as PipelineCatalog;
+}
+
+/** The compiled, typed parameter schema for one pipeline at a ref
+ * (`GET …/pipelines/{name}/interface?ref=`). `inputs` is served opaquely, so we
+ * assert it to the hand-authored `ParamSpec` shape. */
+export async function pipelineInterface(
+  org: string,
+  repo: string,
+  name: string,
+  ref: string,
+): Promise<PipelineInterface> {
+  const { data, error, response } = await api.GET(
+    "/v1/repos/{org}/{repo}/pipelines/{name}/interface",
+    { params: { path: { org, repo, name }, query: { ref } } },
+  );
+  if (error || !data) {
+    throw new Error(
+      response.status === 400
+        ? `pipeline failed to compile: ${errorText(error)}`
+        : response.status === 404
+          ? `no pipeline "${name}" at ${ref}`
+          : "failed to load pipeline interface",
+    );
+  }
+  // `inputs` is served opaquely (`Record<string, never>[]`); reinterpret it as
+  // the hand-authored ParamSpec shape via `unknown`.
+  return data as unknown as PipelineInterface;
+}
+
+/** Dispatch a named pipeline at a ref (`POST …/dispatch`). Returns a result
+ * union rather than throwing, so a fail-closed 4xx maps onto the form. */
+export async function dispatchRun(
+  org: string,
+  repo: string,
+  body: {
+    ref: string;
+    pipeline: string;
+    params: Record<string, unknown>;
+    kind?: DispatchKind;
+  },
+): Promise<DispatchResult> {
+  const { data, error, response } = await api.POST("/v1/repos/{org}/{repo}/dispatch", {
+    params: { path: { org, repo } },
+    // The generated body types `params` opaquely (`Record<string, never>`); our
+    // typed map is the intended JSON payload.
+    body: body as never,
+  });
+  if (data) return { ok: true, id: data.id };
+  return { ok: false, status: response.status, message: errorText(error) };
+}
+
+/** Best-effort extraction of an error body to text. The dispatch/interface 4xx
+ * bodies are plain text; openapi-fetch surfaces them in `error` (string), but a
+ * stray JSON body is stringified rather than dropped. */
+function errorText(error: unknown): string {
+  if (error == null) return "";
+  if (typeof error === "string") return error;
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return String(error);
+  }
 }
 
 // --- Live streams (ADR-0013). Logs live-tail via SSE; the event log is a

@@ -317,6 +317,13 @@ pub struct RunStatusResponse {
     pub id: String,
     pub status: String,
     pub steps: Vec<StepStatusDto>,
+    /// The run's frozen launch parameters, `name → typed value` (ADR-0043 §5).
+    /// A run-level constant resolved once at creation; non-secret by contract
+    /// (§6), so safe to expose. Empty when the run took none. Lets the UI's
+    /// re-run flow pre-fill the form from the prior run's params.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[schema(value_type = Object)]
+    pub params: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// `GET /v1/runs` body: the most recent runs, newest first.
@@ -788,6 +795,7 @@ async fn get_run(
     let run = RunId(id);
     let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
     let steps = st.db.steps_of_run(&run).await?;
+    let params = st.db.run_params(&run).await?;
     Ok(Json(RunStatusResponse {
         id: run.0,
         status: run_status_name(status).to_string(),
@@ -801,6 +809,7 @@ async fn get_run(
                 gate: s.gate_kind,
             })
             .collect(),
+        params,
     }))
 }
 

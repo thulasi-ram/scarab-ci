@@ -5,13 +5,14 @@
 // with the forge + log-source backend slices; this view is built to show them
 // the moment they exist.
 import { createSignal, createEffect, onMount, onCleanup, For, Show } from "solid-js";
-import { A, useParams } from "@solidjs/router";
+import { A, useParams, useNavigate } from "@solidjs/router";
 import {
   getRun,
   fetchEvents,
   streamLogs,
   restartStep,
   isTerminal,
+  runParams,
   type RunStatus,
   type RunEvent,
 } from "../api/client";
@@ -27,6 +28,7 @@ const POLL_MS = 1200;
 
 export default function RunDetail() {
   const params = useParams();
+  const nav = useNavigate();
   const id = () => params.id!;
   const org = () => params.org!;
   const repo = () => params.repo!;
@@ -151,6 +153,17 @@ export default function RunDetail() {
                 title={sel() ? `restart ${sel()} and its descendants` : "select a step"}
               >
                 <Icon icon="rotate-cw" size={13} /> {restarting() ? "restarting…" : "Restart"}
+              </button>
+              <button
+                class="btn btn-ghost btn-sm"
+                onClick={() =>
+                  nav(`/${org()}/${repo()}/run`, {
+                    state: { prefillParams: runParams(r()) },
+                  })
+                }
+                title="re-run this pipeline, pre-filled with these parameters"
+              >
+                <Icon icon="rotate-cw" size={13} /> Re-run
               </button>
               <button class="btn btn-ghost btn-sm" disabled title="cancel lands with scheduler support">
                 Cancel

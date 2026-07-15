@@ -7,7 +7,6 @@ import { createResource, createSignal, createEffect, For, Show } from "solid-js"
 import { useParams, useNavigate } from "@solidjs/router";
 import {
   listRuns,
-  createRun,
   listSecrets,
   putSecret,
   deleteSecret,
@@ -17,7 +16,6 @@ import {
 import {
   enrichProvenance,
   environments,
-  manualInputs,
   TRIGGER_GLYPH,
   type Provenance,
 } from "../data/catalog";
@@ -54,7 +52,6 @@ export default function RepoView() {
   const [statusFilter, setStatusFilter] = createSignal<"all" | "running" | "failed">("all");
   const [branchFilter, setBranchFilter] = createSignal<string>("all");
   const [triggerFilter, setTriggerFilter] = createSignal<Trigger>("all");
-  const [showDialog, setShowDialog] = createSignal(false);
   const [showEnvDialog, setShowEnvDialog] = createSignal(false);
   const [secretFocus, setSecretFocus] = createSignal(0);
 
@@ -75,7 +72,11 @@ export default function RepoView() {
   const cta = () => {
     switch (tab()) {
       case "runs":
-        return { label: "Run pipeline", icon: "play", onClick: () => setShowDialog(true) };
+        return {
+          label: "Run pipeline",
+          icon: "play",
+          onClick: () => nav(`/${org()}/${repo()}/run`),
+        };
       case "environments":
         return { label: "New environment", icon: "plus", onClick: () => setShowEnvDialog(true) };
       case "secrets":
@@ -235,92 +236,10 @@ export default function RepoView() {
         </div>
       </Show>
 
-      <Show when={showDialog()}>
-        <RunDialog
-          repo={repo()}
-          onClose={() => setShowDialog(false)}
-          onRun={async () => {
-            const id = await createRun({
-              pipeline: {
-                ir_version: 1,
-                steps: [
-                  { id: "build", image: "x", command: ["sh", "-c", "echo building; sleep 1"] },
-                  { id: "test", image: "x", command: ["sh", "-c", "echo testing; sleep 1"], needs: ["build"] },
-                ],
-              },
-            });
-            setShowDialog(false);
-            nav(`/${org()}/${repo()}/runs/${id}`);
-          }}
-        />
-      </Show>
-
       <Show when={showEnvDialog()}>
         <EnvDialog repo={repo()} onClose={() => setShowEnvDialog(false)} />
       </Show>
     </section>
-  );
-}
-
-// ---- manual-run dialog ----------------------------------------------------
-
-function RunDialog(props: { repo: string; onClose: () => void; onRun: () => Promise<void> }) {
-  const inputs = manualInputs(props.repo);
-  const [busy, setBusy] = createSignal(false);
-  return (
-    <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal" onClick={(e) => e.stopPropagation()}>
-        <div class="panel-h"><span>Run pipeline</span></div>
-        <div class="modal-body">
-          <div class="form-r">
-            <label>branch / ref</label>
-            <div class="input select-like">main <Icon icon="chevron-down" size={13} /></div>
-          </div>
-          <div class="form-r">
-            <label>pipeline</label>
-            <div class="input select-like">.scarab/ci.yaml <Icon icon="chevron-down" size={13} /></div>
-          </div>
-          <For each={inputs}>
-            {(inp) => (
-              <div class="form-r">
-                <label>{inp.key} · {inp.type}</label>
-                <Show
-                  when={inp.type === "string"}
-                  fallback={
-                    <div class="input select-like">
-                      {String((inp as { default: unknown }).default)} <Icon icon="chevron-down" size={13} />
-                    </div>
-                  }
-                >
-                  <input class="input" placeholder={inp.key} />
-                </Show>
-              </div>
-            )}
-          </For>
-          <div class="modal-actions">
-            <button
-              class="btn btn-primary"
-              disabled={busy()}
-              onClick={async () => {
-                setBusy(true);
-                try {
-                  await props.onRun();
-                } finally {
-                  setBusy(false);
-                }
-              }}
-            >
-              <Icon icon="play" size={14} /> {busy() ? "starting…" : "Run"}
-            </button>
-            <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
-          </div>
-          <p class="subtle modal-note">
-            Runs a representative pipeline against the local executor. Typed inputs bind at
-            trigger time once the inputs backend lands.
-          </p>
-        </div>
-      </div>
-    </div>
   );
 }
 
