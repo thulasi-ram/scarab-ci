@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1784205106,"nonce":"frNOkiZu/V/9SIgqN0VoffBic7Y=","title":"[ADR-0046] ForgeConnection registry: type + store port + Postgres adapter + RepoRef→Project","was":"2ff6e87 (ADR-0046 epic)"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1784205107,"nonce":"mNwiEH0YPqug+WILNaZupJPtBu8=","added":["type:feat","tracer-bullet","ready-for-agent","area:forge","area:server"],"removed":null}]}
