@@ -23,7 +23,13 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ports::{ExecState, FailureClass};
+use crate::ports::{ExecHandle, ExecState, FailureClass};
+
+/// The bounded auto-retry budget for **never-started infra** failures
+/// (ADR-0047): the step's main process never ran, so no side effect is
+/// possible and retrying needs no author assertion. An author's `retry:` can
+/// only widen this, never narrow it.
+const NEVER_STARTED_AUTO_ATTEMPTS: u32 = 3;
 use crate::{
     Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, ExecError,
     Executor, FailureKind, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus,
@@ -551,8 +557,8 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    /// Drain launch intents: launch (idempotently), poll, and finalize any step
-    /// whose Pod has reached a terminal state.
+    /// Drain launch intents: launch (or adopt), poll, and settle any step whose
+    /// execution reached a terminal state — retrying per ADR-0047 policy.
     pub async fn reconcile(&self) -> Result<(), SchedulerError> {
         let msgs = self
             .db
@@ -570,49 +576,64 @@ impl<'a> Scheduler<'a> {
             let step = StepId(intent.step);
             let attempt = AttemptId(intent.attempt);
 
-            let spec = self
-                .db
-                .step_spec(&run, &step)
-                .await?
-                .ok_or_else(|| SchedulerError::MissingSpec(step.clone()))?;
+            // Launch-or-adopt (ADR-0047): the durable handle marker splits the
+            // two. No marker → this attempt never observably launched → launch
+            // (create-or-adopt on the deterministic fence; a crash after launch
+            // but before the marker re-runs this branch, where the fence makes
+            // it an adopt). Marker present → poll only: the backend object
+            // either still exists (re-adoption — same Attempt, same fence,
+            // supervision resumes, NO budget consumed) or is gone, which
+            // surfaces as `Lost` below — never a blind same-fence relaunch,
+            // which would make a zombie and a retry indistinguishable.
+            let handle = match self.db.attempt_handle(&run, &step, &attempt).await? {
+                Some(h) => ExecHandle(h),
+                None => {
+                    let spec = self
+                        .db
+                        .step_spec(&run, &step)
+                        .await?
+                        .ok_or_else(|| SchedulerError::MissingSpec(step.clone()))?;
 
-            // Launch-time interpolation (ADR-0041): resolve `${{ outputs.… }}`
-            // against this step's upstream results before launch. The upstreams
-            // are all `Succeeded` before the step is ready, so their results
-            // exist; a reference to a missing result fails fast — as a *step*
-            // failure (not a scheduler error), so the run settles as Failed.
-            // Deterministic on re-drive: results are re-derived from the store.
-            let spec = match self.interpolate_spec(&run, &step, spec).await? {
-                Ok(spec) => spec,
-                Err(_reason) => {
-                    self.finalize_step(
-                        &run,
-                        &step,
-                        &attempt,
-                        StepStatus::Failed,
-                        Some(FailureKind::Step),
-                    )
-                    .await?;
-                    self.db.mark_dispatched(msg.id).await?;
-                    continue;
+                    // Launch-time interpolation (ADR-0041): resolve
+                    // `${{ outputs.… }}` against upstream results before
+                    // launch. A bad reference fails fast — as a *step* failure
+                    // (not a scheduler error), so the run settles as Failed.
+                    let spec = match self.interpolate_spec(&run, &step, spec).await? {
+                        Ok(spec) => spec,
+                        Err(_reason) => {
+                            self.finalize_step(
+                                &run,
+                                &step,
+                                &attempt,
+                                StepStatus::Failed,
+                                Some(FailureKind::Step),
+                            )
+                            .await?;
+                            self.db.mark_dispatched(msg.id).await?;
+                            continue;
+                        }
+                    };
+
+                    // Reconstruct the fenced StepRun the executor needs.
+                    let step_run = StepRun {
+                        run: run.clone(),
+                        step: step.clone(),
+                        status: StepStatus::Running,
+                        attempts: vec![Attempt {
+                            id: attempt.clone(),
+                            started_at: self.clock.now().await,
+                            failure: None,
+                        }],
+                        needs: Vec::new(),
+                        gate_kind: None,
+                    };
+                    let handle = self.executor.launch(&step_run, &spec).await?;
+                    self.db
+                        .set_attempt_handle(&run, &step, &attempt, &handle.0)
+                        .await?;
+                    handle
                 }
             };
-
-            // Reconstruct the fenced StepRun the executor needs. launch is
-            // idempotent on this fence, so a re-drive re-attaches.
-            let step_run = StepRun {
-                run: run.clone(),
-                step: step.clone(),
-                status: StepStatus::Running,
-                attempts: vec![Attempt {
-                    id: attempt.clone(),
-                    started_at: self.clock.now().await,
-                    failure: None,
-                }],
-                needs: Vec::new(),
-                gate_kind: None,
-            };
-            let handle = self.executor.launch(&step_run, &spec).await?;
 
             match self.executor.poll(&handle).await? {
                 ExecState::Succeeded => {
@@ -633,11 +654,8 @@ impl<'a> Scheduler<'a> {
                     self.db.mark_dispatched(msg.id).await?;
                 }
                 ExecState::Failed { class, .. } => {
-                    // The adapter classified the failure (ADR-0047); record its
-                    // verdict verbatim — the engine never inspects backend
-                    // state. Retry policy over the class (auto for
-                    // never-started infra, `retry:`-gated otherwise) is the
-                    // retry-loop slice's job.
+                    // The adapter classified the failure (ADR-0047); the engine
+                    // consumes the class verbatim and applies retry policy.
                     let kind = match class {
                         FailureClass::Infra { never_started } => {
                             FailureKind::Infra { never_started }
@@ -645,14 +663,21 @@ impl<'a> Scheduler<'a> {
                         FailureClass::Step => FailureKind::Step,
                         FailureClass::Timeout => FailureKind::Timeout,
                     };
-                    self.finalize_step(&run, &step, &attempt, StepStatus::Failed, Some(kind))
+                    self.settle_failed_attempt(&run, &step, &attempt, kind).await?;
+                    self.db.mark_dispatched(msg.id).await?;
+                }
+                // The backend lost a launched execution (ADR-0047): vanished
+                // Pod / dead process. Conservatively post-start — settle it
+                // (assertion-gated retry on a NEW fence, budget consumed).
+                ExecState::Lost => {
+                    self.settle_failed_attempt(&run, &step, &attempt, FailureKind::Lost)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
-                // Not terminal yet (or infra-lost): leave the intent for a later
-                // reconcile. The claim lease expires and the idempotent relaunch
-                // re-attaches; no duplicate effect.
-                ExecState::Pending | ExecState::Running | ExecState::Lost => {}
+                // Not terminal yet: leave the intent claimed; the lease expires
+                // and a later reconcile re-polls (adopting via the stored
+                // handle). No duplicate effect.
+                ExecState::Pending | ExecState::Running => {}
             }
         }
         Ok(())
@@ -884,6 +909,121 @@ impl<'a> Scheduler<'a> {
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Settle a classified attempt failure per ADR-0047 retry policy:
+    ///
+    /// - **Never-started infra** — the process never ran, no side effect is
+    ///   possible: auto-retry within [`NEVER_STARTED_AUTO_ATTEMPTS`], no author
+    ///   assertion needed.
+    /// - **Post-start infra / Step / Timeout / Lost** — a side effect may
+    ///   exist: retry only when the author configured `retry:` (their
+    ///   idempotency assertion). `Lost` explicitly counts against the budget.
+    ///
+    /// Every retry consumes the attempt budget. A retry re-arms the step to
+    /// `Ready`; the next admission claims it and mints a **new Attempt with a
+    /// new monotonic fence** — the zombie-fencing mechanism.
+    async fn settle_failed_attempt(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        kind: FailureKind,
+    ) -> Result<(), SchedulerError> {
+        // Record the classified failure on the attempt row (idempotent).
+        self.db.set_attempt_failure(run, step, attempt, kind).await?;
+
+        // Stale-delivery guard: only the step's LATEST attempt may settle it.
+        // A redelivered intent for an older attempt (whose successor is already
+        // running under a higher fence) must neither re-arm nor fail the step.
+        let attempts = self.db.attempts_of_step(run, step).await?;
+        if attempts.last().map(|a| &a.id) != Some(attempt) {
+            return Ok(());
+        }
+        let used = attempts.len() as u32;
+
+        let configured = self.step_retry(run, step).await?.map(|r| 1 + r.max);
+        let allowed = match kind {
+            FailureKind::Infra { never_started: true } => {
+                configured.unwrap_or(0).max(NEVER_STARTED_AUTO_ATTEMPTS)
+            }
+            _ => configured.unwrap_or(1),
+        };
+
+        if used < allowed {
+            self.rearm_step(run, step, attempt, kind).await
+        } else {
+            self.finalize_step(run, step, attempt, StepStatus::Failed, Some(kind))
+                .await
+        }
+    }
+
+    /// Re-arm a failed step for retry: `Running → Ready`. The next admission
+    /// pass claims it and mints a new Attempt — and therefore a new monotonic
+    /// fence, so a zombie of the failed attempt presents a stale fence and a
+    /// cooperating sink rejects it (ADR-0047). Re-adoption (same fence, no
+    /// budget) is the stored-handle path in [`reconcile`](Self::reconcile),
+    /// never this one.
+    async fn rearm_step(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        kind: FailureKind,
+    ) -> Result<(), SchedulerError> {
+        match self
+            .db
+            .record_step_transition(run, step, StepStatus::Running, StepStatus::Ready)
+            .await
+        {
+            Ok(()) => {
+                let now = self.clock.now().await;
+                self.append(
+                    run,
+                    EventPayload::AttemptFinished {
+                        step: step.clone(),
+                        attempt: attempt.clone(),
+                        failure: Some(kind),
+                    },
+                    now,
+                )
+                .await?;
+                self.append(
+                    run,
+                    EventPayload::StepTransitioned {
+                        step: step.clone(),
+                        from: StepStatus::Running,
+                        to: StepStatus::Ready,
+                    },
+                    now,
+                )
+                .await?;
+                Ok(())
+            }
+            Err(DbError::Conflict) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The step's authored `retry:` policy, read from the run's stored IR (the
+    /// run is self-describing, ADR-0022). Tolerant navigation — an absent IR,
+    /// step, or field (or an unknown shape) means no assertion.
+    async fn step_retry(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<scarab_pipeline::Retry>, SchedulerError> {
+        let Some(ir) = self.db.run_ir(run).await? else {
+            return Ok(None);
+        };
+        Ok(ir
+            .get("steps")
+            .and_then(|s| s.as_array())
+            .into_iter()
+            .flatten()
+            .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(step.0.as_str()))
+            .and_then(|s| s.get("retry"))
+            .and_then(|r| serde_json::from_value(r.clone()).ok()))
     }
 
     async fn finalize_step(

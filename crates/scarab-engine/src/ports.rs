@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Attempt, AttemptId, ConcurrencyPolicy, DbError, EventKind, ExecError, LogChunkMeta, OutboxId,
-    OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, ConcurrencyPolicy, DbError, EventKind, ExecError, FailureKind,
+    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun,
+    StepSpec, StepStatus, Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -326,6 +327,46 @@ pub trait Db: Send + Sync {
         run: &RunId,
         step: &StepId,
         attempt: &Attempt,
+    ) -> Result<(), DbError>;
+
+    /// All attempts of a step, in start order — the retry loop's budget source
+    /// (ADR-0047: every retry consumes the attempt budget).
+    async fn attempts_of_step(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Vec<Attempt>, DbError>;
+
+    /// Record the executor handle an attempt was launched with — the durable
+    /// "launch happened" marker (ADR-0047). Its presence turns a later missing
+    /// backend object into `Lost` (assertion-gated retry on a NEW fence)
+    /// instead of a blind same-fence relaunch, which would make a zombie and a
+    /// retry indistinguishable.
+    async fn set_attempt_handle(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        handle: &str,
+    ) -> Result<(), DbError>;
+
+    /// The stored launch handle of an attempt, or `None` if that attempt was
+    /// never observed launching (crash before the marker → safe to launch:
+    /// the deterministic fence makes it create-or-adopt).
+    async fn attempt_handle(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<String>, DbError>;
+
+    /// Record the classified failure on a finished attempt (ADR-0047).
+    async fn set_attempt_failure(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        failure: FailureKind,
     ) -> Result<(), DbError>;
 
     /// Append one entry to the run's append-only event log.

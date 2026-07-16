@@ -139,6 +139,11 @@ pub enum FailureKind {
     Infra { never_started: bool },
     Step,
     Timeout,
+    /// The backend lost the execution (vanished Pod, node stopped reporting).
+    /// Conservatively post-start — it cannot be proven the process never ran —
+    /// so retry is assertion-gated and **counts against the attempt budget**
+    /// (ADR-0047).
+    Lost,
 }
 
 // ---------------------------------------------------------------------------
@@ -629,10 +634,12 @@ impl StepRun {
                     StepStatus::Failed
                 }
             }
-            // A started process may have side-effected: retry only on the
-            // author's `retry:` assertion (ADR-0047; wired by the retry-loop
-            // slice). Until then a post-start infra failure is terminal.
-            Some(FailureKind::Infra { never_started: false }) => StepStatus::Failed,
+            // A started (or possibly-started, for Lost) process may have
+            // side-effected: retry only on the author's `retry:` assertion —
+            // the scheduler's settle path owns that decision (ADR-0047).
+            Some(FailureKind::Infra { never_started: false } | FailureKind::Lost) => {
+                StepStatus::Failed
+            }
         };
         self.status = to;
         Ok(vec![

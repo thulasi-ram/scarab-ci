@@ -866,6 +866,10 @@
               "type": "string"
             }
           },
+          "retry": {
+            "type": "object",
+            "description": "Opt-in retry policy `{on, max}` (ADR-0047). ⚠ At-least-once: retry\nre-runs the whole step at-least-once; enable only if the step is\nidempotent or fenced against a cooperating sink. Never-started infra\nfailures auto-retry regardless."
+          },
           "secrets": {
             "type": "array",
             "items": {

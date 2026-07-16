@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Lease};
 use scarab_engine::{
     Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, ExecError, Executor,
-    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec,
-    StepStatus, Timestamp,
+    FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId,
+    StepRun, StepSpec, StepStatus, Timestamp,
 };
 use scarab_storage::{ObjectStore, StorageError};
 
@@ -109,6 +109,9 @@ struct InMemoryState {
     outbox: Vec<OutboxEntry>,
     /// Per-(run, step, attempt) log-chunk index (offsets only, no bodies).
     logs: HashMap<(RunId, StepId, AttemptId), Vec<LogChunkMeta>>,
+    /// Per-(run, step, attempt) launch handle — the durable "launch happened"
+    /// marker (ADR-0047).
+    attempt_handles: HashMap<(RunId, StepId, AttemptId), String>,
     /// Per-run concurrency group + policy.
     concurrency: HashMap<RunId, (String, ConcurrencyPolicy)>,
     /// The single slot holder per concurrency group.
@@ -719,6 +722,60 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn attempts_of_step(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .map(|rec| rec.attempts.clone())
+            .unwrap_or_default())
+    }
+
+    async fn set_attempt_handle(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        handle: &str,
+    ) -> Result<(), DbError> {
+        self.state.lock().unwrap().attempt_handles.insert(
+            (run.clone(), step.clone(), attempt.clone()),
+            handle.to_string(),
+        );
+        Ok(())
+    }
+
+    async fn attempt_handle(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .attempt_handles
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .cloned())
+    }
+
+    async fn set_attempt_failure(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        failure: FailureKind,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
+            if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
+                a.failure = Some(failure);
+            }
+        }
+        Ok(())
+    }
+
     async fn record_transition(
         &self,
         run: &RunId,
@@ -768,16 +825,20 @@ impl Db for InMemoryDb {
         _owner: &str,
         kind: Option<&str>,
         limit: u32,
-        _visibility_ms: i64,
+        visibility_ms: i64,
     ) -> Result<Vec<OutboxMessage>, DbError> {
         let mut st = self.state.lock().unwrap();
         let mut out = Vec::new();
+        // A zero (or negative) visibility window models an already-expired
+        // claim lease: the message is immediately reclaimable — how tests
+        // drive crash/restart re-polls of in-flight work (ADR-0047).
+        let reclaimable = visibility_ms <= 0;
         for entry in st.outbox.iter_mut() {
             if out.len() as u32 >= limit {
                 break;
             }
             let kind_ok = kind.is_none_or(|k| entry.msg.kind == k);
-            if !entry.dispatched && !entry.claimed && kind_ok {
+            if !entry.dispatched && (!entry.claimed || reclaimable) && kind_ok {
                 entry.claimed = true;
                 out.push(entry.msg.clone());
             }

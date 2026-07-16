@@ -894,6 +894,71 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn attempts_of_step(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
+        self.attempts(run, step).await
+    }
+
+    async fn set_attempt_handle(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        handle: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE attempts SET handle = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(handle)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn attempt_handle(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<String>, DbError> {
+        let row = sqlx::query(
+            "SELECT handle FROM attempts
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("handle")))
+    }
+
+    async fn set_attempt_failure(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        failure: FailureKind,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE attempts SET failure = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(failure_str(failure))
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn record_transition(
         &self,
         run: &RunId,
@@ -1277,6 +1342,7 @@ fn failure_str(f: FailureKind) -> &'static str {
         FailureKind::Infra { never_started: true } => "infra-never-started",
         FailureKind::Step => "step",
         FailureKind::Timeout => "timeout",
+        FailureKind::Lost => "lost",
     }
 }
 
@@ -1286,6 +1352,7 @@ fn failure_from_str(s: &str) -> Result<FailureKind, DbError> {
         "infra-never-started" => Ok(FailureKind::Infra { never_started: true }),
         "step" => Ok(FailureKind::Step),
         "timeout" => Ok(FailureKind::Timeout),
+        "lost" => Ok(FailureKind::Lost),
         other => Err(DbError::Other(format!("unknown failure kind {other:?}"))),
     }
 }

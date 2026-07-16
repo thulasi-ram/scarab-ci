@@ -225,6 +225,13 @@ pub struct StepDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object)]
     pub security: Option<scarab_pipeline::StepSecurity>,
+    /// Opt-in retry policy `{on, max}` (ADR-0047). ⚠ At-least-once: retry
+    /// re-runs the whole step at-least-once; enable only if the step is
+    /// idempotent or fenced against a cooperating sink. Never-started infra
+    /// failures auto-retry regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub retry: Option<scarab_pipeline::Retry>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -485,6 +492,21 @@ async fn create_run(
     // per-parameter message and creates **no** run.
     let resolved = scarab_pipeline::params::resolve_params(&req.pipeline.interface, &req.params)
         .map_err(|e| ApiError::BadRequest(format!("invalid launch parameters: {e}")))?;
+
+    // Same retry bound the YAML compiler enforces (ADR-0047): a liveness bound,
+    // rejected before any run exists.
+    for step in &req.pipeline.steps {
+        if let Some(retry) = &step.retry {
+            if !(1..=10).contains(&retry.max) {
+                return Err(ApiError::BadRequest(format!(
+                    "step `{}`: `retry.max` must be between 1 and 10 (got {}) — retry re-runs \
+                     the whole step at-least-once; enable only if the step is idempotent or \
+                     fenced against a cooperating sink",
+                    step.id, retry.max
+                )));
+            }
+        }
+    }
 
     let now = st.clock.now().await;
     let run = RunId(Uuid::new_v4().to_string());
