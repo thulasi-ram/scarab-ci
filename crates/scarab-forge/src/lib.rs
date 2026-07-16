@@ -100,14 +100,17 @@ pub enum Event {
     Cron { schedule: String },
     /// A human dispatch of a named pipeline at a repo + ref (ADR-0043 "World B").
     /// Unlike a webhook event, the target is chosen by the launcher, so the event
-    /// carries the `repo` and the dispatch `ref` explicitly — the read-at-ref /
-    /// compile / admission machinery then treats it exactly like any other
-    /// repo-aware trigger. `ref` is the resolved commit the dispatch runs against.
-    Manual { actor: String, repo: Repo, r#ref: String },
+    /// carries the `repo`, the dispatch `ref`, and the resolved commit explicitly —
+    /// the read-at-ref / compile / admission machinery then treats it exactly like
+    /// any other repo-aware trigger. Mirrors [`Push`](Event::Push): `ref` is the
+    /// **symbolic** dispatch ref (e.g. `refs/heads/main`), used for Environment
+    /// `allowed_refs` matching (ADR-0037); `sha` is the **resolved commit** the
+    /// config is read/pinned at (ADR-0032).
+    Manual { actor: String, repo: Repo, r#ref: String, sha: String },
     /// Started programmatically via the REST API (CLI / third party), as opposed
     /// to a human [`Manual`](Event::Manual) trigger. Repo + ref-aware for the same
-    /// reason (ADR-0043).
-    Api { actor: String, repo: Repo, r#ref: String },
+    /// reason (ADR-0043); `ref` is symbolic, `sha` is the resolved commit.
+    Api { actor: String, repo: Repo, r#ref: String, sha: String },
     Upstream { repo: Repo, run: String },
 }
 
@@ -168,6 +171,27 @@ impl Event {
         matches!(self, Event::PullRequest { fork: true, .. })
     }
 
+    /// The symbolic branch/tag ref this event runs on, for Environment
+    /// `allowed_refs` matching (ADR-0037). Distinct from the immutable commit the
+    /// config is read/pinned at (see the server's `config_ref`). `None` when the
+    /// event has no meaningful branch/tag ref (fail-closed at admission: only an
+    /// *empty* `allowed_refs` admits it).
+    pub fn protection_ref(&self) -> Option<String> {
+        match self {
+            Event::Push { r#ref, .. } => Some(r#ref.clone()),
+            Event::Tag { tag, .. } | Event::Release { tag, .. } => {
+                Some(format!("refs/tags/{tag}"))
+            }
+            // A PR's protection ref is its head ref — deliberately NOT a branch
+            // ref, so a PR is denied a branch-scoped Environment unless the env
+            // explicitly opts PRs in via `refs/pull/*` (the intended fail-safe).
+            Event::PullRequest { number, .. } => Some(format!("refs/pull/{number}/head")),
+            // A dispatch carries its symbolic ref explicitly (ADR-0043).
+            Event::Manual { r#ref, .. } | Event::Api { r#ref, .. } => Some(r#ref.clone()),
+            Event::Comment { .. } | Event::Cron { .. } | Event::Upstream { .. } => None,
+        }
+    }
+
     /// The repository this event targets, if any. Only `cron` is truly repo-less;
     /// `manual`/`api` dispatch carry their target repo (ADR-0043).
     pub fn repo(&self) -> Option<&Repo> {
@@ -223,16 +247,19 @@ impl Event {
             Event::Cron { schedule } => {
                 e.insert("schedule".into(), json!(schedule));
             }
-            Event::Manual { actor, r#ref, .. } | Event::Api { actor, r#ref, .. } => {
+            Event::Manual { actor, r#ref, sha, .. }
+            | Event::Api { actor, r#ref, sha, .. } => {
                 e.insert("actor".into(), json!(actor));
-                // The dispatch ref (a resolved commit) — exposed like push's so a
-                // `when:` guard on `manual`/`api` and the self-describing Run both
-                // see it (ADR-0043).
+                // Exposed like push's (ADR-0043): `ref` is the symbolic dispatch
+                // ref, `branch` its short form, and `sha` the resolved commit the
+                // run is pinned to — so a `when:` guard on `manual`/`api`, the
+                // self-describing Run, and commit-status posting all see them.
                 e.insert("ref".into(), json!(r#ref));
                 e.insert(
                     "branch".into(),
                     json!(r#ref.strip_prefix("refs/heads/").unwrap_or(r#ref)),
                 );
+                e.insert("sha".into(), json!(sha));
             }
             Event::Upstream { run, .. } => {
                 e.insert("run".into(), json!(run));
@@ -362,6 +389,7 @@ mod tests {
                     actor: "u".into(),
                     repo: repo(),
                     r#ref: "refs/heads/main".into(),
+                    sha: "deadbeef".into(),
                 },
                 TriggerKind::Manual,
             ),
@@ -370,6 +398,7 @@ mod tests {
                     actor: "bot".into(),
                     repo: repo(),
                     r#ref: "refs/heads/main".into(),
+                    sha: "deadbeef".into(),
                 },
                 TriggerKind::Api,
             ),
@@ -427,11 +456,13 @@ mod tests {
                 actor: "u".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
+                sha: "cafef00d".into(),
             },
             Event::Api {
                 actor: "bot".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
+                sha: "cafef00d".into(),
             },
         ] {
             assert_eq!(event.repo(), Some(&repo()));
@@ -439,6 +470,7 @@ mod tests {
             assert_eq!(ctx["event"]["repo"]["owner"], "acme");
             assert_eq!(ctx["event"]["ref"], "refs/heads/main");
             assert_eq!(ctx["event"]["branch"], "main");
+            assert_eq!(ctx["event"]["sha"], "cafef00d", "resolved commit exposed");
             assert!(ctx["event"]["actor"].is_string(), "actor still exposed");
         }
         assert_eq!(
@@ -449,6 +481,75 @@ mod tests {
             }
             .repo(),
             Some(&repo())
+        );
+    }
+
+    #[test]
+    fn protection_ref_is_the_symbolic_branch_tag_ref_not_the_commit() {
+        // Push/Manual/Api carry the symbolic ref verbatim; the commit lives
+        // elsewhere (Push::after, Manual/Api::sha), never returned here.
+        assert_eq!(
+            Event::Push {
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                after: "deadbeef".into(),
+            }
+            .protection_ref()
+            .as_deref(),
+            Some("refs/heads/main"),
+        );
+        assert_eq!(
+            Event::Manual {
+                actor: "u".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                sha: "deadbeef".into(),
+            }
+            .protection_ref()
+            .as_deref(),
+            Some("refs/heads/main"),
+        );
+        assert_eq!(
+            Event::Api {
+                actor: "bot".into(),
+                repo: repo(),
+                r#ref: "refs/heads/release/1.2".into(),
+                sha: "deadbeef".into(),
+            }
+            .protection_ref()
+            .as_deref(),
+            Some("refs/heads/release/1.2"),
+        );
+        // Tag/Release synthesize a `refs/tags/*` ref.
+        assert_eq!(
+            Event::Tag { repo: repo(), tag: "v1".into() }
+                .protection_ref()
+                .as_deref(),
+            Some("refs/tags/v1"),
+        );
+        assert_eq!(
+            Event::Release { repo: repo(), tag: "v2".into() }
+                .protection_ref()
+                .as_deref(),
+            Some("refs/tags/v2"),
+        );
+        // A PR's protection ref is its pull ref — never a branch ref, so a PR is
+        // fenced out of a branch-scoped Environment (the fail-safe).
+        assert_eq!(
+            Event::PullRequest { repo: repo(), number: 7, head: "cafe".into(), fork: false }
+                .protection_ref()
+                .as_deref(),
+            Some("refs/pull/7/head"),
+        );
+        // Refless events → None (fail-closed: only an empty allowed_refs admits).
+        assert_eq!(Event::Cron { schedule: "@daily".into() }.protection_ref(), None);
+        assert_eq!(
+            Event::Comment { repo: repo(), issue: 1, body: "/deploy".into() }.protection_ref(),
+            None,
+        );
+        assert_eq!(
+            Event::Upstream { repo: repo(), run: "r1".into() }.protection_ref(),
+            None,
         );
     }
 

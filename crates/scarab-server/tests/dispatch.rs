@@ -172,8 +172,9 @@ async fn dispatch_manual_pins_resolved_sha_and_freezes_and_interpolates_params()
     assert_eq!(stored["region"], json!("us-east-1"));
     assert_eq!(stored["replicas"], json!(5), "string '5' coerced to number");
 
-    // The run is pinned to the RESOLVED commit (not the branch ref): the recorded
-    // trigger event carries the resolved sha.
+    // The run is pinned to the RESOLVED commit while carrying the symbolic ref it
+    // was dispatched at (ADR-0037/0043): `sha` is the resolved commit (the pin),
+    // `ref`/`branch` the symbolic dispatch ref.
     let events = db.events(&run).await.unwrap();
     let trigger = events
         .iter()
@@ -183,7 +184,9 @@ async fn dispatch_manual_pins_resolved_sha_and_freezes_and_interpolates_params()
         })
         .expect("a trigger event was recorded");
     assert_eq!(trigger["event"]["kind"], "manual");
-    assert_eq!(trigger["event"]["ref"], "sha-deadbeef", "pinned to the resolved sha");
+    assert_eq!(trigger["event"]["sha"], "sha-deadbeef", "pinned to the resolved sha");
+    assert_eq!(trigger["event"]["ref"], "refs/heads/main", "symbolic dispatch ref");
+    assert_eq!(trigger["event"]["branch"], "main");
     assert_eq!(trigger["event"]["actor"], "alice");
 
     // Drive the one step and confirm the frozen params interpolate into it.
@@ -302,8 +305,9 @@ async fn dispatched_deploy_suspends_on_the_approval_gate() {
     .await
     .expect("dispatch a deploy");
 
-    // The deploy context was recorded so gate-approval-time admission can find
-    // the Environment's rules — pinned to the (resolved) ref.
+    // The deploy context was recorded so gate-approval-time admission can find the
+    // Environment's rules and re-check allowed_refs. `git_ref` is the *symbolic*
+    // ref (ADR-0037), so the gate-approval `admits()` matches the branch pattern.
     let ctx = db.run_deploy_context(&run).await.unwrap().expect("deploy context");
     assert_eq!(ctx.environment, "prod");
     assert_eq!(ctx.git_ref, "refs/heads/main");
@@ -357,6 +361,85 @@ async fn dispatch_ref_disallowed_by_environment_is_rejected_fail_closed() {
     .expect_err("a disallowed ref must be rejected");
     assert!(matches!(err, DispatchError::RefNotAllowed(_)), "{err:?}");
     assert!(db.list_runs(100).await.unwrap().is_empty(), "no run created for a disallowed ref");
+}
+
+// ADR-0037 core regression: allowed_refs is matched against the *symbolic* ref,
+// while the config is read/pinned at the *resolved commit*. Pre-fix, dispatch
+// matched allowed_refs against the resolved SHA, so a legit `refs/heads/main`
+// deploy whose commit was a real SHA was wrongly REJECTED (SHA never matches a
+// branch glob). This test dispatches `main` (canonicalized to `refs/heads/main`)
+// whose commit resolves to a distinct SHA — it must be ADMITTED, and the run must
+// pin to the SHA.
+#[tokio::test]
+async fn dispatch_to_branch_scoped_env_admits_and_pins_the_resolved_sha() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/deploy.yaml", DEPLOY_YAML)
+        // A bare `main` dispatch resolves to a real commit SHA (≠ the branch ref).
+        .with_commit("main", "1234567890abcdef1234567890abcdef12345678");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let envs = Arc::new(FakeEnvironments::default());
+    envs.put_environment(
+        "acme",
+        "web",
+        &Environment { name: "prod".into(), protection: prod_rules(&[], &["refs/heads/main"]) },
+    )
+    .await
+    .unwrap();
+
+    // Bare branch name `main` → canonicalized to refs/heads/main → admitted.
+    let run = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        Some(envs.as_ref()),
+        "bob".into(),
+        repo(),
+        "main".into(),
+        "deploy".into(),
+        std::collections::BTreeMap::new(),
+        DispatchKind::Manual,
+    )
+    .await
+    .expect("a branch-scoped env admits its allowed branch even when the commit is a real SHA");
+
+    // The run is pinned to the RESOLVED commit, not the branch ref.
+    let ctx = db.run_deploy_context(&run).await.unwrap().expect("deploy context");
+    assert_eq!(ctx.git_ref, "refs/heads/main", "protection ref recorded symbolically");
+    let events = db.events(&run).await.unwrap();
+    let trigger = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventPayload::Raw(v) if v.get("trigger").is_some() => Some(v["trigger"].clone()),
+            _ => None,
+        })
+        .expect("a trigger event was recorded");
+    assert_eq!(
+        trigger["event"]["sha"], "1234567890abcdef1234567890abcdef12345678",
+        "run pinned to the resolved commit, not the branch"
+    );
+
+    // A different branch (`feature`) is NOT in allowed_refs → rejected fail-closed.
+    let err = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        Some(envs.as_ref()),
+        "bob".into(),
+        repo(),
+        "feature".into(),
+        "deploy".into(),
+        std::collections::BTreeMap::new(),
+        DispatchKind::Manual,
+    )
+    .await
+    .expect_err("a branch outside allowed_refs is rejected");
+    match err {
+        DispatchError::RefNotAllowed(r) => {
+            assert_eq!(r, "refs/heads/feature", "error reports the symbolic ref, not a SHA");
+        }
+        other => panic!("expected RefNotAllowed, got {other:?}"),
+    }
 }
 
 // --- HTTP endpoint ------------------------------------------------------------

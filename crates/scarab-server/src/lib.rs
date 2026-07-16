@@ -972,9 +972,11 @@ fn config_ref(event: &scarab_forge::Event) -> String {
         Event::Push { after, .. } => after.clone(),
         Event::PullRequest { head, .. } => head.clone(),
         Event::Tag { tag, .. } | Event::Release { tag, .. } => format!("refs/tags/{tag}"),
-        // A manual/api dispatch carries the resolved commit it runs against
-        // (ADR-0043): the config is read — and the Run pinned — at that ref.
-        Event::Manual { r#ref, .. } | Event::Api { r#ref, .. } => r#ref.clone(),
+        // A manual/api dispatch carries the resolved commit it runs against as
+        // `sha` (ADR-0043): the config is read — and the Run pinned — at that
+        // commit, exactly like Push reads at `after`. The symbolic `ref` is used
+        // only for allowed_refs matching (see `Event::protection_ref`).
+        Event::Manual { sha, .. } | Event::Api { sha, .. } => sha.clone(),
         _ => "HEAD".to_string(),
     }
 }
@@ -1124,7 +1126,6 @@ async fn admit_and_create_run(
     let repo = event
         .repo()
         .ok_or_else(|| TriggerError::Pipeline("event carries no repository".into()))?;
-    let git_ref = config_ref(event);
 
     // ADR-0037/0039: fetch the target Environment's protection rules once (a
     // deploy pipeline only). Used both to reject a disallowed ref at creation
@@ -1141,7 +1142,16 @@ async fn admit_and_create_run(
         None
     };
     if let Some(p) = &protection {
-        if !p.ref_allowed(&git_ref) {
+        // ADR-0037: match allowed_refs against the *symbolic* branch/tag ref
+        // (`refs/heads/main`, `refs/tags/*`, …), NOT the immutable commit the
+        // config is read at (`git_ref` above is a SHA for push/dispatch). An event
+        // with no symbolic ref (cron/comment/upstream) is admitted only by an
+        // unrestricted environment — fail-closed.
+        let admitted = match event.protection_ref() {
+            Some(r) => p.ref_allowed(&r),
+            None => p.allowed_refs.is_empty(),
+        };
+        if !admitted {
             return Ok(None);
         }
     }
@@ -1195,13 +1205,20 @@ impl DispatchKind {
         }
     }
 
-    /// Build the repo+ref-aware dispatch event (ADR-0043): the `ref` carried is
-    /// the resolved commit, so read-at-ref, admission, and the self-describing
-    /// Run all pin to it.
-    fn into_event(self, actor: String, repo: scarab_forge::Repo, r#ref: String) -> scarab_forge::Event {
+    /// Build the repo+ref-aware dispatch event (ADR-0043). Mirrors a push: `r#ref`
+    /// is the **symbolic** dispatch ref (canonicalized, used for `allowed_refs`
+    /// matching, ADR-0037), `sha` the **resolved commit** the config is read at and
+    /// the Run pins to.
+    fn into_event(
+        self,
+        actor: String,
+        repo: scarab_forge::Repo,
+        r#ref: String,
+        sha: String,
+    ) -> scarab_forge::Event {
         match self {
-            DispatchKind::Manual => scarab_forge::Event::Manual { actor, repo, r#ref },
-            DispatchKind::Api => scarab_forge::Event::Api { actor, repo, r#ref },
+            DispatchKind::Manual => scarab_forge::Event::Manual { actor, repo, r#ref, sha },
+            DispatchKind::Api => scarab_forge::Event::Api { actor, repo, r#ref, sha },
         }
     }
 }
@@ -1245,6 +1262,29 @@ impl From<TriggerError> for DispatchError {
             TriggerError::NotUtf8 => DispatchError::NotUtf8,
             TriggerError::Db(d) => DispatchError::Db(d),
         }
+    }
+}
+
+/// Canonicalize a user-supplied dispatch ref into a **symbolic** ref for
+/// Environment `allowed_refs` matching (ADR-0037):
+/// - already a fully-qualified ref (`refs/…`) → taken verbatim;
+/// - a 40-char lowercase-hex string (a raw commit SHA) → taken verbatim, so it
+///   won't match a branch glob and is correctly denied from a branch-scoped
+///   Environment;
+/// - anything else → treated as a bare branch name → `refs/heads/<ref>`.
+///
+/// Pure and total; the resolved commit is looked up separately.
+fn canonicalize_ref(r#ref: &str) -> String {
+    let is_raw_sha = r#ref.len() == 40
+        && r#ref
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+    if r#ref.starts_with("refs/") || is_raw_sha {
+        // Already fully-qualified, or an opaque commit that must stay verbatim so
+        // it never matches a branch glob.
+        r#ref.to_string()
+    } else {
+        format!("refs/heads/{}", r#ref)
     }
 }
 
@@ -1334,8 +1374,13 @@ pub async fn dispatch_run(
     // there) — the shared read-at-ref → compile primitive.
     let ir = prefetch_libs_and_compile(forge, &repo, &sha, &yaml).await?;
 
-    // Build the repo+ref-aware event pinned to the resolved commit.
-    let event = kind.into_event(actor, repo, sha);
+    // Build the repo+ref-aware event: the config is read/pinned at the resolved
+    // commit (`sha`), while allowed_refs (ADR-0037) matches the *symbolic* ref the
+    // launcher named, canonicalized to a `refs/...` form. A user who dispatches a
+    // raw SHA gets a SHA-shaped symbolic ref, which correctly won't match a
+    // branch-scoped Environment.
+    let sym = canonicalize_ref(&r#ref);
+    let event = kind.into_event(actor, repo, sym, sha);
     let ctx = event.context();
 
     // Opt-in (ADR-0043 §4): the pipeline is dispatchable only if it declares a
@@ -1379,7 +1424,11 @@ pub async fn dispatch_run(
     .await?
     {
         Some(run) => Ok(run),
-        None => Err(DispatchError::RefNotAllowed(config_ref(&event))),
+        // Report the symbolic ref the launcher named (what allowed_refs is matched
+        // against), not the opaque resolved commit.
+        None => Err(DispatchError::RefNotAllowed(
+            event.protection_ref().unwrap_or_else(|| config_ref(&event)),
+        )),
     }
 }
 
@@ -1448,7 +1497,15 @@ async fn persist_run_from_ir(
                 org: repo.owner.clone(),
                 repo: repo.name.clone(),
                 environment: env_name.clone(),
-                git_ref: config_ref(event),
+                // ADR-0037: persist the *symbolic* ref, because gate-approval-time
+                // admission re-runs `ProtectionRules::admits` (allowed_refs +
+                // approvers) against this value and deployment history records it.
+                // A SHA here would silently break the second allowed_refs check
+                // (the gate would never release under a non-empty allowed_refs).
+                // Refless deploy events fall back to the read ref.
+                git_ref: event
+                    .protection_ref()
+                    .unwrap_or_else(|| config_ref(event)),
                 // A fork PR is locked out of this environment's secrets (ADR-0015)
                 // and — by extension — its governed privilege grants (ADR-0039).
                 locked_out,
@@ -2633,5 +2690,39 @@ mod grant_admission_tests {
         }]);
         let g = admit_step_grants(Some(&p), Some(&sec), IMG, false).unwrap();
         assert!(g.privileged);
+    }
+}
+
+#[cfg(test)]
+mod canonicalize_ref_tests {
+    use super::canonicalize_ref;
+
+    #[test]
+    fn bare_branch_becomes_a_heads_ref() {
+        assert_eq!(canonicalize_ref("main"), "refs/heads/main");
+        // A slashed branch name is still a bare branch (not a `refs/` ref).
+        assert_eq!(canonicalize_ref("release/1.2"), "refs/heads/release/1.2");
+    }
+
+    #[test]
+    fn fully_qualified_ref_is_verbatim() {
+        assert_eq!(canonicalize_ref("refs/heads/main"), "refs/heads/main");
+        assert_eq!(canonicalize_ref("refs/tags/v1"), "refs/tags/v1");
+        assert_eq!(canonicalize_ref("refs/pull/7/head"), "refs/pull/7/head");
+    }
+
+    #[test]
+    fn raw_sha_stays_verbatim_so_it_wont_match_a_branch_glob() {
+        let sha = "0123456789abcdef0123456789abcdef01234567"; // 40 hex chars
+        assert_eq!(canonicalize_ref(sha), sha);
+    }
+
+    #[test]
+    fn uppercase_or_wrong_length_hex_is_treated_as_a_branch() {
+        // 40 chars but uppercase → not a canonical SHA → a branch name.
+        let upper = "0123456789ABCDEF0123456789ABCDEF01234567";
+        assert_eq!(canonicalize_ref(upper), format!("refs/heads/{upper}"));
+        // A short hex-ish name is a branch, not a SHA.
+        assert_eq!(canonicalize_ref("abc123"), "refs/heads/abc123");
     }
 }
