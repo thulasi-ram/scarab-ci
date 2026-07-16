@@ -28,13 +28,16 @@
 //! | `SCARAB_GITHUB_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/github` |
 //! | `SCARAB_GATE_TOKEN_SECRET` | env | enables external-gate release tokens (ADR-0034) |
 //! | `SCARAB_OIDC_ISSUER` | env | enables the OIDC issuer (keyless federation, ADR-0015) |
-//! | `SCARAB_MASTER_KEY` | env (read by `scarab-secrets-postgres`) | base64 32-byte KEK for envelope encryption (ADR-0014) |
+//! | `SCARAB_OIDC_SIGNING_KEY_FILE` | env | PKCS#8 RSA PEM the issuer signs with — **required** when the issuer is enabled (persistent across restarts/replicas) |
+//! | `SCARAB_MASTER_KEY` | env | base64 32-byte KEK for envelope encryption (ADR-0014) — **required** unless `SCARAB_DEV_INSECURE=1` |
+//! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
 //!
 //! Step-runtime env (`SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`/
 //! `SCARAB_RESULTS*`/`SCARAB_PARAM_*`) is injected *into* step containers by
 //! the executors and is not boot configuration; `SCARAB_SERVER`/`SCARAB_TOKEN`
 //! belong to `scarab` (the CLI client).
 
+use base64::Engine;
 use clap::{Parser, ValueEnum};
 
 /// Which slice(s) of Scarab this process should run.
@@ -154,6 +157,17 @@ pub struct ResultsEgressConfig {
     pub sidecar_image: String,
 }
 
+/// OIDC issuer settings (selected by `SCARAB_OIDC_ISSUER`). The signing key is
+/// mandatory: without a persistent key the JWKS changes every boot and cloud
+/// federation silently breaks on restart/replica (ADR-0048).
+#[derive(Debug, Clone)]
+pub struct OidcConfig {
+    /// The public base URL clouds are configured to trust.
+    pub issuer_url: String,
+    /// Path to the PKCS#8 RSA private-key PEM the issuer signs with.
+    pub signing_key_file: String,
+}
+
 /// A validated boot configuration: if a `Config` exists, the process may
 /// legitimately start. Construction is the startup gate (ADR-0048).
 #[derive(Debug, Clone)]
@@ -168,7 +182,14 @@ pub struct Config {
     pub results_egress: Option<ResultsEgressConfig>,
     pub github_webhook_secret: Option<Vec<u8>>,
     pub gate_token_secret: Option<Vec<u8>>,
-    pub oidc_issuer: Option<String>,
+    pub oidc: Option<OidcConfig>,
+    /// The envelope-encryption KEK (`SCARAB_MASTER_KEY`). `None` only under
+    /// `SCARAB_DEV_INSECURE=1` — the composition root generates a loud
+    /// ephemeral key.
+    pub master_key: Option<[u8; 32]>,
+    /// `SCARAB_DEV_INSECURE=1`: the one loud escape hatch, for *security*
+    /// hard-fails only (ADR-0048). Never the silent default.
+    pub dev_insecure: bool,
 }
 
 /// A configuration the process must refuse to start under, with a message
@@ -178,9 +199,49 @@ pub enum ConfigError {
     #[error(
         "SCARAB_DATABASE_URL is not set. Postgres is mandatory for every serving role \
          (ADR-0048) — there is no API-only mode. Start a Postgres (dev: `just up`) and \
-         set SCARAB_DATABASE_URL; only `--emit-openapi` works without a database."
+         set SCARAB_DATABASE_URL; only `--emit-openapi` works without a database. \
+         SCARAB_DEV_INSECURE does NOT relax this."
     )]
     MissingDatabaseUrl,
+
+    #[error(
+        "SCARAB_MASTER_KEY is not set but the secrets store is enabled (ADR-0048). \
+         Without it, secrets would be sealed under a random ephemeral key and become \
+         undecryptable after a restart. Set a base64 32-byte key \
+         (`head -c 32 /dev/urandom | base64`), or set SCARAB_DEV_INSECURE=1 (dev only) \
+         to boot with a loud ephemeral key."
+    )]
+    MissingMasterKey,
+
+    #[error(
+        "SCARAB_MASTER_KEY is set but invalid — want base64 of exactly 32 bytes \
+         (`head -c 32 /dev/urandom | base64`). A malformed key is a misconfiguration, \
+         not an opt-out, so this fails even under SCARAB_DEV_INSECURE=1."
+    )]
+    InvalidMasterKey,
+
+    #[error(
+        "SCARAB_S3_BUCKET is set but SCARAB_S3_ACCESS_KEY / SCARAB_S3_SECRET_KEY are \
+         empty (ADR-0048). Empty credentials would fail at first use, not at boot — \
+         set both, or unset SCARAB_S3_BUCKET to use the local object dir."
+    )]
+    MissingS3Credentials,
+
+    #[error(
+        "SCARAB_OIDC_ISSUER is set but SCARAB_OIDC_SIGNING_KEY_FILE is not (ADR-0048). \
+         Without a persistent signing key the JWKS changes every boot and cloud OIDC \
+         federation silently breaks on restart/replica. Generate one \
+         (`openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048`) and point \
+         SCARAB_OIDC_SIGNING_KEY_FILE at it, or unset SCARAB_OIDC_ISSUER."
+    )]
+    MissingOidcSigningKey,
+
+    #[error(
+        "no authenticator configured (ADR-0048 auth default-deny). A server that can \
+         authenticate no one must not pretend to be up. Wire auth (ADR-0049, not yet \
+         available) or set SCARAB_DEV_INSECURE=1 (dev only — every caller is Owner)."
+    )]
+    NoAuthenticator,
 }
 
 impl Config {
@@ -192,22 +253,69 @@ impl Config {
 
     /// [`resolve`](Self::resolve) with an injectable environment (tests).
     fn resolve_from(cli: &Cli, env: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        // Postgres first: mandatory for every serving role, and deliberately
+        // NOT relaxed by the dev escape hatch (ADR-0048).
         let database_url = cli
             .database_url
             .clone()
             .filter(|u| !u.is_empty())
             .ok_or(ConfigError::MissingDatabaseUrl)?;
 
+        let dev_insecure = matches!(
+            env("SCARAB_DEV_INSECURE").as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("True")
+        );
+
+        // KEK: a *missing* key is downgradable to a loud ephemeral (dev); a
+        // *malformed* key is a misconfiguration and always refuses.
+        let master_key = match env("SCARAB_MASTER_KEY").filter(|v| !v.is_empty()) {
+            Some(b64) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64.trim())
+                    .map_err(|_| ConfigError::InvalidMasterKey)?;
+                let key: [u8; 32] = bytes.try_into().map_err(|_| ConfigError::InvalidMasterKey)?;
+                Some(key)
+            }
+            None if dev_insecure => None,
+            None => return Err(ConfigError::MissingMasterKey),
+        };
+
         let store = match env("SCARAB_S3_BUCKET") {
-            Some(bucket) => StoreConfig::S3(S3Config {
-                bucket,
-                endpoint: env("SCARAB_S3_ENDPOINT").unwrap_or_default(),
-                region: env("SCARAB_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
-                access_key: env("SCARAB_S3_ACCESS_KEY").unwrap_or_default(),
-                secret_key: env("SCARAB_S3_SECRET_KEY").unwrap_or_default(),
-            }),
+            Some(bucket) => {
+                let s3 = S3Config {
+                    bucket,
+                    endpoint: env("SCARAB_S3_ENDPOINT").unwrap_or_default(),
+                    region: env("SCARAB_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
+                    access_key: env("SCARAB_S3_ACCESS_KEY").unwrap_or_default(),
+                    secret_key: env("SCARAB_S3_SECRET_KEY").unwrap_or_default(),
+                };
+                // Enabled-but-unsafe, and not a security downgrade the dev
+                // hatch covers: refuse regardless of SCARAB_DEV_INSECURE.
+                if s3.access_key.is_empty() || s3.secret_key.is_empty() {
+                    return Err(ConfigError::MissingS3Credentials);
+                }
+                StoreConfig::S3(s3)
+            }
             None => StoreConfig::LocalDir(cli.object_dir.clone()),
         };
+
+        let oidc = match env("SCARAB_OIDC_ISSUER").filter(|v| !v.is_empty()) {
+            Some(issuer_url) => Some(OidcConfig {
+                issuer_url,
+                signing_key_file: env("SCARAB_OIDC_SIGNING_KEY_FILE")
+                    .filter(|v| !v.is_empty())
+                    .ok_or(ConfigError::MissingOidcSigningKey)?,
+            }),
+            None => None,
+        };
+
+        // Auth default-deny (ADR-0048): no authenticator exists yet (it lands
+        // with ADR-0049), so a boot that is not explicitly dev-insecure would
+        // be a server that can authenticate no one — refuse. When ADR-0049
+        // wires an authenticator, this check keys off its configuration.
+        if !dev_insecure {
+            return Err(ConfigError::NoAuthenticator);
+        }
 
         let results_egress = env("SCARAB_RESULTS_TOKEN_SECRET").map(|secret| ResultsEgressConfig {
             token_secret: secret.into_bytes(),
@@ -226,8 +334,31 @@ impl Config {
             results_egress,
             github_webhook_secret: env("SCARAB_GITHUB_WEBHOOK_SECRET").map(String::into_bytes),
             gate_token_secret: env("SCARAB_GATE_TOKEN_SECRET").map(String::into_bytes),
-            oidc_issuer: env("SCARAB_OIDC_ISSUER"),
+            oidc,
+            master_key,
+            dev_insecure,
         })
+    }
+
+    /// The loud boot warnings the dev escape hatch trades hard-fails for
+    /// (ADR-0048): insecure is opt-in and screaming, never silent.
+    pub fn boot_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.dev_insecure {
+            warnings.push(
+                "⚠ AUTH DISABLED — no authenticator; ALL callers are treated as Owner \
+                 (SCARAB_DEV_INSECURE=1, dev only)"
+                    .to_string(),
+            );
+            if self.master_key.is_none() {
+                warnings.push(
+                    "⚠ EPHEMERAL SECRET KEY — SCARAB_MASTER_KEY unset; secrets written this \
+                     boot CANNOT be decrypted after a restart (SCARAB_DEV_INSECURE=1, dev only)"
+                        .to_string(),
+                );
+            }
+        }
+        warnings
     }
 
     /// The startup report (ADR-0048): one line per subsystem, enabled/disabled,
@@ -256,14 +387,28 @@ impl Config {
                 self.namespace,
                 if self.role.runs_driver() { "on" } else { "off — role does not drive" },
             ),
-            format!("secrets store: enabled (envelope encryption, ADR-0014)"),
+            format!(
+                "secrets store: enabled (envelope encryption, ADR-0014; KEK {})",
+                if self.master_key.is_some() { "persistent" } else { "EPHEMERAL" },
+            ),
+            format!(
+                "auth: {}",
+                if self.dev_insecure {
+                    "DISABLED — SCARAB_DEV_INSECURE (all callers are Owner)"
+                } else {
+                    "enabled"
+                },
+            ),
             format!("results egress: {} (ADR-0042)", on_off(self.results_egress.is_some())),
             format!("github webhook: {}", on_off(self.github_webhook_secret.is_some())),
             format!("gate release tokens: {}", on_off(self.gate_token_secret.is_some())),
-            format!(
-                "oidc issuer: {}",
-                self.oidc_issuer.as_deref().unwrap_or("disabled"),
-            ),
+            match &self.oidc {
+                Some(o) => format!(
+                    "oidc issuer: {} (signing key: {})",
+                    o.issuer_url, o.signing_key_file,
+                ),
+                None => "oidc issuer: disabled".to_string(),
+            },
         ]
     }
 }
@@ -305,6 +450,25 @@ mod tests {
         None
     }
 
+    /// A valid base64 32-byte master key for tests.
+    fn key_b64() -> String {
+        base64::engine::general_purpose::STANDARD.encode([7u8; 32])
+    }
+
+    /// Env with the security knobs satisfied (master key set, dev flag off →
+    /// still refuses on auth until ADR-0049; use `dev_env` to boot).
+    fn dev_env(extra: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| {
+            if k == "SCARAB_DEV_INSECURE" {
+                return Some("1".to_string());
+            }
+            extra
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
     #[test]
     fn missing_database_url_refuses_to_boot() {
         let err = Config::resolve_from(&cli(None), no_env).unwrap_err();
@@ -322,25 +486,97 @@ mod tests {
     }
 
     #[test]
+    fn dev_insecure_does_not_relax_the_database_requirement() {
+        let err = Config::resolve_from(&cli(None), dev_env(&[])).unwrap_err();
+        assert_eq!(err, ConfigError::MissingDatabaseUrl);
+    }
+
+    #[test]
+    fn missing_master_key_refuses_without_the_dev_flag() {
+        let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), no_env).unwrap_err();
+        assert_eq!(err, ConfigError::MissingMasterKey);
+    }
+
+    #[test]
+    fn missing_master_key_boots_ephemeral_under_dev_insecure_with_loud_warnings() {
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(&[])).unwrap();
+        assert!(cfg.master_key.is_none());
+        let warnings = cfg.boot_warnings().join("\n");
+        assert!(warnings.contains("AUTH DISABLED"), "{warnings}");
+        assert!(warnings.contains("EPHEMERAL SECRET KEY"), "{warnings}");
+    }
+
+    #[test]
+    fn invalid_master_key_refuses_even_under_dev_insecure() {
+        let env = |k: &str| match k {
+            "SCARAB_DEV_INSECURE" => Some("1".to_string()),
+            "SCARAB_MASTER_KEY" => Some("not-base64!!".to_string()),
+            _ => None,
+        };
+        let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
+        assert_eq!(err, ConfigError::InvalidMasterKey);
+
+        // Right length prefix but wrong byte count also refuses.
+        let short = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+        let env = move |k: &str| match k {
+            "SCARAB_DEV_INSECURE" => Some("1".to_string()),
+            "SCARAB_MASTER_KEY" => Some(short.clone()),
+            _ => None,
+        };
+        let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
+        assert_eq!(err, ConfigError::InvalidMasterKey);
+    }
+
+    #[test]
+    fn no_authenticator_and_no_dev_flag_refuses_to_boot() {
+        let k = key_b64();
+        let env = move |key: &str| (key == "SCARAB_MASTER_KEY").then(|| k.clone());
+        let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
+        assert_eq!(err, ConfigError::NoAuthenticator);
+    }
+
+    #[test]
+    fn s3_bucket_with_empty_creds_refuses_even_under_dev_insecure() {
+        let env = dev_env(&[("SCARAB_S3_BUCKET", "scarab-logs")]);
+        let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
+        assert_eq!(err, ConfigError::MissingS3Credentials);
+    }
+
+    #[test]
+    fn oidc_issuer_without_signing_key_refuses() {
+        let env = dev_env(&[("SCARAB_OIDC_ISSUER", "https://scarab.example")]);
+        let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
+        assert_eq!(err, ConfigError::MissingOidcSigningKey);
+
+        let env = dev_env(&[
+            ("SCARAB_OIDC_ISSUER", "https://scarab.example"),
+            ("SCARAB_OIDC_SIGNING_KEY_FILE", "/etc/scarab/oidc.pem"),
+        ]);
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
+        let oidc = cfg.oidc.expect("oidc enabled");
+        assert_eq!(oidc.signing_key_file, "/etc/scarab/oidc.pem");
+    }
+
+    #[test]
     fn defaults_resolve_to_local_store_and_no_optional_features() {
-        let cfg = Config::resolve_from(&cli(Some("postgres://u:pw@localhost/scarab")), no_env)
-            .unwrap();
+        let cfg =
+            Config::resolve_from(&cli(Some("postgres://u:pw@localhost/scarab")), dev_env(&[]))
+                .unwrap();
         assert!(matches!(cfg.store, StoreConfig::LocalDir(ref d) if d == "./.scarab/objects"));
         assert!(cfg.results_egress.is_none());
         assert!(cfg.github_webhook_secret.is_none());
         assert!(cfg.gate_token_secret.is_none());
-        assert!(cfg.oidc_issuer.is_none());
+        assert!(cfg.oidc.is_none());
     }
 
     #[test]
     fn s3_bucket_selects_s3_store() {
-        let env = |k: &str| match k {
-            "SCARAB_S3_BUCKET" => Some("scarab-logs".to_string()),
-            "SCARAB_S3_ENDPOINT" => Some("http://127.0.0.1:9000".to_string()),
-            "SCARAB_S3_ACCESS_KEY" => Some("k".to_string()),
-            "SCARAB_S3_SECRET_KEY" => Some("s".to_string()),
-            _ => None,
-        };
+        let env = dev_env(&[
+            ("SCARAB_S3_BUCKET", "scarab-logs"),
+            ("SCARAB_S3_ENDPOINT", "http://127.0.0.1:9000"),
+            ("SCARAB_S3_ACCESS_KEY", "k"),
+            ("SCARAB_S3_SECRET_KEY", "s"),
+        ]);
         let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
         match cfg.store {
             StoreConfig::S3(s3) => {
@@ -354,9 +590,7 @@ mod tests {
 
     #[test]
     fn results_egress_needs_only_the_token_secret() {
-        let env = |k: &str| {
-            (k == "SCARAB_RESULTS_TOKEN_SECRET").then(|| "hmac".to_string())
-        };
+        let env = dev_env(&[("SCARAB_RESULTS_TOKEN_SECRET", "hmac")]);
         let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
         let egress = cfg.results_egress.expect("egress enabled");
         assert_eq!(egress.token_secret, b"hmac");
@@ -365,10 +599,31 @@ mod tests {
 
     #[test]
     fn startup_report_redacts_the_database_password() {
-        let cfg = Config::resolve_from(&cli(Some("postgres://scarab:hunter2@db:5432/scarab")), no_env)
-            .unwrap();
+        let cfg = Config::resolve_from(
+            &cli(Some("postgres://scarab:hunter2@db:5432/scarab")),
+            dev_env(&[]),
+        )
+        .unwrap();
         let report = cfg.startup_report().join("\n");
         assert!(!report.contains("hunter2"), "{report}");
         assert!(report.contains("postgres://scarab:***@db:5432/scarab"), "{report}");
+        // The insecure posture is visible in the report, not hidden.
+        assert!(report.contains("auth: DISABLED"), "{report}");
+        assert!(report.contains("KEK EPHEMERAL"), "{report}");
+    }
+
+    #[test]
+    fn no_warnings_without_the_dev_flag_path() {
+        // A dev boot with a persistent key still warns about auth, but not KEK.
+        let k = key_b64();
+        let env = move |key: &str| match key {
+            "SCARAB_DEV_INSECURE" => Some("1".to_string()),
+            "SCARAB_MASTER_KEY" => Some(k.clone()),
+            _ => None,
+        };
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
+        let warnings = cfg.boot_warnings().join("\n");
+        assert!(warnings.contains("AUTH DISABLED"), "{warnings}");
+        assert!(!warnings.contains("EPHEMERAL SECRET KEY"), "{warnings}");
     }
 }

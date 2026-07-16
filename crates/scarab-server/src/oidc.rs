@@ -15,7 +15,7 @@ use base64::Engine;
 use jsonwebtoken::{
     decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
 };
-use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,21 @@ impl Rs256Issuer {
         Ok(Self {
             issuer_url: issuer_url.into(),
             keys: vec![generate_key("scarab-key-1")?],
+        })
+    }
+
+    /// Load the signing key from a PKCS#8 RSA private-key PEM — the persistent
+    /// key source (ADR-0048): the JWKS stays stable across restarts and
+    /// replicas, so cloud OIDC trust does not silently break.
+    pub fn from_pem(
+        issuer_url: impl Into<String>,
+        private_pem: &str,
+    ) -> Result<Self, IdentityError> {
+        let private = RsaPrivateKey::from_pkcs8_pem(private_pem)
+            .map_err(|e| IdentityError::Issuance(format!("signing key PEM: {e}")))?;
+        Ok(Self {
+            issuer_url: issuer_url.into(),
+            keys: vec![signing_key("scarab-key-1", private)?],
         })
     }
 
@@ -156,6 +171,10 @@ fn generate_key(kid: &str) -> Result<SigningKey, IdentityError> {
     let mut rng = rand::rngs::OsRng;
     let private = RsaPrivateKey::new(&mut rng, 2048)
         .map_err(|e| IdentityError::Issuance(format!("keygen: {e}")))?;
+    signing_key(kid, private)
+}
+
+fn signing_key(kid: &str, private: RsaPrivateKey) -> Result<SigningKey, IdentityError> {
     let private_pem = private
         .to_pkcs8_pem(LineEnding::LF)
         .map_err(|e| IdentityError::Issuance(format!("pem: {e}")))?
@@ -168,4 +187,55 @@ fn generate_key(kid: &str) -> Result<SigningKey, IdentityError> {
         n: b64.encode(public.n().to_bytes_be()),
         e: b64.encode(public.e().to_bytes_be()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The persistence property ADR-0048 demands: two issuers loaded from the
+    /// same PEM publish the same JWKS, so tokens verify across restarts.
+    #[tokio::test]
+    async fn from_pem_is_stable_across_restarts() {
+        let mut rng = rand::rngs::OsRng;
+        let pem = RsaPrivateKey::new(&mut rng, 2048)
+            .unwrap()
+            .to_pkcs8_pem(LineEnding::LF)
+            .unwrap()
+            .to_string();
+
+        let a = Rs256Issuer::from_pem("https://scarab.example", &pem).unwrap();
+        let b = Rs256Issuer::from_pem("https://scarab.example", &pem).unwrap();
+        assert_eq!(a.jwks(), b.jwks(), "same PEM must publish the same JWKS");
+
+        // A token minted by "boot A" verifies against "boot B"'s JWKS.
+        let token = a
+            .issue(Claims {
+                issuer: "https://scarab.example".into(),
+                subject: "scarab:org/repo:env:prod:ref:refs/heads/main".into(),
+                audience: "sts.example".into(),
+                expires_at: i64::MAX / 2,
+                run_id: "r1".into(),
+                attempt: "a1".into(),
+                event: "push".into(),
+                git_ref: "refs/heads/main".into(),
+                sha: "deadbeef".into(),
+            })
+            .await
+            .unwrap();
+        let jwks = b.jwks();
+        let key = &jwks["keys"][0];
+        verify(
+            &token.0,
+            key["n"].as_str().unwrap(),
+            key["e"].as_str().unwrap(),
+            "sts.example",
+        )
+        .expect("token from a prior boot verifies against the reloaded JWKS");
+    }
+
+    #[test]
+    fn from_pem_rejects_garbage() {
+        assert!(Rs256Issuer::from_pem("https://x", "not a pem").is_err());
+    }
 }

@@ -59,6 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("startup: {line}");
         println!("startup: {line}");
     }
+    // The dev escape hatch trades hard-fails for SCREAMING (ADR-0048): insecure
+    // is opt-in and loud, never silent.
+    for warning in config.boot_warnings() {
+        tracing::warn!("{warning}");
+        eprintln!("{warning}");
+    }
 
     // Config smoke check: validated and reported; exit without side effects.
     if cli.dry_run {
@@ -91,9 +97,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Secrets store (envelope-encrypted, ADR-0014): built up-front — before the
     // driver — so the launch path can resolve and inject env-scoped secrets
-    // (ADR-0037). Master key from SCARAB_MASTER_KEY.
+    // (ADR-0037). The KEK comes from the validated config; its absence is only
+    // possible under SCARAB_DEV_INSECURE, already warned about above.
+    let master_key = config.master_key.unwrap_or_else(|| {
+        let mut key = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
+        key
+    });
     let secrets: Arc<dyn scarab_secrets::SecretProvider> = {
-        let s = scarab_secrets_postgres::PostgresSecrets::connect(&config.database_url).await?;
+        let s =
+            scarab_secrets_postgres::PostgresSecrets::connect(&config.database_url, master_key)
+                .await?;
         s.migrate().await?;
         Arc::new(s)
     };
@@ -183,16 +197,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state = state.with_gate_token_secret(secret);
     }
     // OIDC issuer for keyless federation (ADR-0014): serve JWKS + discovery so a
-    // cloud provider can verify Scarab-minted tokens. The issuer URL is the
-    // public base URL clouds are configured to trust; enabled only when set.
-    if let Some(issuer_url) = config.oidc_issuer.clone() {
-        match scarab_server::oidc::Rs256Issuer::generate(issuer_url) {
-            Ok(issuer) => {
-                state = state.with_oidc(Arc::new(issuer));
-                tracing::info!("OIDC issuer enabled");
-            }
-            Err(e) => tracing::warn!(error = %e, "failed to generate OIDC signing key; issuer disabled"),
-        }
+    // cloud provider can verify Scarab-minted tokens. The signing key is loaded
+    // from the configured PEM — persistent across restarts/replicas — and any
+    // failure here is a boot failure, not a degraded warn (ADR-0048).
+    if let Some(oidc) = &config.oidc {
+        let pem = std::fs::read_to_string(&oidc.signing_key_file).map_err(|e| {
+            format!(
+                "cannot read SCARAB_OIDC_SIGNING_KEY_FILE {}: {e}",
+                oidc.signing_key_file
+            )
+        })?;
+        let issuer = scarab_server::oidc::Rs256Issuer::from_pem(oidc.issuer_url.clone(), &pem)
+            .map_err(|e| format!("invalid OIDC signing key {}: {e}", oidc.signing_key_file))?;
+        state = state.with_oidc(Arc::new(issuer));
+        tracing::info!("OIDC issuer enabled (persistent signing key)");
     }
     let app = router(state);
 

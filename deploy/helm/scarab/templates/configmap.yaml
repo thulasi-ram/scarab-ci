@@ -21,6 +21,9 @@ data:
   {{- with .Values.scarab.oidcIssuer }}
   SCARAB_OIDC_ISSUER: {{ . | quote }}
   {{- end }}
+  {{- if .Values.scarab.devInsecure }}
+  SCARAB_DEV_INSECURE: "1"
+  {{- end }}
   {{- if .Values.secrets.resultsTokenSecret }}
   SCARAB_SIDECAR_IMAGE: {{ .Values.scarab.sidecarImage | quote }}
   SCARAB_RESULTS_API_URL: {{ .Values.scarab.resultsApiUrl | default (printf "http://%s.%s.svc" (include "scarab.fullname" .) .Release.Namespace) | quote }}

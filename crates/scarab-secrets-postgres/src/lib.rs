@@ -4,13 +4,13 @@
 //! Each secret gets a fresh random 256-bit *data key*; the value is sealed with
 //! AES-256-GCM under that data key, and the data key is itself sealed
 //! (AES-256-GCM) under a *master key*. Postgres stores only ciphertext, the
-//! wrapped data key, and the two nonces — never plaintext. The master key comes
-//! from `SCARAB_MASTER_KEY` (base64, 32 bytes) for dev; the provider is
-//! pluggable (a KMS-backed master key later).
+//! wrapped data key, and the two nonces — never plaintext. The master key is
+//! provided explicitly by the composition root (`scarab_server::config` parses
+//! `SCARAB_MASTER_KEY` and gates boot on it, ADR-0048); the provider is
+//! pluggable (a KMS-backed master key later). This adapter never reads env.
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sqlx::{PgPool, Row};
@@ -28,26 +28,15 @@ pub struct PostgresSecrets {
 }
 
 impl PostgresSecrets {
-    /// Wire a pool, taking the master key from `SCARAB_MASTER_KEY` (base64, 32
-    /// bytes). If unset, a random ephemeral key is used (dev only — secrets
-    /// written under it cannot be read after a restart).
-    pub fn with_pool(pool: PgPool) -> Self {
-        Self {
-            pool,
-            master: master_from_env().unwrap_or_else(random_bytes),
-        }
-    }
-
-    /// Connect a fresh pool from `url`, taking the master key from
-    /// `SCARAB_MASTER_KEY` (as [`with_pool`](Self::with_pool)).
-    pub async fn connect(url: &str) -> Result<Self, SecretError> {
+    /// Connect a fresh pool from `url` with an explicit master key.
+    pub async fn connect(url: &str, master: [u8; 32]) -> Result<Self, SecretError> {
         let pool = PgPool::connect(url)
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
-        Ok(Self::with_pool(pool))
+        Ok(Self::with_master(pool, master))
     }
 
-    /// Wire a pool with an explicit master key (tests / a KMS provider).
+    /// Wire a pool with an explicit master key.
     pub fn with_master(pool: PgPool, master: [u8; 32]) -> Self {
         Self { pool, master }
     }
@@ -198,13 +187,4 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
     OsRng.fill_bytes(&mut buf);
     buf
-}
-
-/// The master key from `SCARAB_MASTER_KEY` (base64, exactly 32 bytes).
-fn master_from_env() -> Option<[u8; 32]> {
-    let b64 = std::env::var("SCARAB_MASTER_KEY").ok()?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .ok()?;
-    bytes.try_into().ok()
 }

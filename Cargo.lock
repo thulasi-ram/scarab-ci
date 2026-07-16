@@ -2661,7 +2661,6 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
- "base64",
  "rand 0.8.7",
  "scarab-secrets",
  "sqlx",
