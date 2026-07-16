@@ -2609,10 +2609,14 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "hmac",
+ "jsonwebtoken",
  "reqwest",
+ "rsa",
  "scarab-forge",
+ "serde",
  "serde_json",
  "sha2",
+ "tokio",
 ]
 
 [[package]]

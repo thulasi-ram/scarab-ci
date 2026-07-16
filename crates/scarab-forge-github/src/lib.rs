@@ -154,51 +154,458 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// A GitHub-backed forge. Holds an HTTP client + auth token.
+// ---------------------------------------------------------------------------
+// Installation webhooks → registry sync (pure)
+// ---------------------------------------------------------------------------
+
+/// The registry effect of a GitHub `installation` / `installation_repositories`
+/// webhook (ADR-0046): installing the App **is** registration. The webhook
+/// route applies this to the `ForgeConnectionStore` via
+/// [`apply_installation_sync`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallationSync {
+    /// The GitHub App installation the delivery belongs to.
+    pub installation_id: u64,
+    pub added: Vec<RepoRef>,
+    pub removed: Vec<RepoRef>,
+}
+
+/// Parse an installation-lifecycle delivery into its registry effect. `None`
+/// for deliveries that are not installation events. Pure — unit-testable
+/// without a network.
+pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync> {
+    let p = &delivery.payload;
+    let installation_id = p.pointer("/installation/id").and_then(Value::as_u64)?;
+    let repos_at = |ptr: &str| -> Vec<RepoRef> {
+        p.pointer(ptr)
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        // Installation payloads carry `full_name` ("owner/name").
+                        let full = r.get("full_name").and_then(Value::as_str)?;
+                        let (owner, name) = full.split_once('/')?;
+                        Some(RepoRef {
+                            owner: owner.to_string(),
+                            name: name.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    match delivery.event.as_str() {
+        "installation" => {
+            let action = p.get("action").and_then(Value::as_str).unwrap_or_default();
+            let repos = repos_at("/repositories");
+            match action {
+                "created" | "unsuspend" => Some(InstallationSync {
+                    installation_id,
+                    added: repos,
+                    removed: vec![],
+                }),
+                "deleted" | "suspend" => Some(InstallationSync {
+                    installation_id,
+                    added: vec![],
+                    removed: repos,
+                }),
+                _ => None,
+            }
+        }
+        "installation_repositories" => Some(InstallationSync {
+            installation_id,
+            added: repos_at("/repositories_added"),
+            removed: repos_at("/repositories_removed"),
+        }),
+        _ => None,
+    }
+}
+
+/// Apply a parsed [`InstallationSync`] to the registry (ADR-0046
+/// auto-registration): added repos bind to `(org, repo.name)` under
+/// `connection_id` (Project name = repo name, 1:1 in v1); removed repos
+/// unbind. Idempotent — replayed deliveries re-apply harmlessly.
+pub async fn apply_installation_sync(
+    store: &dyn scarab_forge::ForgeConnectionStore,
+    connection_id: &str,
+    org: &str,
+    sync: &InstallationSync,
+) -> Result<(), scarab_forge::RegistryError> {
+    for repo in &sync.added {
+        store.bind_repo(connection_id, repo, org, &repo.name).await?;
+    }
+    for repo in &sync.removed {
+        store.unbind_repo(connection_id, repo).await?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The GitHub adapter
+// ---------------------------------------------------------------------------
+
+/// How long an App JWT is valid (GitHub max is 10 minutes; stay under it).
+const APP_JWT_TTL_SECS: i64 = 540;
+/// Installation tokens last ~1h; refresh with this much slack remaining.
+const TOKEN_REFRESH_SLACK_SECS: i64 = 300;
+/// The lifetime we advertise on minted checkout credentials (tokens last 1h;
+/// stay conservative rather than parsing the response timestamp).
+const CHECKOUT_CRED_TTL_SECS: i64 = 55 * 60;
+/// Max attempts per request under secondary-rate-limit backoff.
+const MAX_HTTP_ATTEMPTS: u32 = 3;
+/// Cap a server-suggested Retry-After sleep (never wedge the driver).
+const MAX_BACKOFF_SECS: u64 = 60;
+
+/// GitHub App credentials: the App id + its RSA private key (PEM). The
+/// vendor-specific auth *config* ADR-0046 keeps out of the port.
+#[derive(Clone)]
+pub struct GithubApp {
+    pub app_id: String,
+    pub private_key_pem: String,
+}
+
+/// How the adapter authenticates.
+enum Auth {
+    /// A fixed token (PAT / pre-minted installation token) — dev and tests.
+    Token(String),
+    /// App-based: sign a JWT with the App key, exchange it per installation
+    /// for a short-lived access token, cache + refresh (adapter-internal
+    /// state, ADR-0046).
+    App {
+        app: GithubApp,
+        cache: std::sync::Mutex<AppTokenCache>,
+    },
+}
+
+#[derive(Default)]
+struct AppTokenCache {
+    /// `owner/name` → installation id.
+    installations: std::collections::HashMap<String, u64>,
+    /// installation id → (token, unix-secs expiry).
+    tokens: std::collections::HashMap<u64, (String, i64)>,
+}
+
+/// A GitHub-backed [`ForgePort`] over real HTTP. Base URL is configurable —
+/// `https://api.github.com` or a GHES host (ADR-0046).
 pub struct GithubForge {
-    #[allow(dead_code)]
     client: reqwest::Client,
-    #[allow(dead_code)]
-    token: String,
+    base_url: String,
+    auth: Auth,
+}
+
+#[derive(serde::Serialize)]
+struct AppJwtClaims {
+    iat: i64,
+    exp: i64,
+    iss: String,
+}
+
+/// Sign the App JWT GitHub exchanges for installation tokens. `iat` is
+/// backdated 60s against clock drift; `exp` stays under GitHub's 10m cap.
+/// Free-standing so the claim shape unit-tests without a network.
+pub fn sign_app_jwt(app: &GithubApp, now_unix_secs: i64) -> Result<String, ForgeError> {
+    let claims = AppJwtClaims {
+        iat: now_unix_secs - 60,
+        exp: now_unix_secs + APP_JWT_TTL_SECS,
+        iss: app.app_id.clone(),
+    };
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(app.private_key_pem.as_bytes())
+        .map_err(|e| ForgeError::Api(format!("App private key: {e}")))?;
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+        &claims,
+        &key,
+    )
+    .map_err(|e| ForgeError::Api(format!("App JWT: {e}")))
+}
+
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl GithubForge {
-    /// Construct from an auth token; the HTTP client is built eagerly but
-    /// performs no network I/O until first use.
+    /// Construct from a fixed auth token (PAT / pre-minted token) — the dev
+    /// path; the HTTP client performs no network I/O until first use.
     pub fn new(token: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            token: token.into(),
+            base_url: "https://api.github.com".into(),
+            auth: Auth::Token(token.into()),
         }
+    }
+
+    /// Construct with GitHub **App** auth (ADR-0046): JWT → per-installation
+    /// access token, cached and refreshed adapter-internally.
+    pub fn app(app: GithubApp) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url: "https://api.github.com".into(),
+            auth: Auth::App {
+                app,
+                cache: std::sync::Mutex::new(AppTokenCache::default()),
+            },
+        }
+    }
+
+    /// Point at a GHES host (e.g. `https://ghe.example.com/api/v3`).
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into().trim_end_matches('/').to_string();
+        self
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+
+    /// Issue `req` with standard headers + `token`, honoring secondary rate
+    /// limits: on 403/429 with `Retry-After` (or an exhausted rate-limit
+    /// window) back off and retry, bounded by [`MAX_HTTP_ATTEMPTS`].
+    async fn send(
+        &self,
+        build: impl Fn() -> reqwest::RequestBuilder,
+        token: &str,
+    ) -> Result<reqwest::Response, ForgeError> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let resp = build()
+                .header("authorization", format!("Bearer {token}"))
+                .header("accept", "application/vnd.github+json")
+                .header("x-github-api-version", "2022-11-28")
+                .header("user-agent", "scarab")
+                .send()
+                .await
+                .map_err(|e| ForgeError::Api(e.to_string()))?;
+
+            let status = resp.status();
+            let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || (status == reqwest::StatusCode::FORBIDDEN
+                    && resp
+                        .headers()
+                        .get("x-ratelimit-remaining")
+                        .and_then(|v| v.to_str().ok())
+                        == Some("0"))
+                || (status == reqwest::StatusCode::FORBIDDEN
+                    && resp.headers().contains_key("retry-after"));
+            if rate_limited && attempt < MAX_HTTP_ATTEMPTS {
+                let wait = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(2 * attempt as u64)
+                    .min(MAX_BACKOFF_SECS);
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                continue;
+            }
+            return Ok(resp);
+        }
+    }
+
+    /// The token to authenticate a call against `repo` with. Fixed-token mode
+    /// returns it verbatim; App mode resolves the repo's installation (cached)
+    /// and mints/caches an installation access token.
+    async fn auth_token_for(&self, repo: &RepoRef) -> Result<String, ForgeError> {
+        let Auth::App { app, cache } = &self.auth else {
+            let Auth::Token(t) = &self.auth else { unreachable!() };
+            return Ok(t.clone());
+        };
+
+        let key = format!("{}/{}", repo.owner, repo.name);
+        let now = now_unix_secs();
+        // Fast path: a cached, still-fresh installation token.
+        let cached_installation = {
+            let c = cache.lock().unwrap();
+            if let Some(id) = c.installations.get(&key) {
+                if let Some((token, exp)) = c.tokens.get(id) {
+                    if *exp - now > TOKEN_REFRESH_SLACK_SECS {
+                        return Ok(token.clone());
+                    }
+                }
+                Some(*id)
+            } else {
+                None
+            }
+        };
+
+        let jwt = sign_app_jwt(app, now)?;
+        let installation_id = match cached_installation {
+            Some(id) => id,
+            None => {
+                // Which installation serves this repo? (JWT-authenticated.)
+                let url = self.url(&format!("/repos/{}/{}/installation", repo.owner, repo.name));
+                let resp = self.send(|| self.client.get(&url), &jwt).await?;
+                let body: Value = ok_json(resp).await?;
+                let id = body
+                    .get("id")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| ForgeError::Api("installation.id missing".into()))?;
+                cache.lock().unwrap().installations.insert(key.clone(), id);
+                id
+            }
+        };
+
+        // Exchange the JWT for an installation access token (~1h).
+        let url = self.url(&format!("/app/installations/{installation_id}/access_tokens"));
+        let resp = self.send(|| self.client.post(&url), &jwt).await?;
+        let body: Value = ok_json(resp).await?;
+        let token = body
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ForgeError::Api("access_tokens.token missing".into()))?
+            .to_string();
+        cache
+            .lock()
+            .unwrap()
+            .tokens
+            .insert(installation_id, (token.clone(), now + 3600));
+        Ok(token)
+    }
+
+    /// GET `path` following `Link: rel="next"` pagination, concatenating JSON
+    /// array pages.
+    async fn get_paginated(&self, path: &str, token: &str) -> Result<Vec<Value>, ForgeError> {
+        let mut out = Vec::new();
+        let mut next = Some(format!(
+            "{}{}{}per_page=100",
+            self.base_url,
+            path,
+            if path.contains('?') { "&" } else { "?" }
+        ));
+        while let Some(url) = next.take() {
+            let resp = self.send(|| self.client.get(&url), token).await?;
+            next = next_link(resp.headers());
+            let page: Value = ok_json(resp).await?;
+            match page {
+                Value::Array(items) => out.extend(items),
+                other => {
+                    // A non-array page (single object) means the path is not a
+                    // collection — hand it back as one item.
+                    out.push(other);
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Extract the `rel="next"` URL from a `Link` header, if any.
+fn next_link(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    link.split(',').find_map(|part| {
+        let (url, rel) = part.split_once(';')?;
+        rel.contains("rel=\"next\"")
+            .then(|| url.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+    })
+}
+
+/// Fail non-2xx with the response body in the error; parse JSON otherwise.
+async fn ok_json(resp: reqwest::Response) -> Result<Value, ForgeError> {
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| ForgeError::Api(e.to_string()))?;
+    if !status.is_success() {
+        return Err(ForgeError::Api(format!("{status}: {text}")));
+    }
+    serde_json::from_str(&text).map_err(|e| ForgeError::Api(format!("bad JSON: {e}")))
+}
+
+/// Map GitHub's collaborator permission token to the agnostic flags.
+fn permissions_from_str(p: &str) -> Permissions {
+    match p {
+        "admin" => Permissions { read: true, write: true, admin: true },
+        "write" | "maintain" => Permissions { read: true, write: true, admin: false },
+        "read" | "triage" => Permissions { read: true, write: false, admin: false },
+        _ => Permissions { read: false, write: false, admin: false },
     }
 }
 
 #[async_trait]
 impl ForgePort for GithubForge {
-    async fn latest_commit(&self, _repo: &RepoRef, _ref: &str) -> Result<Commit, ForgeError> {
-        unimplemented!("GithubForge::latest_commit")
+    async fn latest_commit(&self, repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError> {
+        let token = self.auth_token_for(repo).await?;
+        let url = self.url(&format!("/repos/{}/{}/commits/{}", repo.owner, repo.name, r#ref));
+        let resp = self.send(|| self.client.get(&url), &token).await?;
+        let body = ok_json(resp).await?;
+        Ok(Commit {
+            sha: body
+                .get("sha")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ForgeError::Api("commit.sha missing".into()))?
+                .to_string(),
+            message: body
+                .pointer("/commit/message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        })
     }
 
     async fn read_file_at_ref(
         &self,
-        _repo: &RepoRef,
-        _ref: &str,
-        _path: &str,
+        repo: &RepoRef,
+        r#ref: &str,
+        path: &str,
     ) -> Result<Vec<u8>, ForgeError> {
-        unimplemented!("GithubForge::read_file_at_ref")
+        let token = self.auth_token_for(repo).await?;
+        let url = self.url(&format!(
+            "/repos/{}/{}/contents/{path}?ref={ref}",
+            repo.owner,
+            repo.name,
+            r#ref = r#ref
+        ));
+        // The raw media type returns file bytes directly (no base64 dance).
+        let resp = self
+            .send(
+                || self.client.get(&url).header("accept", "application/vnd.github.raw+json"),
+                &token,
+            )
+            .await?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|e| ForgeError::Api(e.to_string()))?;
+        if !status.is_success() {
+            return Err(ForgeError::Api(format!(
+                "{status}: {}",
+                String::from_utf8_lossy(&bytes)
+            )));
+        }
+        Ok(bytes.to_vec())
     }
 
     async fn list_dir_at_ref(
         &self,
-        _repo: &RepoRef,
-        _ref: &str,
-        _dir: &str,
+        repo: &RepoRef,
+        r#ref: &str,
+        dir: &str,
     ) -> Result<Vec<String>, ForgeError> {
-        unimplemented!("GithubForge::list_dir_at_ref")
+        let token = self.auth_token_for(repo).await?;
+        let path = format!(
+            "/repos/{}/{}/contents/{dir}?ref={ref}",
+            repo.owner,
+            repo.name,
+            r#ref = r#ref
+        );
+        let entries = match self.get_paginated(&path, &token).await {
+            Ok(entries) => entries,
+            // An absent directory yields an empty list by contract.
+            Err(ForgeError::Api(msg)) if msg.starts_with("404") => return Ok(vec![]),
+            Err(e) => return Err(e),
+        };
+        Ok(entries
+            .iter()
+            .filter_map(|e| e.get("path").and_then(Value::as_str).map(str::to_string))
+            .collect())
     }
 
+    /// A no-op by design (ADR-0046): the GitHub App receives every
+    /// installation event through its single App webhook — installing the App
+    /// *is* webhook registration. Kept in the port because Forgejo needs it
+    /// for real.
     async fn register_webhook(&self, _repo: &RepoRef, _callback_url: &str) -> Result<(), ForgeError> {
-        unimplemented!("GithubForge::register_webhook")
+        Ok(())
     }
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError> {
@@ -207,31 +614,127 @@ impl ForgePort for GithubForge {
 
     async fn set_status(
         &self,
-        _repo: &RepoRef,
-        _commit: &Commit,
-        _status: Status,
+        repo: &RepoRef,
+        commit: &Commit,
+        status: Status,
     ) -> Result<(), ForgeError> {
-        unimplemented!("GithubForge::set_status")
+        let token = self.auth_token_for(repo).await?;
+        let url = self.url(&format!("/repos/{}/{}/statuses/{}", repo.owner, repo.name, commit.sha));
+        let body = serde_json::json!({
+            "state": status.state.as_wire(),
+            "context": status.context,
+            "target_url": status.target_url,
+        });
+        let resp = self.send(|| self.client.post(&url).json(&body), &token).await?;
+        ok_json(resp).await.map(|_| ())
     }
 
-    async fn create_deployment(&self, _repo: &RepoRef, _environment: &str) -> Result<(), ForgeError> {
-        unimplemented!("GithubForge::create_deployment")
+    async fn create_deployment(&self, repo: &RepoRef, environment: &str) -> Result<(), ForgeError> {
+        let token = self.auth_token_for(repo).await?;
+        // A deployment needs a ref; use the repo's default branch.
+        let url = self.url(&format!("/repos/{}/{}", repo.owner, repo.name));
+        let resp = self.send(|| self.client.get(&url), &token).await?;
+        let default_branch = ok_json(resp)
+            .await?
+            .get("default_branch")
+            .and_then(Value::as_str)
+            .unwrap_or("main")
+            .to_string();
+
+        let url = self.url(&format!("/repos/{}/{}/deployments", repo.owner, repo.name));
+        let body = serde_json::json!({
+            "ref": default_branch,
+            "environment": environment,
+            "auto_merge": false,
+            "required_contexts": [],
+        });
+        let resp = self.send(|| self.client.post(&url).json(&body), &token).await?;
+        ok_json(resp).await.map(|_| ())
     }
 
-    async fn post_comment(&self, _repo: &RepoRef, _issue: u64, _body: &str) -> Result<(), ForgeError> {
-        unimplemented!("GithubForge::post_comment")
+    async fn post_comment(&self, repo: &RepoRef, issue: u64, body: &str) -> Result<(), ForgeError> {
+        let token = self.auth_token_for(repo).await?;
+        let url = self.url(&format!(
+            "/repos/{}/{}/issues/{issue}/comments",
+            repo.owner, repo.name
+        ));
+        let payload = serde_json::json!({ "body": body });
+        let resp = self.send(|| self.client.post(&url).json(&payload), &token).await?;
+        ok_json(resp).await.map(|_| ())
     }
 
-    async fn get_permissions(&self, _repo: &RepoRef, _user: &str) -> Result<Permissions, ForgeError> {
-        unimplemented!("GithubForge::get_permissions")
+    async fn get_permissions(&self, repo: &RepoRef, user: &str) -> Result<Permissions, ForgeError> {
+        let token = self.auth_token_for(repo).await?;
+        let url = self.url(&format!(
+            "/repos/{}/{}/collaborators/{user}/permission",
+            repo.owner, repo.name
+        ));
+        let resp = self.send(|| self.client.get(&url), &token).await?;
+        let body = ok_json(resp).await?;
+        Ok(permissions_from_str(
+            body.get("permission").and_then(Value::as_str).unwrap_or("none"),
+        ))
     }
 
+    /// App mode: mint a fresh installation token **downscoped** to this one
+    /// repository with `contents: read` (or `write` when `read_only` is
+    /// false) — the ADR-0045 clone credential. Fixed-token mode hands back
+    /// the configured token (dev only: a PAT cannot be downscoped, so
+    /// `read_only` is advisory there).
     async fn mint_checkout_credential(
         &self,
-        _repo: &RepoRef,
-        _read_only: bool,
+        repo: &RepoRef,
+        read_only: bool,
     ) -> Result<CheckoutCredential, ForgeError> {
-        unimplemented!("GithubForge::mint_checkout_credential")
+        let now = now_unix_secs();
+        let token = match &self.auth {
+            Auth::Token(t) => t.clone(),
+            Auth::App { app, cache } => {
+                let jwt = sign_app_jwt(app, now)?;
+                // Resolve the installation (reuses the cached mapping).
+                let installation_id = {
+                    let cached = cache
+                        .lock()
+                        .unwrap()
+                        .installations
+                        .get(&format!("{}/{}", repo.owner, repo.name))
+                        .copied();
+                    match cached {
+                        Some(id) => id,
+                        None => {
+                            let url = self.url(&format!(
+                                "/repos/{}/{}/installation",
+                                repo.owner, repo.name
+                            ));
+                            let resp = self.send(|| self.client.get(&url), &jwt).await?;
+                            let body = ok_json(resp).await?;
+                            body.get("id")
+                                .and_then(Value::as_u64)
+                                .ok_or_else(|| ForgeError::Api("installation.id missing".into()))?
+                        }
+                    }
+                };
+                let url =
+                    self.url(&format!("/app/installations/{installation_id}/access_tokens"));
+                let body = serde_json::json!({
+                    "repositories": [repo.name],
+                    "permissions": { "contents": if read_only { "read" } else { "write" } },
+                });
+                let resp = self.send(|| self.client.post(&url).json(&body), &jwt).await?;
+                ok_json(resp)
+                    .await?
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ForgeError::Api("access_tokens.token missing".into()))?
+                    .to_string()
+            }
+        };
+        Ok(CheckoutCredential {
+            username: "x-access-token".into(),
+            token,
+            expires_at: (now + CHECKOUT_CRED_TTL_SECS) * 1000,
+            read_only,
+        })
     }
 }
 
@@ -321,6 +824,135 @@ mod tests {
         });
         let event = normalize(&delivery("pull_request", fork)).unwrap();
         assert!(event.is_fork_pr(), "head repo != base → fork");
+    }
+
+    #[test]
+    fn app_jwt_carries_the_documented_claims() {
+        use rsa::pkcs8::EncodePrivateKey;
+        // A throwaway RSA key: sign with the private half, verify with the public.
+        let mut rng = rsa::rand_core::OsRng;
+        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pem = private
+            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let app = GithubApp {
+            app_id: "12345".into(),
+            private_key_pem: pem,
+        };
+
+        let now = 1_700_000_000;
+        let jwt = sign_app_jwt(&app, now).expect("signs");
+
+        use rsa::pkcs1::EncodeRsaPublicKey;
+        let public_pem = rsa::RsaPublicKey::from(&private)
+            .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap();
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.set_required_spec_claims(&["exp", "iss"]);
+        validation.set_issuer(&["12345"]);
+        validation.validate_exp = false; // fixed historical `now`
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(
+            &jwt,
+            &jsonwebtoken::DecodingKey::from_rsa_pem(public_pem.as_bytes()).unwrap(),
+            &validation,
+        )
+        .expect("verifies with the public key");
+        // iat backdated 60s against drift; exp under GitHub's 10-minute cap.
+        assert_eq!(decoded.claims["iat"], now - 60);
+        assert_eq!(decoded.claims["exp"], now + 540);
+        assert_eq!(decoded.claims["iss"], "12345");
+    }
+
+    #[test]
+    fn installation_webhooks_parse_to_registry_sync() {
+        // App installed with two repos.
+        let created = delivery(
+            "installation",
+            json!({
+                "action": "created",
+                "installation": { "id": 77 },
+                "repositories": [
+                    { "full_name": "acme/web" },
+                    { "full_name": "acme/api" },
+                ]
+            }),
+        );
+        assert_eq!(
+            installation_sync(&created).unwrap(),
+            InstallationSync {
+                installation_id: 77,
+                added: vec![
+                    RepoRef { owner: "acme".into(), name: "web".into() },
+                    RepoRef { owner: "acme".into(), name: "api".into() },
+                ],
+                removed: vec![],
+            }
+        );
+
+        // Repos added/removed after installation.
+        let delta = delivery(
+            "installation_repositories",
+            json!({
+                "action": "added",
+                "installation": { "id": 77 },
+                "repositories_added": [{ "full_name": "acme/new" }],
+                "repositories_removed": [{ "full_name": "acme/api" }]
+            }),
+        );
+        let sync = installation_sync(&delta).unwrap();
+        assert_eq!(sync.added, vec![RepoRef { owner: "acme".into(), name: "new".into() }]);
+        assert_eq!(sync.removed, vec![RepoRef { owner: "acme".into(), name: "api".into() }]);
+
+        // Uninstall removes its repos.
+        let deleted = delivery(
+            "installation",
+            json!({
+                "action": "deleted",
+                "installation": { "id": 77 },
+                "repositories": [{ "full_name": "acme/web" }]
+            }),
+        );
+        let sync = installation_sync(&deleted).unwrap();
+        assert!(sync.added.is_empty());
+        assert_eq!(sync.removed.len(), 1);
+
+        // Non-installation deliveries are not registry events.
+        assert!(installation_sync(&delivery("push", json!({}))).is_none());
+    }
+
+    #[test]
+    fn permission_tokens_map_to_agnostic_flags() {
+        assert!(permissions_from_str("admin").admin);
+        let w = permissions_from_str("write");
+        assert!(w.read && w.write && !w.admin);
+        let r = permissions_from_str("read");
+        assert!(r.read && !r.write);
+        let none = permissions_from_str("none");
+        assert!(!none.read && !none.write && !none.admin);
+    }
+
+    #[test]
+    fn link_header_pagination_finds_next() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::LINK,
+            "<https://api.github.com/x?page=2>; rel=\"next\", <https://api.github.com/x?page=9>; rel=\"last\""
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            next_link(&headers).as_deref(),
+            Some("https://api.github.com/x?page=2")
+        );
+        // Last page: no rel="next".
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::LINK,
+            "<https://api.github.com/x?page=1>; rel=\"prev\"".parse().unwrap(),
+        );
+        assert_eq!(next_link(&headers), None);
+        assert_eq!(next_link(&reqwest::header::HeaderMap::new()), None);
     }
 
     #[test]
