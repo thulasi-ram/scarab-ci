@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1784205107,"nonce":"NZzrY3XNI7Ja6boaBRBI10ScvlI=","title":"[ADR-0046] Multi-forge webhook routing (per-forge endpoints) + delivery-id dedup","was":"2ff6e87 (ADR-0046 epic)"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1784205108,"nonce":"eSyfqYyGftAo/YPURNgjFqSAhfM=","added":["type:feat","tracer-bullet","ready-for-agent","area:server"],"removed":null}]}
