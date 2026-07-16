@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1784207838,"nonce":"JX+U2HTleEjWmi/meUu4/jp6/IQ=","title":"[ADR-0047] Engine retry loop: never-started auto vs assertion-gated; new-fence-per-retry vs re-adopt","was":"aa6d0b7 (ADR-0047 epic)"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1784207840,"nonce":"wzXdVnP16h9YAvwk9RonZwIIUGc=","added":["type:feat","tracer-bullet","ready-for-agent","area:engine"],"removed":null}]}
