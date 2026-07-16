@@ -34,6 +34,7 @@ use scarab_engine::{
 };
 use scarab_identity::{Action, Principal, Session};
 
+pub mod config;
 pub mod converged;
 pub mod log_tail;
 pub mod logs;

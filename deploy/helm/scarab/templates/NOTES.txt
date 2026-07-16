@@ -7,9 +7,9 @@ scarab-server is deployed as release "{{ .Release.Name }}" in namespace "{{ .Rel
 {{- if not .Values.secrets.existingSecret }}
 {{- if not .Values.secrets.databaseUrl }}
 
-  ⚠  No SCARAB_DATABASE_URL is set — scarab-server runs API-only (no durable
-     scheduler/executor driver). Set secrets.databaseUrl (or secrets.existingSecret)
-     to enable durable execution.
+  ⚠  No SCARAB_DATABASE_URL is set — scarab-server will REFUSE TO START
+     (ADR-0048: Postgres is mandatory; there is no API-only mode). Set
+     secrets.databaseUrl (or secrets.existingSecret) before the Pod can boot.
 {{- end }}
 {{- end }}
 

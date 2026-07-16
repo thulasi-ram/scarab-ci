@@ -18,29 +18,22 @@ use sqlx::{PgPool, Row};
 use async_trait::async_trait;
 use scarab_secrets::{Secret, SecretError, SecretProvider, SecretScope};
 
-/// A Postgres-backed, envelope-encrypting secret provider.
+/// A Postgres-backed, envelope-encrypting secret provider. Always connected:
+/// Postgres is mandatory (ADR-0048) — the unconnected construction was
+/// deleted, not guarded.
 pub struct PostgresSecrets {
-    pool: Option<PgPool>,
+    pool: PgPool,
     /// The 256-bit master key that wraps each secret's data key.
     master: [u8; 32],
 }
 
 impl PostgresSecrets {
-    /// No backend wired (unusable until [`with_pool`](Self::with_pool)); the
-    /// master key is a throwaway.
-    pub fn new() -> Self {
-        Self {
-            pool: None,
-            master: random_bytes(),
-        }
-    }
-
     /// Wire a pool, taking the master key from `SCARAB_MASTER_KEY` (base64, 32
     /// bytes). If unset, a random ephemeral key is used (dev only — secrets
     /// written under it cannot be read after a restart).
     pub fn with_pool(pool: PgPool) -> Self {
         Self {
-            pool: Some(pool),
+            pool,
             master: master_from_env().unwrap_or_else(random_bytes),
         }
     }
@@ -56,10 +49,7 @@ impl PostgresSecrets {
 
     /// Wire a pool with an explicit master key (tests / a KMS provider).
     pub fn with_master(pool: PgPool, master: [u8; 32]) -> Self {
-        Self {
-            pool: Some(pool),
-            master,
-        }
+        Self { pool, master }
     }
 
     /// Ensure the `secrets` table exists. Idempotent (CREATE IF NOT EXISTS) so it
@@ -77,22 +67,14 @@ impl PostgresSecrets {
                 PRIMARY KEY (scope, key)
             )",
         )
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(())
     }
 
-    fn pool(&self) -> Result<&PgPool, SecretError> {
-        self.pool
-            .as_ref()
-            .ok_or_else(|| SecretError::Backend("no database pool wired".into()))
-    }
-}
-
-impl Default for PostgresSecrets {
-    fn default() -> Self {
-        Self::new()
+    fn pool(&self) -> &PgPool {
+        &self.pool
     }
 }
 
@@ -105,7 +87,7 @@ impl SecretProvider for PostgresSecrets {
         )
         .bind(scope_key(scope))
         .bind(key)
-        .fetch_optional(self.pool()?)
+        .fetch_optional(self.pool())
         .await
         .map_err(|e| SecretError::Backend(e.to_string()))?
         .ok_or(SecretError::NotFound)?;
@@ -151,7 +133,7 @@ impl SecretProvider for PostgresSecrets {
         .bind(value_nonce)
         .bind(wrapped_key)
         .bind(key_nonce)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(())
@@ -160,7 +142,7 @@ impl SecretProvider for PostgresSecrets {
     async fn list_scoped(&self, scope: &SecretScope) -> Result<Vec<String>, SecretError> {
         let rows = sqlx::query("SELECT key FROM secrets WHERE scope = $1 ORDER BY key")
             .bind(scope_key(scope))
-            .fetch_all(self.pool()?)
+            .fetch_all(self.pool())
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(rows.into_iter().map(|r| r.get::<String, _>("key")).collect())
@@ -170,7 +152,7 @@ impl SecretProvider for PostgresSecrets {
         sqlx::query("DELETE FROM secrets WHERE scope = $1 AND key = $2")
             .bind(scope_key(scope))
             .bind(key)
-            .execute(self.pool()?)
+            .execute(self.pool())
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(())

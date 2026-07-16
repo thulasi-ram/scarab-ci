@@ -31,21 +31,17 @@ use scarab_projects::{Deployment, Environment, EnvironmentStore, ProjectError};
 /// `MIGRATOR.iter()` to apply schema versions one at a time.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
-/// A Postgres-backed [`Db`]. Holds an optional connection pool so the
-/// composition root can construct it without performing I/O.
+/// A Postgres-backed [`Db`]. Always connected: Postgres is mandatory for
+/// every serving role (ADR-0048) — the unconnected/API-only construction was
+/// deleted, not guarded.
 pub struct PostgresDb {
-    pool: Option<PgPool>,
+    pool: PgPool,
 }
 
 impl PostgresDb {
-    /// Construct without connecting (pool wired later).
-    pub fn new() -> Self {
-        Self { pool: None }
-    }
-
     /// Construct from an existing connection pool.
     pub fn with_pool(pool: PgPool) -> Self {
-        Self { pool: Some(pool) }
+        Self { pool }
     }
 
     /// Connect a pool to `url`.
@@ -56,11 +52,11 @@ impl PostgresDb {
 
     /// Apply all pending migrations (the production expand-contract path).
     pub async fn migrate(&self) -> Result<(), DbError> {
-        MIGRATOR.run(self.pool()?).await.map_err(|e| DbError::Other(e.to_string()))
+        MIGRATOR.run(self.pool()).await.map_err(|e| DbError::Other(e.to_string()))
     }
 
-    fn pool(&self) -> Result<&PgPool, DbError> {
-        self.pool.as_ref().ok_or(DbError::Unavailable)
+    fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     // --- read helpers ------------------------------------------------------
@@ -70,7 +66,7 @@ impl PostgresDb {
         let row = sqlx::query("SELECT status FROM step_runs WHERE run_id = $1 AND step_id = $2")
             .bind(&run.0)
             .bind(&step.0)
-            .fetch_optional(self.pool()?)
+            .fetch_optional(self.pool())
             .await
             .map_err(db_err)?;
         row.map(|r| step_status_from_str(r.get::<String, _>("status")))
@@ -85,7 +81,7 @@ impl PostgresDb {
         )
         .bind(&run.0)
         .bind(&step.0)
-        .fetch_all(self.pool()?)
+        .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
         rows.into_iter()
@@ -109,16 +105,10 @@ impl PostgresDb {
             "SELECT kind FROM outbox WHERE run_id = $1 AND dispatched_at IS NULL ORDER BY id",
         )
         .bind(&run.0)
-        .fetch_all(self.pool()?)
+        .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
         Ok(rows.into_iter().map(|r| r.get::<String, _>("kind")).collect())
-    }
-}
-
-impl Default for PostgresDb {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -144,7 +134,7 @@ impl Db for PostgresDb {
              RETURNING run_id, step_id, status, needs, gate_kind",
         )
         .bind(limit as i64)
-        .fetch_all(self.pool()?)
+        .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
 
@@ -184,7 +174,7 @@ impl Db for PostgresDb {
         .bind(ir_version as i32)
         .bind(event_schema_version as i32)
         .bind(at.0)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -212,7 +202,7 @@ impl Db for PostgresDb {
         .bind(spec_json)
         .bind(needs_json)
         .bind(at.0)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -226,7 +216,7 @@ impl Db for PostgresDb {
         )
         .bind(&run.0)
         .bind(ir)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -235,7 +225,7 @@ impl Db for PostgresDb {
     async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError> {
         let row = sqlx::query("SELECT ir FROM runs WHERE id = $1")
             .bind(&run.0)
-            .fetch_optional(self.pool()?)
+            .fetch_optional(self.pool())
             .await
             .map_err(db_err)?;
         // `ir` is itself nullable, so unwrap both the missing-row and NULL cases.
@@ -255,7 +245,7 @@ impl Db for PostgresDb {
         )
         .bind(&run.0)
         .bind(json)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -267,7 +257,7 @@ impl Db for PostgresDb {
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError> {
         let row = sqlx::query("SELECT params FROM runs WHERE id = $1")
             .bind(&run.0)
-            .fetch_optional(self.pool()?)
+            .fetch_optional(self.pool())
             .await
             .map_err(db_err)?;
         match row.and_then(|r| r.get::<Option<Value>, _>("params")) {
@@ -293,7 +283,7 @@ impl Db for PostgresDb {
         .bind(&ctx.environment)
         .bind(&ctx.git_ref)
         .bind(ctx.locked_out)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -308,7 +298,7 @@ impl Db for PostgresDb {
              FROM runs WHERE id = $1",
         )
         .bind(&run.0)
-        .fetch_optional(self.pool()?)
+        .fetch_optional(self.pool())
         .await
         .map_err(db_err)?;
         Ok(row.and_then(|r| {
@@ -349,7 +339,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(&step.0)
         .bind(snapshot)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -360,7 +350,7 @@ impl Db for PostgresDb {
             sqlx::query("SELECT output_snapshot FROM step_runs WHERE run_id = $1 AND step_id = $2")
                 .bind(&run.0)
                 .bind(&step.0)
-                .fetch_optional(self.pool()?)
+                .fetch_optional(self.pool())
                 .await
                 .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<String>, _>("output_snapshot")))
@@ -382,7 +372,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(&step.0)
         .bind(json)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -396,7 +386,7 @@ impl Db for PostgresDb {
         let row = sqlx::query("SELECT results FROM step_runs WHERE run_id = $1 AND step_id = $2")
             .bind(&run.0)
             .bind(&step.0)
-            .fetch_optional(self.pool()?)
+            .fetch_optional(self.pool())
             .await
             .map_err(db_err)?;
         match row.and_then(|r| r.get::<Option<Value>, _>("results")) {
@@ -420,7 +410,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(&step.0)
         .bind(signature)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -431,7 +421,7 @@ impl Db for PostgresDb {
             sqlx::query("SELECT input_signature FROM step_runs WHERE run_id = $1 AND step_id = $2")
                 .bind(&run.0)
                 .bind(&step.0)
-                .fetch_optional(self.pool()?)
+                .fetch_optional(self.pool())
                 .await
                 .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<String>, _>("input_signature")))
@@ -454,7 +444,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(&step.0)
         .bind(json)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -469,7 +459,7 @@ impl Db for PostgresDb {
             sqlx::query("SELECT explicit_inputs FROM step_runs WHERE run_id = $1 AND step_id = $2")
                 .bind(&run.0)
                 .bind(&step.0)
-                .fetch_optional(self.pool()?)
+                .fetch_optional(self.pool())
                 .await
                 .map_err(db_err)?;
         let Some(value) = row.and_then(|r| r.get::<Option<Value>, _>("explicit_inputs")) else {
@@ -494,7 +484,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(group)
         .bind(policy.as_str())
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -507,7 +497,7 @@ impl Db for PostgresDb {
         let row =
             sqlx::query("SELECT concurrency_group, concurrency_policy FROM runs WHERE id = $1")
                 .bind(&run.0)
-                .fetch_optional(self.pool()?)
+                .fetch_optional(self.pool())
                 .await
                 .map_err(db_err)?;
         Ok(row.and_then(|r| {
@@ -519,7 +509,7 @@ impl Db for PostgresDb {
 
     async fn acquire_slot(&self, group: &str, run: &RunId) -> Result<Option<RunId>, DbError> {
         // Serialize acquirers on this group with a row lock, so exactly one wins.
-        let mut tx = self.pool()?.begin().await.map_err(db_err)?;
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
         let holder: Option<String> =
             sqlx::query("SELECT holder FROM concurrency_slots WHERE group_key = $1 FOR UPDATE")
                 .bind(group)
@@ -571,7 +561,7 @@ impl Db for PostgresDb {
         sqlx::query("DELETE FROM concurrency_slots WHERE group_key = $1 AND holder = $2")
             .bind(group)
             .bind(&run.0)
-            .execute(self.pool()?)
+            .execute(self.pool())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -585,7 +575,7 @@ impl Db for PostgresDb {
         )
         .bind(&run.0)
         .bind(key)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -604,7 +594,7 @@ impl Db for PostgresDb {
              ORDER BY created_at",
         )
         .bind(&run.0)
-        .fetch_all(self.pool()?)
+        .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
         Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
@@ -624,7 +614,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(project)
         .bind(priority)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -633,7 +623,7 @@ impl Db for PostgresDb {
     async fn run_project(&self, run: &RunId) -> Result<Option<String>, DbError> {
         let row = sqlx::query("SELECT project FROM runs WHERE id = $1")
             .bind(&run.0)
-            .fetch_optional(self.pool()?)
+            .fetch_optional(self.pool())
             .await
             .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<String>, _>("project")))
@@ -646,7 +636,7 @@ impl Db for PostgresDb {
                AND ($1::text IS NULL OR project = $1)",
         )
         .bind(project)
-        .fetch_one(self.pool()?)
+        .fetch_one(self.pool())
         .await
         .map_err(db_err)?;
         Ok(row.get::<i64, _>("n") as u32)
@@ -668,7 +658,7 @@ impl Db for PostgresDb {
         .bind(&step.0)
         .bind(kind)
         .bind(timer_seconds)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -684,7 +674,7 @@ impl Db for PostgresDb {
         )
         .bind(&run.0)
         .bind(&step.0)
-        .fetch_optional(self.pool()?)
+        .fetch_optional(self.pool())
         .await
         .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<i64>, _>("gate_timer_seconds")))
@@ -693,7 +683,7 @@ impl Db for PostgresDb {
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
         let row = sqlx::query("SELECT status FROM runs WHERE id = $1")
             .bind(&run.0)
-            .fetch_optional(self.pool()?)
+            .fetch_optional(self.pool())
             .await
             .map_err(db_err)?;
         row.map(|r| run_status_from_str(r.get::<String, _>("status")))
@@ -707,7 +697,7 @@ impl Db for PostgresDb {
             "SELECT id FROM runs WHERE status IN ('pending', 'running', 'suspended')
              ORDER BY priority DESC, created_at",
         )
-        .fetch_all(self.pool()?)
+        .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
         Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
@@ -720,7 +710,7 @@ impl Db for PostgresDb {
              LIMIT $1",
         )
         .bind(limit as i64)
-        .fetch_all(self.pool()?)
+        .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
         rows.into_iter()
@@ -737,7 +727,7 @@ impl Db for PostgresDb {
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
         let rows = sqlx::query("SELECT version, at, payload FROM events WHERE run_id = $1 ORDER BY seq")
             .bind(&run.0)
-            .fetch_all(self.pool()?)
+            .fetch_all(self.pool())
             .await
             .map_err(db_err)?;
         rows.into_iter()
@@ -760,7 +750,7 @@ impl Db for PostgresDb {
             "SELECT step_id, status, needs, gate_kind FROM step_runs WHERE run_id = $1 ORDER BY step_id",
         )
         .bind(&run.0)
-        .fetch_all(self.pool()?)
+        .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
         let mut steps = Vec::with_capacity(rows.len());
@@ -786,7 +776,7 @@ impl Db for PostgresDb {
         let row = sqlx::query("SELECT spec FROM step_runs WHERE run_id = $1 AND step_id = $2")
             .bind(&run.0)
             .bind(&step.0)
-            .fetch_optional(self.pool()?)
+            .fetch_optional(self.pool())
             .await
             .map_err(db_err)?;
         match row.and_then(|r| r.get::<Option<Value>, _>("spec")) {
@@ -818,7 +808,7 @@ impl Db for PostgresDb {
         .bind(meta.byte_offset as i64)
         .bind(meta.len as i64)
         .bind(&meta.object_key)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -837,7 +827,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(&step.0)
         .bind(&attempt.0)
-        .fetch_all(self.pool()?)
+        .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
         Ok(rows
@@ -869,7 +859,7 @@ impl Db for PostgresDb {
         .bind(&step.0)
         .bind(step_status_str(from))
         .bind(step_status_str(to))
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?
         .rows_affected();
@@ -898,7 +888,7 @@ impl Db for PostgresDb {
         .bind(&attempt.id.0)
         .bind(attempt.started_at.0)
         .bind(attempt.failure.map(failure_str))
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -922,7 +912,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(run_status_str(from))
         .bind(run_status_str(to))
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?
         .rows_affected();
@@ -939,7 +929,7 @@ impl Db for PostgresDb {
             .bind(event.version as i32)
             .bind(event.at.0)
             .bind(payload)
-            .execute(self.pool()?)
+            .execute(self.pool())
             .await
             .map_err(db_err)?;
         Ok(())
@@ -958,7 +948,7 @@ impl Db for PostgresDb {
         .bind(&msg.payload)
         .bind(&msg.idempotency_key)
         .bind(msg.at.0)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -996,7 +986,7 @@ impl Db for PostgresDb {
         .bind(limit as i64)
         .bind(visibility_ms)
         .bind(kind)
-        .fetch_all(self.pool()?)
+        .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
 
@@ -1019,7 +1009,7 @@ impl Db for PostgresDb {
              WHERE id = $1",
         )
         .bind(id.0)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
@@ -1040,7 +1030,7 @@ impl Db for PostgresDb {
         .bind(resource)
         .bind(owner)
         .bind(ttl_ms)
-        .fetch_optional(self.pool()?)
+        .fetch_optional(self.pool())
         .await
         .map_err(db_err)?;
 
@@ -1053,7 +1043,7 @@ impl Db for PostgresDb {
                 // Not acquired: a valid lease is still held by someone else.
                 let r = sqlx::query("SELECT owner, expires_at FROM leases WHERE resource = $1")
                     .bind(resource)
-                    .fetch_one(self.pool()?)
+                    .fetch_one(self.pool())
                     .await
                     .map_err(db_err)?;
                 Ok(Lease {
@@ -1083,7 +1073,7 @@ impl EnvironmentStore for PostgresDb {
         .bind(repo)
         .bind(&env.name)
         .bind(protection)
-        .execute(self.pool().map_err(proj_err)?)
+        .execute(self.pool())
         .await
         .map_err(|e| ProjectError::Store(e.to_string()))?;
         Ok(())
@@ -1101,7 +1091,7 @@ impl EnvironmentStore for PostgresDb {
         .bind(org)
         .bind(repo)
         .bind(name)
-        .fetch_optional(self.pool().map_err(proj_err)?)
+        .fetch_optional(self.pool())
         .await
         .map_err(|e| ProjectError::Store(e.to_string()))?;
         row.map(|r| {
@@ -1125,7 +1115,7 @@ impl EnvironmentStore for PostgresDb {
         )
         .bind(org)
         .bind(repo)
-        .fetch_all(self.pool().map_err(proj_err)?)
+        .fetch_all(self.pool())
         .await
         .map_err(|e| ProjectError::Store(e.to_string()))?;
         rows.into_iter()
@@ -1150,7 +1140,7 @@ impl EnvironmentStore for PostgresDb {
             .bind(org)
             .bind(repo)
             .bind(name)
-            .execute(self.pool().map_err(proj_err)?)
+            .execute(self.pool())
             .await
             .map_err(|e| ProjectError::Store(e.to_string()))?;
         Ok(())
@@ -1170,7 +1160,7 @@ impl EnvironmentStore for PostgresDb {
         .bind(&d.run)
         .bind(approved)
         .bind(d.at)
-        .execute(self.pool().map_err(proj_err)?)
+        .execute(self.pool())
         .await
         .map_err(|e| ProjectError::Store(e.to_string()))?;
         Ok(())
@@ -1189,7 +1179,7 @@ impl EnvironmentStore for PostgresDb {
         .bind(org)
         .bind(repo)
         .bind(environment)
-        .fetch_all(self.pool().map_err(proj_err)?)
+        .fetch_all(self.pool())
         .await
         .map_err(|e| ProjectError::Store(e.to_string()))?;
         rows.into_iter()
@@ -1208,10 +1198,6 @@ impl EnvironmentStore for PostgresDb {
             })
             .collect()
     }
-}
-
-fn proj_err(e: DbError) -> ProjectError {
-    ProjectError::Store(e.to_string())
 }
 
 // ---------------------------------------------------------------------------

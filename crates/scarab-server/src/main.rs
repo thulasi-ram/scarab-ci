@@ -5,99 +5,24 @@
 //! small installs; the same code scales out by running roles as separate
 //! replicas, since Postgres (the outbox) is the coordination bus. This binary is
 //! a thin composition root over the [`scarab_server`] library.
+//!
+//! Boot is fail-closed (ADR-0048): every `SCARAB_*` knob is read and validated
+//! by [`scarab_server::config`] before anything connects or binds, and a
+//! startup report makes the operational posture legible on line one.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
 use scarab_executor_k8s::{K8sExecutor, ResultsEgress};
 use scarab_executor_local::LocalExecutor;
+use scarab_server::config::{Cli, Config, ExecutorKind, StoreConfig};
 use scarab_server::{converged, router, AppState, LogService, SecretInjectingExecutor, SystemClock};
 use scarab_storage::ObjectStore;
 use scarab_storage_s3::S3Storage;
-
-/// Which slice(s) of Scarab this process should run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Role {
-    /// Run every role in one process (default; ideal for dev).
-    Converged,
-    /// Serve the public/control-plane HTTP API only.
-    Api,
-    /// Run the durable scheduler / reconciler loop only.
-    Scheduler,
-    /// Run the step executor / worker only.
-    Executor,
-    /// Ingest and normalize inbound forge webhooks only.
-    Webhook,
-}
-
-impl Role {
-    /// Roles that drive the scheduler + executor background loop.
-    fn runs_driver(self) -> bool {
-        matches!(self, Role::Converged | Role::Scheduler | Role::Executor)
-    }
-}
-
-/// Which execution backend the driver uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum ExecutorKind {
-    /// Kubernetes: one Pod per step (production; ADR-0005).
-    K8s,
-    /// Local host processes — a dev/CLI backend for laptop runs without a
-    /// cluster (ADR-0036). Never a production deployment mode.
-    Local,
-}
-
-#[derive(Debug, Parser)]
-#[command(name = "scarab-server", about = "Scarab durable CI — server process")]
-struct Cli {
-    /// The role this process runs as.
-    #[arg(long, value_enum, env = "SCARAB_ROLE", default_value_t = Role::Converged)]
-    role: Role,
-
-    /// Report the resolved role and exit WITHOUT binding a socket. Serving is the
-    /// default now; this is the escape hatch for smoke checks / image
-    /// healthchecks that must not hang.
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Deprecated no-op: serving is the default. Kept so existing scripts and
-    /// muscle memory (`--serve`) keep working.
-    #[arg(long, hide = true)]
-    serve: bool,
-
-    /// Address to bind. Override per-environment via `SCARAB_ADDR` (e.g. a dev
-    /// `.env.local` sets `127.0.0.1:8899`).
-    #[arg(long, env = "SCARAB_ADDR", default_value = "0.0.0.0:8080")]
-    addr: String,
-
-    /// Postgres connection URL. When set, the durable store is connected and the
-    /// background driver runs; otherwise the process serves API-only (dev/smoke).
-    #[arg(long, env = "SCARAB_DATABASE_URL")]
-    database_url: Option<String>,
-
-    /// Local directory backing the object store (logs/artifacts). Swapped for
-    /// S3/MinIO in production; a plain directory needs no extra service for dev.
-    #[arg(long, env = "SCARAB_OBJECT_DIR", default_value = "./.scarab/objects")]
-    object_dir: String,
-
-    /// Kubernetes namespace the executor launches step Pods into.
-    #[arg(long, env = "SCARAB_NAMESPACE", default_value = "scarab")]
-    namespace: String,
-
-    /// Execution backend for the driver. `k8s` (default, production) or `local`
-    /// (host processes — a cluster-free dev/CLI loop, ADR-0036).
-    #[arg(long, value_enum, env = "SCARAB_EXECUTOR", default_value_t = ExecutorKind::K8s)]
-    executor: ExecutorKind,
-
-    /// Write the generated OpenAPI document to this path and exit (client
-    /// codegen / CI spec check). Does not connect to Postgres or serve.
-    #[arg(long, value_name = "PATH")]
-    emit_openapi: Option<String>,
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -113,26 +38,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
-    // Spec export: write openapi.json and exit (no DB, no serving).
+    // Spec export: write openapi.json and exit. Runs BEFORE the config gate —
+    // this path must stay DB-free (ADR-0048 carve-out for pure tooling).
     if let Some(path) = &cli.emit_openapi {
         std::fs::write(path, scarab_server::openapi_json())?;
         println!("wrote OpenAPI document to {path}");
         return Ok(());
     }
 
-    tracing::info!(role = ?cli.role, "starting scarab-server");
-    println!("scarab-server role = {:?}", cli.role);
-
-    // Durable store.
-    let connected = cli.database_url.is_some();
-    let pg = match &cli.database_url {
-        Some(url) => {
-            let db = PostgresDb::connect(url).await?;
-            db.migrate().await?;
-            db
+    // The startup gate: refuse to boot on invalid configuration, before any
+    // socket binds or connection is made (ADR-0048).
+    let config = match Config::resolve(&cli) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("scarab-server: refusing to start: {e}");
+            std::process::exit(1);
         }
-        None => PostgresDb::new(),
     };
+    for line in config.startup_report() {
+        tracing::info!("startup: {line}");
+        println!("startup: {line}");
+    }
+
+    // Config smoke check: validated and reported; exit without side effects.
+    if cli.dry_run {
+        println!("(dry run — configuration valid; omit --dry-run to start)");
+        return Ok(());
+    }
+
+    // Durable store — mandatory, already guaranteed by the config gate.
+    let pg = PostgresDb::connect(&config.database_url).await?;
+    pg.migrate().await?;
     // Keep a typed handle so the same Postgres adapter can back both the `Db`
     // port and the `EnvironmentStore` port (it implements both).
     let pg = Arc::new(pg);
@@ -140,54 +76,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Object store: MinIO/S3 when SCARAB_S3_BUCKET is set (the dev harness /
     // prod), else a local directory (zero-dependency dev).
-    let store: Arc<dyn ObjectStore> = match std::env::var("SCARAB_S3_BUCKET") {
-        Ok(bucket) => {
-            let endpoint = std::env::var("SCARAB_S3_ENDPOINT").unwrap_or_default();
-            let region = std::env::var("SCARAB_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
-            let key = std::env::var("SCARAB_S3_ACCESS_KEY").unwrap_or_default();
-            let secret = std::env::var("SCARAB_S3_SECRET_KEY").unwrap_or_default();
-            Arc::new(S3Storage::s3(bucket, &endpoint, &region, &key, &secret)?)
-        }
-        Err(_) => Arc::new(S3Storage::local(&cli.object_dir)?),
+    let store: Arc<dyn ObjectStore> = match &config.store {
+        StoreConfig::S3(s3) => Arc::new(S3Storage::s3(
+            s3.bucket.clone(),
+            &s3.endpoint,
+            &s3.region,
+            &s3.access_key,
+            &s3.secret_key,
+        )?),
+        StoreConfig::LocalDir(dir) => Arc::new(S3Storage::local(dir)?),
     };
     let logs = Arc::new(LogService::new(store, db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
     // Secrets store (envelope-encrypted, ADR-0014): built up-front — before the
     // driver — so the launch path can resolve and inject env-scoped secrets
-    // (ADR-0037). Master key from SCARAB_MASTER_KEY. Only when connected.
-    let secrets: Option<Arc<dyn scarab_secrets::SecretProvider>> =
-        if let (true, Some(url)) = (connected, &cli.database_url) {
-            let s = scarab_secrets_postgres::PostgresSecrets::connect(url).await?;
-            s.migrate().await?;
-            Some(Arc::new(s))
-        } else {
-            None
-        };
+    // (ADR-0037). Master key from SCARAB_MASTER_KEY.
+    let secrets: Arc<dyn scarab_secrets::SecretProvider> = {
+        let s = scarab_secrets_postgres::PostgresSecrets::connect(&config.database_url).await?;
+        s.migrate().await?;
+        Arc::new(s)
+    };
 
-    // Background scheduler + executor loop. The k8s backend best-effort connects
-    // (without a cluster the driver is skipped, API-only); the local backend
-    // needs nothing but a working host (dev/CLI, ADR-0036).
-    // Results egress (ADR-0042): a shared HMAC secret both mints the k8s sidecar's
-    // fence token and verifies it at the ingest endpoint. Absent = no capture.
-    let results_token_secret = std::env::var("SCARAB_RESULTS_TOKEN_SECRET")
-        .ok()
-        .map(String::into_bytes);
-    let results_egress = results_token_secret.as_ref().map(|secret| ResultsEgress {
-        base_url: std::env::var("SCARAB_RESULTS_API_URL")
-            .unwrap_or_else(|_| "http://scarab-server".to_string()),
-        token_secret: secret.clone(),
-        sidecar_image: std::env::var("SCARAB_SIDECAR_IMAGE")
-            .unwrap_or_else(|_| "ghcr.io/scarab/sidecar:latest".to_string()),
+    // Results egress (ADR-0042): a shared HMAC secret both mints the k8s
+    // sidecar's fence token and verifies it at the ingest endpoint.
+    let results_egress = config.results_egress.as_ref().map(|egress| ResultsEgress {
+        base_url: egress.api_url.clone(),
+        token_secret: egress.token_secret.clone(),
+        sidecar_image: egress.sidecar_image.clone(),
     });
 
-    if cli.role.runs_driver() && connected {
-        let executor: Option<Arc<dyn Executor>> = match cli.executor {
+    // Background scheduler + executor loop. The k8s backend best-effort
+    // connects (without a reachable cluster the driver is skipped — a degraded
+    // state, reported loudly); the local backend needs nothing but a working
+    // host (dev/CLI, ADR-0036).
+    if config.role.runs_driver() {
+        let executor: Option<Arc<dyn Executor>> = match config.executor {
             ExecutorKind::Local => {
                 tracing::info!("using the local (host-process) executor — dev/CLI backend");
                 Some(Arc::new(LocalExecutor::new()))
             }
-            ExecutorKind::K8s => match K8sExecutor::connect(cli.namespace.clone()).await {
+            ExecutorKind::K8s => match K8sExecutor::connect(config.namespace.clone()).await {
                 Ok(mut exec) => {
                     if let Some(egress) = results_egress.clone() {
                         exec = exec.with_results_egress(egress);
@@ -196,27 +125,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(Arc::new(exec))
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "no kubernetes cluster reachable; driver not started (API-only)");
+                    tracing::warn!(error = %e, "startup: DEGRADED — no kubernetes cluster reachable; driver not started");
                     None
                 }
             },
         };
         if let Some(executor) = executor {
-            // Inject env-scoped secrets into deploy-run pods at launch (ADR-0037)
-            // when a secrets store is wired; otherwise launch unchanged.
-            let executor: Arc<dyn Executor> = match &secrets {
-                Some(sec) => Arc::new(SecretInjectingExecutor::new(
-                    executor,
-                    db.clone(),
-                    sec.clone(),
-                    logs.clone(),
-                )),
-                None => executor,
-            };
+            // Inject env-scoped secrets into deploy-run pods at launch
+            // (ADR-0037).
+            let executor: Arc<dyn Executor> = Arc::new(SecretInjectingExecutor::new(
+                executor,
+                db.clone(),
+                secrets.clone(),
+                logs.clone(),
+            ));
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.
             // A short window is safe either way — `launch` is idempotent (ADR-0021).
-            let visibility_ms = match cli.executor {
+            let visibility_ms = match config.executor {
                 ExecutorKind::Local => 1_000,
                 ExecutorKind::K8s => 30_000,
             };
@@ -237,34 +163,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut state = AppState::new(db, clock, logs);
-    if let Ok(secret) = std::env::var("SCARAB_GITHUB_WEBHOOK_SECRET") {
-        state = state.with_github_webhook_secret(secret.into_bytes());
+    let mut state = AppState::new(db, clock, logs)
+        // Environments + deployment history: the Postgres adapter is the store.
+        // Enables /v1/environments/* and admission enforcement for
+        // env-targeting runs (ADR-0024).
+        .with_environments(pg.clone())
+        // /v1/secrets management with the secrets store built above (ADR-0014).
+        .with_secrets(secrets.clone());
+    if let Some(secret) = config.github_webhook_secret.clone() {
+        state = state.with_github_webhook_secret(secret);
     }
     // Results ingest (ADR-0042): enables POST …/steps/:step/results for the
     // egress sidecar, verified with the same secret that minted its token.
-    if let Some(secret) = results_token_secret {
-        state = state.with_results_token_secret(secret);
+    if let Some(egress) = &config.results_egress {
+        state = state.with_results_token_secret(egress.token_secret.clone());
     }
     // External-gate release tokens (ADR-0034): enables POST …/gates/:step/release.
-    if let Ok(secret) = std::env::var("SCARAB_GATE_TOKEN_SECRET") {
-        state = state.with_gate_token_secret(secret.into_bytes());
-    }
-    // Environments + deployment history: the Postgres adapter is the store. Only
-    // wired when actually connected — an unconnected PG would fail at request
-    // time. Enables /v1/environments/* and (with an EnvironmentStore present)
-    // admission enforcement for env-targeting runs (ADR-0024).
-    if connected {
-        state = state.with_environments(pg.clone());
-    }
-    // Enable /v1/secrets management with the secrets store built above (ADR-0014).
-    if let Some(sec) = &secrets {
-        state = state.with_secrets(sec.clone());
+    if let Some(secret) = config.gate_token_secret.clone() {
+        state = state.with_gate_token_secret(secret);
     }
     // OIDC issuer for keyless federation (ADR-0014): serve JWKS + discovery so a
     // cloud provider can verify Scarab-minted tokens. The issuer URL is the
     // public base URL clouds are configured to trust; enabled only when set.
-    if let Ok(issuer_url) = std::env::var("SCARAB_OIDC_ISSUER") {
+    if let Some(issuer_url) = config.oidc_issuer.clone() {
         match scarab_server::oidc::Rs256Issuer::generate(issuer_url) {
             Ok(issuer) => {
                 state = state.with_oidc(Arc::new(issuer));
@@ -275,15 +196,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let app = router(state);
 
-    // Serve by default; `--serve` still forces it, `--dry-run` opts out.
-    let serve = cli.serve || !cli.dry_run;
-    if serve {
-        let listener = tokio::net::TcpListener::bind(&cli.addr).await?;
-        println!("listening on {}", cli.addr);
-        axum::serve(listener, app).await?;
-    } else {
-        println!("(dry run — omit --dry-run to bind {})", cli.addr);
-    }
+    let listener = tokio::net::TcpListener::bind(&config.addr).await?;
+    println!("listening on {}", config.addr);
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
