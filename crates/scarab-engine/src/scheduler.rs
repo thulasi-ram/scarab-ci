@@ -405,11 +405,21 @@ impl<'a> Scheduler<'a> {
             return Ok(());
         }
         // A suspended run is waiting on a gate. A `timer` gate releases itself
-        // once its wait has elapsed (ADR-0008); everything else waits for an
-        // explicit release. Either way, do no admission this pass — the resumed
-        // run is picked up next tick.
+        // once its wait has elapsed (ADR-0008); an opt-in `gate_expires_after`
+        // fails a still-unapproved gate at its deadline (ADR-0047; default =
+        // indefinite); everything else waits for an explicit release. Either
+        // way, do no admission this pass — the resumed run is picked up next
+        // tick.
         if status == RunStatus::Suspended {
             self.auto_release_elapsed_timer(run).await?;
+            self.expire_elapsed_gate(run).await?;
+            return Ok(());
+        }
+
+        // Opt-in run budget (ADR-0047): active time only — gate-suspended time
+        // never counts (a run suspended weeks on a gate is the wedge, not a
+        // hang). Exhaustion cancels in-flight steps and fails the run.
+        if self.enforce_run_budget(run).await? {
             return Ok(());
         }
 
@@ -808,7 +818,15 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Settle the run once every step is terminal.
+    /// Settle the run once every step is terminal, mapping the cause to the
+    /// ADR-0047 terminal semantics:
+    ///
+    /// - **`Failed`** — code produced a failing *verdict*: a `Step` failure
+    ///   (incl. an exhausted opt-in retry), a `Timeout`, or a cancelled step.
+    ///   The developer signal.
+    /// - **`DeadLettered`** — the system could not obtain a verdict: infra
+    ///   retries exhausted or a lost execution. The operator signal, with
+    ///   diagnostics on the event log.
     pub async fn advance(&self, run: &RunId) -> Result<(), SchedulerError> {
         let steps = self.db.steps_of_run(run).await?;
         if steps.is_empty() || !steps.iter().all(|s| s.status.is_terminal()) {
@@ -820,13 +838,41 @@ impl<'a> Scheduler<'a> {
         let failed = steps
             .iter()
             .any(|s| matches!(s.status, StepStatus::Failed | StepStatus::Cancelled));
-        let outcome = if failed {
+        // Verdict-less failures (ADR-0047): a failed step whose last attempt
+        // ended in infra (never/post-start) or Lost — no code verdict exists.
+        let dead: Vec<String> = steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Failed)
+            .filter_map(|s| {
+                let failure = s.attempts.last()?.failure?;
+                matches!(
+                    failure,
+                    FailureKind::Infra { .. } | FailureKind::Lost
+                )
+                .then(|| format!("step `{}`: {failure:?} — retries exhausted without a verdict", s.step.0))
+            })
+            .collect();
+        let outcome = if !dead.is_empty() {
+            RunStatus::DeadLettered
+        } else if failed {
             RunStatus::Failed
         } else {
             RunStatus::Succeeded
         };
         if let Some(current) = self.db.run_status(run).await? {
             if !current.is_terminal() {
+                if outcome == RunStatus::DeadLettered {
+                    // Operator diagnostics travel on the event log.
+                    let now = self.clock.now().await;
+                    self.append(
+                        run,
+                        EventPayload::RunDeadLettered {
+                            reason: dead.join("; "),
+                        },
+                        now,
+                    )
+                    .await?;
+                }
                 self.transition_run(run, current, outcome).await?;
                 // Free the concurrency slot so a queued run can start.
                 if let Some((group, _)) = self.db.run_concurrency(run).await? {
@@ -883,21 +929,7 @@ impl<'a> Scheduler<'a> {
             return Ok(());
         };
 
-        // Suspension time: the most recent transition into Suspended.
-        let suspended_at = self
-            .db
-            .events(run)
-            .await?
-            .iter()
-            .filter(|e| {
-                matches!(
-                    &e.kind,
-                    EventPayload::RunTransitioned { to: RunStatus::Suspended, .. }
-                )
-            })
-            .map(|e| e.at.0)
-            .max();
-        let Some(suspended_at) = suspended_at else {
+        let Some(suspended_at) = self.suspended_at(run).await? else {
             return Ok(());
         };
 
@@ -909,6 +941,181 @@ impl<'a> Scheduler<'a> {
                 .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
         }
         Ok(())
+    }
+
+    /// Fail a still-unapproved gate that outlived its opt-in
+    /// `gate_expires_after` (ADR-0047). Default is indefinite — gates may wait
+    /// forever; only an authored expiry arms this. The failed gate makes its
+    /// dependents dep-dead (skipped) and the run settles `Failed` — a code
+    /// verdict ("nobody approved in time"), not a dead-letter.
+    async fn expire_elapsed_gate(&self, run: &RunId) -> Result<(), SchedulerError> {
+        // The timer auto-release above may have already resumed the run.
+        if self.db.run_status(run).await? != Some(RunStatus::Suspended) {
+            return Ok(());
+        }
+        let steps = self.db.steps_of_run(run).await?;
+        let done: HashMap<&StepId, StepStatus> =
+            steps.iter().map(|s| (&s.step, s.status)).collect();
+        let Some(gate) = steps.iter().find(|s| {
+            s.status == StepStatus::Pending
+                && s.is_gate()
+                && s.needs
+                    .iter()
+                    .all(|d| done.get(d).copied() == Some(StepStatus::Succeeded))
+        }) else {
+            return Ok(());
+        };
+        let Some(expiry_secs) = self.gate_expiry_secs(run, &gate.step).await? else {
+            return Ok(());
+        };
+        let Some(suspended_at) = self.suspended_at(run).await? else {
+            return Ok(());
+        };
+
+        let now = self.clock.now().await;
+        if now.0 < suspended_at + expiry_secs.saturating_mul(1000) {
+            return Ok(());
+        }
+        match self
+            .db
+            .record_step_transition(run, &gate.step, StepStatus::Pending, StepStatus::Failed)
+            .await
+        {
+            Ok(()) => {
+                let now = self.clock.now().await;
+                self.append(run, EventPayload::GateExpired { step: gate.step.clone() }, now)
+                    .await?;
+                self.append(
+                    run,
+                    EventPayload::StepTransitioned {
+                        step: gate.step.clone(),
+                        from: StepStatus::Pending,
+                        to: StepStatus::Failed,
+                    },
+                    now,
+                )
+                .await?;
+            }
+            // A racing release already settled the gate — exactly-once.
+            Err(DbError::Conflict) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        // Resume so the next admission skips dependents and settles the run.
+        reopen(self.db, self.clock, run, RunStatus::Suspended, RunStatus::Running)
+            .await
+            .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
+        Ok(())
+    }
+
+    /// Enforce the run's opt-in active-time `budget:` (ADR-0047). Returns
+    /// `true` when the budget is exhausted and the run was failed (admission
+    /// must stop). Active time = wall time since creation minus gate-suspended
+    /// intervals; there is deliberately **no default**.
+    async fn enforce_run_budget(&self, run: &RunId) -> Result<bool, SchedulerError> {
+        if self.db.run_status(run).await? != Some(RunStatus::Running) {
+            return Ok(false);
+        }
+        let Some(budget_secs) = self.run_budget_secs(run).await? else {
+            return Ok(false);
+        };
+        let events = self.db.events(run).await?;
+        let Some(created_at) = events.first().map(|e| e.at.0) else {
+            return Ok(false);
+        };
+        // Sum the closed suspended intervals (the run is Running now, so no
+        // interval is open).
+        let mut suspended_ms: i64 = 0;
+        let mut open: Option<i64> = None;
+        for e in &events {
+            match &e.kind {
+                EventPayload::RunTransitioned { to: RunStatus::Suspended, .. } => {
+                    open = Some(e.at.0);
+                }
+                EventPayload::RunTransitioned { from: RunStatus::Suspended, .. } => {
+                    if let Some(started) = open.take() {
+                        suspended_ms += e.at.0 - started;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let now = self.clock.now().await;
+        let active_ms = now.0 - created_at - suspended_ms;
+        let budget_ms = budget_secs.saturating_mul(1000);
+        if active_ms < budget_ms {
+            return Ok(false);
+        }
+
+        // Exhausted: tear down in-flight work (best-effort), cancel the steps,
+        // and fail the run with diagnostics. Failed — a liveness verdict — not
+        // DeadLettered (the operator did nothing wrong; the budget did its job).
+        for step in self.db.steps_of_run(run).await? {
+            if step.status.is_terminal() {
+                continue;
+            }
+            if let Some(attempt) = step.attempts.last() {
+                if let Some(h) = self.db.attempt_handle(run, &step.step, &attempt.id).await? {
+                    let _ = self.executor.cancel(&ExecHandle(h)).await;
+                }
+            }
+            self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
+                .await?;
+        }
+        self.append(run, EventPayload::RunBudgetExhausted { active_ms, budget_ms }, now)
+            .await?;
+        self.transition_run(run, RunStatus::Running, RunStatus::Failed).await?;
+        if let Some((group, _)) = self.db.run_concurrency(run).await? {
+            self.db.release_slot(&group, run).await?;
+        }
+        Ok(true)
+    }
+
+    /// When the run most recently suspended (the latest `→ Suspended`
+    /// transition on the event log), or `None` if it never has.
+    async fn suspended_at(&self, run: &RunId) -> Result<Option<i64>, SchedulerError> {
+        Ok(self
+            .db
+            .events(run)
+            .await?
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    EventPayload::RunTransitioned { to: RunStatus::Suspended, .. }
+                )
+            })
+            .map(|e| e.at.0)
+            .max())
+    }
+
+    /// The run's opt-in `budget:` (seconds) from its stored IR, if any.
+    async fn run_budget_secs(&self, run: &RunId) -> Result<Option<i64>, SchedulerError> {
+        Ok(self
+            .db
+            .run_ir(run)
+            .await?
+            .and_then(|ir| ir.get("budget").and_then(|b| b.as_u64()))
+            .map(|b| b as i64))
+    }
+
+    /// The gate's opt-in `gate_expires_after` (seconds) from the stored IR.
+    async fn gate_expiry_secs(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<i64>, SchedulerError> {
+        let Some(ir) = self.db.run_ir(run).await? else {
+            return Ok(None);
+        };
+        Ok(ir
+            .get("steps")
+            .and_then(|s| s.as_array())
+            .into_iter()
+            .flatten()
+            .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(step.0.as_str()))
+            .and_then(|s| s.get("gate_expires_after"))
+            .and_then(|t| t.as_u64())
+            .map(|t| t as i64))
     }
 
     // --- helpers -----------------------------------------------------------

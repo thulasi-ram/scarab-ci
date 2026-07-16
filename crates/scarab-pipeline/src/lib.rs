@@ -75,6 +75,12 @@ pub struct PipelineIr {
     /// Distinct from the per-step workspace `inputs:`/`outputs:` (ADR-0007, 0035).
     #[serde(default, skip_serializing_if = "Interface::is_empty")]
     pub interface: Interface,
+    /// Opt-in run budget in seconds (ADR-0047): the run fails once its
+    /// **active** time (gate-suspended time excluded) exceeds this. No default
+    /// — a run suspended for weeks on a gate is the wedge, not a hang; forward
+    /// progress rests on step timeouts and gate expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u32>,
     pub steps: Vec<StepSpec>,
 }
 
@@ -290,6 +296,12 @@ pub struct StepSpec {
     /// any other kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_after: Option<u32>,
+    /// Opt-in gate **expiry** (ADR-0047), in seconds: fail the gate (and hence
+    /// the run) if it is still unapproved this long after the run suspended.
+    /// Distinct from [`gate_after`](StepSpec::gate_after) (a timer's
+    /// auto-release). Default = indefinite — gates may wait forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_expires_after: Option<u32>,
     /// Entrypoint/command (empty = the image default).
     #[serde(default)]
     pub command: Vec<String>,
@@ -581,6 +593,7 @@ pub fn compile_yaml_with_libs(
         concurrency: authored.concurrency,
         environment: authored.environment,
         interface: authored.interface,
+        budget: authored.budget,
         steps: expanded,
     };
 
@@ -1242,6 +1255,11 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
 pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
     let mut diagnostics = Vec::new();
 
+    // Run budget (ADR-0047): opt-in, active-time-only; zero is nonsense.
+    if ir.budget == Some(0) {
+        diagnostics.push("`budget` must be greater than zero seconds".to_string());
+    }
+
     // Unique ids.
     let mut seen = BTreeSet::new();
     let mut ids = BTreeSet::new();
@@ -1292,10 +1310,17 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                     ));
                 }
                 // A gate has no execution to deadline (`gate_after` covers
-                // timer gates; gate *expiry* is a separate ADR-0047 concern).
+                // timer gates; gate *expiry* is `gate_expires_after`).
                 if step.timeout.is_some() {
                     diagnostics.push(format!(
                         "step `{}`: a gate step launches nothing — it must not set `timeout`",
+                        step.id
+                    ));
+                }
+                // Gate expiry (ADR-0047): opt-in, positive.
+                if step.gate_expires_after == Some(0) {
+                    diagnostics.push(format!(
+                        "step `{}`: `gate_expires_after` must be greater than zero seconds",
                         step.id
                     ));
                 }
@@ -1337,6 +1362,13 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                             ));
                         }
                     }
+                }
+                // Gate expiry is only meaningful on a gate.
+                if step.gate_expires_after.is_some() {
+                    diagnostics.push(format!(
+                        "step `{}`: `gate_expires_after` is only valid on a gate step",
+                        step.id
+                    ));
                 }
                 // A zero deadline would kill every step instantly (ADR-0047).
                 if step.timeout == Some(0) {

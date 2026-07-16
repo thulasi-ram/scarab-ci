@@ -668,6 +668,15 @@
           "steps"
         ],
         "properties": {
+          "budget": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Opt-in run budget in seconds (ADR-0047): the run fails once its\n**active** time (gate-suspended time excluded) exceeds this. No default.",
+            "minimum": 0
+          },
           "interface": {
             "type": "object",
             "description": "The pipeline's launch/reuse interface (ADR-0038, 0043) — its declared\ntyped parameters (`inputs`) and exposed outputs. Carried as the pure\n`scarab_pipeline::Interface` (opaque object in the schema; the pure crate\ncannot derive `ToSchema`). Absent = no parameters."

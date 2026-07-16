@@ -201,6 +201,10 @@ pub struct PipelineDto {
     #[serde(default, skip_serializing_if = "scarab_pipeline::Interface::is_empty")]
     #[schema(value_type = Object)]
     pub interface: scarab_pipeline::Interface,
+    /// Opt-in run budget in seconds (ADR-0047): the run fails once its
+    /// **active** time (gate-suspended time excluded) exceeds this. No default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u32>,
     pub steps: Vec<StepDto>,
 }
 

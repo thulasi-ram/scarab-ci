@@ -330,6 +330,16 @@ pub enum EventPayload {
     /// prior output is carried forward rather than recomputed (ADR-0027). Surfaced
     /// explicitly so a "smart" skip is never mysterious.
     StepSkipped { step: StepId, reason: String },
+    /// The run was dead-lettered (ADR-0047): the system could not obtain a
+    /// verdict (infra retries exhausted / a lost execution / poison). The
+    /// **operator** signal — `reason` carries the diagnostics.
+    RunDeadLettered { reason: String },
+    /// An unapproved gate outlived its opt-in `gate_expires_after` deadline and
+    /// failed the run (ADR-0047).
+    GateExpired { step: StepId },
+    /// The run's opt-in active-time `budget:` was exhausted (ADR-0047);
+    /// in-flight steps were cancelled and the run fails.
+    RunBudgetExhausted { active_ms: i64, budget_ms: i64 },
     /// Escape hatch for forward-compatible payloads not yet modelled.
     Raw(serde_json::Value),
 }

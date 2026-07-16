@@ -118,8 +118,12 @@ async fn never_started_infra_exhausts_its_bounded_budget() {
         tick(&db, &clock, &exec).await;
     }
 
-    // Budget (3 attempts) exhausted → terminal Failed, never an infinite loop.
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Failed));
+    // Budget (3 attempts) exhausted with no verdict → DeadLettered (the
+    // operator signal, ADR-0047), never an infinite loop.
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::DeadLettered)
+    );
     assert_eq!(attempts(&db).await.len(), 3);
 }
 
@@ -138,9 +142,15 @@ async fn post_start_classes_fail_immediately_without_the_assertion() {
             tick(&db, &clock, &exec).await;
         }
 
+        // Terminal semantics (ADR-0047): a code verdict (Step/Timeout) fails
+        // the run; a verdict-less post-start infra failure dead-letters it.
+        let expected = match class {
+            FailureClass::Infra { .. } => RunStatus::DeadLettered,
+            FailureClass::Step | FailureClass::Timeout => RunStatus::Failed,
+        };
         assert_eq!(
             db.run_status(&run_id()).await.unwrap(),
-            Some(RunStatus::Failed),
+            Some(expected),
             "{class:?}"
         );
         // A side effect may exist: no retry without the author's assertion.
@@ -200,7 +210,11 @@ async fn lost_without_the_assertion_is_terminal_and_never_relaunched() {
         tick(&db, &clock, &exec).await;
     }
 
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Failed));
+    // Lost = no verdict → the operator signal (ADR-0047).
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::DeadLettered)
+    );
     let a = attempts(&db).await;
     assert_eq!(a.len(), 1, "Lost counted against the budget");
     assert_eq!(a[0].failure, Some(FailureKind::Lost));
