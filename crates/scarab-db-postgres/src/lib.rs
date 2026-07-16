@@ -24,6 +24,9 @@ use scarab_engine::{
     LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec,
     StepStatus, Timestamp,
 };
+use scarab_forge::{
+    ForgeConnection, ForgeConnectionStore, ForgeKind, RegistryError, RepoRef, ResolvedRepo,
+};
 use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError};
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
@@ -1144,6 +1147,155 @@ impl Db for PostgresDb {
             }
         }
     }
+}
+
+#[async_trait]
+impl ForgeConnectionStore for PostgresDb {
+    async fn put_connection(&self, conn: &ForgeConnection) -> Result<(), RegistryError> {
+        sqlx::query(
+            "INSERT INTO forge_connections (id, kind, base_url, credential_ref)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (id) DO UPDATE SET
+                 kind = EXCLUDED.kind,
+                 base_url = EXCLUDED.base_url,
+                 credential_ref = EXCLUDED.credential_ref",
+        )
+        .bind(&conn.id)
+        .bind(conn.kind.as_str())
+        .bind(&conn.base_url)
+        .bind(&conn.credential_ref)
+        .execute(self.pool())
+        .await
+        .map_err(reg_err)?;
+        Ok(())
+    }
+
+    async fn get_connection(&self, id: &str) -> Result<Option<ForgeConnection>, RegistryError> {
+        let row = sqlx::query(
+            "SELECT id, kind, base_url, credential_ref FROM forge_connections WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(reg_err)?;
+        row.map(connection_from_row).transpose()
+    }
+
+    async fn list_connections(&self) -> Result<Vec<ForgeConnection>, RegistryError> {
+        let rows = sqlx::query(
+            "SELECT id, kind, base_url, credential_ref FROM forge_connections ORDER BY id",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(reg_err)?;
+        rows.into_iter().map(connection_from_row).collect()
+    }
+
+    async fn delete_connection(&self, id: &str) -> Result<(), RegistryError> {
+        // Repo bindings go with it (ON DELETE CASCADE).
+        sqlx::query("DELETE FROM forge_connections WHERE id = $1")
+            .bind(id)
+            .execute(self.pool())
+            .await
+            .map_err(reg_err)?;
+        Ok(())
+    }
+
+    async fn bind_repo(
+        &self,
+        connection_id: &str,
+        repo: &RepoRef,
+        org: &str,
+        project: &str,
+    ) -> Result<(), RegistryError> {
+        sqlx::query(
+            "INSERT INTO forge_repos (connection_id, owner, name, org, project)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (owner, name) DO UPDATE SET
+                 connection_id = EXCLUDED.connection_id,
+                 org = EXCLUDED.org,
+                 project = EXCLUDED.project",
+        )
+        .bind(connection_id)
+        .bind(&repo.owner)
+        .bind(&repo.name)
+        .bind(org)
+        .bind(project)
+        .execute(self.pool())
+        .await
+        .map_err(reg_err)?;
+        Ok(())
+    }
+
+    async fn unbind_repo(
+        &self,
+        connection_id: &str,
+        repo: &RepoRef,
+    ) -> Result<(), RegistryError> {
+        sqlx::query(
+            "DELETE FROM forge_repos WHERE connection_id = $1 AND owner = $2 AND name = $3",
+        )
+        .bind(connection_id)
+        .bind(&repo.owner)
+        .bind(&repo.name)
+        .execute(self.pool())
+        .await
+        .map_err(reg_err)?;
+        Ok(())
+    }
+
+    async fn repos_of(&self, connection_id: &str) -> Result<Vec<RepoRef>, RegistryError> {
+        let rows = sqlx::query(
+            "SELECT owner, name FROM forge_repos WHERE connection_id = $1 ORDER BY owner, name",
+        )
+        .bind(connection_id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(reg_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| RepoRef {
+                owner: r.get::<String, _>("owner"),
+                name: r.get::<String, _>("name"),
+            })
+            .collect())
+    }
+
+    async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError> {
+        let row = sqlx::query(
+            "SELECT c.id, c.kind, c.base_url, c.credential_ref, r.org, r.project
+             FROM forge_repos r JOIN forge_connections c ON c.id = r.connection_id
+             WHERE r.owner = $1 AND r.name = $2",
+        )
+        .bind(&repo.owner)
+        .bind(&repo.name)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(reg_err)?;
+        row.map(|r| {
+            Ok(ResolvedRepo {
+                org: r.get::<String, _>("org"),
+                project: r.get::<String, _>("project"),
+                connection: connection_from_row(r)?,
+            })
+        })
+        .transpose()
+    }
+}
+
+fn connection_from_row(r: sqlx::postgres::PgRow) -> Result<ForgeConnection, RegistryError> {
+    let kind = r.get::<String, _>("kind");
+    Ok(ForgeConnection {
+        id: r.get::<String, _>("id"),
+        kind: ForgeKind::from_str_token(&kind)
+            .ok_or_else(|| RegistryError::Store(format!("unknown forge kind {kind:?}")))?,
+        base_url: r.get::<String, _>("base_url"),
+        credential_ref: r.get::<String, _>("credential_ref"),
+    })
+}
+
+fn reg_err(e: sqlx::Error) -> RegistryError {
+    RegistryError::Store(e.to_string())
 }
 
 #[async_trait::async_trait]

@@ -2548,6 +2548,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "scarab-engine",
+ "scarab-forge",
  "scarab-pipeline",
  "scarab-project",
  "scarab-storage",

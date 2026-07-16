@@ -2493,6 +2493,26 @@ async fn secret_matrix(
     }))
 }
 
+/// The reserved secret-scope org under which forge-connection credentials live
+/// (ADR-0046). A `ForgeConnection` row carries only `credential_ref` — the key
+/// within this scope; the material (GitHub App PEM / Forgejo token) is fetched
+/// here at use-time and never persisted on the connection.
+pub const FORGE_CREDENTIALS_ORG: &str = "_forge";
+
+/// Resolve a [`scarab_forge::ForgeConnection`]'s credential material at
+/// use-time (ADR-0046): the bytes an adapter authenticates with, fetched from
+/// `SecretProvider` under the reserved [`FORGE_CREDENTIALS_ORG`] scope by the
+/// connection's `credential_ref` handle.
+pub async fn connection_credential(
+    secrets: &dyn scarab_secrets::SecretProvider,
+    conn: &scarab_forge::ForgeConnection,
+) -> Result<Vec<u8>, scarab_secrets::SecretError> {
+    let scope = scarab_secrets::SecretScope::Org {
+        org: FORGE_CREDENTIALS_ORG.to_string(),
+    };
+    Ok(secrets.get(&scope, &conn.credential_ref).await?.value)
+}
+
 /// Resolve a step's scoped secrets and prepare them for injection (ADR-0014,
 /// 0013): fetch each `key` at `scope` from `provider`, **register its value with
 /// the log redactor** so it can never appear in stored or streamed logs, and

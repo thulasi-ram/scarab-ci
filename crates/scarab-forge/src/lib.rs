@@ -370,6 +370,120 @@ pub trait ForgePort: Send + Sync {
     ) -> Result<CheckoutCredential, ForgeError>;
 }
 
+/// The kind of forge a [`ForgeConnection`] targets — the vendor discriminator
+/// that selects the adapter crate. Adding a kind = adding an adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeKind {
+    GitHub,
+    Forgejo,
+}
+
+impl ForgeKind {
+    /// The canonical lowercase token (matches the serde representation and the
+    /// stored TEXT column).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ForgeKind::GitHub => "github",
+            ForgeKind::Forgejo => "forgejo",
+        }
+    }
+
+    /// Parse the canonical token back to a kind.
+    pub fn from_str_token(s: &str) -> Option<ForgeKind> {
+        Some(match s {
+            "github" => ForgeKind::GitHub,
+            "forgejo" => ForgeKind::Forgejo,
+            _ => return None,
+        })
+    }
+}
+
+/// A configured link between Scarab and a forge account (ADR-0046, CONTEXT
+/// §4.5): a GitHub App installation and a Forgejo connection are both
+/// instances. It owns a set of [`RepoRef`]s (persisted by the
+/// [`ForgeConnectionStore`]) and is the **seam** that resolves a `RepoRef` to
+/// its governed Project and supplies credentials.
+///
+/// Holds a credential **reference** (`credential_ref`, a `SecretProvider`
+/// handle), never secret bytes — the material (GitHub App PEM / Forgejo
+/// token) is resolved at use-time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeConnection {
+    pub id: String,
+    pub kind: ForgeKind,
+    /// The API base URL — adapter config even for GitHub (GHES), e.g.
+    /// `https://api.github.com` or a self-hosted Forgejo host.
+    pub base_url: String,
+    /// The handle under which the credential material lives in
+    /// `SecretProvider`. Opaque here; resolved at use-time by the composition
+    /// root. Never plaintext.
+    pub credential_ref: String,
+}
+
+/// The result of resolving a [`RepoRef`] through the registry: which
+/// connection (forge, base URL, credential handle) serves it, and which
+/// governed Project owns it (ADR-0046: `ForgeConnection` resolves
+/// `RepoRef` → Project).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedRepo {
+    pub connection: ForgeConnection,
+    /// The owning Project's natural key (org, project) — the project name is
+    /// its repo's forge name, 1:1 in v1.
+    pub org: String,
+    pub project: String,
+}
+
+/// Errors from the connection registry store.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    #[error("registry store error: {0}")]
+    Store(String),
+}
+
+/// Durable store for [`ForgeConnection`]s and the [`RepoRef`]s they own —
+/// the repo/Project **registry** (ADR-0046). Persistence is an adapter
+/// (Postgres); this port keeps the pure crate I/O-free. In v1 a `RepoRef`
+/// (`owner`/`name`) is globally unique across connections, so
+/// [`resolve`](ForgeConnectionStore::resolve) is deterministic; multi-host
+/// coordinate collisions are deferred with multi-forge Orgs.
+#[async_trait]
+pub trait ForgeConnectionStore: Send + Sync {
+    /// Create or replace a connection (upsert by id).
+    async fn put_connection(&self, conn: &ForgeConnection) -> Result<(), RegistryError>;
+
+    /// Fetch a connection by id.
+    async fn get_connection(&self, id: &str) -> Result<Option<ForgeConnection>, RegistryError>;
+
+    /// All configured connections.
+    async fn list_connections(&self) -> Result<Vec<ForgeConnection>, RegistryError>;
+
+    /// Remove a connection (and the repo bindings it owns). Idempotent.
+    async fn delete_connection(&self, id: &str) -> Result<(), RegistryError>;
+
+    /// Bind a repo owned by `connection_id` to its governed Project
+    /// `(org, project)`. Upserts: re-binding an existing repo re-homes it.
+    async fn bind_repo(
+        &self,
+        connection_id: &str,
+        repo: &RepoRef,
+        org: &str,
+        project: &str,
+    ) -> Result<(), RegistryError>;
+
+    /// Remove a repo binding. Idempotent.
+    async fn unbind_repo(&self, connection_id: &str, repo: &RepoRef)
+        -> Result<(), RegistryError>;
+
+    /// The repos a connection owns.
+    async fn repos_of(&self, connection_id: &str) -> Result<Vec<RepoRef>, RegistryError>;
+
+    /// Resolve a forge coordinate to its owning Project + serving connection —
+    /// *which forge, which base URL, which credentials* (ADR-0046). `None` for
+    /// an unregistered repo (its webhooks are dropped).
+    async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError>;
+}
+
 /// The shared **`ForgePort` contract-test suite** (ADR-0046): the behavioural
 /// contract every adapter must pass, runnable against any implementation —
 /// the fakes, the GitHub adapter (live-gated), the Forgejo adapter
