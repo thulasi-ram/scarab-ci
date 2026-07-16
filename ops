@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1784207839,"nonce":"8t2Iw1IDFYrASXlMpk3fgME66CQ=","title":"[ADR-0047] Durability guard tests: crash-interleaving over the full taxonomy","was":"aa6d0b7 (ADR-0047 epic)"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1784207840,"nonce":"MotYduG7jry7p8V2AJ+diLquFsI=","added":["type:test","tracer-bullet","ready-for-agent","area:engine"],"removed":null}]}
