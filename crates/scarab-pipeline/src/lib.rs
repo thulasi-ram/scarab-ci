@@ -325,6 +325,20 @@ pub struct StepSpec {
     /// (ADR-0029); authored + validated here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<String>>,
+    /// Opt-in retry policy (ADR-0020/0047): `retry: { on: failure, max: N }`.
+    ///
+    /// ⚠ **At-least-once:** retry re-runs the whole step at-least-once; enable
+    /// only if the step is idempotent or fenced against a cooperating sink
+    /// (ADR-0021). Non-cooperating side effects (a bare POST, an email) *will*
+    /// double-fire on retry — no fence token can prevent that.
+    ///
+    /// Setting this is the author's assertion "this step is safe to re-run":
+    /// it gates retry of *post-start* failures (post-start infra, step
+    /// verdict, timeout). Never-started infra failures (image pull,
+    /// unschedulable) auto-retry independently of this field — no side effect
+    /// is possible when the process never ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<Retry>,
     /// Authoring-only fan-out modifier; `None` on every compiled step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix: Option<Matrix>,
@@ -383,6 +397,34 @@ impl StepSecurity {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// A step's opt-in retry policy (ADR-0020 syntax, ADR-0047 semantics).
+///
+/// ⚠ **At-least-once warning** (surfaced verbatim to authors): *retry re-runs
+/// the whole step at-least-once; enable only if the step is idempotent or
+/// fenced against a cooperating sink.*
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retry {
+    /// Which failures the author's assertion covers. `failure` (the default
+    /// and only value today) selects every *post-start* class: post-start
+    /// infra, step verdict, and timeout. Never-started infra retries
+    /// automatically regardless.
+    #[serde(default)]
+    pub on: RetryOn,
+    /// The re-run budget: up to `max` additional attempts after the first.
+    /// Bounded by [`validate`] to 1..=10 — a liveness bound, not a safety one
+    /// (ADR-0047): side-effect safety remains at-least-once.
+    pub max: u32,
+}
+
+/// The failure selector of a [`Retry`] policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RetryOn {
+    /// Any post-start failure: post-start infra, step verdict, or timeout.
+    #[default]
+    Failure,
 }
 
 /// The upstream steps this step depends on (its DAG edges).
@@ -1235,6 +1277,13 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                         step.id
                     ));
                 }
+                // A gate executes nothing, so there is nothing to re-run.
+                if step.retry.is_some() {
+                    diagnostics.push(format!(
+                        "step `{}`: a gate step launches nothing — it must not set `retry`",
+                        step.id
+                    ));
+                }
                 // A `timer` gate needs a positive wait; other kinds must not set one.
                 match (kind.as_str(), step.gate_after) {
                     ("timer", None) => diagnostics.push(format!(
@@ -1272,6 +1321,19 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                                 step.id
                             ));
                         }
+                    }
+                }
+                // Retry budget bounds (ADR-0047): a liveness bound. Zero re-runs
+                // is "no retry" (omit the field); an unbounded budget hides
+                // flakiness and burns minutes on doomed code.
+                if let Some(retry) = &step.retry {
+                    if !(1..=10).contains(&retry.max) {
+                        diagnostics.push(format!(
+                            "step `{}`: `retry.max` must be between 1 and 10 (got {}) — retry re-runs \
+                             the whole step at-least-once; enable only if the step is idempotent or \
+                             fenced against a cooperating sink",
+                            step.id, retry.max
+                        ));
                     }
                 }
             }
@@ -2716,6 +2778,109 @@ mod tests {
         match compile_yaml("steps: [ this is : not valid") {
             Err(PipelineError::Parse(_)) => {}
             other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    // --- retry: {on, max} (ADR-0020 syntax, ADR-0047 semantics) -------------
+
+    #[test]
+    fn retry_parses_and_lands_in_the_compiled_ir() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: flaky
+                image: busybox
+                retry: { on: failure, max: 3 }
+            "#,
+        );
+        assert_eq!(
+            ir.steps[0].retry,
+            Some(Retry { on: RetryOn::Failure, max: 3 })
+        );
+    }
+
+    #[test]
+    fn retry_on_defaults_to_failure() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: flaky
+                image: busybox
+                retry: { max: 2 }
+            "#,
+        );
+        assert_eq!(
+            ir.steps[0].retry,
+            Some(Retry { on: RetryOn::Failure, max: 2 })
+        );
+    }
+
+    #[test]
+    fn no_retry_is_the_default() {
+        let ir = compile("steps: [{ id: a, image: busybox }]");
+        assert_eq!(ir.steps[0].retry, None);
+        // And the compiled IR round-trips without a retry key at all.
+        let json = serde_json::to_value(&ir).unwrap();
+        assert!(json["steps"][0].get("retry").is_none());
+    }
+
+    #[test]
+    fn retry_max_bounds_are_validated() {
+        for max in [0, 11] {
+            let yaml = format!(
+                "steps: [{{ id: a, image: busybox, retry: {{ max: {max} }} }}]"
+            );
+            match compile_yaml(&yaml) {
+                Err(PipelineError::Validation(errs)) => {
+                    // The bound error carries the at-least-once warning at the
+                    // opt-in point (ADR-0047: never over-promise safety).
+                    assert!(
+                        errs.iter().any(|e| e.contains("retry.max")
+                            && e.contains("at-least-once")),
+                        "max={max}: {errs:?}"
+                    );
+                }
+                other => panic!("max={max}: expected validation error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn retry_on_a_gate_step_is_rejected() {
+        match compile_yaml(
+            r#"
+            steps:
+              - id: approve
+                gate: manual
+                retry: { max: 1 }
+            "#,
+        ) {
+            Err(PipelineError::Validation(errs)) => {
+                assert!(
+                    errs.iter().any(|e| e.contains("must not set `retry`")),
+                    "{errs:?}"
+                );
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_survives_matrix_expansion() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: test
+                image: busybox
+                retry: { max: 2 }
+                matrix:
+                  dimensions:
+                    os: [linux, mac]
+            "#,
+        );
+        assert_eq!(ir.steps.len(), 2);
+        for step in &ir.steps {
+            assert_eq!(step.retry, Some(Retry { on: RetryOn::Failure, max: 2 }));
         }
     }
 }
