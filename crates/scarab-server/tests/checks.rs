@@ -88,7 +88,10 @@ async fn run_failure_posts_failure_status() {
         .pop()
         .expect("push starts a run");
     let exec = FakeExecutor::new();
-    exec.script_outcome(ExecState::Failed { exit_code: Some(1) });
+    exec.script_outcome(ExecState::Failed {
+        exit_code: Some(1),
+        class: scarab_engine::ports::FailureClass::Step,
+    });
     drive(&db, &clock, &exec, &run).await;
     assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
     // The build step actually failed (sanity).

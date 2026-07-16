@@ -18,7 +18,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, DeleteParams, LogParams, PostParams};
 
-use scarab_engine::ports::{ExecHandle, ExecState, LogChunks};
+use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogChunks};
 use scarab_engine::{ExecError, Executor, StepRun, StepSpec};
 
 /// The step container's name in every step Pod (see [`build_pod`]). The log tail
@@ -556,7 +556,9 @@ pub fn push_fence(image: &str, digest: &str) -> String {
 
 /// Map a Pod's observed status to the domain [`ExecState`]. For a
 /// `restartPolicy: Never` Pod the phase is terminal on completion; the exit code
-/// is lifted from the container's terminated state.
+/// is lifted from the container's terminated state, and every terminal failure
+/// carries a [`FailureClass`] (ADR-0047) — only this adapter sees the execution
+/// conditions around the opaque step, so only it can classify.
 pub fn pod_state(pod: &Pod) -> ExecState {
     let phase = pod
         .status
@@ -565,20 +567,116 @@ pub fn pod_state(pod: &Pod) -> ExecState {
         .unwrap_or("Pending");
     match phase {
         "Succeeded" => ExecState::Succeeded,
-        "Failed" => ExecState::Failed {
-            exit_code: container_exit_code(pod),
-        },
+        "Failed" => {
+            let exit_code = container_exit_code(pod);
+            ExecState::Failed {
+                exit_code,
+                class: classify_failed_pod(pod, exit_code),
+            }
+        }
         "Running" => ExecState::Running,
         // "Unknown" means the node stopped reporting — the backend lost it.
+        // Conservatively post-start (ADR-0047): can't prove it never ran.
         "Unknown" => ExecState::Lost,
         // A Pending Pod is normally still scheduling or pulling — but some
-        // container `waiting` reasons are terminal: the kubelet will never start
-        // the container without a new Pod spec (bad config, unpullable image).
-        // Such a Pod stays Pending forever, hanging the run (and hot-looping the
-        // best-effort log tail). Surface it as a failure so the step fails fast.
-        _ if has_terminal_waiting_reason(pod) => ExecState::Failed { exit_code: None },
+        // states are terminal-while-Pending: a container `waiting` reason the
+        // kubelet can never recover from (bad config, unpullable image), or a
+        // scheduler verdict of Unschedulable. Such a Pod stays Pending forever,
+        // hanging the run. Surface it as a *never-started infra* failure
+        // (ADR-0047): the main process never ran, so no side effect is
+        // possible and auto-retry is safe.
+        _ if has_terminal_waiting_reason(pod) || is_unschedulable(pod) => ExecState::Failed {
+            exit_code: None,
+            class: FailureClass::Infra { never_started: true },
+        },
         _ => ExecState::Pending,
     }
+}
+
+/// Classify a `phase: Failed` Pod (ADR-0047).
+///
+/// Order matters: the kubelet's own verdicts (deadline, eviction, OOM-kill)
+/// take precedence over the container exit code — an OOM-killed container also
+/// reports exit 137, but the *platform* killed it, not the step's own logic.
+fn classify_failed_pod(pod: &Pod, exit_code: Option<i32>) -> FailureClass {
+    let pod_reason = pod.status.as_ref().and_then(|s| s.reason.as_deref());
+    match pod_reason {
+        // activeDeadlineSeconds elapsed — the kubelet killed the Pod.
+        Some("DeadlineExceeded") => return FailureClass::Timeout,
+        // Evicted: infra reclaimed the Pod. Whether a side effect is possible
+        // depends on whether the step's process had started.
+        Some("Evicted") => {
+            return FailureClass::Infra {
+                never_started: !step_container_started(pod),
+            }
+        }
+        _ => {}
+    }
+    // The platform OOM-killed the started process: post-start infra.
+    if step_terminated_reason(pod).as_deref() == Some("OOMKilled") {
+        return FailureClass::Infra { never_started: false };
+    }
+    match exit_code {
+        // The step's own code produced a verdict.
+        Some(_) => FailureClass::Step,
+        // Failed with no exit code: the container never produced a verdict —
+        // infra, with side-effect possibility keyed on whether it started.
+        None => FailureClass::Infra {
+            never_started: !step_container_started(pod),
+        },
+    }
+}
+
+/// True once the step container's main process has (ever) started: a running
+/// or terminated state now, a prior terminated state, or the kubelet's
+/// `started` flag. Point-in-time observations of an evicted/failed Pod retain
+/// these fields, so this distinguishes never-started from post-start.
+fn step_container_started(pod: &Pod) -> bool {
+    let Some(c) = step_container_status(pod) else {
+        return false;
+    };
+    c.started == Some(true)
+        || c.state
+            .as_ref()
+            .is_some_and(|s| s.running.is_some() || s.terminated.is_some())
+        || c.last_state.as_ref().is_some_and(|s| s.terminated.is_some())
+}
+
+/// The step container's terminated `reason` (e.g. `OOMKilled`), current or last.
+fn step_terminated_reason(pod: &Pod) -> Option<String> {
+    let c = step_container_status(pod)?;
+    c.state
+        .as_ref()
+        .and_then(|s| s.terminated.as_ref())
+        .or_else(|| c.last_state.as_ref().and_then(|s| s.terminated.as_ref()))
+        .and_then(|t| t.reason.clone())
+}
+
+/// The step container's status — by name, falling back to the first (mirrors
+/// [`container_exit_code`]'s selection).
+fn step_container_status(pod: &Pod) -> Option<&k8s_openapi::api::core::v1::ContainerStatus> {
+    let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
+    statuses
+        .iter()
+        .find(|c| c.name == STEP_CONTAINER)
+        .or_else(|| statuses.first())
+}
+
+/// True if the scheduler has verdict-ed the Pod `Unschedulable`
+/// (`PodScheduled=False`). The Pod would otherwise sit Pending indefinitely;
+/// ADR-0047 treats it as never-started infra churn to self-heal via bounded
+/// auto-retry.
+fn is_unschedulable(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|c| {
+            c.type_ == "PodScheduled"
+                && c.status == "False"
+                && c.reason.as_deref() == Some("Unschedulable")
+        })
 }
 
 /// True if any container (step or native sidecar) is stuck in a `waiting` state
@@ -980,9 +1078,13 @@ mod tests {
             pod_state(&with_phase("Succeeded", Some(0))),
             ExecState::Succeeded
         );
+        // A container exit code is the step's own verdict (ADR-0047).
         assert_eq!(
             pod_state(&with_phase("Failed", Some(1))),
-            ExecState::Failed { exit_code: Some(1) }
+            ExecState::Failed {
+                exit_code: Some(1),
+                class: FailureClass::Step,
+            }
         );
         assert_eq!(pod_state(&with_phase("Unknown", None)), ExecState::Lost);
         // No status yet -> not scheduled -> Pending.
@@ -1025,9 +1127,14 @@ mod tests {
             "ErrImagePull",
             "ImagePullBackOff",
         ] {
+            // The main process never ran: never-started infra (ADR-0047),
+            // safe to auto-retry.
             assert_eq!(
                 pod_state(&waiting(reason)),
-                ExecState::Failed { exit_code: None },
+                ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Infra { never_started: true },
+                },
                 "{reason} should be terminal"
             );
         }
@@ -1035,5 +1142,143 @@ mod tests {
         // A benign transient wait (e.g. still pulling) stays Pending.
         assert_eq!(pod_state(&waiting("ContainerCreating")), ExecState::Pending);
         assert_eq!(pod_state(&waiting("PodInitializing")), ExecState::Pending);
+    }
+
+    /// One fixture per ADR-0047 classification rule.
+    mod failure_classification {
+        use super::*;
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStatus,
+            PodCondition, PodStatus,
+        };
+
+        fn class_of(pod: &Pod) -> FailureClass {
+            match pod_state(pod) {
+                ExecState::Failed { class, .. } => class,
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+
+        fn failed_pod(reason: Option<&str>, container: Option<ContainerStatus>) -> Pod {
+            Pod {
+                status: Some(PodStatus {
+                    phase: Some("Failed".into()),
+                    reason: reason.map(String::from),
+                    container_statuses: container.map(|c| vec![c]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn terminated(exit_code: i32, reason: Option<&str>) -> ContainerStatus {
+            ContainerStatus {
+                name: STEP_CONTAINER.into(),
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code,
+                        reason: reason.map(String::from),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn deadline_exceeded_is_timeout() {
+            let pod = failed_pod(Some("DeadlineExceeded"), Some(terminated(137, None)));
+            assert_eq!(class_of(&pod), FailureClass::Timeout);
+        }
+
+        #[test]
+        fn oom_kill_is_post_start_infra_despite_exit_code() {
+            let pod = failed_pod(None, Some(terminated(137, Some("OOMKilled"))));
+            assert_eq!(
+                class_of(&pod),
+                FailureClass::Infra { never_started: false },
+                "the platform killed the process — not the step's verdict"
+            );
+        }
+
+        #[test]
+        fn evicted_while_running_is_post_start_infra() {
+            // An evicted Pod whose step container had started (terminated state
+            // exists) — a side effect may have occurred.
+            let pod = failed_pod(Some("Evicted"), Some(terminated(137, None)));
+            assert_eq!(class_of(&pod), FailureClass::Infra { never_started: false });
+        }
+
+        #[test]
+        fn evicted_before_start_is_never_started_infra() {
+            // Evicted with no container ever started: no side effect possible.
+            let pod = failed_pod(Some("Evicted"), None);
+            assert_eq!(class_of(&pod), FailureClass::Infra { never_started: true });
+        }
+
+        #[test]
+        fn failed_without_verdict_or_start_is_never_started_infra() {
+            let pod = failed_pod(None, None);
+            assert_eq!(class_of(&pod), FailureClass::Infra { never_started: true });
+        }
+
+        #[test]
+        fn running_container_counts_as_started() {
+            // Failed phase but the container status still shows `running`
+            // (point-in-time race): post-start.
+            let container = ContainerStatus {
+                name: STEP_CONTAINER.into(),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let pod = failed_pod(Some("Evicted"), Some(container));
+            assert_eq!(class_of(&pod), FailureClass::Infra { never_started: false });
+        }
+
+        #[test]
+        fn unschedulable_is_never_started_infra() {
+            let pod = Pod {
+                status: Some(PodStatus {
+                    phase: Some("Pending".into()),
+                    conditions: Some(vec![PodCondition {
+                        type_: "PodScheduled".into(),
+                        status: "False".into(),
+                        reason: Some("Unschedulable".into()),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                pod_state(&pod),
+                ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Infra { never_started: true },
+                }
+            );
+        }
+
+        #[test]
+        fn scheduled_pending_pod_stays_pending() {
+            // PodScheduled=True (or no verdict yet) must NOT fail the step.
+            let pod = Pod {
+                status: Some(PodStatus {
+                    phase: Some("Pending".into()),
+                    conditions: Some(vec![PodCondition {
+                        type_: "PodScheduled".into(),
+                        status: "True".into(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(pod_state(&pod), ExecState::Pending);
+        }
     }
 }

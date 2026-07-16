@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use tokio::process::{Child, Command};
 
-use scarab_engine::ports::{ExecHandle, ExecState};
+use scarab_engine::ports::{ExecHandle, ExecState, FailureClass};
 use scarab_engine::{ExecError, Executor, StepRun, StepSpec};
 
 /// A tracked child: still running, or finished with an observed state.
@@ -80,14 +80,22 @@ impl Default for LocalExecutor {
     }
 }
 
-/// Map a finished process's exit status to an [`ExecState`].
+/// Map a finished process's exit status to an [`ExecState`], classifying the
+/// failure (ADR-0047): a non-zero exit code is the step's own verdict (`Step`);
+/// a signal kill (`code() == None` on unix) means the platform — not the step's
+/// logic — ended a *started* process, so it is post-start `Infra`.
 fn state_of(status: std::process::ExitStatus) -> ExecState {
     if status.success() {
         ExecState::Succeeded
     } else {
-        ExecState::Failed {
-            exit_code: status.code(),
-        }
+        let exit_code = status.code();
+        let class = match exit_code {
+            Some(_) => FailureClass::Step,
+            None => FailureClass::Infra {
+                never_started: false,
+            },
+        };
+        ExecState::Failed { exit_code, class }
     }
 }
 
@@ -179,10 +187,16 @@ impl Executor for LocalExecutor {
         let mut procs = self.procs.lock().unwrap();
         if let Some(Proc::Running(child)) = procs.get_mut(&handle.0) {
             // Best-effort kill; `kill_on_drop` also reaps if the slot is dropped.
+            // A cancel is the platform ending a started process (ADR-0047).
             let _ = child.start_kill();
             procs.insert(
                 handle.0.clone(),
-                Proc::Done(ExecState::Failed { exit_code: None }),
+                Proc::Done(ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Infra {
+                        never_started: false,
+                    },
+                }),
             );
         }
         Ok(())

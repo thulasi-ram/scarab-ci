@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ports::ExecState;
+use crate::ports::{ExecState, FailureClass};
 use crate::{
     Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, ExecError,
     Executor, FailureKind, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus,
@@ -632,16 +632,21 @@ impl<'a> Scheduler<'a> {
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
-                ExecState::Failed { .. } => {
-                    // A non-zero exit is a *step* failure (not retried by default).
-                    self.finalize_step(
-                        &run,
-                        &step,
-                        &attempt,
-                        StepStatus::Failed,
-                        Some(FailureKind::Step),
-                    )
-                    .await?;
+                ExecState::Failed { class, .. } => {
+                    // The adapter classified the failure (ADR-0047); record its
+                    // verdict verbatim — the engine never inspects backend
+                    // state. Retry policy over the class (auto for
+                    // never-started infra, `retry:`-gated otherwise) is the
+                    // retry-loop slice's job.
+                    let kind = match class {
+                        FailureClass::Infra { never_started } => {
+                            FailureKind::Infra { never_started }
+                        }
+                        FailureClass::Step => FailureKind::Step,
+                        FailureClass::Timeout => FailureKind::Timeout,
+                    };
+                    self.finalize_step(&run, &step, &attempt, StepStatus::Failed, Some(kind))
+                        .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
                 // Not terminal yet (or infra-lost): leave the intent for a later

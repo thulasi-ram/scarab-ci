@@ -22,14 +22,40 @@ pub struct Lease {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecHandle(pub String);
 
+/// Why a launched execution failed, as classified by the **executor adapter**
+/// (ADR-0047). A step is an opaque black box (ADR-0002), so only the adapter —
+/// which alone observes the execution conditions around the box — can classify;
+/// the pure engine consumes the class and never inspects backend state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailureClass {
+    /// The platform failed the step, not the step's own code (image pull,
+    /// unschedulable, eviction, OOM-kill, node loss). `never_started: true`
+    /// means the main process never ran ⇒ **no side effect is possible** ⇒
+    /// safe to auto-retry without any author assertion (ADR-0047).
+    Infra { never_started: bool },
+    /// The step's own code produced a failing verdict (non-zero exit).
+    Step,
+    /// The step exceeded its deadline (kubelet `DeadlineExceeded`, local
+    /// kill-timer). Post-start by definition.
+    Timeout,
+}
+
 /// Observed state of a launched execution when polled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecState {
     Pending,
     Running,
     Succeeded,
-    Failed { exit_code: Option<i32> },
-    /// The backend lost the execution (node died, pod evicted…).
+    /// Terminal failure, classified by the adapter (ADR-0047). `exit_code` is
+    /// the step container's exit code when one exists (`Step` failures); infra
+    /// failures that never produced a verdict carry `None`.
+    Failed {
+        exit_code: Option<i32>,
+        class: FailureClass,
+    },
+    /// The backend lost the execution (vanished Pod, node stopped reporting).
+    /// Conservatively treated as post-start — it cannot be proven the process
+    /// never ran (ADR-0047).
     Lost,
 }
 

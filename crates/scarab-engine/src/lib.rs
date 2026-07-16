@@ -122,14 +122,23 @@ impl ConcurrencyPolicy {
     }
 }
 
-/// Classifies a failure so the engine can decide retry vs. dead-letter.
+/// Classifies a recorded attempt failure so the engine can decide retry vs.
+/// dead-letter (ADR-0020/0047). Mirrors the executor port's
+/// [`ports::FailureClass`] — the adapter classifies, the engine consumes.
 ///
-/// `Infra` failures (node died, image pull, network) are retried on fresh
-/// infra; `Step` failures (the user's command exited non-zero) are not.
+/// - `Infra { never_started: true }` — the platform failed the step before its
+///   main process ever ran (image pull, unschedulable, evicted-while-Pending):
+///   no side effect is possible, so bounded auto-retry is always safe.
+/// - `Infra { never_started: false }` — the platform killed a started process
+///   (OOM, eviction, node loss): a side effect may exist; retry only on the
+///   author's `retry:` assertion (ADR-0047, wired by the retry-loop slice).
+/// - `Step` — the user's command exited non-zero; never auto-retried.
+/// - `Timeout` — the step exceeded its deadline; post-start by definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureKind {
-    Infra,
+    Infra { never_started: bool },
     Step,
+    Timeout,
 }
 
 // ---------------------------------------------------------------------------
@@ -582,9 +591,14 @@ impl StepRun {
     ///
     /// Outcome — and hence the *bounded* retry that guarantees forward progress:
     /// - success (`None`)            → `Succeeded`.
-    /// - `Step` failure              → `Failed` (user command; never retried).
-    /// - `Infra` failure, attempts left (`< max_attempts`) → back to `Ready` for a retry.
-    /// - `Infra` failure, attempts exhausted               → `Failed` (poison; caller dead-letters the run).
+    /// - `Step` / `Timeout` failure  → `Failed` (a verdict was produced; retry
+    ///   is only ever the author's opt-in `retry:` assertion, ADR-0047).
+    /// - never-started `Infra`, attempts left (`< max_attempts`) → back to
+    ///   `Ready` for an auto-retry (no side effect was possible).
+    /// - never-started `Infra`, attempts exhausted → `Failed` (poison; caller
+    ///   dead-letters the run).
+    /// - post-start `Infra` → `Failed` (a side effect may exist; assertion-gated
+    ///   retry lands with the ADR-0047 retry-loop slice).
     pub fn finish_attempt(
         &mut self,
         failure: Option<FailureKind>,
@@ -607,14 +621,18 @@ impl StepRun {
         let from = StepStatus::Running;
         let to = match failure {
             None => StepStatus::Succeeded,
-            Some(FailureKind::Step) => StepStatus::Failed,
-            Some(FailureKind::Infra) => {
+            Some(FailureKind::Step | FailureKind::Timeout) => StepStatus::Failed,
+            Some(FailureKind::Infra { never_started: true }) => {
                 if (self.attempts.len() as u32) < max_attempts {
                     StepStatus::Ready
                 } else {
                     StepStatus::Failed
                 }
             }
+            // A started process may have side-effected: retry only on the
+            // author's `retry:` assertion (ADR-0047; wired by the retry-loop
+            // slice). Until then a post-start infra failure is terminal.
+            Some(FailureKind::Infra { never_started: false }) => StepStatus::Failed,
         };
         self.status = to;
         Ok(vec![

@@ -1271,15 +1271,21 @@ fn step_status_from_str(s: String) -> Result<StepStatus, DbError> {
 
 fn failure_str(f: FailureKind) -> &'static str {
     match f {
-        FailureKind::Infra => "infra",
+        // "infra" keeps its pre-ADR-0047 spelling (post-start is the
+        // conservative reading of historical rows).
+        FailureKind::Infra { never_started: false } => "infra",
+        FailureKind::Infra { never_started: true } => "infra-never-started",
         FailureKind::Step => "step",
+        FailureKind::Timeout => "timeout",
     }
 }
 
 fn failure_from_str(s: &str) -> Result<FailureKind, DbError> {
     match s {
-        "infra" => Ok(FailureKind::Infra),
+        "infra" => Ok(FailureKind::Infra { never_started: false }),
+        "infra-never-started" => Ok(FailureKind::Infra { never_started: true }),
         "step" => Ok(FailureKind::Step),
+        "timeout" => Ok(FailureKind::Timeout),
         other => Err(DbError::Other(format!("unknown failure kind {other:?}"))),
     }
 }

@@ -3,7 +3,7 @@
 //! relaunching a fence re-attaches, an unknown handle is Lost, and cancel kills
 //! a running child. No Docker/k8s.
 
-use scarab_engine::ports::ExecState;
+use scarab_engine::ports::{ExecState, FailureClass};
 use scarab_engine::{Executor, RunId, StepId, StepRun, StepSpec};
 use scarab_executor_local::LocalExecutor;
 
@@ -49,7 +49,33 @@ async fn nonzero_exit_command_fails_with_its_code() {
     let exec = LocalExecutor::new();
     let s = step("r1", "boom");
     let handle = exec.launch(&s, &spec(&["sh", "-c", "exit 3"])).await.unwrap();
-    assert_eq!(drive(&exec, &handle).await, ExecState::Failed { exit_code: Some(3) });
+    // A non-zero exit is the step's own verdict: class Step (ADR-0047).
+    assert_eq!(
+        drive(&exec, &handle).await,
+        ExecState::Failed {
+            exit_code: Some(3),
+            class: FailureClass::Step,
+        }
+    );
+}
+
+/// ADR-0047: a signal kill has no exit code — the platform ended a started
+/// process, so the local executor classifies it post-start `Infra`.
+#[tokio::test]
+async fn signal_kill_is_post_start_infra() {
+    let exec = LocalExecutor::new();
+    let s = step("r1", "sigkill");
+    let handle = exec
+        .launch(&s, &spec(&["sh", "-c", "kill -9 $$"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        drive(&exec, &handle).await,
+        ExecState::Failed {
+            exit_code: None,
+            class: FailureClass::Infra { never_started: false },
+        }
+    );
 }
 
 #[tokio::test]
