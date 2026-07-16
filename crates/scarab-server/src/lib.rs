@@ -1544,7 +1544,7 @@ async fn persist_run_from_ir(
             run,
             &scarab_engine::DeployContext {
                 org: repo.owner.clone(),
-                repo: repo.name.clone(),
+                project: repo.name.clone(),
                 environment: env_name.clone(),
                 // ADR-0037: persist the *symbolic* ref, because gate-approval-time
                 // admission re-runs `ProtectionRules::admits` (allowed_refs +
@@ -2009,7 +2009,7 @@ async fn approve_gate(
     let ctx = st.db.run_deploy_context(&run).await.map_err(ApiError::Db)?;
     let rules = match (&ctx, st.environments.as_ref()) {
         (Some(c), Some(store)) => store
-            .get_environment(&c.org, &c.repo, &c.environment)
+            .get_environment(&c.org, &c.project, &c.environment)
             .await
             .map_err(|e| ApiError::BadRequest(e.to_string()))?
             .map(|e| e.protection),
@@ -2043,7 +2043,7 @@ async fn approve_gate(
         store
             .record_deployment(&scarab_project::Deployment {
                 org: c.org.clone(),
-                repo: c.repo.clone(),
+                project: c.project.clone(),
                 environment: c.environment.clone(),
                 git_ref: c.git_ref.clone(),
                 run: run.0.clone(),

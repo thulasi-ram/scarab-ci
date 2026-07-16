@@ -91,7 +91,7 @@ impl EnvironmentStore for FakeEnvironments {
             .lock()
             .unwrap()
             .iter()
-            .filter(|d| d.org == org && d.repo == repo && d.environment == environment)
+            .filter(|d| d.org == org && d.project == repo && d.environment == environment)
             .cloned()
             .collect())
     }

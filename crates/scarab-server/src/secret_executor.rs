@@ -63,9 +63,11 @@ impl Executor for SecretInjectingExecutor {
         let Some(ctx) = ctx else {
             return self.inner.launch(step, spec).await;
         };
+        // The secret scope's `repo` is the Project's name (its repo's forge
+        // name, 1:1 in v1 — ADR-0046).
         let scope = SecretScope::Environment {
             org: ctx.org,
-            repo: ctx.repo,
+            repo: ctx.project,
             environment: ctx.environment,
         };
         // Resolve (with inheritance), register each value with the redactor, and

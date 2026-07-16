@@ -7,12 +7,21 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-/// A repository coordinate on some forge.
+/// A **forge coordinate** — `{owner, name}` as the forge addresses a
+/// repository (ADR-0046, CONTEXT §4.5). External and mutable (a forge
+/// rename/transfer changes it); carried by `Event`/`Status`; the *only*
+/// concept named "Repo". Resolved to a governed `Project` via a
+/// `ForgeConnection`. The forge it lives on is bound by the connection
+/// (registry ticket), not carried here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Repo {
+pub struct RepoRef {
     pub owner: String,
     pub name: String,
 }
+
+/// Transitional alias while the `ForgePort` signatures migrate to [`RepoRef`]
+/// (the agnostic-port refactor ticket removes it).
+pub type Repo = RepoRef;
 
 /// A resolved commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

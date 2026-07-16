@@ -155,7 +155,7 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
 
     let ctx = DeployContext {
         org: "acme".into(),
-        repo: "web".into(),
+        project: "web".into(),
         environment: "prod".into(),
         git_ref: "refs/heads/main".into(),
         locked_out: false,

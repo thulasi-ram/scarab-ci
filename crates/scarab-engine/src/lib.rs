@@ -303,7 +303,11 @@ pub struct LogChunkMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployContext {
     pub org: String,
-    pub repo: String,
+    /// The owning Project's name — its repo's forge name, 1:1 in v1
+    /// (ADR-0046: a Project IS the governed repo). Keys the protection-rule
+    /// lookup at admission.
+    #[serde(alias = "repo")]
+    pub project: String,
     pub environment: String,
     pub git_ref: String,
     /// Whether this run is locked out of secrets (a fork PR, ADR-0015/0037). When

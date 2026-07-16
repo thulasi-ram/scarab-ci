@@ -70,7 +70,7 @@ async fn injects_env_scoped_secret_with_repo_inheritance() {
         &RunId("r1".into()),
         &DeployContext {
             org: "acme".into(),
-            repo: "web".into(),
+            project: "web".into(),
             environment: "prod".into(),
             git_ref: "refs/heads/main".into(),
             locked_out: false,
@@ -109,7 +109,7 @@ async fn fork_pr_lockout_injects_no_secrets() {
         &RunId("r1".into()),
         &DeployContext {
             org: "acme".into(),
-            repo: "web".into(),
+            project: "web".into(),
             environment: "prod".into(),
             git_ref: "refs/heads/main".into(),
             locked_out: true, // fork PR
