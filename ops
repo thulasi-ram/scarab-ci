@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1784207838,"nonce":"qMLbeZEfROseN9xSuKMa60MTqBQ=","title":"[ADR-0047] Executor FailureClass {Infra,Step,Timeout} + k8s/local classification","was":"aa6d0b7 (ADR-0047 epic)"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1784207839,"nonce":"pVq51lAqoK9uXSKmENpn5N71gpI=","added":["type:feat","tracer-bullet","ready-for-agent","area:executor"],"removed":null}]}
