@@ -232,6 +232,10 @@ pub struct StepDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object)]
     pub retry: Option<scarab_pipeline::Retry>,
+    /// Per-step execution deadline in seconds (ADR-0047). Absent = the global
+    /// default (1h). Exceeding it is a `Timeout` failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -556,6 +560,7 @@ async fn create_run(
             run_as_root: admitted.run_as_root,
             add_capabilities: admitted.add_capabilities,
             privileged: admitted.privileged,
+            timeout_seconds: step.timeout,
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -1616,6 +1621,7 @@ async fn persist_run_from_ir(
                 run_as_root: admitted.run_as_root,
                 add_capabilities: admitted.add_capabilities,
                 privileged: admitted.privileged,
+                timeout_seconds: step.timeout,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;

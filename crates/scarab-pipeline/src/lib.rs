@@ -325,6 +325,13 @@ pub struct StepSpec {
     /// (ADR-0029); authored + validated here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<String>>,
+    /// Per-step execution deadline in **seconds** (ADR-0047). Absent = the
+    /// global default (1h). Enforced primarily by the backend (kubelet
+    /// `activeDeadlineSeconds` / the local kill-timer — it survives
+    /// control-plane downtime), with an engine-side backstop. Exceeding it is
+    /// a `Timeout` failure: terminal unless the step opted into `retry:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
     /// Opt-in retry policy (ADR-0020/0047): `retry: { on: failure, max: N }`.
     ///
     /// ⚠ **At-least-once:** retry re-runs the whole step at-least-once; enable
@@ -1284,6 +1291,14 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                         step.id
                     ));
                 }
+                // A gate has no execution to deadline (`gate_after` covers
+                // timer gates; gate *expiry* is a separate ADR-0047 concern).
+                if step.timeout.is_some() {
+                    diagnostics.push(format!(
+                        "step `{}`: a gate step launches nothing — it must not set `timeout`",
+                        step.id
+                    ));
+                }
                 // A `timer` gate needs a positive wait; other kinds must not set one.
                 match (kind.as_str(), step.gate_after) {
                     ("timer", None) => diagnostics.push(format!(
@@ -1322,6 +1337,13 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                             ));
                         }
                     }
+                }
+                // A zero deadline would kill every step instantly (ADR-0047).
+                if step.timeout == Some(0) {
+                    diagnostics.push(format!(
+                        "step `{}`: `timeout` must be greater than zero seconds",
+                        step.id
+                    ));
                 }
                 // Retry budget bounds (ADR-0047): a liveness bound. Zero re-runs
                 // is "no retry" (omit the field); an unbounded budget hides

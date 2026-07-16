@@ -31,6 +31,7 @@
 //! | `SCARAB_OIDC_SIGNING_KEY_FILE` | env | PKCS#8 RSA PEM the issuer signs with — **required** when the issuer is enabled (persistent across restarts/replicas) |
 //! | `SCARAB_MASTER_KEY` | env | base64 32-byte KEK for envelope encryption (ADR-0014) — **required** unless `SCARAB_DEV_INSECURE=1` |
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
+//! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //!
 //! Step-runtime env (`SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`/
 //! `SCARAB_RESULTS*`/`SCARAB_PARAM_*`) is injected *into* step containers by
@@ -190,6 +191,10 @@ pub struct Config {
     /// `SCARAB_DEV_INSECURE=1`: the one loud escape hatch, for *security*
     /// hard-fails only (ADR-0048). Never the silent default.
     pub dev_insecure: bool,
+    /// Global default step deadline in seconds (ADR-0047): applied when a step
+    /// declares no `timeout:`. A default is mandatory — it closes the
+    /// "hung Pod wedges the run forever" hole.
+    pub step_timeout_secs: u32,
 }
 
 /// A configuration the process must refuse to start under, with a message
@@ -242,6 +247,12 @@ pub enum ConfigError {
          available) or set SCARAB_DEV_INSECURE=1 (dev only — every caller is Owner)."
     )]
     NoAuthenticator,
+
+    #[error(
+        "SCARAB_STEP_TIMEOUT_SECS is set but invalid — want a positive integer number \
+         of seconds (the global default step deadline, ADR-0047)."
+    )]
+    InvalidStepTimeout,
 }
 
 impl Config {
@@ -317,6 +328,15 @@ impl Config {
             return Err(ConfigError::NoAuthenticator);
         }
 
+        let step_timeout_secs = match env("SCARAB_STEP_TIMEOUT_SECS").filter(|v| !v.is_empty()) {
+            Some(v) => v
+                .parse::<u32>()
+                .ok()
+                .filter(|s| *s > 0)
+                .ok_or(ConfigError::InvalidStepTimeout)?,
+            None => 3_600,
+        };
+
         let results_egress = env("SCARAB_RESULTS_TOKEN_SECRET").map(|secret| ResultsEgressConfig {
             token_secret: secret.into_bytes(),
             api_url: env("SCARAB_RESULTS_API_URL").unwrap_or_else(|| "http://scarab-server".into()),
@@ -337,6 +357,7 @@ impl Config {
             oidc,
             master_key,
             dev_insecure,
+            step_timeout_secs,
         })
     }
 
@@ -386,6 +407,10 @@ impl Config {
                 self.executor,
                 self.namespace,
                 if self.role.runs_driver() { "on" } else { "off — role does not drive" },
+            ),
+            format!(
+                "step timeout default: {}s (ADR-0047; per-step `timeout:` overrides)",
+                self.step_timeout_secs,
             ),
             format!(
                 "secrets store: enabled (envelope encryption, ADR-0014; KEK {})",

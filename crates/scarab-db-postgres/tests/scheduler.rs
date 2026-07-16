@@ -23,6 +23,7 @@ fn spec() -> StepSpec {
         run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
+        timeout_seconds: None,
     }
 }
 
@@ -154,6 +155,7 @@ async fn named_result_flows_into_a_downstream_interpolation() {
         run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
+        timeout_seconds: None,
     };
     db.create_step_run(
         &run,

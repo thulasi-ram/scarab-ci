@@ -65,6 +65,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
+        timeout_seconds: None,
     };
 
     // launch, then launch again — the second call must re-attach, not relaunch.
@@ -89,6 +90,67 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
     exec.cancel(&h1).await.expect("cancel cleans up the pod");
 }
 
+/// Live step-timeout acceptance (ADR-0047): a sleeping step whose `timeout:`
+/// is 5s is killed by the kubelet (`activeDeadlineSeconds`) and surfaces as a
+/// classified `Timeout` failure. `#[ignore]`d + gated on SCARAB_TEST_KUBE.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn sleeping_step_is_killed_at_its_deadline() {
+    let Some(ns) = opted_in() else { return };
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    let exec = K8sExecutor::with_client(ns, client);
+    let step = StepRun {
+        run: RunId("run-timeout".into()),
+        step: StepId("sleeper".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let spec = StepSpec {
+        image: "busybox:latest".into(),
+        command: vec!["sh".into(), "-c".into(), "sleep 300".into()],
+        env: vec![],
+        secrets: vec![],
+        // busybox runs as root; without the self-service grant the hardened
+        // baseline rejects the container (CreateContainerConfigError) and the
+        // step never starts — this test needs the sleep to actually run.
+        run_as_root: true,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(5),
+    };
+
+    let h = exec.launch(&step, &spec).await.expect("launch");
+
+    // The kubelet enforces the deadline; DeadlineExceeded classifies Timeout.
+    let mut terminal = None;
+    for _ in 0..90 {
+        match exec.poll(&h).await.expect("poll") {
+            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
+                terminal = Some(s);
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    match terminal {
+        Some(ExecState::Failed { class, .. }) => assert_eq!(
+            class,
+            scarab_engine::ports::FailureClass::Timeout,
+            "DeadlineExceeded must classify as Timeout"
+        ),
+        other => panic!("expected a Timeout failure, got {other:?}"),
+    }
+
+    exec.cancel(&h).await.expect("cancel cleans up the pod");
+}
+
 /// Live log tail (ADR-0013): `log_stream` follows a Pod's stdout and yields the
 /// step's output. `#[ignore]`d + gated on SCARAB_TEST_KUBE — needs the dev kind
 /// cluster. The chunking/drain loop itself is unit-tested cluster-free in
@@ -110,6 +172,7 @@ async fn log_stream_tails_pod_stdout() {
         run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
+        timeout_seconds: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");

@@ -127,7 +127,7 @@ async fn environment_management_crud_over_repo_scoped_routes() {
 /// admit the accumulated approver; otherwise the run stays suspended.
 async fn drive_to_gate(pg: &Arc<PostgresDb>, run: &RunId) {
     let (a, g, b) = (StepId("a".into()), StepId("gate".into()), StepId("b".into()));
-    let spec = StepSpec { image: "busybox".into(), command: vec!["true".into()], env: vec![], secrets: vec![], run_as_root: false, add_capabilities: vec![], privileged: false };
+    let spec = StepSpec { image: "busybox".into(), command: vec!["true".into()], env: vec![], secrets: vec![], run_as_root: false, add_capabilities: vec![], privileged: false, timeout_seconds: None };
     pg.create_run(run, 1, 1, Timestamp(0)).await.unwrap();
     pg.create_step_run(run, &a, Some(&spec), &[], Timestamp(0)).await.unwrap();
     pg.create_step_run(run, &g, None, std::slice::from_ref(&a), Timestamp(0)).await.unwrap();

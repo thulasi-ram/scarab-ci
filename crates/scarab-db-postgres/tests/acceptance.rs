@@ -60,6 +60,7 @@ async fn compile_and_create(db: &PostgresDb, run: &RunId) -> Vec<scarab_pipeline
             run_as_root: false,
             add_capabilities: vec![],
             privileged: false,
+        timeout_seconds: None,
         };
         let needs: Vec<StepId> = step.needs.0.iter().map(|n| StepId(n.clone())).collect();
         db.create_step_run(run, &StepId(step.id.clone()), Some(&spec), &needs, Timestamp(0))

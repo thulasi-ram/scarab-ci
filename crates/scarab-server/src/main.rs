@@ -128,10 +128,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let executor: Option<Arc<dyn Executor>> = match config.executor {
             ExecutorKind::Local => {
                 tracing::info!("using the local (host-process) executor — dev/CLI backend");
-                Some(Arc::new(LocalExecutor::new()))
+                Some(Arc::new(
+                    LocalExecutor::new().with_default_step_timeout_secs(config.step_timeout_secs),
+                ))
             }
             ExecutorKind::K8s => match K8sExecutor::connect(config.namespace.clone()).await {
                 Ok(mut exec) => {
+                    exec = exec.with_default_step_timeout_secs(config.step_timeout_secs);
                     if let Some(egress) = results_egress.clone() {
                         exec = exec.with_results_egress(egress);
                         tracing::info!("results egress sidecar enabled (ADR-0042)");
@@ -172,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "scarab-server".to_string(),
                 Duration::from_millis(500),
                 visibility_ms,
+                (config.step_timeout_secs as i64).saturating_mul(1000),
             );
             tracing::info!("converged driver started");
         }

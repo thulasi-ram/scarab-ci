@@ -55,6 +55,9 @@ pub struct K8sExecutor {
     client: Option<kube::Client>,
     namespace: String,
     results_egress: Option<ResultsEgress>,
+    /// Global default step deadline in seconds (ADR-0047), applied when a step
+    /// declares no `timeout:`. Default 1h.
+    default_step_timeout_secs: u32,
 }
 
 impl K8sExecutor {
@@ -63,6 +66,7 @@ impl K8sExecutor {
             client: None,
             namespace: namespace.into(),
             results_egress: None,
+            default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
         }
     }
 
@@ -71,12 +75,19 @@ impl K8sExecutor {
             client: Some(client),
             namespace: namespace.into(),
             results_egress: None,
+            default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
         }
     }
 
     /// Enable result capture via the per-Pod egress sidecar (ADR-0042).
     pub fn with_results_egress(mut self, egress: ResultsEgress) -> Self {
         self.results_egress = Some(egress);
+        self
+    }
+
+    /// Override the global default step deadline (ADR-0047).
+    pub fn with_default_step_timeout_secs(mut self, secs: u32) -> Self {
+        self.default_step_timeout_secs = secs;
         self
     }
 
@@ -112,7 +123,14 @@ impl Executor for K8sExecutor {
             return Ok(ExecHandle(name));
         }
 
-        let pod = build_pod(&name, &self.namespace, step, spec, self.results_egress.as_ref());
+        let pod = build_pod(
+            &name,
+            &self.namespace,
+            step,
+            spec,
+            self.results_egress.as_ref(),
+            self.default_step_timeout_secs,
+        );
         match pods.create(&PostParams::default(), &pod).await {
             Ok(_) => Ok(ExecHandle(name)),
             // A concurrent launcher won the race — the Pod now exists, which is
@@ -228,6 +246,11 @@ pub fn pod_name(step: &StepRun) -> String {
     format!("scarab-{slug}-{hash:08x}")
 }
 
+/// The global default step deadline in seconds (ADR-0047): mandatory, so a
+/// hung Pod can never wedge a run forever. Overridable per step (`timeout:`)
+/// and globally (`SCARAB_STEP_TIMEOUT_SECS`).
+pub const DEFAULT_STEP_TIMEOUT_SECS: u32 = 3_600;
+
 /// Absolute in-Pod path of the shared results directory (ADR-0008/0042). The
 /// step writes `<name>.json` files here; the egress sidecar reads them.
 const RESULTS_MOUNT_PATH: &str = "/scarab/results";
@@ -247,6 +270,7 @@ pub fn build_pod(
     step: &StepRun,
     spec: &StepSpec,
     egress: Option<&ResultsEgress>,
+    default_timeout_secs: u32,
 ) -> Pod {
     let attempt = step
         .current_attempt()
@@ -338,6 +362,12 @@ pub fn build_pod(
             init_containers,
             volumes,
             restart_policy: Some("Never".to_string()),
+            // Step deadline (ADR-0047): enforced by the kubelet, so a hung Pod
+            // dies even if the control plane is down. Exceeding it surfaces as
+            // `DeadlineExceeded` → the `Timeout` failure class.
+            active_deadline_seconds: Some(
+                spec.timeout_seconds.unwrap_or(default_timeout_secs) as i64
+            ),
             ..Default::default()
         }),
         ..Default::default()
@@ -569,6 +599,25 @@ pub fn pod_state(pod: &Pod) -> ExecState {
         "Succeeded" => ExecState::Succeeded,
         "Failed" => {
             let exit_code = container_exit_code(pod);
+            // A just-killed Pod can surface `phase: Failed` BEFORE the kubelet
+            // finishes writing the verdict — no status reason, no terminated
+            // container state (observed on k3s enforcing
+            // activeDeadlineSeconds). Classifying that snapshot would misread
+            // a timeout as never-started infra. A Failed phase never reverts,
+            // so defer: report Pending and classify on the next poll, when the
+            // settled status (e.g. `reason: DeadlineExceeded`) has landed. The
+            // engine's timeout backstop bounds the pathological
+            // never-settling case.
+            let reason = pod.status.as_ref().and_then(|s| s.reason.as_deref());
+            // `ContainerStatusUnknown` means the kubelet could not locate the
+            // container when the Pod was killed — its exit code (137) is
+            // synthesized, not the step's verdict.
+            let synthetic =
+                step_terminated_reason(pod).as_deref() == Some("ContainerStatusUnknown");
+            let no_verdict = exit_code.is_none() && step_terminated_reason(pod).is_none();
+            if reason.is_none() && (no_verdict || synthetic) {
+                return ExecState::Pending;
+            }
             ExecState::Failed {
                 exit_code,
                 class: classify_failed_pod(pod, exit_code),
@@ -616,6 +665,14 @@ fn classify_failed_pod(pod: &Pod, exit_code: Option<i32>) -> FailureClass {
     if step_terminated_reason(pod).as_deref() == Some("OOMKilled") {
         return FailureClass::Infra { never_started: false };
     }
+    // `reason: DeadlineExceeded` can propagate a beat AFTER the kubelet kills
+    // the containers (observed on k3s: the first Failed observation carries
+    // only the SIGKILL exit 137). The Pod itself is authoritative: if it
+    // outlived its own spec'd deadline, the kill is a timeout — never the
+    // step's verdict.
+    if outlived_deadline(pod) {
+        return FailureClass::Timeout;
+    }
     match exit_code {
         // The step's own code produced a verdict.
         Some(_) => FailureClass::Step,
@@ -625,6 +682,23 @@ fn classify_failed_pod(pod: &Pod, exit_code: Option<i32>) -> FailureClass {
             never_started: !step_container_started(pod),
         },
     }
+}
+
+/// True if the Pod ran past its own `activeDeadlineSeconds` — the
+/// deterministic timeout signal, independent of the (sometimes-late)
+/// `DeadlineExceeded` status reason.
+fn outlived_deadline(pod: &Pod) -> bool {
+    let Some(deadline) = pod.spec.as_ref().and_then(|s| s.active_deadline_seconds) else {
+        return false;
+    };
+    let Some(start) = pod.status.as_ref().and_then(|s| s.start_time.as_ref()) else {
+        return false;
+    };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(i64::MAX);
+    now_secs - start.0.as_second() >= deadline
 }
 
 /// True once the step container's main process has (ever) started: a running
@@ -793,13 +867,14 @@ mod tests {
             run_as_root: false,
             add_capabilities: vec![],
             privileged: false,
+        timeout_seconds: None,
         }
     }
 
     #[test]
     fn step_pod_is_hardened_restricted_by_default() {
         let step = step_with_attempt("run-1", "build", "a1");
-        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), None);
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS);
         let sc = pod.spec.unwrap().containers[0]
             .security_context
             .clone()
@@ -825,8 +900,9 @@ mod tests {
             run_as_root: true,
             add_capabilities: vec!["NET_ADMIN".into()],
             privileged: true,
+        timeout_seconds: None,
         };
-        let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None);
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS);
         let sc = pod.spec.unwrap().containers[0].security_context.clone().unwrap();
         assert_eq!(sc.run_as_non_root, Some(false));
         assert_eq!(sc.run_as_user, Some(0));
@@ -845,7 +921,7 @@ mod tests {
             run_as_root: true,
             ..busybox()
         };
-        let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None);
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS);
         let sc = pod.spec.unwrap().containers[0].security_context.clone().unwrap();
         assert_eq!(sc.run_as_non_root, Some(false));
         assert_eq!(sc.privileged, Some(false));
@@ -896,7 +972,7 @@ mod tests {
     #[test]
     fn build_pod_sets_image_command_restart_policy_and_fence_env() {
         let step = step_with_attempt("run-1", "build", "a1");
-        let pod = build_pod("scarab-build-a1-deadbeef", "scarab-run-1", &step, &busybox(), None);
+        let pod = build_pod("scarab-build-a1-deadbeef", "scarab-run-1", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS);
 
         let spec = pod.spec.unwrap();
         assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
@@ -928,7 +1004,7 @@ mod tests {
     #[test]
     fn build_pod_without_egress_has_no_results_volume_or_sidecar() {
         let step = step_with_attempt("run-1", "build", "a1");
-        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), None);
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS);
         let spec = pod.spec.unwrap();
         assert!(spec.volumes.is_none(), "no shared volume without egress");
         assert!(spec.init_containers.is_none(), "no sidecar without egress");
@@ -944,7 +1020,7 @@ mod tests {
             sidecar_image: "ghcr.io/acme/scarab-sidecar:1".into(),
         };
         let step = step_with_attempt("run-1", "build", "a1");
-        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), Some(&egress));
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), Some(&egress), DEFAULT_STEP_TIMEOUT_SECS);
         let spec = pod.spec.unwrap();
 
         // Shared results emptyDir.
@@ -1092,6 +1168,22 @@ mod tests {
     }
 
     #[test]
+    fn build_pod_sets_the_step_deadline() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        // Default: the global default deadline.
+        let pod = build_pod("scarab-x", "ns", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS);
+        assert_eq!(
+            pod.spec.as_ref().unwrap().active_deadline_seconds,
+            Some(DEFAULT_STEP_TIMEOUT_SECS as i64),
+        );
+        // Authored `timeout:` overrides it (ADR-0047).
+        let mut spec = busybox();
+        spec.timeout_seconds = Some(120);
+        let pod = build_pod("scarab-x", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS);
+        assert_eq!(pod.spec.as_ref().unwrap().active_deadline_seconds, Some(120));
+    }
+
+    #[test]
     fn pod_state_fails_fast_on_terminal_waiting_reason() {
         use k8s_openapi::api::core::v1::{
             ContainerState, ContainerStateWaiting, ContainerStatus, PodStatus,
@@ -1218,9 +1310,13 @@ mod tests {
         }
 
         #[test]
-        fn failed_without_verdict_or_start_is_never_started_infra() {
+        fn verdictless_failed_snapshot_defers_classification() {
+            // phase=Failed but the kubelet hasn't written the verdict yet (no
+            // reason, no exit code, no terminated state) — classification is
+            // deferred to the next poll rather than misread (observed on k3s
+            // enforcing activeDeadlineSeconds).
             let pod = failed_pod(None, None);
-            assert_eq!(class_of(&pod), FailureClass::Infra { never_started: true });
+            assert_eq!(pod_state(&pod), ExecState::Pending);
         }
 
         #[test]

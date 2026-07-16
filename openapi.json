@@ -880,6 +880,15 @@
           "security": {
             "type": "object",
             "description": "Privilege escalation requested above the hardened baseline (ADR-0039).\nOn an inline API run only the self-service `run_as_root` grant is admitted\n(it stays inside the sandbox); governed grants (add-capabilities /\nprivileged) require a target Environment and are rejected fail-closed."
+          },
+          "timeout": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Per-step execution deadline in seconds (ADR-0047). Absent = the global\ndefault (1h). Exceeding it is a `Timeout` failure.",
+            "minimum": 0
           }
         }
       },

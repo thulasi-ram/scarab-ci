@@ -232,6 +232,43 @@ async fn lost_with_the_assertion_retries_on_a_new_fence() {
     assert_eq!(exec.launch_count(&handle(2)), 1);
 }
 
+/// ADR-0047 engine-side timeout backstop: when the backend cannot enforce the
+/// deadline (the fake reports Running forever), the scheduler cancels and
+/// settles `Timeout` once the deadline + grace passes. Not auto-retried
+/// (post-start) — terminal without the author's `retry:` assertion.
+#[tokio::test]
+async fn engine_backstop_times_out_a_hung_step() {
+    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let at = Timestamp(1_000);
+    db.create_run(&run_id(), 1, 1, at).await.unwrap();
+    db.create_step_run(&run_id(), &step_id(), Some(&spec()), &[], at)
+        .await
+        .unwrap();
+    // Authored timeout: 5s (read from the run's stored IR).
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 1,
+            "steps": [{ "id": STEP, "image": "img", "timeout": 5 }] }),
+    )
+    .await
+    .unwrap();
+
+    tick(&db, &clock, &exec).await; // a1 launches; poll defaults to Running
+    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Running));
+
+    // Deadline (5s) + backstop grace (60s) elapse; the backend still says
+    // nothing (a hung kubelet). The backstop cancels + settles Timeout.
+    clock.advance(5_000 + 60_000 + 1);
+    for _ in 0..2 {
+        tick(&db, &clock, &exec).await;
+    }
+
+    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Failed));
+    let a = attempts(&db).await;
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].failure, Some(FailureKind::Timeout));
+}
+
 #[tokio::test]
 async fn re_adoption_after_a_crash_reuses_the_fence_and_consumes_no_budget() {
     let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());

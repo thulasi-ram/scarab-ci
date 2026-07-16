@@ -23,6 +23,7 @@ fn spec() -> StepSpec {
         run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
+        timeout_seconds: None,
     }
 }
 

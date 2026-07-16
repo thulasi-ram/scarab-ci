@@ -52,6 +52,7 @@ fn spec_with_secret() -> StepSpec {
         run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
+        timeout_seconds: None,
     }
 }
 fn logs(db: Arc<dyn Db>) -> Arc<LogService> {

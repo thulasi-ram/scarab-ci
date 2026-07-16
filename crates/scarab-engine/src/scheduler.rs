@@ -30,6 +30,14 @@ use crate::ports::{ExecHandle, ExecState, FailureClass};
 /// possible and retrying needs no author assertion. An author's `retry:` can
 /// only widen this, never narrow it.
 const NEVER_STARTED_AUTO_ATTEMPTS: u32 = 3;
+
+/// Slack the engine-side timeout backstop waits past a step's deadline before
+/// enforcing it (ADR-0047). The backend's own enforcement (kubelet
+/// `activeDeadlineSeconds`, the local kill-timer) is primary — it survives
+/// control-plane downtime and surfaces a classified `Timeout`; the backstop
+/// only fires when the backend could not enforce (hung kubelet, lost node),
+/// and the grace keeps the two from racing in the normal case.
+const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 use crate::{
     Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, ExecError,
     Executor, FailureKind, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus,
@@ -282,6 +290,10 @@ struct Config {
     project_run_cap: u32,
     /// Max in-flight runs globally (backpressure). Default unbounded.
     global_run_cap: u32,
+    /// The global default step deadline (ADR-0047), used when a step declares
+    /// no `timeout:`. Default 1h — mandatory, so a hung Pod can never wedge a
+    /// run forever.
+    default_step_timeout_ms: i64,
 }
 
 /// The durable scheduler. Borrows the ports for the duration of a cycle.
@@ -311,8 +323,15 @@ impl<'a> Scheduler<'a> {
                 outbox_visibility_ms: 30_000,
                 project_run_cap: 20,
                 global_run_cap: u32::MAX,
+                default_step_timeout_ms: 3_600_000,
             },
         }
+    }
+
+    /// Override the global default step deadline (ADR-0047).
+    pub fn with_default_step_timeout_ms(mut self, ms: i64) -> Self {
+        self.cfg.default_step_timeout_ms = ms;
+        self
     }
 
     /// Override the per-project in-flight cap (fairness).
@@ -676,8 +695,29 @@ impl<'a> Scheduler<'a> {
                 }
                 // Not terminal yet: leave the intent claimed; the lease expires
                 // and a later reconcile re-polls (adopting via the stored
-                // handle). No duplicate effect.
-                ExecState::Pending | ExecState::Running => {}
+                // handle). No duplicate effect. Engine-side timeout backstop
+                // (ADR-0047): if the attempt has outlived its deadline (plus
+                // grace) and the backend hasn't enforced it, cancel
+                // best-effort and settle as Timeout.
+                ExecState::Pending | ExecState::Running => {
+                    let started_at = self
+                        .db
+                        .attempts_of_step(&run, &step)
+                        .await?
+                        .iter()
+                        .find(|a| a.id == attempt)
+                        .map(|a| a.started_at);
+                    if let Some(started_at) = started_at {
+                        let timeout_ms = self.step_timeout_ms(&run, &step).await?;
+                        let now = self.clock.now().await;
+                        if now.0 >= started_at.0 + timeout_ms + TIMEOUT_BACKSTOP_GRACE_MS {
+                            let _ = self.executor.cancel(&handle).await;
+                            self.settle_failed_attempt(&run, &step, &attempt, FailureKind::Timeout)
+                                .await?;
+                            self.db.mark_dispatched(msg.id).await?;
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -1003,6 +1043,25 @@ impl<'a> Scheduler<'a> {
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The step's effective deadline in ms (ADR-0047): its authored `timeout:`
+    /// (seconds, from the run's stored IR) or the configured global default.
+    async fn step_timeout_ms(&self, run: &RunId, step: &StepId) -> Result<i64, SchedulerError> {
+        let authored = match self.db.run_ir(run).await? {
+            Some(ir) => ir
+                .get("steps")
+                .and_then(|s| s.as_array())
+                .into_iter()
+                .flatten()
+                .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(step.0.as_str()))
+                .and_then(|s| s.get("timeout"))
+                .and_then(|t| t.as_u64()),
+            None => None,
+        };
+        Ok(authored
+            .map(|secs| (secs as i64).saturating_mul(1000))
+            .unwrap_or(self.cfg.default_step_timeout_ms))
     }
 
     /// The step's authored `retry:` policy, read from the run's stored IR (the

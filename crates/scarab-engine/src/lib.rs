@@ -213,6 +213,12 @@ pub struct StepSpec {
     pub add_capabilities: Vec<String>,
     #[serde(default)]
     pub privileged: bool,
+    /// The step's authored execution deadline in seconds (ADR-0047), if any.
+    /// `None` = the executor's configured global default (1h). The backend
+    /// enforces it primarily (kubelet `activeDeadlineSeconds` / local
+    /// kill-timer); the scheduler keeps an engine-side backstop.
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
 }
 
 /// A manual/approval gate that suspends a run until released.

@@ -18,6 +18,9 @@ use crate::LogTailer;
 /// Run one converged cycle across all active runs: tick the scheduler, ensure a
 /// live log tail is running for every in-flight step (if a `tailer` is wired),
 /// then (if a `forge` is wired) post any pending commit statuses back.
+// Wiring seam: all inputs are distinct composition-root dependencies (see
+// `spawn_driver`); a config struct would only add indirection.
+#[allow(clippy::too_many_arguments)]
 pub async fn tick_once(
     db: &Arc<dyn Db>,
     clock: &Arc<dyn Clock>,
@@ -26,9 +29,11 @@ pub async fn tick_once(
     tailer: Option<&LogTailer>,
     owner: &str,
     visibility_ms: i64,
+    step_timeout_ms: i64,
 ) -> Result<(), SchedulerError> {
     Scheduler::new(&**db, &**clock, &**executor, owner)
         .with_outbox_visibility_ms(visibility_ms)
+        .with_default_step_timeout_ms(step_timeout_ms)
         .tick_all()
         .await?;
     // Log tail (ADR-0013): pull each running step's stdout/stderr into the log
@@ -82,6 +87,7 @@ pub fn spawn_driver(
     owner: String,
     interval: Duration,
     visibility_ms: i64,
+    step_timeout_ms: i64,
 ) -> tokio::task::JoinHandle<()> {
     let tailer = logs.map(|logs| LogTailer::new(executor.clone(), logs));
     tokio::spawn(async move {
@@ -94,6 +100,7 @@ pub fn spawn_driver(
                 tailer.as_ref(),
                 &owner,
                 visibility_ms,
+                step_timeout_ms,
             )
             .await
             {

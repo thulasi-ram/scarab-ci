@@ -18,6 +18,7 @@ fn spec(command: Vec<&str>) -> StepSpec {
         run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
+        timeout_seconds: None,
     }
 }
 
