@@ -9,7 +9,8 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use scarab_forge::{
-    Commit, Event, ForgeError, ForgePort, Permissions, Repo, Status, WebhookDelivery,
+    CheckoutCredential, Commit, Event, ForgeError, ForgePort, Permissions, RepoRef, Status,
+    WebhookDelivery,
 };
 use serde_json::Value;
 use sha2::Sha256;
@@ -111,7 +112,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
 }
 
 /// Extract the `repository` coordinate (`owner.login` / `name`) from a payload.
-fn repo_of(payload: &Value) -> Result<Repo, ForgeError> {
+fn repo_of(payload: &Value) -> Result<RepoRef, ForgeError> {
     let owner = payload
         .pointer("/repository/owner/login")
         .and_then(Value::as_str)
@@ -120,7 +121,7 @@ fn repo_of(payload: &Value) -> Result<Repo, ForgeError> {
         .pointer("/repository/name")
         .and_then(Value::as_str)
         .ok_or_else(|| ForgeError::Malformed("repository.name".into()))?;
-    Ok(Repo {
+    Ok(RepoRef {
         owner: owner.to_string(),
         name: name.to_string(),
     })
@@ -174,13 +175,13 @@ impl GithubForge {
 
 #[async_trait]
 impl ForgePort for GithubForge {
-    async fn latest_commit(&self, _repo: &Repo, _ref: &str) -> Result<Commit, ForgeError> {
+    async fn latest_commit(&self, _repo: &RepoRef, _ref: &str) -> Result<Commit, ForgeError> {
         unimplemented!("GithubForge::latest_commit")
     }
 
     async fn read_file_at_ref(
         &self,
-        _repo: &Repo,
+        _repo: &RepoRef,
         _ref: &str,
         _path: &str,
     ) -> Result<Vec<u8>, ForgeError> {
@@ -189,14 +190,14 @@ impl ForgePort for GithubForge {
 
     async fn list_dir_at_ref(
         &self,
-        _repo: &Repo,
+        _repo: &RepoRef,
         _ref: &str,
         _dir: &str,
     ) -> Result<Vec<String>, ForgeError> {
         unimplemented!("GithubForge::list_dir_at_ref")
     }
 
-    async fn register_webhook(&self, _repo: &Repo, _callback_url: &str) -> Result<(), ForgeError> {
+    async fn register_webhook(&self, _repo: &RepoRef, _callback_url: &str) -> Result<(), ForgeError> {
         unimplemented!("GithubForge::register_webhook")
     }
 
@@ -206,23 +207,31 @@ impl ForgePort for GithubForge {
 
     async fn set_status(
         &self,
-        _repo: &Repo,
+        _repo: &RepoRef,
         _commit: &Commit,
         _status: Status,
     ) -> Result<(), ForgeError> {
         unimplemented!("GithubForge::set_status")
     }
 
-    async fn create_deployment(&self, _repo: &Repo, _environment: &str) -> Result<(), ForgeError> {
+    async fn create_deployment(&self, _repo: &RepoRef, _environment: &str) -> Result<(), ForgeError> {
         unimplemented!("GithubForge::create_deployment")
     }
 
-    async fn post_comment(&self, _repo: &Repo, _issue: u64, _body: &str) -> Result<(), ForgeError> {
+    async fn post_comment(&self, _repo: &RepoRef, _issue: u64, _body: &str) -> Result<(), ForgeError> {
         unimplemented!("GithubForge::post_comment")
     }
 
-    async fn get_permissions(&self, _repo: &Repo, _user: &str) -> Result<Permissions, ForgeError> {
+    async fn get_permissions(&self, _repo: &RepoRef, _user: &str) -> Result<Permissions, ForgeError> {
         unimplemented!("GithubForge::get_permissions")
+    }
+
+    async fn mint_checkout_credential(
+        &self,
+        _repo: &RepoRef,
+        _read_only: bool,
+    ) -> Result<CheckoutCredential, ForgeError> {
+        unimplemented!("GithubForge::mint_checkout_credential")
     }
 }
 
@@ -267,7 +276,7 @@ mod tests {
         assert_eq!(
             normalize(&delivery("push", base("refs/heads/main"))).unwrap(),
             Event::Push {
-                repo: Repo { owner: "acme".into(), name: "app".into() },
+                repo: RepoRef { owner: "acme".into(), name: "app".into() },
                 r#ref: "refs/heads/main".into(),
                 after: "abc123".into(),
             }
@@ -276,7 +285,7 @@ mod tests {
         assert_eq!(
             normalize(&delivery("push", base("refs/tags/v1.2.3"))).unwrap(),
             Event::Tag {
-                repo: Repo { owner: "acme".into(), name: "app".into() },
+                repo: RepoRef { owner: "acme".into(), name: "app".into() },
                 tag: "v1.2.3".into(),
             }
         );
@@ -295,7 +304,7 @@ mod tests {
         assert_eq!(
             normalize(&delivery("pull_request", internal)).unwrap(),
             Event::PullRequest {
-                repo: Repo { owner: "acme".into(), name: "app".into() },
+                repo: RepoRef { owner: "acme".into(), name: "app".into() },
                 number: 42,
                 head: "feedface".into(),
                 fork: false,

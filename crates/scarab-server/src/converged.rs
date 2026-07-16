@@ -30,6 +30,7 @@ pub async fn tick_once(
     owner: &str,
     visibility_ms: i64,
     step_timeout_ms: i64,
+    public_url: &str,
 ) -> Result<(), SchedulerError> {
     Scheduler::new(&**db, &**clock, &**executor, owner)
         .with_outbox_visibility_ms(visibility_ms)
@@ -47,7 +48,9 @@ pub async fn tick_once(
     if let Some(forge) = forge {
         // Status posting is best-effort within a tick; a failed post stays on the
         // outbox for the next cycle (at-least-once, idempotent).
-        if let Err(e) = crate::drain_forge_statuses(&**forge, &**db, owner, 32, 30_000).await {
+        if let Err(e) =
+            crate::drain_forge_statuses(&**forge, &**db, owner, 32, 30_000, public_url).await
+        {
             tracing::warn!(error = %e, "forge status drain failed");
         }
     }
@@ -88,6 +91,7 @@ pub fn spawn_driver(
     interval: Duration,
     visibility_ms: i64,
     step_timeout_ms: i64,
+    public_url: String,
 ) -> tokio::task::JoinHandle<()> {
     let tailer = logs.map(|logs| LogTailer::new(executor.clone(), logs));
     tokio::spawn(async move {
@@ -101,6 +105,7 @@ pub fn spawn_driver(
                 &owner,
                 visibility_ms,
                 step_timeout_ms,
+                &public_url,
             )
             .await
             {

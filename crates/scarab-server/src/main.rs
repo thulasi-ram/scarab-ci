@@ -176,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Duration::from_millis(500),
                 visibility_ms,
                 (config.step_timeout_secs as i64).saturating_mul(1000),
+                config.public_url.clone(),
             );
             tracing::info!("converged driver started");
         }

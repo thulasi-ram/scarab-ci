@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use scarab_engine::ports::ExecState;
 use scarab_engine::{Db, RunId, RunStatus, Scheduler, StepStatus};
-use scarab_forge::{Event, Repo, StatusState};
+use scarab_forge::{Event, RepoRef, StatusState};
 use scarab_server::{drain_forge_statuses, trigger_run_from_event};
 use scarab_testkit::{FakeClock, FakeExecutor, FakeForge, InMemoryDb};
 
@@ -20,7 +20,7 @@ steps:
 
 fn push() -> Event {
     Event::Push {
-        repo: Repo {
+        repo: RepoRef {
             owner: "acme".into(),
             name: "app".into(),
         },
@@ -60,16 +60,25 @@ async fn run_start_and_success_post_pending_then_success() {
 
     // Drain status notifications to the forge: Running -> pending, then
     // Succeeded -> success, in order.
-    let posted = drain_forge_statuses(forge.as_ref(), &db, "drainer", 32, 30_000)
+    let posted = drain_forge_statuses(forge.as_ref(), &db, "drainer", 32, 30_000, "http://scarab.test")
         .await
         .unwrap();
     assert_eq!(posted, 2);
     let states: Vec<StatusState> = forge.statuses().iter().map(|s| s.state).collect();
     assert_eq!(states, vec![StatusState::Pending, StatusState::Success]);
     assert!(forge.statuses().iter().all(|s| s.context == "scarab"));
+    // Every status carries the REQUIRED run deep-link (ADR-0046).
+    assert!(
+        forge
+            .statuses()
+            .iter()
+            .all(|s| s.target_url == format!("http://scarab.test/runs/{}", run.0)),
+        "statuses deep-link to the run: {:?}",
+        forge.statuses()
+    );
 
     // Redraining is a no-op — dispatched messages are not re-posted (idempotent).
-    let again = drain_forge_statuses(forge.as_ref(), &db, "drainer", 32, 30_000)
+    let again = drain_forge_statuses(forge.as_ref(), &db, "drainer", 32, 30_000, "http://scarab.test")
         .await
         .unwrap();
     assert_eq!(again, 0);
@@ -98,7 +107,7 @@ async fn run_failure_posts_failure_status() {
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(steps[0].status, StepStatus::Failed);
 
-    drain_forge_statuses(forge.as_ref(), &db, "drainer", 32, 30_000)
+    drain_forge_statuses(forge.as_ref(), &db, "drainer", 32, 30_000, "http://scarab.test")
         .await
         .unwrap();
     let states: Vec<StatusState> = forge.statuses().iter().map(|s| s.state).collect();

@@ -615,7 +615,7 @@ async fn dispatch(
         st.clock.as_ref(),
         st.environments.as_deref(),
         principal.subject,
-        scarab_forge::Repo { owner: org, name: repo },
+        scarab_forge::RepoRef { owner: org, name: repo },
         req.r#ref,
         req.pipeline,
         req.params,
@@ -677,7 +677,7 @@ async fn list_pipelines(
         .forge
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
-    let repo = scarab_forge::Repo { owner: org, name: repo };
+    let repo = scarab_forge::RepoRef { owner: org, name: repo };
 
     // Resolve the ref to a concrete commit; the catalog reflects exactly it.
     let sha = forge
@@ -764,7 +764,7 @@ async fn pipeline_interface(
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
     let forge = forge.as_ref();
-    let repo = scarab_forge::Repo { owner: org, name: repo };
+    let repo = scarab_forge::RepoRef { owner: org, name: repo };
 
     // Resolve the ref → SHA (echoed back), read the named pipeline there, and
     // fully compile — mapping each failure to a structured 4xx via DispatchError
@@ -1123,7 +1123,7 @@ pub async fn trigger_run_from_event(
 /// [`dispatch_run`] (one named pipeline) so both produce byte-identical IR.
 async fn prefetch_libs_and_compile(
     forge: &dyn scarab_forge::ForgePort,
-    repo: &scarab_forge::Repo,
+    repo: &scarab_forge::RepoRef,
     read_ref: &str,
     yaml: &str,
 ) -> Result<scarab_pipeline::PipelineIr, TriggerError> {
@@ -1261,7 +1261,7 @@ impl DispatchKind {
     fn into_event(
         self,
         actor: String,
-        repo: scarab_forge::Repo,
+        repo: scarab_forge::RepoRef,
         r#ref: String,
         sha: String,
     ) -> scarab_forge::Event {
@@ -1359,7 +1359,7 @@ fn dispatch_candidate_paths(pipeline: &str) -> Vec<String> {
 /// identically (a bare name or a full `.scarab/*.yaml` path).
 async fn read_named_pipeline(
     forge: &dyn scarab_forge::ForgePort,
-    repo: &scarab_forge::Repo,
+    repo: &scarab_forge::RepoRef,
     sha: &str,
     pipeline: &str,
 ) -> Result<(String, String), DispatchError> {
@@ -1401,7 +1401,7 @@ pub async fn dispatch_run(
     clock: &dyn Clock,
     environments: Option<&dyn scarab_project::EnvironmentStore>,
     actor: String,
-    repo: scarab_forge::Repo,
+    repo: scarab_forge::RepoRef,
     r#ref: String,
     pipeline: String,
     params: std::collections::BTreeMap<String, serde_json::Value>,
@@ -1663,12 +1663,17 @@ async fn persist_run_from_ir(
 /// message is retired (`mark_dispatched`) only after a successful post; a post
 /// that fails is left for redelivery (at-least-once, and `set_status` is
 /// idempotent on the forge). Returns how many statuses were posted.
+///
+/// `public_url` is Scarab's public base URL: every status carries the
+/// **required** deep-link back to its run (`{public_url}/runs/{id}`,
+/// ADR-0046) — a status without a way back to its run is a dead end.
 pub async fn drain_forge_statuses(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     owner: &str,
     limit: u32,
     visibility_ms: i64,
+    public_url: &str,
 ) -> Result<usize, DbError> {
     let msgs = db
         .claim_outbox(owner, Some(RUN_STATUS_CHANGED), limit, visibility_ms)
@@ -1691,7 +1696,7 @@ pub async fn drain_forge_statuses(
         let status = scarab_forge::Status {
             context: "scarab".into(),
             state: run_status_to_forge(to),
-            target_url: None,
+            target_url: format!("{}/runs/{}", public_url.trim_end_matches('/'), msg.run.0),
         };
         let commit = scarab_forge::Commit {
             sha,
@@ -1722,7 +1727,7 @@ fn run_status_to_forge(s: RunStatus) -> scarab_forge::StatusState {
 async fn run_forge_coords(
     db: &dyn Db,
     run: &RunId,
-) -> Result<Option<(scarab_forge::Repo, String)>, DbError> {
+) -> Result<Option<(scarab_forge::RepoRef, String)>, DbError> {
     for e in db.events(run).await? {
         if let EventPayload::Raw(v) = &e.kind {
             let ev = &v["trigger"]["event"];
@@ -1732,7 +1737,7 @@ async fn run_forge_coords(
                 ev["sha"].as_str(),
             ) {
                 return Ok(Some((
-                    scarab_forge::Repo {
+                    scarab_forge::RepoRef {
                         owner: owner.to_string(),
                         name: name.to_string(),
                     },

@@ -32,6 +32,7 @@
 //! | `SCARAB_MASTER_KEY` | env | base64 32-byte KEK for envelope encryption (ADR-0014) — **required** unless `SCARAB_DEV_INSECURE=1` |
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
+//! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
 //!
 //! Step-runtime env (`SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`/
 //! `SCARAB_RESULTS*`/`SCARAB_PARAM_*`) is injected *into* step containers by
@@ -195,6 +196,10 @@ pub struct Config {
     /// declares no `timeout:`. A default is mandatory — it closes the
     /// "hung Pod wedges the run forever" hole.
     pub step_timeout_secs: u32,
+    /// Scarab's public base URL (ADR-0046): the run deep-link every forge
+    /// status carries (`{public_url}/runs/{id}`). Dev default
+    /// `http://localhost:8080`.
+    pub public_url: String,
 }
 
 /// A configuration the process must refuse to start under, with a message
@@ -358,6 +363,9 @@ impl Config {
             master_key,
             dev_insecure,
             step_timeout_secs,
+            public_url: env("SCARAB_PUBLIC_URL")
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "http://localhost:8080".into()),
         })
     }
 
@@ -412,6 +420,7 @@ impl Config {
                 "step timeout default: {}s (ADR-0047; per-step `timeout:` overrides)",
                 self.step_timeout_secs,
             ),
+            format!("public url: {} (run deep-links, ADR-0046)", self.public_url),
             format!(
                 "secrets store: enabled (envelope encryption, ADR-0014; KEK {})",
                 if self.master_key.is_some() { "persistent" } else { "EPHEMERAL" },

@@ -1104,7 +1104,8 @@ impl ObjectStore for InMemoryObjectStore {
 // ---------------------------------------------------------------------------
 
 use scarab_forge::{
-    Commit, Event, ForgeError, ForgePort, Permissions, Repo, Status, WebhookDelivery,
+    CheckoutCredential, Commit, Event, ForgeError, ForgePort, Permissions, RepoRef, Status,
+    WebhookDelivery,
 };
 
 /// An in-memory [`ForgePort`]: serves seeded in-repo files (by path, e.g.
@@ -1153,7 +1154,7 @@ impl FakeForge {
 
 #[async_trait]
 impl ForgePort for FakeForge {
-    async fn latest_commit(&self, _repo: &Repo, r#ref: &str) -> Result<Commit, ForgeError> {
+    async fn latest_commit(&self, _repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError> {
         let sha = self
             .commits
             .lock()
@@ -1169,7 +1170,7 @@ impl ForgePort for FakeForge {
 
     async fn read_file_at_ref(
         &self,
-        _repo: &Repo,
+        _repo: &RepoRef,
         _ref: &str,
         path: &str,
     ) -> Result<Vec<u8>, ForgeError> {
@@ -1183,7 +1184,7 @@ impl ForgePort for FakeForge {
 
     async fn list_dir_at_ref(
         &self,
-        _repo: &Repo,
+        _repo: &RepoRef,
         _ref: &str,
         dir: &str,
     ) -> Result<Vec<String>, ForgeError> {
@@ -1204,17 +1205,21 @@ impl ForgePort for FakeForge {
         Ok(out)
     }
 
-    async fn register_webhook(&self, _repo: &Repo, _callback_url: &str) -> Result<(), ForgeError> {
+    async fn register_webhook(&self, _repo: &RepoRef, _callback_url: &str) -> Result<(), ForgeError> {
         Ok(())
     }
 
-    async fn normalize_event(&self, _raw: WebhookDelivery) -> Result<Event, ForgeError> {
-        Err(ForgeError::UnsupportedEvent("fake forge does not normalize".into()))
+    async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError> {
+        // The fake's wire format IS the canonical vocabulary: the payload is a
+        // serialized `Event`. Keeps the fake contract-capable (ADR-0046)
+        // without inventing a vendor format.
+        serde_json::from_value(raw.payload)
+            .map_err(|e| ForgeError::Malformed(format!("fake payload is not an Event: {e}")))
     }
 
     async fn set_status(
         &self,
-        _repo: &Repo,
+        _repo: &RepoRef,
         _commit: &Commit,
         status: Status,
     ) -> Result<(), ForgeError> {
@@ -1222,16 +1227,31 @@ impl ForgePort for FakeForge {
         Ok(())
     }
 
-    async fn create_deployment(&self, _repo: &Repo, _environment: &str) -> Result<(), ForgeError> {
+    async fn create_deployment(&self, _repo: &RepoRef, _environment: &str) -> Result<(), ForgeError> {
         Ok(())
     }
 
-    async fn post_comment(&self, _repo: &Repo, issue: u64, body: &str) -> Result<(), ForgeError> {
+    async fn post_comment(&self, _repo: &RepoRef, issue: u64, body: &str) -> Result<(), ForgeError> {
         self.comments.lock().unwrap().push((issue, body.to_string()));
         Ok(())
     }
 
-    async fn get_permissions(&self, _repo: &Repo, _user: &str) -> Result<Permissions, ForgeError> {
+    async fn mint_checkout_credential(
+        &self,
+        repo: &RepoRef,
+        read_only: bool,
+    ) -> Result<CheckoutCredential, ForgeError> {
+        // Deterministic fake credential: scoped to the repo, short TTL,
+        // read-only honored verbatim (the contract forbids widening it).
+        Ok(CheckoutCredential {
+            username: "x-access-token".into(),
+            token: format!("fake-token-{}-{}", repo.owner, repo.name),
+            expires_at: 9_999_999_999_999,
+            read_only,
+        })
+    }
+
+    async fn get_permissions(&self, _repo: &RepoRef, _user: &str) -> Result<Permissions, ForgeError> {
         Ok(Permissions {
             read: true,
             write: true,

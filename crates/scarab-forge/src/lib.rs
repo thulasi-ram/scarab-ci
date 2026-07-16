@@ -19,10 +19,6 @@ pub struct RepoRef {
     pub name: String,
 }
 
-/// Transitional alias while the `ForgePort` signatures migrate to [`RepoRef`]
-/// (the agnostic-port refactor ticket removes it).
-pub type Repo = RepoRef;
-
 /// A resolved commit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
@@ -30,12 +26,17 @@ pub struct Commit {
     pub message: String,
 }
 
-/// A commit-status / check result to publish back to the forge.
+/// A commit-status / check result to publish back to the forge. Pitched at
+/// commit-status level — the capability *both* forges guarantee (ADR-0046);
+/// an adapter may enrich internally (e.g. GitHub Checks) without the port
+/// knowing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub context: String,
     pub state: StatusState,
-    pub target_url: Option<String>,
+    /// The deep-link back to the Scarab run — **required** (ADR-0046): a
+    /// status without a way back to its run is a dead end in the PR.
+    pub target_url: String,
 }
 
 /// The state of a published [`Status`]. These four are the canonical, forge-
@@ -93,9 +94,9 @@ pub struct WebhookDelivery {
 /// admission, UI — speaks only this vocabulary, never a vendor's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
-    Push { repo: Repo, r#ref: String, after: String },
+    Push { repo: RepoRef, r#ref: String, after: String },
     PullRequest {
-        repo: Repo,
+        repo: RepoRef,
         number: u64,
         head: String,
         /// True when the PR's head repo differs from its base repo — an
@@ -103,9 +104,9 @@ pub enum Event {
         /// downgraded OIDC subject.
         fork: bool,
     },
-    Tag { repo: Repo, tag: String },
-    Release { repo: Repo, tag: String },
-    Comment { repo: Repo, issue: u64, body: String },
+    Tag { repo: RepoRef, tag: String },
+    Release { repo: RepoRef, tag: String },
+    Comment { repo: RepoRef, issue: u64, body: String },
     Cron { schedule: String },
     /// A human dispatch of a named pipeline at a repo + ref (ADR-0043 "World B").
     /// Unlike a webhook event, the target is chosen by the launcher, so the event
@@ -115,12 +116,12 @@ pub enum Event {
     /// **symbolic** dispatch ref (e.g. `refs/heads/main`), used for Environment
     /// `allowed_refs` matching (ADR-0037); `sha` is the **resolved commit** the
     /// config is read/pinned at (ADR-0032).
-    Manual { actor: String, repo: Repo, r#ref: String, sha: String },
+    Manual { actor: String, repo: RepoRef, r#ref: String, sha: String },
     /// Started programmatically via the REST API (CLI / third party), as opposed
     /// to a human [`Manual`](Event::Manual) trigger. Repo + ref-aware for the same
     /// reason (ADR-0043); `ref` is symbolic, `sha` is the resolved commit.
-    Api { actor: String, repo: Repo, r#ref: String, sha: String },
-    Upstream { repo: Repo, run: String },
+    Api { actor: String, repo: RepoRef, r#ref: String, sha: String },
+    Upstream { repo: RepoRef, run: String },
 }
 
 /// The canonical trigger vocabulary (`on:` in a pipeline). A pipeline's triggers
@@ -203,7 +204,7 @@ impl Event {
 
     /// The repository this event targets, if any. Only `cron` is truly repo-less;
     /// `manual`/`api` dispatch carry their target repo (ADR-0043).
-    pub fn repo(&self) -> Option<&Repo> {
+    pub fn repo(&self) -> Option<&RepoRef> {
         match self {
             Event::Push { repo, .. }
             | Event::PullRequest { repo, .. }
@@ -286,6 +287,26 @@ pub struct Permissions {
     pub admin: bool,
 }
 
+/// A short-lived, repo-scoped **checkout credential** (ADR-0045 S4, ADR-0046):
+/// whatever the vendor can mint — GitHub: an installation token scoped
+/// `contents:read` to one repo; Forgejo: a repo-scoped access token. Presented
+/// as HTTPS basic auth on clone/fetch. The port asks for the *capability*;
+/// how it is minted is adapter-internal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckoutCredential {
+    /// The username half of the basic-auth pair (vendor convention, e.g.
+    /// `x-access-token` on GitHub).
+    pub username: String,
+    /// The opaque secret half. Never persisted; delivered to the clone step
+    /// via tmpfs/askpass (ADR-0045), redacted from logs.
+    pub token: String,
+    /// Unix-ms expiry — short TTL by contract.
+    pub expires_at: i64,
+    /// Whether the credential is read-only. A fork-PR checkout MUST be
+    /// read-only (ADR-0045); an adapter must honor `read_only: true`.
+    pub read_only: bool,
+}
+
 /// Errors returned by the forge port.
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
@@ -299,14 +320,20 @@ pub enum ForgeError {
     Malformed(String),
 }
 
-/// Outbound port to a code forge. `async-trait` keeps it `dyn`-safe.
+/// Outbound port to a code forge, expressed as **forge-agnostic capabilities**
+/// (ADR-0046): resolve a ref to a commit, read a file/dir at a ref, post a
+/// status, ingest a normalized event, register a webhook, mint a scoped
+/// checkout credential. No vendor vocabulary (App/installation/JWT) appears
+/// here — each adapter satisfies the capabilities however its vendor allows,
+/// and the shared [`contract`] suite keeps every adapter honest.
+/// `async-trait` keeps it `dyn`-safe.
 #[async_trait]
 pub trait ForgePort: Send + Sync {
-    async fn latest_commit(&self, repo: &Repo, r#ref: &str) -> Result<Commit, ForgeError>;
+    async fn latest_commit(&self, repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError>;
 
     async fn read_file_at_ref(
         &self,
-        repo: &Repo,
+        repo: &RepoRef,
         r#ref: &str,
         path: &str,
     ) -> Result<Vec<u8>, ForgeError>;
@@ -316,30 +343,132 @@ pub trait ForgePort: Send + Sync {
     /// Returns full repo-relative paths; an absent directory yields an empty list.
     async fn list_dir_at_ref(
         &self,
-        repo: &Repo,
+        repo: &RepoRef,
         r#ref: &str,
         dir: &str,
     ) -> Result<Vec<String>, ForgeError>;
 
-    async fn register_webhook(&self, repo: &Repo, callback_url: &str) -> Result<(), ForgeError>;
+    async fn register_webhook(&self, repo: &RepoRef, callback_url: &str) -> Result<(), ForgeError>;
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError>;
 
-    async fn set_status(&self, repo: &Repo, commit: &Commit, status: Status) -> Result<(), ForgeError>;
+    async fn set_status(&self, repo: &RepoRef, commit: &Commit, status: Status) -> Result<(), ForgeError>;
 
-    async fn create_deployment(&self, repo: &Repo, environment: &str) -> Result<(), ForgeError>;
+    async fn create_deployment(&self, repo: &RepoRef, environment: &str) -> Result<(), ForgeError>;
 
-    async fn post_comment(&self, repo: &Repo, issue: u64, body: &str) -> Result<(), ForgeError>;
+    async fn post_comment(&self, repo: &RepoRef, issue: u64, body: &str) -> Result<(), ForgeError>;
 
-    async fn get_permissions(&self, repo: &Repo, user: &str) -> Result<Permissions, ForgeError>;
+    async fn get_permissions(&self, repo: &RepoRef, user: &str) -> Result<Permissions, ForgeError>;
+
+    /// Mint a short-TTL, repo-scoped [`CheckoutCredential`] for cloning `repo`
+    /// (ADR-0045 S4, ADR-0046). `read_only: true` is mandatory for fork-PR
+    /// checkouts; an adapter must never widen it.
+    async fn mint_checkout_credential(
+        &self,
+        repo: &RepoRef,
+        read_only: bool,
+    ) -> Result<CheckoutCredential, ForgeError>;
+}
+
+/// The shared **`ForgePort` contract-test suite** (ADR-0046): the behavioural
+/// contract every adapter must pass, runnable against any implementation —
+/// the fakes, the GitHub adapter (live-gated), the Forgejo adapter
+/// (live-gated). Two real adapters plus this suite is what keeps future ones
+/// (GitLab, Bitbucket) honest.
+pub mod contract {
+    use super::*;
+
+    /// What an implementation under test must provide: a repo the port can
+    /// read, with known content at a known ref, and a raw delivery that
+    /// normalizes to a push on that repo.
+    pub struct ContractFixture {
+        /// The repo the port serves.
+        pub repo: RepoRef,
+        /// A ref that resolves on that repo.
+        pub r#ref: String,
+        /// The commit sha `r#ref` resolves to.
+        pub commit_sha: String,
+        /// A directory listable at `r#ref`…
+        pub dir: String,
+        /// …containing this `(path, content)` file, readable at `r#ref`.
+        pub known_file: (String, Vec<u8>),
+        /// A raw webhook delivery that normalizes to a `push` on `repo`.
+        pub push_delivery: WebhookDelivery,
+    }
+
+    /// Assert the full port contract. Panics on violation — designed to be the
+    /// body of a `#[tokio::test]` per adapter.
+    pub async fn assert_contract(port: &dyn ForgePort, fx: &ContractFixture) {
+        // Capability: resolve a ref to a commit.
+        let commit = port
+            .latest_commit(&fx.repo, &fx.r#ref)
+            .await
+            .expect("latest_commit resolves the ref");
+        assert_eq!(commit.sha, fx.commit_sha, "ref resolves to the expected commit");
+
+        // Capability: read a file at a ref.
+        let bytes = port
+            .read_file_at_ref(&fx.repo, &fx.r#ref, &fx.known_file.0)
+            .await
+            .expect("read_file_at_ref serves a known file");
+        assert_eq!(bytes, fx.known_file.1, "file content matches");
+
+        // Capability: list a directory at a ref (contains the known file).
+        let paths = port
+            .list_dir_at_ref(&fx.repo, &fx.r#ref, &fx.dir)
+            .await
+            .expect("list_dir_at_ref lists the dir");
+        assert!(
+            paths.contains(&fx.known_file.0),
+            "dir listing contains {} (got {paths:?})",
+            fx.known_file.0
+        );
+
+        // Capability: ingest + normalize an event into the canonical vocabulary.
+        let event = port
+            .normalize_event(fx.push_delivery.clone())
+            .await
+            .expect("normalize_event handles a push delivery");
+        assert_eq!(event.trigger_kind(), TriggerKind::Push, "normalizes to push");
+        assert_eq!(event.repo(), Some(&fx.repo), "event carries the RepoRef");
+
+        // Capability: post a status — the run deep-link is REQUIRED.
+        port.set_status(
+            &fx.repo,
+            &commit,
+            Status {
+                context: "scarab".into(),
+                state: StatusState::Pending,
+                target_url: "https://scarab.example/runs/r1".into(),
+            },
+        )
+        .await
+        .expect("set_status accepts a status with a run deep-link");
+
+        // Capability: register a webhook (real on Forgejo; a no-op adapter
+        // must still ACCEPT it).
+        port.register_webhook(&fx.repo, "https://scarab.example/webhooks/x")
+            .await
+            .expect("register_webhook accepted");
+
+        // Capability: mint a scoped checkout credential; read-only honored.
+        let cred = port
+            .mint_checkout_credential(&fx.repo, true)
+            .await
+            .expect("mint_checkout_credential");
+        assert!(!cred.token.is_empty(), "credential carries a secret");
+        assert!(!cred.username.is_empty(), "credential carries a username");
+        assert!(cred.read_only, "read_only: true must be honored, never widened");
+        assert!(cred.expires_at > 0, "credential carries an expiry (short TTL)");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn repo() -> Repo {
-        Repo {
+    fn repo() -> RepoRef {
+        RepoRef {
             owner: "acme".into(),
             name: "app".into(),
         }
