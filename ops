@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1784207839,"nonce":"ZScoEhPstCrjijFpRDTQh3booWY=","title":"[ADR-0047] Produce DeadLettered + terminal semantics + gate expiry + opt-in run budget","was":"aa6d0b7 (ADR-0047 epic)"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1784207840,"nonce":"SMNwMjdPMXVnFEAhZMdMxPG27oQ=","added":["type:feat","tracer-bullet","ready-for-agent","area:engine"],"removed":null}]}
