@@ -396,6 +396,15 @@ pub trait Db: Send + Sync {
     /// Mark a claimed outbox message dispatched, so it is never redelivered.
     async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError>;
 
+    /// Record one failed delivery of an outbox message (ADR-0047 poison
+    /// handling) and return the total failures so far. Benign redeliveries of
+    /// in-flight work never call this — only a processing *error* counts.
+    async fn record_outbox_failure(&self, id: OutboxId) -> Result<u32, DbError>;
+
+    /// Permanently stop redelivering a poison message (ADR-0047): it is never
+    /// claimed again but retained for diagnosis.
+    async fn dead_letter_outbox(&self, id: OutboxId) -> Result<(), DbError>;
+
     /// Acquire (or renew) a time-bounded lease over a named `resource` (a step
     /// id, `"scheduler"` leadership, …) for `owner`. Only an expired lease is
     /// taken over; the returned [`Lease`] names the current holder.

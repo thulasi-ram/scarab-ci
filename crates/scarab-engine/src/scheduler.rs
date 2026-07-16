@@ -31,6 +31,12 @@ use crate::ports::{ExecHandle, ExecState, FailureClass};
 /// only widen this, never narrow it.
 const NEVER_STARTED_AUTO_ATTEMPTS: u32 = 3;
 
+/// How many *failed* deliveries an outbox message may accumulate before it is
+/// dead-lettered (ADR-0047 poison handling). Benign redeliveries of in-flight
+/// work (a Running step re-polled each tick) never count — only processing
+/// errors do — so this only trips on a permanently-failing message.
+const MAX_DELIVERY_ATTEMPTS: u32 = 10;
+
 /// Slack the engine-side timeout backstop waits past a step's deadline before
 /// enforcing it (ADR-0047). The backend's own enforcement (kubelet
 /// `activeDeadlineSeconds`, the local kill-timer) is primary — it survives
@@ -599,6 +605,36 @@ impl<'a> Scheduler<'a> {
             )
             .await?;
         for msg in msgs {
+            // Fault isolation + poison handling (ADR-0047): one failing
+            // message must neither stall the batch behind it nor redeliver
+            // forever. A processing error counts one failed delivery; at
+            // MAX_DELIVERY_ATTEMPTS the message is dead-lettered (never
+            // claimed again) and its run transitions to DeadLettered with
+            // diagnostics — the operator signal.
+            if let Err(e) = self.process_launch_intent(&msg).await {
+                let failures = self.db.record_outbox_failure(msg.id).await?;
+                if failures >= MAX_DELIVERY_ATTEMPTS {
+                    self.db.dead_letter_outbox(msg.id).await?;
+                    self.dead_letter_run(
+                        &msg.run,
+                        format!(
+                            "outbox message `{}` (id {}) exceeded {MAX_DELIVERY_ATTEMPTS} \
+                             failed deliveries — poison; last error: {e}",
+                            msg.kind, msg.id.0
+                        ),
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Process one launch intent: launch-or-adopt, poll, settle. Extracted so
+    /// [`reconcile`](Self::reconcile) can fault-isolate each message
+    /// (ADR-0047 poison handling).
+    async fn process_launch_intent(&self, msg: &OutboxMessage) -> Result<(), SchedulerError> {
+        {
             let intent: LaunchIntent = serde_json::from_value(msg.payload.clone())
                 .map_err(|e| SchedulerError::BadPayload(e.to_string()))?;
             let run = RunId(intent.run);
@@ -639,7 +675,7 @@ impl<'a> Scheduler<'a> {
                             )
                             .await?;
                             self.db.mark_dispatched(msg.id).await?;
-                            continue;
+                            return Ok(());
                         }
                     };
 
@@ -1203,6 +1239,31 @@ impl<'a> Scheduler<'a> {
             self.finalize_step(run, step, attempt, StepStatus::Failed, Some(kind))
                 .await
         }
+    }
+
+    /// Dead-letter a run outright (ADR-0047, e.g. a poison outbox message):
+    /// cancel its non-terminal steps, record diagnostics on the event log, and
+    /// transition it to `DeadLettered` — the operator signal.
+    async fn dead_letter_run(&self, run: &RunId, reason: String) -> Result<(), SchedulerError> {
+        let Some(current) = self.db.run_status(run).await? else {
+            return Ok(());
+        };
+        if current.is_terminal() {
+            return Ok(());
+        }
+        for step in self.db.steps_of_run(run).await? {
+            if !step.status.is_terminal() {
+                self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
+                    .await?;
+            }
+        }
+        let now = self.clock.now().await;
+        self.append(run, EventPayload::RunDeadLettered { reason }, now).await?;
+        self.transition_run(run, current, RunStatus::DeadLettered).await?;
+        if let Some((group, _)) = self.db.run_concurrency(run).await? {
+            self.db.release_slot(&group, run).await?;
+        }
+        Ok(())
     }
 
     /// Re-arm a failed step for retry: `Running → Ready`. The next admission

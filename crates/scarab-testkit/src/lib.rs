@@ -68,6 +68,10 @@ struct OutboxEntry {
     msg: OutboxMessage,
     claimed: bool,
     dispatched: bool,
+    /// Failed-delivery count (ADR-0047 poison handling).
+    delivery_attempts: u32,
+    /// Poison marker: never redelivered, retained for diagnosis.
+    dead_lettered: bool,
 }
 
 /// A step's in-memory row: status, durable spec, dependency edges, and attempts.
@@ -816,6 +820,8 @@ impl Db for InMemoryDb {
             msg,
             claimed: false,
             dispatched: false,
+            delivery_attempts: 0,
+            dead_lettered: false,
         });
         Ok(())
     }
@@ -838,7 +844,11 @@ impl Db for InMemoryDb {
                 break;
             }
             let kind_ok = kind.is_none_or(|k| entry.msg.kind == k);
-            if !entry.dispatched && (!entry.claimed || reclaimable) && kind_ok {
+            if !entry.dispatched
+                && !entry.dead_lettered
+                && (!entry.claimed || reclaimable)
+                && kind_ok
+            {
                 entry.claimed = true;
                 out.push(entry.msg.clone());
             }
@@ -850,6 +860,27 @@ impl Db for InMemoryDb {
         let mut st = self.state.lock().unwrap();
         if let Some(e) = st.outbox.iter_mut().find(|e| e.msg.id == id) {
             e.dispatched = true;
+        }
+        Ok(())
+    }
+
+    async fn record_outbox_failure(&self, id: OutboxId) -> Result<u32, DbError> {
+        let mut st = self.state.lock().unwrap();
+        Ok(st
+            .outbox
+            .iter_mut()
+            .find(|e| e.msg.id == id)
+            .map(|e| {
+                e.delivery_attempts += 1;
+                e.delivery_attempts
+            })
+            .unwrap_or(0))
+    }
+
+    async fn dead_letter_outbox(&self, id: OutboxId) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(e) = st.outbox.iter_mut().find(|e| e.msg.id == id) {
+            e.dead_lettered = true;
         }
         Ok(())
     }

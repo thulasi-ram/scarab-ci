@@ -1038,6 +1038,7 @@ impl Db for PostgresDb {
              WHERE id IN (
                  SELECT id FROM outbox
                  WHERE dispatched_at IS NULL
+                   AND dead_lettered_at IS NULL
                    AND ($4::text IS NULL OR kind = $4)
                    AND (claimed_until IS NULL
                         OR claimed_until < (extract(epoch from now()) * 1000)::bigint)
@@ -1071,6 +1072,31 @@ impl Db for PostgresDb {
     async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE outbox SET dispatched_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(id.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn record_outbox_failure(&self, id: OutboxId) -> Result<u32, DbError> {
+        let row = sqlx::query(
+            "UPDATE outbox SET delivery_attempts = delivery_attempts + 1
+             WHERE id = $1
+             RETURNING delivery_attempts",
+        )
+        .bind(id.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| r.get::<i64, _>("delivery_attempts") as u32).unwrap_or(0))
+    }
+
+    async fn dead_letter_outbox(&self, id: OutboxId) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE outbox SET dead_lettered_at = (extract(epoch from now()) * 1000)::bigint
              WHERE id = $1",
         )
         .bind(id.0)
