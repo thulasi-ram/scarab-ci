@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1784205106,"nonce":"oUA8icNnEPTHWM76O/6GZ7refH8=","title":"[ADR-0046] GitHub adapter: App auth + installation tokens + the 8 methods (real HTTP)","was":"2ff6e87 (ADR-0046 epic)"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1784205108,"nonce":"df4k4PJaASoRQ4BTzCj3k6NFjY4=","added":["type:feat","tracer-bullet","ready-for-agent","area:forge"],"removed":null}]}
