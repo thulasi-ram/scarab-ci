@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1784205106,"nonce":"rMcvpC4JNnbsZTWz2ql7uO7AE9o=","title":"[ADR-0046] Forgejo/Codeberg adapter (keeps the port honest; passes contract test)","was":"2ff6e87 (ADR-0046 epic)"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1784205108,"nonce":"Qr0qYODbv8Qf4cmCg/B+3NQIvPE=","added":["type:feat","tracer-bullet","ready-for-agent","area:forge"],"removed":null}]}
