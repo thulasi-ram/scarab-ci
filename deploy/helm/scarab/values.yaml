@@ -1,0 +1,132 @@
+# Default values for the scarab chart.
+# Every stanza maps to scarab-server's env-driven config (see crates/scarab-server/src/main.rs).
+
+image:
+  repository: ghcr.io/thulasi-ram/scarab-server
+  # Pin to a digest or immutable tag in production; `edge` tracks main.
+  tag: ""          # defaults to .Chart.AppVersion when empty
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Number of scarab-server replicas. Safe to scale: Postgres (the outbox) is the
+# coordination bus, and `launch` is idempotent (ADR-0021). For a converged
+# deployment keep this at 1 unless you split roles.
+replicaCount: 1
+
+scarab:
+  # api | scheduler | executor | webhook | converged (ADR-0016).
+  role: converged
+  # k8s (production, one Pod per step) | local (host processes — dev only).
+  executor: k8s
+  # Namespace the executor launches step Pods into. Empty => the release
+  # namespace (.Release.Namespace); the RBAC below is granted there.
+  namespace: ""
+  # Address scarab-server binds inside the container.
+  addr: "0.0.0.0:8080"
+  # Extra plain (non-secret) env vars, e.g. RUST_LOG.
+  extraEnv:
+    RUST_LOG: "info"
+
+  # Object store (logs/artifacts). When bucket is set the S3/MinIO backend is
+  # used; otherwise scarab falls back to a local directory (dev only).
+  s3:
+    bucket: ""
+    endpoint: ""       # e.g. http://minio.scarab.svc:9000 ; empty => AWS S3
+    region: "us-east-1"
+
+  # OIDC issuer public URL for keyless federation (ADR-0014). Empty => disabled.
+  oidcIssuer: ""
+
+  # Results-egress sidecar image injected into step Pods (ADR-0042). Only used
+  # when secrets.resultsTokenSecret is set.
+  sidecarImage: "ghcr.io/thulasi-ram/scarab-sidecar:latest"
+  # Base URL step-Pod sidecars POST results back to. Empty => the in-cluster
+  # Service DNS name derived from the release.
+  resultsApiUrl: ""
+
+# Sensitive config. Two modes:
+#   1. existingSecret: reference a Secret you manage out-of-band (recommended
+#      for production). Keys must match the env var names below.
+#   2. Inline values here => the chart renders a Secret. Fine for dev; do NOT
+#      commit real values.
+secrets:
+  existingSecret: ""
+  # --- inline (rendered into a chart-managed Secret when existingSecret is "") ---
+  # Postgres URL. Absent => API-only mode (no durable driver).
+  databaseUrl: ""
+  # S3/MinIO credentials (needed when scarab.s3.bucket is set).
+  s3AccessKey: ""
+  s3SecretKey: ""
+  # base64 32-byte key so encrypted secrets survive restarts (ADR-0014).
+  masterKey: ""
+  # HMAC secrets for webhook verification / gate + results token minting.
+  githubWebhookSecret: ""
+  gateTokenSecret: ""
+  resultsTokenSecret: ""
+
+# RBAC the k8s executor needs to run one Pod per step in scarab.namespace.
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}   # e.g. IRSA / Workload Identity role bindings
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: scarab.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+# /healthz is a cheap static handler (crates/scarab-server/src/lib.rs).
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 15
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 3
+  periodSeconds: 10
+
+# Container hardening: scarab-server runs as an unprivileged user and needs no
+# write access to its root filesystem (object dir is under the writable home).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

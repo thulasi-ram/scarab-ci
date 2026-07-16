@@ -1,0 +1,41 @@
+{{- if .Values.rbac.create -}}
+{{- /*
+  The k8s executor (crates/scarab-executor-k8s) creates one Pod per step,
+  deletes it on completion, and tails its logs (ADR-0013). It re-attaches to an
+  existing Pod after a control-plane restart (get/list). Scope the Role to the
+  namespace step Pods land in — the release namespace by default.
+*/ -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "scarab.fullname" . }}-executor
+  namespace: {{ include "scarab.execNamespace" . }}
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "scarab.fullname" . }}-executor
+  namespace: {{ include "scarab.execNamespace" . }}
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "scarab.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "scarab.fullname" . }}-executor
+{{- end }}

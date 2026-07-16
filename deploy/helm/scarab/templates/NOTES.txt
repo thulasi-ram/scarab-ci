@@ -1,0 +1,28 @@
+scarab-server is deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+  Role:     {{ .Values.scarab.role }}
+  Executor: {{ .Values.scarab.executor }}  (step Pods launch into "{{ include "scarab.execNamespace" . }}")
+  Image:    {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+
+{{- if not .Values.secrets.existingSecret }}
+{{- if not .Values.secrets.databaseUrl }}
+
+  ⚠  No SCARAB_DATABASE_URL is set — scarab-server runs API-only (no durable
+     scheduler/executor driver). Set secrets.databaseUrl (or secrets.existingSecret)
+     to enable durable execution.
+{{- end }}
+{{- end }}
+
+Check health:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "scarab.fullname" . }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "scarab.fullname" . }} 8080:{{ .Values.service.port }}
+  curl -sf http://127.0.0.1:8080/healthz    # => ok
+
+{{- if .Values.ingress.enabled }}
+
+Reachable via Ingress at:
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- end }}

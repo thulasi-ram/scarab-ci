@@ -1,0 +1,20 @@
+apiVersion: v2
+name: scarab
+description: |
+  Scarab — durable-execution, Kubernetes-native CI. Deploys the scarab-server
+  process (ADR-0016: one binary, selectable roles) with the RBAC it needs to
+  launch one Pod per step (ADR-0005) in its namespace.
+type: application
+# Chart version — bump on chart changes.
+version: 0.1.0
+# Tracks the scarab workspace version (Cargo workspace.package.version).
+appVersion: "0.1.0"
+keywords:
+  - ci
+  - durable-execution
+  - kubernetes
+home: https://github.com/thulasi-ram/scarab-ci
+sources:
+  - https://github.com/thulasi-ram/scarab-ci
+maintainers:
+  - name: Thulasi Ram

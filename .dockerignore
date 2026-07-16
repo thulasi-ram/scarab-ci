@@ -1,0 +1,19 @@
+# Keep the build context to what `cargo build -p scarab-server` needs.
+.git
+target
+.workspaces
+dev/.kubeconfig
+dev/server.log
+dev/server.pid
+.scarab
+.env.local
+.direnv
+
+# Front-end + docs: npm projects, not cargo members.
+ui/**/node_modules
+ui/**/dist
+ui/**/.astro
+
+# Editor / OS cruft.
+**/*.rs.bk
+.DS_Store
