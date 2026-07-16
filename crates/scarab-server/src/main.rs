@@ -103,6 +103,14 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
+    // rustls 0.23 refuses to pick a process-level default CryptoProvider when
+    // more than one backend is linked — and this binary links both: `ring`
+    // (sqlx's `tls-rustls-ring`) and `aws-lc-rs` (pulled by object_store). Left
+    // unset, the first TLS handshake — the kube client dialing the API server —
+    // panics. Install `ring` explicitly (matching sqlx) before any TLS. The
+    // Result is Err only if a provider is already installed; ignore it.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
 
     // Spec export: write openapi.json and exit (no DB, no serving).

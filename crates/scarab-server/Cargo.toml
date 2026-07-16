@@ -19,6 +19,8 @@ tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Composition root installs the rustls default CryptoProvider (see main.rs).
+rustls = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

@@ -2681,6 +2681,7 @@ dependencies = [
  "jsonwebtoken",
  "rand 0.8.7",
  "rsa",
+ "rustls",
  "scarab-db-postgres",
  "scarab-engine",
  "scarab-executor-k8s",

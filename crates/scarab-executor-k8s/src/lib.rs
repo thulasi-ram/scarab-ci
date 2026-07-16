@@ -571,8 +571,39 @@ pub fn pod_state(pod: &Pod) -> ExecState {
         "Running" => ExecState::Running,
         // "Unknown" means the node stopped reporting — the backend lost it.
         "Unknown" => ExecState::Lost,
+        // A Pending Pod is normally still scheduling or pulling — but some
+        // container `waiting` reasons are terminal: the kubelet will never start
+        // the container without a new Pod spec (bad config, unpullable image).
+        // Such a Pod stays Pending forever, hanging the run (and hot-looping the
+        // best-effort log tail). Surface it as a failure so the step fails fast.
+        _ if has_terminal_waiting_reason(pod) => ExecState::Failed { exit_code: None },
         _ => ExecState::Pending,
     }
+}
+
+/// True if any container (step or native sidecar) is stuck in a `waiting` state
+/// the kubelet cannot recover from on its own — a container-config error or an
+/// unpullable image. These keep the Pod `Pending` indefinitely, so we treat them
+/// as terminal rather than waiting forever.
+fn has_terminal_waiting_reason(pod: &Pod) -> bool {
+    const TERMINAL: &[&str] = &[
+        "CreateContainerConfigError",
+        "CreateContainerError",
+        "RunContainerError",
+        "InvalidImageName",
+        "ErrImagePull",
+        "ImagePullBackOff",
+    ];
+    let Some(status) = pod.status.as_ref() else {
+        return false;
+    };
+    status
+        .container_statuses
+        .iter()
+        .flatten()
+        .chain(status.init_container_statuses.iter().flatten())
+        .filter_map(|c| c.state.as_ref()?.waiting.as_ref()?.reason.as_deref())
+        .any(|reason| TERMINAL.contains(&reason))
 }
 
 fn container_exit_code(pod: &Pod) -> Option<i32> {
@@ -956,5 +987,53 @@ mod tests {
         assert_eq!(pod_state(&with_phase("Unknown", None)), ExecState::Lost);
         // No status yet -> not scheduled -> Pending.
         assert_eq!(pod_state(&Pod::default()), ExecState::Pending);
+    }
+
+    #[test]
+    fn pod_state_fails_fast_on_terminal_waiting_reason() {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateWaiting, ContainerStatus, PodStatus,
+        };
+
+        let waiting = |reason: &str| Pod {
+            status: Some(PodStatus {
+                // A stuck container keeps the Pod in Pending.
+                phase: Some("Pending".into()),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "step".into(),
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some(reason.into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Un-recoverable container/image errors surface as a terminal failure so
+        // the run does not hang forever (and the log tail stops retrying).
+        for reason in [
+            "CreateContainerConfigError",
+            "CreateContainerError",
+            "RunContainerError",
+            "InvalidImageName",
+            "ErrImagePull",
+            "ImagePullBackOff",
+        ] {
+            assert_eq!(
+                pod_state(&waiting(reason)),
+                ExecState::Failed { exit_code: None },
+                "{reason} should be terminal"
+            );
+        }
+
+        // A benign transient wait (e.g. still pulling) stays Pending.
+        assert_eq!(pod_state(&waiting("ContainerCreating")), ExecState::Pending);
+        assert_eq!(pod_state(&waiting("PodInitializing")), ExecState::Pending);
     }
 }

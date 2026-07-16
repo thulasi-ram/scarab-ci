@@ -13,12 +13,20 @@
 //! [`LogTailer`] owns the per-fence dedup + task spawning the converged driver
 //! calls once per tick for each running step.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use scarab_engine::{AttemptId, Executor, LogChunks, RunId, StepId, StepRun};
 
 use crate::logs::{LogError, LogService};
+
+/// Cool-down before re-tailing a fence whose last attempt errored. Without it, a
+/// step whose Pod never produces a log (e.g. stuck in `CreateContainerConfigError`
+/// until it is failed) would be re-tailed every driver tick — hammering the k8s
+/// API a few times a second. One retry every few seconds is plenty to pick up a
+/// Pod that finally starts.
+const RETRY_BACKOFF: Duration = Duration::from_secs(3);
 
 /// Errors from draining a log tail. Both arms are best-effort at the call site —
 /// the tail is logged and dropped, never failing the run (ADR-0013).
@@ -76,6 +84,15 @@ pub struct LogTailer {
     /// across ticks). A tail removes itself here when it ends, so an early
     /// failure (Pod still Pending, log not yet available) is retried next tick.
     active: Arc<Mutex<HashSet<Fence>>>,
+    /// Fences whose tail drained to end-of-stream (the followed Pod finished and
+    /// the API closed the log). These are complete and must never be re-tailed —
+    /// otherwise a step that stays `running` in the store for a few ticks after
+    /// its Pod exits gets its whole stdout re-ingested every tick, duplicating
+    /// the log N times. Bounded by total step-attempts over the process lifetime.
+    drained: Arc<Mutex<HashSet<Fence>>>,
+    /// Earliest instant a fence whose last tail errored may be retried — a
+    /// per-fence backoff so a Pod with no log yet isn't re-tailed every tick.
+    retry_at: Arc<Mutex<HashMap<Fence, Instant>>>,
 }
 
 impl LogTailer {
@@ -84,6 +101,8 @@ impl LogTailer {
             executor,
             logs,
             active: Arc::new(Mutex::new(HashSet::new())),
+            drained: Arc::new(Mutex::new(HashSet::new())),
+            retry_at: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -97,6 +116,16 @@ impl LogTailer {
         let attempt = attempt.id.clone();
         let fence = fence_of(&step.run, &step.step, &attempt);
 
+        // Already fully drained — the Pod's log is complete; never re-tail it.
+        if self.drained.lock().unwrap().contains(&fence) {
+            return;
+        }
+        // Backing off after a recent error — don't hammer a Pod with no log yet.
+        if let Some(at) = self.retry_at.lock().unwrap().get(&fence) {
+            if Instant::now() < *at {
+                return;
+            }
+        }
         // Claim the fence; bail if a tail is already in flight for it.
         if !self.active.lock().unwrap().insert(fence.clone()) {
             return;
@@ -105,16 +134,30 @@ impl LogTailer {
         let executor = self.executor.clone();
         let logs = self.logs.clone();
         let active = self.active.clone();
+        let drained = self.drained.clone();
+        let retry_at = self.retry_at.clone();
         let step_run = step.clone();
         let run = step.run.clone();
         let step_id = step.step.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = drain(&*executor, &logs, &step_run, &run, &step_id, &attempt).await {
+            match drain(&*executor, &logs, &step_run, &run, &step_id, &attempt).await {
+                // Stream closed cleanly: we have the step's complete log. Mark the
+                // fence drained so no later tick re-ingests it (dedup fix).
+                Ok(()) => {
+                    drained.lock().unwrap().insert(fence.clone());
+                    retry_at.lock().unwrap().remove(&fence);
+                }
                 // Best-effort: a lost tail never fails the run (ADR-0013). Common
                 // benign case: the Pod is still Pending, so its log isn't ready —
-                // clearing the fence lets a later tick retry.
-                tracing::warn!(run = %run.0, step = %step_id.0, error = %e, "log tail ended with error");
+                // back off before retrying so we don't hammer the API each tick.
+                Err(e) => {
+                    tracing::warn!(run = %run.0, step = %step_id.0, error = %e, "log tail ended with error");
+                    retry_at
+                        .lock()
+                        .unwrap()
+                        .insert(fence.clone(), Instant::now() + RETRY_BACKOFF);
+                }
             }
             active.lock().unwrap().remove(&fence);
         });

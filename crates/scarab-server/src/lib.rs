@@ -217,6 +217,13 @@ pub struct StepDto {
     pub secrets: Vec<String>,
     #[serde(default)]
     pub needs: Vec<String>,
+    /// Privilege escalation requested above the hardened baseline (ADR-0039).
+    /// On an inline API run only the self-service `run_as_root` grant is admitted
+    /// (it stays inside the sandbox); governed grants (add-capabilities /
+    /// privileged) require a target Environment and are rejected fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub security: Option<scarab_pipeline::StepSecurity>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -501,6 +508,19 @@ async fn create_run(
         .await?;
 
     for step in &req.pipeline.steps {
+        // Admit the step's privilege request (ADR-0039), same as the trigger path.
+        // An inline API run carries no Environment, so governed grants
+        // (add-capabilities/privileged) are rejected fail-closed — but the
+        // self-service `run_as_root` grant is honored (it stays inside the
+        // caps-dropped, unprivileged sandbox). The hardened floor always applies.
+        let admitted = admit_step_grants(None, step.security.as_ref(), &step.image, false)
+            .map_err(|v| {
+                ApiError::BadRequest(format!(
+                    "step `{}`: privilege request rejected: {}",
+                    step.id,
+                    v.join("; ")
+                ))
+            })?;
         let spec = StepSpec {
             image: step.image.clone(),
             command: step.command.clone(),
@@ -510,12 +530,9 @@ async fn create_run(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             secrets: step.secrets.clone(),
-            // Inline API runs carry no Environment, so they are baseline-only
-            // (ADR-0039): request governed grants via a committed `.scarab` that
-            // targets an Environment. The hardened floor still applies in the pod.
-            run_as_root: false,
-            add_capabilities: Vec::new(),
-            privileged: false,
+            run_as_root: admitted.run_as_root,
+            add_capabilities: admitted.add_capabilities,
+            privileged: admitted.privileged,
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db

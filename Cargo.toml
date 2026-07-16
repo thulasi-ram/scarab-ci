@@ -57,6 +57,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "migrate", "macros", "json"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+# Pin the rustls default CryptoProvider (ring) at the composition root; see the
+# note in scarab-server/src/main.rs. `ring` matches sqlx's `tls-rustls-ring`.
+rustls = { version = "0.23", features = ["ring"] }
 object_store = { version = "0.14", features = ["aws"] }
 sha2 = "0.10"
 hmac = "0.12"
