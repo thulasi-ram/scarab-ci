@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1784205107,"nonce":"jbZhPx33HiRNXEy54skgUTcgJQQ=","title":"[ADR-0046] Wire forge into production (AppState.forge, status posting, run deep-link)","was":"2ff6e87 (ADR-0046 epic)"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1784205108,"nonce":"Ej8S4dFbble5rmDffEO4i27vi54=","added":["type:feat","tracer-bullet","ready-for-agent","area:server"],"removed":null}]}
