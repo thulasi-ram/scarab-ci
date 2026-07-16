@@ -1,6 +1,6 @@
 # 0043. Launch parameters + manual dispatch as a repo-aware trigger
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-16
 - **Deciders:** thulasi.ram (architect)
 - **Refines:** [0038](0038-invoke-and-local-reuse.md) (makes `interface.inputs` a *launch* contract, not only a reuse contract), [0041](0041-named-results-and-interpolation.md) (adds the `inputs` binding to the interpolation rail), [0009](0009-dsl-ir-yaml-cel.md) (typed IR + CEL), [0010](0010-forge-integration.md) (read-at-ref discovery)
