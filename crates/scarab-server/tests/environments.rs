@@ -27,7 +27,7 @@ use scarab_engine::ports::ExecState;
 use scarab_engine::{
     Db, DeployContext, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
 };
-use scarab_projects::{EnvironmentStore, ProtectionRules};
+use scarab_project::{EnvironmentStore, ProtectionRules};
 use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeExecutor, FakeSecrets, InMemoryObjectStore};
@@ -99,7 +99,7 @@ async fn environment_management_crud_over_repo_scoped_routes() {
     let resp = app.clone().oneshot(get_req("/v1/repos/acme/web/environments")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let envs: Vec<scarab_projects::Environment> = serde_json::from_slice(&body).unwrap();
+    let envs: Vec<scarab_project::Environment> = serde_json::from_slice(&body).unwrap();
     assert_eq!(envs.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), vec!["prod", "staging"]);
 
     // Deployment history starts empty.
@@ -169,7 +169,7 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
     };
 
     // --- Case 1: approver requirement NOT met by the anonymous approver ---
-    pg.put_environment("acme", "web", &scarab_projects::Environment {
+    pg.put_environment("acme", "web", &scarab_project::Environment {
         name: "prod".into(),
         protection: rules(&["alice"], &["refs/heads/main"]), // requires alice, not anonymous
     })
@@ -189,7 +189,7 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
     assert!(pg.deployments("acme", "web", "prod").await.unwrap().is_empty());
 
     // --- Case 2: approver requirement satisfied by the anonymous approver ---
-    pg.put_environment("acme", "web", &scarab_projects::Environment {
+    pg.put_environment("acme", "web", &scarab_project::Environment {
         name: "prod".into(),
         protection: rules(&["anonymous"], &["refs/heads/main"]),
     })
@@ -233,7 +233,7 @@ async fn secret_matrix_reports_effective_status() {
         pg.put_environment(
             "acme",
             "web",
-            &scarab_projects::Environment { name: name.into(), protection: rules(&[], &[]) },
+            &scarab_project::Environment { name: name.into(), protection: rules(&[], &[]) },
         )
         .await
         .unwrap();

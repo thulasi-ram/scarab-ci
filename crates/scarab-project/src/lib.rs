@@ -1,4 +1,4 @@
-//! # scarab-projects — org / repo / project / environment model
+//! # scarab-project — org / repo / project / environment model
 //!
 //! Pure domain crate. Holds the tenancy + configuration model, including
 //! environment [`ProtectionRules`]. Depends only on `serde` and the pure

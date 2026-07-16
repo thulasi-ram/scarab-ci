@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_engine::Db;
 use scarab_forge::{Event, Repo};
-use scarab_projects::{
+use scarab_project::{
     Deployment, Environment, EnvironmentStore, ProjectError, ProtectionRules,
 };
 use scarab_secrets::SecretScope;

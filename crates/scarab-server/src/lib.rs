@@ -80,7 +80,7 @@ pub struct AppState {
     pub sessions: Option<Arc<dyn scarab_identity::SessionStore>>,
     /// Environments + deployment history store. `None` disables the environment
     /// endpoints.
-    pub environments: Option<Arc<dyn scarab_projects::EnvironmentStore>>,
+    pub environments: Option<Arc<dyn scarab_project::EnvironmentStore>>,
     /// The OIDC issuer. When set, serves JWKS + discovery for keyless federation.
     pub oidc: Option<Arc<oidc::Rs256Issuer>>,
     /// HMAC secret for external-gate release tokens (ADR-0034). `None` disables
@@ -140,7 +140,7 @@ impl AppState {
     /// Enable the environment / deployment endpoints.
     pub fn with_environments(
         mut self,
-        environments: Arc<dyn scarab_projects::EnvironmentStore>,
+        environments: Arc<dyn scarab_project::EnvironmentStore>,
     ) -> Self {
         self.environments = Some(environments);
         self
@@ -1043,7 +1043,7 @@ pub async fn trigger_run_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
-    environments: Option<&dyn scarab_projects::EnvironmentStore>,
+    environments: Option<&dyn scarab_project::EnvironmentStore>,
     event: &scarab_forge::Event,
 ) -> Result<Vec<RunId>, TriggerError> {
     // Repo-less events (cron/manual/api) don't carry in-repo config here.
@@ -1163,7 +1163,7 @@ async fn prefetch_libs_and_compile(
 async fn admit_and_create_run(
     db: &dyn Db,
     clock: &dyn Clock,
-    environments: Option<&dyn scarab_projects::EnvironmentStore>,
+    environments: Option<&dyn scarab_project::EnvironmentStore>,
     event: &scarab_forge::Event,
     ir: &scarab_pipeline::PipelineIr,
     path: &str,
@@ -1399,7 +1399,7 @@ pub async fn dispatch_run(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
-    environments: Option<&dyn scarab_projects::EnvironmentStore>,
+    environments: Option<&dyn scarab_project::EnvironmentStore>,
     actor: String,
     repo: scarab_forge::Repo,
     r#ref: String,
@@ -1492,15 +1492,15 @@ pub async fn dispatch_run(
 ///   are impossible ("privileged requires an Environment"); self-service
 ///   `run-as-root` is still allowed (it cannot escape the sandbox).
 fn admit_step_grants(
-    protection: Option<&scarab_projects::ProtectionRules>,
+    protection: Option<&scarab_project::ProtectionRules>,
     security: Option<&scarab_pipeline::StepSecurity>,
     image: &str,
     locked_out: bool,
-) -> Result<scarab_projects::AdmittedGrants, Vec<String>> {
+) -> Result<scarab_project::AdmittedGrants, Vec<String>> {
     let Some(sec) = security.filter(|s| !s.is_baseline()) else {
-        return Ok(scarab_projects::AdmittedGrants::default());
+        return Ok(scarab_project::AdmittedGrants::default());
     };
-    let req = scarab_projects::GrantRequest {
+    let req = scarab_project::GrantRequest {
         run_as_root: sec.run_as_root,
         add_capabilities: sec.add_capabilities.clone(),
         privileged: sec.privileged,
@@ -1511,7 +1511,7 @@ fn admit_step_grants(
             "governed grants (add-capabilities/privileged) require a target Environment"
                 .to_string(),
         ]),
-        None => Ok(scarab_projects::AdmittedGrants {
+        None => Ok(scarab_project::AdmittedGrants {
             run_as_root: req.run_as_root,
             ..Default::default()
         }),
@@ -1528,7 +1528,7 @@ async fn persist_run_from_ir(
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,
     pipeline: &str,
-    protection: Option<&scarab_projects::ProtectionRules>,
+    protection: Option<&scarab_project::ProtectionRules>,
     locked_out: bool,
     excluded: &[String],
     now: Timestamp,
@@ -2041,7 +2041,7 @@ async fn approve_gate(
     if let (Some(c), Some(store)) = (&ctx, st.environments.as_ref()) {
         let now = st.clock.now().await.0;
         store
-            .record_deployment(&scarab_projects::Deployment {
+            .record_deployment(&scarab_project::Deployment {
                 org: c.org.clone(),
                 repo: c.repo.clone(),
                 environment: c.environment.clone(),
@@ -2336,11 +2336,11 @@ async fn put_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
-    Json(protection): Json<scarab_projects::ProtectionRules>,
+    Json(protection): Json<scarab_project::ProtectionRules>,
 ) -> Result<StatusCode, ApiError> {
     authorize(&st, &headers, Action::Administer).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
-    let env = scarab_projects::Environment {
+    let env = scarab_project::Environment {
         name: name.clone(),
         protection,
     };
@@ -2356,7 +2356,7 @@ async fn get_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
-) -> Result<Json<scarab_projects::Environment>, ApiError> {
+) -> Result<Json<scarab_project::Environment>, ApiError> {
     authorize(&st, &headers, Action::Read).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let env = store
@@ -2372,7 +2372,7 @@ async fn list_environments(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo)): Path<(String, String)>,
-) -> Result<Json<Vec<scarab_projects::Environment>>, ApiError> {
+) -> Result<Json<Vec<scarab_project::Environment>>, ApiError> {
     authorize(&st, &headers, Action::Read).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let envs = store
@@ -2404,7 +2404,7 @@ async fn list_deployments(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
-) -> Result<Json<Vec<scarab_projects::Deployment>>, ApiError> {
+) -> Result<Json<Vec<scarab_project::Deployment>>, ApiError> {
     authorize(&st, &headers, Action::Read).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let history = store
@@ -2693,7 +2693,7 @@ fn step_status_name(s: StepStatus) -> &'static str {
 mod grant_admission_tests {
     use super::admit_step_grants;
     use scarab_pipeline::StepSecurity;
-    use scarab_projects::{ImageGrant, ProtectionRules};
+    use scarab_project::{ImageGrant, ProtectionRules};
     use scarab_secrets::SecretScope;
 
     const IMG: &str = "ghcr.io/acme/deployer@sha256:aaaa";

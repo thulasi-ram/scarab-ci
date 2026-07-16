@@ -42,7 +42,7 @@ scarab-forge = { workspace = true }
 scarab-identity = { workspace = true }
 scarab-secrets = { workspace = true }
 scarab-storage = { workspace = true }
-scarab-projects = { workspace = true }
+scarab-project = { workspace = true }
 scarab-db-postgres = { workspace = true }
 scarab-forge-github = { workspace = true }
 scarab-secrets-postgres = { workspace = true }

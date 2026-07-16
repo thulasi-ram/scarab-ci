@@ -24,7 +24,7 @@ use scarab_engine::{
     LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec,
     StepStatus, Timestamp,
 };
-use scarab_projects::{Deployment, Environment, EnvironmentStore, ProjectError};
+use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError};
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
 /// applies all pending ones (tracked in `_sqlx_migrations`); tests can also walk

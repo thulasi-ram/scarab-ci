@@ -1,5 +1,5 @@
 [package]
-name = "scarab-projects"
+name = "scarab-project"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

@@ -22,7 +22,7 @@ use scarab_engine::{
     Clock, Db, EventPayload, ExecError, RunId, RunStatus, Scheduler, StepRun, StepSpec,
 };
 use scarab_forge::Repo;
-use scarab_projects::{
+use scarab_project::{
     Deployment, Environment, EnvironmentStore, ProjectError, ProtectionRules,
 };
 use scarab_secrets::SecretScope;
