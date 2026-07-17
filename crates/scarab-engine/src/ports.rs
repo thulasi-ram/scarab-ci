@@ -437,6 +437,15 @@ pub trait Db: Send + Sync {
     /// metadata (state row, event log) is retained for audit (ADR-0050).
     async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError>;
 
+    /// The workspace-CAS **mark set** roots (ADR-0050): the output snapshots
+    /// of every step of every non-terminal run, plus terminal runs that
+    /// settled at/after `terminal_cutoff`. A gate-suspended run is
+    /// non-terminal, so its roots are ALWAYS marked, regardless of age.
+    async fn gc_workspace_roots(
+        &self,
+        terminal_cutoff: Timestamp,
+    ) -> Result<Vec<String>, DbError>;
+
     /// Acquire (or renew) a time-bounded lease over a named `resource` (a step
     /// id, `"scheduler"` leadership, …) for `owner`. Only an expired lease is
     /// taken over; the returned [`Lease`] names the current holder.

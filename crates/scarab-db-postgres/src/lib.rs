@@ -1192,6 +1192,27 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn gc_workspace_roots(
+        &self,
+        terminal_cutoff: Timestamp,
+    ) -> Result<Vec<String>, DbError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT sr.output_snapshot FROM step_runs sr
+             JOIN runs r ON r.id = sr.run_id
+             WHERE sr.output_snapshot IS NOT NULL
+               AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
+                    OR r.updated_at >= $1)",
+        )
+        .bind(terminal_cutoff.0)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("output_snapshot"))
+            .collect())
+    }
+
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
         // Acquire or renew, taking over only an expired lease. RETURNING yields
         // the winning holder; if the incumbent lease is still valid the DO

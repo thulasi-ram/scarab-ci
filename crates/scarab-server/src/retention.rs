@@ -79,13 +79,100 @@ async fn prune_run_logs(
     Ok(())
 }
 
-/// Spawn the background sweeper: one pass every `interval`, forever.
+/// The workspace-CAS GC configuration (ADR-0050).
+#[derive(Debug, Clone, Copy)]
+pub struct GcConfig {
+    /// How long a TERMINAL run's workspace stays reachable, in ms.
+    pub workspace_ttl_ms: i64,
+    /// Objects younger than this are never swept even when unmarked — the
+    /// window protecting an in-flight ingest whose root is not yet recorded.
+    pub grace_ms: i64,
+}
+
+const GC_LEASE: &str = "cas-gc";
+const GC_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
+
+/// One mark-sweep pass over the workspace CAS (ADR-0050). Returns the number
+/// of objects swept. Leader-gated on its own lease.
+///
+/// - **Mark**: walk every root the Db reports reachable (all non-terminal
+///   runs + terminal runs within TTL), collecting `trees/<h>` + `blobs/<h>`.
+///   A walk error aborts the pass — robust over precise: a missed mark must
+///   never become a deleted live object.
+/// - **Sweep**: delete unmarked objects older than the grace window.
+pub async fn sweep_cas(
+    db: &Arc<dyn Db>,
+    cas: &Arc<dyn scarab_storage::Cas>,
+    store: &Arc<dyn ObjectStore>,
+    clock: &Arc<dyn Clock>,
+    owner: &str,
+    cfg: GcConfig,
+) -> Result<u32, String> {
+    let lease = db.lease(GC_LEASE, owner, GC_LEASE_TTL_MS).await.map_err(|e| e.to_string())?;
+    if lease.owner != owner {
+        return Ok(0);
+    }
+    let now = clock.now().await;
+
+    // --- Mark. ---------------------------------------------------------
+    let roots = db
+        .gc_workspace_roots(Timestamp(now.0 - cfg.workspace_ttl_ms))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut marked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut frontier: Vec<String> = roots;
+    while let Some(hash) = frontier.pop() {
+        if !marked.insert(format!("trees/{hash}")) {
+            continue; // shared subtree already walked (the dedup win)
+        }
+        let entries = cas
+            .tree_entries(&scarab_storage::TreeHash(hash.clone()))
+            .await
+            .map_err(|e| format!("mark walk of tree {hash}: {e} — aborting pass"))?;
+        for entry in entries {
+            match entry.target {
+                scarab_storage::TreeTarget::Blob(b) => {
+                    marked.insert(format!("blobs/{}", b.0));
+                }
+                scarab_storage::TreeTarget::Tree(t) => frontier.push(t.0),
+            }
+        }
+    }
+
+    // --- Sweep. --------------------------------------------------------
+    let mut swept = 0u32;
+    for prefix in ["trees/", "blobs/"] {
+        let objects = store.list_objects(prefix).await.map_err(|e| e.to_string())?;
+        for obj in objects {
+            if marked.contains(&obj.key) {
+                continue;
+            }
+            if now.0 - obj.modified_ms < cfg.grace_ms {
+                continue; // too young — possibly an in-flight ingest
+            }
+            if let Err(e) = store.delete(&obj.key).await {
+                tracing::warn!(key = %obj.key, error = %e, "cas gc: delete failed (next pass retries)");
+                continue;
+            }
+            swept += 1;
+        }
+    }
+    if swept > 0 {
+        tracing::info!(swept, marked = marked.len(), "cas gc pass complete");
+    }
+    Ok(swept)
+}
+
+/// Spawn the background sweeper: one retention pass + one CAS GC pass every
+/// `interval`, forever.
 pub fn spawn_sweeper(
     db: Arc<dyn Db>,
+    cas: Arc<dyn scarab_storage::Cas>,
     store: Arc<dyn ObjectStore>,
     clock: Arc<dyn Clock>,
     owner: String,
     cfg: RetentionConfig,
+    gc: GcConfig,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -94,6 +181,9 @@ pub fn spawn_sweeper(
                 Ok(0) => {}
                 Ok(n) => tracing::info!(runs = n, "retention sweep pass complete"),
                 Err(e) => tracing::warn!(error = %e, "retention sweep pass failed"),
+            }
+            if let Err(e) = sweep_cas(&db, &cas, &store, &clock, &owner, gc).await {
+                tracing::warn!(error = %e, "cas gc pass failed");
             }
             tokio::time::sleep(interval).await;
         }

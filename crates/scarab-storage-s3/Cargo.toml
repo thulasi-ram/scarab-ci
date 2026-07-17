@@ -8,6 +8,7 @@ license.workspace = true
 scarab-storage = { workspace = true }
 async-trait = { workspace = true }
 object_store = { workspace = true }
+futures = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 

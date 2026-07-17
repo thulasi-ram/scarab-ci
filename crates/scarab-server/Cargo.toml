@@ -56,3 +56,4 @@ scarab-testkit = { workspace = true }
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 sqlx = { workspace = true }
+tempfile = { workspace = true }

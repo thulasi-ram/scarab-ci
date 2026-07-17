@@ -40,6 +40,7 @@
 //! | `SCARAB_OAUTH_CLIENT_ID` … `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | env | OAuth/OIDC login provider (ADR-0049): all five together enable real authn (GitHub, Forgejo, or any OIDC issuer); a partial set refuses boot |
 //! | `SCARAB_OAUTH_SCOPES` | env | space-separated scopes for the authorize redirect (optional; e.g. `read:user` for GitHub, `openid profile` for OIDC) |
 //! | `SCARAB_RETENTION_LOG_DAYS` | env | terminal runs' log TTL in days (ADR-0050); default 30 — metadata is retained regardless |
+//! | `SCARAB_RETENTION_WORKSPACE_DAYS` | env | terminal runs' workspace-CAS reachability TTL in days (ADR-0050 mark-sweep); default 14 — non-terminal runs always reachable |
 //! | `SCARAB_OAUTH_OWNERS` | env | comma-separated subjects granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer` |
 //!
 //! Step-runtime env (`SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`/
@@ -224,6 +225,10 @@ pub struct Config {
     /// How long a terminal run's logs are retained, in days (ADR-0050;
     /// ADR-0030 default 30). Run metadata is retained regardless.
     pub retention_log_days: u32,
+    /// How long a TERMINAL run's workspace CAS stays reachable, in days
+    /// (ADR-0050 mark-sweep; default 14). Non-terminal runs are always
+    /// reachable regardless of age.
+    pub retention_workspace_days: u32,
 }
 
 /// The forge-agnostic OAuth/OIDC login provider (ADR-0049): explicit
@@ -481,6 +486,16 @@ impl Config {
                     .filter(|d| *d > 0)
                     .ok_or(ConfigError::InvalidRetention)?,
                 None => 30,
+            },
+            retention_workspace_days: match env("SCARAB_RETENTION_WORKSPACE_DAYS")
+                .filter(|v| !v.is_empty())
+            {
+                Some(v) => v
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|d| *d > 0)
+                    .ok_or(ConfigError::InvalidRetention)?,
+                None => 14,
             },
         })
     }

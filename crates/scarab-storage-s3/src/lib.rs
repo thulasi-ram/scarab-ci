@@ -180,6 +180,24 @@ impl ObjectStore for S3Storage {
         Ok(())
     }
 
+    async fn list_objects(&self, prefix: &str) -> Result<Vec<scarab_storage::StoredObject>, StorageError> {
+        use futures::TryStreamExt;
+        let prefix_path = ObjPath::from(prefix);
+        let metas: Vec<object_store::ObjectMeta> = self
+            .backend()?
+            .list(Some(&prefix_path))
+            .try_collect()
+            .await
+            .map_err(map_err)?;
+        Ok(metas
+            .into_iter()
+            .map(|m| scarab_storage::StoredObject {
+                key: m.location.to_string(),
+                modified_ms: m.last_modified.timestamp_millis(),
+            })
+            .collect())
+    }
+
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
         self.backend()?
             .delete(&ObjPath::from(key))
@@ -205,6 +223,10 @@ impl Cas for S3Storage {
             return Err(StorageError::HashMismatch);
         }
         Ok(data)
+    }
+
+    async fn tree_entries(&self, hash: &TreeHash) -> Result<Vec<TreeEntry>, StorageError> {
+        self.get_tree(hash).await
     }
 
     async fn put_tree(&self, mut entries: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {

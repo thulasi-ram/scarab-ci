@@ -122,17 +122,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.role.runs_driver() {
         scarab_server::retention::spawn_sweeper(
             db.clone(),
+            workspace_cas.clone(),
             Arc::clone(&store),
             clock.clone(),
             "scarab-server".to_string(),
             scarab_server::retention::RetentionConfig {
                 log_ttl_ms: (config.retention_log_days as i64) * 24 * 60 * 60 * 1000,
             },
+            scarab_server::retention::GcConfig {
+                workspace_ttl_ms: (config.retention_workspace_days as i64) * 24 * 60 * 60 * 1000,
+                // Never sweep objects younger than a day: protects an
+                // in-flight ingest whose root is not yet recorded.
+                grace_ms: 24 * 60 * 60 * 1000,
+            },
             Duration::from_secs(300),
         );
         tracing::info!(
-            "retention sweeper on (logs {}d; metadata retained, ADR-0050)",
-            config.retention_log_days
+            "retention sweeper on (logs {}d, workspace CAS {}d mark-sweep; metadata retained, ADR-0050)",
+            config.retention_log_days,
+            config.retention_workspace_days,
         );
     }
 

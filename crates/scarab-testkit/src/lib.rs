@@ -947,6 +947,26 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn gc_workspace_roots(
+        &self,
+        terminal_cutoff: Timestamp,
+    ) -> Result<Vec<String>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .steps
+            .iter()
+            .filter(|((run, _), rec)| {
+                rec.output.is_some()
+                    && st.runs.get(run).is_some_and(|status| {
+                        !status.is_terminal()
+                            || st.run_created.get(run).copied().unwrap_or(Timestamp(0)).0
+                                >= terminal_cutoff.0
+                    })
+            })
+            .filter_map(|(_, rec)| rec.output.clone())
+            .collect())
+    }
+
     async fn lease(&self, _resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
         Ok(Lease {
             owner: owner.to_string(),
@@ -1129,13 +1149,21 @@ impl Executor for FakeExecutor {
 #[derive(Default)]
 pub struct InMemoryObjectStore {
     blobs: Mutex<HashMap<String, Vec<u8>>>,
+    /// Per-key last-modified (unix-ms) for GC tests; unset = 0 (ancient).
+    modified: Mutex<HashMap<String, i64>>,
 }
 
 impl InMemoryObjectStore {
     pub fn new() -> Self {
         Self {
             blobs: Mutex::new(HashMap::new()),
+            modified: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Set a key's last-modified time (what the GC grace window reads).
+    pub fn set_modified(&self, key: &str, ms: i64) {
+        self.modified.lock().unwrap().insert(key.to_string(), ms);
     }
 
     /// Number of stored objects (for assertions).
@@ -1167,6 +1195,21 @@ impl ObjectStore for InMemoryObjectStore {
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
         self.blobs.lock().unwrap().remove(key);
         Ok(())
+    }
+    async fn list_objects(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<scarab_storage::StoredObject>, StorageError> {
+        let objects = self.blobs.lock().unwrap();
+        let modified = self.modified.lock().unwrap();
+        Ok(objects
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .map(|k| scarab_storage::StoredObject {
+                key: k.clone(),
+                modified_ms: modified.get(k).copied().unwrap_or(0),
+            })
+            .collect())
     }
 }
 

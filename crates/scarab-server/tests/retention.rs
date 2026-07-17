@@ -159,3 +159,142 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
 
     tdb.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------
+// Workspace-CAS mark-sweep GC (ADR-0050) — real Postgres + a real local CAS.
+// ---------------------------------------------------------------------------
+
+use scarab_server::retention::{sweep_cas, GcConfig};
+use scarab_storage::Cas;
+
+async fn seed_run_with_workspace(
+    db: &PostgresDb,
+    cas: &Arc<dyn Cas>,
+    id: &str,
+    terminal: bool,
+    files: &[(&str, &str)],
+) -> String {
+    let run = RunId(id.into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    let path = &[
+        (RunStatus::Pending, RunStatus::Running),
+        if terminal {
+            (RunStatus::Running, RunStatus::Succeeded)
+        } else {
+            (RunStatus::Running, RunStatus::Suspended)
+        },
+    ];
+    for (from, to) in path {
+        db.record_transition(&run, *from, *to).await.unwrap();
+    }
+    db.create_step_run(&run, &StepId("s1".into()), None, &[], Timestamp(0)).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for (name, content) in files {
+        std::fs::write(dir.path().join(name), content).unwrap();
+    }
+    let root = cas.ingest(dir.path().to_str().unwrap()).await.unwrap().root.0;
+    db.set_step_output(&run, &StepId("s1".into()), &root).await.unwrap();
+    root
+}
+
+#[tokio::test]
+async fn cas_gc_sweeps_only_unreachable_aged_objects() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = PostgresDb::with_pool(tdb.pool.clone());
+    pg.migrate().await.unwrap();
+
+    let cas_dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(
+        scarab_storage_s3::S3Storage::local(cas_dir.path().to_str().unwrap()).unwrap(),
+    );
+    let cas: Arc<dyn Cas> = storage.clone();
+    let store: Arc<dyn ObjectStore> = storage.clone();
+
+    // Old TERMINAL run: its workspace becomes unreachable. One file is SHARED
+    // with the suspended run — the dedup case the mark walk must protect.
+    let old_root =
+        seed_run_with_workspace(&pg, &cas, "gc-old-done", true, &[("only-old.txt", "old"), ("shared.txt", "same-bytes")])
+            .await;
+    // Old SUSPENDED run: reachable forever, regardless of age.
+    let suspended_root =
+        seed_run_with_workspace(&pg, &cas, "gc-old-suspended", false, &[("keep.txt", "keep"), ("shared.txt", "same-bytes")])
+            .await;
+    // Age both runs' rows well past the TTL.
+    for id in ["gc-old-done", "gc-old-suspended"] {
+        sqlx::query("UPDATE runs SET updated_at = 0 WHERE id = $1")
+            .bind(id)
+            .execute(&tdb.pool)
+            .await
+            .unwrap();
+    }
+    // Fresh TERMINAL run: within TTL, reachable.
+    let fresh_root =
+        seed_run_with_workspace(&pg, &cas, "gc-fresh-done", true, &[("fresh.txt", "fresh")]).await;
+
+    let db: Arc<dyn Db> = Arc::new(pg);
+    // Real "now" (+1 min so freshly written CAS files are strictly older than
+    // the clock): grace-window arithmetic compares against real file mtimes.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(now_ms));
+
+    // Pass 1 — a HUGE grace window: nothing is swept even though the old
+    // terminal run is unreachable (in-flight-ingest protection).
+    let swept = sweep_cas(
+        &db,
+        &cas,
+        &store,
+        &clock,
+        "gc-1",
+        GcConfig { workspace_ttl_ms: 30 * DAY_MS, grace_ms: i64::MAX },
+    )
+    .await
+    .unwrap();
+    assert_eq!(swept, 0, "grace window protects young objects");
+
+    // Pass 2 — no grace: exactly the old terminal run's UNSHARED objects go.
+    let swept = sweep_cas(
+        &db,
+        &cas,
+        &store,
+        &clock,
+        "gc-1",
+        GcConfig { workspace_ttl_ms: 30 * DAY_MS, grace_ms: 0 },
+    )
+    .await
+    .unwrap();
+    assert!(swept > 0, "the unreachable workspace was collected");
+
+    // The suspended (never-collectable) and fresh workspaces materialize fine.
+    for (root, file) in [(&suspended_root, "keep.txt"), (&fresh_root, "fresh.txt")] {
+        let out = tempfile::tempdir().unwrap();
+        cas.materialize(&scarab_storage::TreeHash(root.clone()), out.path().to_str().unwrap())
+            .await
+            .expect("reachable workspace survives GC");
+        assert!(out.path().join(file).exists());
+    }
+    // The SHARED blob survived (marked via the suspended run) even though the
+    // old run that also referenced it was collected.
+    let out = tempfile::tempdir().unwrap();
+    cas.materialize(&scarab_storage::TreeHash(suspended_root.clone()), out.path().to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(out.path().join("shared.txt")).unwrap(), "same-bytes");
+
+    // The old root's tree object is gone: materializing it now fails.
+    let out = tempfile::tempdir().unwrap();
+    assert!(
+        cas.materialize(&scarab_storage::TreeHash(old_root), out.path().to_str().unwrap())
+            .await
+            .is_err(),
+        "the unreachable root was actually swept"
+    );
+
+    tdb.cleanup().await;
+}
