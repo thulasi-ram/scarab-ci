@@ -112,6 +112,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(s)
     };
 
+    // The production forge (ADR-0046): a registry-routed ForgePort — each call
+    // resolves its repo through the ForgeConnection registry, constructs the
+    // vendor adapter (GitHub App/token, Forgejo token) with credentials
+    // fetched from SecretProvider at use-time, and caches it per connection.
+    let forge: Arc<dyn scarab_forge::ForgePort> = Arc::new(
+        scarab_server::forge_router::RegistryForge::new(
+            pg.clone(),
+            secrets.clone(),
+            config.github_app_id.clone(),
+        ),
+    );
+    // Startup validation (ADR-0046): every registered connection's credential
+    // handle must resolve. Missing material is a loud DEGRADED warning — the
+    // connection cannot serve until the secret is registered.
+    {
+        use scarab_forge::ForgeConnectionStore;
+        match pg.list_connections().await {
+            Ok(conns) => {
+                for conn in conns {
+                    if let Err(e) =
+                        scarab_server::connection_credential(secrets.as_ref(), &conn).await
+                    {
+                        tracing::warn!(
+                            connection = %conn.id,
+                            credential_ref = %conn.credential_ref,
+                            error = %e,
+                            "startup: DEGRADED — forge connection credential unavailable"
+                        );
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "startup: could not list forge connections"),
+        }
+    }
+
     // Results egress (ADR-0042): a shared HMAC secret both mints the k8s
     // sidecar's fence token and verifies it at the ingest endpoint.
     let results_egress = config.results_egress.as_ref().map(|egress| ResultsEgress {
@@ -163,13 +198,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ExecutorKind::Local => 1_000,
                 ExecutorKind::K8s => 30_000,
             };
-            // Forge-status posting is wired once GitHub App auth lands; until then
-            // the driver ticks without a forge.
+            // Forge-status posting (ADR-0046): the registry-routed forge posts
+            // Running/Succeeded/Failed commit statuses with run deep-links.
             converged::spawn_driver(
                 db.clone(),
                 clock.clone(),
                 executor,
-                None,
+                Some(forge.clone()),
                 // Feed the log pipeline from the executor's live tail (ADR-0013).
                 Some(logs.clone()),
                 "scarab-server".to_string(),
@@ -190,6 +225,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The ForgeConnection registry (ADR-0046): RepoRef→Project resolution,
         // installation auto-registration, webhook replay dedup.
         .with_forge_connections(pg.clone())
+        // The acting forge (no more forge=None): webhook-triggered runs read
+        // in-repo `.scarab` config through it for real.
+        .with_forge(forge.clone())
         // /v1/secrets management with the secrets store built above (ADR-0014).
         .with_secrets(secrets.clone());
     if let Some(secret) = config.github_webhook_secret.clone() {

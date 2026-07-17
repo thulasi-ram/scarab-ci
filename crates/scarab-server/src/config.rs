@@ -34,6 +34,7 @@
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
+//! | `SCARAB_GITHUB_APP_ID` | env | GitHub App id (ADR-0046): when set, GitHub connections authenticate in **App mode** (their credential secret is the App PEM); absent = token mode (dev) |
 //!
 //! Step-runtime env (`SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`/
 //! `SCARAB_RESULTS*`/`SCARAB_PARAM_*`) is injected *into* step containers by
@@ -202,6 +203,9 @@ pub struct Config {
     /// status carries (`{public_url}/runs/{id}`). Dev default
     /// `http://localhost:8080`.
     pub public_url: String,
+    /// GitHub App id (ADR-0046). `Some` = App mode (connection credentials
+    /// are the App private-key PEM); `None` = token mode (dev).
+    pub github_app_id: Option<String>,
 }
 
 /// A configuration the process must refuse to start under, with a message
@@ -369,6 +373,7 @@ impl Config {
             public_url: env("SCARAB_PUBLIC_URL")
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "http://localhost:8080".into()),
+            github_app_id: env("SCARAB_GITHUB_APP_ID").filter(|v| !v.is_empty()),
         })
     }
 
@@ -424,6 +429,13 @@ impl Config {
                 self.step_timeout_secs,
             ),
             format!("public url: {} (run deep-links, ADR-0046)", self.public_url),
+            format!(
+                "forge: registry-routed; github auth {} (ADR-0046)",
+                match &self.github_app_id {
+                    Some(id) => format!("App mode (app id {id})"),
+                    None => "token mode (dev; set SCARAB_GITHUB_APP_ID for App auth)".into(),
+                },
+            ),
             format!(
                 "secrets store: enabled (envelope encryption, ADR-0014; KEK {})",
                 if self.master_key.is_some() { "persistent" } else { "EPHEMERAL" },
