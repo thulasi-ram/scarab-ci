@@ -142,6 +142,15 @@ impl Executor for LocalExecutor {
                     .into(),
             ));
         }
+        // Same contract for build steps (ADR-0018): rootless BuildKit is a
+        // Pod-shaped capability the host-process backend cannot honor.
+        if spec.build.is_some() {
+            return Err(ExecError::Launch(
+                "build steps require the k8s executor (rootless BuildKit, ADR-0018); \
+                 the local backend has no image-build support"
+                    .into(),
+            ));
+        }
         // The step contract is an OCI image + command; locally there is no image,
         // so a command is required (ADR-0036).
         let (program, args) = spec

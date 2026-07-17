@@ -405,6 +405,26 @@ impl ForgePort for ForgejoForge {
             read_only,
         })
     }
+
+    /// Forgejo serves its container registry on the instance host itself
+    /// (ADR-0018 amendment): the configured token pushes there — its
+    /// `write:package` scope is the operator's contract.
+    async fn registry_credential(
+        &self,
+        _repo: &RepoRef,
+    ) -> Result<Option<scarab_forge::RegistryCredential>, ForgeError> {
+        let host = self
+            .base_url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+        Ok(Some(scarab_forge::RegistryCredential {
+            registry: host,
+            username: "scarab".into(),
+            token: self.token.clone(),
+        }))
+    }
 }
 
 #[cfg(test)]

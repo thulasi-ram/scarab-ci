@@ -79,6 +79,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         timeout_seconds: None,
         workspace_inputs: vec![],
         clone: None,
+        build: None,
     };
 
     // launch, then launch again — the second call must re-attach, not relaunch.
@@ -139,6 +140,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         timeout_seconds: Some(5),
         workspace_inputs: vec![],
         clone: None,
+        build: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -190,6 +192,7 @@ async fn log_stream_tails_pod_stdout() {
         timeout_seconds: None,
         workspace_inputs: vec![],
         clone: None,
+        build: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -276,6 +279,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         timeout_seconds: Some(120),
         workspace_inputs: inputs,
         clone: None,
+        build: None,
     };
     async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
         for _ in 0..90 {
@@ -392,6 +396,7 @@ async fn clone_step_produces_a_source_workspace() {
             url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
             ..Default::default()
         }),
+        build: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch clone");
@@ -466,6 +471,7 @@ async fn clone_step_produces_a_source_workspace() {
         timeout_seconds: Some(300),
         workspace_inputs: vec![root.clone()],
         clone: None,
+        build: None,
     };
     let bh = exec.launch(&build, &build_spec).await.expect("launch downstream");
     let mut terminal = None;
@@ -542,6 +548,7 @@ async fn clone_depth_full_exposes_history() {
             url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
             ..Default::default()
         }),
+        build: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch full clone");
     let mut terminal = None;
@@ -587,6 +594,7 @@ async fn clone_depth_full_exposes_history() {
         timeout_seconds: Some(300),
         workspace_inputs: vec![root],
         clone: None,
+        build: None,
     };
     let ch = exec.launch(&count, &count_spec).await.expect("launch history check");
     let mut terminal = None;
@@ -662,6 +670,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
             url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
             ..Default::default()
         }),
+        build: None,
     };
 
     let started = std::time::Instant::now();
@@ -690,4 +699,145 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
     );
 
     exec.cancel(&h).await.expect("cleanup");
+}
+
+/// LIVE `kind: build` (ADR-0018): rootless BuildKit builds a trivial image
+/// from a CAS-materialized workspace and pushes it to a local in-cluster
+/// registry; a verification step then reads the registry's tag list.
+/// Needs a registry Service in the cluster (SCARAB_TEST_REGISTRY, e.g.
+/// `registry.default.svc.cluster.local:5000` — plain HTTP, hence
+/// insecure_push). `#[ignore]`d + SCARAB_TEST_KUBE gated.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn build_step_builds_and_pushes_to_a_local_registry() {
+    use scarab_storage::Cas;
+    let Some(ns) = opted_in() else { return };
+    let Ok(registry) = std::env::var("SCARAB_TEST_REGISTRY") else {
+        eprintln!("skipping: set SCARAB_TEST_REGISTRY to an in-cluster registry host:port");
+        return;
+    };
+    let run_id = unique_run("run-build");
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    let tmp = tempfile::tempdir().expect("cas dir");
+    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
+        scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local cas"),
+    );
+    let exec = K8sExecutor::with_client(ns, client).with_workspace_cas(cas.clone());
+
+    // The build context: a trivial Dockerfile, ingested as the upstream
+    // (checkout) workspace.
+    let ctx = tempfile::tempdir().expect("context dir");
+    std::fs::write(
+        ctx.path().join("Dockerfile"),
+        "FROM busybox\nRUN echo scarab-built > /built.txt\n",
+    )
+    .unwrap();
+    let root = cas
+        .ingest(ctx.path().to_str().unwrap())
+        .await
+        .expect("ingest context")
+        .root
+        .0;
+
+    let image = format!("{registry}/scarab-test:live");
+    let step = StepRun {
+        run: RunId(run_id.clone()),
+        step: StepId("image".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![StepId("checkout".into())],
+        gate_kind: None,
+    };
+    let spec = StepSpec {
+        image: String::new(),
+        command: vec![],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(600),
+        workspace_inputs: vec![root],
+        clone: None,
+        build: Some(scarab_engine::BuildConfig {
+            context: ".".into(),
+            dockerfile: "Dockerfile".into(),
+            image: image.clone(),
+            push: true,
+            insecure_push: true, // the local test registry is plain HTTP
+            ..Default::default()
+        }),
+    };
+    let h = exec.launch(&step, &spec).await.expect("launch build");
+    let mut terminal = None;
+    for _ in 0..300 {
+        match exec.poll(&h).await.expect("poll") {
+            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
+                terminal = Some(s);
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    assert_eq!(terminal, Some(ExecState::Succeeded), "build step succeeds");
+
+    // The push is observable: a verification step reads the registry's tag
+    // list from inside the cluster.
+    let verify = StepRun {
+        run: RunId(run_id.clone()),
+        step: StepId("verify".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let verify_spec = StepSpec {
+        image: "busybox:latest".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "tags=$(wget -qO- http://{registry}/v2/scarab-test/tags/list) && \
+                 echo \"$tags\" && echo \"$tags\" | grep -q live"
+            ),
+        ],
+        env: vec![],
+        secrets: vec![],
+        // busybox runs as root; the hardened baseline would reject it.
+        run_as_root: true,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(120),
+        workspace_inputs: vec![],
+        clone: None,
+        build: None,
+    };
+    let vh = exec.launch(&verify, &verify_spec).await.expect("launch verify");
+    let mut terminal = None;
+    for _ in 0..120 {
+        match exec.poll(&vh).await.expect("poll") {
+            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
+                terminal = Some(s);
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    assert_eq!(
+        terminal,
+        Some(ExecState::Succeeded),
+        "the pushed tag is listed by the registry"
+    );
+
+    exec.cancel(&vh).await.expect("cleanup verify");
+    exec.cancel(&h).await.expect("cleanup build");
 }

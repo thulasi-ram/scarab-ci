@@ -173,4 +173,11 @@ impl ForgePort for RegistryForge {
     ) -> Result<CheckoutCredential, ForgeError> {
         self.adapter_for(repo).await?.mint_checkout_credential(repo, read_only).await
     }
+
+    async fn registry_credential(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<Option<scarab_forge::RegistryCredential>, ForgeError> {
+        self.adapter_for(repo).await?.registry_credential(repo).await
+    }
 }

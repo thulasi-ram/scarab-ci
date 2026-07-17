@@ -627,6 +627,7 @@ async fn create_run(
             timeout_seconds: step.timeout,
             workspace_inputs: vec![],
         clone: None,
+            build: None,
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -1773,6 +1774,7 @@ async fn persist_run_from_ir(
                     url: String::new(),
                     credential: None,
                 }),
+                build: None,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -1789,6 +1791,25 @@ async fn persist_run_from_ir(
                             v.join("; ")
                         ))
                     })?;
+            // A `kind: build` step (ADR-0018): the engine runs rootless
+            // BuildKit with this context — never the author's image. The
+            // registry credential resolves at LAUNCH (scoped REGISTRY_AUTH
+            // secret, else the forge-derived credential).
+            let build = step.build.as_ref().map(|b| scarab_engine::BuildConfig {
+                context: if b.context.is_empty() { ".".into() } else { b.context.clone() },
+                dockerfile: if b.dockerfile.is_empty() {
+                    "Dockerfile".into()
+                } else {
+                    b.dockerfile.clone()
+                },
+                image: b.image.clone(),
+                repo_owner: event.repo().map(|r| r.owner.clone()).unwrap_or_default(),
+                repo_name: event.repo().map(|r| r.name.clone()).unwrap_or_default(),
+                push: b.push && !locked_out, // fork-PR lockout never pushes
+                insecure_push: false,
+                registry_auth_json: None,
+                derived_auth: None,
+            });
             let spec = StepSpec {
                 image: step.image.clone(),
                 command: step.command.clone(),
@@ -1798,8 +1819,9 @@ async fn persist_run_from_ir(
                 add_capabilities: admitted.add_capabilities,
                 privileged: admitted.privileged,
                 timeout_seconds: step.timeout,
-            workspace_inputs: vec![],
-        clone: None,
+                workspace_inputs: vec![],
+                clone: None,
+                build,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;

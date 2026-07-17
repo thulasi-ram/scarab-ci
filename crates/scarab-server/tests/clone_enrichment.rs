@@ -47,6 +47,7 @@ fn clone_spec(read_only: bool) -> StepSpec {
             read_only,
             ..Default::default()
         }),
+        build: None,
     }
 }
 
@@ -124,4 +125,121 @@ async fn non_clone_steps_pass_through_untouched() {
     spec.image = "busybox".into();
     let handle = exec.launch(&step_run("build"), &spec).await.unwrap();
     assert_eq!(inner.launched_spec(&handle).unwrap(), spec);
+}
+
+// ---------------------------------------------------------------------------
+// Build-step registry auth enrichment (ADR-0018 amendment).
+// ---------------------------------------------------------------------------
+
+use scarab_engine::BuildConfig;
+use scarab_secrets::SecretScope;
+use scarab_testkit::FakeSecrets;
+
+fn build_spec(image: &str) -> StepSpec {
+    StepSpec {
+        image: String::new(),
+        command: vec![],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: None,
+        workspace_inputs: vec![],
+        clone: None,
+        build: Some(BuildConfig {
+            context: ".".into(),
+            dockerfile: "Dockerfile".into(),
+            image: image.into(),
+            repo_owner: "acme".into(),
+            repo_name: "web".into(),
+            push: true,
+            ..Default::default()
+        }),
+    }
+}
+
+#[tokio::test]
+async fn scoped_registry_auth_secret_takes_precedence_over_forge_derived() {
+    let inner = Arc::new(FakeExecutor::new());
+    let secrets = Arc::new(FakeSecrets::new().with_secret(
+        &SecretScope::Repo { org: "acme".into(), repo: "web".into() },
+        "REGISTRY_AUTH",
+        br#"{"auths":{"registry.corp":{"auth":"eDp5"}}}"#,
+    ));
+    let forge = Arc::new(FakeForge::new().with_registry_credential(
+        scarab_forge::RegistryCredential {
+            registry: "ghcr.io".into(),
+            username: "x-access-token".into(),
+            token: "derived".into(),
+        },
+    ));
+    let exec = CloneEnrichingExecutor::new(inner.clone(), Arc::new(InMemoryDb::new()), forge)
+        .with_secrets(secrets);
+    let handle = exec
+        .launch(&step_run("image"), &build_spec("ghcr.io/acme/web:1"))
+        .await
+        .unwrap();
+    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
+    assert_eq!(
+        enriched.registry_auth_json.as_deref(),
+        Some(r#"{"auths":{"registry.corp":{"auth":"eDp5"}}}"#),
+        "the scoped secret wins"
+    );
+    assert_eq!(enriched.derived_auth, None);
+}
+
+#[tokio::test]
+async fn forge_derived_credential_is_the_fallback_and_only_for_its_own_registry() {
+    let forge = Arc::new(FakeForge::new().with_registry_credential(
+        scarab_forge::RegistryCredential {
+            registry: "ghcr.io".into(),
+            username: "x-access-token".into(),
+            token: "derived".into(),
+        },
+    ));
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = CloneEnrichingExecutor::new(inner.clone(), Arc::new(InMemoryDb::new()), forge)
+        .with_secrets(Arc::new(FakeSecrets::new())); // no scoped secret
+
+    // Pushing to the forge's own registry: derived credential applies.
+    let handle = exec
+        .launch(&step_run("image"), &build_spec("ghcr.io/acme/web:1"))
+        .await
+        .unwrap();
+    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
+    assert_eq!(enriched.registry_auth_json, None);
+    let derived = enriched.derived_auth.expect("forge-derived credential");
+    assert_eq!(derived.registry, "ghcr.io");
+    assert_eq!(derived.token, "derived");
+
+    // Pushing elsewhere: the forge credential must NOT leak to a foreign
+    // registry — anonymous build instead.
+    let handle = exec
+        .launch(&step_run("image2"), &build_spec("registry.elsewhere/acme/web:1"))
+        .await
+        .unwrap();
+    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
+    assert_eq!(enriched.registry_auth_json, None);
+    assert_eq!(enriched.derived_auth, None);
+}
+
+#[tokio::test]
+async fn inline_dev_builds_get_no_auth() {
+    let forge = Arc::new(FakeForge::new().with_registry_credential(
+        scarab_forge::RegistryCredential {
+            registry: "ghcr.io".into(),
+            username: "x".into(),
+            token: "t".into(),
+        },
+    ));
+    let inner = Arc::new(FakeExecutor::new());
+    let exec = CloneEnrichingExecutor::new(inner.clone(), Arc::new(InMemoryDb::new()), forge);
+    let mut spec = build_spec("ghcr.io/acme/web:1");
+    spec.build.as_mut().unwrap().repo_owner = String::new(); // no trigger repo
+    spec.build.as_mut().unwrap().repo_name = String::new();
+    let handle = exec.launch(&step_run("image"), &spec).await.unwrap();
+    let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();
+    assert_eq!(enriched.registry_auth_json, None);
+    assert_eq!(enriched.derived_auth, None);
 }

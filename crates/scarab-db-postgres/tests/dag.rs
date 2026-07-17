@@ -25,6 +25,7 @@ fn spec() -> StepSpec {
         timeout_seconds: None,
         workspace_inputs: vec![],
         clone: None,
+        build: None,
     }
 }
 

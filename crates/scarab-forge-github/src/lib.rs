@@ -747,6 +747,75 @@ impl ForgePort for GithubForge {
             read_only,
         })
     }
+
+    /// GHCR (ADR-0018 amendment): derive a push credential for github.com's
+    /// own registry. App mode mints an installation token asking for
+    /// `packages: write`; token mode hands back the PAT (its scopes are the
+    /// operator's contract). Best-effort — GHES (no ghcr.io) and Apps without
+    /// the packages permission yield `None`, never an error.
+    async fn registry_credential(
+        &self,
+        repo: &RepoRef,
+    ) -> Result<Option<scarab_forge::RegistryCredential>, ForgeError> {
+        if self.url("").trim_end_matches('/') != "https://api.github.com" {
+            return Ok(None); // GHES: registry host is instance-specific
+        }
+        let token = match &self.auth {
+            Auth::Token(t) => t.clone(),
+            Auth::App { app, cache } => {
+                let now = now_unix_secs();
+                let jwt = match sign_app_jwt(app, now) {
+                    Ok(j) => j,
+                    Err(_) => return Ok(None),
+                };
+                let installation_id = {
+                    let cached = cache
+                        .lock()
+                        .unwrap()
+                        .installations
+                        .get(&format!("{}/{}", repo.owner, repo.name))
+                        .copied();
+                    match cached {
+                        Some(id) => id,
+                        None => {
+                            let url = self.url(&format!(
+                                "/repos/{}/{}/installation",
+                                repo.owner, repo.name
+                            ));
+                            let Ok(resp) = self.send(|| self.client.get(&url), &jwt).await else {
+                                return Ok(None);
+                            };
+                            let Ok(body) = ok_json(resp).await else { return Ok(None) };
+                            match body.get("id").and_then(Value::as_u64) {
+                                Some(id) => id,
+                                None => return Ok(None),
+                            }
+                        }
+                    }
+                };
+                let url =
+                    self.url(&format!("/app/installations/{installation_id}/access_tokens"));
+                let body = serde_json::json!({
+                    "repositories": [repo.name],
+                    "permissions": { "packages": "write" },
+                });
+                let Ok(resp) = self.send(|| self.client.post(&url).json(&body), &jwt).await
+                else {
+                    return Ok(None);
+                };
+                let Ok(json) = ok_json(resp).await else { return Ok(None) };
+                match json.get("token").and_then(Value::as_str) {
+                    Some(t) => t.to_string(),
+                    None => return Ok(None),
+                }
+            }
+        };
+        Ok(Some(scarab_forge::RegistryCredential {
+            registry: "ghcr.io".into(),
+            username: "x-access-token".into(),
+            token,
+        }))
+    }
 }
 
 #[cfg(test)]

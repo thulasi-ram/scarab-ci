@@ -281,6 +281,13 @@ pub struct StepSpec {
     /// rule). Image-less like `gate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clone: Option<CloneSpec>,
+    /// If set, this is a **build** step (ADR-0018): a first-class rootless
+    /// BuildKit image build. The engine runs the blessed BuildKit image
+    /// (never the author's); the context/dockerfile are workspace-relative,
+    /// so a build step normally `needs` the clone step. Image-less like
+    /// `gate`/`clone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildSpec>,
     /// If set, this is an **invoke** step (ADR-0038): a repo-relative path to a
     /// Library pipeline (under `.scarab/lib/` by convention) that is *inlined at
     /// compile time*, not a runtime object. The step launches nothing itself;
@@ -392,6 +399,11 @@ impl StepSpec {
         self.clone.is_some()
     }
 
+    /// Is this a build step (ADR-0018 rootless image build)?
+    pub fn is_build(&self) -> bool {
+        self.build.is_some()
+    }
+
     /// Is this an image-less invoke step (a compile-time library inline point)?
     /// True only in authored YAML — [`compile_yaml_with_libs`] resolves every
     /// invoke step away, so a compiled IR never contains one.
@@ -452,6 +464,27 @@ pub struct CloneSpec {
     /// its resolved SHA (ADR-0043/0044) — restarts always re-clone that SHA.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
     pub r#ref: Option<String>,
+}
+
+/// Configuration of a `build` step (ADR-0018): what to build and where to
+/// push. Registry credentials are NEVER authored here — they are a scoped
+/// `REGISTRY_AUTH` secret (ADR-0037) or derived from the forge connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildSpec {
+    /// Workspace-relative build context directory (default `.`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context: String,
+    /// Dockerfile name within the context (default `Dockerfile`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dockerfile: String,
+    /// The image reference to build (and push), e.g. `ghcr.io/acme/app:v1`.
+    /// Serde-defaulted so an absent tag surfaces as a validation diagnostic,
+    /// not a parse error.
+    #[serde(default)]
+    pub image: String,
+    /// Push the built image (default false — build-only validation).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub push: bool,
 }
 
 /// The `depth:` of a [`CloneSpec`]: shallow (`1`, the default) or `full`.
@@ -1396,11 +1429,41 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         }
         // Step kinds are mutually exclusive: a step is a gate, a clone, or an
         // ordinary executed step — never two at once.
-        if step.gate.is_some() && step.clone.is_some() {
+        if [step.gate.is_some(), step.clone.is_some(), step.build.is_some()]
+            .iter()
+            .filter(|k| **k)
+            .count()
+            > 1
+        {
             diagnostics.push(format!(
-                "step `{}`: `gate` and `clone` are mutually exclusive step kinds",
+                "step `{}`: `gate`, `clone`, and `build` are mutually exclusive step kinds",
                 step.id
             ));
+        }
+        // A build step runs the blessed rootless BuildKit image (ADR-0018):
+        // the author names no image/command and needs no privilege (rootless
+        // by construction).
+        if let Some(build) = &step.build {
+            if build.image.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: a build step must name the `image:` to build",
+                    step.id
+                ));
+            }
+            if !step.image.is_empty() || !step.command.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: a build step runs the blessed BuildKit image — it must not \
+                     set an image or command",
+                    step.id
+                ));
+            }
+            if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
+                diagnostics.push(format!(
+                    "step `{}`: a build step is rootless by construction — it must not request \
+                     privilege escalation",
+                    step.id
+                ));
+            }
         }
         // A clone step is zero-config by design (ADR-0045): the engine runs
         // the canonical scarab-clone image with the run's trigger context —
@@ -1484,7 +1547,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 }
             }
             None => {
-                if step.image.is_empty() && !step.is_clone() {
+                if step.image.is_empty() && !step.is_clone() && !step.is_build() {
                     diagnostics.push(format!("step `{}`: missing image", step.id));
                 }
                 if step.gate_after.is_some() {
@@ -3087,6 +3150,76 @@ mod tests {
         // Downstream inherits the clone workspace via a plain needs edge
         // (ADR-0007 — no new inheritance rule).
         assert_eq!(ir.steps[1].needs.0, vec!["checkout".to_string()]);
+    }
+
+    // --- build step kind (ADR-0018) -----------------------------------------
+
+    #[test]
+    fn build_compiles_to_a_distinct_kind_with_defaults() {
+        let ir = compile(
+            r#"
+            steps:
+              - { id: checkout, clone: {} }
+              - id: image
+                needs: [checkout]
+                build:
+                  image: ghcr.io/acme/app:v1
+                  push: true
+            "#,
+        );
+        let image = &ir.steps[1];
+        assert!(image.is_build());
+        assert!(!image.is_clone() && !image.is_gate());
+        let b = image.build.as_ref().unwrap();
+        assert_eq!(b.image, "ghcr.io/acme/app:v1");
+        assert!(b.push);
+        assert!(b.context.is_empty() && b.dockerfile.is_empty(), "defaults resolve at persist");
+    }
+
+    #[test]
+    fn build_step_rejects_image_command_privilege_and_missing_tag() {
+        // An authored image/command contradicts the blessed BuildKit image.
+        let err = errors(
+            r#"
+            steps:
+              - id: image
+                image: busybox
+                build: { image: "ghcr.io/a/b:1" }
+            "#,
+        );
+        assert!(err.iter().any(|d| d.contains("must not") && d.contains("image")), "{err:?}");
+
+        // The image to build is mandatory.
+        let err = errors(
+            r#"
+            steps:
+              - id: image
+                build: {}
+            "#,
+        );
+        assert!(err.iter().any(|d| d.contains("must name the `image:`")), "{err:?}");
+
+        // Build steps are rootless by construction — no escalation.
+        let err = errors(
+            r#"
+            steps:
+              - id: image
+                build: { image: "ghcr.io/a/b:1" }
+                security: { run_as_root: true }
+            "#,
+        );
+        assert!(err.iter().any(|d| d.contains("rootless")), "{err:?}");
+
+        // Kinds are mutually exclusive.
+        let err = errors(
+            r#"
+            steps:
+              - id: image
+                gate: manual
+                build: { image: "ghcr.io/a/b:1" }
+            "#,
+        );
+        assert!(err.iter().any(|d| d.contains("mutually exclusive")), "{err:?}");
     }
 
     #[test]

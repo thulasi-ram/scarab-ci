@@ -209,7 +209,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     executor,
                     pg.clone(),
                     forge.clone(),
-                ),
+                )
+                // Build-step registry auth (ADR-0018): scoped REGISTRY_AUTH
+                // secret first, forge-derived credential as fallback.
+                .with_secrets(secrets.clone()),
             );
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.

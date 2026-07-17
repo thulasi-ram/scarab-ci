@@ -234,6 +234,61 @@ pub struct StepSpec {
     /// image/command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clone: Option<CloneConfig>,
+    /// Set when this is a **build** step (ADR-0018): the engine runs rootless
+    /// BuildKit with this context instead of an authored image/command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildConfig>,
+}
+
+/// The launch context of a `kind: build` step (ADR-0018): what to build
+/// (workspace-relative context/dockerfile) and the image tag to build and
+/// optionally push.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildConfig {
+    /// Workspace-relative build context directory (default `.`).
+    #[serde(default)]
+    pub context: String,
+    /// Dockerfile name within the context (default `Dockerfile`).
+    #[serde(default)]
+    pub dockerfile: String,
+    /// The image reference to build (and push), e.g. `ghcr.io/acme/app:sha`.
+    pub image: String,
+    /// The run's repo coordinate (from the trigger), pinned at creation —
+    /// what the scoped `REGISTRY_AUTH` secret resolves against and what the
+    /// forge derives its registry credential for. Empty for inline dev runs.
+    #[serde(default)]
+    pub repo_owner: String,
+    #[serde(default)]
+    pub repo_name: String,
+    /// Push after building.
+    #[serde(default)]
+    pub push: bool,
+    /// Allow pushing to an insecure (plain-HTTP) registry — dev/test clusters
+    /// only; never authored, set by the composition/test harness.
+    #[serde(default)]
+    pub insecure_push: bool,
+    /// A scoped `REGISTRY_AUTH` secret's dockerconfigjson, resolved at
+    /// LAUNCH — **never serialized**; mounted verbatim as the Pod's docker
+    /// config (tmpfs), never env (ADR-0018/0037). Takes precedence over
+    /// [`derived_auth`](Self::derived_auth).
+    #[serde(skip)]
+    pub registry_auth_json: Option<String>,
+    /// A forge-derived registry credential for the forge's own registry
+    /// (ADR-0018 amendment: zero-config GHCR/Forgejo push). Filled at LAUNCH,
+    /// **never serialized**; used only when no scoped `REGISTRY_AUTH` secret
+    /// resolves. Delivered to the Pod as a mounted dockerconfigjson, never env.
+    #[serde(skip)]
+    pub derived_auth: Option<RegistryCredential>,
+}
+
+/// The in-memory half of a derived registry credential (mirrors the forge
+/// port's type without a crate dependency; the engine stays forge-free).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryCredential {
+    /// Registry host, e.g. `ghcr.io`.
+    pub registry: String,
+    pub username: String,
+    pub token: String,
 }
 
 /// The launch context of a clone step (ADR-0045), resolved from the run's

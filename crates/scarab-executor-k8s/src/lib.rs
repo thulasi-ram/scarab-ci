@@ -190,6 +190,54 @@ impl K8sExecutor {
         }
     }
 
+    /// Upsert the per-Pod Secret carrying a build step's registry
+    /// dockerconfigjson (ADR-0018): mounted read-only as `DOCKER_CONFIG`
+    /// (tmpfs) — the credential is never in env, argv, or the stored spec.
+    /// Owner-referenced to the Pod; re-drives refresh it.
+    async fn ensure_registry_secret(
+        &self,
+        pod_name: &str,
+        pod: &Pod,
+        spec: &StepSpec,
+    ) -> Result<(), ExecError> {
+        let Some(config_json) = spec.build.as_ref().and_then(|b| registry_dockerconfig(b)) else {
+            return Ok(());
+        };
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(client, &self.namespace);
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some(registry_secret_name(pod_name)),
+                namespace: Some(self.namespace.clone()),
+                owner_references: pod.metadata.uid.clone().map(|uid| {
+                    vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                        api_version: "v1".into(),
+                        kind: "Pod".into(),
+                        name: pod_name.to_string(),
+                        uid,
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            },
+            string_data: Some(std::collections::BTreeMap::from([(
+                REGISTRY_AUTH_KEY.to_string(),
+                config_json,
+            )])),
+            ..Default::default()
+        };
+        match secrets.create(&PostParams::default(), &secret).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 409 => secrets
+                .replace(&registry_secret_name(pod_name), &PostParams::default(), &secret)
+                .await
+                .map(|_| ())
+                .map_err(|e| ExecError::Launch(format!("registry secret: {e}"))),
+            Err(e) => Err(ExecError::Launch(format!("registry secret: {e}"))),
+        }
+    }
+
     /// Drive the workspace lifecycle for `pod` (ADR-0029/0045). Two idempotent
     /// legs, all state derived from the Pod itself:
     ///
@@ -409,6 +457,7 @@ impl Executor for K8sExecutor {
         if let Some(pod) = existing {
             // Refresh the short-TTL clone credential on re-drives (ADR-0045).
             self.ensure_clone_secret(&name, &pod, spec).await?;
+            self.ensure_registry_secret(&name, &pod, spec).await?;
             return Ok(ExecHandle(name));
         }
 
@@ -425,6 +474,7 @@ impl Executor for K8sExecutor {
         match pods.create(&PostParams::default(), &pod).await {
             Ok(created) => {
                 self.ensure_clone_secret(&name, &created, spec).await?;
+                self.ensure_registry_secret(&name, &created, spec).await?;
                 Ok(ExecHandle(name))
             }
             // A concurrent launcher won the race — the Pod now exists, which is
@@ -752,12 +802,60 @@ pub fn build_pod(
         (spec.image.clone(), spec.command.clone())
     };
 
+    // Build steps (ADR-0018): rootless BuildKit (never the author's image),
+    // registry auth ONLY via a mounted dockerconfigjson (a per-Pod Secret —
+    // tmpfs), and the image digest emitted as the `image` step result when
+    // the egress sidecar is present.
+    let mut registry_volume: Option<Volume> = None;
+    let (image, command, args) = if let Some(build) = &spec.build {
+        env.push(EnvVar {
+            // Rootless buildkitd cannot use the process sandbox.
+            name: "BUILDKITD_FLAGS".into(),
+            value: Some("--oci-worker-no-process-sandbox".into()),
+            value_from: None,
+        });
+        let has_auth = build.registry_auth_json.is_some() || build.derived_auth.is_some();
+        if has_auth {
+            env.push(EnvVar {
+                name: "DOCKER_CONFIG".into(),
+                value: Some(REGISTRY_AUTH_MOUNT_PATH.to_string()),
+                value_from: None,
+            });
+            step_mounts.push(VolumeMount {
+                name: REGISTRY_AUTH_VOLUME.to_string(),
+                mount_path: REGISTRY_AUTH_MOUNT_PATH.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+            registry_volume = Some(Volume {
+                name: REGISTRY_AUTH_VOLUME.to_string(),
+                secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                    secret_name: Some(registry_secret_name(name)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        (
+            BUILDKIT_IMAGE.to_string(),
+            vec!["buildctl-daemonless.sh".to_string()],
+            buildctl_args(build, egress.is_some()),
+        )
+    } else {
+        (image, command, Vec::new())
+    };
+
     let container = Container {
         name: STEP_CONTAINER.to_string(),
         image: Some(image),
         command: (!command.is_empty()).then_some(command),
+        args: (!args.is_empty()).then_some(args),
         env: Some(env),
-        security_context: Some(step_security_context(spec)),
+        security_context: Some(if spec.build.is_some() {
+            build_security_context()
+        } else {
+            step_security_context(spec)
+        }),
         volume_mounts: (!step_mounts.is_empty()).then_some(step_mounts),
         // Steps run in the workspace (ADR-0008 convention).
         working_dir: workspace.then(|| WORKSPACE_MOUNT_PATH.to_string()),
@@ -796,7 +894,17 @@ pub fn build_pod(
     if let Some(v) = clone_token_volume {
         volumes.push(v);
     }
+    if let Some(v) = registry_volume {
+        volumes.push(v);
+    }
     let mut annotations = std::collections::BTreeMap::new();
+    if spec.build.is_some() {
+        // AppArmor unconfined for rootless buildkit (user-namespace worker).
+        annotations.insert(
+            format!("container.apparmor.security.beta.kubernetes.io/{STEP_CONTAINER}"),
+            "unconfined".to_string(),
+        );
+    }
     if workspace {
         volumes.push(Volume {
             name: WORKSPACE_VOLUME.to_string(),
@@ -969,111 +1077,76 @@ fn step_security_context(spec: &StepSpec) -> SecurityContext {
 
 /// The rootless BuildKit image used by a `kind: build` step (ADR-0018).
 const BUILDKIT_IMAGE: &str = "moby/buildkit:rootless";
+/// Where the registry dockerconfigjson is mounted (`DOCKER_CONFIG` points
+/// here); a per-Pod Secret volume — tmpfs on the node, never env (ADR-0018).
+const REGISTRY_AUTH_MOUNT_PATH: &str = "/scarab/registry";
+const REGISTRY_AUTH_VOLUME: &str = "scarab-registry-auth";
+/// The file name inside the mount — what `DOCKER_CONFIG` clients expect.
+const REGISTRY_AUTH_KEY: &str = "config.json";
 
-/// What a built-in `kind: build` step builds (ADR-0018). The context/dockerfile
-/// are workspace-relative; `image` is the tag to build and (optionally) push.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildSpec {
-    pub context: String,
-    pub dockerfile: String,
-    pub image: String,
-    pub push: bool,
+/// The per-Pod Secret carrying the registry dockerconfigjson.
+fn registry_secret_name(pod_name: &str) -> String {
+    format!("{pod_name}-registry")
 }
 
-impl BuildSpec {
-    /// The `buildctl` args this build compiles to.
-    fn buildctl_args(&self) -> Vec<String> {
-        vec![
-            "build".into(),
-            "--frontend".into(),
-            "dockerfile.v0".into(),
-            "--local".into(),
-            format!("context={}", self.context),
-            "--local".into(),
-            format!("dockerfile={}", self.context),
-            "--opt".into(),
-            format!("filename={}", self.dockerfile),
-            "--output".into(),
-            format!("type=image,name={},push={}", self.image, self.push),
-        ]
+/// The `buildctl` args a build step compiles to (ADR-0018). With the egress
+/// sidecar present, the image digest is written to the results volume as the
+/// `image` result — the ImageArtifact of record (`containerimage.digest`).
+fn buildctl_args(build: &scarab_engine::BuildConfig, with_metadata: bool) -> Vec<String> {
+    let mut push_opt = format!("type=image,name={},push={}", build.image, build.push);
+    if build.push && build.insecure_push {
+        push_opt.push_str(",registry.insecure=true");
     }
-}
-
-/// Build the Pod for a `kind: build` step: **rootless BuildKit** (no
-/// Docker-in-Docker, no privileged container) invoking `buildctl` to build the
-/// image and push it (ADR-0018). Runs as a non-root user with an unconfined
-/// seccomp/AppArmor profile — what rootless buildkitd needs without privilege.
-pub fn build_pod_for_build(
-    name: &str,
-    namespace: &str,
-    step: &StepRun,
-    build: &BuildSpec,
-) -> Pod {
-    let attempt = step
-        .current_attempt()
-        .map(|a| a.id.0.clone())
-        .unwrap_or_else(|| "0".to_string());
-
-    let env = vec![
-        // Rootless buildkitd cannot use the process sandbox.
-        EnvVar {
-            name: "BUILDKITD_FLAGS".into(),
-            value: Some("--oci-worker-no-process-sandbox".into()),
-            value_from: None,
-        },
-        EnvVar { name: "SCARAB_RUN".into(), value: Some(step.run.0.clone()), value_from: None },
-        EnvVar { name: "SCARAB_STEP".into(), value: Some(step.step.0.clone()), value_from: None },
-        EnvVar { name: "SCARAB_ATTEMPT".into(), value: Some(attempt.clone()), value_from: None },
+    let mut args = vec![
+        "build".to_string(),
+        "--frontend".into(),
+        "dockerfile.v0".into(),
+        "--local".into(),
+        format!("context={}", build.context),
+        "--local".into(),
+        format!("dockerfile={}", build.context),
+        "--opt".into(),
+        format!("filename={}", build.dockerfile),
+        "--output".into(),
+        push_opt,
     ];
+    if with_metadata {
+        args.push("--metadata-file".into());
+        args.push(format!("{RESULTS_MOUNT_PATH}/image.json"));
+    }
+    args
+}
 
-    let container = Container {
-        name: "build".to_string(),
-        image: Some(BUILDKIT_IMAGE.to_string()),
-        command: Some(vec!["buildctl-daemonless.sh".to_string()]),
-        args: Some(build.buildctl_args()),
-        env: Some(env),
-        // Rootless: explicitly NOT privileged; non-root; unconfined seccomp so
-        // the user-namespace worker can run (ADR-0018).
-        security_context: Some(SecurityContext {
-            privileged: Some(false),
-            run_as_non_root: Some(true),
-            run_as_user: Some(1000),
-            seccomp_profile: Some(SeccompProfile {
-                type_: "Unconfined".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-
-    let labels = std::collections::BTreeMap::from([
-        ("app.kubernetes.io/managed-by".to_string(), "scarab".to_string()),
-        ("scarab.io/run".to_string(), sanitize_label(&step.run.0)),
-        ("scarab.io/step".to_string(), sanitize_label(&step.step.0)),
-        ("scarab.io/attempt".to_string(), sanitize_label(&attempt)),
-    ]);
-    // AppArmor unconfined for the build container (rootless buildkit).
-    let annotations = std::collections::BTreeMap::from([(
-        "container.apparmor.security.beta.kubernetes.io/build".to_string(),
-        "unconfined".to_string(),
-    )]);
-
-    Pod {
-        metadata: ObjectMeta {
-            name: Some(name.to_string()),
-            namespace: Some(namespace.to_string()),
-            labels: Some(labels),
-            annotations: Some(annotations),
-            ..Default::default()
-        },
-        spec: Some(PodSpec {
-            containers: vec![container],
-            restart_policy: Some("Never".to_string()),
+/// The security context of a build step: rootless BuildKit needs a non-root
+/// uid with an unconfined seccomp profile (user-namespace worker) — explicitly
+/// NOT privileged, and never the author's request (a build step cannot ask
+/// for escalation; the pipeline compiler rejects it).
+fn build_security_context() -> SecurityContext {
+    SecurityContext {
+        privileged: Some(false),
+        allow_privilege_escalation: Some(true), // setuid newuidmap needs it
+        run_as_non_root: Some(true),
+        run_as_user: Some(1000),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "Unconfined".to_string(),
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+
+/// The dockerconfigjson for a build Pod (ADR-0018): the scoped secret's JSON
+/// verbatim when present, else synthesized from the forge-derived credential.
+fn registry_dockerconfig(build: &scarab_engine::BuildConfig) -> Option<String> {
+    if let Some(json) = &build.registry_auth_json {
+        return Some(json.clone());
+    }
+    build.derived_auth.as_ref().map(|cred| {
+        use base64::Engine;
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", cred.username, cred.token));
+        serde_json::json!({ "auths": { cred.registry.clone(): { "auth": auth } } }).to_string()
+    })
 }
 
 /// The image an image-build step produced, recorded as an Artifact of record
@@ -1085,7 +1158,7 @@ pub struct ImageArtifact {
 }
 
 /// Record a built image's digest as an [`ImageArtifact`].
-pub fn image_artifact(build: &BuildSpec, digest: &str) -> ImageArtifact {
+pub fn image_artifact(build: &scarab_engine::BuildConfig, digest: &str) -> ImageArtifact {
     ImageArtifact {
         image: build.image.clone(),
         digest: digest.to_string(),
@@ -1384,6 +1457,7 @@ mod tests {
         timeout_seconds: None,
         workspace_inputs: vec![],
         clone: None,
+            build: None,
         }
     }
 
@@ -1419,6 +1493,7 @@ mod tests {
         timeout_seconds: None,
         workspace_inputs: vec![],
         clone: None,
+            build: None,
         };
         let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
         let sc = pod.spec.unwrap().containers[0].security_context.clone().unwrap();
@@ -1577,48 +1652,133 @@ mod tests {
         );
     }
 
-    fn sample_build() -> BuildSpec {
-        BuildSpec {
-            context: "workspace".into(),
+    fn sample_build() -> scarab_engine::BuildConfig {
+        scarab_engine::BuildConfig {
+            context: ".".into(),
             dockerfile: "Dockerfile".into(),
             image: "registry.example/app:1.0".into(),
+            repo_owner: "acme".into(),
+            repo_name: "app".into(),
             push: true,
+            insecure_push: false,
+            registry_auth_json: None,
+            derived_auth: None,
         }
     }
 
     #[test]
     fn build_pod_is_rootless_buildkit_and_not_privileged() {
         let step = step_with_attempt("run-1", "image", "a1");
-        let pod = build_pod_for_build("scarab-image-a1", "scarab-run-1", &step, &sample_build());
+        let mut spec = busybox();
+        spec.image = String::new();
+        spec.command = vec![];
+        spec.build = Some(sample_build());
+        let pod = build_pod("scarab-image-a1", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, true, DEFAULT_CLONE_IMAGE);
         let c = &pod.spec.as_ref().unwrap().containers[0];
 
         assert_eq!(c.image.as_deref(), Some("moby/buildkit:rootless"));
         assert_eq!(c.command.as_ref().unwrap(), &vec!["buildctl-daemonless.sh".to_string()]);
+        let args = c.args.as_ref().unwrap().join(" ");
+        assert!(args.contains("--frontend dockerfile.v0"), "{args}");
+        assert!(args.contains("filename=Dockerfile"), "{args}");
+        assert!(args.contains("type=image,name=registry.example/app:1.0,push=true"), "{args}");
 
         // Rootless security posture: never privileged, non-root, unconfined seccomp.
         let sc = c.security_context.as_ref().unwrap();
         assert_eq!(sc.privileged, Some(false));
         assert_eq!(sc.run_as_non_root, Some(true));
         assert_eq!(sc.seccomp_profile.as_ref().unwrap().type_, "Unconfined");
-        // AppArmor unconfined annotation for the build container.
+        // AppArmor unconfined annotation for the step container.
         assert_eq!(
             pod.metadata
                 .annotations
                 .as_ref()
                 .unwrap()
-                .get("container.apparmor.security.beta.kubernetes.io/build")
+                .get(&format!(
+                    "container.apparmor.security.beta.kubernetes.io/{STEP_CONTAINER}"
+                ))
                 .map(String::as_str),
             Some("unconfined")
         );
+        // No auth resolved => no registry mount, no DOCKER_CONFIG.
+        assert!(c.env.as_ref().unwrap().iter().all(|e| e.name != "DOCKER_CONFIG"));
+        // The build consumes its `needs` workspace like any step.
+        assert!(pod
+            .spec
+            .as_ref()
+            .unwrap()
+            .init_containers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|i| i.name == WORKSPACE_INIT_CONTAINER));
     }
 
     #[test]
-    fn build_args_carry_context_dockerfile_and_pushed_image() {
-        let args = sample_build().buildctl_args().join(" ");
-        assert!(args.contains("--frontend dockerfile.v0"));
-        assert!(args.contains("context=workspace"));
-        assert!(args.contains("filename=Dockerfile"));
-        assert!(args.contains("type=image,name=registry.example/app:1.0,push=true"));
+    fn build_pod_mounts_registry_auth_and_never_puts_the_token_in_env() {
+        let step = step_with_attempt("run-1", "image", "a1");
+        let mut spec = busybox();
+        spec.image = String::new();
+        spec.command = vec![];
+        let mut build = sample_build();
+        build.derived_auth = Some(scarab_engine::RegistryCredential {
+            registry: "registry.example".into(),
+            username: "x-access-token".into(),
+            token: "sekret-registry-token".into(),
+        });
+        spec.build = Some(build.clone());
+        let pod = build_pod("scarab-image-a1", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        let env = c.env.as_ref().unwrap();
+        assert_eq!(
+            env.iter().find(|e| e.name == "DOCKER_CONFIG").and_then(|e| e.value.clone()),
+            Some("/scarab/registry".to_string())
+        );
+        // THE INVARIANT (ADR-0018/0037): the token rides ONLY in the mounted
+        // Secret — never in env.
+        assert!(env.iter().all(|e| e.value.as_deref() != Some("sekret-registry-token")));
+        let m = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "scarab-registry-auth")
+            .unwrap();
+        assert_eq!(m.mount_path, "/scarab/registry");
+        assert_eq!(m.read_only, Some(true));
+        let vols = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap();
+        let v = vols.iter().find(|v| v.name == "scarab-registry-auth").unwrap();
+        assert_eq!(
+            v.secret.as_ref().unwrap().secret_name.as_deref(),
+            Some("scarab-image-a1-registry")
+        );
+
+        // The synthesized dockerconfigjson carries the derived credential.
+        let json = registry_dockerconfig(&build).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["auths"]["registry.example"]["auth"].is_string());
+        // A scoped secret takes precedence, verbatim.
+        build.registry_auth_json = Some("{\"auths\":{}}".into());
+        assert_eq!(registry_dockerconfig(&build).unwrap(), "{\"auths\":{}}");
+    }
+
+    #[test]
+    fn build_args_capture_the_digest_when_egress_is_present() {
+        let step = step_with_attempt("run-1", "image", "a1");
+        let mut spec = busybox();
+        spec.image = String::new();
+        spec.command = vec![];
+        spec.build = Some(sample_build());
+        let egress = ResultsEgress {
+            base_url: "http://scarab:8080".into(),
+            token_secret: b"k".to_vec(),
+            sidecar_image: "ghcr.io/scarab/egress:1".into(),
+        };
+        let pod = build_pod("scarab-image-a1", "ns", &step, &spec, Some(&egress), DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        let args = pod.spec.as_ref().unwrap().containers[0].args.as_ref().unwrap().join(" ");
+        // The digest lands as the `image` result (ADR-0041/0042) — the
+        // ImageArtifact of record.
+        assert!(args.contains("--metadata-file /scarab/results/image.json"), "{args}");
     }
 
     #[test]

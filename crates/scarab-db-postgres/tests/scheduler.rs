@@ -26,6 +26,7 @@ fn spec() -> StepSpec {
         timeout_seconds: None,
         workspace_inputs: vec![],
         clone: None,
+        build: None,
     }
 }
 
@@ -160,6 +161,7 @@ async fn named_result_flows_into_a_downstream_interpolation() {
         timeout_seconds: None,
         workspace_inputs: vec![],
         clone: None,
+        build: None,
     };
     db.create_step_run(
         &run,

@@ -33,11 +33,14 @@ pub fn clone_url(kind: ForgeKind, base_url: &str, repo: &RepoRef) -> String {
 }
 
 /// An [`Executor`] decorator that enriches clone-step launches (see the
-/// module docs). Non-clone steps pass through untouched.
+/// module docs) and build-step launches (ADR-0018: registry auth — the
+/// scoped `REGISTRY_AUTH` secret, else the forge-derived credential for the
+/// forge's own registry). Other steps pass through untouched.
 pub struct CloneEnrichingExecutor {
     inner: Arc<dyn Executor>,
     connections: Arc<dyn ForgeConnectionStore>,
     forge: Arc<dyn ForgePort>,
+    secrets: Option<Arc<dyn scarab_secrets::SecretProvider>>,
 }
 
 impl CloneEnrichingExecutor {
@@ -46,13 +49,75 @@ impl CloneEnrichingExecutor {
         connections: Arc<dyn ForgeConnectionStore>,
         forge: Arc<dyn ForgePort>,
     ) -> Self {
-        Self { inner, connections, forge }
+        Self { inner, connections, forge, secrets: None }
+    }
+
+    /// Enable scoped `REGISTRY_AUTH` resolution for build steps (ADR-0018).
+    pub fn with_secrets(mut self, secrets: Arc<dyn scarab_secrets::SecretProvider>) -> Self {
+        self.secrets = Some(secrets);
+        self
+    }
+
+    /// The registry auth for a build step (ADR-0018 amendment), in precedence
+    /// order: the scoped `REGISTRY_AUTH` secret (repo scope, org fallback —
+    /// a dockerconfigjson), else the forge-derived credential for the forge's
+    /// own registry (only when it can serve the image's registry host).
+    /// Missing auth degrades to an anonymous build — public pulls keep
+    /// working; a push fails at the registry with a clear auth error.
+    async fn registry_auth(
+        &self,
+        build: &scarab_engine::BuildConfig,
+    ) -> (Option<String>, Option<scarab_engine::RegistryCredential>) {
+        if build.repo_owner.is_empty() {
+            return (None, None); // inline dev run: no scope, no forge context
+        }
+        if let Some(secrets) = &self.secrets {
+            for scope in [
+                scarab_secrets::SecretScope::Repo {
+                    org: build.repo_owner.clone(),
+                    repo: build.repo_name.clone(),
+                },
+                scarab_secrets::SecretScope::Org { org: build.repo_owner.clone() },
+            ] {
+                if let Ok(secret) = secrets.get(&scope, "REGISTRY_AUTH").await {
+                    if let Ok(json) = String::from_utf8(secret.value) {
+                        return (Some(json), None);
+                    }
+                }
+            }
+        }
+        let repo = RepoRef {
+            owner: build.repo_owner.clone(),
+            name: build.repo_name.clone(),
+        };
+        match self.forge.registry_credential(&repo).await {
+            Ok(Some(cred)) if build.image.starts_with(&format!("{}/", cred.registry)) => (
+                None,
+                Some(scarab_engine::RegistryCredential {
+                    registry: cred.registry,
+                    username: cred.username,
+                    token: cred.token,
+                }),
+            ),
+            _ => (None, None),
+        }
     }
 }
 
 #[async_trait]
 impl Executor for CloneEnrichingExecutor {
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        // A build step (ADR-0018): resolve its registry auth in memory only —
+        // the stored spec never carries a credential.
+        if let Some(build) = &spec.build {
+            let (auth_json, derived) = self.registry_auth(build).await;
+            let mut enriched = spec.clone();
+            if let Some(b) = enriched.build.as_mut() {
+                b.registry_auth_json = auth_json;
+                b.derived_auth = derived;
+            }
+            return self.inner.launch(step, &enriched).await;
+        }
         let Some(clone) = &spec.clone else {
             return self.inner.launch(step, spec).await;
         };

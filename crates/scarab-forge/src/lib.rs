@@ -307,6 +307,19 @@ pub struct CheckoutCredential {
     pub read_only: bool,
 }
 
+/// A derived **registry credential** for the forge's own container registry
+/// (ADR-0018 amendment): the zero-config "push to my forge" case — GHCR via
+/// the GitHub installation token, the Forgejo package registry via its token.
+/// Used only when no scoped `REGISTRY_AUTH` secret resolves; delivered to the
+/// build Pod as a mounted dockerconfigjson, never env.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryCredential {
+    /// The registry host this credential authenticates to (e.g. `ghcr.io`).
+    pub registry: String,
+    pub username: String,
+    pub token: String,
+}
+
 /// Errors returned by the forge port.
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
@@ -368,6 +381,17 @@ pub trait ForgePort: Send + Sync {
         repo: &RepoRef,
         read_only: bool,
     ) -> Result<CheckoutCredential, ForgeError>;
+
+    /// Derive a credential for pushing to the forge's **own** registry
+    /// (ADR-0018 amendment) — the zero-config case. `Ok(None)` when the
+    /// forge has no registry or the adapter cannot derive one; a scoped
+    /// `REGISTRY_AUTH` secret always takes precedence.
+    async fn registry_credential(
+        &self,
+        _repo: &RepoRef,
+    ) -> Result<Option<RegistryCredential>, ForgeError> {
+        Ok(None)
+    }
 }
 
 /// The kind of forge a [`ForgeConnection`] targets — the vendor discriminator

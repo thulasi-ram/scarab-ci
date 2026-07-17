@@ -49,6 +49,7 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
         timeout_seconds: None,
         workspace_inputs: vec![],
         clone: None,
+        build: None,
     };
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
     db.create_step_run(&run, &step, Some(&spec), &[], Timestamp(0))

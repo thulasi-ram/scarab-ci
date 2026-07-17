@@ -1146,6 +1146,9 @@ pub struct FakeForge {
     /// A ref with no mapping resolves to itself (identity) — the default that
     /// keeps ref-agnostic tests simple.
     commits: Mutex<HashMap<String, String>>,
+    /// A seeded derived registry credential (ADR-0018); `None` (default)
+    /// mirrors a forge with no derivable registry.
+    registry_credential: Mutex<Option<scarab_forge::RegistryCredential>>,
 }
 
 impl FakeForge {
@@ -1156,6 +1159,12 @@ impl FakeForge {
     /// Seed the content the forge returns for `path` at any ref.
     pub fn with_file(self, path: impl Into<String>, content: impl Into<Vec<u8>>) -> Self {
         self.files.lock().unwrap().insert(path.into(), content.into());
+        self
+    }
+
+    /// Seed the derived registry credential (ADR-0018 zero-config push).
+    pub fn with_registry_credential(self, cred: scarab_forge::RegistryCredential) -> Self {
+        *self.registry_credential.lock().unwrap() = Some(cred);
         self
     }
 
@@ -1379,6 +1388,13 @@ impl ForgePort for FakeForge {
     async fn post_comment(&self, _repo: &RepoRef, issue: u64, body: &str) -> Result<(), ForgeError> {
         self.comments.lock().unwrap().push((issue, body.to_string()));
         Ok(())
+    }
+
+    async fn registry_credential(
+        &self,
+        _repo: &RepoRef,
+    ) -> Result<Option<scarab_forge::RegistryCredential>, ForgeError> {
+        Ok(self.registry_credential.lock().unwrap().clone())
     }
 
     async fn mint_checkout_credential(
