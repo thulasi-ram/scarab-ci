@@ -58,11 +58,27 @@ fi
 git checkout -q "$SCARAB_CLONE_SHA"
 
 if [ "${SCARAB_CLONE_SUBMODULES:-false}" = "true" ]; then
-  git submodule update --init --recursive -q
+  if ! git submodule update --init --recursive -q; then
+    # DOCUMENTED LIMITATION (ADR-0045): the clone credential is scoped to the
+    # run's repository on its own forge. A private submodule in another
+    # org/installation (or on another host — the askpass helper is
+    # host-pinned) is not covered by it.
+    echo "SubmoduleUnavailable: recursive submodule checkout failed for $SCARAB_CLONE_URL" >&2
+    echo "  The run's clone credential covers only its own repository; a private" >&2
+    echo "  submodule in another org/installation or on another host cannot be" >&2
+    echo "  fetched with it (documented limitation, ADR-0045). Make the submodule" >&2
+    echo "  public, vendor it, or host it under the same forge installation." >&2
+    exit 87
+  fi
 fi
 if [ "${SCARAB_CLONE_LFS:-false}" = "true" ]; then
   git lfs install --local >/dev/null
-  git lfs pull -q
+  # NB: `git lfs pull` has no -q flag; quiet it via stdout redirect.
+  if ! git lfs pull >/dev/null; then
+    echo "LfsUnavailable: git-lfs pull failed for $SCARAB_CLONE_URL" >&2
+    echo "  (LFS objects unreachable or not covered by the clone credential)" >&2
+    exit 88
+  fi
 fi
 
 # Pre-snapshot guard: refuse to expose a workspace whose .git carries any
