@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1784281774,"nonce":"lujU9ZHYc37JRZyFjSjML3Qy73E=","message":"Root-caused: strict claimed_until \u003c now vs same-millisecond reclaim with visibility 0 (test-only config, but the off-by-one-ms was real). Fixed with an inclusive comparison; 8/8 green.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1784281775,"nonce":"JCN8ODgfnIA/wAkpAgrYGa/fALc=","status":2}]}
