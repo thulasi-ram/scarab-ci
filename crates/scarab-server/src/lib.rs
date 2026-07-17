@@ -29,7 +29,8 @@ use uuid::Uuid;
 
 use scarab_engine::{
     Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RestartError, RunId, RunStatus,
-    StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION, RUN_STATUS_CHANGED,
+    StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION, MAX_DELIVERY_ATTEMPTS,
+    RUN_STATUS_CHANGED,
 };
 use scarab_identity::{Action, Principal, Session};
 
@@ -1193,6 +1194,36 @@ pub struct ProjectDto {
     pub name: String,
 }
 
+/// The authenticated principal (ADR-0049) — powers the UI's identity menu.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeResponse {
+    /// Stable, forge-agnostic identity subject.
+    pub subject: String,
+    /// Human display name, when the identity provides one.
+    pub display_name: Option<String>,
+    /// The principal's Scarab-native roles (e.g. `["Owner"]`).
+    pub roles: Vec<String>,
+}
+
+/// Return the current authenticated principal. In dev (auth disabled) this is
+/// the synthetic Owner.
+#[utoipa::path(
+    get,
+    path = "/v1/me",
+    responses(
+        (status = 200, body = MeResponse),
+        (status = 401, description = "not authenticated")
+    )
+)]
+async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeResponse>, ApiError> {
+    let principal = authenticate(&st, &headers, Action::Read).await?;
+    Ok(Json(MeResponse {
+        subject: principal.subject,
+        display_name: principal.display_name,
+        roles: principal.roles.iter().map(|r| format!("{r:?}")).collect(),
+    }))
+}
+
 /// List the registered projects (ADR-0046 registry — what the dashboard's
 /// repo cards render). Scoped: global roles see all; otherwise only orgs/
 /// projects the caller's bindings grant Read on.
@@ -2153,10 +2184,42 @@ pub async fn drain_forge_statuses(
             sha,
             message: String::new(),
         };
-        // Leave a failed post unclaimed for redelivery rather than dropping it.
-        if forge.set_status(&repo, &commit, status).await.is_ok() {
-            db.mark_dispatched(msg.id).await?;
-            posted += 1;
+        // Post the status. A failed post stays on the outbox for redelivery
+        // (at-least-once; set_status is idempotent on the forge) but is no
+        // longer SILENT: log it, count the failed delivery, and dead-letter the
+        // MESSAGE after MAX_DELIVERY_ATTEMPTS so a permanently-rejected post —
+        // e.g. HTTP 403 "Resource not accessible by integration" when the App
+        // lacks statuses:write — surfaces instead of retrying forever. Mirrors
+        // scheduler::reconcile poison handling (ADR-0047), but never dead-letters
+        // the run: the run's verdict is independent of the forge accepting it.
+        match forge.set_status(&repo, &commit, status).await {
+            Ok(()) => {
+                db.mark_dispatched(msg.id).await?;
+                posted += 1;
+            }
+            Err(e) => {
+                let failures = db.record_outbox_failure(msg.id).await?;
+                tracing::warn!(
+                    run = %msg.run.0,
+                    repo = %format!("{}/{}", repo.owner, repo.name),
+                    sha = %commit.sha,
+                    failures,
+                    error = %e,
+                    "forge set_status failed; left on outbox for redelivery"
+                );
+                if failures >= MAX_DELIVERY_ATTEMPTS {
+                    db.dead_letter_outbox(msg.id).await?;
+                    tracing::error!(
+                        run = %msg.run.0,
+                        repo = %format!("{}/{}", repo.owner, repo.name),
+                        sha = %commit.sha,
+                        failures,
+                        error = %e,
+                        "forge set_status dead-lettered as poison — status will NOT be \
+                         posted; check the forge App's statuses:write permission"
+                    );
+                }
+            }
         }
     }
     Ok(posted)
@@ -3663,6 +3726,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         oauth_login_redirect,
         oauth_callback,
         logout,
+        me,
         list_bindings,
         put_binding,
         delete_binding,
@@ -3710,7 +3774,8 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         RunStatusResponse,
         StepStatusDto,
         PutSecretRequest,
-        SecretListResponse
+        SecretListResponse,
+        MeResponse
     ))
 )]
 pub struct ApiDoc;
@@ -3740,6 +3805,7 @@ fn router_inner(state: AppState) -> Router {
         .route("/v1/auth/login", post(login).get(oauth_login_redirect))
         .route("/v1/auth/callback", get(oauth_callback))
         .route("/v1/auth/logout", post(logout))
+        .route("/v1/me", get(me))
         .route(
             "/v1/orgs/{org}/bindings",
             get(list_bindings).put(put_binding).delete(delete_binding),
