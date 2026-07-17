@@ -632,6 +632,43 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("project")))
     }
 
+    async fn set_run_tenant(
+        &self,
+        run: &RunId,
+        org: &str,
+        project: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE runs SET tenant_org = $2, tenant_project = $3,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(org)
+        .bind(project)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError> {
+        let row = sqlx::query("SELECT tenant_org, tenant_project FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.and_then(|r| {
+            match (
+                r.get::<Option<String>, _>("tenant_org"),
+                r.get::<Option<String>, _>("tenant_project"),
+            ) {
+                (Some(o), Some(p)) => Some((o, p)),
+                _ => None,
+            }
+        }))
+    }
+
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
         let row = sqlx::query(
             "SELECT count(*) AS n FROM runs
@@ -708,7 +745,7 @@ impl Db for PostgresDb {
 
     async fn list_runs(&self, limit: u32) -> Result<Vec<RunSummary>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, status, created_at FROM runs
+            "SELECT id, status, created_at, tenant_org, tenant_project FROM runs
              ORDER BY created_at DESC, id DESC
              LIMIT $1",
         )
@@ -718,10 +755,18 @@ impl Db for PostgresDb {
         .map_err(db_err)?;
         rows.into_iter()
             .map(|r| {
+                let tenant = match (
+                    r.get::<Option<String>, _>("tenant_org"),
+                    r.get::<Option<String>, _>("tenant_project"),
+                ) {
+                    (Some(o), Some(p)) => Some((o, p)),
+                    _ => None,
+                };
                 Ok(RunSummary {
                     run: RunId(r.get::<String, _>("id")),
                     status: run_status_from_str(r.get::<String, _>("status"))?,
                     created_at: Timestamp(r.get::<i64, _>("created_at")),
+                    tenant,
                 })
             })
             .collect()
@@ -1613,5 +1658,167 @@ impl scarab_identity::SessionStore for PostgresDb {
             .await
             .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RbacStore (ADR-0049 C2): role bindings in Postgres. project='' encodes an
+// org-scoped binding; role NULL is a native revoke tombstone.
+// ---------------------------------------------------------------------------
+
+fn scope_cols(scope: &scarab_identity::Scope) -> (&str, &str) {
+    match scope {
+        scarab_identity::Scope::Org(org) => (org.as_str(), ""),
+        scarab_identity::Scope::Project { org, name } => (org.as_str(), name.as_str()),
+    }
+}
+
+fn role_str(role: scarab_identity::Role) -> &'static str {
+    match role {
+        scarab_identity::Role::Viewer => "viewer",
+        scarab_identity::Role::Member => "member",
+        scarab_identity::Role::Admin => "admin",
+        scarab_identity::Role::Owner => "owner",
+    }
+}
+
+fn role_from_str(s: &str) -> Option<scarab_identity::Role> {
+    Some(match s {
+        "viewer" => scarab_identity::Role::Viewer,
+        "member" => scarab_identity::Role::Member,
+        "admin" => scarab_identity::Role::Admin,
+        "owner" => scarab_identity::Role::Owner,
+        _ => return None,
+    })
+}
+
+fn identity_err(e: sqlx::Error) -> scarab_identity::IdentityError {
+    scarab_identity::IdentityError::Issuance(e.to_string())
+}
+
+#[async_trait]
+impl scarab_identity::RbacStore for PostgresDb {
+    async fn grant(
+        &self,
+        binding: &scarab_identity::Binding,
+        origin: scarab_identity::BindingOrigin,
+    ) -> Result<(), scarab_identity::IdentityError> {
+        let (org, project) = scope_cols(&binding.scope);
+        match origin {
+            // Native is authoritative: unconditional upsert (also clears a
+            // tombstone by writing a real role over it).
+            scarab_identity::BindingOrigin::Native => {
+                sqlx::query(
+                    "INSERT INTO rbac_bindings (subject, org, project, role, origin)
+                     VALUES ($1, $2, $3, $4, 'native')
+                     ON CONFLICT (subject, org, project)
+                     DO UPDATE SET role = EXCLUDED.role, origin = 'native'",
+                )
+                .bind(&binding.subject)
+                .bind(org)
+                .bind(project)
+                .bind(role_str(binding.role))
+                .execute(self.pool())
+                .await
+                .map_err(identity_err)?;
+            }
+            // An import only seeds/refreshes rows it owns — a native grant or
+            // a native revoke tombstone is NEVER clobbered by a re-sync.
+            scarab_identity::BindingOrigin::Import => {
+                sqlx::query(
+                    "INSERT INTO rbac_bindings (subject, org, project, role, origin)
+                     VALUES ($1, $2, $3, $4, 'import')
+                     ON CONFLICT (subject, org, project)
+                     DO UPDATE SET role = EXCLUDED.role
+                     WHERE rbac_bindings.origin = 'import'",
+                )
+                .bind(&binding.subject)
+                .bind(org)
+                .bind(project)
+                .bind(role_str(binding.role))
+                .execute(self.pool())
+                .await
+                .map_err(identity_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn revoke(
+        &self,
+        subject: &str,
+        scope: &scarab_identity::Scope,
+    ) -> Result<(), scarab_identity::IdentityError> {
+        let (org, project) = scope_cols(scope);
+        sqlx::query(
+            "INSERT INTO rbac_bindings (subject, org, project, role, origin)
+             VALUES ($1, $2, $3, NULL, 'native')
+             ON CONFLICT (subject, org, project)
+             DO UPDATE SET role = NULL, origin = 'native'",
+        )
+        .bind(subject)
+        .bind(org)
+        .bind(project)
+        .execute(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(())
+    }
+
+    async fn role_of(
+        &self,
+        subject: &str,
+        scope: &scarab_identity::Scope,
+    ) -> Result<Option<scarab_identity::Role>, scarab_identity::IdentityError> {
+        let (org, project) = scope_cols(scope);
+        // Exact scope + the enclosing org (Org role inherits down, ADR-0049);
+        // tombstones (role NULL) grant nothing.
+        let rows = sqlx::query(
+            "SELECT role FROM rbac_bindings
+             WHERE subject = $1 AND org = $2 AND (project = $3 OR project = '')
+               AND role IS NOT NULL",
+        )
+        .bind(subject)
+        .bind(org)
+        .bind(project)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| role_from_str(&r.get::<String, _>("role")))
+            .max())
+    }
+
+    async fn bindings(
+        &self,
+        org: &str,
+    ) -> Result<Vec<scarab_identity::Binding>, scarab_identity::IdentityError> {
+        let rows = sqlx::query(
+            "SELECT subject, project, role FROM rbac_bindings
+             WHERE org = $1 AND role IS NOT NULL
+             ORDER BY subject, project",
+        )
+        .bind(org)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let role = role_from_str(&r.get::<String, _>("role"))?;
+                let project = r.get::<String, _>("project");
+                let scope = if project.is_empty() {
+                    scarab_identity::Scope::Org(org.to_string())
+                } else {
+                    scarab_identity::Scope::Project { org: org.to_string(), name: project }
+                };
+                Some(scarab_identity::Binding {
+                    subject: r.get::<String, _>("subject"),
+                    scope,
+                    role,
+                })
+            })
+            .collect())
     }
 }

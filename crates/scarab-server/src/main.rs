@@ -272,8 +272,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let login = Arc::new(scarab_server::oauth::OAuthAuthenticator::new(oauth_cfg));
         state = state
             .with_auth(login.clone(), pg.clone())
-            .with_oauth_login(login, config.public_url.clone());
-        tracing::info!("authn: OAuth/OIDC login + PG sessions wired (ADR-0049)");
+            .with_oauth_login(login, config.public_url.clone())
+            // Scoped RBAC (ADR-0049 C2): per-request role-in-Org/Project from
+            // the native bindings in Postgres.
+            .with_rbac(pg.clone());
+        tracing::info!("authn: OAuth/OIDC login + PG sessions + scoped RBAC wired (ADR-0049)");
     }
     // OIDC issuer for keyless federation (ADR-0014): serve JWKS + discovery so a
     // cloud provider can verify Scarab-minted tokens. The signing key is loaded

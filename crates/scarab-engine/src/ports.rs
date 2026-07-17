@@ -242,6 +242,19 @@ pub trait Db: Send + Sync {
     /// A run's project, if set.
     async fn run_project(&self, run: &RunId) -> Result<Option<String>, DbError>;
 
+    /// Stamp the run's owning tenant `(org, project)` (ADR-0049): resolved
+    /// from the trigger's repo at creation; untenanted runs (inline dev
+    /// submissions) never call this and stay visible to global roles only.
+    async fn set_run_tenant(
+        &self,
+        run: &RunId,
+        org: &str,
+        project: &str,
+    ) -> Result<(), DbError>;
+
+    /// The run's owning tenant, if stamped.
+    async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError>;
+
     /// How many runs are in-flight (started, not terminal). With `project`,
     /// scoped to that project (fairness cap); without, the global count
     /// (backpressure).

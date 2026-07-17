@@ -127,6 +127,7 @@ struct InMemoryState {
     /// Per-run project (fairness) and admission priority.
     run_project: HashMap<RunId, String>,
     run_priority: HashMap<RunId, i32>,
+    run_tenant: HashMap<RunId, (String, String)>,
     /// ForgeConnection registry rows (ADR-0046).
     forge_connections: HashMap<String, scarab_forge::ForgeConnection>,
     /// Repo bindings: (owner, name) → (connection id, org, project).
@@ -469,6 +470,24 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().run_project.get(run).cloned())
     }
 
+    async fn set_run_tenant(
+        &self,
+        run: &RunId,
+        org: &str,
+        project: &str,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_tenant
+            .insert(run.clone(), (org.to_string(), project.to_string()));
+        Ok(())
+    }
+
+    async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError> {
+        Ok(self.state.lock().unwrap().run_tenant.get(run).cloned())
+    }
+
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
         let st = self.state.lock().unwrap();
         let n = st
@@ -602,6 +621,7 @@ impl Db for InMemoryDb {
                 run: run.clone(),
                 status: *status,
                 created_at: st.run_created.get(run).copied().unwrap_or(Timestamp(0)),
+                tenant: st.run_tenant.get(run).cloned(),
             })
             .collect();
         // Newest first, then id — matches the adapter's ORDER BY.
@@ -1456,6 +1476,106 @@ impl SessionStore for InMemorySessions {
     async fn delete(&self, id: &str) -> Result<(), IdentityError> {
         self.sessions.lock().unwrap().remove(id);
         Ok(())
+    }
+}
+
+/// An in-memory [`scarab_identity::RbacStore`] with the same origin semantics
+/// as the Postgres adapter: native rows are authoritative (imports never
+/// clobber them), a native revoke is a tombstone imports cannot resurrect,
+/// and `role_of` applies Org→Project inheritance.
+#[derive(Default)]
+pub struct InMemoryRbac {
+    /// (subject, org, project) → (role, origin); project "" = org scope;
+    /// role None = native tombstone.
+    rows: Mutex<HashMap<(String, String, String), (Option<scarab_identity::Role>, scarab_identity::BindingOrigin)>>,
+}
+
+impl InMemoryRbac {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+fn rbac_key(subject: &str, scope: &scarab_identity::Scope) -> (String, String, String) {
+    match scope {
+        scarab_identity::Scope::Org(org) => (subject.to_string(), org.clone(), String::new()),
+        scarab_identity::Scope::Project { org, name } => {
+            (subject.to_string(), org.clone(), name.clone())
+        }
+    }
+}
+
+#[async_trait]
+impl scarab_identity::RbacStore for InMemoryRbac {
+    async fn grant(
+        &self,
+        binding: &scarab_identity::Binding,
+        origin: scarab_identity::BindingOrigin,
+    ) -> Result<(), IdentityError> {
+        let key = rbac_key(&binding.subject, &binding.scope);
+        let mut rows = self.rows.lock().unwrap();
+        match origin {
+            scarab_identity::BindingOrigin::Native => {
+                rows.insert(key, (Some(binding.role), origin));
+            }
+            scarab_identity::BindingOrigin::Import => {
+                let native_owned = matches!(
+                    rows.get(&key),
+                    Some((_, scarab_identity::BindingOrigin::Native))
+                );
+                if !native_owned {
+                    rows.insert(key, (Some(binding.role), origin));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn revoke(
+        &self,
+        subject: &str,
+        scope: &scarab_identity::Scope,
+    ) -> Result<(), IdentityError> {
+        self.rows.lock().unwrap().insert(
+            rbac_key(subject, scope),
+            (None, scarab_identity::BindingOrigin::Native),
+        );
+        Ok(())
+    }
+
+    async fn role_of(
+        &self,
+        subject: &str,
+        scope: &scarab_identity::Scope,
+    ) -> Result<Option<scarab_identity::Role>, IdentityError> {
+        let rows = self.rows.lock().unwrap();
+        let exact = rows.get(&rbac_key(subject, scope)).and_then(|(r, _)| *r);
+        let org = rows
+            .get(&rbac_key(subject, &scarab_identity::Scope::Org(scope.org().to_string())))
+            .and_then(|(r, _)| *r);
+        Ok(exact.max(org))
+    }
+
+    async fn bindings(
+        &self,
+        org: &str,
+    ) -> Result<Vec<scarab_identity::Binding>, IdentityError> {
+        let rows = self.rows.lock().unwrap();
+        let mut out: Vec<scarab_identity::Binding> = rows
+            .iter()
+            .filter(|((_, o, _), (role, _))| o == org && role.is_some())
+            .map(|((subject, o, p), (role, _))| scarab_identity::Binding {
+                subject: subject.clone(),
+                scope: if p.is_empty() {
+                    scarab_identity::Scope::Org(o.clone())
+                } else {
+                    scarab_identity::Scope::Project { org: o.clone(), name: p.clone() }
+                },
+                role: role.unwrap(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.subject.cmp(&b.subject));
+        Ok(out)
     }
 }
 

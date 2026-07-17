@@ -80,6 +80,10 @@ pub struct RunSummary {
     pub run: RunId,
     pub status: RunStatus,
     pub created_at: Timestamp,
+    /// The owning tenant `(org, project)` (ADR-0049), if the run was stamped
+    /// at creation — the tenancy filter for the list view.
+    #[serde(default)]
+    pub tenant: Option<(String, String)>,
 }
 
 /// Lifecycle status of a single step.

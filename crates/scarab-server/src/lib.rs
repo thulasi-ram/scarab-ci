@@ -103,6 +103,10 @@ pub struct AppState {
     /// `None` disables the results-ingest endpoint (rejects with 404). Shared with
     /// the k8s executor, which mints the per-step token the egress sidecar presents.
     pub results_token_secret: Option<Vec<u8>>,
+    /// Scoped role bindings (ADR-0049 C2): the native RBAC model authorize()
+    /// consults per request against the path's Org/Project. `None` = only the
+    /// principal's flat global roles decide (the C1 bootstrap).
+    pub rbac: Option<Arc<dyn scarab_identity::RbacStore>>,
     /// The browser OAuth login flow (ADR-0049): redirect + callback. `None`
     /// leaves only the credential-exchange `POST /v1/auth/login` (API/CLI).
     pub oauth_login: Option<Arc<oauth::OAuthAuthenticator>>,
@@ -128,6 +132,7 @@ impl AppState {
             gate_token_secret: None,
             secrets: None,
             results_token_secret: None,
+            rbac: None,
             oauth_login: None,
             public_url: "http://localhost:8080".into(),
         }
@@ -201,6 +206,13 @@ impl AppState {
     ) -> Self {
         self.auth = Some(auth);
         self.sessions = Some(sessions);
+        self
+    }
+
+    /// Enable scoped RBAC (ADR-0049 C2): authorize() consults these bindings
+    /// per request against the path's Org/Project scope.
+    pub fn with_rbac(mut self, rbac: Arc<dyn scarab_identity::RbacStore>) -> Self {
+        self.rbac = Some(rbac);
         self
     }
 
@@ -651,7 +663,8 @@ async fn dispatch(
     headers: HeaderMap,
     Json(req): Json<DispatchRequest>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), ApiError> {
-    let principal = authorize(&st, &headers, Action::Write).await?;
+    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
+    let principal = authorize_scoped(&st, &headers, Action::Write, Some(&scope)).await?;
 
     // Dispatch rides the read-at-ref machinery, so a forge must be wired.
     let forge = st
@@ -722,7 +735,8 @@ async fn list_pipelines(
     Path((org, repo)): Path<(String, String)>,
     Query(q): Query<PipelineRefQuery>,
 ) -> Result<Json<PipelineCatalogResponse>, ApiError> {
-    authorize(&st, &headers, Action::Read).await?;
+    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
     let forge = st
         .forge
         .as_ref()
@@ -808,7 +822,8 @@ async fn pipeline_interface(
     Path((org, repo, name)): Path<(String, String, String)>,
     Query(q): Query<PipelineRefQuery>,
 ) -> Result<Json<PipelineInterfaceResponse>, ApiError> {
-    authorize(&st, &headers, Action::Read).await?;
+    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
     let forge = st
         .forge
         .as_ref()
@@ -863,9 +878,45 @@ async fn list_runs(
     headers: HeaderMap,
     Query(q): Query<ListRunsQuery>,
 ) -> Result<Json<RunListResponse>, ApiError> {
-    authorize(&st, &headers, Action::Read).await?;
+    // Tenancy scoping (ADR-0049): authenticate, then filter the list to what
+    // the caller may see — global roles see everything; scoped principals see
+    // the runs of orgs/projects their bindings grant Read on. Untenanted runs
+    // (inline dev submissions) are visible to global roles only.
+    let principal = authenticate(&st, &headers, Action::Read).await?;
     let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
-    let runs = st.db.list_runs(limit).await?;
+    let mut runs = st.db.list_runs(limit).await?;
+    if !principal.can(Action::Read) {
+        let Some(rbac) = st.rbac.as_ref() else {
+            return Err(ApiError::Forbidden);
+        };
+        // Resolve each distinct tenant once, never per run.
+        let mut allowed: std::collections::HashMap<(String, String), bool> =
+            std::collections::HashMap::new();
+        let mut visible = Vec::with_capacity(runs.len());
+        for r in runs {
+            let Some(tenant) = r.tenant.clone() else { continue };
+            let ok = match allowed.get(&tenant) {
+                Some(ok) => *ok,
+                None => {
+                    let scope = scarab_identity::Scope::Project {
+                        org: tenant.0.clone(),
+                        name: tenant.1.clone(),
+                    };
+                    let ok = rbac
+                        .role_of(&principal.subject, &scope)
+                        .await
+                        .map_err(|_| ApiError::Forbidden)?
+                        .is_some_and(|role| role.allows(Action::Read));
+                    allowed.insert(tenant.clone(), ok);
+                    ok
+                }
+            };
+            if ok {
+                visible.push(r);
+            }
+        }
+        runs = visible;
+    }
     Ok(Json(RunListResponse {
         runs: runs
             .into_iter()
@@ -890,8 +941,9 @@ async fn get_run(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<RunStatusResponse>, ApiError> {
-    authorize(&st, &headers, Action::Read).await?;
     let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
     let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
     let steps = st.db.steps_of_run(&run).await?;
     let params = st.db.run_params(&run).await?;
@@ -925,8 +977,9 @@ async fn get_events(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    authorize(&st, &headers, Action::Read).await?;
     let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
     if st.db.run_status(&run).await?.is_none() {
         return Err(ApiError::NotFound);
     }
@@ -957,8 +1010,9 @@ async fn get_logs(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Sse<BoxStream<'static, Result<Event, Infallible>>>, ApiError> {
-    authorize(&st, &headers, Action::Read).await?;
     let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
     let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
     let steps = st.db.steps_of_run(&run).await?;
 
@@ -1015,8 +1069,9 @@ async fn restart_step(
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&st, &headers, Action::Write).await?;
     let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
     match scarab_engine::restart_step(&*st.db, &*st.clock, &run, &StepId(step)).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
         Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
@@ -1607,6 +1662,12 @@ async fn persist_run_from_ir(
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     db.create_run(run, ir.ir_version, EVENT_VERSION, now).await?;
+    // Tenancy (ADR-0049): stamp the owning (org, project) from the trigger's
+    // repo, so run reads/lists can be scoped by the caller's bindings.
+    // Untenanted runs (no repo — inline dev submissions) stay global-only.
+    if let Some(repo) = event.repo() {
+        db.set_run_tenant(run, &repo.owner, &repo.name).await?;
+    }
     db.store_run_ir(run, &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null))
         .await?;
     // ADR-0037: record the deploy context (repo + environment + git ref) so
@@ -2243,11 +2304,200 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Respon
     Ok(resp)
 }
 
-/// Authorize the request for `action`. With no session store configured, authz
-/// is **disabled** (dev/test) and every caller is treated as an Owner. Otherwise
-/// a valid session bearer token / cookie is required and its principal must
-/// grant `action` (ADR-0032 RBAC).
-async fn authorize(
+// ---------------------------------------------------------------------------
+// Role bindings (ADR-0049 C2): native grants/revokes + forge-permission import.
+// ---------------------------------------------------------------------------
+
+/// `PUT /v1/orgs/{org}/bindings` body — a native grant. `project` absent =
+/// org-scoped (inherits down to every project of the org).
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BindingRequest {
+    pub subject: String,
+    /// `viewer` | `member` | `admin` | `owner`.
+    pub role: String,
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BindingQuery {
+    subject: String,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BindingDto {
+    pub subject: String,
+    pub role: String,
+    /// Empty = org-scoped.
+    pub project: String,
+}
+
+/// `POST /v1/repos/{org}/{repo}/bindings/import` body: the forge users whose
+/// repo permissions to import as seed bindings.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ImportBindingsRequest {
+    pub subjects: Vec<String>,
+}
+
+fn parse_role(s: &str) -> Result<scarab_identity::Role, ApiError> {
+    Ok(match s {
+        "viewer" => scarab_identity::Role::Viewer,
+        "member" => scarab_identity::Role::Member,
+        "admin" => scarab_identity::Role::Admin,
+        "owner" => scarab_identity::Role::Owner,
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown role `{other}` (want viewer|member|admin|owner)"
+            )))
+        }
+    })
+}
+
+fn role_name(r: scarab_identity::Role) -> &'static str {
+    match r {
+        scarab_identity::Role::Viewer => "viewer",
+        scarab_identity::Role::Member => "member",
+        scarab_identity::Role::Admin => "admin",
+        scarab_identity::Role::Owner => "owner",
+    }
+}
+
+/// List an org's live bindings (org- and project-scoped). Administer.
+async fn list_bindings(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+) -> Result<Json<Vec<BindingDto>>, ApiError> {
+    let scope = scarab_identity::Scope::Org(org.clone());
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
+    let bindings = rbac.bindings(&org).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(
+        bindings
+            .into_iter()
+            .map(|b| BindingDto {
+                subject: b.subject,
+                role: role_name(b.role).to_string(),
+                project: match b.scope {
+                    scarab_identity::Scope::Org(_) => String::new(),
+                    scarab_identity::Scope::Project { name, .. } => name,
+                },
+            })
+            .collect(),
+    ))
+}
+
+/// Natively grant `subject` a role in the org (or one of its projects).
+/// Native bindings are authoritative — no import ever overwrites them.
+async fn put_binding(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    Json(req): Json<BindingRequest>,
+) -> Result<StatusCode, ApiError> {
+    let org_scope = scarab_identity::Scope::Org(org.clone());
+    authorize_scoped(&st, &headers, Action::Administer, Some(&org_scope)).await?;
+    let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
+    if req.subject.is_empty() {
+        return Err(ApiError::BadRequest("subject is required".into()));
+    }
+    let binding = scarab_identity::Binding {
+        subject: req.subject,
+        scope: match req.project.filter(|p| !p.is_empty()) {
+            Some(name) => scarab_identity::Scope::Project { org, name },
+            None => org_scope,
+        },
+        role: parse_role(&req.role)?,
+    };
+    rbac.grant(&binding, scarab_identity::BindingOrigin::Native)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Natively revoke `subject`'s binding at the scope — a durable tombstone a
+/// later forge import cannot resurrect.
+async fn delete_binding(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<BindingQuery>,
+) -> Result<StatusCode, ApiError> {
+    let org_scope = scarab_identity::Scope::Org(org.clone());
+    authorize_scoped(&st, &headers, Action::Administer, Some(&org_scope)).await?;
+    let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
+    let scope = match q.project.filter(|p| !p.is_empty()) {
+        Some(name) => scarab_identity::Scope::Project { org, name },
+        None => org_scope,
+    };
+    rbac.revoke(&q.subject, &scope)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Import the given users' forge permissions on the repo as **seed** bindings
+/// (ADR-0049): admin→Admin, write→Member, read→Viewer, none→skipped. The
+/// import never clobbers a native grant or revoke, and authorization keeps
+/// reading only native storage — the forge is consulted here, once, not on
+/// the authz hot path.
+async fn import_bindings(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo)): Path<(String, String)>,
+    Json(req): Json<ImportBindingsRequest>,
+) -> Result<Json<Vec<BindingDto>>, ApiError> {
+    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
+    let forge = st
+        .forge
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
+    let repo_ref = scarab_forge::RepoRef { owner: org.clone(), name: repo.clone() };
+
+    let mut imported = Vec::new();
+    for subject in &req.subjects {
+        let perms = forge
+            .get_permissions(&repo_ref, subject)
+            .await
+            .map_err(|e| ApiError::BadRequest(format!("forge permissions for {subject}: {e}")))?;
+        let role = if perms.admin {
+            scarab_identity::Role::Admin
+        } else if perms.write {
+            scarab_identity::Role::Member
+        } else if perms.read {
+            scarab_identity::Role::Viewer
+        } else {
+            continue; // no forge access — nothing to seed
+        };
+        rbac.grant(
+            &scarab_identity::Binding {
+                subject: subject.clone(),
+                scope: scope.clone(),
+                role,
+            },
+            scarab_identity::BindingOrigin::Import,
+        )
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        imported.push(BindingDto {
+            subject: subject.clone(),
+            role: role_name(role).to_string(),
+            project: repo.clone(),
+        });
+    }
+    Ok(Json(imported))
+}
+
+/// Authenticate the request: resolve the session (Bearer or cookie), enforce
+/// expiry + the CSRF double-submit on cookie mutations, and return the
+/// principal — **no role decision** (that's [`authorize`]/[`authorize_scoped`]).
+/// With no session store configured, authn is **disabled** (dev/test) and
+/// every caller is a synthetic Owner (the loud SCARAB_DEV_INSECURE posture).
+async fn authenticate(
     st: &AppState,
     headers: &HeaderMap,
     action: Action,
@@ -2278,10 +2528,54 @@ async fn authorize(
             return Err(ApiError::Forbidden);
         }
     }
-    if !session.principal.can(action) {
-        return Err(ApiError::Forbidden);
-    }
     Ok(session.principal)
+}
+
+/// Authorize `action` with **global** (flat) roles only — for resources that
+/// belong to no tenant (inline dev runs, the catch-all default).
+async fn authorize(
+    st: &AppState,
+    headers: &HeaderMap,
+    action: Action,
+) -> Result<Principal, ApiError> {
+    authorize_scoped(st, headers, action, None).await
+}
+
+/// Authorize `action` in `scope` (ADR-0049 C2). The decision is scope-aware:
+/// a flat **global** role on the principal (the C1/owners bootstrap) allows
+/// everywhere; otherwise the native role bindings decide **for the request's
+/// Org/Project** — never a live forge call. `None` scope (an untenanted
+/// resource) is global-only.
+async fn authorize_scoped(
+    st: &AppState,
+    headers: &HeaderMap,
+    action: Action,
+    scope: Option<&scarab_identity::Scope>,
+) -> Result<Principal, ApiError> {
+    let principal = authenticate(st, headers, action).await?;
+    if principal.can(action) {
+        return Ok(principal);
+    }
+    if let (Some(rbac), Some(scope)) = (st.rbac.as_ref(), scope) {
+        let role = rbac
+            .role_of(&principal.subject, scope)
+            .await
+            .map_err(|_| ApiError::Forbidden)?;
+        if role.is_some_and(|r| r.allows(action)) {
+            return Ok(principal);
+        }
+    }
+    Err(ApiError::Forbidden)
+}
+
+/// The tenant scope of a run (ADR-0049), if it was stamped at creation.
+async fn run_scope(st: &AppState, run: &RunId) -> Option<scarab_identity::Scope> {
+    st.db
+        .run_tenant(run)
+        .await
+        .ok()
+        .flatten()
+        .map(|(org, name)| scarab_identity::Scope::Project { org, name })
 }
 
 /// How a request presented its session — Bearer carries the credential
@@ -2353,8 +2647,9 @@ async fn approve_gate(
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let principal = authorize(&st, &headers, Action::Write).await?;
     let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
     let step = StepId(step);
 
     // 1. Record this principal's approval — append-only, no resume, idempotent
@@ -2586,6 +2881,16 @@ async fn ingest_step_results(
 
 /// Build a [`SecretScope`] from the flat org/repo/environment selector,
 /// enforcing that an environment scope names a repo (ADR-0014, 0024).
+/// The RBAC scope of an (org, optional repo) coordinate (ADR-0049): a repo
+/// pins the Project; bare org is Org scope. Environment adds no RBAC scope —
+/// deploy authorization is the protection rules (ADR-0037).
+fn rbac_scope(org: &str, repo: Option<&str>) -> scarab_identity::Scope {
+    match repo {
+        Some(name) => scarab_identity::Scope::Project { org: org.to_string(), name: name.to_string() },
+        None => scarab_identity::Scope::Org(org.to_string()),
+    }
+}
+
 fn secret_scope(
     org: String,
     repo: Option<String>,
@@ -2634,7 +2939,8 @@ async fn put_secret(
     headers: HeaderMap,
     Json(req): Json<PutSecretRequest>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&st, &headers, Action::Administer).await?;
+    let scope = rbac_scope(&req.org, req.repo.as_deref());
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     if req.name.is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
@@ -2672,7 +2978,8 @@ async fn list_secrets(
     headers: HeaderMap,
     Query(q): Query<SecretScopeQuery>,
 ) -> Result<Json<SecretListResponse>, ApiError> {
-    authorize(&st, &headers, Action::Administer).await?;
+    let rscope = rbac_scope(&q.org, q.repo.as_deref());
+    authorize_scoped(&st, &headers, Action::Administer, Some(&rscope)).await?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     let scope = secret_scope(q.org, q.repo, q.environment)?;
     let names = secrets.list_scoped(&scope).await.map_err(secret_err)?;
@@ -2699,7 +3006,8 @@ async fn delete_secret(
     headers: HeaderMap,
     Query(q): Query<SecretScopeQuery>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&st, &headers, Action::Administer).await?;
+    let rscope = rbac_scope(&q.org, q.repo.as_deref());
+    authorize_scoped(&st, &headers, Action::Administer, Some(&rscope)).await?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     let name = q
         .name
@@ -2720,7 +3028,8 @@ async fn put_environment(
     Path((org, repo, name)): Path<(String, String, String)>,
     Json(protection): Json<scarab_project::ProtectionRules>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&st, &headers, Action::Administer).await?;
+    let scope = rbac_scope(&org, Some(&repo));
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let env = scarab_project::Environment {
         name: name.clone(),
@@ -2739,7 +3048,8 @@ async fn get_environment(
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
 ) -> Result<Json<scarab_project::Environment>, ApiError> {
-    authorize(&st, &headers, Action::Read).await?;
+    let scope = rbac_scope(&org, Some(&repo));
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let env = store
         .get_environment(&org, &repo, &name)
@@ -2755,7 +3065,8 @@ async fn list_environments(
     headers: HeaderMap,
     Path((org, repo)): Path<(String, String)>,
 ) -> Result<Json<Vec<scarab_project::Environment>>, ApiError> {
-    authorize(&st, &headers, Action::Read).await?;
+    let scope = rbac_scope(&org, Some(&repo));
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let envs = store
         .list_environments(&org, &repo)
@@ -2770,7 +3081,8 @@ async fn delete_environment(
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&st, &headers, Action::Administer).await?;
+    let scope = rbac_scope(&org, Some(&repo));
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     store
         .delete_environment(&org, &repo, &name)
@@ -2787,7 +3099,8 @@ async fn list_deployments(
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
 ) -> Result<Json<Vec<scarab_project::Deployment>>, ApiError> {
-    authorize(&st, &headers, Action::Read).await?;
+    let scope = rbac_scope(&org, Some(&repo));
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let history = store
         .deployments(&org, &repo, &name)
@@ -2806,7 +3119,8 @@ async fn secret_matrix(
     headers: HeaderMap,
     Path((org, repo)): Path<(String, String)>,
 ) -> Result<Json<SecretMatrix>, ApiError> {
-    authorize(&st, &headers, Action::Administer).await?;
+    let scope = rbac_scope(&org, Some(&repo));
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let envs_store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
 
@@ -3028,6 +3342,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/auth/login", post(login).get(oauth_login_redirect))
         .route("/v1/auth/callback", get(oauth_callback))
         .route("/v1/auth/logout", post(logout))
+        .route(
+            "/v1/orgs/{org}/bindings",
+            get(list_bindings).put(put_binding).delete(delete_binding),
+        )
+        .route("/v1/repos/{org}/{repo}/bindings/import", post(import_bindings))
         .route("/v1/runs", post(create_run).get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))
