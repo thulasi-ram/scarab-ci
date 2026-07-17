@@ -74,7 +74,8 @@ function bakeScene(name, { cols, rows, frames, draw }) {
 const scarabRows = (cols) => Math.round(cols * (VB_H / VB_W) * CELL_ASPECT);
 const beetleRows = (cols, vbH) => Math.round(cols * (vbH / 96) * CELL_ASPECT);
 
-bakeScene("wingspread-hero", { cols: 84, rows: scarabRows(84), frames: 48, draw: drawScarab });
+// The wing-spread scene (drawScarab) is currently unbaked — the docs hero uses
+// the square emblem SVG. Re-add a bakeScene line if a state moment wants it.
 bakeScene("dungroller", { cols: 88, rows: beetleRows(88, BEETLE_VB_H), frames: 72, draw: drawBeetle });
 // Traveling variant: no ground in the scene (crops at the feet) — the host
 // provides the ground line and moves the beetle across it.

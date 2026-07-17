@@ -54,7 +54,9 @@
   --radius: 8px;
   --radius-sm: 6px;
 
-  --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
+  /* Display voice: Departure Mono (ui/brand/fonts, OFL) — the lo-fi terminal
+     face that pairs with the ASCII beetle scenes (DESIGN.md §5). */
+  --font-display: "Departure Mono", "Space Grotesk", "Inter", system-ui, sans-serif;
   --font-ui: "Inter", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
@@ -95,6 +97,14 @@
   --badge-ink: #0b120e;
 
   color-scheme: dark;
+}
+
+@font-face {
+  font-family: "Departure Mono";
+  src: url("./assets/fonts/DepartureMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
 }
 
 * {
@@ -1514,3 +1524,13 @@ h2 {
 .rp-actions { display: flex; gap: 10px; margin-top: 2px; }
 .rp-hint { margin: 0; }
 .rp-hint code { color: var(--copper); }
+
+/* ---- Departure Mono display normalization (keep LAST — order wins) -------
+   The display face is single-weight and pixel-gridded: never fake bold onto
+   it, never track it negative (glyphs collide). Covers every rule that uses
+   var(--font-display). */
+h1, h2, .brand, .crumb-head, .run-title, .repo-name, .ac-title {
+  font-weight: 400;
+  letter-spacing: 0;
+  font-synthesis: none;
+}

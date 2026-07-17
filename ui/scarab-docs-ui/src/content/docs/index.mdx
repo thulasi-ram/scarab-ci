@@ -6,8 +6,10 @@ hero:
   layout: split-left
   tagline: A modern CI engine for Kubernetes — forge-native, on a durable core. It treats your run as state, not a process.
   image:
-    # Filled by <AsciiScene slotSelector> below — the baked wing-spread loop.
-    html: '<div class="ascii-hero-slot"></div>'
+    # The brand emblem, square-cropped (1:1) — ink outline on light, gold on dark.
+    light: ../../assets/brand/scarab-emblem-square.svg
+    dark: ../../assets/brand/scarab-emblem-dark-square.svg
+    alt: The Scarab emblem — a scarab with spread wings inside a ring
   actions:
     - text: Run it locally
       link: /scarab-ci/get-started/run-locally/
@@ -20,13 +22,6 @@ hero:
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
 import AsciiScene from '../../components/AsciiScene.astro';
-
-<AsciiScene
-  name="wingspread-hero"
-  fontSize={9}
-  slotSelector=".ascii-hero-slot"
-  label="The Scarab emblem in ASCII art — a scarab spreading its wings inside its nimbus"
-/>
 
 CI tools fall into two camps. **Workflow engines** — Argo, Tekton, Temporal — have a durable,
 crash-safe core, but they aren't CI: forge integration, in-repo config, PR checks, identity,
