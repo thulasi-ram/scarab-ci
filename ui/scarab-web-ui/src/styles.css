@@ -241,7 +241,8 @@ code,
   margin: 0;
   font-family: var(--font-mono);
   font-size: var(--ascii-fs, 8px);
-  line-height: calc(var(--ascii-fs, 8px) * 1.667);
+  /* cell = 0.602em x 1.0em -> the 0.6 ratio the bake squashes for */
+  line-height: var(--ascii-fs, 8px);
   user-select: none;
 }
 .ascii-scene .ascii-em { color: var(--emerald); }
@@ -254,7 +255,7 @@ code,
    working". Travel is CSS; the frames only animate legs + ball spin. */
 .dash-footer {
   position: relative;
-  height: 252px;
+  height: 172px;
   overflow: hidden;
 }
 .dash-footer::after {
@@ -295,7 +296,7 @@ code,
   margin: 0;
   font-family: var(--font-mono);
   font-size: 7px;
-  line-height: 11.7px;
+  line-height: 7px;
   color: var(--copper);
   opacity: 0.3;
   transform: rotate(-6deg);

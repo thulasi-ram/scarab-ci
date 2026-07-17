@@ -41,7 +41,7 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
     // JetBrains Mono's advance is exactly 0.6em.
     `--ascii-fs:${fontSize}px;` +
     `width:${scene.cols * fontSize * 0.6}px;` +
-    `height:${(scene.rows * fontSize * 1.667).toFixed(1)}px`
+    `height:${scene.rows * fontSize}px`
   }
   role={label ? "img" : undefined}
   aria-label={label}
@@ -109,7 +109,8 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
        Mono's exact 0.6em advance; a narrower mono would squash the scenes. */
     font-family: 'JetBrains Mono', ui-monospace, monospace;
     font-size: var(--ascii-fs, 8px);
-    line-height: calc(var(--ascii-fs, 8px) * 1.667);
+    /* cell = 0.602em x 1.0em -> the 0.6 ratio the bake squashes for */
+    line-height: var(--ascii-fs, 8px);
     user-select: none;
     overflow: hidden;
   }

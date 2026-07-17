@@ -44,14 +44,15 @@ export default function AsciiScene(props: {
 
   // Explicit box: layers are absolutely positioned, and the trimmed text lines
   // must not size the scene (a layer can be much narrower than the grid).
-  // JetBrains Mono's advance is exactly 0.6em.
+  // JetBrains Mono's advance is exactly 0.6em; line-height is 1em, giving the
+  // 0.6 cell ratio the bake squashes for.
   return (
     <div
       class={`ascii-scene ${props.class ?? ""}`}
       style={{
         "--ascii-fs": `${props.fontSize ?? 8}px`,
         width: `${props.scene.cols * (props.fontSize ?? 8) * 0.6}px`,
-        height: `${props.scene.rows * (props.fontSize ?? 8) * 1.667}px`,
+        height: `${props.scene.rows * (props.fontSize ?? 8)}px`,
       }}
       role={props.label ? "img" : undefined}
       aria-label={props.label}
