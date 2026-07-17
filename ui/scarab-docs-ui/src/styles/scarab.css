@@ -73,13 +73,15 @@
  * dot-matrix strokes hold a line. h2+ and body stay Geist — the display
  * voice is an accent, not the whole page. */
 :root {
-  --scarab-display: 'Doto Variable';
+  --scarab-display: 'Major Mono Display';
 }
 h1[data-page-title],
 .sl-markdown-content h1,
 .site-title span {
   font-family: var(--scarab-display), var(--sl-font-mono);
-  font-weight: 700;
+  /* 400 for the Major Mono Display trial (single weight); use 700 for
+     Doto / 10 Pixel. */
+  font-weight: 400;
   letter-spacing: 0;
   font-synthesis: none;
 }
