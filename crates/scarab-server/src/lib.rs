@@ -1169,8 +1169,14 @@ async fn prefetch_libs_and_compile(
             Err(e) => return Err(TriggerError::Forge(e)),
         }
     }
-    scarab_pipeline::compile_yaml_with_libs(yaml, &libs)
-        .map_err(|e| TriggerError::Pipeline(e.to_string()))
+    let ir = scarab_pipeline::compile_yaml_with_libs(yaml, &libs)
+        .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
+    // Non-fatal lint diagnostics (ADR-0045), surfaced on the compile path —
+    // warnings only, never failures.
+    for warning in scarab_pipeline::lint(&ir) {
+        tracing::warn!(lint = %warning, "pipeline lint");
+    }
+    Ok(ir)
 }
 
 /// Fetch the target Environment's protection rules, enforce allowed-refs

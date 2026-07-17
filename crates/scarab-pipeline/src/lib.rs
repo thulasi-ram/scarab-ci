@@ -273,6 +273,14 @@ pub struct StepSpec {
     /// released. The engine wiring is `Db::set_step_gate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
+    /// If set, this is a **clone** step (ADR-0045): first-class source
+    /// provisioning. Zero-config by design — repo/ref/SHA/token are implicit
+    /// from the run's trigger context; the engine runs the canonical
+    /// `scarab-clone` image (never the author's). Downstream steps inherit
+    /// the cloned workspace via plain `needs` (ADR-0007 — no new inheritance
+    /// rule). Image-less like `gate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<CloneSpec>,
     /// If set, this is an **invoke** step (ADR-0038): a repo-relative path to a
     /// Library pipeline (under `.scarab/lib/` by convention) that is *inlined at
     /// compile time*, not a runtime object. The step launches nothing itself;
@@ -379,6 +387,11 @@ impl StepSpec {
         self.gate.is_some()
     }
 
+    /// Is this a clone step (ADR-0045 source provisioning)?
+    pub fn is_clone(&self) -> bool {
+        self.clone.is_some()
+    }
+
     /// Is this an image-less invoke step (a compile-time library inline point)?
     /// True only in authored YAML — [`compile_yaml_with_libs`] resolves every
     /// invoke step away, so a compiled IR never contains one.
@@ -416,6 +429,84 @@ impl StepSecurity {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Configuration of a `clone` step (ADR-0045). Everything is optional —
+/// `clone: {}` is the common case; repo/ref/SHA/token come from the run's
+/// trigger context, never from the author.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneSpec {
+    /// `1` (default — shallow, small CAS snapshots) or `full` (complete
+    /// history + all refs, for history-dependent workloads). Any other value
+    /// is a compile error.
+    #[serde(default)]
+    pub depth: CloneDepth,
+    /// Recursive submodule fetch with the run's token. Cross-installation
+    /// private submodules are a documented limitation (ADR-0045).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub submodules: bool,
+    /// git-lfs fetch (served by the canonical `scarab-clone` image).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lfs: bool,
+    /// Override the ref to clone. Default = the run's trigger ref, pinned to
+    /// its resolved SHA (ADR-0043/0044) — restarts always re-clone that SHA.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
+    pub r#ref: Option<String>,
+}
+
+/// The `depth:` of a [`CloneSpec`]: shallow (`1`, the default) or `full`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CloneDepth {
+    /// `depth: 1` — the working tree at the pinned SHA, minimal history.
+    #[default]
+    Shallow,
+    /// `depth: full` — complete history and all refs.
+    Full,
+}
+
+impl Serialize for CloneDepth {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            CloneDepth::Shallow => s.serialize_u64(1),
+            CloneDepth::Full => s.serialize_str("full"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CloneDepth {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = CloneDepth;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("`1` (shallow) or `full`")
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<CloneDepth, E> {
+                if v == 1 {
+                    Ok(CloneDepth::Shallow)
+                } else {
+                    Err(E::custom(format!(
+                        "invalid clone depth {v}: only `1` (shallow) or `full` are supported"
+                    )))
+                }
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<CloneDepth, E> {
+                u64::try_from(v)
+                    .map_err(|_| E::custom("invalid clone depth"))
+                    .and_then(|v| self.visit_u64(v))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<CloneDepth, E> {
+                match v {
+                    "1" => Ok(CloneDepth::Shallow),
+                    "full" => Ok(CloneDepth::Full),
+                    other => Err(E::custom(format!(
+                        "invalid clone depth `{other}`: only `1` (shallow) or `full` are supported"
+                    ))),
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// A step's opt-in retry policy (ADR-0020 syntax, ADR-0047 semantics).
@@ -1252,6 +1343,31 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
 /// Validate a compiled [`PipelineIr`], returning **all** discovered problems at
 /// once. Checks: unique step ids, no unexpanded matrix (a compile-invariant),
 /// `needs` resolve to real steps, and the `needs` graph is acyclic.
+/// Non-fatal lint diagnostics over a compiled pipeline (ADR-0045) — the rules
+/// behind `scarab lint`, also surfaced (as warnings, never failures) wherever
+/// a pipeline compiles. First rule: a `push`/`pull_request` pipeline with no
+/// `clone` step almost certainly forgot its source; some triggered pipelines
+/// legitimately need none, hence a lint and not a hard error. Repo-less
+/// triggers (`cron`, `upstream`, …) never warn.
+pub fn lint(ir: &PipelineIr) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let source_triggered = ir
+        .triggers
+        .0
+        .keys()
+        .any(|k| k == "push" || k == "pull_request");
+    let has_clone = ir.steps.iter().any(|s| s.is_clone());
+    if source_triggered && !has_clone {
+        warnings.push(
+            "pipeline triggers on push/pull_request but has no `clone` step — its steps will \
+             run without source (ADR-0045); add `- { id: checkout, clone: {} }` and depend on \
+             it via `needs`"
+                .to_string(),
+        );
+    }
+    warnings
+}
+
 pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
     let mut diagnostics = Vec::new();
 
@@ -1277,6 +1393,32 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         }
         if step.invoke.is_some() {
             diagnostics.push(format!("step `{}`: invoke was not inlined", step.id));
+        }
+        // Step kinds are mutually exclusive: a step is a gate, a clone, or an
+        // ordinary executed step — never two at once.
+        if step.gate.is_some() && step.clone.is_some() {
+            diagnostics.push(format!(
+                "step `{}`: `gate` and `clone` are mutually exclusive step kinds",
+                step.id
+            ));
+        }
+        // A clone step is zero-config by design (ADR-0045): the engine runs
+        // the canonical scarab-clone image with the run's trigger context —
+        // the author supplies no image/command/security.
+        if step.clone.is_some() {
+            if !step.image.is_empty() || !step.command.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: a clone step runs the canonical scarab-clone image — it must not \
+                     set an image or command",
+                    step.id
+                ));
+            }
+            if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
+                diagnostics.push(format!(
+                    "step `{}`: a clone step must not request privilege escalation",
+                    step.id
+                ));
+            }
         }
         // Step kind: a gate launches nothing (image-less); every other step must
         // name an image. A gate with an image/command is a contradiction.
@@ -1342,7 +1484,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 }
             }
             None => {
-                if step.image.is_empty() {
+                if step.image.is_empty() && !step.is_clone() {
                     diagnostics.push(format!("step `{}`: missing image", step.id));
                 }
                 if step.gate_after.is_some() {
@@ -2917,6 +3059,136 @@ mod tests {
             }
             other => panic!("expected validation error, got {other:?}"),
         }
+    }
+
+    // --- clone step kind + missing-clone lint (ADR-0045) --------------------
+
+    #[test]
+    fn clone_compiles_to_a_distinct_kind_with_zero_config() {
+        let ir = compile(
+            r#"
+            steps:
+              - { id: checkout, clone: {} }
+              - { id: build, image: busybox, needs: [checkout] }
+            "#,
+        );
+        let checkout = &ir.steps[0];
+        assert!(checkout.is_clone());
+        assert!(!checkout.is_gate());
+        assert_eq!(
+            checkout.clone,
+            Some(CloneSpec {
+                depth: CloneDepth::Shallow, // default
+                submodules: false,
+                lfs: false,
+                r#ref: None,
+            })
+        );
+        // Downstream inherits the clone workspace via a plain needs edge
+        // (ADR-0007 — no new inheritance rule).
+        assert_eq!(ir.steps[1].needs.0, vec!["checkout".to_string()]);
+    }
+
+    #[test]
+    fn clone_knobs_parse_and_round_trip() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: checkout
+                clone: { depth: full, submodules: true, lfs: true, ref: refs/heads/release }
+            "#,
+        );
+        let spec = ir.steps[0].clone.as_ref().unwrap();
+        assert_eq!(spec.depth, CloneDepth::Full);
+        assert!(spec.submodules);
+        assert!(spec.lfs);
+        assert_eq!(spec.r#ref.as_deref(), Some("refs/heads/release"));
+        // The compiled IR serializes depth canonically (1 | "full").
+        let json = serde_json::to_value(&ir).unwrap();
+        assert_eq!(json["steps"][0]["clone"]["depth"], "full");
+        let shallow = compile("steps: [{ id: c, clone: { depth: 1 } }]");
+        let json = serde_json::to_value(&shallow).unwrap();
+        assert_eq!(json["steps"][0]["clone"]["depth"], 1);
+    }
+
+    #[test]
+    fn invalid_clone_depth_is_a_compile_error() {
+        for depth in ["2", "\"deep\"", "0"] {
+            let yaml = format!("steps: [{{ id: c, clone: {{ depth: {depth} }} }}]");
+            match compile_yaml(&yaml) {
+                Err(PipelineError::Parse(e)) => {
+                    assert!(e.to_string().contains("depth"), "depth={depth}: {e}")
+                }
+                other => panic!("depth={depth}: expected parse error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn clone_is_zero_config_image_and_gate_are_rejected() {
+        match compile_yaml("steps: [{ id: c, clone: {}, image: busybox }]") {
+            Err(PipelineError::Validation(errs)) => {
+                assert!(errs.iter().any(|e| e.contains("scarab-clone")), "{errs:?}")
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+        match compile_yaml("steps: [{ id: c, clone: {}, gate: manual }]") {
+            Err(PipelineError::Validation(errs)) => {
+                assert!(errs.iter().any(|e| e.contains("mutually exclusive")), "{errs:?}")
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_clone_on_push_pipeline_lints_but_compiles() {
+        // The lint fires — and compilation still SUCCEEDS (non-fatal).
+        let ir = compile(
+            r#"
+            on: { push: {} }
+            steps: [{ id: build, image: busybox }]
+            "#,
+        );
+        let warnings = lint(&ir);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("without source"), "{warnings:?}");
+
+        // pull_request triggers warn too.
+        let ir = compile(
+            r#"
+            on: { pull_request: {} }
+            steps: [{ id: test, image: busybox }]
+            "#,
+        );
+        assert_eq!(lint(&ir).len(), 1);
+    }
+
+    #[test]
+    fn lint_is_quiet_with_a_clone_or_on_repo_less_triggers() {
+        // A push pipeline WITH a clone: quiet.
+        let ir = compile(
+            r#"
+            on: { push: {} }
+            steps:
+              - { id: checkout, clone: {} }
+              - { id: build, image: busybox, needs: [checkout] }
+            "#,
+        );
+        assert!(lint(&ir).is_empty());
+
+        // Repo-less triggers (cron/upstream) never warn — they legitimately
+        // may have no source.
+        let ir = compile(
+            r#"
+            on: { cron: {} }
+            steps: [{ id: sweep, image: busybox }]
+            "#,
+        );
+        assert!(lint(&ir).is_empty());
+
+        // No triggers at all (API/manual-only): quiet.
+        let ir = compile("steps: [{ id: a, image: busybox }]");
+        assert!(lint(&ir).is_empty());
     }
 
     #[test]
