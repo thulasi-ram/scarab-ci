@@ -18,6 +18,15 @@ rules:
     # patch: the workspace CAS root is recorded as a Pod annotation (ADR-0045).
     verbs: ["get", "list", "watch", "create", "delete", "patch"]
   - apiGroups: [""]
+    # Per-Pod Secrets the executor upserts before a step runs: the clone token
+    # (ADR-0045, GIT_ASKPASS tmpfs mount), the per-attempt OIDC token (ADR-0015),
+    # and a build step's registry dockerconfig (ADR-0018). Each is owner-
+    # referenced to its Pod, so it is garbage-collected when the Pod is deleted —
+    # no explicit secrets delete is needed. `update` backs the re-drive refresh
+    # (replace-in-place on a 409).
+    resources: ["secrets"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
   - apiGroups: [""]
