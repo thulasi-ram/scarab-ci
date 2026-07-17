@@ -8,12 +8,6 @@ license.workspace = true
 scarab-engine = { workspace = true }
 async-trait = { workspace = true }
 kube = { workspace = true }
-tar = { workspace = true }
-tempfile = { workspace = true }
-tokio = { workspace = true }
-serde_json = { workspace = true }
-base64 = { workspace = true }
-scarab-storage = { workspace = true }
 k8s-openapi = { workspace = true }
 # Reused only for `sign_hex` — the single source of truth for the fence-token
 # format the server's results endpoint verifies (ADR-0042), so the two sides
@@ -24,6 +18,4 @@ scarab-forge-github = { workspace = true }
 futures = { workspace = true }
 
 [dev-dependencies]
-scarab-storage-s3 = { workspace = true }
-axum = { workspace = true }
 tokio = { workspace = true }

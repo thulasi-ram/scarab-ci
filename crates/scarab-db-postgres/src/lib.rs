@@ -24,27 +24,28 @@ use scarab_engine::{
     LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec,
     StepStatus, Timestamp,
 };
-use scarab_forge::{
-    ForgeConnection, ForgeConnectionStore, ForgeKind, RegistryError, RepoRef, ResolvedRepo,
-};
-use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError};
+use scarab_projects::{Deployment, Environment, EnvironmentStore, ProjectError};
 
 /// The embedded, ordered set of forward-only migrations. `MIGRATOR.run(pool)`
 /// applies all pending ones (tracked in `_sqlx_migrations`); tests can also walk
 /// `MIGRATOR.iter()` to apply schema versions one at a time.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
-/// A Postgres-backed [`Db`]. Always connected: Postgres is mandatory for
-/// every serving role (ADR-0048) — the unconnected/API-only construction was
-/// deleted, not guarded.
+/// A Postgres-backed [`Db`]. Holds an optional connection pool so the
+/// composition root can construct it without performing I/O.
 pub struct PostgresDb {
-    pool: PgPool,
+    pool: Option<PgPool>,
 }
 
 impl PostgresDb {
+    /// Construct without connecting (pool wired later).
+    pub fn new() -> Self {
+        Self { pool: None }
+    }
+
     /// Construct from an existing connection pool.
     pub fn with_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool: Some(pool) }
     }
 
     /// Connect a pool to `url`.
@@ -55,11 +56,11 @@ impl PostgresDb {
 
     /// Apply all pending migrations (the production expand-contract path).
     pub async fn migrate(&self) -> Result<(), DbError> {
-        MIGRATOR.run(self.pool()).await.map_err(|e| DbError::Other(e.to_string()))
+        MIGRATOR.run(self.pool()?).await.map_err(|e| DbError::Other(e.to_string()))
     }
 
-    fn pool(&self) -> &PgPool {
-        &self.pool
+    fn pool(&self) -> Result<&PgPool, DbError> {
+        self.pool.as_ref().ok_or(DbError::Unavailable)
     }
 
     // --- read helpers ------------------------------------------------------
@@ -69,7 +70,7 @@ impl PostgresDb {
         let row = sqlx::query("SELECT status FROM step_runs WHERE run_id = $1 AND step_id = $2")
             .bind(&run.0)
             .bind(&step.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.pool()?)
             .await
             .map_err(db_err)?;
         row.map(|r| step_status_from_str(r.get::<String, _>("status")))
@@ -84,7 +85,7 @@ impl PostgresDb {
         )
         .bind(&run.0)
         .bind(&step.0)
-        .fetch_all(self.pool())
+        .fetch_all(self.pool()?)
         .await
         .map_err(db_err)?;
         rows.into_iter()
@@ -108,10 +109,16 @@ impl PostgresDb {
             "SELECT kind FROM outbox WHERE run_id = $1 AND dispatched_at IS NULL ORDER BY id",
         )
         .bind(&run.0)
-        .fetch_all(self.pool())
+        .fetch_all(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(rows.into_iter().map(|r| r.get::<String, _>("kind")).collect())
+    }
+}
+
+impl Default for PostgresDb {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -137,7 +144,7 @@ impl Db for PostgresDb {
              RETURNING run_id, step_id, status, needs, gate_kind",
         )
         .bind(limit as i64)
-        .fetch_all(self.pool())
+        .fetch_all(self.pool()?)
         .await
         .map_err(db_err)?;
 
@@ -177,7 +184,7 @@ impl Db for PostgresDb {
         .bind(ir_version as i32)
         .bind(event_schema_version as i32)
         .bind(at.0)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -205,7 +212,7 @@ impl Db for PostgresDb {
         .bind(spec_json)
         .bind(needs_json)
         .bind(at.0)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -219,7 +226,7 @@ impl Db for PostgresDb {
         )
         .bind(&run.0)
         .bind(ir)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -228,7 +235,7 @@ impl Db for PostgresDb {
     async fn run_ir(&self, run: &RunId) -> Result<Option<serde_json::Value>, DbError> {
         let row = sqlx::query("SELECT ir FROM runs WHERE id = $1")
             .bind(&run.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.pool()?)
             .await
             .map_err(db_err)?;
         // `ir` is itself nullable, so unwrap both the missing-row and NULL cases.
@@ -248,7 +255,7 @@ impl Db for PostgresDb {
         )
         .bind(&run.0)
         .bind(json)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -260,7 +267,7 @@ impl Db for PostgresDb {
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError> {
         let row = sqlx::query("SELECT params FROM runs WHERE id = $1")
             .bind(&run.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.pool()?)
             .await
             .map_err(db_err)?;
         match row.and_then(|r| r.get::<Option<Value>, _>("params")) {
@@ -275,18 +282,18 @@ impl Db for PostgresDb {
         ctx: &scarab_engine::DeployContext,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "UPDATE runs SET deploy_org = $2, deploy_project = $3, deploy_environment = $4,
+            "UPDATE runs SET deploy_org = $2, deploy_repo = $3, deploy_environment = $4,
                  deploy_git_ref = $5, deploy_locked_out = $6,
                  updated_at = (extract(epoch from now()) * 1000)::bigint
              WHERE id = $1",
         )
         .bind(&run.0)
         .bind(&ctx.org)
-        .bind(&ctx.project)
+        .bind(&ctx.repo)
         .bind(&ctx.environment)
         .bind(&ctx.git_ref)
         .bind(ctx.locked_out)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -297,11 +304,11 @@ impl Db for PostgresDb {
         run: &RunId,
     ) -> Result<Option<scarab_engine::DeployContext>, DbError> {
         let row = sqlx::query(
-            "SELECT deploy_org, deploy_project, deploy_environment, deploy_git_ref, deploy_locked_out
+            "SELECT deploy_org, deploy_repo, deploy_environment, deploy_git_ref, deploy_locked_out
              FROM runs WHERE id = $1",
         )
         .bind(&run.0)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(row.and_then(|r| {
@@ -309,14 +316,14 @@ impl Db for PostgresDb {
             // non-deploy run); `deploy_locked_out` defaults false.
             match (
                 r.get::<Option<String>, _>("deploy_org"),
-                r.get::<Option<String>, _>("deploy_project"),
+                r.get::<Option<String>, _>("deploy_repo"),
                 r.get::<Option<String>, _>("deploy_environment"),
                 r.get::<Option<String>, _>("deploy_git_ref"),
             ) {
-                (Some(org), Some(project), Some(environment), Some(git_ref)) => {
+                (Some(org), Some(repo), Some(environment), Some(git_ref)) => {
                     Some(scarab_engine::DeployContext {
                         org,
-                        project,
+                        repo,
                         environment,
                         git_ref,
                         locked_out: r.get::<bool, _>("deploy_locked_out"),
@@ -342,7 +349,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(&step.0)
         .bind(snapshot)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -353,7 +360,7 @@ impl Db for PostgresDb {
             sqlx::query("SELECT output_snapshot FROM step_runs WHERE run_id = $1 AND step_id = $2")
                 .bind(&run.0)
                 .bind(&step.0)
-                .fetch_optional(self.pool())
+                .fetch_optional(self.pool()?)
                 .await
                 .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<String>, _>("output_snapshot")))
@@ -375,7 +382,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(&step.0)
         .bind(json)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -389,7 +396,7 @@ impl Db for PostgresDb {
         let row = sqlx::query("SELECT results FROM step_runs WHERE run_id = $1 AND step_id = $2")
             .bind(&run.0)
             .bind(&step.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.pool()?)
             .await
             .map_err(db_err)?;
         match row.and_then(|r| r.get::<Option<Value>, _>("results")) {
@@ -413,7 +420,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(&step.0)
         .bind(signature)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -424,7 +431,7 @@ impl Db for PostgresDb {
             sqlx::query("SELECT input_signature FROM step_runs WHERE run_id = $1 AND step_id = $2")
                 .bind(&run.0)
                 .bind(&step.0)
-                .fetch_optional(self.pool())
+                .fetch_optional(self.pool()?)
                 .await
                 .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<String>, _>("input_signature")))
@@ -447,7 +454,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(&step.0)
         .bind(json)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -462,7 +469,7 @@ impl Db for PostgresDb {
             sqlx::query("SELECT explicit_inputs FROM step_runs WHERE run_id = $1 AND step_id = $2")
                 .bind(&run.0)
                 .bind(&step.0)
-                .fetch_optional(self.pool())
+                .fetch_optional(self.pool()?)
                 .await
                 .map_err(db_err)?;
         let Some(value) = row.and_then(|r| r.get::<Option<Value>, _>("explicit_inputs")) else {
@@ -487,7 +494,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(group)
         .bind(policy.as_str())
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -500,7 +507,7 @@ impl Db for PostgresDb {
         let row =
             sqlx::query("SELECT concurrency_group, concurrency_policy FROM runs WHERE id = $1")
                 .bind(&run.0)
-                .fetch_optional(self.pool())
+                .fetch_optional(self.pool()?)
                 .await
                 .map_err(db_err)?;
         Ok(row.and_then(|r| {
@@ -512,7 +519,7 @@ impl Db for PostgresDb {
 
     async fn acquire_slot(&self, group: &str, run: &RunId) -> Result<Option<RunId>, DbError> {
         // Serialize acquirers on this group with a row lock, so exactly one wins.
-        let mut tx = self.pool().begin().await.map_err(db_err)?;
+        let mut tx = self.pool()?.begin().await.map_err(db_err)?;
         let holder: Option<String> =
             sqlx::query("SELECT holder FROM concurrency_slots WHERE group_key = $1 FOR UPDATE")
                 .bind(group)
@@ -564,7 +571,7 @@ impl Db for PostgresDb {
         sqlx::query("DELETE FROM concurrency_slots WHERE group_key = $1 AND holder = $2")
             .bind(group)
             .bind(&run.0)
-            .execute(self.pool())
+            .execute(self.pool()?)
             .await
             .map_err(db_err)?;
         Ok(())
@@ -578,7 +585,7 @@ impl Db for PostgresDb {
         )
         .bind(&run.0)
         .bind(key)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -597,7 +604,7 @@ impl Db for PostgresDb {
              ORDER BY created_at",
         )
         .bind(&run.0)
-        .fetch_all(self.pool())
+        .fetch_all(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
@@ -617,7 +624,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(project)
         .bind(priority)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -626,47 +633,10 @@ impl Db for PostgresDb {
     async fn run_project(&self, run: &RunId) -> Result<Option<String>, DbError> {
         let row = sqlx::query("SELECT project FROM runs WHERE id = $1")
             .bind(&run.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.pool()?)
             .await
             .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<String>, _>("project")))
-    }
-
-    async fn set_run_tenant(
-        &self,
-        run: &RunId,
-        org: &str,
-        project: &str,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "UPDATE runs SET tenant_org = $2, tenant_project = $3,
-                 updated_at = (extract(epoch from now()) * 1000)::bigint
-             WHERE id = $1",
-        )
-        .bind(&run.0)
-        .bind(org)
-        .bind(project)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError> {
-        let row = sqlx::query("SELECT tenant_org, tenant_project FROM runs WHERE id = $1")
-            .bind(&run.0)
-            .fetch_optional(self.pool())
-            .await
-            .map_err(db_err)?;
-        Ok(row.and_then(|r| {
-            match (
-                r.get::<Option<String>, _>("tenant_org"),
-                r.get::<Option<String>, _>("tenant_project"),
-            ) {
-                (Some(o), Some(p)) => Some((o, p)),
-                _ => None,
-            }
-        }))
     }
 
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
@@ -676,7 +646,7 @@ impl Db for PostgresDb {
                AND ($1::text IS NULL OR project = $1)",
         )
         .bind(project)
-        .fetch_one(self.pool())
+        .fetch_one(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(row.get::<i64, _>("n") as u32)
@@ -698,7 +668,7 @@ impl Db for PostgresDb {
         .bind(&step.0)
         .bind(kind)
         .bind(timer_seconds)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -714,7 +684,7 @@ impl Db for PostgresDb {
         )
         .bind(&run.0)
         .bind(&step.0)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<i64>, _>("gate_timer_seconds")))
@@ -723,7 +693,7 @@ impl Db for PostgresDb {
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {
         let row = sqlx::query("SELECT status FROM runs WHERE id = $1")
             .bind(&run.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.pool()?)
             .await
             .map_err(db_err)?;
         row.map(|r| run_status_from_str(r.get::<String, _>("status")))
@@ -737,7 +707,7 @@ impl Db for PostgresDb {
             "SELECT id FROM runs WHERE status IN ('pending', 'running', 'suspended')
              ORDER BY priority DESC, created_at",
         )
-        .fetch_all(self.pool())
+        .fetch_all(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
@@ -745,28 +715,20 @@ impl Db for PostgresDb {
 
     async fn list_runs(&self, limit: u32) -> Result<Vec<RunSummary>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, status, created_at, tenant_org, tenant_project FROM runs
+            "SELECT id, status, created_at FROM runs
              ORDER BY created_at DESC, id DESC
              LIMIT $1",
         )
         .bind(limit as i64)
-        .fetch_all(self.pool())
+        .fetch_all(self.pool()?)
         .await
         .map_err(db_err)?;
         rows.into_iter()
             .map(|r| {
-                let tenant = match (
-                    r.get::<Option<String>, _>("tenant_org"),
-                    r.get::<Option<String>, _>("tenant_project"),
-                ) {
-                    (Some(o), Some(p)) => Some((o, p)),
-                    _ => None,
-                };
                 Ok(RunSummary {
                     run: RunId(r.get::<String, _>("id")),
                     status: run_status_from_str(r.get::<String, _>("status"))?,
                     created_at: Timestamp(r.get::<i64, _>("created_at")),
-                    tenant,
                 })
             })
             .collect()
@@ -775,7 +737,7 @@ impl Db for PostgresDb {
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
         let rows = sqlx::query("SELECT version, at, payload FROM events WHERE run_id = $1 ORDER BY seq")
             .bind(&run.0)
-            .fetch_all(self.pool())
+            .fetch_all(self.pool()?)
             .await
             .map_err(db_err)?;
         rows.into_iter()
@@ -798,7 +760,7 @@ impl Db for PostgresDb {
             "SELECT step_id, status, needs, gate_kind FROM step_runs WHERE run_id = $1 ORDER BY step_id",
         )
         .bind(&run.0)
-        .fetch_all(self.pool())
+        .fetch_all(self.pool()?)
         .await
         .map_err(db_err)?;
         let mut steps = Vec::with_capacity(rows.len());
@@ -824,7 +786,7 @@ impl Db for PostgresDb {
         let row = sqlx::query("SELECT spec FROM step_runs WHERE run_id = $1 AND step_id = $2")
             .bind(&run.0)
             .bind(&step.0)
-            .fetch_optional(self.pool())
+            .fetch_optional(self.pool()?)
             .await
             .map_err(db_err)?;
         match row.and_then(|r| r.get::<Option<Value>, _>("spec")) {
@@ -856,7 +818,7 @@ impl Db for PostgresDb {
         .bind(meta.byte_offset as i64)
         .bind(meta.len as i64)
         .bind(&meta.object_key)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -875,7 +837,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(&step.0)
         .bind(&attempt.0)
-        .fetch_all(self.pool())
+        .fetch_all(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(rows
@@ -907,7 +869,7 @@ impl Db for PostgresDb {
         .bind(&step.0)
         .bind(step_status_str(from))
         .bind(step_status_str(to))
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?
         .rows_affected();
@@ -936,72 +898,7 @@ impl Db for PostgresDb {
         .bind(&attempt.id.0)
         .bind(attempt.started_at.0)
         .bind(attempt.failure.map(failure_str))
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn attempts_of_step(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
-        self.attempts(run, step).await
-    }
-
-    async fn set_attempt_handle(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        handle: &str,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "UPDATE attempts SET handle = $4
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.0)
-        .bind(handle)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn attempt_handle(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<Option<String>, DbError> {
-        let row = sqlx::query(
-            "SELECT handle FROM attempts
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.0)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(row.and_then(|r| r.get::<Option<String>, _>("handle")))
-    }
-
-    async fn set_attempt_failure(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        failure: FailureKind,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "UPDATE attempts SET failure = $4
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .bind(&attempt.0)
-        .bind(failure_str(failure))
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -1025,7 +922,7 @@ impl Db for PostgresDb {
         .bind(&run.0)
         .bind(run_status_str(from))
         .bind(run_status_str(to))
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?
         .rows_affected();
@@ -1042,7 +939,7 @@ impl Db for PostgresDb {
             .bind(event.version as i32)
             .bind(event.at.0)
             .bind(payload)
-            .execute(self.pool())
+            .execute(self.pool()?)
             .await
             .map_err(db_err)?;
         Ok(())
@@ -1061,7 +958,7 @@ impl Db for PostgresDb {
         .bind(&msg.payload)
         .bind(&msg.idempotency_key)
         .bind(msg.at.0)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
@@ -1086,10 +983,9 @@ impl Db for PostgresDb {
              WHERE id IN (
                  SELECT id FROM outbox
                  WHERE dispatched_at IS NULL
-                   AND dead_lettered_at IS NULL
                    AND ($4::text IS NULL OR kind = $4)
                    AND (claimed_until IS NULL
-                        OR claimed_until <= (extract(epoch from now()) * 1000)::bigint)
+                        OR claimed_until < (extract(epoch from now()) * 1000)::bigint)
                  ORDER BY id
                  FOR UPDATE SKIP LOCKED
                  LIMIT $2
@@ -1100,7 +996,7 @@ impl Db for PostgresDb {
         .bind(limit as i64)
         .bind(visibility_ms)
         .bind(kind)
-        .fetch_all(self.pool())
+        .fetch_all(self.pool()?)
         .await
         .map_err(db_err)?;
 
@@ -1123,193 +1019,10 @@ impl Db for PostgresDb {
              WHERE id = $1",
         )
         .bind(id.0)
-        .execute(self.pool())
+        .execute(self.pool()?)
         .await
         .map_err(db_err)?;
         Ok(())
-    }
-
-    async fn record_outbox_failure(&self, id: OutboxId) -> Result<u32, DbError> {
-        let row = sqlx::query(
-            "UPDATE outbox SET delivery_attempts = delivery_attempts + 1
-             WHERE id = $1
-             RETURNING delivery_attempts",
-        )
-        .bind(id.0)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(row.map(|r| r.get::<i64, _>("delivery_attempts") as u32).unwrap_or(0))
-    }
-
-    async fn dead_letter_outbox(&self, id: OutboxId) -> Result<(), DbError> {
-        sqlx::query(
-            "UPDATE outbox SET dead_lettered_at = (extract(epoch from now()) * 1000)::bigint
-             WHERE id = $1",
-        )
-        .bind(id.0)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn run_status_counts(&self) -> Result<Vec<(String, u64)>, DbError> {
-        let rows = sqlx::query("SELECT status, count(*) AS n FROM runs GROUP BY status")
-            .fetch_all(self.pool())
-            .await
-            .map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.get::<String, _>("status"), r.get::<i64, _>("n") as u64))
-            .collect())
-    }
-
-    async fn outbox_depth(&self) -> Result<u64, DbError> {
-        let row = sqlx::query(
-            "SELECT count(*) AS n FROM outbox
-             WHERE dispatched_at IS NULL AND dead_lettered_at IS NULL",
-        )
-        .fetch_one(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(row.get::<i64, _>("n") as u64)
-    }
-
-    async fn put_artifacts(
-        &self,
-        run: &RunId,
-        artifacts: &[scarab_engine::ArtifactMeta],
-        at: Timestamp,
-    ) -> Result<(), DbError> {
-        for a in artifacts {
-            sqlx::query(
-                "INSERT INTO artifacts (run_id, name, size, content_type, object_key, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (run_id, name) DO UPDATE SET
-                     size = EXCLUDED.size,
-                     content_type = EXCLUDED.content_type,
-                     object_key = EXCLUDED.object_key",
-            )
-            .bind(&run.0)
-            .bind(&a.name)
-            .bind(a.size as i64)
-            .bind(&a.content_type)
-            .bind(&a.object_key)
-            .bind(at.0)
-            .execute(self.pool())
-            .await
-            .map_err(db_err)?;
-        }
-        Ok(())
-    }
-
-    async fn artifacts_of_run(&self, run: &RunId) -> Result<Vec<scarab_engine::ArtifactMeta>, DbError> {
-        let rows = sqlx::query(
-            "SELECT name, size, content_type, object_key FROM artifacts
-             WHERE run_id = $1 ORDER BY name",
-        )
-        .bind(&run.0)
-        .fetch_all(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| scarab_engine::ArtifactMeta {
-                name: r.get::<String, _>("name"),
-                size: r.get::<i64, _>("size") as u64,
-                content_type: r.get::<String, _>("content_type"),
-                object_key: r.get::<String, _>("object_key"),
-            })
-            .collect())
-    }
-
-    async fn prunable_artifact_runs(
-        &self,
-        cutoff: Timestamp,
-        limit: u32,
-    ) -> Result<Vec<RunId>, DbError> {
-        let rows = sqlx::query(
-            "SELECT DISTINCT r.id FROM runs r
-             JOIN artifacts a ON a.run_id = r.id
-             WHERE r.status IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
-               AND r.updated_at < $1
-             LIMIT $2",
-        )
-        .bind(cutoff.0)
-        .bind(limit as i64)
-        .fetch_all(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
-    }
-
-    async fn delete_artifacts_of_run(&self, run: &RunId) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM artifacts WHERE run_id = $1")
-            .bind(&run.0)
-            .execute(self.pool())
-            .await
-            .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn prunable_log_runs(
-        &self,
-        cutoff: Timestamp,
-        limit: u32,
-    ) -> Result<Vec<RunId>, DbError> {
-        let rows = sqlx::query(
-            "SELECT DISTINCT r.id FROM runs r
-             JOIN log_chunks lc ON lc.run_id = r.id
-             WHERE r.status IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
-               AND r.updated_at < $1
-             LIMIT $2",
-        )
-        .bind(cutoff.0)
-        .bind(limit as i64)
-        .fetch_all(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
-    }
-
-    async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError> {
-        let rows = sqlx::query("SELECT object_key FROM log_chunks WHERE run_id = $1")
-            .bind(&run.0)
-            .fetch_all(self.pool())
-            .await
-            .map_err(db_err)?;
-        Ok(rows.into_iter().map(|r| r.get::<String, _>("object_key")).collect())
-    }
-
-    async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM log_chunks WHERE run_id = $1")
-            .bind(&run.0)
-            .execute(self.pool())
-            .await
-            .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn gc_workspace_roots(
-        &self,
-        terminal_cutoff: Timestamp,
-    ) -> Result<Vec<String>, DbError> {
-        let rows = sqlx::query(
-            "SELECT DISTINCT sr.output_snapshot FROM step_runs sr
-             JOIN runs r ON r.id = sr.run_id
-             WHERE sr.output_snapshot IS NOT NULL
-               AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
-                    OR r.updated_at >= $1)",
-        )
-        .bind(terminal_cutoff.0)
-        .fetch_all(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| r.get::<String, _>("output_snapshot"))
-            .collect())
     }
 
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
@@ -1327,7 +1040,7 @@ impl Db for PostgresDb {
         .bind(resource)
         .bind(owner)
         .bind(ttl_ms)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.pool()?)
         .await
         .map_err(db_err)?;
 
@@ -1340,7 +1053,7 @@ impl Db for PostgresDb {
                 // Not acquired: a valid lease is still held by someone else.
                 let r = sqlx::query("SELECT owner, expires_at FROM leases WHERE resource = $1")
                     .bind(resource)
-                    .fetch_one(self.pool())
+                    .fetch_one(self.pool()?)
                     .await
                     .map_err(db_err)?;
                 Ok(Lease {
@@ -1352,193 +1065,25 @@ impl Db for PostgresDb {
     }
 }
 
-#[async_trait]
-impl ForgeConnectionStore for PostgresDb {
-    async fn put_connection(&self, conn: &ForgeConnection) -> Result<(), RegistryError> {
-        sqlx::query(
-            "INSERT INTO forge_connections (id, kind, base_url, credential_ref)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (id) DO UPDATE SET
-                 kind = EXCLUDED.kind,
-                 base_url = EXCLUDED.base_url,
-                 credential_ref = EXCLUDED.credential_ref",
-        )
-        .bind(&conn.id)
-        .bind(conn.kind.as_str())
-        .bind(&conn.base_url)
-        .bind(&conn.credential_ref)
-        .execute(self.pool())
-        .await
-        .map_err(reg_err)?;
-        Ok(())
-    }
-
-    async fn get_connection(&self, id: &str) -> Result<Option<ForgeConnection>, RegistryError> {
-        let row = sqlx::query(
-            "SELECT id, kind, base_url, credential_ref FROM forge_connections WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(reg_err)?;
-        row.map(connection_from_row).transpose()
-    }
-
-    async fn list_connections(&self) -> Result<Vec<ForgeConnection>, RegistryError> {
-        let rows = sqlx::query(
-            "SELECT id, kind, base_url, credential_ref FROM forge_connections ORDER BY id",
-        )
-        .fetch_all(self.pool())
-        .await
-        .map_err(reg_err)?;
-        rows.into_iter().map(connection_from_row).collect()
-    }
-
-    async fn delete_connection(&self, id: &str) -> Result<(), RegistryError> {
-        // Repo bindings go with it (ON DELETE CASCADE).
-        sqlx::query("DELETE FROM forge_connections WHERE id = $1")
-            .bind(id)
-            .execute(self.pool())
-            .await
-            .map_err(reg_err)?;
-        Ok(())
-    }
-
-    async fn bind_repo(
-        &self,
-        connection_id: &str,
-        repo: &RepoRef,
-        org: &str,
-        project: &str,
-    ) -> Result<(), RegistryError> {
-        sqlx::query(
-            "INSERT INTO forge_repos (connection_id, owner, name, org, project)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (owner, name) DO UPDATE SET
-                 connection_id = EXCLUDED.connection_id,
-                 org = EXCLUDED.org,
-                 project = EXCLUDED.project",
-        )
-        .bind(connection_id)
-        .bind(&repo.owner)
-        .bind(&repo.name)
-        .bind(org)
-        .bind(project)
-        .execute(self.pool())
-        .await
-        .map_err(reg_err)?;
-        Ok(())
-    }
-
-    async fn unbind_repo(
-        &self,
-        connection_id: &str,
-        repo: &RepoRef,
-    ) -> Result<(), RegistryError> {
-        sqlx::query(
-            "DELETE FROM forge_repos WHERE connection_id = $1 AND owner = $2 AND name = $3",
-        )
-        .bind(connection_id)
-        .bind(&repo.owner)
-        .bind(&repo.name)
-        .execute(self.pool())
-        .await
-        .map_err(reg_err)?;
-        Ok(())
-    }
-
-    async fn repos_of(&self, connection_id: &str) -> Result<Vec<RepoRef>, RegistryError> {
-        let rows = sqlx::query(
-            "SELECT owner, name FROM forge_repos WHERE connection_id = $1 ORDER BY owner, name",
-        )
-        .bind(connection_id)
-        .fetch_all(self.pool())
-        .await
-        .map_err(reg_err)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| RepoRef {
-                owner: r.get::<String, _>("owner"),
-                name: r.get::<String, _>("name"),
-            })
-            .collect())
-    }
-
-    async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError> {
-        let row = sqlx::query(
-            "SELECT c.id, c.kind, c.base_url, c.credential_ref, r.org, r.project
-             FROM forge_repos r JOIN forge_connections c ON c.id = r.connection_id
-             WHERE r.owner = $1 AND r.name = $2",
-        )
-        .bind(&repo.owner)
-        .bind(&repo.name)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(reg_err)?;
-        row.map(|r| {
-            Ok(ResolvedRepo {
-                org: r.get::<String, _>("org"),
-                project: r.get::<String, _>("project"),
-                connection: connection_from_row(r)?,
-            })
-        })
-        .transpose()
-    }
-
-    async fn record_delivery(
-        &self,
-        forge: ForgeKind,
-        delivery_id: &str,
-    ) -> Result<bool, RegistryError> {
-        // First writer wins; a conflicting insert (a replay) affects zero rows.
-        let result = sqlx::query(
-            "INSERT INTO webhook_deliveries (forge, id, at)
-             VALUES ($1, $2, (extract(epoch from now()) * 1000)::bigint)
-             ON CONFLICT (forge, id) DO NOTHING",
-        )
-        .bind(forge.as_str())
-        .bind(delivery_id)
-        .execute(self.pool())
-        .await
-        .map_err(reg_err)?;
-        Ok(result.rows_affected() == 1)
-    }
-}
-
-fn connection_from_row(r: sqlx::postgres::PgRow) -> Result<ForgeConnection, RegistryError> {
-    let kind = r.get::<String, _>("kind");
-    Ok(ForgeConnection {
-        id: r.get::<String, _>("id"),
-        kind: ForgeKind::from_str_token(&kind)
-            .ok_or_else(|| RegistryError::Store(format!("unknown forge kind {kind:?}")))?,
-        base_url: r.get::<String, _>("base_url"),
-        credential_ref: r.get::<String, _>("credential_ref"),
-    })
-}
-
-fn reg_err(e: sqlx::Error) -> RegistryError {
-    RegistryError::Store(e.to_string())
-}
-
 #[async_trait::async_trait]
 impl EnvironmentStore for PostgresDb {
     async fn put_environment(
         &self,
         org: &str,
-        project: &str,
+        repo: &str,
         env: &Environment,
     ) -> Result<(), ProjectError> {
         let protection = serde_json::to_value(&env.protection)
             .map_err(|e| ProjectError::Store(e.to_string()))?;
         sqlx::query(
-            "INSERT INTO environments (org, project, name, protection) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (org, project, name) DO UPDATE SET protection = EXCLUDED.protection",
+            "INSERT INTO environments (org, repo, name, protection) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (org, repo, name) DO UPDATE SET protection = EXCLUDED.protection",
         )
         .bind(org)
-        .bind(project)
+        .bind(repo)
         .bind(&env.name)
         .bind(protection)
-        .execute(self.pool())
+        .execute(self.pool().map_err(proj_err)?)
         .await
         .map_err(|e| ProjectError::Store(e.to_string()))?;
         Ok(())
@@ -1547,16 +1092,16 @@ impl EnvironmentStore for PostgresDb {
     async fn get_environment(
         &self,
         org: &str,
-        project: &str,
+        repo: &str,
         name: &str,
     ) -> Result<Option<Environment>, ProjectError> {
         let row = sqlx::query(
-            "SELECT protection FROM environments WHERE org = $1 AND project = $2 AND name = $3",
+            "SELECT protection FROM environments WHERE org = $1 AND repo = $2 AND name = $3",
         )
         .bind(org)
-        .bind(project)
+        .bind(repo)
         .bind(name)
-        .fetch_optional(self.pool())
+        .fetch_optional(self.pool().map_err(proj_err)?)
         .await
         .map_err(|e| ProjectError::Store(e.to_string()))?;
         row.map(|r| {
@@ -1573,14 +1118,14 @@ impl EnvironmentStore for PostgresDb {
     async fn list_environments(
         &self,
         org: &str,
-        project: &str,
+        repo: &str,
     ) -> Result<Vec<Environment>, ProjectError> {
         let rows = sqlx::query(
-            "SELECT name, protection FROM environments WHERE org = $1 AND project = $2 ORDER BY name",
+            "SELECT name, protection FROM environments WHERE org = $1 AND repo = $2 ORDER BY name",
         )
         .bind(org)
-        .bind(project)
-        .fetch_all(self.pool())
+        .bind(repo)
+        .fetch_all(self.pool().map_err(proj_err)?)
         .await
         .map_err(|e| ProjectError::Store(e.to_string()))?;
         rows.into_iter()
@@ -1598,14 +1143,14 @@ impl EnvironmentStore for PostgresDb {
     async fn delete_environment(
         &self,
         org: &str,
-        project: &str,
+        repo: &str,
         name: &str,
     ) -> Result<(), ProjectError> {
-        sqlx::query("DELETE FROM environments WHERE org = $1 AND project = $2 AND name = $3")
+        sqlx::query("DELETE FROM environments WHERE org = $1 AND repo = $2 AND name = $3")
             .bind(org)
-            .bind(project)
+            .bind(repo)
             .bind(name)
-            .execute(self.pool())
+            .execute(self.pool().map_err(proj_err)?)
             .await
             .map_err(|e| ProjectError::Store(e.to_string()))?;
         Ok(())
@@ -1615,17 +1160,17 @@ impl EnvironmentStore for PostgresDb {
         let approved = serde_json::to_value(&d.approved_by)
             .map_err(|e| ProjectError::Store(e.to_string()))?;
         sqlx::query(
-            "INSERT INTO deployments (org, project, environment, git_ref, run_id, approved_by, at)
+            "INSERT INTO deployments (org, repo, environment, git_ref, run_id, approved_by, at)
              VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(&d.org)
-        .bind(&d.project)
+        .bind(&d.repo)
         .bind(&d.environment)
         .bind(&d.git_ref)
         .bind(&d.run)
         .bind(approved)
         .bind(d.at)
-        .execute(self.pool())
+        .execute(self.pool().map_err(proj_err)?)
         .await
         .map_err(|e| ProjectError::Store(e.to_string()))?;
         Ok(())
@@ -1634,17 +1179,17 @@ impl EnvironmentStore for PostgresDb {
     async fn deployments(
         &self,
         org: &str,
-        project: &str,
+        repo: &str,
         environment: &str,
     ) -> Result<Vec<Deployment>, ProjectError> {
         let rows = sqlx::query(
             "SELECT git_ref, run_id, approved_by, at FROM deployments
-             WHERE org = $1 AND project = $2 AND environment = $3 ORDER BY id DESC",
+             WHERE org = $1 AND repo = $2 AND environment = $3 ORDER BY id DESC",
         )
         .bind(org)
-        .bind(project)
+        .bind(repo)
         .bind(environment)
-        .fetch_all(self.pool())
+        .fetch_all(self.pool().map_err(proj_err)?)
         .await
         .map_err(|e| ProjectError::Store(e.to_string()))?;
         rows.into_iter()
@@ -1653,7 +1198,7 @@ impl EnvironmentStore for PostgresDb {
                     .map_err(|e| ProjectError::Store(e.to_string()))?;
                 Ok(Deployment {
                     org: org.to_string(),
-                    project: project.to_string(),
+                    repo: repo.to_string(),
                     environment: environment.to_string(),
                     git_ref: r.get::<String, _>("git_ref"),
                     run: r.get::<String, _>("run_id"),
@@ -1663,6 +1208,10 @@ impl EnvironmentStore for PostgresDb {
             })
             .collect()
     }
+}
+
+fn proj_err(e: DbError) -> ProjectError {
+    ProjectError::Store(e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1736,23 +1285,15 @@ fn step_status_from_str(s: String) -> Result<StepStatus, DbError> {
 
 fn failure_str(f: FailureKind) -> &'static str {
     match f {
-        // "infra" keeps its pre-ADR-0047 spelling (post-start is the
-        // conservative reading of historical rows).
-        FailureKind::Infra { never_started: false } => "infra",
-        FailureKind::Infra { never_started: true } => "infra-never-started",
+        FailureKind::Infra => "infra",
         FailureKind::Step => "step",
-        FailureKind::Timeout => "timeout",
-        FailureKind::Lost => "lost",
     }
 }
 
 fn failure_from_str(s: &str) -> Result<FailureKind, DbError> {
     match s {
-        "infra" => Ok(FailureKind::Infra { never_started: false }),
-        "infra-never-started" => Ok(FailureKind::Infra { never_started: true }),
+        "infra" => Ok(FailureKind::Infra),
         "step" => Ok(FailureKind::Step),
-        "timeout" => Ok(FailureKind::Timeout),
-        "lost" => Ok(FailureKind::Lost),
         other => Err(DbError::Other(format!("unknown failure kind {other:?}"))),
     }
 }
@@ -1761,222 +1302,5 @@ fn db_err(e: sqlx::Error) -> DbError {
     match e {
         sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed => DbError::Unavailable,
         other => DbError::Other(other.to_string()),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SessionStore (ADR-0049 C1): server-side login sessions in Postgres.
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-impl scarab_identity::SessionStore for PostgresDb {
-    async fn put(&self, session: &scarab_identity::Session) -> Result<(), scarab_identity::IdentityError> {
-        let principal = serde_json::to_value(&session.principal)
-            .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
-        sqlx::query(
-            "INSERT INTO sessions (id, principal, csrf, expires_at)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (id) DO UPDATE SET
-                 principal = EXCLUDED.principal,
-                 csrf = EXCLUDED.csrf,
-                 expires_at = EXCLUDED.expires_at",
-        )
-        .bind(&session.id)
-        .bind(&principal)
-        .bind(&session.csrf)
-        .bind(session.expires_at)
-        .execute(self.pool())
-        .await
-        .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn get(&self, id: &str) -> Result<Option<scarab_identity::Session>, scarab_identity::IdentityError> {
-        let row = sqlx::query("SELECT principal, csrf, expires_at FROM sessions WHERE id = $1")
-            .bind(id)
-            .fetch_optional(self.pool())
-            .await
-            .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
-        let Some(row) = row else { return Ok(None) };
-        let principal: scarab_identity::Principal =
-            serde_json::from_value(row.get::<serde_json::Value, _>("principal"))
-                .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
-        Ok(Some(scarab_identity::Session {
-            id: id.to_string(),
-            principal,
-            csrf: row.get::<String, _>("csrf"),
-            expires_at: row.get::<i64, _>("expires_at"),
-        }))
-    }
-
-    async fn delete(&self, id: &str) -> Result<(), scarab_identity::IdentityError> {
-        sqlx::query("DELETE FROM sessions WHERE id = $1")
-            .bind(id)
-            .execute(self.pool())
-            .await
-            .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// RbacStore (ADR-0049 C2): role bindings in Postgres. project='' encodes an
-// org-scoped binding; role NULL is a native revoke tombstone.
-// ---------------------------------------------------------------------------
-
-fn scope_cols(scope: &scarab_identity::Scope) -> (&str, &str) {
-    match scope {
-        scarab_identity::Scope::Org(org) => (org.as_str(), ""),
-        scarab_identity::Scope::Project { org, name } => (org.as_str(), name.as_str()),
-    }
-}
-
-fn role_str(role: scarab_identity::Role) -> &'static str {
-    match role {
-        scarab_identity::Role::Viewer => "viewer",
-        scarab_identity::Role::Member => "member",
-        scarab_identity::Role::Admin => "admin",
-        scarab_identity::Role::Owner => "owner",
-    }
-}
-
-fn role_from_str(s: &str) -> Option<scarab_identity::Role> {
-    Some(match s {
-        "viewer" => scarab_identity::Role::Viewer,
-        "member" => scarab_identity::Role::Member,
-        "admin" => scarab_identity::Role::Admin,
-        "owner" => scarab_identity::Role::Owner,
-        _ => return None,
-    })
-}
-
-fn identity_err(e: sqlx::Error) -> scarab_identity::IdentityError {
-    scarab_identity::IdentityError::Issuance(e.to_string())
-}
-
-#[async_trait]
-impl scarab_identity::RbacStore for PostgresDb {
-    async fn grant(
-        &self,
-        binding: &scarab_identity::Binding,
-        origin: scarab_identity::BindingOrigin,
-    ) -> Result<(), scarab_identity::IdentityError> {
-        let (org, project) = scope_cols(&binding.scope);
-        match origin {
-            // Native is authoritative: unconditional upsert (also clears a
-            // tombstone by writing a real role over it).
-            scarab_identity::BindingOrigin::Native => {
-                sqlx::query(
-                    "INSERT INTO rbac_bindings (subject, org, project, role, origin)
-                     VALUES ($1, $2, $3, $4, 'native')
-                     ON CONFLICT (subject, org, project)
-                     DO UPDATE SET role = EXCLUDED.role, origin = 'native'",
-                )
-                .bind(&binding.subject)
-                .bind(org)
-                .bind(project)
-                .bind(role_str(binding.role))
-                .execute(self.pool())
-                .await
-                .map_err(identity_err)?;
-            }
-            // An import only seeds/refreshes rows it owns — a native grant or
-            // a native revoke tombstone is NEVER clobbered by a re-sync.
-            scarab_identity::BindingOrigin::Import => {
-                sqlx::query(
-                    "INSERT INTO rbac_bindings (subject, org, project, role, origin)
-                     VALUES ($1, $2, $3, $4, 'import')
-                     ON CONFLICT (subject, org, project)
-                     DO UPDATE SET role = EXCLUDED.role
-                     WHERE rbac_bindings.origin = 'import'",
-                )
-                .bind(&binding.subject)
-                .bind(org)
-                .bind(project)
-                .bind(role_str(binding.role))
-                .execute(self.pool())
-                .await
-                .map_err(identity_err)?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn revoke(
-        &self,
-        subject: &str,
-        scope: &scarab_identity::Scope,
-    ) -> Result<(), scarab_identity::IdentityError> {
-        let (org, project) = scope_cols(scope);
-        sqlx::query(
-            "INSERT INTO rbac_bindings (subject, org, project, role, origin)
-             VALUES ($1, $2, $3, NULL, 'native')
-             ON CONFLICT (subject, org, project)
-             DO UPDATE SET role = NULL, origin = 'native'",
-        )
-        .bind(subject)
-        .bind(org)
-        .bind(project)
-        .execute(self.pool())
-        .await
-        .map_err(identity_err)?;
-        Ok(())
-    }
-
-    async fn role_of(
-        &self,
-        subject: &str,
-        scope: &scarab_identity::Scope,
-    ) -> Result<Option<scarab_identity::Role>, scarab_identity::IdentityError> {
-        let (org, project) = scope_cols(scope);
-        // Exact scope + the enclosing org (Org role inherits down, ADR-0049);
-        // tombstones (role NULL) grant nothing.
-        let rows = sqlx::query(
-            "SELECT role FROM rbac_bindings
-             WHERE subject = $1 AND org = $2 AND (project = $3 OR project = '')
-               AND role IS NOT NULL",
-        )
-        .bind(subject)
-        .bind(org)
-        .bind(project)
-        .fetch_all(self.pool())
-        .await
-        .map_err(identity_err)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| role_from_str(&r.get::<String, _>("role")))
-            .max())
-    }
-
-    async fn bindings(
-        &self,
-        org: &str,
-    ) -> Result<Vec<scarab_identity::Binding>, scarab_identity::IdentityError> {
-        let rows = sqlx::query(
-            "SELECT subject, project, role FROM rbac_bindings
-             WHERE org = $1 AND role IS NOT NULL
-             ORDER BY subject, project",
-        )
-        .bind(org)
-        .fetch_all(self.pool())
-        .await
-        .map_err(identity_err)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                let role = role_from_str(&r.get::<String, _>("role"))?;
-                let project = r.get::<String, _>("project");
-                let scope = if project.is_empty() {
-                    scarab_identity::Scope::Org(org.to_string())
-                } else {
-                    scarab_identity::Scope::Project { org: org.to_string(), name: project }
-                };
-                Some(scarab_identity::Binding {
-                    subject: r.get::<String, _>("subject"),
-                    scope,
-                    role,
-                })
-            })
-            .collect())
     }
 }

@@ -22,21 +22,13 @@ use scarab_secrets::{SecretProvider, SecretScope};
 use crate::{resolve_step_secrets, LogService};
 
 /// Wraps an [`Executor`], injecting a step's declared secrets into its env at
-/// launch time — and, when the OIDC issuer is configured, minting the
-/// per-attempt federation token (ADR-0015).
+/// launch time.
 pub struct SecretInjectingExecutor {
     inner: Arc<dyn Executor>,
     db: Arc<dyn Db>,
     secrets: Arc<dyn SecretProvider>,
     logs: Arc<LogService>,
-    /// The OIDC issuer + token audience (ADR-0015). `None` = no token minted.
-    oidc: Option<(Arc<dyn scarab_identity::OidcIssuer>, String)>,
-    issuer_url: String,
 }
-
-/// Per-attempt OIDC token TTL (ADR-0015: short-lived by design — long enough
-/// for the cloud exchange at step start, not the step's whole runtime).
-const OIDC_TOKEN_TTL_SECS: i64 = 15 * 60;
 
 impl SecretInjectingExecutor {
     pub fn new(
@@ -50,98 +42,14 @@ impl SecretInjectingExecutor {
             db,
             secrets,
             logs,
-            oidc: None,
-            issuer_url: String::new(),
         }
-    }
-
-    /// Enable per-attempt OIDC token minting (ADR-0015): every launched step
-    /// of a deploy-context run gets a short-lived token whose subject the
-    /// cloud's trust policy matches; a fork-PR run's subject environment is
-    /// downgraded to `none` (it can never assume a real environment's role).
-    pub fn with_oidc(
-        mut self,
-        issuer: Arc<dyn scarab_identity::OidcIssuer>,
-        issuer_url: impl Into<String>,
-        audience: impl Into<String>,
-    ) -> Self {
-        self.oidc = Some((issuer, audience.into()));
-        self.issuer_url = issuer_url.into();
-        self
-    }
-
-    /// Mint the per-attempt token for `step`, if the issuer is configured and
-    /// the run carries a deploy context (org/project/env/ref — what the
-    /// subject encodes). Ordinary tenantless CI runs get no token.
-    async fn mint_oidc_token(
-        &self,
-        step: &StepRun,
-        now_ms: i64,
-    ) -> Result<Option<String>, ExecError> {
-        let Some((issuer, audience)) = &self.oidc else {
-            return Ok(None);
-        };
-        let Some(ctx) = self
-            .db
-            .run_deploy_context(&step.run)
-            .await
-            .map_err(|e| ExecError::Other(e.to_string()))?
-        else {
-            return Ok(None);
-        };
-        // The fork-PR downgrade (ADR-0015): a locked-out run's subject says
-        // env `none` — no cloud trust policy for a real environment matches.
-        let env = if ctx.locked_out { "none" } else { &ctx.environment };
-        let subject = scarab_identity::Claims::run_subject(
-            &ctx.org,
-            &ctx.project,
-            env,
-            &ctx.git_ref,
-        );
-        let attempt = step
-            .current_attempt()
-            .map(|a| a.id.0.clone())
-            .unwrap_or_default();
-        let claims = scarab_identity::Claims {
-            issuer: self.issuer_url.clone(),
-            subject,
-            audience: audience.clone(),
-            run_id: step.run.0.clone(),
-            attempt,
-            event: "deploy".into(),
-            git_ref: ctx.git_ref.clone(),
-            sha: String::new(),
-            expires_at: now_ms / 1000 + OIDC_TOKEN_TTL_SECS,
-        };
-        let jwt = issuer
-            .issue(claims)
-            .await
-            .map_err(|e| ExecError::Other(format!("oidc mint: {e}")))?;
-        Ok(Some(jwt.0))
     }
 }
 
 #[async_trait]
 impl Executor for SecretInjectingExecutor {
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        // Per-attempt OIDC token (ADR-0015): minted fresh on every launch,
-        // in memory only — the k8s executor delivers it via a tmpfs file.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let oidc_token = self.mint_oidc_token(step, now_ms).await?;
-        let base;
-        let spec = if let Some(token) = oidc_token {
-            base = StepSpec {
-                oidc_token: Some(token),
-                ..spec.clone()
-            };
-            &base
-        } else {
-            spec
-        };
-        // No declared secrets → nothing further to inject.
+        // No declared secrets → nothing to inject.
         if spec.secrets.is_empty() {
             return self.inner.launch(step, spec).await;
         }
@@ -155,11 +63,9 @@ impl Executor for SecretInjectingExecutor {
         let Some(ctx) = ctx else {
             return self.inner.launch(step, spec).await;
         };
-        // The secret scope's `repo` is the Project's name (its repo's forge
-        // name, 1:1 in v1 — ADR-0046).
         let scope = SecretScope::Environment {
             org: ctx.org,
-            repo: ctx.project,
+            repo: ctx.repo,
             environment: ctx.environment,
         };
         // Resolve (with inheritance), register each value with the redactor, and

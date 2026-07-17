@@ -248,6 +248,27 @@ Feed each Lucide icon's SVG path(s) to `rough.svg().path(d, opts)` (see
 `waypoints`, `network`, `package`, `terminal`, `key-round`, `shield-check`,
 `timer`, `play`/`circle-dot`.
 
+### ASCII beetle scenes (the animated tier)
+
+Above the doodles sits one louder decoration: brand beetles **doing things**,
+rendered as ASCII text (`ui/brand/ascii` — same pipeline philosophy as the
+doodle generator: bake offline, commit the output, ship no rendering code).
+Scenes play at 12 fps by swapping baked text frames; three `<pre>` layers carry
+the brand roles (emerald wings / gold body / gray detail) and are colored via
+theme tokens, so both themes come free.
+
+Placement is stricter than doodles, because motion competes with content:
+
+- **Docs**: the landing page ONLY — the hero (wing-spread in its nimbus) plus
+  at most one accent (the dung-roller). Inner pages keep static doodles.
+- **Web-UI**: state moments only — all-clear, empty, loading. Never ambient
+  behind live data; an operator surface is scanned, and a permanently moving
+  background fights the "what needs me" read.
+- **Static ASCII marks** (the traced emblem) follow the doodle rules: faint,
+  background, ≤2 per page.
+- Players honor `prefers-reduced-motion` (hold an open frame) and skip work
+  while the document is hidden.
+
 ## 6. Component Stylings
 
 ### Buttons

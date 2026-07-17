@@ -23,27 +23,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ports::{ExecHandle, ExecState, FailureClass};
-
-/// The bounded auto-retry budget for **never-started infra** failures
-/// (ADR-0047): the step's main process never ran, so no side effect is
-/// possible and retrying needs no author assertion. An author's `retry:` can
-/// only widen this, never narrow it.
-const NEVER_STARTED_AUTO_ATTEMPTS: u32 = 3;
-
-/// How many *failed* deliveries an outbox message may accumulate before it is
-/// dead-lettered (ADR-0047 poison handling). Benign redeliveries of in-flight
-/// work (a Running step re-polled each tick) never count — only processing
-/// errors do — so this only trips on a permanently-failing message.
-const MAX_DELIVERY_ATTEMPTS: u32 = 10;
-
-/// Slack the engine-side timeout backstop waits past a step's deadline before
-/// enforcing it (ADR-0047). The backend's own enforcement (kubelet
-/// `activeDeadlineSeconds`, the local kill-timer) is primary — it survives
-/// control-plane downtime and surfaces a classified `Timeout`; the backstop
-/// only fires when the backend could not enforce (hung kubelet, lost node),
-/// and the grace keeps the two from racing in the normal case.
-const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
+use crate::ports::ExecState;
 use crate::{
     Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, ExecError,
     Executor, FailureKind, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus,
@@ -58,12 +38,6 @@ pub const LAUNCH_STEP: &str = "launch_step";
 /// payload is `{ "to": <RunStatus> }`; the key is unique per (run, state) so the
 /// same transition enqueues exactly one post.
 pub const RUN_STATUS_CHANGED: &str = "run_status_changed";
-
-/// Outbox message kind: tear down a cancelled run's in-flight executions
-/// (ADR-0054). The durable Cancelled state is written by
-/// [`cancel_run_request`]; the driver (which owns the executor) processes
-/// this message and deletes the Pods — API replicas never touch the cluster.
-pub const CANCEL_RUN: &str = "cancel_run";
 
 /// The payload of a [`LAUNCH_STEP`] outbox message — the step's fence.
 #[derive(Debug, Serialize, Deserialize)]
@@ -269,89 +243,6 @@ pub async fn record_gate_approval(
 
 /// Move a run `from -> to` and append the transition event (used to reopen a
 /// settled run on restart).
-/// Cancel a run from the API (ADR-0054): drive its non-terminal steps and
-/// the run itself to `Cancelled` durably, release its concurrency slot, and
-/// enqueue a [`CANCEL_RUN`] outbox message so the driver tears down any
-/// in-flight Pods (SIGTERM + grace — the executor's `cancel`). Returns
-/// `Ok(false)` when the run is unknown or already terminal (nothing to do).
-pub async fn cancel_run_request(
-    db: &dyn Db,
-    clock: &dyn Clock,
-    run: &RunId,
-) -> Result<bool, SchedulerError> {
-    let Some(current) = db.run_status(run).await? else {
-        return Ok(false);
-    };
-    if current.is_terminal() {
-        return Ok(false);
-    }
-    let now = clock.now().await;
-    for step in db.steps_of_run(run).await? {
-        if step.status.is_terminal() {
-            continue;
-        }
-        match db
-            .record_step_transition(run, &step.step, step.status, StepStatus::Cancelled)
-            .await
-        {
-            Ok(()) => {
-                db.append_event(&EventKind {
-                    version: EVENT_VERSION,
-                    run: run.clone(),
-                    kind: EventPayload::StepTransitioned {
-                        step: step.step.clone(),
-                        from: step.status,
-                        to: StepStatus::Cancelled,
-                    },
-                    at: now,
-                })
-                .await?;
-            }
-            Err(DbError::Conflict) => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    match db.record_transition(run, current, RunStatus::Cancelled).await {
-        Ok(()) => {
-            db.append_event(&EventKind {
-                version: EVENT_VERSION,
-                run: run.clone(),
-                kind: EventPayload::RunTransitioned {
-                    from: current,
-                    to: RunStatus::Cancelled,
-                },
-                at: now,
-            })
-            .await?;
-            db.enqueue_outbox(&OutboxMessage {
-                id: crate::OutboxId(0),
-                run: run.clone(),
-                kind: RUN_STATUS_CHANGED.to_string(),
-                payload: serde_json::json!({ "to": RunStatus::Cancelled }),
-                idempotency_key: format!("status:{}:Cancelled", run.0),
-                at: now,
-            })
-            .await?;
-        }
-        Err(DbError::Conflict) => {}
-        Err(e) => return Err(e.into()),
-    }
-    // The teardown intent — processed by the driver, which owns the executor.
-    db.enqueue_outbox(&OutboxMessage {
-        id: crate::OutboxId(0),
-        run: run.clone(),
-        kind: CANCEL_RUN.to_string(),
-        payload: serde_json::Value::Null,
-        idempotency_key: format!("cancel:{}", run.0),
-        at: now,
-    })
-    .await?;
-    if let Some((group, _)) = db.run_concurrency(run).await? {
-        db.release_slot(&group, run).await?;
-    }
-    Ok(true)
-}
-
 async fn reopen(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -385,10 +276,6 @@ struct Config {
     project_run_cap: u32,
     /// Max in-flight runs globally (backpressure). Default unbounded.
     global_run_cap: u32,
-    /// The global default step deadline (ADR-0047), used when a step declares
-    /// no `timeout:`. Default 1h — mandatory, so a hung Pod can never wedge a
-    /// run forever.
-    default_step_timeout_ms: i64,
 }
 
 /// The durable scheduler. Borrows the ports for the duration of a cycle.
@@ -418,15 +305,8 @@ impl<'a> Scheduler<'a> {
                 outbox_visibility_ms: 30_000,
                 project_run_cap: 20,
                 global_run_cap: u32::MAX,
-                default_step_timeout_ms: 3_600_000,
             },
         }
-    }
-
-    /// Override the global default step deadline (ADR-0047).
-    pub fn with_default_step_timeout_ms(mut self, ms: i64) -> Self {
-        self.cfg.default_step_timeout_ms = ms;
-        self
     }
 
     /// Override the per-project in-flight cap (fairness).
@@ -471,10 +351,6 @@ impl<'a> Scheduler<'a> {
             self.admit(run).await?;
         }
         self.reconcile().await?;
-        // API-requested cancellations (ADR-0054): tear down the Pods of runs
-        // already durably Cancelled. After reconcile so a just-cancelled
-        // step's launch intent settles this same tick.
-        self.reconcile_cancellations().await?;
         for run in &runs {
             self.advance(run).await?;
         }
@@ -504,21 +380,11 @@ impl<'a> Scheduler<'a> {
             return Ok(());
         }
         // A suspended run is waiting on a gate. A `timer` gate releases itself
-        // once its wait has elapsed (ADR-0008); an opt-in `gate_expires_after`
-        // fails a still-unapproved gate at its deadline (ADR-0047; default =
-        // indefinite); everything else waits for an explicit release. Either
-        // way, do no admission this pass — the resumed run is picked up next
-        // tick.
+        // once its wait has elapsed (ADR-0008); everything else waits for an
+        // explicit release. Either way, do no admission this pass — the resumed
+        // run is picked up next tick.
         if status == RunStatus::Suspended {
             self.auto_release_elapsed_timer(run).await?;
-            self.expire_elapsed_gate(run).await?;
-            return Ok(());
-        }
-
-        // Opt-in run budget (ADR-0047): active time only — gate-suspended time
-        // never counts (a run suspended weeks on a gate is the wedge, not a
-        // hang). Exhaustion cancels in-flight steps and fails the run.
-        if self.enforce_run_budget(run).await? {
             return Ok(());
         }
 
@@ -685,8 +551,8 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    /// Drain launch intents: launch (or adopt), poll, and settle any step whose
-    /// execution reached a terminal state — retrying per ADR-0047 policy.
+    /// Drain launch intents: launch (idempotently), poll, and finalize any step
+    /// whose Pod has reached a terminal state.
     pub async fn reconcile(&self) -> Result<(), SchedulerError> {
         let msgs = self
             .db
@@ -698,154 +564,55 @@ impl<'a> Scheduler<'a> {
             )
             .await?;
         for msg in msgs {
-            // Fault isolation + poison handling (ADR-0047): one failing
-            // message must neither stall the batch behind it nor redeliver
-            // forever. A processing error counts one failed delivery; at
-            // MAX_DELIVERY_ATTEMPTS the message is dead-lettered (never
-            // claimed again) and its run transitions to DeadLettered with
-            // diagnostics — the operator signal.
-            if let Err(e) = self.process_launch_intent(&msg).await {
-                let failures = self.db.record_outbox_failure(msg.id).await?;
-                if failures >= MAX_DELIVERY_ATTEMPTS {
-                    self.db.dead_letter_outbox(msg.id).await?;
-                    self.dead_letter_run(
-                        &msg.run,
-                        format!(
-                            "outbox message `{}` (id {}) exceeded {MAX_DELIVERY_ATTEMPTS} \
-                             failed deliveries — poison; last error: {e}",
-                            msg.kind, msg.id.0
-                        ),
-                    )
-                    .await?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Drain cancel-teardown intents (ADR-0054): for each cancelled run,
-    /// best-effort delete every recorded in-flight execution (the executor's
-    /// `cancel` — SIGTERM + grace period), then mark the message dispatched.
-    pub async fn reconcile_cancellations(&self) -> Result<(), SchedulerError> {
-        let msgs = self
-            .db
-            .claim_outbox(
-                &self.owner,
-                Some(CANCEL_RUN),
-                self.cfg.outbox_batch,
-                self.cfg.outbox_visibility_ms,
-            )
-            .await?;
-        for msg in msgs {
-            for step in self.db.steps_of_run(&msg.run).await? {
-                if let Some(attempt) = step.attempts.last() {
-                    if let Some(h) =
-                        self.db.attempt_handle(&msg.run, &step.step, &attempt.id).await?
-                    {
-                        let _ = self.executor.cancel(&ExecHandle(h)).await;
-                    }
-                }
-            }
-            self.db.mark_dispatched(msg.id).await?;
-        }
-        Ok(())
-    }
-
-    /// Process one launch intent: launch-or-adopt, poll, settle. Extracted so
-    /// [`reconcile`](Self::reconcile) can fault-isolate each message
-    /// (ADR-0047 poison handling).
-    async fn process_launch_intent(&self, msg: &OutboxMessage) -> Result<(), SchedulerError> {
-        {
             let intent: LaunchIntent = serde_json::from_value(msg.payload.clone())
                 .map_err(|e| SchedulerError::BadPayload(e.to_string()))?;
             let run = RunId(intent.run);
             let step = StepId(intent.step);
             let attempt = AttemptId(intent.attempt);
 
-            // Launch-or-adopt (ADR-0047): the durable handle marker splits the
-            // two. No marker → this attempt never observably launched → launch
-            // (create-or-adopt on the deterministic fence; a crash after launch
-            // but before the marker re-runs this branch, where the fence makes
-            // it an adopt). Marker present → poll only: the backend object
-            // either still exists (re-adoption — same Attempt, same fence,
-            // supervision resumes, NO budget consumed) or is gone, which
-            // surfaces as `Lost` below — never a blind same-fence relaunch,
-            // which would make a zombie and a retry indistinguishable.
-            let handle = match self.db.attempt_handle(&run, &step, &attempt).await? {
-                Some(h) => ExecHandle(h),
-                None => {
-                    let spec = self
-                        .db
-                        .step_spec(&run, &step)
-                        .await?
-                        .ok_or_else(|| SchedulerError::MissingSpec(step.clone()))?;
+            let spec = self
+                .db
+                .step_spec(&run, &step)
+                .await?
+                .ok_or_else(|| SchedulerError::MissingSpec(step.clone()))?;
 
-                    // Workspace inputs (ADR-0007/0029/0045): the CAS roots of
-                    // the workspaces this step consumes — its explicit
-                    // `inputs:` subset or all of its `needs` — merged in
-                    // order. The executor materializes them into `/workspace`
-                    // before the step starts. Deterministic on re-drive: the
-                    // outputs are re-read from the store.
-                    let mut spec = spec;
-                    {
-                        let all = self.db.steps_of_run(&run).await?;
-                        if let Some(me) = all.iter().find(|s| s.step == step) {
-                            let consumed = self
-                                .db
-                                .step_inputs(&run, &step)
-                                .await?
-                                .unwrap_or_else(|| me.needs.clone());
-                            let mut output_of = HashMap::new();
-                            for s in &all {
-                                if let Some(o) = self.db.step_output(&run, &s.step).await? {
-                                    output_of.insert(s.step.clone(), o);
-                                }
-                            }
-                            spec.workspace_inputs =
-                                crate::workspace_inputs(&consumed, &output_of);
-                        }
-                    }
-
-                    // Launch-time interpolation (ADR-0041): resolve
-                    // `${{ outputs.… }}` against upstream results before
-                    // launch. A bad reference fails fast — as a *step* failure
-                    // (not a scheduler error), so the run settles as Failed.
-                    let spec = match self.interpolate_spec(&run, &step, spec).await? {
-                        Ok(spec) => spec,
-                        Err(_reason) => {
-                            self.finalize_step(
-                                &run,
-                                &step,
-                                &attempt,
-                                StepStatus::Failed,
-                                Some(FailureKind::Step),
-                            )
-                            .await?;
-                            self.db.mark_dispatched(msg.id).await?;
-                            return Ok(());
-                        }
-                    };
-
-                    // Reconstruct the fenced StepRun the executor needs.
-                    let step_run = StepRun {
-                        run: run.clone(),
-                        step: step.clone(),
-                        status: StepStatus::Running,
-                        attempts: vec![Attempt {
-                            id: attempt.clone(),
-                            started_at: self.clock.now().await,
-                            failure: None,
-                        }],
-                        needs: Vec::new(),
-                        gate_kind: None,
-                    };
-                    let handle = self.executor.launch(&step_run, &spec).await?;
-                    self.db
-                        .set_attempt_handle(&run, &step, &attempt, &handle.0)
-                        .await?;
-                    handle
+            // Launch-time interpolation (ADR-0041): resolve `${{ outputs.… }}`
+            // against this step's upstream results before launch. The upstreams
+            // are all `Succeeded` before the step is ready, so their results
+            // exist; a reference to a missing result fails fast — as a *step*
+            // failure (not a scheduler error), so the run settles as Failed.
+            // Deterministic on re-drive: results are re-derived from the store.
+            let spec = match self.interpolate_spec(&run, &step, spec).await? {
+                Ok(spec) => spec,
+                Err(_reason) => {
+                    self.finalize_step(
+                        &run,
+                        &step,
+                        &attempt,
+                        StepStatus::Failed,
+                        Some(FailureKind::Step),
+                    )
+                    .await?;
+                    self.db.mark_dispatched(msg.id).await?;
+                    continue;
                 }
             };
+
+            // Reconstruct the fenced StepRun the executor needs. launch is
+            // idempotent on this fence, so a re-drive re-attaches.
+            let step_run = StepRun {
+                run: run.clone(),
+                step: step.clone(),
+                status: StepStatus::Running,
+                attempts: vec![Attempt {
+                    id: attempt.clone(),
+                    started_at: self.clock.now().await,
+                    failure: None,
+                }],
+                needs: Vec::new(),
+                gate_kind: None,
+            };
+            let handle = self.executor.launch(&step_run, &spec).await?;
 
             match self.executor.poll(&handle).await? {
                 ExecState::Succeeded => {
@@ -861,64 +628,26 @@ impl<'a> Scheduler<'a> {
                     if !results.is_empty() {
                         self.db.set_step_results(&run, &step, &results).await?;
                     }
-                    // Persist the artifacts of record the step published
-                    // (ADR-0052) — blobs are already in the object store;
-                    // this durably indexes them for list/download.
-                    let artifacts = self.executor.artifacts(&handle).await?;
-                    if !artifacts.is_empty() {
-                        let now = self.clock.now().await;
-                        self.db.put_artifacts(&run, &artifacts, now).await?;
-                    }
                     self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
-                ExecState::Failed { class, .. } => {
-                    // The adapter classified the failure (ADR-0047); the engine
-                    // consumes the class verbatim and applies retry policy.
-                    let kind = match class {
-                        FailureClass::Infra { never_started } => {
-                            FailureKind::Infra { never_started }
-                        }
-                        FailureClass::Step => FailureKind::Step,
-                        FailureClass::Timeout => FailureKind::Timeout,
-                    };
-                    self.settle_failed_attempt(&run, &step, &attempt, kind).await?;
+                ExecState::Failed { .. } => {
+                    // A non-zero exit is a *step* failure (not retried by default).
+                    self.finalize_step(
+                        &run,
+                        &step,
+                        &attempt,
+                        StepStatus::Failed,
+                        Some(FailureKind::Step),
+                    )
+                    .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
-                // The backend lost a launched execution (ADR-0047): vanished
-                // Pod / dead process. Conservatively post-start — settle it
-                // (assertion-gated retry on a NEW fence, budget consumed).
-                ExecState::Lost => {
-                    self.settle_failed_attempt(&run, &step, &attempt, FailureKind::Lost)
-                        .await?;
-                    self.db.mark_dispatched(msg.id).await?;
-                }
-                // Not terminal yet: leave the intent claimed; the lease expires
-                // and a later reconcile re-polls (adopting via the stored
-                // handle). No duplicate effect. Engine-side timeout backstop
-                // (ADR-0047): if the attempt has outlived its deadline (plus
-                // grace) and the backend hasn't enforced it, cancel
-                // best-effort and settle as Timeout.
-                ExecState::Pending | ExecState::Running => {
-                    let started_at = self
-                        .db
-                        .attempts_of_step(&run, &step)
-                        .await?
-                        .iter()
-                        .find(|a| a.id == attempt)
-                        .map(|a| a.started_at);
-                    if let Some(started_at) = started_at {
-                        let timeout_ms = self.step_timeout_ms(&run, &step).await?;
-                        let now = self.clock.now().await;
-                        if now.0 >= started_at.0 + timeout_ms + TIMEOUT_BACKSTOP_GRACE_MS {
-                            let _ = self.executor.cancel(&handle).await;
-                            self.settle_failed_attempt(&run, &step, &attempt, FailureKind::Timeout)
-                                .await?;
-                            self.db.mark_dispatched(msg.id).await?;
-                        }
-                    }
-                }
+                // Not terminal yet (or infra-lost): leave the intent for a later
+                // reconcile. The claim lease expires and the idempotent relaunch
+                // re-attaches; no duplicate effect.
+                ExecState::Pending | ExecState::Running | ExecState::Lost => {}
             }
         }
         Ok(())
@@ -1009,15 +738,7 @@ impl<'a> Scheduler<'a> {
         }
     }
 
-    /// Settle the run once every step is terminal, mapping the cause to the
-    /// ADR-0047 terminal semantics:
-    ///
-    /// - **`Failed`** — code produced a failing *verdict*: a `Step` failure
-    ///   (incl. an exhausted opt-in retry), a `Timeout`, or a cancelled step.
-    ///   The developer signal.
-    /// - **`DeadLettered`** — the system could not obtain a verdict: infra
-    ///   retries exhausted or a lost execution. The operator signal, with
-    ///   diagnostics on the event log.
+    /// Settle the run once every step is terminal.
     pub async fn advance(&self, run: &RunId) -> Result<(), SchedulerError> {
         let steps = self.db.steps_of_run(run).await?;
         if steps.is_empty() || !steps.iter().all(|s| s.status.is_terminal()) {
@@ -1029,41 +750,13 @@ impl<'a> Scheduler<'a> {
         let failed = steps
             .iter()
             .any(|s| matches!(s.status, StepStatus::Failed | StepStatus::Cancelled));
-        // Verdict-less failures (ADR-0047): a failed step whose last attempt
-        // ended in infra (never/post-start) or Lost — no code verdict exists.
-        let dead: Vec<String> = steps
-            .iter()
-            .filter(|s| s.status == StepStatus::Failed)
-            .filter_map(|s| {
-                let failure = s.attempts.last()?.failure?;
-                matches!(
-                    failure,
-                    FailureKind::Infra { .. } | FailureKind::Lost
-                )
-                .then(|| format!("step `{}`: {failure:?} — retries exhausted without a verdict", s.step.0))
-            })
-            .collect();
-        let outcome = if !dead.is_empty() {
-            RunStatus::DeadLettered
-        } else if failed {
+        let outcome = if failed {
             RunStatus::Failed
         } else {
             RunStatus::Succeeded
         };
         if let Some(current) = self.db.run_status(run).await? {
             if !current.is_terminal() {
-                if outcome == RunStatus::DeadLettered {
-                    // Operator diagnostics travel on the event log.
-                    let now = self.clock.now().await;
-                    self.append(
-                        run,
-                        EventPayload::RunDeadLettered {
-                            reason: dead.join("; "),
-                        },
-                        now,
-                    )
-                    .await?;
-                }
                 self.transition_run(run, current, outcome).await?;
                 // Free the concurrency slot so a queued run can start.
                 if let Some((group, _)) = self.db.run_concurrency(run).await? {
@@ -1082,13 +775,6 @@ impl<'a> Scheduler<'a> {
     pub async fn cancel_run(&self, run: &RunId) -> Result<(), SchedulerError> {
         for step in self.db.steps_of_run(run).await? {
             if !step.status.is_terminal() {
-                // Tear down the in-flight execution first (best-effort —
-                // SIGTERM + grace via the backend), then settle durably.
-                if let Some(attempt) = step.attempts.last() {
-                    if let Some(h) = self.db.attempt_handle(run, &step.step, &attempt.id).await? {
-                        let _ = self.executor.cancel(&ExecHandle(h)).await;
-                    }
-                }
                 self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
                     .await?;
             }
@@ -1127,151 +813,8 @@ impl<'a> Scheduler<'a> {
             return Ok(());
         };
 
-        let Some(suspended_at) = self.suspended_at(run).await? else {
-            return Ok(());
-        };
-
-        let now = self.clock.now().await;
-        if now.0 >= suspended_at + wait_secs.saturating_mul(1000) {
-            // Reuse the manual-release path: marks the gate Succeeded and resumes.
-            release_gate(self.db, self.clock, run, &gate.step)
-                .await
-                .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
-        }
-        Ok(())
-    }
-
-    /// Fail a still-unapproved gate that outlived its opt-in
-    /// `gate_expires_after` (ADR-0047). Default is indefinite — gates may wait
-    /// forever; only an authored expiry arms this. The failed gate makes its
-    /// dependents dep-dead (skipped) and the run settles `Failed` — a code
-    /// verdict ("nobody approved in time"), not a dead-letter.
-    async fn expire_elapsed_gate(&self, run: &RunId) -> Result<(), SchedulerError> {
-        // The timer auto-release above may have already resumed the run.
-        if self.db.run_status(run).await? != Some(RunStatus::Suspended) {
-            return Ok(());
-        }
-        let steps = self.db.steps_of_run(run).await?;
-        let done: HashMap<&StepId, StepStatus> =
-            steps.iter().map(|s| (&s.step, s.status)).collect();
-        let Some(gate) = steps.iter().find(|s| {
-            s.status == StepStatus::Pending
-                && s.is_gate()
-                && s.needs
-                    .iter()
-                    .all(|d| done.get(d).copied() == Some(StepStatus::Succeeded))
-        }) else {
-            return Ok(());
-        };
-        let Some(expiry_secs) = self.gate_expiry_secs(run, &gate.step).await? else {
-            return Ok(());
-        };
-        let Some(suspended_at) = self.suspended_at(run).await? else {
-            return Ok(());
-        };
-
-        let now = self.clock.now().await;
-        if now.0 < suspended_at + expiry_secs.saturating_mul(1000) {
-            return Ok(());
-        }
-        match self
-            .db
-            .record_step_transition(run, &gate.step, StepStatus::Pending, StepStatus::Failed)
-            .await
-        {
-            Ok(()) => {
-                let now = self.clock.now().await;
-                self.append(run, EventPayload::GateExpired { step: gate.step.clone() }, now)
-                    .await?;
-                self.append(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: gate.step.clone(),
-                        from: StepStatus::Pending,
-                        to: StepStatus::Failed,
-                    },
-                    now,
-                )
-                .await?;
-            }
-            // A racing release already settled the gate — exactly-once.
-            Err(DbError::Conflict) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        }
-        // Resume so the next admission skips dependents and settles the run.
-        reopen(self.db, self.clock, run, RunStatus::Suspended, RunStatus::Running)
-            .await
-            .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
-        Ok(())
-    }
-
-    /// Enforce the run's opt-in active-time `budget:` (ADR-0047). Returns
-    /// `true` when the budget is exhausted and the run was failed (admission
-    /// must stop). Active time = wall time since creation minus gate-suspended
-    /// intervals; there is deliberately **no default**.
-    async fn enforce_run_budget(&self, run: &RunId) -> Result<bool, SchedulerError> {
-        if self.db.run_status(run).await? != Some(RunStatus::Running) {
-            return Ok(false);
-        }
-        let Some(budget_secs) = self.run_budget_secs(run).await? else {
-            return Ok(false);
-        };
-        let events = self.db.events(run).await?;
-        let Some(created_at) = events.first().map(|e| e.at.0) else {
-            return Ok(false);
-        };
-        // Sum the closed suspended intervals (the run is Running now, so no
-        // interval is open).
-        let mut suspended_ms: i64 = 0;
-        let mut open: Option<i64> = None;
-        for e in &events {
-            match &e.kind {
-                EventPayload::RunTransitioned { to: RunStatus::Suspended, .. } => {
-                    open = Some(e.at.0);
-                }
-                EventPayload::RunTransitioned { from: RunStatus::Suspended, .. } => {
-                    if let Some(started) = open.take() {
-                        suspended_ms += e.at.0 - started;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let now = self.clock.now().await;
-        let active_ms = now.0 - created_at - suspended_ms;
-        let budget_ms = budget_secs.saturating_mul(1000);
-        if active_ms < budget_ms {
-            return Ok(false);
-        }
-
-        // Exhausted: tear down in-flight work (best-effort), cancel the steps,
-        // and fail the run with diagnostics. Failed — a liveness verdict — not
-        // DeadLettered (the operator did nothing wrong; the budget did its job).
-        for step in self.db.steps_of_run(run).await? {
-            if step.status.is_terminal() {
-                continue;
-            }
-            if let Some(attempt) = step.attempts.last() {
-                if let Some(h) = self.db.attempt_handle(run, &step.step, &attempt.id).await? {
-                    let _ = self.executor.cancel(&ExecHandle(h)).await;
-                }
-            }
-            self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
-                .await?;
-        }
-        self.append(run, EventPayload::RunBudgetExhausted { active_ms, budget_ms }, now)
-            .await?;
-        self.transition_run(run, RunStatus::Running, RunStatus::Failed).await?;
-        if let Some((group, _)) = self.db.run_concurrency(run).await? {
-            self.db.release_slot(&group, run).await?;
-        }
-        Ok(true)
-    }
-
-    /// When the run most recently suspended (the latest `→ Suspended`
-    /// transition on the event log), or `None` if it never has.
-    async fn suspended_at(&self, run: &RunId) -> Result<Option<i64>, SchedulerError> {
-        Ok(self
+        // Suspension time: the most recent transition into Suspended.
+        let suspended_at = self
             .db
             .events(run)
             .await?
@@ -1283,37 +826,19 @@ impl<'a> Scheduler<'a> {
                 )
             })
             .map(|e| e.at.0)
-            .max())
-    }
-
-    /// The run's opt-in `budget:` (seconds) from its stored IR, if any.
-    async fn run_budget_secs(&self, run: &RunId) -> Result<Option<i64>, SchedulerError> {
-        Ok(self
-            .db
-            .run_ir(run)
-            .await?
-            .and_then(|ir| ir.get("budget").and_then(|b| b.as_u64()))
-            .map(|b| b as i64))
-    }
-
-    /// The gate's opt-in `gate_expires_after` (seconds) from the stored IR.
-    async fn gate_expiry_secs(
-        &self,
-        run: &RunId,
-        step: &StepId,
-    ) -> Result<Option<i64>, SchedulerError> {
-        let Some(ir) = self.db.run_ir(run).await? else {
-            return Ok(None);
+            .max();
+        let Some(suspended_at) = suspended_at else {
+            return Ok(());
         };
-        Ok(ir
-            .get("steps")
-            .and_then(|s| s.as_array())
-            .into_iter()
-            .flatten()
-            .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(step.0.as_str()))
-            .and_then(|s| s.get("gate_expires_after"))
-            .and_then(|t| t.as_u64())
-            .map(|t| t as i64))
+
+        let now = self.clock.now().await;
+        if now.0 >= suspended_at + wait_secs.saturating_mul(1000) {
+            // Reuse the manual-release path: marks the gate Succeeded and resumes.
+            release_gate(self.db, self.clock, run, &gate.step)
+                .await
+                .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
+        }
+        Ok(())
     }
 
     // --- helpers -----------------------------------------------------------
@@ -1354,165 +879,6 @@ impl<'a> Scheduler<'a> {
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
-    }
-
-    /// Settle a classified attempt failure per ADR-0047 retry policy:
-    ///
-    /// - **Never-started infra** — the process never ran, no side effect is
-    ///   possible: auto-retry within [`NEVER_STARTED_AUTO_ATTEMPTS`], no author
-    ///   assertion needed.
-    /// - **Post-start infra / Step / Timeout / Lost** — a side effect may
-    ///   exist: retry only when the author configured `retry:` (their
-    ///   idempotency assertion). `Lost` explicitly counts against the budget.
-    ///
-    /// Every retry consumes the attempt budget. A retry re-arms the step to
-    /// `Ready`; the next admission claims it and mints a **new Attempt with a
-    /// new monotonic fence** — the zombie-fencing mechanism.
-    async fn settle_failed_attempt(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        kind: FailureKind,
-    ) -> Result<(), SchedulerError> {
-        // Record the classified failure on the attempt row (idempotent).
-        self.db.set_attempt_failure(run, step, attempt, kind).await?;
-
-        // Stale-delivery guard: only the step's LATEST attempt may settle it.
-        // A redelivered intent for an older attempt (whose successor is already
-        // running under a higher fence) must neither re-arm nor fail the step.
-        let attempts = self.db.attempts_of_step(run, step).await?;
-        if attempts.last().map(|a| &a.id) != Some(attempt) {
-            return Ok(());
-        }
-        let used = attempts.len() as u32;
-
-        let configured = self.step_retry(run, step).await?.map(|r| 1 + r.max);
-        let allowed = match kind {
-            FailureKind::Infra { never_started: true } => {
-                configured.unwrap_or(0).max(NEVER_STARTED_AUTO_ATTEMPTS)
-            }
-            _ => configured.unwrap_or(1),
-        };
-
-        if used < allowed {
-            self.rearm_step(run, step, attempt, kind).await
-        } else {
-            self.finalize_step(run, step, attempt, StepStatus::Failed, Some(kind))
-                .await
-        }
-    }
-
-    /// Dead-letter a run outright (ADR-0047, e.g. a poison outbox message):
-    /// cancel its non-terminal steps, record diagnostics on the event log, and
-    /// transition it to `DeadLettered` — the operator signal.
-    async fn dead_letter_run(&self, run: &RunId, reason: String) -> Result<(), SchedulerError> {
-        let Some(current) = self.db.run_status(run).await? else {
-            return Ok(());
-        };
-        if current.is_terminal() {
-            return Ok(());
-        }
-        for step in self.db.steps_of_run(run).await? {
-            if !step.status.is_terminal() {
-                self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
-                    .await?;
-            }
-        }
-        let now = self.clock.now().await;
-        self.append(run, EventPayload::RunDeadLettered { reason }, now).await?;
-        self.transition_run(run, current, RunStatus::DeadLettered).await?;
-        if let Some((group, _)) = self.db.run_concurrency(run).await? {
-            self.db.release_slot(&group, run).await?;
-        }
-        Ok(())
-    }
-
-    /// Re-arm a failed step for retry: `Running → Ready`. The next admission
-    /// pass claims it and mints a new Attempt — and therefore a new monotonic
-    /// fence, so a zombie of the failed attempt presents a stale fence and a
-    /// cooperating sink rejects it (ADR-0047). Re-adoption (same fence, no
-    /// budget) is the stored-handle path in [`reconcile`](Self::reconcile),
-    /// never this one.
-    async fn rearm_step(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        kind: FailureKind,
-    ) -> Result<(), SchedulerError> {
-        match self
-            .db
-            .record_step_transition(run, step, StepStatus::Running, StepStatus::Ready)
-            .await
-        {
-            Ok(()) => {
-                let now = self.clock.now().await;
-                self.append(
-                    run,
-                    EventPayload::AttemptFinished {
-                        step: step.clone(),
-                        attempt: attempt.clone(),
-                        failure: Some(kind),
-                    },
-                    now,
-                )
-                .await?;
-                self.append(
-                    run,
-                    EventPayload::StepTransitioned {
-                        step: step.clone(),
-                        from: StepStatus::Running,
-                        to: StepStatus::Ready,
-                    },
-                    now,
-                )
-                .await?;
-                Ok(())
-            }
-            Err(DbError::Conflict) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// The step's effective deadline in ms (ADR-0047): its authored `timeout:`
-    /// (seconds, from the run's stored IR) or the configured global default.
-    async fn step_timeout_ms(&self, run: &RunId, step: &StepId) -> Result<i64, SchedulerError> {
-        let authored = match self.db.run_ir(run).await? {
-            Some(ir) => ir
-                .get("steps")
-                .and_then(|s| s.as_array())
-                .into_iter()
-                .flatten()
-                .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(step.0.as_str()))
-                .and_then(|s| s.get("timeout"))
-                .and_then(|t| t.as_u64()),
-            None => None,
-        };
-        Ok(authored
-            .map(|secs| (secs as i64).saturating_mul(1000))
-            .unwrap_or(self.cfg.default_step_timeout_ms))
-    }
-
-    /// The step's authored `retry:` policy, read from the run's stored IR (the
-    /// run is self-describing, ADR-0022). Tolerant navigation — an absent IR,
-    /// step, or field (or an unknown shape) means no assertion.
-    async fn step_retry(
-        &self,
-        run: &RunId,
-        step: &StepId,
-    ) -> Result<Option<scarab_pipeline::Retry>, SchedulerError> {
-        let Some(ir) = self.db.run_ir(run).await? else {
-            return Ok(None);
-        };
-        Ok(ir
-            .get("steps")
-            .and_then(|s| s.as_array())
-            .into_iter()
-            .flatten()
-            .find(|s| s.get("id").and_then(|i| i.as_str()) == Some(step.0.as_str()))
-            .and_then(|s| s.get("retry"))
-            .and_then(|r| serde_json::from_value(r.clone()).ok()))
     }
 
     async fn finalize_step(

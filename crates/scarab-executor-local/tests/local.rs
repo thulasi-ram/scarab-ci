@@ -3,7 +3,7 @@
 //! relaunching a fence re-attaches, an unknown handle is Lost, and cancel kills
 //! a running child. No Docker/k8s.
 
-use scarab_engine::ports::{ExecState, FailureClass};
+use scarab_engine::ports::ExecState;
 use scarab_engine::{Executor, RunId, StepId, StepRun, StepSpec};
 use scarab_executor_local::LocalExecutor;
 
@@ -20,12 +20,6 @@ fn spec(cmd: &[&str]) -> StepSpec {
         run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
-        timeout_seconds: None,
-        workspace_inputs: vec![],
-        clone: None,
-        build: None,
-        artifacts: vec![],
-        oidc_token: None,
     }
 }
 
@@ -55,33 +49,7 @@ async fn nonzero_exit_command_fails_with_its_code() {
     let exec = LocalExecutor::new();
     let s = step("r1", "boom");
     let handle = exec.launch(&s, &spec(&["sh", "-c", "exit 3"])).await.unwrap();
-    // A non-zero exit is the step's own verdict: class Step (ADR-0047).
-    assert_eq!(
-        drive(&exec, &handle).await,
-        ExecState::Failed {
-            exit_code: Some(3),
-            class: FailureClass::Step,
-        }
-    );
-}
-
-/// ADR-0047: a signal kill has no exit code — the platform ended a started
-/// process, so the local executor classifies it post-start `Infra`.
-#[tokio::test]
-async fn signal_kill_is_post_start_infra() {
-    let exec = LocalExecutor::new();
-    let s = step("r1", "sigkill");
-    let handle = exec
-        .launch(&s, &spec(&["sh", "-c", "kill -9 $$"]))
-        .await
-        .unwrap();
-    assert_eq!(
-        drive(&exec, &handle).await,
-        ExecState::Failed {
-            exit_code: None,
-            class: FailureClass::Infra { never_started: false },
-        }
-    );
+    assert_eq!(drive(&exec, &handle).await, ExecState::Failed { exit_code: Some(3) });
 }
 
 #[tokio::test]
@@ -108,26 +76,6 @@ async fn unknown_handle_is_lost() {
     let exec = LocalExecutor::new();
     let bogus = scarab_engine::ports::ExecHandle("local://nope/nope/0".into());
     assert_eq!(exec.poll(&bogus).await.unwrap(), ExecState::Lost);
-}
-
-/// ADR-0047: the local kill-timer enforces the step deadline — a step that
-/// outlives its `timeout:` is killed and classified `Timeout`.
-#[tokio::test]
-async fn kill_timer_times_out_a_hung_step() {
-    let exec = LocalExecutor::new();
-    let s = step("r1", "hung");
-    let mut sp = spec(&["sh", "-c", "sleep 30"]);
-    sp.timeout_seconds = Some(1);
-    let handle = exec.launch(&s, &sp).await.unwrap();
-    assert_eq!(exec.poll(&handle).await.unwrap(), ExecState::Running);
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    assert_eq!(
-        exec.poll(&handle).await.unwrap(),
-        ExecState::Failed {
-            exit_code: None,
-            class: FailureClass::Timeout,
-        }
-    );
 }
 
 #[tokio::test]

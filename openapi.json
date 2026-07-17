@@ -10,229 +10,6 @@
     "version": "0.1.0"
   },
   "paths": {
-    "/.well-known/jwks.json": {
-      "get": {
-        "tags": [],
-        "summary": "OIDC issuer JWKS (ADR-0015)",
-        "operationId": "jwks",
-        "responses": {
-          "200": {
-            "description": "the signing keys"
-          },
-          "404": {
-            "description": "issuer disabled"
-          }
-        }
-      }
-    },
-    "/.well-known/openid-configuration": {
-      "get": {
-        "tags": [],
-        "summary": "OIDC discovery (ADR-0015)",
-        "operationId": "openid_configuration",
-        "responses": {
-          "200": {
-            "description": "the discovery document"
-          },
-          "404": {
-            "description": "issuer disabled"
-          }
-        }
-      }
-    },
-    "/healthz": {
-      "get": {
-        "tags": [],
-        "summary": "Liveness: process up (ADR-0053)",
-        "operationId": "healthz",
-        "responses": {
-          "200": {
-            "description": "alive"
-          }
-        }
-      }
-    },
-    "/metrics": {
-      "get": {
-        "tags": [],
-        "summary": "Prometheus gauges (ADR-0053)",
-        "operationId": "metrics",
-        "responses": {
-          "200": {
-            "description": "Prometheus text exposition"
-          }
-        }
-      }
-    },
-    "/readyz": {
-      "get": {
-        "tags": [],
-        "summary": "Readiness: DB + object store reachable (ADR-0053)",
-        "operationId": "readyz",
-        "responses": {
-          "200": {
-            "description": "ready"
-          },
-          "503": {
-            "description": "a dependency is unreachable"
-          }
-        }
-      }
-    },
-    "/v1/auth/callback": {
-      "get": {
-        "tags": [],
-        "summary": "Finish the browser OAuth flow (ADR-0049)",
-        "operationId": "oauth_callback",
-        "responses": {
-          "302": {
-            "description": "session + CSRF cookies set; redirect to /"
-          },
-          "401": {
-            "description": "state mismatch or bad code"
-          }
-        }
-      }
-    },
-    "/v1/auth/login": {
-      "get": {
-        "tags": [],
-        "summary": "Begin the browser OAuth flow (ADR-0049)",
-        "operationId": "oauth_login_redirect",
-        "responses": {
-          "302": {
-            "description": "redirect to the provider with a state cookie"
-          },
-          "404": {
-            "description": "OAuth not configured"
-          }
-        }
-      },
-      "post": {
-        "tags": [],
-        "summary": "Exchange an OAuth credential for a session (API/CLI, ADR-0049)",
-        "operationId": "login",
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LoginResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "bad credential"
-          },
-          "404": {
-            "description": "login not configured"
-          }
-        }
-      }
-    },
-    "/v1/auth/logout": {
-      "post": {
-        "tags": [],
-        "summary": "Revoke the session (ADR-0049)",
-        "operationId": "logout",
-        "responses": {
-          "204": {
-            "description": "session revoked; cookies expired"
-          }
-        }
-      }
-    },
-    "/v1/orgs/{org}/bindings": {
-      "get": {
-        "tags": [],
-        "summary": "List an org's role bindings (ADR-0049)",
-        "operationId": "list_bindings",
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/BindingDto"
-                  }
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "not an org admin"
-          }
-        }
-      },
-      "put": {
-        "tags": [],
-        "summary": "Natively grant a role (ADR-0049)",
-        "operationId": "put_binding",
-        "responses": {
-          "204": {
-            "description": "granted"
-          }
-        }
-      },
-      "delete": {
-        "tags": [],
-        "summary": "Natively revoke a role - a durable tombstone (ADR-0049)",
-        "operationId": "delete_binding",
-        "responses": {
-          "204": {
-            "description": "revoked"
-          }
-        }
-      }
-    },
-    "/v1/repos": {
-      "get": {
-        "tags": [],
-        "summary": "List the registered projects (ADR-0046 registry — what the dashboard's\nrepo cards render). Scoped: global roles see all; otherwise only orgs/\nprojects the caller's bindings grant Read on.",
-        "operationId": "list_projects",
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ProjectDto"
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/repos/{org}/{repo}/bindings/import": {
-      "post": {
-        "tags": [],
-        "summary": "Seed bindings from forge permissions (ADR-0049)",
-        "operationId": "import_bindings",
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/BindingDto"
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/repos/{org}/{repo}/dispatch": {
       "post": {
         "tags": [],
@@ -278,65 +55,6 @@
                 }
               }
             }
-          }
-        }
-      }
-    },
-    "/v1/repos/{org}/{repo}/environments": {
-      "get": {
-        "tags": [],
-        "summary": "List a repo's environments",
-        "operationId": "list_environments",
-        "responses": {
-          "200": {
-            "description": "the environments"
-          }
-        }
-      }
-    },
-    "/v1/repos/{org}/{repo}/environments/{name}": {
-      "get": {
-        "tags": [],
-        "summary": "One environment's protection rules",
-        "operationId": "get_environment",
-        "responses": {
-          "200": {
-            "description": "the environment"
-          },
-          "404": {
-            "description": "unknown"
-          }
-        }
-      },
-      "put": {
-        "tags": [],
-        "summary": "Create/replace a protected environment (ADR-0024/0037)",
-        "operationId": "put_environment",
-        "responses": {
-          "200": {
-            "description": "stored"
-          }
-        }
-      },
-      "delete": {
-        "tags": [],
-        "summary": "Delete an environment (idempotent)",
-        "operationId": "delete_environment",
-        "responses": {
-          "204": {
-            "description": "deleted"
-          }
-        }
-      }
-    },
-    "/v1/repos/{org}/{repo}/environments/{name}/deployments": {
-      "get": {
-        "tags": [],
-        "summary": "An environment's deployment history (ADR-0037)",
-        "operationId": "list_deployments",
-        "responses": {
-          "200": {
-            "description": "most recent first"
           }
         }
       }
@@ -452,25 +170,6 @@
         }
       }
     },
-    "/v1/repos/{org}/{repo}/secrets/matrix": {
-      "get": {
-        "tags": [],
-        "summary": "The secret parity matrix (ADR-0037) - names + status, never values",
-        "operationId": "secret_matrix",
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SecretMatrix"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/runs": {
       "get": {
         "tags": [],
@@ -559,106 +258,6 @@
           },
           "404": {
             "description": "no such run"
-          }
-        }
-      }
-    },
-    "/v1/runs/{id}/artifacts": {
-      "get": {
-        "tags": [],
-        "summary": "List a run's artifacts of record (ADR-0052). Read at the run's tenant.",
-        "operationId": "list_artifacts",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "run id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ArtifactDto"
-                  }
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "no such run"
-          }
-        }
-      }
-    },
-    "/v1/runs/{id}/artifacts/{name}": {
-      "get": {
-        "tags": [],
-        "summary": "Download one artifact's bytes (ADR-0052). Streams through the server (a\npresigned-URL fast path can replace this when the store backend supports\nsigning). Read at the run's tenant; immutable content.",
-        "operationId": "download_artifact",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "run id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "name",
-            "in": "path",
-            "description": "artifact name (may contain slashes)",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "the artifact bytes"
-          },
-          "404": {
-            "description": "no such artifact"
-          }
-        }
-      }
-    },
-    "/v1/runs/{id}/cancel": {
-      "post": {
-        "tags": [],
-        "summary": "Cancel a run (ADR-0054): drive its non-terminal steps and the run to\n`Cancelled` durably and enqueue the Pod-teardown intent the driver\nexecutes (SIGTERM + grace via the backend). Idempotent — cancelling a\nterminal run is a 409; an unknown run is a 404.",
-        "operationId": "cancel_run",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "run id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "202": {
-            "description": "cancellation recorded; Pods tear down asynchronously"
-          },
-          "404": {
-            "description": "no such run"
-          },
-          "409": {
-            "description": "run already terminal"
           }
         }
       }
@@ -817,45 +416,6 @@
         }
       }
     },
-    "/v1/runs/{id}/steps/{step}/results": {
-      "post": {
-        "tags": [],
-        "summary": "Ingest a step's named results (ADR-0040/0042): the trusted per-Pod egress\nsidecar POSTs `{ name: value, … }` here, authenticated by a fence-scoped\ntoken, and the control plane persists them to `step_runs.results`. The\nuntrusted step never calls this — only the sidecar holds the token.",
-        "description": "404 when no token secret is configured; 401 on a bad/missing token; 404 for\nan unknown step; 413 for an over-large body. The write is idempotent on the\nfence (a re-drive overwrites deterministically, ADR-0021).",
-        "operationId": "ingest_step_results",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "run id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "step",
-            "in": "path",
-            "description": "step id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "202": {
-            "description": "results recorded"
-          },
-          "401": {
-            "description": "bad or missing token"
-          },
-          "404": {
-            "description": "no such step, or results ingest disabled"
-          }
-        }
-      }
-    },
     "/v1/secrets": {
       "get": {
         "tags": [],
@@ -980,82 +540,10 @@
           }
         }
       }
-    },
-    "/webhooks/forgejo": {
-      "post": {
-        "tags": [],
-        "summary": "Forgejo webhook ingest (HMAC-verified, ADR-0046)",
-        "operationId": "forgejo_webhook",
-        "responses": {
-          "202": {
-            "description": "delivery accepted"
-          },
-          "401": {
-            "description": "bad signature"
-          }
-        }
-      }
-    },
-    "/webhooks/github": {
-      "post": {
-        "tags": [],
-        "summary": "GitHub webhook ingest (HMAC-verified, ADR-0046)",
-        "operationId": "github_webhook",
-        "responses": {
-          "202": {
-            "description": "delivery accepted"
-          },
-          "401": {
-            "description": "bad signature"
-          }
-        }
-      }
     }
   },
   "components": {
     "schemas": {
-      "ArtifactDto": {
-        "type": "object",
-        "description": "One artifact in a run's list (ADR-0052).",
-        "required": [
-          "name",
-          "size",
-          "content_type"
-        ],
-        "properties": {
-          "content_type": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "size": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          }
-        }
-      },
-      "BindingDto": {
-        "type": "object",
-        "required": [
-          "subject",
-          "role",
-          "project"
-        ],
-        "properties": {
-          "project": {
-            "type": "string",
-            "description": "Empty = org-scoped."
-          },
-          "role": {
-            "type": "string"
-          },
-          "subject": {
-            "type": "string"
-          }
-        }
-      },
       "CatalogEntry": {
         "type": "object",
         "description": "One pipeline in the dispatch catalog: its selection `name` and whether it\nopts into `manual` / `api` dispatch (its `on:` includes that trigger).",
@@ -1151,26 +639,6 @@
           }
         }
       },
-      "LoginResponse": {
-        "type": "object",
-        "required": [
-          "session",
-          "subject",
-          "csrf"
-        ],
-        "properties": {
-          "csrf": {
-            "type": "string",
-            "description": "The session's CSRF token — browsers echo it in `x-csrf-token` on every\nmutation (also delivered as the readable `scarab_csrf` cookie)."
-          },
-          "session": {
-            "type": "string"
-          },
-          "subject": {
-            "type": "string"
-          }
-        }
-      },
       "PipelineCatalogResponse": {
         "type": "object",
         "description": "`GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable\ncatalog at a ref (ADR-0043 §4). Lightweight — each entry is an `on:`-only\nread, not a full compile. `sha` is the ref resolved to a concrete commit.",
@@ -1200,15 +668,6 @@
           "steps"
         ],
         "properties": {
-          "budget": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "Opt-in run budget in seconds (ADR-0047): the run fails once its\n**active** time (gate-suspended time excluded) exceeds this. No default.",
-            "minimum": 0
-          },
           "interface": {
             "type": "object",
             "description": "The pipeline's launch/reuse interface (ADR-0038, 0043) — its declared\ntyped parameters (`inputs`) and exposed outputs. Carried as the pure\n`scarab_pipeline::Interface` (opaque object in the schema; the pure crate\ncannot derive `ToSchema`). Absent = no parameters."
@@ -1255,31 +714,6 @@
           "sha": {
             "type": "string",
             "description": "The ref resolved to a concrete commit — the interface reflects this exact\ncommit; a subsequent dispatch should pin to it."
-          }
-        }
-      },
-      "ProjectDto": {
-        "type": "object",
-        "description": "One registered project (governed repo, ADR-0046) in the repos list.",
-        "required": [
-          "org",
-          "project",
-          "owner",
-          "name"
-        ],
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "org": {
-            "type": "string"
-          },
-          "owner": {
-            "type": "string",
-            "description": "The forge coordinate backing it (1:1 in v1)."
-          },
-          "project": {
-            "type": "string"
           }
         }
       },
@@ -1363,7 +797,7 @@
       },
       "RunSummaryDto": {
         "type": "object",
-        "description": "One run in the list view: identity, status, creation time (epoch millis),\nand — when the run was stamped at creation (ADR-0049) — its owning tenant.",
+        "description": "One run in the list view: identity, status, and creation time (epoch millis).",
         "required": [
           "id",
           "status",
@@ -1376,20 +810,6 @@
           },
           "id": {
             "type": "string"
-          },
-          "org": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The owning org, if the run is tenanted (trigger-created)."
-          },
-          "project": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The owning project (repo name), if tenanted."
           },
           "status": {
             "type": "string"
@@ -1406,51 +826,6 @@
           "names": {
             "type": "array",
             "items": {
-              "type": "string"
-            }
-          }
-        }
-      },
-      "SecretMatrix": {
-        "type": "object",
-        "description": "`GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory parity view\n(ADR-0037). For each secret key, its **effective** status per environment\nafter inheritance — never a value. `unset` where the key resolves to nothing.",
-        "required": [
-          "environments",
-          "keys"
-        ],
-        "properties": {
-          "environments": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "The repo's environments, in the order the columns should render."
-          },
-          "keys": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/SecretMatrixRow"
-            }
-          }
-        }
-      },
-      "SecretMatrixRow": {
-        "type": "object",
-        "required": [
-          "key",
-          "status"
-        ],
-        "properties": {
-          "key": {
-            "type": "string"
-          },
-          "status": {
-            "type": "object",
-            "description": "`environment name -> \"set\" | \"inherited\" | \"unset\"`.",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "propertyNames": {
               "type": "string"
             }
           }
@@ -1491,10 +866,6 @@
               "type": "string"
             }
           },
-          "retry": {
-            "type": "object",
-            "description": "Opt-in retry policy `{on, max}` (ADR-0047). ⚠ At-least-once: retry\nre-runs the whole step at-least-once; enable only if the step is\nidempotent or fenced against a cooperating sink. Never-started infra\nfailures auto-retry regardless."
-          },
           "secrets": {
             "type": "array",
             "items": {
@@ -1505,15 +876,6 @@
           "security": {
             "type": "object",
             "description": "Privilege escalation requested above the hardened baseline (ADR-0039).\nOn an inline API run only the self-service `run_as_root` grant is admitted\n(it stays inside the sandbox); governed grants (add-capabilities /\nprivileged) require a target Environment and are rejected fail-closed."
-          },
-          "timeout": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "Per-step execution deadline in seconds (ADR-0047). Absent = the global\ndefault (1h). Exceeding it is a `Timeout` failure.",
-            "minimum": 0
           }
         }
       },

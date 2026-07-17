@@ -212,6 +212,49 @@ code,
   overflow: visible;
 }
 
+/* ---- ASCII beetle scenes (ui/brand/ascii) ------------------------------
+   Baked text frames in three brand-role layers, colored off the existing
+   theme tokens so both themes come free. Animated scenes appear ONLY in
+   state moments (all-clear/empty/loading); backgrounds get the static mark. */
+.ascii-scene {
+  position: relative;
+  line-height: 0;
+  max-width: 100%;
+  overflow: hidden;
+  flex: none;
+}
+.ascii-scene pre {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--ascii-fs, 8px);
+  line-height: calc(var(--ascii-fs, 8px) * 1.667);
+  user-select: none;
+}
+.ascii-scene pre + pre {
+  position: absolute;
+  inset: 0;
+}
+.ascii-scene .ascii-em { color: var(--emerald); }
+.ascii-scene .ascii-au { color: var(--copper); }
+.ascii-scene .ascii-fe { color: var(--muted-sage); }
+
+/* The traced emblem as a faint background mark (doodle placement rules). */
+.ascii-watermark {
+  position: absolute;
+  z-index: 0;
+  top: 52px;
+  right: 36px;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 7px;
+  line-height: 11.7px;
+  color: var(--copper);
+  opacity: 0.3;
+  transform: rotate(-6deg);
+  pointer-events: none;
+  user-select: none;
+}
+
 h1 {
   font-family: var(--font-display);
   font-size: 40px;
@@ -1018,6 +1061,7 @@ h2 {
   text-decoration: none;
 }
 .brand svg { color: var(--copper); }
+.brand-emblem { display: block; }
 .crumbs { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 13px; }
 .crumb { color: var(--sage); text-decoration: none; }
 .crumb:hover { color: var(--emerald); text-decoration: underline; text-underline-offset: 3px; }
@@ -1363,7 +1407,7 @@ h2 {
   padding: 20px 22px; border: 1px solid var(--border); border-radius: 11px;
   background: var(--emerald-surface);
 }
-.allclear .ac-ico { color: var(--emerald); flex: none; }
+.allclear .ac-scene { flex: none; }
 .allclear .ac-title { font-family: var(--font-display); font-size: 15px; font-weight: 600; color: var(--soft-white); }
 .allclear .ac-sub { font-size: 13px; color: var(--muted-sage); margin-top: 2px; }
 

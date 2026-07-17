@@ -24,6 +24,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::{self, BoxStream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::BroadcastStream;
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -33,12 +34,7 @@ use scarab_engine::{
 };
 use scarab_identity::{Action, Principal, Session};
 
-pub mod config;
 pub mod converged;
-pub mod clone_executor;
-pub mod oauth;
-pub mod retention;
-pub mod forge_router;
 pub mod log_tail;
 pub mod logs;
 pub mod oidc;
@@ -71,13 +67,6 @@ pub struct AppState {
     /// HMAC secret for verifying inbound GitHub webhooks (ADR-0032). `None`
     /// disables the ingest endpoint (rejects with 401).
     pub github_webhook_secret: Option<Vec<u8>>,
-    /// HMAC secret for verifying inbound Forgejo webhooks (ADR-0046 — each
-    /// forge endpoint binds its own secret). `None` disables `/webhooks/forgejo`.
-    pub forgejo_webhook_secret: Option<Vec<u8>>,
-    /// The ForgeConnection registry (ADR-0046): RepoRef→Project resolution,
-    /// installation auto-registration, and the webhook delivery-id replay
-    /// guard. `None` skips dedup/registration (dev without a registry).
-    pub connections: Option<Arc<dyn scarab_forge::ForgeConnectionStore>>,
     /// The forge port used to read in-repo `.scarab` config on a trigger. `None`
     /// means the webhook ingest can verify+normalize but not start config-driven
     /// runs.
@@ -90,7 +79,7 @@ pub struct AppState {
     pub sessions: Option<Arc<dyn scarab_identity::SessionStore>>,
     /// Environments + deployment history store. `None` disables the environment
     /// endpoints.
-    pub environments: Option<Arc<dyn scarab_project::EnvironmentStore>>,
+    pub environments: Option<Arc<dyn scarab_projects::EnvironmentStore>>,
     /// The OIDC issuer. When set, serves JWKS + discovery for keyless federation.
     pub oidc: Option<Arc<oidc::Rs256Issuer>>,
     /// HMAC secret for external-gate release tokens (ADR-0034). `None` disables
@@ -103,23 +92,6 @@ pub struct AppState {
     /// `None` disables the results-ingest endpoint (rejects with 404). Shared with
     /// the k8s executor, which mints the per-step token the egress sidecar presents.
     pub results_token_secret: Option<Vec<u8>>,
-    /// The artifact blob store (ADR-0052): serves downloads. `None` disables
-    /// the artifact endpoints (404).
-    pub artifact_store: Option<Arc<dyn scarab_storage::ObjectStore>>,
-    /// The built SPA's dist directory (ADR-0054). `Some` serves the web UI at
-    /// `/` with an SPA fallback — same-origin with the API, so no CORS layer
-    /// exists or is needed. `None` (dev) leaves non-API paths 404.
-    pub ui_dir: Option<std::path::PathBuf>,
-    /// Scoped role bindings (ADR-0049 C2): the native RBAC model authorize()
-    /// consults per request against the path's Org/Project. `None` = only the
-    /// principal's flat global roles decide (the C1 bootstrap).
-    pub rbac: Option<Arc<dyn scarab_identity::RbacStore>>,
-    /// The browser OAuth login flow (ADR-0049): redirect + callback. `None`
-    /// leaves only the credential-exchange `POST /v1/auth/login` (API/CLI).
-    pub oauth_login: Option<Arc<oauth::OAuthAuthenticator>>,
-    /// Scarab's public base URL — the OAuth callback `redirect_uri` is
-    /// `{public_url}/v1/auth/callback`.
-    pub public_url: String,
 }
 
 impl AppState {
@@ -129,8 +101,6 @@ impl AppState {
             clock,
             logs,
             github_webhook_secret: None,
-            forgejo_webhook_secret: None,
-            connections: None,
             forge: None,
             auth: None,
             sessions: None,
@@ -139,11 +109,6 @@ impl AppState {
             gate_token_secret: None,
             secrets: None,
             results_token_secret: None,
-            artifact_store: None,
-            ui_dir: None,
-            rbac: None,
-            oauth_login: None,
-            public_url: "http://localhost:8080".into(),
         }
     }
 
@@ -174,7 +139,7 @@ impl AppState {
     /// Enable the environment / deployment endpoints.
     pub fn with_environments(
         mut self,
-        environments: Arc<dyn scarab_project::EnvironmentStore>,
+        environments: Arc<dyn scarab_projects::EnvironmentStore>,
     ) -> Self {
         self.environments = Some(environments);
         self
@@ -183,21 +148,6 @@ impl AppState {
     /// Set the GitHub webhook HMAC secret (from `SCARAB_GITHUB_WEBHOOK_SECRET`).
     pub fn with_github_webhook_secret(mut self, secret: Vec<u8>) -> Self {
         self.github_webhook_secret = Some(secret);
-        self
-    }
-
-    /// Set the Forgejo webhook HMAC secret (from `SCARAB_FORGEJO_WEBHOOK_SECRET`).
-    pub fn with_forgejo_webhook_secret(mut self, secret: Vec<u8>) -> Self {
-        self.forgejo_webhook_secret = Some(secret);
-        self
-    }
-
-    /// Enable the ForgeConnection registry (dedup, resolution, auto-registration).
-    pub fn with_forge_connections(
-        mut self,
-        connections: Arc<dyn scarab_forge::ForgeConnectionStore>,
-    ) -> Self {
-        self.connections = Some(connections);
         self
     }
 
@@ -215,38 +165,6 @@ impl AppState {
     ) -> Self {
         self.auth = Some(auth);
         self.sessions = Some(sessions);
-        self
-    }
-
-    /// Serve the built web UI from `dir` (ADR-0054): `/` + SPA fallback.
-    pub fn with_ui_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
-        self.ui_dir = Some(dir.into());
-        self
-    }
-
-    /// Enable the artifact endpoints (ADR-0052), serving blobs from `store`.
-    pub fn with_artifact_store(mut self, store: Arc<dyn scarab_storage::ObjectStore>) -> Self {
-        self.artifact_store = Some(store);
-        self
-    }
-
-    /// Enable scoped RBAC (ADR-0049 C2): authorize() consults these bindings
-    /// per request against the path's Org/Project scope.
-    pub fn with_rbac(mut self, rbac: Arc<dyn scarab_identity::RbacStore>) -> Self {
-        self.rbac = Some(rbac);
-        self
-    }
-
-    /// Enable the browser OAuth login flow (ADR-0049): `GET /v1/auth/login`
-    /// redirects to the provider; the callback lands on
-    /// `{public_url}/v1/auth/callback`.
-    pub fn with_oauth_login(
-        mut self,
-        login: Arc<oauth::OAuthAuthenticator>,
-        public_url: impl Into<String>,
-    ) -> Self {
-        self.oauth_login = Some(login);
-        self.public_url = public_url.into();
         self
     }
 }
@@ -282,10 +200,6 @@ pub struct PipelineDto {
     #[serde(default, skip_serializing_if = "scarab_pipeline::Interface::is_empty")]
     #[schema(value_type = Object)]
     pub interface: scarab_pipeline::Interface,
-    /// Opt-in run budget in seconds (ADR-0047): the run fails once its
-    /// **active** time (gate-suspended time excluded) exceeds this. No default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget: Option<u32>,
     pub steps: Vec<StepDto>,
 }
 
@@ -310,17 +224,6 @@ pub struct StepDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object)]
     pub security: Option<scarab_pipeline::StepSecurity>,
-    /// Opt-in retry policy `{on, max}` (ADR-0047). ⚠ At-least-once: retry
-    /// re-runs the whole step at-least-once; enable only if the step is
-    /// idempotent or fenced against a cooperating sink. Never-started infra
-    /// failures auto-retry regardless.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Object)]
-    pub retry: Option<scarab_pipeline::Retry>,
-    /// Per-step execution deadline in seconds (ADR-0047). Absent = the global
-    /// default (1h). Exceeding it is a `Timeout` failure.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<u32>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -436,19 +339,12 @@ pub struct RunListResponse {
     pub runs: Vec<RunSummaryDto>,
 }
 
-/// One run in the list view: identity, status, creation time (epoch millis),
-/// and — when the run was stamped at creation (ADR-0049) — its owning tenant.
+/// One run in the list view: identity, status, and creation time (epoch millis).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunSummaryDto {
     pub id: String,
     pub status: String,
     pub created_at: i64,
-    /// The owning org, if the run is tenanted (trigger-created).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub org: Option<String>,
-    /// The owning project (repo name), if tenanted.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
 }
 
 /// `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
@@ -589,21 +485,6 @@ async fn create_run(
     let resolved = scarab_pipeline::params::resolve_params(&req.pipeline.interface, &req.params)
         .map_err(|e| ApiError::BadRequest(format!("invalid launch parameters: {e}")))?;
 
-    // Same retry bound the YAML compiler enforces (ADR-0047): a liveness bound,
-    // rejected before any run exists.
-    for step in &req.pipeline.steps {
-        if let Some(retry) = &step.retry {
-            if !(1..=10).contains(&retry.max) {
-                return Err(ApiError::BadRequest(format!(
-                    "step `{}`: `retry.max` must be between 1 and 10 (got {}) — retry re-runs \
-                     the whole step at-least-once; enable only if the step is idempotent or \
-                     fenced against a cooperating sink",
-                    step.id, retry.max
-                )));
-            }
-        }
-    }
-
     let now = st.clock.now().await;
     let run = RunId(Uuid::new_v4().to_string());
 
@@ -652,12 +533,6 @@ async fn create_run(
             run_as_root: admitted.run_as_root,
             add_capabilities: admitted.add_capabilities,
             privileged: admitted.privileged,
-            timeout_seconds: step.timeout,
-            workspace_inputs: vec![],
-        clone: None,
-            build: None,
-            artifacts: vec![],
-            oidc_token: None,
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -694,8 +569,7 @@ async fn dispatch(
     headers: HeaderMap,
     Json(req): Json<DispatchRequest>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), ApiError> {
-    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
-    let principal = authorize_scoped(&st, &headers, Action::Write, Some(&scope)).await?;
+    let principal = authorize(&st, &headers, Action::Write).await?;
 
     // Dispatch rides the read-at-ref machinery, so a forge must be wired.
     let forge = st
@@ -709,7 +583,7 @@ async fn dispatch(
         st.clock.as_ref(),
         st.environments.as_deref(),
         principal.subject,
-        scarab_forge::RepoRef { owner: org, name: repo },
+        scarab_forge::Repo { owner: org, name: repo },
         req.r#ref,
         req.pipeline,
         req.params,
@@ -766,13 +640,12 @@ async fn list_pipelines(
     Path((org, repo)): Path<(String, String)>,
     Query(q): Query<PipelineRefQuery>,
 ) -> Result<Json<PipelineCatalogResponse>, ApiError> {
-    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
-    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    authorize(&st, &headers, Action::Read).await?;
     let forge = st
         .forge
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
-    let repo = scarab_forge::RepoRef { owner: org, name: repo };
+    let repo = scarab_forge::Repo { owner: org, name: repo };
 
     // Resolve the ref to a concrete commit; the catalog reflects exactly it.
     let sha = forge
@@ -853,14 +726,13 @@ async fn pipeline_interface(
     Path((org, repo, name)): Path<(String, String, String)>,
     Query(q): Query<PipelineRefQuery>,
 ) -> Result<Json<PipelineInterfaceResponse>, ApiError> {
-    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
-    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    authorize(&st, &headers, Action::Read).await?;
     let forge = st
         .forge
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
     let forge = forge.as_ref();
-    let repo = scarab_forge::RepoRef { owner: org, name: repo };
+    let repo = scarab_forge::Repo { owner: org, name: repo };
 
     // Resolve the ref → SHA (echoed back), read the named pipeline there, and
     // fully compile — mapping each failure to a structured 4xx via DispatchError
@@ -909,45 +781,9 @@ async fn list_runs(
     headers: HeaderMap,
     Query(q): Query<ListRunsQuery>,
 ) -> Result<Json<RunListResponse>, ApiError> {
-    // Tenancy scoping (ADR-0049): authenticate, then filter the list to what
-    // the caller may see — global roles see everything; scoped principals see
-    // the runs of orgs/projects their bindings grant Read on. Untenanted runs
-    // (inline dev submissions) are visible to global roles only.
-    let principal = authenticate(&st, &headers, Action::Read).await?;
+    authorize(&st, &headers, Action::Read).await?;
     let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
-    let mut runs = st.db.list_runs(limit).await?;
-    if !principal.can(Action::Read) {
-        let Some(rbac) = st.rbac.as_ref() else {
-            return Err(ApiError::Forbidden);
-        };
-        // Resolve each distinct tenant once, never per run.
-        let mut allowed: std::collections::HashMap<(String, String), bool> =
-            std::collections::HashMap::new();
-        let mut visible = Vec::with_capacity(runs.len());
-        for r in runs {
-            let Some(tenant) = r.tenant.clone() else { continue };
-            let ok = match allowed.get(&tenant) {
-                Some(ok) => *ok,
-                None => {
-                    let scope = scarab_identity::Scope::Project {
-                        org: tenant.0.clone(),
-                        name: tenant.1.clone(),
-                    };
-                    let ok = rbac
-                        .role_of(&principal.subject, &scope)
-                        .await
-                        .map_err(|_| ApiError::Forbidden)?
-                        .is_some_and(|role| role.allows(Action::Read));
-                    allowed.insert(tenant.clone(), ok);
-                    ok
-                }
-            };
-            if ok {
-                visible.push(r);
-            }
-        }
-        runs = visible;
-    }
+    let runs = st.db.list_runs(limit).await?;
     Ok(Json(RunListResponse {
         runs: runs
             .into_iter()
@@ -955,8 +791,6 @@ async fn list_runs(
                 id: s.run.0,
                 status: run_status_name(s.status).to_string(),
                 created_at: s.created_at.0,
-                org: s.tenant.as_ref().map(|(o, _)| o.clone()),
-                project: s.tenant.as_ref().map(|(_, p)| p.clone()),
             })
             .collect(),
     }))
@@ -974,9 +808,8 @@ async fn get_run(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<RunStatusResponse>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
     let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
     let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
     let steps = st.db.steps_of_run(&run).await?;
     let params = st.db.run_params(&run).await?;
@@ -1010,9 +843,8 @@ async fn get_events(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
     let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
     if st.db.run_status(&run).await?.is_none() {
         return Err(ApiError::NotFound);
     }
@@ -1043,28 +875,22 @@ async fn get_logs(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Sse<BoxStream<'static, Result<Event, Infallible>>>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
     let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
     let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
     let steps = st.db.steps_of_run(&run).await?;
 
-    // Replay everything committed so far, remembering how far each stream was
-    // consumed (the live tail resumes from these seqs — never duplicating).
     let mut replay: Vec<Result<Event, Infallible>> = Vec::new();
-    let mut seen: std::collections::HashMap<(String, String), u64> =
-        std::collections::HashMap::new();
+    let mut receivers = Vec::new();
     for s in &steps {
         for a in &s.attempts {
-            let (body, next) = st
-                .logs
-                .read_from(&run, &s.step, &a.id, 0)
-                .await
-                .unwrap_or_default();
+            let body = st.logs.read_all(&run, &s.step, &a.id).await.unwrap_or_default();
             if !body.is_empty() {
                 replay.push(Ok(Event::default().data(String::from_utf8_lossy(&body))));
             }
-            seen.insert((s.step.0.clone(), a.id.0.clone()), next);
+            if !status.is_terminal() {
+                receivers.push(st.logs.subscribe(&run, &s.step, &a.id));
+            }
         }
     }
 
@@ -1073,46 +899,16 @@ async fn get_logs(
         // Nothing more will be written: replay and close.
         Ok(Sse::new(replay_stream.boxed()))
     } else {
-        // Live tail (ADR-0051): poll the DURABLE index for new chunks, so ANY
-        // replica serves live logs regardless of which replica tails the Pod.
-        // (The in-process broadcast is only a same-replica fast-path, not the
-        // source of truth — this path never depends on it.) The stream ends
-        // one poll after the run settles.
-        let live = futures::stream::unfold(
-            (st.clone(), run.clone(), seen, false),
-            |(st, run, mut seen, done)| async move {
-                if done {
-                    return None;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                let terminal = matches!(
-                    st.db.run_status(&run).await,
-                    Ok(Some(s)) if s.is_terminal()
-                );
-                let steps = st.db.steps_of_run(&run).await.unwrap_or_default();
-                let mut body = Vec::new();
-                for s in &steps {
-                    for a in &s.attempts {
-                        let key = (s.step.0.clone(), a.id.0.clone());
-                        let from = seen.get(&key).copied().unwrap_or(0);
-                        if let Ok((bytes, next)) =
-                            st.logs.read_from(&run, &s.step, &a.id, from).await
-                        {
-                            if !bytes.is_empty() {
-                                body.extend(bytes);
-                            }
-                            seen.insert(key, next);
-                        }
-                    }
-                }
-                let event = if body.is_empty() {
-                    Event::default().comment("keepalive")
-                } else {
-                    Event::default().data(String::from_utf8_lossy(&body))
-                };
-                Some((Ok(event), (st, run, seen, terminal)))
-            },
-        );
+        // Replay what's committed, then live-tail new chunks.
+        let live = futures::stream::select_all(receivers.into_iter().map(|rx| {
+            BroadcastStream::new(rx).map(|r| {
+                Ok(match r {
+                    Ok(bytes) => Event::default().data(String::from_utf8_lossy(&bytes)),
+                    // A slow reader that lagged the broadcast buffer: note the gap.
+                    Err(_) => Event::default().comment("log stream lagged"),
+                })
+            })
+        }));
         Ok(Sse::new(replay_stream.chain(live).boxed()))
     }
 }
@@ -1137,198 +933,13 @@ async fn restart_step(
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
+    authorize(&st, &headers, Action::Write).await?;
     let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
     match scarab_engine::restart_step(&*st.db, &*st.clock, &run, &StepId(step)).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
         Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
         Err(RestartError::Db(e)) => Err(ApiError::Db(e)),
     }
-}
-
-/// Cancel a run (ADR-0054): drive its non-terminal steps and the run to
-/// `Cancelled` durably and enqueue the Pod-teardown intent the driver
-/// executes (SIGTERM + grace via the backend). Idempotent — cancelling a
-/// terminal run is a 409; an unknown run is a 404.
-#[utoipa::path(
-    post,
-    path = "/v1/runs/{id}/cancel",
-    params(("id" = String, Path, description = "run id")),
-    responses(
-        (status = 202, description = "cancellation recorded; Pods tear down asynchronously"),
-        (status = 404, description = "no such run"),
-        (status = 409, description = "run already terminal")
-    )
-)]
-async fn cancel_run(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    let Some(status) = st.db.run_status(&run).await? else {
-        return Err(ApiError::NotFound);
-    };
-    match scarab_engine::cancel_run_request(&*st.db, &*st.clock, &run).await {
-        Ok(true) => Ok(StatusCode::ACCEPTED),
-        Ok(false) => {
-            // Known run, nothing to cancel: already terminal.
-            let _ = status;
-            Ok(StatusCode::CONFLICT)
-        }
-        Err(e) => Err(ApiError::BadRequest(e.to_string())),
-    }
-}
-
-/// One registered project (governed repo, ADR-0046) in the repos list.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ProjectDto {
-    pub org: String,
-    pub project: String,
-    /// The forge coordinate backing it (1:1 in v1).
-    pub owner: String,
-    pub name: String,
-}
-
-/// List the registered projects (ADR-0046 registry — what the dashboard's
-/// repo cards render). Scoped: global roles see all; otherwise only orgs/
-/// projects the caller's bindings grant Read on.
-#[utoipa::path(
-    get,
-    path = "/v1/repos",
-    responses((status = 200, body = [ProjectDto]))
-)]
-async fn list_projects(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<ProjectDto>>, ApiError> {
-    let principal = authenticate(&st, &headers, Action::Read).await?;
-    let Some(connections) = st.connections.as_ref() else {
-        return Ok(Json(Vec::new())); // no registry wired (dev): empty, honest
-    };
-    let conns = connections
-        .list_connections()
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let mut out = Vec::new();
-    for conn in conns {
-        let repos = connections
-            .repos_of(&conn.id)
-            .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        for repo in repos {
-            let Some(resolved) = connections
-                .resolve(&repo)
-                .await
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?
-            else {
-                continue;
-            };
-            // Tenancy (ADR-0049): scoped principals see only their projects.
-            if !principal.can(Action::Read) {
-                let scope = scarab_identity::Scope::Project {
-                    org: resolved.org.clone(),
-                    name: resolved.project.clone(),
-                };
-                let allowed = match st.rbac.as_ref() {
-                    Some(rbac) => rbac
-                        .role_of(&principal.subject, &scope)
-                        .await
-                        .map_err(|_| ApiError::Forbidden)?
-                        .is_some_and(|r| r.allows(Action::Read)),
-                    None => false,
-                };
-                if !allowed {
-                    continue;
-                }
-            }
-            out.push(ProjectDto {
-                org: resolved.org,
-                project: resolved.project,
-                owner: repo.owner,
-                name: repo.name,
-            });
-        }
-    }
-    out.sort_by(|a, b| (&a.org, &a.project).cmp(&(&b.org, &b.project)));
-    Ok(Json(out))
-}
-
-/// One artifact in a run's list (ADR-0052).
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ArtifactDto {
-    pub name: String,
-    pub size: u64,
-    pub content_type: String,
-}
-
-/// List a run's artifacts of record (ADR-0052). Read at the run's tenant.
-#[utoipa::path(
-    get,
-    path = "/v1/runs/{id}/artifacts",
-    params(("id" = String, Path, description = "run id")),
-    responses((status = 200, body = [ArtifactDto]), (status = 404, description = "no such run"))
-)]
-async fn list_artifacts(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<ArtifactDto>>, ApiError> {
-    let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
-    if st.db.run_status(&run).await?.is_none() {
-        return Err(ApiError::NotFound);
-    }
-    let artifacts = st.db.artifacts_of_run(&run).await?;
-    Ok(Json(
-        artifacts
-            .into_iter()
-            .map(|a| ArtifactDto { name: a.name, size: a.size, content_type: a.content_type })
-            .collect(),
-    ))
-}
-
-/// Download one artifact's bytes (ADR-0052). Streams through the server (a
-/// presigned-URL fast path can replace this when the store backend supports
-/// signing). Read at the run's tenant; immutable content.
-#[utoipa::path(
-    get,
-    path = "/v1/runs/{id}/artifacts/{name}",
-    params(
-        ("id" = String, Path, description = "run id"),
-        ("name" = String, Path, description = "artifact name (may contain slashes)")
-    ),
-    responses((status = 200, description = "the artifact bytes"), (status = 404, description = "no such artifact"))
-)]
-async fn download_artifact(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((id, name)): Path<(String, String)>,
-) -> Result<Response, ApiError> {
-    let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
-    let store = st.artifact_store.as_ref().ok_or(ApiError::NotFound)?;
-    let artifact = st
-        .db
-        .artifacts_of_run(&run)
-        .await?
-        .into_iter()
-        .find(|a| a.name == name)
-        .ok_or(ApiError::NotFound)?;
-    let bytes = store
-        .get(&artifact.object_key)
-        .await
-        .map_err(|_| ApiError::NotFound)?;
-    let mut resp = bytes.into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&artifact.content_type) {
-        resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, v);
-    }
-    Ok(resp)
 }
 
 /// In-repo directory holding pipeline definitions (ADR-0010). Every
@@ -1400,7 +1011,7 @@ pub async fn trigger_run_from_event(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
-    environments: Option<&dyn scarab_project::EnvironmentStore>,
+    environments: Option<&dyn scarab_projects::EnvironmentStore>,
     event: &scarab_forge::Event,
 ) -> Result<Vec<RunId>, TriggerError> {
     // Repo-less events (cron/manual/api) don't carry in-repo config here.
@@ -1480,7 +1091,7 @@ pub async fn trigger_run_from_event(
 /// [`dispatch_run`] (one named pipeline) so both produce byte-identical IR.
 async fn prefetch_libs_and_compile(
     forge: &dyn scarab_forge::ForgePort,
-    repo: &scarab_forge::RepoRef,
+    repo: &scarab_forge::Repo,
     read_ref: &str,
     yaml: &str,
 ) -> Result<scarab_pipeline::PipelineIr, TriggerError> {
@@ -1501,14 +1112,8 @@ async fn prefetch_libs_and_compile(
             Err(e) => return Err(TriggerError::Forge(e)),
         }
     }
-    let ir = scarab_pipeline::compile_yaml_with_libs(yaml, &libs)
-        .map_err(|e| TriggerError::Pipeline(e.to_string()))?;
-    // Non-fatal lint diagnostics (ADR-0045), surfaced on the compile path —
-    // warnings only, never failures.
-    for warning in scarab_pipeline::lint(&ir) {
-        tracing::warn!(lint = %warning, "pipeline lint");
-    }
-    Ok(ir)
+    scarab_pipeline::compile_yaml_with_libs(yaml, &libs)
+        .map_err(|e| TriggerError::Pipeline(e.to_string()))
 }
 
 /// Fetch the target Environment's protection rules, enforce allowed-refs
@@ -1526,7 +1131,7 @@ async fn prefetch_libs_and_compile(
 async fn admit_and_create_run(
     db: &dyn Db,
     clock: &dyn Clock,
-    environments: Option<&dyn scarab_project::EnvironmentStore>,
+    environments: Option<&dyn scarab_projects::EnvironmentStore>,
     event: &scarab_forge::Event,
     ir: &scarab_pipeline::PipelineIr,
     path: &str,
@@ -1624,7 +1229,7 @@ impl DispatchKind {
     fn into_event(
         self,
         actor: String,
-        repo: scarab_forge::RepoRef,
+        repo: scarab_forge::Repo,
         r#ref: String,
         sha: String,
     ) -> scarab_forge::Event {
@@ -1722,7 +1327,7 @@ fn dispatch_candidate_paths(pipeline: &str) -> Vec<String> {
 /// identically (a bare name or a full `.scarab/*.yaml` path).
 async fn read_named_pipeline(
     forge: &dyn scarab_forge::ForgePort,
-    repo: &scarab_forge::RepoRef,
+    repo: &scarab_forge::Repo,
     sha: &str,
     pipeline: &str,
 ) -> Result<(String, String), DispatchError> {
@@ -1762,9 +1367,9 @@ pub async fn dispatch_run(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     clock: &dyn Clock,
-    environments: Option<&dyn scarab_project::EnvironmentStore>,
+    environments: Option<&dyn scarab_projects::EnvironmentStore>,
     actor: String,
-    repo: scarab_forge::RepoRef,
+    repo: scarab_forge::Repo,
     r#ref: String,
     pipeline: String,
     params: std::collections::BTreeMap<String, serde_json::Value>,
@@ -1855,15 +1460,15 @@ pub async fn dispatch_run(
 ///   are impossible ("privileged requires an Environment"); self-service
 ///   `run-as-root` is still allowed (it cannot escape the sandbox).
 fn admit_step_grants(
-    protection: Option<&scarab_project::ProtectionRules>,
+    protection: Option<&scarab_projects::ProtectionRules>,
     security: Option<&scarab_pipeline::StepSecurity>,
     image: &str,
     locked_out: bool,
-) -> Result<scarab_project::AdmittedGrants, Vec<String>> {
+) -> Result<scarab_projects::AdmittedGrants, Vec<String>> {
     let Some(sec) = security.filter(|s| !s.is_baseline()) else {
-        return Ok(scarab_project::AdmittedGrants::default());
+        return Ok(scarab_projects::AdmittedGrants::default());
     };
-    let req = scarab_project::GrantRequest {
+    let req = scarab_projects::GrantRequest {
         run_as_root: sec.run_as_root,
         add_capabilities: sec.add_capabilities.clone(),
         privileged: sec.privileged,
@@ -1874,7 +1479,7 @@ fn admit_step_grants(
             "governed grants (add-capabilities/privileged) require a target Environment"
                 .to_string(),
         ]),
-        None => Ok(scarab_project::AdmittedGrants {
+        None => Ok(scarab_projects::AdmittedGrants {
             run_as_root: req.run_as_root,
             ..Default::default()
         }),
@@ -1883,23 +1488,6 @@ fn admit_step_grants(
 
 /// Durably materialize a compiled pipeline IR into a Run: store the IR on the
 /// run (self-describing, ADR-0022), record RunCreated + the normalized trigger
-/// The (repo, pinned sha) a clone step fetches, from a sha-carrying trigger
-/// (ADR-0045: the run pins its commit ONCE at trigger time and clone always
-/// fetches that — never a re-resolved ref). `None` for triggers without a
-/// concrete commit (tag/release resolution is a follow-up; cron/comment/
-/// upstream have no source).
-fn clone_context(event: &scarab_forge::Event) -> Option<(scarab_forge::RepoRef, String)> {
-    use scarab_forge::Event;
-    match event {
-        Event::Push { repo, after, .. } => Some((repo.clone(), after.clone())),
-        Event::PullRequest { repo, head, .. } => Some((repo.clone(), head.clone())),
-        Event::Manual { repo, sha, .. } | Event::Api { repo, sha, .. } => {
-            Some((repo.clone(), sha.clone()))
-        }
-        _ => None,
-    }
-}
-
 /// on the event log, and create each step with its `needs`.
 #[allow(clippy::too_many_arguments)] // a cohesive persist routine; splitting hides the flow
 async fn persist_run_from_ir(
@@ -1908,18 +1496,12 @@ async fn persist_run_from_ir(
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,
     pipeline: &str,
-    protection: Option<&scarab_project::ProtectionRules>,
+    protection: Option<&scarab_projects::ProtectionRules>,
     locked_out: bool,
     excluded: &[String],
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     db.create_run(run, ir.ir_version, EVENT_VERSION, now).await?;
-    // Tenancy (ADR-0049): stamp the owning (org, project) from the trigger's
-    // repo, so run reads/lists can be scoped by the caller's bindings.
-    // Untenanted runs (no repo — inline dev submissions) stay global-only.
-    if let Some(repo) = event.repo() {
-        db.set_run_tenant(run, &repo.owner, &repo.name).await?;
-    }
     db.store_run_ir(run, &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null))
         .await?;
     // ADR-0037: record the deploy context (repo + environment + git ref) so
@@ -1930,7 +1512,7 @@ async fn persist_run_from_ir(
             run,
             &scarab_engine::DeployContext {
                 org: repo.owner.clone(),
-                project: repo.name.clone(),
+                repo: repo.name.clone(),
                 environment: env_name.clone(),
                 // ADR-0037: persist the *symbolic* ref, because gate-approval-time
                 // admission re-runs `ProtectionRules::admits` (allowed_refs +
@@ -1990,47 +1572,6 @@ async fn persist_run_from_ir(
             db.create_step_run(run, &step_id, None, &needs, now).await?;
             let timer = step.gate_after.map(|s| s as i64);
             db.set_step_gate(run, &step_id, kind, timer).await?;
-        } else if let Some(clone) = &step.clone {
-            // A clone step (ADR-0045): the engine runs the canonical
-            // scarab-clone image with context pinned from the trigger. The
-            // URL and the short-TTL credential are resolved at LAUNCH by the
-            // composition root (registry + forge); read_only is fixed here —
-            // a fork PR can never escalate to a writable credential later.
-            let Some((repo, sha)) = clone_context(event) else {
-                return Err(TriggerError::Pipeline(format!(
-                    "step `{}`: a clone step needs a sha-carrying trigger \
-                     (push/pull_request/manual/api) — this run was triggered by `{}`",
-                    step.id,
-                    event.trigger_kind().as_str()
-                )));
-            };
-            let spec = StepSpec {
-                image: String::new(),
-                command: Vec::new(),
-                env: step.env.clone(),
-                secrets: Vec::new(),
-                run_as_root: false,
-                add_capabilities: Vec::new(),
-                privileged: false,
-                timeout_seconds: step.timeout,
-                workspace_inputs: vec![],
-                clone: Some(scarab_engine::CloneConfig {
-                    owner: repo.owner.clone(),
-                    name: repo.name.clone(),
-                    sha,
-                    depth_full: clone.depth == scarab_pipeline::CloneDepth::Full,
-                    submodules: clone.submodules,
-                    lfs: clone.lfs,
-                    read_only: locked_out || event.is_fork_pr(),
-                    url: String::new(),
-                    credential: None,
-                }),
-                build: None,
-                artifacts: vec![],
-                oidc_token: None,
-            };
-            db.create_step_run(run, &step_id, Some(&spec), &needs, now)
-                .await?;
         } else {
             // ADR-0039: admit the step's privilege request against the target
             // Environment's whitelist, fail-closed. A rejected request aborts the
@@ -2044,25 +1585,6 @@ async fn persist_run_from_ir(
                             v.join("; ")
                         ))
                     })?;
-            // A `kind: build` step (ADR-0018): the engine runs rootless
-            // BuildKit with this context — never the author's image. The
-            // registry credential resolves at LAUNCH (scoped REGISTRY_AUTH
-            // secret, else the forge-derived credential).
-            let build = step.build.as_ref().map(|b| scarab_engine::BuildConfig {
-                context: if b.context.is_empty() { ".".into() } else { b.context.clone() },
-                dockerfile: if b.dockerfile.is_empty() {
-                    "Dockerfile".into()
-                } else {
-                    b.dockerfile.clone()
-                },
-                image: b.image.clone(),
-                repo_owner: event.repo().map(|r| r.owner.clone()).unwrap_or_default(),
-                repo_name: event.repo().map(|r| r.name.clone()).unwrap_or_default(),
-                push: b.push && !locked_out, // fork-PR lockout never pushes
-                insecure_push: false,
-                registry_auth_json: None,
-                derived_auth: None,
-            });
             let spec = StepSpec {
                 image: step.image.clone(),
                 command: step.command.clone(),
@@ -2071,12 +1593,6 @@ async fn persist_run_from_ir(
                 run_as_root: admitted.run_as_root,
                 add_capabilities: admitted.add_capabilities,
                 privileged: admitted.privileged,
-                timeout_seconds: step.timeout,
-                workspace_inputs: vec![],
-                clone: None,
-                build,
-                artifacts: step.artifacts.clone(),
-                oidc_token: None,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -2114,17 +1630,12 @@ async fn persist_run_from_ir(
 /// message is retired (`mark_dispatched`) only after a successful post; a post
 /// that fails is left for redelivery (at-least-once, and `set_status` is
 /// idempotent on the forge). Returns how many statuses were posted.
-///
-/// `public_url` is Scarab's public base URL: every status carries the
-/// **required** deep-link back to its run (`{public_url}/runs/{id}`,
-/// ADR-0046) — a status without a way back to its run is a dead end.
 pub async fn drain_forge_statuses(
     forge: &dyn scarab_forge::ForgePort,
     db: &dyn Db,
     owner: &str,
     limit: u32,
     visibility_ms: i64,
-    public_url: &str,
 ) -> Result<usize, DbError> {
     let msgs = db
         .claim_outbox(owner, Some(RUN_STATUS_CHANGED), limit, visibility_ms)
@@ -2147,7 +1658,7 @@ pub async fn drain_forge_statuses(
         let status = scarab_forge::Status {
             context: "scarab".into(),
             state: run_status_to_forge(to),
-            target_url: format!("{}/runs/{}", public_url.trim_end_matches('/'), msg.run.0),
+            target_url: None,
         };
         let commit = scarab_forge::Commit {
             sha,
@@ -2178,7 +1689,7 @@ fn run_status_to_forge(s: RunStatus) -> scarab_forge::StatusState {
 async fn run_forge_coords(
     db: &dyn Db,
     run: &RunId,
-) -> Result<Option<(scarab_forge::RepoRef, String)>, DbError> {
+) -> Result<Option<(scarab_forge::Repo, String)>, DbError> {
     for e in db.events(run).await? {
         if let EventPayload::Raw(v) = &e.kind {
             let ev = &v["trigger"]["event"];
@@ -2188,7 +1699,7 @@ async fn run_forge_coords(
                 ev["sha"].as_str(),
             ) {
                 return Ok(Some((
-                    scarab_forge::RepoRef {
+                    scarab_forge::Repo {
                         owner: owner.to_string(),
                         name: name.to_string(),
                     },
@@ -2200,31 +1711,50 @@ async fn run_forge_coords(
     Ok(None)
 }
 
-/// Replay guard (ADR-0046): record the delivery id against the registry;
-/// `Ok(false)` means this exact delivery was already processed (a replay —
-/// even a correctly-signed one) and must be acknowledged without re-processing.
-/// With no registry wired (dev) or an empty id, dedup is skipped.
-async fn delivery_is_fresh(
-    st: &AppState,
-    forge: scarab_forge::ForgeKind,
-    delivery_id: &str,
-) -> Result<bool, ApiError> {
-    let (Some(connections), false) = (st.connections.as_ref(), delivery_id.is_empty()) else {
-        return Ok(true);
-    };
-    connections
-        .record_delivery(forge, delivery_id)
-        .await
-        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))
-}
-
-/// The shared tail of every webhook ingest: read in-repo `.scarab` config at
-/// the event ref, compile, and start Runs if a pipeline's `on:` matches
-/// (ADR-0010). Without a forge wired we can only acknowledge the delivery.
-async fn ingest_event(
-    st: &AppState,
-    event: scarab_forge::Event,
+/// Inbound GitHub webhook ingest (ADR-0010, 0032): verify the HMAC signature,
+/// normalize the payload to a canonical forge [`Event`](scarab_forge::Event),
+/// then durably create a Run triggered by it (its steps are populated when the
+/// in-repo `.scarab` config is read on trigger — a later slice-3 issue). The
+/// normalized trigger is persisted on the run's event log for that step to read.
+/// Unverified deliveries are rejected; administrative events (e.g. `ping`) are
+/// acknowledged and ignored.
+async fn github_webhook(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Verify HMAC-SHA256 over the raw body (ADR-0032). No secret configured =>
+    // the endpoint is closed.
+    let secret = st
+        .github_webhook_secret
+        .as_deref()
+        .ok_or(ApiError::Unauthorized)?;
+    let sig = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok());
+    scarab_forge_github::verify_signature(secret, body.as_ref(), sig)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    let payload: serde_json::Value = serde_json::from_slice(body.as_ref())
+        .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}")))?;
+    let delivery = scarab_forge::WebhookDelivery {
+        id: header_str(&headers, "x-github-delivery"),
+        event: header_str(&headers, "x-github-event"),
+        signature: sig.map(str::to_string),
+        payload,
+    };
+    let event = match scarab_forge_github::normalize(&delivery) {
+        Ok(e) => e,
+        // Acknowledge-and-ignore events we don't act on (ping, unsupported).
+        Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
+            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
+        }
+        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+    };
+
+    // Read in-repo `.scarab` config at the event ref, compile, and start a run
+    // if the pipeline's `on:` matches (ADR-0010). Without a forge wired, we can
+    // only acknowledge the delivery.
     let Some(forge) = st.forge.as_ref() else {
         return Ok((
             StatusCode::OK,
@@ -2259,158 +1789,6 @@ async fn ingest_event(
     }
 }
 
-/// Inbound GitHub webhook ingest (ADR-0010, 0032, 0046): verify the HMAC
-/// signature with the GitHub secret, guard against replays by delivery id,
-/// auto-register installation events into the ForgeConnection registry
-/// (installing the App IS registration), normalize the payload to a canonical
-/// [`Event`](scarab_forge::Event), and durably create the triggered Runs.
-/// Unverified deliveries are rejected; administrative events (e.g. `ping`)
-/// are acknowledged and ignored.
-#[utoipa::path(post, path = "/webhooks/github", summary = "GitHub webhook ingest (HMAC-verified, ADR-0046)", responses((status = 202, description = "delivery accepted"), (status = 401, description = "bad signature")))]
-async fn github_webhook(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    // Verify HMAC-SHA256 over the raw body (ADR-0032). No secret configured =>
-    // the endpoint is closed.
-    let secret = st
-        .github_webhook_secret
-        .as_deref()
-        .ok_or(ApiError::Unauthorized)?;
-    let sig = headers
-        .get("x-hub-signature-256")
-        .and_then(|v| v.to_str().ok());
-    scarab_forge_github::verify_signature(secret, body.as_ref(), sig)
-        .map_err(|_| ApiError::Unauthorized)?;
-
-    let payload: serde_json::Value = serde_json::from_slice(body.as_ref())
-        .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}")))?;
-    let delivery = scarab_forge::WebhookDelivery {
-        id: header_str(&headers, "x-github-delivery"),
-        event: header_str(&headers, "x-github-event"),
-        signature: sig.map(str::to_string),
-        payload,
-    };
-
-    // Replay guard — only verified deliveries are recorded (ADR-0046).
-    if !delivery_is_fresh(&st, scarab_forge::ForgeKind::GitHub, &delivery.id).await? {
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({ "ignored": "duplicate delivery" })),
-        ));
-    }
-
-    // Installation lifecycle → registry auto-registration (ADR-0046).
-    if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
-        if let Some(connections) = st.connections.as_ref() {
-            let conn_id = format!("github-install-{}", sync.installation_id);
-            connections
-                .put_connection(&scarab_forge::ForgeConnection {
-                    id: conn_id.clone(),
-                    kind: scarab_forge::ForgeKind::GitHub,
-                    base_url: "https://api.github.com".into(),
-                    // The App credential is shared across installations; the
-                    // composition root registers it under this handle.
-                    credential_ref: "github-app".into(),
-                })
-                .await
-                .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-            scarab_forge_github::apply_installation_sync(
-                connections.as_ref(),
-                &conn_id,
-                &sync.account,
-                &sync,
-            )
-            .await
-            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-            return Ok((
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "registered": { "added": sync.added.len(), "removed": sync.removed.len() },
-                })),
-            ));
-        }
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({ "ignored": "no registry configured" })),
-        ));
-    }
-
-    let event = match scarab_forge_github::normalize(&delivery) {
-        Ok(e) => e,
-        // Acknowledge-and-ignore events we don't act on (ping, unsupported).
-        Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
-            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
-        }
-        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
-    };
-    ingest_event(&st, event).await
-}
-
-/// Inbound Forgejo webhook ingest (ADR-0046): the second per-forge endpoint,
-/// bound to the Forgejo adapter's verification (plain-hex
-/// `X-Forgejo/Gitea-Signature`) and its own secret — no payload sniffing on a
-/// shared endpoint. Same replay guard, same canonical vocabulary downstream.
-#[utoipa::path(post, path = "/webhooks/forgejo", summary = "Forgejo webhook ingest (HMAC-verified, ADR-0046)", responses((status = 202, description = "delivery accepted"), (status = 401, description = "bad signature")))]
-async fn forgejo_webhook(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let secret = st
-        .forgejo_webhook_secret
-        .as_deref()
-        .ok_or(ApiError::Unauthorized)?;
-    let sig = headers
-        .get("x-forgejo-signature")
-        .or_else(|| headers.get("x-gitea-signature"))
-        .and_then(|v| v.to_str().ok());
-    scarab_forge_forgejo::verify_signature(secret, body.as_ref(), sig)
-        .map_err(|_| ApiError::Unauthorized)?;
-
-    let payload: serde_json::Value = serde_json::from_slice(body.as_ref())
-        .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}")))?;
-    let event_header = {
-        let forgejo = header_str(&headers, "x-forgejo-event");
-        if forgejo.is_empty() {
-            header_str(&headers, "x-gitea-event")
-        } else {
-            forgejo
-        }
-    };
-    let delivery_id = {
-        let forgejo = header_str(&headers, "x-forgejo-delivery");
-        if forgejo.is_empty() {
-            header_str(&headers, "x-gitea-delivery")
-        } else {
-            forgejo
-        }
-    };
-    let delivery = scarab_forge::WebhookDelivery {
-        id: delivery_id,
-        event: event_header,
-        signature: sig.map(str::to_string),
-        payload,
-    };
-
-    if !delivery_is_fresh(&st, scarab_forge::ForgeKind::Forgejo, &delivery.id).await? {
-        return Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({ "ignored": "duplicate delivery" })),
-        ));
-    }
-
-    let event = match scarab_forge_forgejo::normalize(&delivery) {
-        Ok(e) => e,
-        Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
-            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
-        }
-        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
-    };
-    ingest_event(&st, event).await
-}
-
 fn header_str(headers: &HeaderMap, name: &str) -> String {
     headers
         .get(name)
@@ -2432,15 +1810,11 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub session: String,
     pub subject: String,
-    /// The session's CSRF token — browsers echo it in `x-csrf-token` on every
-    /// mutation (also delivered as the readable `scarab_csrf` cookie).
-    pub csrf: String,
 }
 
 /// Exchange an OAuth/OIDC credential for a Scarab session (ADR-0010, 0032):
 /// authenticate to a forge-agnostic [`Principal`], mint a server-side
 /// [`Session`], and return its id (also set as an httpOnly cookie).
-#[utoipa::path(post, path = "/v1/auth/login", summary = "Exchange an OAuth credential for a session (API/CLI, ADR-0049)", responses((status = 200, body = LoginResponse), (status = 401, description = "bad credential"), (status = 404, description = "login not configured")))]
 async fn login(
     State(st): State<AppState>,
     Json(req): Json<LoginRequest>,
@@ -2453,338 +1827,36 @@ async fn login(
         .await
         .map_err(|_| ApiError::Unauthorized)?;
     let now = st.clock.now().await.0;
-    let session = mint_session(principal.clone(), now);
+    let session = Session {
+        id: Uuid::new_v4().to_string(),
+        principal: principal.clone(),
+        expires_at: now + SESSION_TTL_MS,
+    };
     sessions.put(&session).await.map_err(|_| ApiError::Unauthorized)?;
 
+    let cookie = format!(
+        "scarab_session={}; HttpOnly; Path=/; SameSite=Lax",
+        session.id
+    );
     let mut resp = (
         StatusCode::OK,
         Json(LoginResponse {
             session: session.id.clone(),
             subject: principal.subject,
-            csrf: session.csrf.clone(),
         }),
     )
         .into_response();
-    set_session_cookies(resp.headers_mut(), &session);
-    Ok(resp)
-}
-
-/// Mint a fresh [`Session`] (opaque id + CSRF token, 24h TTL).
-fn mint_session(principal: Principal, now_ms: i64) -> Session {
-    Session {
-        id: Uuid::new_v4().to_string(),
-        principal,
-        expires_at: now_ms + SESSION_TTL_MS,
-        csrf: Uuid::new_v4().to_string(),
-    }
-}
-
-/// Append the login cookies (ADR-0049): the session cookie is `HttpOnly` +
-/// `Secure` + `SameSite=Lax` (script-unreadable); the CSRF cookie is
-/// deliberately script-READABLE — the UI double-submits it as `x-csrf-token`,
-/// which a cross-site attacker cannot do.
-fn set_session_cookies(headers: &mut HeaderMap, session: &Session) {
-    for cookie in [
-        format!(
-            "scarab_session={}; HttpOnly; Secure; Path=/; SameSite=Lax",
-            session.id
-        ),
-        format!(
-            "scarab_csrf={}; Secure; Path=/; SameSite=Lax",
-            session.csrf
-        ),
-    ] {
-        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
-            headers.append(axum::http::header::SET_COOKIE, v);
-        }
-    }
-}
-
-/// `GET /v1/auth/login` (ADR-0049): begin the browser OAuth flow — set an
-/// unguessable `state` (HttpOnly cookie, 10 min) and redirect to the
-/// provider's authorize endpoint.
-#[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 404, description = "OAuth not configured")))]
-async fn oauth_login_redirect(State(st): State<AppState>) -> Result<Response, ApiError> {
-    let Some(flow) = st.oauth_login.as_ref() else {
-        return Err(ApiError::NotFound);
-    };
-    let state = Uuid::new_v4().to_string();
-    let redirect_uri = format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'));
-    let location = flow.authorize_redirect(&redirect_uri, &state);
-    let mut resp = (StatusCode::FOUND, ()).into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
-        resp.headers_mut().insert(axum::http::header::LOCATION, v);
-    }
-    let cookie = format!(
-        "scarab_oauth_state={state}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=600"
-    );
     if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
-        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        resp.headers_mut().insert(axum::http::header::SET_COOKIE, v);
     }
     Ok(resp)
 }
 
-/// `GET /v1/auth/callback?code&state` (ADR-0049): finish the browser OAuth
-/// flow — verify the `state` echo against the cookie, exchange the code for a
-/// [`Principal`], mint the PG session + CSRF token, and land on `/`.
-#[utoipa::path(get, path = "/v1/auth/callback", summary = "Finish the browser OAuth flow (ADR-0049)", responses((status = 302, description = "session + CSRF cookies set; redirect to /"), (status = 401, description = "state mismatch or bad code")))]
-async fn oauth_callback(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Response, ApiError> {
-    let (Some(auth), Some(sessions)) = (st.auth.as_ref(), st.sessions.as_ref()) else {
-        return Err(ApiError::NotFound);
-    };
-    let (Some(code), Some(state)) = (q.get("code"), q.get("state")) else {
-        return Err(ApiError::BadRequest("missing code/state".into()));
-    };
-    // The state cookie proves THIS browser started the flow (login-CSRF guard).
-    if cookie_value(&headers, "scarab_oauth_state").as_deref() != Some(state.as_str()) {
-        return Err(ApiError::Unauthorized);
-    }
-    let principal = auth
-        .authenticate(code)
-        .await
-        .map_err(|_| ApiError::Unauthorized)?;
-    let now = st.clock.now().await.0;
-    let session = mint_session(principal, now);
-    sessions.put(&session).await.map_err(|_| ApiError::Unauthorized)?;
-
-    let mut resp = (StatusCode::FOUND, ()).into_response();
-    resp.headers_mut()
-        .insert(axum::http::header::LOCATION, axum::http::HeaderValue::from_static("/"));
-    set_session_cookies(resp.headers_mut(), &session);
-    // The one-shot state cookie is spent.
-    if let Ok(v) = axum::http::HeaderValue::from_str(
-        "scarab_oauth_state=; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=0",
-    ) {
-        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
-    }
-    Ok(resp)
-}
-
-/// `POST /v1/auth/logout` (ADR-0049): revoke the presented session server-side
-/// and expire the browser cookies. Exempt from the CSRF guard by design — the
-/// worst a forged logout achieves is logging the victim out.
-#[utoipa::path(post, path = "/v1/auth/logout", summary = "Revoke the session (ADR-0049)", responses((status = 204, description = "session revoked; cookies expired")))]
-async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    let Some(sessions) = st.sessions.as_ref() else {
-        return Err(ApiError::NotFound);
-    };
-    if let Some((sid, _)) = session_id(&headers) {
-        sessions.delete(&sid).await.map_err(|_| ApiError::Unauthorized)?;
-    }
-    let mut resp = StatusCode::NO_CONTENT.into_response();
-    for cookie in [
-        "scarab_session=; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=0",
-        "scarab_csrf=; Secure; Path=/; SameSite=Lax; Max-Age=0",
-    ] {
-        if let Ok(v) = axum::http::HeaderValue::from_str(cookie) {
-            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
-        }
-    }
-    Ok(resp)
-}
-
-// ---------------------------------------------------------------------------
-// Role bindings (ADR-0049 C2): native grants/revokes + forge-permission import.
-// ---------------------------------------------------------------------------
-
-/// `PUT /v1/orgs/{org}/bindings` body — a native grant. `project` absent =
-/// org-scoped (inherits down to every project of the org).
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct BindingRequest {
-    pub subject: String,
-    /// `viewer` | `member` | `admin` | `owner`.
-    pub role: String,
-    #[serde(default)]
-    pub project: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BindingQuery {
-    subject: String,
-    #[serde(default)]
-    project: Option<String>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct BindingDto {
-    pub subject: String,
-    pub role: String,
-    /// Empty = org-scoped.
-    pub project: String,
-}
-
-/// `POST /v1/repos/{org}/{repo}/bindings/import` body: the forge users whose
-/// repo permissions to import as seed bindings.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ImportBindingsRequest {
-    pub subjects: Vec<String>,
-}
-
-fn parse_role(s: &str) -> Result<scarab_identity::Role, ApiError> {
-    Ok(match s {
-        "viewer" => scarab_identity::Role::Viewer,
-        "member" => scarab_identity::Role::Member,
-        "admin" => scarab_identity::Role::Admin,
-        "owner" => scarab_identity::Role::Owner,
-        other => {
-            return Err(ApiError::BadRequest(format!(
-                "unknown role `{other}` (want viewer|member|admin|owner)"
-            )))
-        }
-    })
-}
-
-fn role_name(r: scarab_identity::Role) -> &'static str {
-    match r {
-        scarab_identity::Role::Viewer => "viewer",
-        scarab_identity::Role::Member => "member",
-        scarab_identity::Role::Admin => "admin",
-        scarab_identity::Role::Owner => "owner",
-    }
-}
-
-/// List an org's live bindings (org- and project-scoped). Administer.
-#[utoipa::path(get, path = "/v1/orgs/{org}/bindings", summary = "List an org's role bindings (ADR-0049)", responses((status = 200, body = [BindingDto]), (status = 403, description = "not an org admin")))]
-async fn list_bindings(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(org): Path<String>,
-) -> Result<Json<Vec<BindingDto>>, ApiError> {
-    let scope = scarab_identity::Scope::Org(org.clone());
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
-    let bindings = rbac.bindings(&org).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(
-        bindings
-            .into_iter()
-            .map(|b| BindingDto {
-                subject: b.subject,
-                role: role_name(b.role).to_string(),
-                project: match b.scope {
-                    scarab_identity::Scope::Org(_) => String::new(),
-                    scarab_identity::Scope::Project { name, .. } => name,
-                },
-            })
-            .collect(),
-    ))
-}
-
-/// Natively grant `subject` a role in the org (or one of its projects).
-/// Native bindings are authoritative — no import ever overwrites them.
-#[utoipa::path(put, path = "/v1/orgs/{org}/bindings", summary = "Natively grant a role (ADR-0049)", responses((status = 204, description = "granted")))]
-async fn put_binding(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(org): Path<String>,
-    Json(req): Json<BindingRequest>,
-) -> Result<StatusCode, ApiError> {
-    let org_scope = scarab_identity::Scope::Org(org.clone());
-    authorize_scoped(&st, &headers, Action::Administer, Some(&org_scope)).await?;
-    let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
-    if req.subject.is_empty() {
-        return Err(ApiError::BadRequest("subject is required".into()));
-    }
-    let binding = scarab_identity::Binding {
-        subject: req.subject,
-        scope: match req.project.filter(|p| !p.is_empty()) {
-            Some(name) => scarab_identity::Scope::Project { org, name },
-            None => org_scope,
-        },
-        role: parse_role(&req.role)?,
-    };
-    rbac.grant(&binding, scarab_identity::BindingOrigin::Native)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Natively revoke `subject`'s binding at the scope — a durable tombstone a
-/// later forge import cannot resurrect.
-#[utoipa::path(delete, path = "/v1/orgs/{org}/bindings", summary = "Natively revoke a role - a durable tombstone (ADR-0049)", responses((status = 204, description = "revoked")))]
-async fn delete_binding(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(org): Path<String>,
-    axum::extract::Query(q): axum::extract::Query<BindingQuery>,
-) -> Result<StatusCode, ApiError> {
-    let org_scope = scarab_identity::Scope::Org(org.clone());
-    authorize_scoped(&st, &headers, Action::Administer, Some(&org_scope)).await?;
-    let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
-    let scope = match q.project.filter(|p| !p.is_empty()) {
-        Some(name) => scarab_identity::Scope::Project { org, name },
-        None => org_scope,
-    };
-    rbac.revoke(&q.subject, &scope)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Import the given users' forge permissions on the repo as **seed** bindings
-/// (ADR-0049): admin→Admin, write→Member, read→Viewer, none→skipped. The
-/// import never clobbers a native grant or revoke, and authorization keeps
-/// reading only native storage — the forge is consulted here, once, not on
-/// the authz hot path.
-#[utoipa::path(post, path = "/v1/repos/{org}/{repo}/bindings/import", summary = "Seed bindings from forge permissions (ADR-0049)", responses((status = 200, body = [BindingDto])))]
-async fn import_bindings(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((org, repo)): Path<(String, String)>,
-    Json(req): Json<ImportBindingsRequest>,
-) -> Result<Json<Vec<BindingDto>>, ApiError> {
-    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
-    let forge = st
-        .forge
-        .as_ref()
-        .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
-    let repo_ref = scarab_forge::RepoRef { owner: org.clone(), name: repo.clone() };
-
-    let mut imported = Vec::new();
-    for subject in &req.subjects {
-        let perms = forge
-            .get_permissions(&repo_ref, subject)
-            .await
-            .map_err(|e| ApiError::BadRequest(format!("forge permissions for {subject}: {e}")))?;
-        let role = if perms.admin {
-            scarab_identity::Role::Admin
-        } else if perms.write {
-            scarab_identity::Role::Member
-        } else if perms.read {
-            scarab_identity::Role::Viewer
-        } else {
-            continue; // no forge access — nothing to seed
-        };
-        rbac.grant(
-            &scarab_identity::Binding {
-                subject: subject.clone(),
-                scope: scope.clone(),
-                role,
-            },
-            scarab_identity::BindingOrigin::Import,
-        )
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        imported.push(BindingDto {
-            subject: subject.clone(),
-            role: role_name(role).to_string(),
-            project: repo.clone(),
-        });
-    }
-    Ok(Json(imported))
-}
-
-/// Authenticate the request: resolve the session (Bearer or cookie), enforce
-/// expiry + the CSRF double-submit on cookie mutations, and return the
-/// principal — **no role decision** (that's [`authorize`]/[`authorize_scoped`]).
-/// With no session store configured, authn is **disabled** (dev/test) and
-/// every caller is a synthetic Owner (the loud SCARAB_DEV_INSECURE posture).
-async fn authenticate(
+/// Authorize the request for `action`. With no session store configured, authz
+/// is **disabled** (dev/test) and every caller is treated as an Owner. Otherwise
+/// a valid session bearer token / cookie is required and its principal must
+/// grant `action` (ADR-0032 RBAC).
+async fn authorize(
     st: &AppState,
     headers: &HeaderMap,
     action: Action,
@@ -2796,7 +1868,7 @@ async fn authenticate(
             roles: vec![scarab_identity::Role::Owner],
         });
     };
-    let (sid, via) = session_id(headers).ok_or(ApiError::Unauthorized)?;
+    let sid = session_id(headers).ok_or(ApiError::Unauthorized)?;
     let session = sessions
         .get(&sid)
         .await
@@ -2805,94 +1877,26 @@ async fn authenticate(
     if !session.is_valid(st.clock.now().await.0) {
         return Err(ApiError::Unauthorized);
     }
-    // CSRF (ADR-0049): a cookie-authenticated MUTATION must double-submit the
-    // session's token in `x-csrf-token` — a cross-site form can make the
-    // browser send the cookie, but it can never read the token. Bearer
-    // requests (API/CLI) carry the credential explicitly; no CSRF surface.
-    if action != Action::Read && via == AuthVia::Cookie {
-        let presented = headers.get("x-csrf-token").and_then(|v| v.to_str().ok());
-        if session.csrf.is_empty() || presented != Some(session.csrf.as_str()) {
-            return Err(ApiError::Forbidden);
-        }
+    if !session.principal.can(action) {
+        return Err(ApiError::Forbidden);
     }
     Ok(session.principal)
 }
 
-/// Authorize `action` with **global** (flat) roles only — for resources that
-/// belong to no tenant (inline dev runs, the catch-all default).
-async fn authorize(
-    st: &AppState,
-    headers: &HeaderMap,
-    action: Action,
-) -> Result<Principal, ApiError> {
-    authorize_scoped(st, headers, action, None).await
-}
-
-/// Authorize `action` in `scope` (ADR-0049 C2). The decision is scope-aware:
-/// a flat **global** role on the principal (the C1/owners bootstrap) allows
-/// everywhere; otherwise the native role bindings decide **for the request's
-/// Org/Project** — never a live forge call. `None` scope (an untenanted
-/// resource) is global-only.
-async fn authorize_scoped(
-    st: &AppState,
-    headers: &HeaderMap,
-    action: Action,
-    scope: Option<&scarab_identity::Scope>,
-) -> Result<Principal, ApiError> {
-    let principal = authenticate(st, headers, action).await?;
-    if principal.can(action) {
-        return Ok(principal);
-    }
-    if let (Some(rbac), Some(scope)) = (st.rbac.as_ref(), scope) {
-        let role = rbac
-            .role_of(&principal.subject, scope)
-            .await
-            .map_err(|_| ApiError::Forbidden)?;
-        if role.is_some_and(|r| r.allows(action)) {
-            return Ok(principal);
-        }
-    }
-    Err(ApiError::Forbidden)
-}
-
-/// The tenant scope of a run (ADR-0049), if it was stamped at creation.
-async fn run_scope(st: &AppState, run: &RunId) -> Option<scarab_identity::Scope> {
-    st.db
-        .run_tenant(run)
-        .await
-        .ok()
-        .flatten()
-        .map(|(org, name)| scarab_identity::Scope::Project { org, name })
-}
-
-/// How a request presented its session — Bearer carries the credential
-/// explicitly (API/CLI); Cookie rides ambiently on browser requests and
-/// therefore needs CSRF proof on mutations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuthVia {
-    Bearer,
-    Cookie,
-}
-
 /// Extract a session id from `Authorization: Bearer <id>` or a
 /// `scarab_session=<id>` cookie.
-fn session_id(headers: &HeaderMap) -> Option<(String, AuthVia)> {
+fn session_id(headers: &HeaderMap) -> Option<String> {
     if let Some(tok) = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
     {
-        return Some((tok.to_string(), AuthVia::Bearer));
+        return Some(tok.to_string());
     }
-    cookie_value(headers, "scarab_session").map(|v| (v, AuthVia::Cookie))
-}
-
-/// The value of cookie `name`, if present.
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let cookie = headers.get("cookie").and_then(|v| v.to_str().ok())?;
     cookie
         .split(';')
-        .filter_map(|p| p.trim().strip_prefix(&format!("{name}=")))
+        .filter_map(|p| p.trim().strip_prefix("scarab_session="))
         .map(str::to_string)
         .next()
 }
@@ -2934,9 +1938,8 @@ async fn approve_gate(
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
+    let principal = authorize(&st, &headers, Action::Write).await?;
     let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
     let step = StepId(step);
 
     // 1. Record this principal's approval — append-only, no resume, idempotent
@@ -2973,7 +1976,7 @@ async fn approve_gate(
     let ctx = st.db.run_deploy_context(&run).await.map_err(ApiError::Db)?;
     let rules = match (&ctx, st.environments.as_ref()) {
         (Some(c), Some(store)) => store
-            .get_environment(&c.org, &c.project, &c.environment)
+            .get_environment(&c.org, &c.repo, &c.environment)
             .await
             .map_err(|e| ApiError::BadRequest(e.to_string()))?
             .map(|e| e.protection),
@@ -3005,9 +2008,9 @@ async fn approve_gate(
     if let (Some(c), Some(store)) = (&ctx, st.environments.as_ref()) {
         let now = st.clock.now().await.0;
         store
-            .record_deployment(&scarab_project::Deployment {
+            .record_deployment(&scarab_projects::Deployment {
                 org: c.org.clone(),
-                project: c.project.clone(),
+                repo: c.repo.clone(),
                 environment: c.environment.clone(),
                 git_ref: c.git_ref.clone(),
                 run: run.0.clone(),
@@ -3168,16 +2171,6 @@ async fn ingest_step_results(
 
 /// Build a [`SecretScope`] from the flat org/repo/environment selector,
 /// enforcing that an environment scope names a repo (ADR-0014, 0024).
-/// The RBAC scope of an (org, optional repo) coordinate (ADR-0049): a repo
-/// pins the Project; bare org is Org scope. Environment adds no RBAC scope —
-/// deploy authorization is the protection rules (ADR-0037).
-fn rbac_scope(org: &str, repo: Option<&str>) -> scarab_identity::Scope {
-    match repo {
-        Some(name) => scarab_identity::Scope::Project { org: org.to_string(), name: name.to_string() },
-        None => scarab_identity::Scope::Org(org.to_string()),
-    }
-}
-
 fn secret_scope(
     org: String,
     repo: Option<String>,
@@ -3226,8 +2219,7 @@ async fn put_secret(
     headers: HeaderMap,
     Json(req): Json<PutSecretRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let scope = rbac_scope(&req.org, req.repo.as_deref());
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    authorize(&st, &headers, Action::Administer).await?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     if req.name.is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
@@ -3265,8 +2257,7 @@ async fn list_secrets(
     headers: HeaderMap,
     Query(q): Query<SecretScopeQuery>,
 ) -> Result<Json<SecretListResponse>, ApiError> {
-    let rscope = rbac_scope(&q.org, q.repo.as_deref());
-    authorize_scoped(&st, &headers, Action::Administer, Some(&rscope)).await?;
+    authorize(&st, &headers, Action::Administer).await?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     let scope = secret_scope(q.org, q.repo, q.environment)?;
     let names = secrets.list_scoped(&scope).await.map_err(secret_err)?;
@@ -3293,8 +2284,7 @@ async fn delete_secret(
     headers: HeaderMap,
     Query(q): Query<SecretScopeQuery>,
 ) -> Result<StatusCode, ApiError> {
-    let rscope = rbac_scope(&q.org, q.repo.as_deref());
-    authorize_scoped(&st, &headers, Action::Administer, Some(&rscope)).await?;
+    authorize(&st, &headers, Action::Administer).await?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
     let name = q
         .name
@@ -3309,17 +2299,15 @@ async fn delete_secret(
 /// Create/replace a repo's protected environment (ADR-0024, 0037). Editing the
 /// deployment target's rules requires the Administer capability — so a pipeline
 /// author (Write) cannot grant themselves deploy access by changing the YAML.
-#[utoipa::path(put, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "Create/replace a protected environment (ADR-0024/0037)", responses((status = 200, description = "stored")))]
 async fn put_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
-    Json(protection): Json<scarab_project::ProtectionRules>,
+    Json(protection): Json<scarab_projects::ProtectionRules>,
 ) -> Result<StatusCode, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    authorize(&st, &headers, Action::Administer).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
-    let env = scarab_project::Environment {
+    let env = scarab_projects::Environment {
         name: name.clone(),
         protection,
     };
@@ -3331,14 +2319,12 @@ async fn put_environment(
 }
 
 /// Fetch one environment's definition (rules). Read capability.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "One environment's protection rules", responses((status = 200, description = "the environment"), (status = 404, description = "unknown")))]
 async fn get_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
-) -> Result<Json<scarab_project::Environment>, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+) -> Result<Json<scarab_projects::Environment>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let env = store
         .get_environment(&org, &repo, &name)
@@ -3349,14 +2335,12 @@ async fn get_environment(
 }
 
 /// List a repo's environments. Read capability.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments", summary = "List a repo's environments", responses((status = 200, description = "the environments")))]
 async fn list_environments(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo)): Path<(String, String)>,
-) -> Result<Json<Vec<scarab_project::Environment>>, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+) -> Result<Json<Vec<scarab_projects::Environment>>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let envs = store
         .list_environments(&org, &repo)
@@ -3366,14 +2350,12 @@ async fn list_environments(
 }
 
 /// Delete an environment (idempotent). Administer capability.
-#[utoipa::path(delete, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "Delete an environment (idempotent)", responses((status = 204, description = "deleted")))]
 async fn delete_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    authorize(&st, &headers, Action::Administer).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     store
         .delete_environment(&org, &repo, &name)
@@ -3385,14 +2367,12 @@ async fn delete_environment(
 /// An environment's deployment history, most recent first (ADR-0037). This
 /// replaces the old `POST …/deploy` admission endpoint: admission now happens in
 /// the run's gate-approval path, so this surface is **read-only**. Read cap.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}/deployments", summary = "An environment's deployment history (ADR-0037)", responses((status = 200, description = "most recent first")))]
 async fn list_deployments(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
-) -> Result<Json<Vec<scarab_project::Deployment>>, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+) -> Result<Json<Vec<scarab_projects::Deployment>>, ApiError> {
+    authorize(&st, &headers, Action::Read).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let history = store
         .deployments(&org, &repo, &name)
@@ -3406,14 +2386,12 @@ async fn list_deployments(
 /// (resolves from repo/org scope), or `unset`. Post-inheritance, so a shared key
 /// defined once at repo scope never reads as missing. Names + status only, never
 /// values — same `Administer` capability as listing secrets.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/secrets/matrix", summary = "The secret parity matrix (ADR-0037) - names + status, never values", responses((status = 200, body = SecretMatrix)))]
 async fn secret_matrix(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo)): Path<(String, String)>,
 ) -> Result<Json<SecretMatrix>, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    authorize(&st, &headers, Action::Administer).await?;
     let envs_store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
     let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
 
@@ -3477,26 +2455,6 @@ async fn secret_matrix(
     }))
 }
 
-/// The reserved secret-scope org under which forge-connection credentials live
-/// (ADR-0046). A `ForgeConnection` row carries only `credential_ref` — the key
-/// within this scope; the material (GitHub App PEM / Forgejo token) is fetched
-/// here at use-time and never persisted on the connection.
-pub const FORGE_CREDENTIALS_ORG: &str = "_forge";
-
-/// Resolve a [`scarab_forge::ForgeConnection`]'s credential material at
-/// use-time (ADR-0046): the bytes an adapter authenticates with, fetched from
-/// `SecretProvider` under the reserved [`FORGE_CREDENTIALS_ORG`] scope by the
-/// connection's `credential_ref` handle.
-pub async fn connection_credential(
-    secrets: &dyn scarab_secrets::SecretProvider,
-    conn: &scarab_forge::ForgeConnection,
-) -> Result<Vec<u8>, scarab_secrets::SecretError> {
-    let scope = scarab_secrets::SecretScope::Org {
-        org: FORGE_CREDENTIALS_ORG.to_string(),
-    };
-    Ok(secrets.get(&scope, &conn.credential_ref).await?.value)
-}
-
 /// Resolve a step's scoped secrets and prepare them for injection (ADR-0014,
 /// 0013): fetch each `key` at `scope` from `provider`, **register its value with
 /// the log redactor** so it can never appear in stored or streamed logs, and
@@ -3530,14 +2488,12 @@ pub async fn resolve_step_secrets(
 }
 
 /// The JWKS a cloud fetches to verify Scarab-issued OIDC tokens (ADR-0015).
-#[utoipa::path(get, path = "/.well-known/jwks.json", summary = "OIDC issuer JWKS (ADR-0015)", responses((status = 200, description = "the signing keys"), (status = 404, description = "issuer disabled")))]
 async fn jwks(State(st): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let issuer = st.oidc.as_ref().ok_or(ApiError::NotFound)?;
     Ok(Json(issuer.jwks()))
 }
 
 /// The OIDC discovery document.
-#[utoipa::path(get, path = "/.well-known/openid-configuration", summary = "OIDC discovery (ADR-0015)", responses((status = 200, description = "the discovery document"), (status = 404, description = "issuer disabled")))]
 async fn openid_configuration(
     State(st): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -3569,77 +2525,6 @@ pub fn fork_policy(event: &scarab_forge::Event, target_env: &str) -> ForkPolicy 
     }
 }
 
-/// `GET /metrics` (ADR-0053): Prometheus text exposition of the key gauges —
-/// runs by status and outbox backlog, read live from the durable store on
-/// each scrape (pull-model, always consistent, no in-process drift).
-#[utoipa::path(get, path = "/metrics", summary = "Prometheus gauges (ADR-0053)", responses((status = 200, description = "Prometheus text exposition")))]
-async fn metrics(State(st): State<AppState>) -> Result<Response, ApiError> {
-    let mut out = String::new();
-    out.push_str("# HELP scarab_runs Current run count by status.
-# TYPE scarab_runs gauge
-");
-    for (status, n) in st.db.run_status_counts().await? {
-        out.push_str(&format!("scarab_runs{{status=\"{status}\"}} {n}
-"));
-    }
-    out.push_str(
-        "# HELP scarab_outbox_depth Undispatched outbox messages.
-# TYPE scarab_outbox_depth gauge
-",
-    );
-    out.push_str(&format!("scarab_outbox_depth {}
-", st.db.outbox_depth().await?));
-    let mut resp = out.into_response();
-    resp.headers_mut().insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("text/plain; version=0.0.4"),
-    );
-    Ok(resp)
-}
-
-/// `GET /readyz` (ADR-0053): readiness = can this replica actually serve —
-/// DB and object store reachable. Distinct from `/healthz` (liveness =
-/// process up): a server with a dead DB must leave rotation, not restart.
-#[utoipa::path(get, path = "/readyz", summary = "Readiness: DB + object store reachable (ADR-0053)", responses((status = 200, description = "ready"), (status = 503, description = "a dependency is unreachable")))]
-async fn readyz(State(st): State<AppState>) -> Response {
-    if let Err(e) = st.db.run_status_counts().await {
-        return (StatusCode::SERVICE_UNAVAILABLE, format!("db: {e}")).into_response();
-    }
-    if let Some(store) = &st.artifact_store {
-        // NotFound = reachable; only a backend error is unready.
-        if let Err(scarab_storage::StorageError::Backend(e)) =
-            store.get("readyz/probe").await
-        {
-            return (StatusCode::SERVICE_UNAVAILABLE, format!("store: {e}")).into_response();
-        }
-    }
-    "ready".into_response()
-}
-
-/// Request-id middleware (ADR-0053): every response carries `x-request-id`
-/// (honoring an inbound one), and a tracing span correlates the logs.
-pub async fn request_id_middleware(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let id = req
-        .headers()
-        .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let span = tracing::info_span!("request", request_id = %id, method = %req.method(), path = %req.uri().path());
-    let mut resp = {
-        let _enter = span.enter();
-        next.run(req).await
-    };
-    if let Ok(v) = axum::http::HeaderValue::from_str(&id) {
-        resp.headers_mut().insert("x-request-id", v);
-    }
-    resp
-}
-
-#[utoipa::path(get, path = "/healthz", summary = "Liveness: process up (ADR-0053)", responses((status = 200, description = "alive")))]
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -3654,41 +2539,15 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        healthz,
-        readyz,
-        metrics,
-        jwks,
-        openid_configuration,
-        login,
-        oauth_login_redirect,
-        oauth_callback,
-        logout,
-        list_bindings,
-        put_binding,
-        delete_binding,
-        import_bindings,
-        github_webhook,
-        forgejo_webhook,
-        put_environment,
-        get_environment,
-        list_environments,
-        delete_environment,
-        list_deployments,
-        secret_matrix,
-        ingest_step_results,
         create_run,
         dispatch,
         list_pipelines,
         pipeline_interface,
         list_runs,
-        list_projects,
         get_run,
         get_events,
         get_logs,
         restart_step,
-        cancel_run,
-        list_artifacts,
-        download_artifact,
         approve_gate,
         release_gate_external,
         put_secret,
@@ -3726,34 +2585,17 @@ pub fn openapi_json() -> String {
 
 /// Build the HTTP router bound to `state`.
 pub fn router(state: AppState) -> Router {
-    router_inner(state)
-}
-
-fn router_inner(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics))
         .route("/openapi.json", get(openapi))
         .route("/.well-known/jwks.json", get(jwks))
         .route("/.well-known/openid-configuration", get(openid_configuration))
-        .route("/v1/auth/login", post(login).get(oauth_login_redirect))
-        .route("/v1/auth/callback", get(oauth_callback))
-        .route("/v1/auth/logout", post(logout))
-        .route(
-            "/v1/orgs/{org}/bindings",
-            get(list_bindings).put(put_binding).delete(delete_binding),
-        )
-        .route("/v1/repos/{org}/{repo}/bindings/import", post(import_bindings))
-        .route("/v1/repos", get(list_projects))
+        .route("/v1/auth/login", post(login))
         .route("/v1/runs", post(create_run).get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))
         .route("/v1/runs/{id}/logs", get(get_logs))
         .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
-        .route("/v1/runs/{id}/cancel", post(cancel_run))
-        .route("/v1/runs/{id}/artifacts", get(list_artifacts))
-        .route("/v1/runs/{id}/artifacts/{*name}", get(download_artifact))
         .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
         .route("/v1/runs/{id}/gates/{step}/release", post(release_gate_external))
         .route("/v1/runs/{id}/steps/{step}/results", post(ingest_step_results))
@@ -3783,56 +2625,7 @@ fn router_inner(state: AppState) -> Router {
         )
         .route("/v1/repos/{org}/{repo}/dispatch", post(dispatch))
         .route("/webhooks/github", post(github_webhook))
-        .route("/webhooks/forgejo", post(forgejo_webhook))
-        // The embedded web UI (ADR-0054): everything no API route claimed
-        // falls through here — a real file from dist/, else index.html (SPA
-        // client routing). Same-origin by construction: no CORS anywhere.
-        .fallback(serve_ui)
-        // Request-id correlation on every route (ADR-0053).
-        .layer(axum::middleware::from_fn(request_id_middleware))
         .with_state(state)
-}
-
-/// Serve the SPA (ADR-0054): a request for a real file under the dist dir
-/// gets it; anything else (a client-side route like `/acme/web/runs/…`) gets
-/// index.html. Path traversal is rejected by segment sanitization. With no
-/// UI dir configured (dev API-only), non-API paths are plain 404s.
-async fn serve_ui(State(st): State<AppState>, uri: axum::http::Uri) -> Response {
-    let Some(dir) = &st.ui_dir else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let rel = uri.path().trim_start_matches('/');
-    let mut path = dir.clone();
-    // Segment-wise join: never let `..` (or an absolute segment) escape dist.
-    for seg in rel.split('/') {
-        if seg.is_empty() || seg == "." || seg == ".." || seg.contains('\\') {
-            continue;
-        }
-        path.push(seg);
-    }
-    let file = if path.is_file() { path } else { dir.join("index.html") };
-    match tokio::fs::read(&file).await {
-        Ok(bytes) => {
-            let mime = match file.extension().and_then(|e| e.to_str()).unwrap_or_default() {
-                "html" => "text/html; charset=utf-8",
-                "js" => "application/javascript",
-                "css" => "text/css",
-                "svg" => "image/svg+xml",
-                "png" => "image/png",
-                "ico" => "image/x-icon",
-                "json" => "application/json",
-                "woff2" => "font/woff2",
-                _ => "application/octet-stream",
-            };
-            let mut resp = bytes.into_response();
-            resp.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static(mime),
-            );
-            resp
-        }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3867,7 +2660,7 @@ fn step_status_name(s: StepStatus) -> &'static str {
 mod grant_admission_tests {
     use super::admit_step_grants;
     use scarab_pipeline::StepSecurity;
-    use scarab_project::{ImageGrant, ProtectionRules};
+    use scarab_projects::{ImageGrant, ProtectionRules};
     use scarab_secrets::SecretScope;
 
     const IMG: &str = "ghcr.io/acme/deployer@sha256:aaaa";

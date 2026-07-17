@@ -38,19 +38,11 @@ scarab:
     region: "us-east-1"
 
   # OIDC issuer public URL for keyless federation (ADR-0014). Empty => disabled.
-  # When set, SCARAB_OIDC_SIGNING_KEY_FILE must point at a persistent PKCS#8
-  # RSA PEM (mount it via extraEnv + a volume, or bake it into existingSecret) —
-  # the server refuses to boot without one (ADR-0048).
   oidcIssuer: ""
-
-  # ⚠ Dev-only (ADR-0048): boots without an authenticator/KEK, with loud
-  # warnings, instead of refusing. NEVER set in production. Until authn
-  # (ADR-0049) ships, a deploy only boots with this on — an honest red line.
-  devInsecure: false
 
   # Results-egress sidecar image injected into step Pods (ADR-0042). Only used
   # when secrets.resultsTokenSecret is set.
-  sidecarImage: "ghcr.io/thulasi-ram/scarab-results-sidecar:edge"
+  sidecarImage: "ghcr.io/thulasi-ram/scarab-sidecar:latest"
   # Base URL step-Pod sidecars POST results back to. Empty => the in-cluster
   # Service DNS name derived from the release.
   resultsApiUrl: ""
@@ -63,13 +55,12 @@ scarab:
 secrets:
   existingSecret: ""
   # --- inline (rendered into a chart-managed Secret when existingSecret is "") ---
-  # Postgres URL. MANDATORY (ADR-0048): scarab-server refuses to boot without it.
+  # Postgres URL. Absent => API-only mode (no durable driver).
   databaseUrl: ""
   # S3/MinIO credentials (needed when scarab.s3.bucket is set).
   s3AccessKey: ""
   s3SecretKey: ""
   # base64 32-byte key so encrypted secrets survive restarts (ADR-0014).
-  # MANDATORY unless scarab.devInsecure is on (ADR-0048).
   masterKey: ""
   # HMAC secrets for webhook verification / gate + results token minting.
   githubWebhookSecret: ""
@@ -118,9 +109,7 @@ livenessProbe:
   periodSeconds: 15
 readinessProbe:
   httpGet:
-    # Readiness = can this replica serve (DB + store reachable, ADR-0053) —
-    # distinct from liveness (/healthz = process up).
-    path: /readyz
+    path: /healthz
     port: http
   initialDelaySeconds: 3
   periodSeconds: 10
@@ -141,9 +130,3 @@ podAnnotations: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
-
-# Prometheus scraping (ADR-0053): render a ServiceMonitor when the Prometheus
-# Operator CRDs are installed.
-serviceMonitor:
-  enabled: false
-  interval: 30s

@@ -6,13 +6,22 @@ import type { ParentProps } from "solid-js";
 import { A } from "@solidjs/router";
 import Icon from "./components/Icon";
 import { theme, toggleTheme } from "./theme";
+import emblemLight from "./assets/brand/scarab-emblem.svg";
+import emblemDark from "./assets/brand/scarab-emblem-dark.svg";
 
 export default function Layout(props: ParentProps) {
   return (
     <div class="app">
       <nav class="topbar">
         <A href="/" class="brand" end>
-          <Icon icon="bug" size={23} />
+          {/* The brand emblem (ui/brand): ink outline on light, gold on dark. */}
+          <img
+            class="brand-emblem"
+            src={theme() === "dark" ? emblemDark : emblemLight}
+            alt=""
+            width={26}
+            height={23}
+          />
           <span>Scarab</span>
         </A>
         <span class="topbar-spacer" />

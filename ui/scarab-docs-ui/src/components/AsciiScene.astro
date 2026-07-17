@@ -1,0 +1,113 @@
+---
+// Animated brand beetle — plays a baked ASCII scene from ui/brand/ascii
+// (see its README). Landing page ONLY, per the placement rules there: no
+// rendering code ships — the client script swaps pre-baked text frames.
+//
+// Frame 0 is rendered into the HTML at build time, so the scene is present at
+// first paint; the player script upgrades it to the loop. Three <pre> layers
+// (emerald / gold / gray) are colored via CSS so both themes work.
+//
+// `slotSelector` supports the hero: Starlight's hero.image.html is a static
+// string, so the page puts an empty slot div there and this component moves
+// itself into it during parse (inline script — before first paint).
+interface Props {
+  name: string;
+  fontSize?: number;      // px per cell column (glyph advance ≈ 0.602 × this)
+  slotSelector?: string;
+  label?: string;         // accessible name; omit → decorative (aria-hidden)
+  class?: string;
+}
+const { name, fontSize = 8, slotSelector, label, class: cls } = Astro.props;
+
+const scenes = import.meta.glob("../../../brand/ascii/generated/*.json", {
+  import: "default",
+  eager: true,
+}) as Record<string, { cols: number; rows: number; fps: number; frames: [string, string, string][] }>;
+const entry = Object.entries(scenes).find(([p]) => p.endsWith(`/${name}.json`));
+if (!entry) throw new Error(`AsciiScene: unknown scene "${name}" (run npm run bake in ui/brand/ascii)`);
+const scene = entry[1];
+const [em0, au0, fe0] = scene.frames[0];
+const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
+---
+
+<div
+  class:list={["ascii-scene", cls]}
+  id={id}
+  data-ascii={name}
+  data-fps={scene.fps}
+  style={`--ascii-fs:${fontSize}px`}
+  role={label ? "img" : undefined}
+  aria-label={label}
+  aria-hidden={label ? undefined : "true"}
+>
+  <pre class="ascii-em" data-layer="0">{em0}</pre>
+  <pre class="ascii-au" data-layer="1">{au0}</pre>
+  <pre class="ascii-fe" data-layer="2">{fe0}</pre>
+</div>
+
+{slotSelector && (
+  <script is:inline define:vars={{ id, slotSelector }}>
+    // Runs during parse: the hero slot is earlier in the DOM, so the scene is
+    // in place before first paint — no flash at the wrong location.
+    const slot = document.querySelector(slotSelector);
+    const node = document.getElementById(id);
+    if (slot && node) slot.appendChild(node);
+  </script>
+)}
+
+<script>
+  // One player for every scene on the page. Baked frames only — the dynamic
+  // import pulls just the scenes this page actually uses.
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const nodes = document.querySelectorAll<HTMLElement>("[data-ascii]");
+
+  for (const node of nodes) {
+    const name = node.dataset.ascii!;
+    if (reduce) {
+      // Hold a fully-open frame instead of animating (frame 0 is closed).
+      import(`../../../brand/ascii/generated/${name}.json`).then((m) => {
+        const mid = m.default.frames[Math.floor(m.default.frames.length / 2)];
+        node.querySelectorAll("pre").forEach((p, i) => (p.textContent = mid[i]));
+      });
+      continue;
+    }
+    import(`../../../brand/ascii/generated/${name}.json`).then((m) => {
+      const { fps, frames } = m.default as { fps: number; frames: [string, string, string][] };
+      const pres = node.querySelectorAll("pre");
+      let f = 0;
+      setInterval(() => {
+        if (document.hidden) return;
+        f = (f + 1) % frames.length;
+        for (let i = 0; i < 3; i++) pres[i].textContent = frames[f][i];
+      }, 1000 / fps);
+    });
+  }
+</script>
+
+<style>
+  .ascii-scene {
+    position: relative;
+    line-height: 0;
+    max-width: 100%;
+    overflow: hidden;
+  }
+  .ascii-scene pre {
+    margin: 0;
+    padding: 0;
+    background: none;
+    border: none;
+    font-family: var(--sl-font-mono, ui-monospace, monospace);
+    font-size: var(--ascii-fs, 8px);
+    line-height: calc(var(--ascii-fs, 8px) * 1.667);
+    user-select: none;
+    overflow: hidden;
+  }
+  .ascii-scene pre + pre {
+    position: absolute;
+    inset: 0;
+  }
+  /* brand-role layers; tokens themed in scarab.css */
+  .ascii-scene .ascii-em { color: var(--ascii-emerald); }
+  .ascii-scene .ascii-au { color: var(--ascii-gold); }
+  .ascii-scene .ascii-fe { color: var(--ascii-gray); }
+</style>

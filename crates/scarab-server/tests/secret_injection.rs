@@ -52,12 +52,6 @@ fn spec_with_secret() -> StepSpec {
         run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
-        timeout_seconds: None,
-        workspace_inputs: vec![],
-        clone: None,
-        build: None,
-        artifacts: vec![],
-        oidc_token: None,
     }
 }
 fn logs(db: Arc<dyn Db>) -> Arc<LogService> {
@@ -75,7 +69,7 @@ async fn injects_env_scoped_secret_with_repo_inheritance() {
         &RunId("r1".into()),
         &DeployContext {
             org: "acme".into(),
-            project: "web".into(),
+            repo: "web".into(),
             environment: "prod".into(),
             git_ref: "refs/heads/main".into(),
             locked_out: false,
@@ -114,7 +108,7 @@ async fn fork_pr_lockout_injects_no_secrets() {
         &RunId("r1".into()),
         &DeployContext {
             org: "acme".into(),
-            project: "web".into(),
+            repo: "web".into(),
             environment: "prod".into(),
             git_ref: "refs/heads/main".into(),
             locked_out: true, // fork PR
@@ -159,159 +153,4 @@ async fn non_deploy_run_injects_no_secrets() {
 
     let env = launched_env(&inner).await;
     assert!(!env.iter().any(|(k, _)| k == "TOKEN"), "no scope → no secret: {env:?}");
-}
-
-// ---------------------------------------------------------------------------
-// Per-attempt OIDC token minting (ADR-0015).
-// ---------------------------------------------------------------------------
-
-use scarab_server::oidc::{verify, Rs256Issuer};
-
-/// An inner executor that records the whole spec of the last launch.
-#[derive(Default)]
-struct SpecCapturingExec {
-    last: Mutex<Option<StepSpec>>,
-}
-#[async_trait]
-impl Executor for SpecCapturingExec {
-    async fn launch(&self, _step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        *self.last.lock().unwrap() = Some(spec.clone());
-        Ok(ExecHandle("h".into()))
-    }
-    async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
-        Ok(ExecState::Running)
-    }
-    async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
-        Ok(())
-    }
-}
-
-fn plain_spec() -> StepSpec {
-    StepSpec {
-        image: "busybox".into(),
-        command: vec!["true".into()],
-        env: vec![],
-        secrets: vec![],
-        run_as_root: false,
-        add_capabilities: vec![],
-        privileged: false,
-        timeout_seconds: None,
-        workspace_inputs: vec![],
-        clone: None,
-        build: None,
-        artifacts: vec![],
-        oidc_token: None,
-    }
-}
-
-async fn seed_deploy(db: &InMemoryDb, run: &str, locked_out: bool) {
-    db.set_run_deploy_context(
-        &RunId(run.into()),
-        &DeployContext {
-            org: "acme".into(),
-            project: "web".into(),
-            environment: "prod".into(),
-            git_ref: "refs/heads/main".into(),
-            locked_out,
-        },
-    )
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn deploy_run_gets_a_verifiable_token_with_the_run_subject() {
-    let db = Arc::new(InMemoryDb::new());
-    seed_deploy(&db, "r1", false).await;
-    let issuer = Arc::new(Rs256Issuer::generate("https://scarab.example").unwrap());
-    let inner = Arc::new(SpecCapturingExec::default());
-    let exec = SecretInjectingExecutor::new(
-        inner.clone(),
-        db.clone() as Arc<dyn Db>,
-        Arc::new(FakeSecrets::new()),
-        logs(db.clone()),
-    )
-    .with_oidc(issuer.clone(), "https://scarab.example", "sts.example.com");
-
-    exec.launch(&step("r1"), &plain_spec()).await.unwrap();
-    let launched = inner.last.lock().unwrap().clone().unwrap();
-    let token = launched.oidc_token.expect("token minted");
-
-    // The token verifies against the issuer's OWN JWKS — what a cloud does.
-    let jwks = issuer.jwks();
-    let (n, e) = (
-        jwks["keys"][0]["n"].as_str().unwrap(),
-        jwks["keys"][0]["e"].as_str().unwrap(),
-    );
-    let claims = verify(&token, n, e, "sts.example.com").expect("verifies against JWKS");
-    assert_eq!(
-        claims["sub"],
-        "scarab:org/acme/repo/web/env/prod/ref/refs/heads/main"
-    );
-    assert_eq!(claims["run_id"], "r1");
-    assert_eq!(claims["iss"], "https://scarab.example");
-}
-
-#[tokio::test]
-async fn fork_pr_token_subject_is_downgraded_to_env_none() {
-    let db = Arc::new(InMemoryDb::new());
-    seed_deploy(&db, "r-fork", true).await; // locked out
-    let issuer = Arc::new(Rs256Issuer::generate("https://scarab.example").unwrap());
-    let inner = Arc::new(SpecCapturingExec::default());
-    let exec = SecretInjectingExecutor::new(
-        inner.clone(),
-        db.clone() as Arc<dyn Db>,
-        Arc::new(FakeSecrets::new()),
-        logs(db.clone()),
-    )
-    .with_oidc(issuer.clone(), "https://scarab.example", "sts.example.com");
-
-    exec.launch(&step("r-fork"), &plain_spec()).await.unwrap();
-    let token = inner.last.lock().unwrap().clone().unwrap().oidc_token.unwrap();
-    let jwks = issuer.jwks();
-    let claims = verify(
-        &token,
-        jwks["keys"][0]["n"].as_str().unwrap(),
-        jwks["keys"][0]["e"].as_str().unwrap(),
-        "sts.example.com",
-    )
-    .unwrap();
-    // The downgraded subject: no real environment's trust policy matches.
-    assert_eq!(
-        claims["sub"],
-        "scarab:org/acme/repo/web/env/none/ref/refs/heads/main"
-    );
-}
-
-#[tokio::test]
-async fn no_issuer_or_no_deploy_context_means_no_token() {
-    let db = Arc::new(InMemoryDb::new());
-    seed_deploy(&db, "r1", false).await;
-
-    // Issuer not configured: absent.
-    let inner = Arc::new(SpecCapturingExec::default());
-    let exec = SecretInjectingExecutor::new(
-        inner.clone(),
-        db.clone() as Arc<dyn Db>,
-        Arc::new(FakeSecrets::new()),
-        logs(db.clone()),
-    );
-    exec.launch(&step("r1"), &plain_spec()).await.unwrap();
-    assert_eq!(inner.last.lock().unwrap().clone().unwrap().oidc_token, None);
-
-    // Issuer configured but an untenanted (non-deploy) run: absent.
-    let inner = Arc::new(SpecCapturingExec::default());
-    let exec = SecretInjectingExecutor::new(
-        inner.clone(),
-        db.clone() as Arc<dyn Db>,
-        Arc::new(FakeSecrets::new()),
-        logs(db.clone()),
-    )
-    .with_oidc(
-        Arc::new(Rs256Issuer::generate("https://scarab.example").unwrap()),
-        "https://scarab.example",
-        "aud",
-    );
-    exec.launch(&step("r-plain"), &plain_spec()).await.unwrap();
-    assert_eq!(inner.last.lock().unwrap().clone().unwrap().oidc_token, None);
 }

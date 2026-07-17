@@ -1,0 +1,11 @@
+[package]
+name = "scarab-projects"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+scarab-secrets = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }

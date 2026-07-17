@@ -1,0 +1,47 @@
+# Brand ASCII scenes
+
+The animated cousin of the doodle system (docs/DESIGN.md §5): brand beetles
+*doing things*, rendered as ASCII text. Same pipeline philosophy as
+`scarab-docs-ui/scripts/gen-doodles.mjs` — **generate offline, commit the
+output, ship no rendering code**. The UIs play plain text frames by swapping
+`textContent` at 12 fps (ASCII reads better slow — more terminal, less video).
+
+```
+npm install && npm run bake     # deterministic; reruns don't churn
+```
+
+## Scenes (`generated/`)
+
+| Asset | What | Used by |
+|---|---|---|
+| `wingspread-hero.json` | scarab spreads wings inside its nimbus, 84×45 | docs landing hero |
+| `wingspread-small.json` | same loop, 60×32 | web-ui all-clear state |
+| `dungroller.json` | dung beetle rolling its ball, 88×47 | docs landing accent |
+| `emblem-mark.txt` | the **traced** emblem, static, 64×34 | faint background marks |
+
+## Format
+
+`{ cols, rows, fps, frames: [[em, au, fe], …] }` — each frame is three
+same-shape text layers split by brand role: **em**erald (wings), gold/**au**
+(body, ball, nimbus), **fe**/gray (legs, films, ground). A player stacks three
+`<pre>` elements and colors them via CSS custom properties, so the art follows
+the theme with zero per-cell work at runtime.
+
+## Why the animated scarab is parametric, not traced
+
+The traced emblem's dark layer (`../logo/scarab-emblem.svg`) is one
+winding-linked compound path — its background whites are *hole contours* — so
+it cannot be dismembered for wing articulation. `scenes.mjs` rebuilds the
+scarab parametrically at the emblem's measured proportions (ring r≈894 at
+(1089,950), wing pivots (882,1030)/(1314,1030)); the traced original renders
+verbatim only as the static mark. Cell glyphs are ~1:1.67, so scenes squash y
+by 0.6 to keep the nimbus round.
+
+## Placement rules (extends DESIGN.md §5)
+
+- **Animated scenes**: docs **landing page only** (hero + at most one accent),
+  and web-ui **state moments** (all-clear, empty, loading) — never ambient
+  behind live data, never on inner docs pages.
+- **Static marks**: doodle rules apply (faint, background, ≤2/page).
+- Players must honor `prefers-reduced-motion` (show one open frame) and pause
+  when the document is hidden.

@@ -6,7 +6,8 @@ hero:
   layout: split-left
   tagline: A modern CI engine for Kubernetes — forge-native, on a durable core. It treats your run as state, not a process.
   image:
-    file: ../../assets/logo.svg
+    # Filled by <AsciiScene slotSelector> below — the baked wing-spread loop.
+    html: '<div class="ascii-hero-slot"></div>'
   actions:
     - text: Run it locally
       link: /scarab-ci/get-started/run-locally/
@@ -18,9 +19,14 @@ hero:
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
-import Doodle from '../../components/Doodle.astro';
+import AsciiScene from '../../components/AsciiScene.astro';
 
-<Doodle icon="bug" size={260} rotate={-14} opacity={0.07} top="6rem" right="-3rem" />
+<AsciiScene
+  name="wingspread-hero"
+  fontSize={9}
+  slotSelector=".ascii-hero-slot"
+  label="The Scarab emblem in ASCII art — a scarab spreading its wings inside its nimbus"
+/>
 
 CI tools fall into two camps. **Workflow engines** — Argo, Tekton, Temporal — have a durable,
 crash-safe core, but they aren't CI: forge integration, in-repo config, PR checks, identity,
@@ -53,9 +59,9 @@ durable **state**, not a fire-and-forget process.
   </Card>
 </CardGrid>
 
-<Doodle icon="workflow" size={200} rotate={12} opacity={0.06} bottom="2rem" left="-2rem" />
-
 ## Why now
+
+<AsciiScene name="dungroller" fontSize={5} class="ascii-accent" />
 
 As pipelines get longer and more autonomous — agents, long review gates, multi-day workflows —
 "the job died, click re-run" stops being good enough. Scarab holds a suspended run at near-zero

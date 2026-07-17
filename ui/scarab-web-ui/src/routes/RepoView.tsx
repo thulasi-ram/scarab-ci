@@ -11,17 +11,21 @@ import {
   putSecret,
   deleteSecret,
   fetchSecretMatrix,
-  listEnvironments,
-  listDeployments,
-  type RunSummary,
-  type RepoEnvironment,
   type SecretCellStatus,
 } from "../api/client";
+import {
+  enrichProvenance,
+  environments,
+  TRIGGER_GLYPH,
+  type Provenance,
+} from "../data/catalog";
 import { relTime, absTime } from "../fmt";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 
+type Row = { id: string; status: string; created_at: number; prov: Provenance };
 type Tab = "runs" | "environments" | "secrets" | "settings";
+type Trigger = "all" | "push" | "pull_request" | "tag" | "manual";
 
 const TABS: [Tab, string][] = [
   ["runs", "Runs"],
@@ -36,26 +40,32 @@ export default function RepoView() {
   const org = () => params.org!;
   const repo = () => params.repo!;
 
-  // Only this repo's tenanted runs (run.org/project stamped at creation,
-  // ADR-0049). Untenanted dev runs (inline `POST /v1/runs`) don't belong to
-  // any repo, so they never show here — the dashboard's activity feed has them.
   const [rows, { refetch }] = createResource(
-    () => ({ org: org(), repo: repo() }),
-    async (k): Promise<RunSummary[]> => {
+    () => repo(),
+    async (r): Promise<Row[]> => {
       const runs = await listRuns(50);
-      return runs.filter((r) => r.org === k.org && r.project === k.repo);
+      return runs.map((x) => ({ ...x, prov: enrichProvenance(x.id, r) }));
     },
   );
 
   const [tab, setTab] = createSignal<Tab>("runs");
   const [statusFilter, setStatusFilter] = createSignal<"all" | "running" | "failed">("all");
+  const [branchFilter, setBranchFilter] = createSignal<string>("all");
+  const [triggerFilter, setTriggerFilter] = createSignal<Trigger>("all");
   const [showEnvDialog, setShowEnvDialog] = createSignal(false);
   const [secretFocus, setSecretFocus] = createSignal(0);
 
+  const branches = () => [...new Set((rows() ?? []).map((r) => r.prov.branch))];
+
   const filtered = () => {
-    const all = rows() ?? [];
+    let all = rows() ?? [];
     const s = statusFilter();
-    return s === "all" ? all : all.filter((r) => r.status === s);
+    if (s !== "all") all = all.filter((r) => r.status === s);
+    const b = branchFilter();
+    if (b !== "all") all = all.filter((r) => r.prov.branch === b);
+    const t = triggerFilter();
+    if (t !== "all") all = all.filter((r) => r.prov.trigger === t);
+    return all;
   };
 
   // The header CTA follows the tab: what you'd create in this context.
@@ -118,40 +128,93 @@ export default function RepoView() {
               </button>
             )}
           </For>
+          <label class="fselect">
+            <Icon icon="git-branch" size={12} />
+            <select value={branchFilter()} onChange={(e) => setBranchFilter(e.currentTarget.value)}>
+              <option value="all">all branches</option>
+              <For each={branches()}>{(b) => <option value={b}>{b}</option>}</For>
+            </select>
+          </label>
+          <label class="fselect">
+            <Icon icon="git-pull-request" size={12} />
+            <select
+              value={triggerFilter()}
+              onChange={(e) => setTriggerFilter(e.currentTarget.value as Trigger)}
+            >
+              <option value="all">all triggers</option>
+              <option value="push">push</option>
+              <option value="pull_request">pull request</option>
+              <option value="tag">tag</option>
+              <option value="manual">manual</option>
+            </select>
+          </label>
           <button class="btn btn-ghost btn-sm filters-refresh" onClick={() => refetch()}>
             <Icon icon="rotate-cw" size={13} /> Refresh
           </button>
         </div>
 
         <Show when={!rows.loading} fallback={<p class="empty">loading…</p>}>
-          <Show when={!rows.error} fallback={<p class="error">Could not load runs.</p>}>
-            <Show when={filtered().length > 0} fallback={<p class="empty">No runs match these filters.</p>}>
-              <div class="runlist">
-                <div class="runrow head">
-                  <span></span><span>run</span><span>status</span><span></span><span>when</span>
-                </div>
-                <For each={filtered()}>
-                  {(r) => (
-                    <div class="runrow" onClick={() => nav(`/${org()}/${repo()}/runs/${r.id}`)}>
-                      <span class={`sdot ${r.status}`} />
-                      <span class="rr-commit">
-                        <span class="rr-sha mono">{r.id.slice(0, 8)}</span>
-                      </span>
-                      <span class="rr-trigger mono">{r.status}</span>
-                      <span class="rr-dur mono"></span>
-                      <span class="rr-when mono" title={absTime(r.created_at)}>{relTime(r.created_at)}</span>
-                    </div>
-                  )}
-                </For>
+          <Show when={filtered().length > 0} fallback={<p class="empty">No runs match these filters.</p>}>
+            <div class="runlist">
+              <div class="runrow head">
+                <span></span><span>commit</span><span>trigger · branch</span><span>duration</span><span>when</span>
               </div>
-            </Show>
+              <For each={filtered()}>
+                {(r) => (
+                  <div class="runrow" onClick={() => nav(`/${org()}/${repo()}/runs/${r.id}`)}>
+                    <span class={`sdot ${r.status}`} />
+                    <span class="rr-commit">
+                      <span class="rr-sha mono">{r.prov.sha}</span>
+                      <span class="rr-msg">{r.prov.message}</span>
+                    </span>
+                    <span class="rr-trigger mono">
+                      <span class="tglyph">{TRIGGER_GLYPH[r.prov.trigger]}</span>
+                      {r.prov.trigger === "pull_request"
+                        ? `PR #${r.prov.prNumber}`
+                        : r.prov.trigger === "tag"
+                          ? r.prov.tag
+                          : r.prov.trigger}
+                      <span class="rr-branch"> · {r.prov.branch}</span>
+                    </span>
+                    <span class="rr-dur mono">{r.status === "pending" ? "—" : r.prov.duration}</span>
+                    <span class="rr-when mono" title={absTime(r.created_at)}>{relTime(r.created_at)}</span>
+                  </div>
+                )}
+              </For>
+            </div>
           </Show>
         </Show>
       </Show>
 
       {/* ---- Environments ---- */}
       <Show when={tab() === "environments"}>
-        <RepoEnvironments org={org()} repo={repo()} />
+        <For each={environments(repo())}>
+          {(env) => (
+            <div class="panel env-panel">
+              <div class="panel-h">
+                <span>{env.name}</span>
+                <span class="subtle mono">current {env.current}</span>
+              </div>
+              <div class="env-body">
+                <div class="env-rules mono">
+                  <Icon icon="shield-check" size={13} /> {env.approvers} approvers
+                  <span class="dotsep">·</span> {env.wait} wait
+                  <span class="dotsep">·</span> {env.allowed}
+                </div>
+                <div class="env-history">
+                  <For each={env.history}>
+                    {(h) => (
+                      <div class="env-h-row mono">
+                        <span class="subtle">{h.when}</span> {h.version}
+                        <span class="ok-mark">✓</span> approved {h.by}
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </div>
+            </div>
+          )}
+        </For>
       </Show>
 
       {/* ---- Secrets ---- */}
@@ -177,68 +240,6 @@ export default function RepoView() {
         <EnvDialog repo={repo()} onClose={() => setShowEnvDialog(false)} />
       </Show>
     </section>
-  );
-}
-
-// ---- environments (real API: `GET …/environments` + per-env deployments) --
-
-function RepoEnvironments(props: { org: string; repo: string }) {
-  const key = () => ({ org: props.org, repo: props.repo });
-  const [envs] = createResource(key, ({ org, repo }) => listEnvironments(org, repo));
-
-  return (
-    <Show when={!envs.loading} fallback={<p class="empty">loading…</p>}>
-      <Show when={!envs.error} fallback={<p class="error">Could not load environments.</p>}>
-        <Show when={(envs()?.length ?? 0) > 0} fallback={<p class="empty">No environments.</p>}>
-          <For each={envs()}>
-            {(env) => <EnvPanel org={props.org} repo={props.repo} env={env} />}
-          </For>
-        </Show>
-      </Show>
-    </Show>
-  );
-}
-
-function EnvPanel(props: { org: string; repo: string; env: RepoEnvironment }) {
-  const key = () => ({ org: props.org, repo: props.repo, name: props.env.name });
-  const [history] = createResource(key, ({ org, repo, name }) =>
-    listDeployments(org, repo, name).catch(() => []),
-  );
-  const rules = () => props.env.protection;
-  const allowed = () => (rules().allowed_refs.length ? rules().allowed_refs.join(", ") : "any ref");
-
-  return (
-    <div class="panel env-panel">
-      <div class="panel-h">
-        <span>{props.env.name}</span>
-        <Show when={(history() ?? []).length > 0}>
-          <span class="subtle mono">current {history()![0]!.git_ref}</span>
-        </Show>
-      </div>
-      <div class="env-body">
-        <div class="env-rules mono">
-          <Icon icon="shield-check" size={13} /> {rules().approvers.length} approver
-          {rules().approvers.length === 1 ? "" : "s"}
-          <span class="dotsep">·</span> {rules().wait_timer}s wait
-          <span class="dotsep">·</span> {allowed()}
-        </div>
-        <div class="env-history">
-          <For
-            each={history() ?? []}
-            fallback={<div class="env-h-row mono subtle">no deployments yet</div>}
-          >
-            {(h) => (
-              <div class="env-h-row mono">
-                <span class="subtle" title={absTime(h.at)}>{relTime(h.at)}</span> {h.git_ref}
-                <Show when={h.approved_by.length > 0}>
-                  <span class="ok-mark">✓</span> approved {h.approved_by.join(", ")}
-                </Show>
-              </div>
-            )}
-          </For>
-        </div>
-      </div>
-    </div>
   );
 }
 

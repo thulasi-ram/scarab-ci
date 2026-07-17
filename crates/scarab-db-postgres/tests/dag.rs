@@ -22,12 +22,6 @@ fn spec() -> StepSpec {
         run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
-        timeout_seconds: None,
-        workspace_inputs: vec![],
-        clone: None,
-        build: None,
-        artifacts: vec![],
-        oidc_token: None,
     }
 }
 

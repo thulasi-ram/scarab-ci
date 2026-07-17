@@ -48,7 +48,6 @@ serve:
     SCARAB_S3_BUCKET=scarab-logs SCARAB_S3_ENDPOINT=http://127.0.0.1:9000 \
     SCARAB_S3_ACCESS_KEY=scarab SCARAB_S3_SECRET_KEY=scarabsecret SCARAB_S3_REGION=us-east-1 \
     KUBECONFIG=dev/.kubeconfig SCARAB_NAMESPACE=scarab \
-    SCARAB_DEV_INSECURE=1 \
     cargo run -p scarab-server -- --role converged --serve --addr 127.0.0.1:8080
 
 # Build + test the workspace. Set SCARAB_TEST_DATABASE_URL to run PG-backed tests.

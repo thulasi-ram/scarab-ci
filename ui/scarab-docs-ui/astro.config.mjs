@@ -14,11 +14,23 @@ import lucode from 'lucode-starlight';
 export default defineConfig({
   site: 'https://thulasi-ram.github.io',
   base: '/scarab-ci/',
+  vite: {
+    // AsciiScene imports baked frames from ui/brand/ascii/generated (the
+    // canonical committed output — not copied per-app). Dev server needs the
+    // parent allowed; production builds import statically regardless.
+    server: { fs: { allow: ['../..'] } },
+  },
   integrations: [
     starlight({
       title: 'Scarab',
       tagline: 'A modern CI engine for Kubernetes — forge-native, on a durable core.',
-      logo: { src: './src/assets/logo.svg', alt: 'Scarab' },
+      // The brand emblem (ui/brand): ink-outline variant on light, gold-outline
+      // on dark — same mark as the favicon.
+      logo: {
+        light: './src/assets/brand/scarab-emblem.svg',
+        dark: './src/assets/brand/scarab-emblem-dark.svg',
+        alt: 'Scarab',
+      },
       // Brand favicon (ui/brand): theme-aware SVG (ink outline on light, gold on
       // dark), with .ico + apple-touch fallbacks. Starlight prepends `base` to
       // `favicon`; the `head` hrefs are written with the /scarab-ci/ base inline.

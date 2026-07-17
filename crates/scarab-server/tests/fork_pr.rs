@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use scarab_forge::{Event, RepoRef};
+use scarab_forge::{Event, Repo};
 use scarab_identity::Claims;
 use scarab_server::{fork_policy, resolve_step_secrets, LogService};
 use scarab_secrets::SecretScope;
@@ -19,7 +19,7 @@ fn scope() -> SecretScope {
 
 fn pr(fork: bool) -> Event {
     Event::PullRequest {
-        repo: RepoRef {
+        repo: Repo {
             owner: "acme".into(),
             name: "app".into(),
         },

@@ -91,30 +91,11 @@ async fn tables_round_trip_via_adapter() {
     let attempt = Attempt {
         id: AttemptId("a1".into()),
         started_at: Timestamp(1_100),
-        failure: Some(FailureKind::Infra { never_started: false }),
+        failure: Some(FailureKind::Infra),
     };
     db.record_attempt(&run, &step, &attempt).await.unwrap();
     let got = db.attempts(&run, &step).await.unwrap();
     assert_eq!(got, vec![attempt]);
-
-    // The full ADR-0047 taxonomy round-trips through the TEXT codec.
-    for (i, failure) in [
-        FailureKind::Infra { never_started: true },
-        FailureKind::Step,
-        FailureKind::Timeout,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let attempt = Attempt {
-            id: AttemptId(format!("a{}", i + 2)),
-            started_at: Timestamp(1_200 + i as i64),
-            failure: Some(failure),
-        };
-        db.record_attempt(&run, &step, &attempt).await.unwrap();
-        let got = db.attempts(&run, &step).await.unwrap();
-        assert_eq!(got.last().unwrap().failure, Some(failure), "{failure:?}");
-    }
 
     // events (append-only, versioned; JSONB payload round-trips)
     let (_, created) = Run::new(run.clone(), at);

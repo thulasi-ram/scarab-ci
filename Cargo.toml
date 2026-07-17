@@ -34,10 +34,9 @@ scarab-forge = { path = "crates/scarab-forge" }
 scarab-identity = { path = "crates/scarab-identity" }
 scarab-secrets = { path = "crates/scarab-secrets" }
 scarab-storage = { path = "crates/scarab-storage" }
-scarab-project = { path = "crates/scarab-project" }
+scarab-projects = { path = "crates/scarab-projects" }
 scarab-db-postgres = { path = "crates/scarab-db-postgres" }
 scarab-forge-github = { path = "crates/scarab-forge-github" }
-scarab-forge-forgejo = { path = "crates/scarab-forge-forgejo" }
 scarab-secrets-postgres = { path = "crates/scarab-secrets-postgres" }
 scarab-storage-s3 = { path = "crates/scarab-storage-s3" }
 scarab-executor-k8s = { path = "crates/scarab-executor-k8s" }
@@ -51,12 +50,11 @@ axum = "0.8"
 utoipa = { version = "5" }
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
-regex-lite = "0.1"
 flate2 = "1"
 tower = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "migrate", "macros", "json"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 # Pin the rustls default CryptoProvider (ring) at the composition root; see the
@@ -69,8 +67,6 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 rand = "0.8"
 base64 = "0.22"
 jsonwebtoken = "9"
-tar = "0.4"
-tempfile = "3"
 rsa = { version = "0.9", features = ["pem"] }
-kube = { version = "4", default-features = false, features = ["client", "ws", "rustls-tls"] }
+kube = { version = "4", default-features = false, features = ["client", "rustls-tls"] }
 k8s-openapi = { version = "0.28", features = ["latest"] }

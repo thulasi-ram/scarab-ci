@@ -69,8 +69,6 @@ async fn background_driver_runs_a_pipeline_end_to_end() {
         "conv-1".to_string(),
         Duration::from_millis(10),
         30_000,
-         3_600_000,
-        "http://scarab.test".to_string(),
     );
 
     // Wait for the driver to carry the run to Succeeded.

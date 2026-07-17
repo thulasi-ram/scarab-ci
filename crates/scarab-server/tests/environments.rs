@@ -27,7 +27,7 @@ use scarab_engine::ports::ExecState;
 use scarab_engine::{
     Db, DeployContext, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
 };
-use scarab_project::{EnvironmentStore, ProtectionRules};
+use scarab_projects::{EnvironmentStore, ProtectionRules};
 use scarab_secrets::{SecretProvider, SecretScope};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeExecutor, FakeSecrets, InMemoryObjectStore};
@@ -99,7 +99,7 @@ async fn environment_management_crud_over_repo_scoped_routes() {
     let resp = app.clone().oneshot(get_req("/v1/repos/acme/web/environments")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-    let envs: Vec<scarab_project::Environment> = serde_json::from_slice(&body).unwrap();
+    let envs: Vec<scarab_projects::Environment> = serde_json::from_slice(&body).unwrap();
     assert_eq!(envs.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), vec!["prod", "staging"]);
 
     // Deployment history starts empty.
@@ -127,7 +127,7 @@ async fn environment_management_crud_over_repo_scoped_routes() {
 /// admit the accumulated approver; otherwise the run stays suspended.
 async fn drive_to_gate(pg: &Arc<PostgresDb>, run: &RunId) {
     let (a, g, b) = (StepId("a".into()), StepId("gate".into()), StepId("b".into()));
-    let spec = StepSpec { image: "busybox".into(), command: vec!["true".into()], env: vec![], secrets: vec![], run_as_root: false, add_capabilities: vec![], privileged: false, timeout_seconds: None, workspace_inputs: vec![], clone: None, build: None, artifacts: vec![], oidc_token: None };
+    let spec = StepSpec { image: "busybox".into(), command: vec!["true".into()], env: vec![], secrets: vec![], run_as_root: false, add_capabilities: vec![], privileged: false };
     pg.create_run(run, 1, 1, Timestamp(0)).await.unwrap();
     pg.create_step_run(run, &a, Some(&spec), &[], Timestamp(0)).await.unwrap();
     pg.create_step_run(run, &g, None, std::slice::from_ref(&a), Timestamp(0)).await.unwrap();
@@ -155,7 +155,7 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
 
     let ctx = DeployContext {
         org: "acme".into(),
-        project: "web".into(),
+        repo: "web".into(),
         environment: "prod".into(),
         git_ref: "refs/heads/main".into(),
         locked_out: false,
@@ -169,7 +169,7 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
     };
 
     // --- Case 1: approver requirement NOT met by the anonymous approver ---
-    pg.put_environment("acme", "web", &scarab_project::Environment {
+    pg.put_environment("acme", "web", &scarab_projects::Environment {
         name: "prod".into(),
         protection: rules(&["alice"], &["refs/heads/main"]), // requires alice, not anonymous
     })
@@ -189,7 +189,7 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
     assert!(pg.deployments("acme", "web", "prod").await.unwrap().is_empty());
 
     // --- Case 2: approver requirement satisfied by the anonymous approver ---
-    pg.put_environment("acme", "web", &scarab_project::Environment {
+    pg.put_environment("acme", "web", &scarab_projects::Environment {
         name: "prod".into(),
         protection: rules(&["anonymous"], &["refs/heads/main"]),
     })
@@ -233,7 +233,7 @@ async fn secret_matrix_reports_effective_status() {
         pg.put_environment(
             "acme",
             "web",
-            &scarab_project::Environment { name: name.into(), protection: rules(&[], &[]) },
+            &scarab_projects::Environment { name: name.into(), protection: rules(&[], &[]) },
         )
         .await
         .unwrap();

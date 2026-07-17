@@ -12,5 +12,4 @@ path = "src/main.rs"
 clap = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
-scarab-pipeline = { workspace = true }
 serde_json = { workspace = true }

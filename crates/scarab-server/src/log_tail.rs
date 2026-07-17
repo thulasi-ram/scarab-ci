@@ -72,10 +72,6 @@ fn fence_of(run: &RunId, step: &StepId, attempt: &AttemptId) -> Fence {
     (run.0.clone(), step.0.clone(), attempt.0.clone())
 }
 
-/// The tail-lease TTL (ADR-0051): long enough to survive a slow tick, short
-/// enough that a crashed replica's steps are re-tailed within a minute.
-const TAIL_LEASE_TTL_MS: i64 = 45_000;
-
 /// Spawns and tracks per-fence log tails. The converged driver calls
 /// [`ensure`](LogTailer::ensure) for every running step each tick; the tailer
 /// dedups by fence so a step is tailed exactly once per attempt while it runs,
@@ -84,11 +80,6 @@ const TAIL_LEASE_TTL_MS: i64 = 45_000;
 pub struct LogTailer {
     executor: Arc<dyn Executor>,
     logs: Arc<LogService>,
-    /// The claim-to-tail lease store (ADR-0051): with `Some`, a fence is
-    /// tailed only while THIS replica holds `tail:{run}:{step}:{attempt}` —
-    /// deduping ingestion across replicas and distributing the log I/O.
-    /// `None` = single-replica mode (in-process dedup only).
-    lease: Option<(Arc<dyn scarab_engine::Db>, String)>,
     /// Fences with a tail task currently in flight (guards against double-tailing
     /// across ticks). A tail removes itself here when it ends, so an early
     /// failure (Pod still Pending, log not yet available) is retried next tick.
@@ -109,17 +100,10 @@ impl LogTailer {
         Self {
             executor,
             logs,
-            lease: None,
             active: Arc::new(Mutex::new(HashSet::new())),
             drained: Arc::new(Mutex::new(HashSet::new())),
             retry_at: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    /// Enable the claim-to-tail lease (ADR-0051): required for 2+ replicas.
-    pub fn with_lease(mut self, db: Arc<dyn scarab_engine::Db>, owner: impl Into<String>) -> Self {
-        self.lease = Some((db, owner.into()));
-        self
     }
 
     /// Ensure a best-effort tail is running for `step`'s current attempt.
@@ -152,52 +136,12 @@ impl LogTailer {
         let active = self.active.clone();
         let drained = self.drained.clone();
         let retry_at = self.retry_at.clone();
-        let lease = self.lease.clone();
         let step_run = step.clone();
         let run = step.run.clone();
         let step_id = step.step.clone();
 
         tokio::spawn(async move {
-            // Claim-to-tail (ADR-0051): only the lease holder tails this
-            // fence; everyone else backs off and re-checks next tick — when
-            // the holder's lease expires (crash), a peer takes over here.
-            let mut renewer: Option<tokio::task::JoinHandle<()>> = None;
-            if let Some((db, owner)) = &lease {
-                let resource = format!("tail:{}:{}:{}", run.0, step_id.0, attempt.0);
-                match db.lease(&resource, owner, TAIL_LEASE_TTL_MS).await {
-                    Ok(l) if &l.owner == owner => {
-                        // Ours: renew in the background while the drain runs.
-                        let db = db.clone();
-                        let owner = owner.clone();
-                        renewer = Some(tokio::spawn(async move {
-                            loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(
-                                    (TAIL_LEASE_TTL_MS / 3) as u64,
-                                ))
-                                .await;
-                                if db.lease(&resource, &owner, TAIL_LEASE_TTL_MS).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }));
-                    }
-                    _ => {
-                        // Another replica tails it (or the store hiccuped):
-                        // back off, retry the claim next backoff window.
-                        retry_at
-                            .lock()
-                            .unwrap()
-                            .insert(fence.clone(), Instant::now() + RETRY_BACKOFF);
-                        active.lock().unwrap().remove(&fence);
-                        return;
-                    }
-                }
-            }
-            let result = drain(&*executor, &logs, &step_run, &run, &step_id, &attempt).await;
-            if let Some(r) = renewer {
-                r.abort();
-            }
-            match result {
+            match drain(&*executor, &logs, &step_run, &run, &step_id, &attempt).await {
                 // Stream closed cleanly: we have the step's complete log. Mark the
                 // fence drained so no later tick re-ingests it (dedup fix).
                 Ok(()) => {

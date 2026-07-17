@@ -28,6 +28,12 @@
   /* Green, used sparingly: links, the TOC current item, and the active edge. */
   --sl-color-text-accent: var(--scarab-emerald);
   --ring: var(--scarab-emerald); /* active-nav rail + focus ring → emerald */
+
+  /* ASCII beetle scenes (ui/brand/ascii): the three brand-role layers.
+   * Deep enough to read as ink on paper; the gray stays quiet. */
+  --ascii-emerald: oklch(50% 0.11 162);
+  --ascii-gold: oklch(55% 0.1 80);
+  --ascii-gray: oklch(62% 0.02 160);
 }
 
 :root[data-theme='dark'] {
@@ -37,7 +43,29 @@
 
   --sl-color-text-accent: var(--scarab-emerald);
   --ring: var(--scarab-emerald);
+
+  --ascii-emerald: oklch(74% 0.13 162);
+  --ascii-gold: oklch(76% 0.11 85);
+  --ascii-gray: oklch(52% 0.02 160);
 }
+
+/* ---- ASCII beetle scenes (landing page only; ui/brand/ascii README) ---- */
+/* Hero slot: the wing-spread loop sits where a hero image would. */
+.ascii-hero-slot {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+/* Landing accent: the dung-roller works beside the prose, not over it. */
+.ascii-accent {
+  float: right;
+  margin: 0 0 0.75rem 1.5rem;
+}
+@media (max-width: 800px) {
+  .ascii-accent { float: none; margin: 1rem auto; }
+}
+/* Asides never run under a floated accent. */
+body:has(.hero) .sl-markdown-content .starlight-aside { clear: right; }
 
 /* ---- Splash: line the body up with the (already constrained) hero ----
  * Starlight leaves splash markdown full-bleed; our hero is capped at ~1024px,

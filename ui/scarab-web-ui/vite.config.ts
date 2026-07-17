@@ -10,6 +10,9 @@ const apiTarget = process.env.SCARAB_API_URL ?? "http://127.0.0.1:8899";
 export default defineConfig({
   plugins: [solid()],
   server: {
+    // Baked ASCII scenes are imported from ../brand/ascii/generated (the
+    // canonical committed output — not copied per-app); allow the parent.
+    fs: { allow: ["../.."] },
     port: 5173,
     proxy: {
       "/v1": { target: apiTarget, changeOrigin: true },

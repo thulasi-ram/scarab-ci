@@ -22,14 +22,6 @@ pub struct BlobHash(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TreeHash(pub String);
 
-/// One stored object as seen by [`ObjectStore::list_objects`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredObject {
-    pub key: String,
-    /// Last-modified, unix-ms — what the GC grace window compares against.
-    pub modified_ms: i64,
-}
-
 /// One entry in a tree: a name bound to either a blob or a sub-tree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeEntry {
@@ -67,11 +59,6 @@ pub trait ObjectStore: Send + Sync {
     async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError>;
     async fn put(&self, key: &str, data: Vec<u8>) -> Result<(), StorageError>;
     async fn delete(&self, key: &str) -> Result<(), StorageError>;
-
-    /// Every stored object under `prefix`, with its last-modified time — the
-    /// GC sweep's candidate list (ADR-0050). Unsupported backends may return
-    /// `Unsupported`; the sweeper then skips CAS GC loudly.
-    async fn list_objects(&self, prefix: &str) -> Result<Vec<StoredObject>, StorageError>;
 }
 
 /// A per-file merkle content-addressed store.
@@ -85,9 +72,6 @@ pub trait Cas: Send + Sync {
 
     /// Store a tree object (a hashed list of entries), returning its hash.
     async fn put_tree(&self, entries: Vec<TreeEntry>) -> Result<TreeHash, StorageError>;
-
-    /// Read a tree object's entries by hash — the GC mark walk (ADR-0050).
-    async fn tree_entries(&self, hash: &TreeHash) -> Result<Vec<TreeEntry>, StorageError>;
 
     /// Materialize a tree onto the filesystem at `path`.
     async fn materialize(&self, tree: &TreeHash, path: &str) -> Result<(), StorageError>;
