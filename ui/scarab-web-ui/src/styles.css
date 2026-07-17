@@ -1129,7 +1129,9 @@ h2 {
    size as a breadcrumb link, followed by the run title. */
 .crumb-head {
   display: flex;
-  align-items: baseline;
+  /* center, not baseline: the title runs smaller than the repo crumb, and the
+     unicase display face reads best optically centered against its cap height */
+  align-items: center;
   gap: 6px;
   margin: 0;
   flex: 0 1 auto;
