@@ -1,0 +1,10 @@
+#!/bin/sh
+# GIT_ASKPASS helper (ADR-0045 token delivery): git invokes this with a prompt
+# string; we answer Username/Password from env + the tmpfs token file under
+# /scarab/secrets/. The token therefore never appears in a URL, in argv, or in
+# .git/config — the remote URL stays credential-free by construction.
+case "$1" in
+  Username*) printf '%s' "${SCARAB_CLONE_USERNAME:-x-access-token}" ;;
+  Password*) cat "${SCARAB_CLONE_TOKEN_FILE:-/scarab/secrets/clone-token}" ;;
+  *) exit 1 ;;
+esac
