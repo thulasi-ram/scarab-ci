@@ -2705,6 +2705,7 @@ dependencies = [
  "scarab-executor-k8s",
  "scarab-executor-local",
  "scarab-forge",
+ "scarab-forge-forgejo",
  "scarab-forge-github",
  "scarab-identity",
  "scarab-pipeline",

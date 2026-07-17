@@ -111,3 +111,149 @@ async fn unsupported_event_is_acknowledged_and_ignored() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(db.active_runs().await.unwrap().is_empty(), "ping creates no run");
 }
+
+// ---------------------------------------------------------------------------
+// Multi-forge routing + replay dedup (ADR-0046)
+// ---------------------------------------------------------------------------
+
+/// App with BOTH forge endpoints + the registry (dedup) wired.
+fn multi_forge_app(db: Arc<InMemoryDb>) -> axum::Router {
+    let clock = Arc::new(FakeClock::new(1_000));
+    let store = Arc::new(InMemoryObjectStore::new());
+    let logs = Arc::new(LogService::new(store, db.clone()));
+    let forge: Arc<dyn ForgePort> = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    router(
+        AppState::new(db.clone(), clock, logs)
+            .with_github_webhook_secret(SECRET.to_vec())
+            .with_forgejo_webhook_secret(b"forgejo-secret".to_vec())
+            .with_forge_connections(db)
+            .with_forge(forge),
+    )
+}
+
+fn forgejo_request(event: &str, delivery: &str, body: &[u8], signature: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/webhooks/forgejo")
+        .header("content-type", "application/json")
+        .header("x-forgejo-event", event)
+        .header("x-forgejo-delivery", delivery)
+        .header("x-forgejo-signature", signature)
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
+/// A signed Forgejo push routes through ITS endpoint/adapter and creates a run
+/// — and each endpoint verifies with its own secret (the GitHub secret does
+/// not open the Forgejo door).
+#[tokio::test]
+async fn forgejo_endpoint_verifies_with_its_own_secret_and_creates_a_run() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let app = multi_forge_app(db.clone());
+
+    // Forgejo payload variant: owner.username instead of owner.login.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "ref": "refs/heads/main",
+        "after": "abc123",
+        "repository": { "name": "app", "owner": { "username": "acme" } }
+    }))
+    .unwrap();
+
+    // Signed with the WRONG (GitHub) secret => rejected.
+    let bad = scarab_forge_forgejo::sign_hex(SECRET, &body);
+    let resp = app
+        .clone()
+        .oneshot(forgejo_request("push", "fj-1", &body, &bad))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Signed with the Forgejo secret => a run starts.
+    let sig = scarab_forge_forgejo::sign_hex(b"forgejo-secret", &body);
+    let resp = app
+        .clone()
+        .oneshot(forgejo_request("push", "fj-1", &body, &sig))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+}
+
+/// A replayed (still correctly-signed) delivery is acknowledged WITHOUT
+/// re-processing — the delivery-id guard (ADR-0046). Distinct ids process.
+#[tokio::test]
+async fn replayed_delivery_is_ignored_idempotently() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let app = multi_forge_app(db.clone());
+
+    let body = push_body();
+    let sig = scarab_forge_github::sign_hex(SECRET, &body);
+    let req = |delivery: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/webhooks/github")
+            .header("content-type", "application/json")
+            .header("x-github-event", "push")
+            .header("x-github-delivery", delivery)
+            .header("x-hub-signature-256", &sig)
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+
+    let resp = app.clone().oneshot(req("gh-d1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1);
+
+    // The exact same delivery again: acknowledged, NOT re-processed.
+    let resp = app.clone().oneshot(req("gh-d1")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(db.active_runs().await.unwrap().len(), 1, "no duplicate run");
+
+    // A different delivery id processes normally.
+    let resp = app.clone().oneshot(req("gh-d2")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(db.active_runs().await.unwrap().len(), 2);
+}
+
+/// A GitHub `installation` webhook auto-registers a ForgeConnection and binds
+/// its repos to Projects (ADR-0046: installing the App IS registration).
+#[tokio::test]
+async fn installation_webhook_auto_registers_the_connection_and_repos() {
+    use scarab_forge::ForgeConnectionStore;
+
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let app = multi_forge_app(db.clone());
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "action": "created",
+        "installation": { "id": 42, "account": { "login": "acme" } },
+        "repositories": [ { "full_name": "acme/web" }, { "full_name": "acme/api" } ]
+    }))
+    .unwrap();
+    let sig = scarab_forge_github::sign_hex(SECRET, &body);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/webhooks/github")
+        .header("content-type", "application/json")
+        .header("x-github-event", "installation")
+        .header("x-github-delivery", "install-d1")
+        .header("x-hub-signature-256", &sig)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The connection exists and both repos resolve to their Projects.
+    let conn = db
+        .get_connection("github-install-42")
+        .await
+        .unwrap()
+        .expect("auto-registered connection");
+    assert_eq!(conn.kind, scarab_forge::ForgeKind::GitHub);
+    let hit = db
+        .resolve(&scarab_forge::RepoRef { owner: "acme".into(), name: "web".into() })
+        .await
+        .unwrap()
+        .expect("repo bound");
+    assert_eq!((hit.org.as_str(), hit.project.as_str()), ("acme", "web"));
+}

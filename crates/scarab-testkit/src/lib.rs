@@ -127,6 +127,12 @@ struct InMemoryState {
     /// Per-run project (fairness) and admission priority.
     run_project: HashMap<RunId, String>,
     run_priority: HashMap<RunId, i32>,
+    /// ForgeConnection registry rows (ADR-0046).
+    forge_connections: HashMap<String, scarab_forge::ForgeConnection>,
+    /// Repo bindings: (owner, name) → (connection id, org, project).
+    forge_repos: HashMap<(String, String), (String, String, String)>,
+    /// Webhook delivery-id replay guard: (forge kind token, delivery id).
+    webhook_deliveries: std::collections::HashSet<(String, String)>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -1149,6 +1155,125 @@ impl FakeForge {
     /// Comments posted via [`post_comment`](ForgePort::post_comment).
     pub fn comments(&self) -> Vec<(u64, String)> {
         self.comments.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl scarab_forge::ForgeConnectionStore for InMemoryDb {
+    async fn put_connection(
+        &self,
+        conn: &scarab_forge::ForgeConnection,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .forge_connections
+            .insert(conn.id.clone(), conn.clone());
+        Ok(())
+    }
+
+    async fn get_connection(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_forge::ForgeConnection>, scarab_forge::RegistryError> {
+        Ok(self.state.lock().unwrap().forge_connections.get(id).cloned())
+    }
+
+    async fn list_connections(
+        &self,
+    ) -> Result<Vec<scarab_forge::ForgeConnection>, scarab_forge::RegistryError> {
+        let mut out: Vec<_> = self
+            .state
+            .lock()
+            .unwrap()
+            .forge_connections
+            .values()
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    async fn delete_connection(&self, id: &str) -> Result<(), scarab_forge::RegistryError> {
+        let mut st = self.state.lock().unwrap();
+        st.forge_connections.remove(id);
+        st.forge_repos.retain(|_, (conn, _, _)| conn != id);
+        Ok(())
+    }
+
+    async fn bind_repo(
+        &self,
+        connection_id: &str,
+        repo: &scarab_forge::RepoRef,
+        org: &str,
+        project: &str,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        self.state.lock().unwrap().forge_repos.insert(
+            (repo.owner.clone(), repo.name.clone()),
+            (connection_id.to_string(), org.to_string(), project.to_string()),
+        );
+        Ok(())
+    }
+
+    async fn unbind_repo(
+        &self,
+        connection_id: &str,
+        repo: &scarab_forge::RepoRef,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        let mut st = self.state.lock().unwrap();
+        let key = (repo.owner.clone(), repo.name.clone());
+        if st.forge_repos.get(&key).is_some_and(|(c, _, _)| c == connection_id) {
+            st.forge_repos.remove(&key);
+        }
+        Ok(())
+    }
+
+    async fn repos_of(
+        &self,
+        connection_id: &str,
+    ) -> Result<Vec<scarab_forge::RepoRef>, scarab_forge::RegistryError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<_> = st
+            .forge_repos
+            .iter()
+            .filter(|(_, (c, _, _))| c == connection_id)
+            .map(|((owner, name), _)| scarab_forge::RepoRef {
+                owner: owner.clone(),
+                name: name.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.owner, &a.name).cmp(&(&b.owner, &b.name)));
+        Ok(out)
+    }
+
+    async fn resolve(
+        &self,
+        repo: &scarab_forge::RepoRef,
+    ) -> Result<Option<scarab_forge::ResolvedRepo>, scarab_forge::RegistryError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .forge_repos
+            .get(&(repo.owner.clone(), repo.name.clone()))
+            .and_then(|(conn_id, org, project)| {
+                st.forge_connections.get(conn_id).map(|c| scarab_forge::ResolvedRepo {
+                    connection: c.clone(),
+                    org: org.clone(),
+                    project: project.clone(),
+                })
+            }))
+    }
+
+    async fn record_delivery(
+        &self,
+        forge: scarab_forge::ForgeKind,
+        delivery_id: &str,
+    ) -> Result<bool, scarab_forge::RegistryError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .webhook_deliveries
+            .insert((forge.as_str().to_string(), delivery_id.to_string())))
     }
 }
 

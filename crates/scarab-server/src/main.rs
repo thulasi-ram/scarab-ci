@@ -187,10 +187,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Enables /v1/environments/* and admission enforcement for
         // env-targeting runs (ADR-0024).
         .with_environments(pg.clone())
+        // The ForgeConnection registry (ADR-0046): RepoRef→Project resolution,
+        // installation auto-registration, webhook replay dedup.
+        .with_forge_connections(pg.clone())
         // /v1/secrets management with the secrets store built above (ADR-0014).
         .with_secrets(secrets.clone());
     if let Some(secret) = config.github_webhook_secret.clone() {
         state = state.with_github_webhook_secret(secret);
+    }
+    if let Some(secret) = config.forgejo_webhook_secret.clone() {
+        state = state.with_forgejo_webhook_secret(secret);
     }
     // Results ingest (ADR-0042): enables POST …/steps/:step/results for the
     // egress sidecar, verified with the same secret that minted its token.

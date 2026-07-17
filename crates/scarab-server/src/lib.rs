@@ -68,6 +68,13 @@ pub struct AppState {
     /// HMAC secret for verifying inbound GitHub webhooks (ADR-0032). `None`
     /// disables the ingest endpoint (rejects with 401).
     pub github_webhook_secret: Option<Vec<u8>>,
+    /// HMAC secret for verifying inbound Forgejo webhooks (ADR-0046 — each
+    /// forge endpoint binds its own secret). `None` disables `/webhooks/forgejo`.
+    pub forgejo_webhook_secret: Option<Vec<u8>>,
+    /// The ForgeConnection registry (ADR-0046): RepoRef→Project resolution,
+    /// installation auto-registration, and the webhook delivery-id replay
+    /// guard. `None` skips dedup/registration (dev without a registry).
+    pub connections: Option<Arc<dyn scarab_forge::ForgeConnectionStore>>,
     /// The forge port used to read in-repo `.scarab` config on a trigger. `None`
     /// means the webhook ingest can verify+normalize but not start config-driven
     /// runs.
@@ -102,6 +109,8 @@ impl AppState {
             clock,
             logs,
             github_webhook_secret: None,
+            forgejo_webhook_secret: None,
+            connections: None,
             forge: None,
             auth: None,
             sessions: None,
@@ -149,6 +158,21 @@ impl AppState {
     /// Set the GitHub webhook HMAC secret (from `SCARAB_GITHUB_WEBHOOK_SECRET`).
     pub fn with_github_webhook_secret(mut self, secret: Vec<u8>) -> Self {
         self.github_webhook_secret = Some(secret);
+        self
+    }
+
+    /// Set the Forgejo webhook HMAC secret (from `SCARAB_FORGEJO_WEBHOOK_SECRET`).
+    pub fn with_forgejo_webhook_secret(mut self, secret: Vec<u8>) -> Self {
+        self.forgejo_webhook_secret = Some(secret);
+        self
+    }
+
+    /// Enable the ForgeConnection registry (dedup, resolution, auto-registration).
+    pub fn with_forge_connections(
+        mut self,
+        connections: Arc<dyn scarab_forge::ForgeConnectionStore>,
+    ) -> Self {
+        self.connections = Some(connections);
         self
     }
 
@@ -1749,50 +1773,31 @@ async fn run_forge_coords(
     Ok(None)
 }
 
-/// Inbound GitHub webhook ingest (ADR-0010, 0032): verify the HMAC signature,
-/// normalize the payload to a canonical forge [`Event`](scarab_forge::Event),
-/// then durably create a Run triggered by it (its steps are populated when the
-/// in-repo `.scarab` config is read on trigger — a later slice-3 issue). The
-/// normalized trigger is persisted on the run's event log for that step to read.
-/// Unverified deliveries are rejected; administrative events (e.g. `ping`) are
-/// acknowledged and ignored.
-async fn github_webhook(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
+/// Replay guard (ADR-0046): record the delivery id against the registry;
+/// `Ok(false)` means this exact delivery was already processed (a replay —
+/// even a correctly-signed one) and must be acknowledged without re-processing.
+/// With no registry wired (dev) or an empty id, dedup is skipped.
+async fn delivery_is_fresh(
+    st: &AppState,
+    forge: scarab_forge::ForgeKind,
+    delivery_id: &str,
+) -> Result<bool, ApiError> {
+    let (Some(connections), false) = (st.connections.as_ref(), delivery_id.is_empty()) else {
+        return Ok(true);
+    };
+    connections
+        .record_delivery(forge, delivery_id)
+        .await
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))
+}
+
+/// The shared tail of every webhook ingest: read in-repo `.scarab` config at
+/// the event ref, compile, and start Runs if a pipeline's `on:` matches
+/// (ADR-0010). Without a forge wired we can only acknowledge the delivery.
+async fn ingest_event(
+    st: &AppState,
+    event: scarab_forge::Event,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    // Verify HMAC-SHA256 over the raw body (ADR-0032). No secret configured =>
-    // the endpoint is closed.
-    let secret = st
-        .github_webhook_secret
-        .as_deref()
-        .ok_or(ApiError::Unauthorized)?;
-    let sig = headers
-        .get("x-hub-signature-256")
-        .and_then(|v| v.to_str().ok());
-    scarab_forge_github::verify_signature(secret, body.as_ref(), sig)
-        .map_err(|_| ApiError::Unauthorized)?;
-
-    let payload: serde_json::Value = serde_json::from_slice(body.as_ref())
-        .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}")))?;
-    let delivery = scarab_forge::WebhookDelivery {
-        id: header_str(&headers, "x-github-delivery"),
-        event: header_str(&headers, "x-github-event"),
-        signature: sig.map(str::to_string),
-        payload,
-    };
-    let event = match scarab_forge_github::normalize(&delivery) {
-        Ok(e) => e,
-        // Acknowledge-and-ignore events we don't act on (ping, unsupported).
-        Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
-            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
-        }
-        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
-    };
-
-    // Read in-repo `.scarab` config at the event ref, compile, and start a run
-    // if the pipeline's `on:` matches (ADR-0010). Without a forge wired, we can
-    // only acknowledge the delivery.
     let Some(forge) = st.forge.as_ref() else {
         return Ok((
             StatusCode::OK,
@@ -1825,6 +1830,156 @@ async fn github_webhook(
         Err(TriggerError::Db(e)) => Err(ApiError::Db(e)),
         Err(e) => Err(ApiError::BadRequest(e.to_string())),
     }
+}
+
+/// Inbound GitHub webhook ingest (ADR-0010, 0032, 0046): verify the HMAC
+/// signature with the GitHub secret, guard against replays by delivery id,
+/// auto-register installation events into the ForgeConnection registry
+/// (installing the App IS registration), normalize the payload to a canonical
+/// [`Event`](scarab_forge::Event), and durably create the triggered Runs.
+/// Unverified deliveries are rejected; administrative events (e.g. `ping`)
+/// are acknowledged and ignored.
+async fn github_webhook(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Verify HMAC-SHA256 over the raw body (ADR-0032). No secret configured =>
+    // the endpoint is closed.
+    let secret = st
+        .github_webhook_secret
+        .as_deref()
+        .ok_or(ApiError::Unauthorized)?;
+    let sig = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok());
+    scarab_forge_github::verify_signature(secret, body.as_ref(), sig)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    let payload: serde_json::Value = serde_json::from_slice(body.as_ref())
+        .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}")))?;
+    let delivery = scarab_forge::WebhookDelivery {
+        id: header_str(&headers, "x-github-delivery"),
+        event: header_str(&headers, "x-github-event"),
+        signature: sig.map(str::to_string),
+        payload,
+    };
+
+    // Replay guard — only verified deliveries are recorded (ADR-0046).
+    if !delivery_is_fresh(&st, scarab_forge::ForgeKind::GitHub, &delivery.id).await? {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "ignored": "duplicate delivery" })),
+        ));
+    }
+
+    // Installation lifecycle → registry auto-registration (ADR-0046).
+    if let Some(sync) = scarab_forge_github::installation_sync(&delivery) {
+        if let Some(connections) = st.connections.as_ref() {
+            let conn_id = format!("github-install-{}", sync.installation_id);
+            connections
+                .put_connection(&scarab_forge::ForgeConnection {
+                    id: conn_id.clone(),
+                    kind: scarab_forge::ForgeKind::GitHub,
+                    base_url: "https://api.github.com".into(),
+                    // The App credential is shared across installations; the
+                    // composition root registers it under this handle.
+                    credential_ref: "github-app".into(),
+                })
+                .await
+                .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+            scarab_forge_github::apply_installation_sync(
+                connections.as_ref(),
+                &conn_id,
+                &sync.account,
+                &sync,
+            )
+            .await
+            .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "registered": { "added": sync.added.len(), "removed": sync.removed.len() },
+                })),
+            ));
+        }
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "ignored": "no registry configured" })),
+        ));
+    }
+
+    let event = match scarab_forge_github::normalize(&delivery) {
+        Ok(e) => e,
+        // Acknowledge-and-ignore events we don't act on (ping, unsupported).
+        Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
+            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
+        }
+        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+    };
+    ingest_event(&st, event).await
+}
+
+/// Inbound Forgejo webhook ingest (ADR-0046): the second per-forge endpoint,
+/// bound to the Forgejo adapter's verification (plain-hex
+/// `X-Forgejo/Gitea-Signature`) and its own secret — no payload sniffing on a
+/// shared endpoint. Same replay guard, same canonical vocabulary downstream.
+async fn forgejo_webhook(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let secret = st
+        .forgejo_webhook_secret
+        .as_deref()
+        .ok_or(ApiError::Unauthorized)?;
+    let sig = headers
+        .get("x-forgejo-signature")
+        .or_else(|| headers.get("x-gitea-signature"))
+        .and_then(|v| v.to_str().ok());
+    scarab_forge_forgejo::verify_signature(secret, body.as_ref(), sig)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    let payload: serde_json::Value = serde_json::from_slice(body.as_ref())
+        .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}")))?;
+    let event_header = {
+        let forgejo = header_str(&headers, "x-forgejo-event");
+        if forgejo.is_empty() {
+            header_str(&headers, "x-gitea-event")
+        } else {
+            forgejo
+        }
+    };
+    let delivery_id = {
+        let forgejo = header_str(&headers, "x-forgejo-delivery");
+        if forgejo.is_empty() {
+            header_str(&headers, "x-gitea-delivery")
+        } else {
+            forgejo
+        }
+    };
+    let delivery = scarab_forge::WebhookDelivery {
+        id: delivery_id,
+        event: event_header,
+        signature: sig.map(str::to_string),
+        payload,
+    };
+
+    if !delivery_is_fresh(&st, scarab_forge::ForgeKind::Forgejo, &delivery.id).await? {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({ "ignored": "duplicate delivery" })),
+        ));
+    }
+
+    let event = match scarab_forge_forgejo::normalize(&delivery) {
+        Ok(e) => e,
+        Err(scarab_forge::ForgeError::UnsupportedEvent(_)) => {
+            return Ok((StatusCode::OK, Json(serde_json::json!({ "ignored": true }))));
+        }
+        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+    };
+    ingest_event(&st, event).await
 }
 
 fn header_str(headers: &HeaderMap, name: &str) -> String {
@@ -2683,6 +2838,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/repos/{org}/{repo}/dispatch", post(dispatch))
         .route("/webhooks/github", post(github_webhook))
+        .route("/webhooks/forgejo", post(forgejo_webhook))
         .with_state(state)
 }
 

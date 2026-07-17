@@ -166,6 +166,9 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 pub struct InstallationSync {
     /// The GitHub App installation the delivery belongs to.
     pub installation_id: u64,
+    /// The account (user/org login) the App was installed on — the default
+    /// Scarab Org for auto-registered Projects.
+    pub account: String,
     pub added: Vec<RepoRef>,
     pub removed: Vec<RepoRef>,
 }
@@ -176,6 +179,11 @@ pub struct InstallationSync {
 pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync> {
     let p = &delivery.payload;
     let installation_id = p.pointer("/installation/id").and_then(Value::as_u64)?;
+    let account = p
+        .pointer("/installation/account/login")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let repos_at = |ptr: &str| -> Vec<RepoRef> {
         p.pointer(ptr)
             .and_then(Value::as_array)
@@ -201,11 +209,13 @@ pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync>
             match action {
                 "created" | "unsuspend" => Some(InstallationSync {
                     installation_id,
+                    account,
                     added: repos,
                     removed: vec![],
                 }),
                 "deleted" | "suspend" => Some(InstallationSync {
                     installation_id,
+                    account,
                     added: vec![],
                     removed: repos,
                 }),
@@ -214,6 +224,7 @@ pub fn installation_sync(delivery: &WebhookDelivery) -> Option<InstallationSync>
         }
         "installation_repositories" => Some(InstallationSync {
             installation_id,
+            account,
             added: repos_at("/repositories_added"),
             removed: repos_at("/repositories_removed"),
         }),
@@ -871,7 +882,7 @@ mod tests {
             "installation",
             json!({
                 "action": "created",
-                "installation": { "id": 77 },
+                "installation": { "id": 77, "account": { "login": "acme" } },
                 "repositories": [
                     { "full_name": "acme/web" },
                     { "full_name": "acme/api" },
@@ -882,6 +893,7 @@ mod tests {
             installation_sync(&created).unwrap(),
             InstallationSync {
                 installation_id: 77,
+                account: "acme".into(),
                 added: vec![
                     RepoRef { owner: "acme".into(), name: "web".into() },
                     RepoRef { owner: "acme".into(), name: "api".into() },

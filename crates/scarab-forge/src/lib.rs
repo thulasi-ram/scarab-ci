@@ -482,6 +482,15 @@ pub trait ForgeConnectionStore: Send + Sync {
     /// *which forge, which base URL, which credentials* (ADR-0046). `None` for
     /// an unregistered repo (its webhooks are dropped).
     async fn resolve(&self, repo: &RepoRef) -> Result<Option<ResolvedRepo>, RegistryError>;
+
+    /// Record a webhook delivery id for `forge` — the replay guard (ADR-0046).
+    /// Returns `true` if this is the FIRST time the id is seen; `false` for a
+    /// replay (the caller acknowledges without re-processing). Idempotent.
+    async fn record_delivery(
+        &self,
+        forge: ForgeKind,
+        delivery_id: &str,
+    ) -> Result<bool, RegistryError>;
 }
 
 /// The shared **`ForgePort` contract-test suite** (ADR-0046): the behavioural

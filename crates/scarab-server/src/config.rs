@@ -26,6 +26,7 @@
 //! | `SCARAB_RESULTS_API_URL` | env | base URL the sidecar posts results to |
 //! | `SCARAB_SIDECAR_IMAGE` | env | results-egress sidecar image |
 //! | `SCARAB_GITHUB_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/github` |
+//! | `SCARAB_FORGEJO_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/forgejo` (ADR-0046 — each forge endpoint binds its own secret) |
 //! | `SCARAB_GATE_TOKEN_SECRET` | env | enables external-gate release tokens (ADR-0034) |
 //! | `SCARAB_OIDC_ISSUER` | env | enables the OIDC issuer (keyless federation, ADR-0015) |
 //! | `SCARAB_OIDC_SIGNING_KEY_FILE` | env | PKCS#8 RSA PEM the issuer signs with — **required** when the issuer is enabled (persistent across restarts/replicas) |
@@ -183,6 +184,7 @@ pub struct Config {
     pub store: StoreConfig,
     pub results_egress: Option<ResultsEgressConfig>,
     pub github_webhook_secret: Option<Vec<u8>>,
+    pub forgejo_webhook_secret: Option<Vec<u8>>,
     pub gate_token_secret: Option<Vec<u8>>,
     pub oidc: Option<OidcConfig>,
     /// The envelope-encryption KEK (`SCARAB_MASTER_KEY`). `None` only under
@@ -358,6 +360,7 @@ impl Config {
             store,
             results_egress,
             github_webhook_secret: env("SCARAB_GITHUB_WEBHOOK_SECRET").map(String::into_bytes),
+            forgejo_webhook_secret: env("SCARAB_FORGEJO_WEBHOOK_SECRET").map(String::into_bytes),
             gate_token_secret: env("SCARAB_GATE_TOKEN_SECRET").map(String::into_bytes),
             oidc,
             master_key,
@@ -435,6 +438,7 @@ impl Config {
             ),
             format!("results egress: {} (ADR-0042)", on_off(self.results_egress.is_some())),
             format!("github webhook: {}", on_off(self.github_webhook_secret.is_some())),
+            format!("forgejo webhook: {}", on_off(self.forgejo_webhook_secret.is_some())),
             format!("gate release tokens: {}", on_off(self.gate_token_secret.is_some())),
             match &self.oidc {
                 Some(o) => format!(

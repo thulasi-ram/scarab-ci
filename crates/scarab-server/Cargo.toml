@@ -45,6 +45,7 @@ scarab-storage = { workspace = true }
 scarab-project = { workspace = true }
 scarab-db-postgres = { workspace = true }
 scarab-forge-github = { workspace = true }
+scarab-forge-forgejo = { workspace = true }
 scarab-secrets-postgres = { workspace = true }
 scarab-storage-s3 = { workspace = true }
 scarab-executor-k8s = { workspace = true }

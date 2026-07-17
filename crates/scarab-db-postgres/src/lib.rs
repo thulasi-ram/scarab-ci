@@ -1281,6 +1281,25 @@ impl ForgeConnectionStore for PostgresDb {
         })
         .transpose()
     }
+
+    async fn record_delivery(
+        &self,
+        forge: ForgeKind,
+        delivery_id: &str,
+    ) -> Result<bool, RegistryError> {
+        // First writer wins; a conflicting insert (a replay) affects zero rows.
+        let result = sqlx::query(
+            "INSERT INTO webhook_deliveries (forge, id, at)
+             VALUES ($1, $2, (extract(epoch from now()) * 1000)::bigint)
+             ON CONFLICT (forge, id) DO NOTHING",
+        )
+        .bind(forge.as_str())
+        .bind(delivery_id)
+        .execute(self.pool())
+        .await
+        .map_err(reg_err)?;
+        Ok(result.rows_affected() == 1)
+    }
 }
 
 fn connection_from_row(r: sqlx::postgres::PgRow) -> Result<ForgeConnection, RegistryError> {
