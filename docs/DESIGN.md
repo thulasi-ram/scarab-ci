@@ -167,7 +167,7 @@ Major Mono Display; section headings stay Space Grotesk.
 
 | Role | Family | Size | Weight | Tracking |
 |------|--------|------|--------|----------|
-| Display / Hero (`h1`) | Major Mono Display | 40px | 400 | 0 |
+| Display / Hero (`h1`) | Major Mono Display | 32px | 400 | 0 |
 | Run title / breadcrumb | Major Mono Display | 22–24px | 400 | 0 |
 | Section heading (`h2`) | Space Grotesk | 20px | 600 | -0.4px |
 | Card / repo name | Space Grotesk | 15px | 600 | -0.3px |

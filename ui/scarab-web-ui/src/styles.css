@@ -305,9 +305,11 @@ code,
 
 h1 {
   font-family: var(--font-display);
-  font-size: 40px;
+  /* The biform is WIDE — it carries presence through width, not height, so
+     the page title runs smaller than a normal face would. */
+  font-size: 32px;
   font-weight: 700;
-  line-height: 1.02;
+  line-height: 1.05;
   letter-spacing: -1.4px;
   color: var(--display-ink);
   margin: 0 0 24px;
