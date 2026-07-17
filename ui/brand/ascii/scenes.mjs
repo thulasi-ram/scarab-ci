@@ -170,10 +170,17 @@ export function drawBeetle(x, u, cols, rows, opts = {}) {
     }
   }
 
-  // dung ball — outline + rotating flecks, resting on the ground
+  // dung ball — outline + rotating flecks, resting on the ground.
+  // The rim is dashed and phase-locked to the roll (a smooth circle rotating
+  // is invisible); 21 segments divide the circumference exactly, so the loop
+  // stays seamless.
   const by = GY - BALL.r;
+  const rimPeriod = (TAU * BALL.r) / 21;
   x.strokeStyle = "#d9b45e"; x.lineWidth = 2.2;
+  x.setLineDash([rimPeriod * 0.62, rimPeriod * 0.38]);
+  x.lineDashOffset = -roll * BALL.r;
   x.beginPath(); x.arc(BALL.x, by, BALL.r, 0, 7); x.stroke();
+  x.setLineDash([]);
   x.fillStyle = "#b3924a";
   for (let i = 0; i < 16; i++) {
     const a = roll + i * 2.39996;            // golden-angle scatter
