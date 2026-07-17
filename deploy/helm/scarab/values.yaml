@@ -30,22 +30,6 @@ scarab:
   extraEnv:
     RUST_LOG: "info"
 
-  # --- forge / GitHub App auth (ADR-0046) ---------------------------------
-  # GitHub App id: when set, GitHub connections authenticate in App mode (their
-  # credential secret is the App PEM, stored via the API at org `_forge`).
-  # Empty => token mode (dev).
-  githubAppId: ""
-  # Scarab's public base URL: the run deep-link every forge commit status
-  # carries (`{publicUrl}/runs/{id}`). Empty => the server default
-  # (http://localhost:8080). Set this to your ingress / tunnel URL.
-  publicUrl: ""
-  # The canonical scarab-clone image a `clone` step runs (ADR-0045). Empty =>
-  # the server default (ghcr `:edge`). Digest-pin in production.
-  cloneImage: ""
-  # Global default step deadline in seconds (ADR-0047). Empty => server
-  # default (3600). Per-step `timeout:` always overrides.
-  stepTimeoutSecs: ""
-
   # Object store (logs/artifacts). When bucket is set the S3/MinIO backend is
   # used; otherwise scarab falls back to a local directory (dev only).
   s3:

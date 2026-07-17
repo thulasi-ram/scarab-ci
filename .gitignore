@@ -6,13 +6,8 @@
 /dev/.kubeconfig
 /dev/server.pid
 /dev/server.log
-# local object-store backend (default dev fallback) and other runtime state
-# under .scarab/ — but keep committed pipeline configs (.scarab/*.yaml and the
-# .scarab/lib/ catalog) tracked; that is where a repo declares its own CI.
-/.scarab/*
-!/.scarab/*.yaml
-!/.scarab/*.yml
-!/.scarab/lib/
+# local object-store backend (default dev fallback)
+/.scarab
 
 # machine-specific dev env (direnv loads it; see .env.local.example)
 /.env.local

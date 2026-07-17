@@ -37,11 +37,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # --- runtime ---------------------------------------------------------------
 # --- The web UI (ADR-0054): built once, baked into the runtime image. -----
+# The build context mirrors the repo's `ui/` layout: scarab-web-ui imports
+# shared brand assets from its sibling `ui/brand` via `../../../brand/...`
+# (the ASCII motifs, PR #18), so both must sit under a common `ui/` root here
+# or those relative imports resolve outside the tree and rollup fails.
 FROM node:22-bookworm-slim AS ui
-WORKDIR /ui
+WORKDIR /ui/scarab-web-ui
 COPY ui/scarab-web-ui/package.json ui/scarab-web-ui/package-lock.json ./
 RUN npm ci
 COPY ui/scarab-web-ui .
+COPY ui/brand /ui/brand
 COPY openapi.json /openapi.json
 RUN sed -i 's|../../openapi.json|/openapi.json|' package.json && npm run gen && npm run build
 
@@ -55,7 +60,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /usr/local/bin/scarab-server /usr/local/bin/scarab-server
 # The same-origin web UI (ADR-0054): the server serves it at / when present.
-COPY --from=ui /ui/dist /usr/share/scarab/ui
+COPY --from=ui /ui/scarab-web-ui/dist /usr/share/scarab/ui
 ENV SCARAB_UI_DIR=/usr/share/scarab/ui
 
 # Default object-store fallback dir lives under the writable home when no S3 is
