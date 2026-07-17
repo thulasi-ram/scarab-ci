@@ -590,6 +590,7 @@ async fn create_run(
             add_capabilities: admitted.add_capabilities,
             privileged: admitted.privileged,
             timeout_seconds: step.timeout,
+            workspace_inputs: vec![],
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -1657,6 +1658,7 @@ async fn persist_run_from_ir(
                 add_capabilities: admitted.add_capabilities,
                 privileged: admitted.privileged,
                 timeout_seconds: step.timeout,
+            workspace_inputs: vec![],
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;

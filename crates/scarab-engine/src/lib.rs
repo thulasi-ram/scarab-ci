@@ -219,6 +219,12 @@ pub struct StepSpec {
     /// kill-timer); the scheduler keeps an engine-side backstop.
     #[serde(default)]
     pub timeout_seconds: Option<u32>,
+    /// The CAS tree roots of the workspaces this step consumes (ADR-0007/
+    /// 0029/0045): the outputs of its `needs` (or its explicit `inputs:`
+    /// subset), merged in order. Filled by the scheduler at launch; the
+    /// executor materializes them into `/workspace` before the step starts.
+    #[serde(default)]
+    pub workspace_inputs: Vec<String>,
 }
 
 /// A manual/approval gate that suspends a run until released.

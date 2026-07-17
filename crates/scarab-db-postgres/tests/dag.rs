@@ -23,6 +23,7 @@ fn spec() -> StepSpec {
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
+        workspace_inputs: vec![],
     }
 }
 

@@ -81,17 +81,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db: Arc<dyn Db> = pg.clone();
 
     // Object store: MinIO/S3 when SCARAB_S3_BUCKET is set (the dev harness /
-    // prod), else a local directory (zero-dependency dev).
-    let store: Arc<dyn ObjectStore> = match &config.store {
-        StoreConfig::S3(s3) => Arc::new(S3Storage::s3(
+    // prod), else a local directory (zero-dependency dev). One S3Storage backs
+    // BOTH ports: the log/artifact ObjectStore and the workspace Cas
+    // (ADR-0029/0045).
+    let storage = Arc::new(match &config.store {
+        StoreConfig::S3(s3) => S3Storage::s3(
             s3.bucket.clone(),
             &s3.endpoint,
             &s3.region,
             &s3.access_key,
             &s3.secret_key,
-        )?),
-        StoreConfig::LocalDir(dir) => Arc::new(S3Storage::local(dir)?),
-    };
+        )?,
+        StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
+    });
+    let store: Arc<dyn ObjectStore> = storage.clone();
+    let workspace_cas: Arc<dyn scarab_storage::Cas> = storage;
     let logs = Arc::new(LogService::new(store, db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
@@ -169,7 +173,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             ExecutorKind::K8s => match K8sExecutor::connect(config.namespace.clone()).await {
                 Ok(mut exec) => {
-                    exec = exec.with_default_step_timeout_secs(config.step_timeout_secs);
+                    exec = exec
+                        .with_default_step_timeout_secs(config.step_timeout_secs)
+                        // Workspace flow (ADR-0029/0045): materialize `needs`
+                        // into /workspace, snapshot it back after the step.
+                        .with_workspace_cas(workspace_cas.clone());
                     if let Some(egress) = results_egress.clone() {
                         exec = exec.with_results_egress(egress);
                         tracing::info!("results egress sidecar enabled (ADR-0042)");

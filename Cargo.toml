@@ -68,6 +68,8 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 rand = "0.8"
 base64 = "0.22"
 jsonwebtoken = "9"
+tar = "0.4"
+tempfile = "3"
 rsa = { version = "0.9", features = ["pem"] }
-kube = { version = "4", default-features = false, features = ["client", "rustls-tls"] }
+kube = { version = "4", default-features = false, features = ["client", "ws", "rustls-tls"] }
 k8s-openapi = { version = "0.28", features = ["latest"] }

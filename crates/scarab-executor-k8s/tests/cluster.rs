@@ -66,6 +66,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
+        workspace_inputs: vec![],
     };
 
     // launch, then launch again — the second call must re-attach, not relaunch.
@@ -124,6 +125,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: Some(5),
+        workspace_inputs: vec![],
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -173,6 +175,7 @@ async fn log_stream_tails_pod_stdout() {
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
+        workspace_inputs: vec![],
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -211,4 +214,108 @@ async fn rootless_buildkit_builds_an_image() {
     }
     // Intentionally left as a harness placeholder: applying build_pod_for_build
     // to the cluster, waiting for completion, and asserting a pushed digest.
+}
+
+/// Live workspace flow (ADR-0029/0045 keystone): step A writes a file into
+/// /workspace, its workspace is snapshotted into the CAS (Executor::output
+/// returns the root), and step B (`needs: [A]`) has it materialized and reads
+/// it back. Also proves restart determinism: re-running A yields the SAME
+/// CAS root. `#[ignore]`d + gated on SCARAB_TEST_KUBE.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn workspace_flows_from_a_to_b_through_the_cas() {
+    use scarab_storage::Cas;
+    let Some(ns) = opted_in() else { return };
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    // SCARAB_TEST_CAS_DIR pins the CAS for post-mortem inspection; default is
+    // a tempdir that lives for the duration of the test.
+    let tmp = tempfile::tempdir().expect("cas dir");
+    let cas_dir = std::env::var("SCARAB_TEST_CAS_DIR")
+        .unwrap_or_else(|_| tmp.path().to_string_lossy().into_owned());
+    std::fs::create_dir_all(&cas_dir).expect("cas dir");
+    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
+        scarab_storage_s3::S3Storage::local(&cas_dir).expect("local cas"),
+    );
+    let exec = K8sExecutor::with_client(ns, client).with_workspace_cas(cas);
+
+    let step_run = |id: &str, attempt: &str| StepRun {
+        run: RunId("run-ws".into()),
+        step: StepId(id.into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId(attempt.into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let spec = |cmd: &str, inputs: Vec<String>| StepSpec {
+        image: "busybox:latest".into(),
+        command: vec!["sh".into(), "-c".into(), cmd.into()],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: true, // busybox runs as root; fsGroup covers the emptyDir
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(120),
+        workspace_inputs: inputs,
+    };
+    async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
+        for _ in 0..90 {
+            match exec.poll(h).await.expect("poll") {
+                s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
+                    return s;
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+            }
+        }
+        panic!("pod did not settle");
+    }
+
+    // --- Step A: produce a file in /workspace. ---
+    let a = step_run("a", "a1");
+    let ha = exec
+        .launch(&a, &spec("echo scarab-was-here > /workspace/out.txt", vec![]))
+        .await
+        .expect("launch A");
+    assert_eq!(settle(&exec, &ha).await, ExecState::Succeeded, "A succeeds");
+    let root_a = exec
+        .output(&ha)
+        .await
+        .expect("output")
+        .expect("A produced a workspace snapshot");
+
+    // --- Step B (needs: [A]): the file is materialized and readable. ---
+    let b = step_run("b", "a1");
+    let hb = exec
+        .launch(
+            &b,
+            &spec(
+                "grep -q scarab-was-here /workspace/out.txt",
+                vec![root_a.clone()],
+            ),
+        )
+        .await
+        .expect("launch B");
+    assert_eq!(
+        settle(&exec, &hb).await,
+        ExecState::Succeeded,
+        "B read the file A wrote — the workspace flowed through the CAS"
+    );
+
+    // --- Restart determinism: a NEW attempt of A yields the SAME root. ---
+    let a2 = step_run("a", "a2");
+    let ha2 = exec
+        .launch(&a2, &spec("echo scarab-was-here > /workspace/out.txt", vec![]))
+        .await
+        .expect("relaunch A");
+    assert_eq!(settle(&exec, &ha2).await, ExecState::Succeeded);
+    let root_a2 = exec.output(&ha2).await.expect("output").expect("snapshot");
+    assert_eq!(root_a, root_a2, "same content => same CAS root (deterministic)");
+
+    for h in [ha, hb, ha2] {
+        exec.cancel(&h).await.expect("cleanup");
+    }
 }

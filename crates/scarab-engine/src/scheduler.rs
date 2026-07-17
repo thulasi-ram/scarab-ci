@@ -659,6 +659,32 @@ impl<'a> Scheduler<'a> {
                         .await?
                         .ok_or_else(|| SchedulerError::MissingSpec(step.clone()))?;
 
+                    // Workspace inputs (ADR-0007/0029/0045): the CAS roots of
+                    // the workspaces this step consumes — its explicit
+                    // `inputs:` subset or all of its `needs` — merged in
+                    // order. The executor materializes them into `/workspace`
+                    // before the step starts. Deterministic on re-drive: the
+                    // outputs are re-read from the store.
+                    let mut spec = spec;
+                    {
+                        let all = self.db.steps_of_run(&run).await?;
+                        if let Some(me) = all.iter().find(|s| s.step == step) {
+                            let consumed = self
+                                .db
+                                .step_inputs(&run, &step)
+                                .await?
+                                .unwrap_or_else(|| me.needs.clone());
+                            let mut output_of = HashMap::new();
+                            for s in &all {
+                                if let Some(o) = self.db.step_output(&run, &s.step).await? {
+                                    output_of.insert(s.step.clone(), o);
+                                }
+                            }
+                            spec.workspace_inputs =
+                                crate::workspace_inputs(&consumed, &output_of);
+                        }
+                    }
+
                     // Launch-time interpolation (ADR-0041): resolve
                     // `${{ outputs.… }}` against upstream results before
                     // launch. A bad reference fails fast — as a *step* failure
