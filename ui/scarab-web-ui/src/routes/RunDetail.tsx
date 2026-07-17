@@ -11,6 +11,7 @@ import {
   fetchEvents,
   streamLogs,
   restartStep,
+  cancelRun,
   isTerminal,
   runParams,
   type RunStatus,
@@ -42,6 +43,7 @@ export default function RunDetail() {
   const [live, setLive] = createSignal(true);
   const [sel, setSel] = createSignal<string | null>(null);
   const [restarting, setRestarting] = createSignal<string | null>(null);
+  const [cancelling, setCancelling] = createSignal(false);
   const [follow, setFollow] = createSignal(true);
   const [wrap, setWrap] = createSignal(true);
 
@@ -123,6 +125,17 @@ export default function RunDetail() {
     }
   }
 
+  async function onCancel() {
+    setCancelling(true);
+    try {
+      await cancelRun(id());
+      setLog((p) => p + `\n— cancelled —\n`);
+      await refresh();
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   return (
     <section class="page">
       <Doodle icon="container" size={230} rotate={14} opacity={0.05} bottom="40px" right="60px" />
@@ -165,8 +178,13 @@ export default function RunDetail() {
               >
                 <Icon icon="rotate-cw" size={13} /> Re-run
               </button>
-              <button class="btn btn-ghost btn-sm" disabled title="cancel lands with scheduler support">
-                Cancel
+              <button
+                class="btn btn-ghost btn-sm"
+                onClick={() => void onCancel()}
+                disabled={cancelling() || (run() ? isTerminal(run()!.status) : true)}
+                title="cancel this run and tear down its steps"
+              >
+                {cancelling() ? "cancelling…" : "Cancel"}
               </button>
             </div>
 

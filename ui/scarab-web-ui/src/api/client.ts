@@ -246,6 +246,14 @@ export async function restartStep(id: string, step: string): Promise<void> {
   if (error) throw new Error(`failed to restart ${step}`);
 }
 
+/** Cancel a run — steps settle Cancelled, Pods tear down (`POST …/cancel`). */
+export async function cancelRun(id: string): Promise<void> {
+  const { error } = await api.POST("/v1/runs/{id}/cancel", {
+    params: { path: { id } },
+  });
+  if (error) throw new Error(`failed to cancel run ${id}`);
+}
+
 /** Whether a run status is terminal (no further updates will stream). */
 export function isTerminal(status: string): boolean {
   return status === "succeeded" || status === "failed" || status === "cancelled";

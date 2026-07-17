@@ -1081,6 +1081,42 @@ async fn restart_step(
     }
 }
 
+/// Cancel a run (ADR-0054): drive its non-terminal steps and the run to
+/// `Cancelled` durably and enqueue the Pod-teardown intent the driver
+/// executes (SIGTERM + grace via the backend). Idempotent — cancelling a
+/// terminal run is a 409; an unknown run is a 404.
+#[utoipa::path(
+    post,
+    path = "/v1/runs/{id}/cancel",
+    params(("id" = String, Path, description = "run id")),
+    responses(
+        (status = 202, description = "cancellation recorded; Pods tear down asynchronously"),
+        (status = 404, description = "no such run"),
+        (status = 409, description = "run already terminal")
+    )
+)]
+async fn cancel_run(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let Some(status) = st.db.run_status(&run).await? else {
+        return Err(ApiError::NotFound);
+    };
+    match scarab_engine::cancel_run_request(&*st.db, &*st.clock, &run).await {
+        Ok(true) => Ok(StatusCode::ACCEPTED),
+        Ok(false) => {
+            // Known run, nothing to cancel: already terminal.
+            let _ = status;
+            Ok(StatusCode::CONFLICT)
+        }
+        Err(e) => Err(ApiError::BadRequest(e.to_string())),
+    }
+}
+
 /// In-repo directory holding pipeline definitions (ADR-0010). Every
 /// `*.yaml`/`*.yml` directly under it is a pipeline, discovered and evaluated on
 /// a trigger.
@@ -3322,6 +3358,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         get_events,
         get_logs,
         restart_step,
+        cancel_run,
         approve_gate,
         release_gate_external,
         put_secret,
@@ -3377,6 +3414,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/{id}/events", get(get_events))
         .route("/v1/runs/{id}/logs", get(get_logs))
         .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
+        .route("/v1/runs/{id}/cancel", post(cancel_run))
         .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
         .route("/v1/runs/{id}/gates/{step}/release", post(release_gate_external))
         .route("/v1/runs/{id}/steps/{step}/results", post(ingest_step_results))

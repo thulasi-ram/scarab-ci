@@ -114,6 +114,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/runs/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a run (ADR-0054): drive its non-terminal steps and the run to
+         *     `Cancelled` durably and enqueue the Pod-teardown intent the driver
+         *     executes (SIGTERM + grace via the backend). Idempotent — cancelling a
+         *     terminal run is a 409; an unknown run is a 404.
+         */
+        post: operations["cancel_run"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/runs/{id}/events": {
         parameters: {
             query?: never;
@@ -346,6 +368,12 @@ export interface components {
         /** @description The inline pipeline (IR subset). */
         PipelineDto: {
             /**
+             * Format: int32
+             * @description Opt-in run budget in seconds (ADR-0047): the run fails once its
+             *     **active** time (gate-suspended time excluded) exceeds this. No default.
+             */
+            budget?: number | null;
+            /**
              * @description The pipeline's launch/reuse interface (ADR-0038, 0043) — its declared
              *     typed parameters (`inputs`) and exposed outputs. Carried as the pure
              *     `scarab_pipeline::Interface` (opaque object in the schema; the pure crate
@@ -436,8 +464,28 @@ export interface components {
             id: string;
             image: string;
             needs?: string[];
+            /**
+             * @description Opt-in retry policy `{on, max}` (ADR-0047). ⚠ At-least-once: retry
+             *     re-runs the whole step at-least-once; enable only if the step is
+             *     idempotent or fenced against a cooperating sink. Never-started infra
+             *     failures auto-retry regardless.
+             */
+            retry?: Record<string, never>;
             /** @description Secret keys to resolve and inject at launch (ADR-0037). */
             secrets?: string[];
+            /**
+             * @description Privilege escalation requested above the hardened baseline (ADR-0039).
+             *     On an inline API run only the self-service `run_as_root` grant is admitted
+             *     (it stays inside the sandbox); governed grants (add-capabilities /
+             *     privileged) require a target Environment and are rejected fail-closed.
+             */
+            security?: Record<string, never>;
+            /**
+             * Format: int32
+             * @description Per-step execution deadline in seconds (ADR-0047). Absent = the global
+             *     default (1h). Exceeding it is a `Timeout` failure.
+             */
+            timeout?: number | null;
         };
         StepStatusDto: {
             attempts: number;
@@ -632,6 +680,41 @@ export interface operations {
             };
             /** @description no such run */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    cancel_run: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description cancellation recorded; Pods tear down asynchronously */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such run */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description run already terminal */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

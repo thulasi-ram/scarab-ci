@@ -59,6 +59,12 @@ pub const LAUNCH_STEP: &str = "launch_step";
 /// same transition enqueues exactly one post.
 pub const RUN_STATUS_CHANGED: &str = "run_status_changed";
 
+/// Outbox message kind: tear down a cancelled run's in-flight executions
+/// (ADR-0054). The durable Cancelled state is written by
+/// [`cancel_run_request`]; the driver (which owns the executor) processes
+/// this message and deletes the Pods — API replicas never touch the cluster.
+pub const CANCEL_RUN: &str = "cancel_run";
+
 /// The payload of a [`LAUNCH_STEP`] outbox message — the step's fence.
 #[derive(Debug, Serialize, Deserialize)]
 struct LaunchIntent {
@@ -263,6 +269,89 @@ pub async fn record_gate_approval(
 
 /// Move a run `from -> to` and append the transition event (used to reopen a
 /// settled run on restart).
+/// Cancel a run from the API (ADR-0054): drive its non-terminal steps and
+/// the run itself to `Cancelled` durably, release its concurrency slot, and
+/// enqueue a [`CANCEL_RUN`] outbox message so the driver tears down any
+/// in-flight Pods (SIGTERM + grace — the executor's `cancel`). Returns
+/// `Ok(false)` when the run is unknown or already terminal (nothing to do).
+pub async fn cancel_run_request(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+) -> Result<bool, SchedulerError> {
+    let Some(current) = db.run_status(run).await? else {
+        return Ok(false);
+    };
+    if current.is_terminal() {
+        return Ok(false);
+    }
+    let now = clock.now().await;
+    for step in db.steps_of_run(run).await? {
+        if step.status.is_terminal() {
+            continue;
+        }
+        match db
+            .record_step_transition(run, &step.step, step.status, StepStatus::Cancelled)
+            .await
+        {
+            Ok(()) => {
+                db.append_event(&EventKind {
+                    version: EVENT_VERSION,
+                    run: run.clone(),
+                    kind: EventPayload::StepTransitioned {
+                        step: step.step.clone(),
+                        from: step.status,
+                        to: StepStatus::Cancelled,
+                    },
+                    at: now,
+                })
+                .await?;
+            }
+            Err(DbError::Conflict) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    match db.record_transition(run, current, RunStatus::Cancelled).await {
+        Ok(()) => {
+            db.append_event(&EventKind {
+                version: EVENT_VERSION,
+                run: run.clone(),
+                kind: EventPayload::RunTransitioned {
+                    from: current,
+                    to: RunStatus::Cancelled,
+                },
+                at: now,
+            })
+            .await?;
+            db.enqueue_outbox(&OutboxMessage {
+                id: crate::OutboxId(0),
+                run: run.clone(),
+                kind: RUN_STATUS_CHANGED.to_string(),
+                payload: serde_json::json!({ "to": RunStatus::Cancelled }),
+                idempotency_key: format!("status:{}:Cancelled", run.0),
+                at: now,
+            })
+            .await?;
+        }
+        Err(DbError::Conflict) => {}
+        Err(e) => return Err(e.into()),
+    }
+    // The teardown intent — processed by the driver, which owns the executor.
+    db.enqueue_outbox(&OutboxMessage {
+        id: crate::OutboxId(0),
+        run: run.clone(),
+        kind: CANCEL_RUN.to_string(),
+        payload: serde_json::Value::Null,
+        idempotency_key: format!("cancel:{}", run.0),
+        at: now,
+    })
+    .await?;
+    if let Some((group, _)) = db.run_concurrency(run).await? {
+        db.release_slot(&group, run).await?;
+    }
+    Ok(true)
+}
+
 async fn reopen(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -382,6 +471,10 @@ impl<'a> Scheduler<'a> {
             self.admit(run).await?;
         }
         self.reconcile().await?;
+        // API-requested cancellations (ADR-0054): tear down the Pods of runs
+        // already durably Cancelled. After reconcile so a just-cancelled
+        // step's launch intent settles this same tick.
+        self.reconcile_cancellations().await?;
         for run in &runs {
             self.advance(run).await?;
         }
@@ -626,6 +719,34 @@ impl<'a> Scheduler<'a> {
                     .await?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Drain cancel-teardown intents (ADR-0054): for each cancelled run,
+    /// best-effort delete every recorded in-flight execution (the executor's
+    /// `cancel` — SIGTERM + grace period), then mark the message dispatched.
+    pub async fn reconcile_cancellations(&self) -> Result<(), SchedulerError> {
+        let msgs = self
+            .db
+            .claim_outbox(
+                &self.owner,
+                Some(CANCEL_RUN),
+                self.cfg.outbox_batch,
+                self.cfg.outbox_visibility_ms,
+            )
+            .await?;
+        for msg in msgs {
+            for step in self.db.steps_of_run(&msg.run).await? {
+                if let Some(attempt) = step.attempts.last() {
+                    if let Some(h) =
+                        self.db.attempt_handle(&msg.run, &step.step, &attempt.id).await?
+                    {
+                        let _ = self.executor.cancel(&ExecHandle(h)).await;
+                    }
+                }
+            }
+            self.db.mark_dispatched(msg.id).await?;
         }
         Ok(())
     }
@@ -953,6 +1074,13 @@ impl<'a> Scheduler<'a> {
     pub async fn cancel_run(&self, run: &RunId) -> Result<(), SchedulerError> {
         for step in self.db.steps_of_run(run).await? {
             if !step.status.is_terminal() {
+                // Tear down the in-flight execution first (best-effort —
+                // SIGTERM + grace via the backend), then settle durably.
+                if let Some(attempt) = step.attempts.last() {
+                    if let Some(h) = self.db.attempt_handle(run, &step.step, &attempt.id).await? {
+                        let _ = self.executor.cancel(&ExecHandle(h)).await;
+                    }
+                }
                 self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
                     .await?;
             }

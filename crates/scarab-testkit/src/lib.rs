@@ -948,13 +948,21 @@ struct FakeExecState {
 /// is idempotent on the step's fence, mirroring the real executor's re-attach.
 pub struct FakeExecutor {
     inner: Mutex<FakeExecState>,
+    /// Handles `cancel` was called with (teardown assertions).
+    cancelled: Mutex<Vec<String>>,
 }
 
 impl FakeExecutor {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(FakeExecState::default()),
+            cancelled: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The handles torn down via `cancel`, in call order.
+    pub fn cancelled_handles(&self) -> Vec<String> {
+        self.cancelled.lock().unwrap().clone()
     }
 
     /// Push the next outcome `poll` should report.
@@ -1047,7 +1055,8 @@ impl Executor for FakeExecutor {
         }
     }
 
-    async fn cancel(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+    async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        self.cancelled.lock().unwrap().push(handle.0.clone());
         Ok(())
     }
 

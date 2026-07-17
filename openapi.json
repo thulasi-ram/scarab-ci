@@ -262,6 +262,35 @@
         }
       }
     },
+    "/v1/runs/{id}/cancel": {
+      "post": {
+        "tags": [],
+        "summary": "Cancel a run (ADR-0054): drive its non-terminal steps and the run to\n`Cancelled` durably and enqueue the Pod-teardown intent the driver\nexecutes (SIGTERM + grace via the backend). Idempotent — cancelling a\nterminal run is a 409; an unknown run is a 404.",
+        "operationId": "cancel_run",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "cancellation recorded; Pods tear down asynchronously"
+          },
+          "404": {
+            "description": "no such run"
+          },
+          "409": {
+            "description": "run already terminal"
+          }
+        }
+      }
+    },
     "/v1/runs/{id}/events": {
       "get": {
         "tags": [],

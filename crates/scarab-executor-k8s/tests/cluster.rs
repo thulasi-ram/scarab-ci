@@ -975,3 +975,66 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
 
     exec.cancel(&h).await.expect("cleanup");
 }
+
+/// LIVE cancel teardown (ADR-0054): a RUNNING step's Pod is actually deleted
+/// from the cluster by `cancel` (SIGTERM + grace), not just marked cancelled.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn cancel_tears_down_a_running_pod() {
+    let Some(ns) = opted_in() else { return };
+    let run_id = unique_run("run-cancel");
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    let exec = K8sExecutor::with_client(ns.clone(), client.clone());
+    let step = StepRun {
+        run: RunId(run_id.clone()),
+        step: StepId("sleeper".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let spec = StepSpec {
+        image: "busybox:latest".into(),
+        command: vec!["sh".into(), "-c".into(), "sleep 300".into()],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: true, // busybox
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(600),
+        workspace_inputs: vec![],
+        clone: None,
+        build: None,
+        oidc_token: None,
+    };
+    let h = exec.launch(&step, &spec).await.expect("launch");
+    // Wait until it is actually Running (the interesting teardown case).
+    for _ in 0..90 {
+        if exec.poll(&h).await.expect("poll") == ExecState::Running {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert_eq!(exec.poll(&h).await.unwrap(), ExecState::Running, "step reached Running");
+
+    exec.cancel(&h).await.expect("cancel");
+
+    // The Pod OBJECT disappears from the cluster (grace period honored —
+    // allow up to 60s for SIGTERM + kubelet cleanup).
+    use kube::api::Api;
+    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, &ns);
+    let mut gone = false;
+    for _ in 0..60 {
+        if pods.get_opt(&h.0).await.expect("get pod").is_none() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert!(gone, "the Pod was torn down, not left running");
+}
