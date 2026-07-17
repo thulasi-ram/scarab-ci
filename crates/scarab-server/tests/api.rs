@@ -244,3 +244,30 @@ async fn get_run_exposes_step_needs_for_the_dag() {
     let build = steps.iter().find(|s| s["id"] == "build").unwrap();
     assert_eq!(build["needs"], serde_json::json!([]), "root step has no needs");
 }
+
+/// Full-route OpenAPI coverage (ADR-0054): every route registered on the
+/// router appears in the generated spec (and vice versa), so the committed
+/// openapi.json — which CI diffs against — can never silently under-describe
+/// the API. Parses the router source; `/openapi.json` (the spec serving
+/// itself) is the one exemption.
+#[test]
+fn every_registered_route_is_in_the_openapi_spec() {
+    let src = include_str!("../src/lib.rs");
+    let re = regex_lite::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
+    let mut routes: Vec<String> = re
+        .captures_iter(src)
+        .map(|c| c[1].replace("{*name}", "{name}"))
+        .filter(|r| r != "/openapi.json")
+        .collect();
+    routes.sort();
+    routes.dedup();
+
+    let spec: serde_json::Value = serde_json::from_str(&scarab_server::openapi_json()).unwrap();
+    let have: std::collections::BTreeSet<String> =
+        spec["paths"].as_object().unwrap().keys().cloned().collect();
+
+    let missing: Vec<&String> = routes.iter().filter(|r| !have.contains(*r)).collect();
+    assert!(missing.is_empty(), "routes missing from the OpenAPI spec: {missing:?}");
+    let extra: Vec<&String> = have.iter().filter(|p| !routes.contains(p)).collect();
+    assert!(extra.is_empty(), "spec paths with no registered route: {extra:?}");
+}

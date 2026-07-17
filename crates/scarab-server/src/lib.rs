@@ -2172,6 +2172,7 @@ async fn ingest_event(
 /// [`Event`](scarab_forge::Event), and durably create the triggered Runs.
 /// Unverified deliveries are rejected; administrative events (e.g. `ping`)
 /// are acknowledged and ignored.
+#[utoipa::path(post, path = "/webhooks/github", summary = "GitHub webhook ingest (HMAC-verified, ADR-0046)", responses((status = 202, description = "delivery accepted"), (status = 401, description = "bad signature")))]
 async fn github_webhook(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2257,6 +2258,7 @@ async fn github_webhook(
 /// bound to the Forgejo adapter's verification (plain-hex
 /// `X-Forgejo/Gitea-Signature`) and its own secret — no payload sniffing on a
 /// shared endpoint. Same replay guard, same canonical vocabulary downstream.
+#[utoipa::path(post, path = "/webhooks/forgejo", summary = "Forgejo webhook ingest (HMAC-verified, ADR-0046)", responses((status = 202, description = "delivery accepted"), (status = 401, description = "bad signature")))]
 async fn forgejo_webhook(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2344,6 +2346,7 @@ pub struct LoginResponse {
 /// Exchange an OAuth/OIDC credential for a Scarab session (ADR-0010, 0032):
 /// authenticate to a forge-agnostic [`Principal`], mint a server-side
 /// [`Session`], and return its id (also set as an httpOnly cookie).
+#[utoipa::path(post, path = "/v1/auth/login", summary = "Exchange an OAuth credential for a session (API/CLI, ADR-0049)", responses((status = 200, body = LoginResponse), (status = 401, description = "bad credential"), (status = 404, description = "login not configured")))]
 async fn login(
     State(st): State<AppState>,
     Json(req): Json<LoginRequest>,
@@ -2406,6 +2409,7 @@ fn set_session_cookies(headers: &mut HeaderMap, session: &Session) {
 /// `GET /v1/auth/login` (ADR-0049): begin the browser OAuth flow — set an
 /// unguessable `state` (HttpOnly cookie, 10 min) and redirect to the
 /// provider's authorize endpoint.
+#[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 404, description = "OAuth not configured")))]
 async fn oauth_login_redirect(State(st): State<AppState>) -> Result<Response, ApiError> {
     let Some(flow) = st.oauth_login.as_ref() else {
         return Err(ApiError::NotFound);
@@ -2429,6 +2433,7 @@ async fn oauth_login_redirect(State(st): State<AppState>) -> Result<Response, Ap
 /// `GET /v1/auth/callback?code&state` (ADR-0049): finish the browser OAuth
 /// flow — verify the `state` echo against the cookie, exchange the code for a
 /// [`Principal`], mint the PG session + CSRF token, and land on `/`.
+#[utoipa::path(get, path = "/v1/auth/callback", summary = "Finish the browser OAuth flow (ADR-0049)", responses((status = 302, description = "session + CSRF cookies set; redirect to /"), (status = 401, description = "state mismatch or bad code")))]
 async fn oauth_callback(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2468,6 +2473,7 @@ async fn oauth_callback(
 /// `POST /v1/auth/logout` (ADR-0049): revoke the presented session server-side
 /// and expire the browser cookies. Exempt from the CSRF guard by design — the
 /// worst a forged logout achieves is logging the victim out.
+#[utoipa::path(post, path = "/v1/auth/logout", summary = "Revoke the session (ADR-0049)", responses((status = 204, description = "session revoked; cookies expired")))]
 async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     let Some(sessions) = st.sessions.as_ref() else {
         return Err(ApiError::NotFound);
@@ -2548,6 +2554,7 @@ fn role_name(r: scarab_identity::Role) -> &'static str {
 }
 
 /// List an org's live bindings (org- and project-scoped). Administer.
+#[utoipa::path(get, path = "/v1/orgs/{org}/bindings", summary = "List an org's role bindings (ADR-0049)", responses((status = 200, body = [BindingDto]), (status = 403, description = "not an org admin")))]
 async fn list_bindings(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2574,6 +2581,7 @@ async fn list_bindings(
 
 /// Natively grant `subject` a role in the org (or one of its projects).
 /// Native bindings are authoritative — no import ever overwrites them.
+#[utoipa::path(put, path = "/v1/orgs/{org}/bindings", summary = "Natively grant a role (ADR-0049)", responses((status = 204, description = "granted")))]
 async fn put_binding(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2602,6 +2610,7 @@ async fn put_binding(
 
 /// Natively revoke `subject`'s binding at the scope — a durable tombstone a
 /// later forge import cannot resurrect.
+#[utoipa::path(delete, path = "/v1/orgs/{org}/bindings", summary = "Natively revoke a role - a durable tombstone (ADR-0049)", responses((status = 204, description = "revoked")))]
 async fn delete_binding(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -2626,6 +2635,7 @@ async fn delete_binding(
 /// import never clobbers a native grant or revoke, and authorization keeps
 /// reading only native storage — the forge is consulted here, once, not on
 /// the authz hot path.
+#[utoipa::path(post, path = "/v1/repos/{org}/{repo}/bindings/import", summary = "Seed bindings from forge permissions (ADR-0049)", responses((status = 200, body = [BindingDto])))]
 async fn import_bindings(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -3205,6 +3215,7 @@ async fn delete_secret(
 /// Create/replace a repo's protected environment (ADR-0024, 0037). Editing the
 /// deployment target's rules requires the Administer capability — so a pipeline
 /// author (Write) cannot grant themselves deploy access by changing the YAML.
+#[utoipa::path(put, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "Create/replace a protected environment (ADR-0024/0037)", responses((status = 200, description = "stored")))]
 async fn put_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -3226,6 +3237,7 @@ async fn put_environment(
 }
 
 /// Fetch one environment's definition (rules). Read capability.
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "One environment's protection rules", responses((status = 200, description = "the environment"), (status = 404, description = "unknown")))]
 async fn get_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -3243,6 +3255,7 @@ async fn get_environment(
 }
 
 /// List a repo's environments. Read capability.
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments", summary = "List a repo's environments", responses((status = 200, description = "the environments")))]
 async fn list_environments(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -3259,6 +3272,7 @@ async fn list_environments(
 }
 
 /// Delete an environment (idempotent). Administer capability.
+#[utoipa::path(delete, path = "/v1/repos/{org}/{repo}/environments/{name}", summary = "Delete an environment (idempotent)", responses((status = 204, description = "deleted")))]
 async fn delete_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -3277,6 +3291,7 @@ async fn delete_environment(
 /// An environment's deployment history, most recent first (ADR-0037). This
 /// replaces the old `POST …/deploy` admission endpoint: admission now happens in
 /// the run's gate-approval path, so this surface is **read-only**. Read cap.
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/environments/{name}/deployments", summary = "An environment's deployment history (ADR-0037)", responses((status = 200, description = "most recent first")))]
 async fn list_deployments(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -3297,6 +3312,7 @@ async fn list_deployments(
 /// (resolves from repo/org scope), or `unset`. Post-inheritance, so a shared key
 /// defined once at repo scope never reads as missing. Names + status only, never
 /// values — same `Administer` capability as listing secrets.
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/secrets/matrix", summary = "The secret parity matrix (ADR-0037) - names + status, never values", responses((status = 200, body = SecretMatrix)))]
 async fn secret_matrix(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -3420,12 +3436,14 @@ pub async fn resolve_step_secrets(
 }
 
 /// The JWKS a cloud fetches to verify Scarab-issued OIDC tokens (ADR-0015).
+#[utoipa::path(get, path = "/.well-known/jwks.json", summary = "OIDC issuer JWKS (ADR-0015)", responses((status = 200, description = "the signing keys"), (status = 404, description = "issuer disabled")))]
 async fn jwks(State(st): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let issuer = st.oidc.as_ref().ok_or(ApiError::NotFound)?;
     Ok(Json(issuer.jwks()))
 }
 
 /// The OIDC discovery document.
+#[utoipa::path(get, path = "/.well-known/openid-configuration", summary = "OIDC discovery (ADR-0015)", responses((status = 200, description = "the discovery document"), (status = 404, description = "issuer disabled")))]
 async fn openid_configuration(
     State(st): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -3460,6 +3478,7 @@ pub fn fork_policy(event: &scarab_forge::Event, target_env: &str) -> ForkPolicy 
 /// `GET /metrics` (ADR-0053): Prometheus text exposition of the key gauges —
 /// runs by status and outbox backlog, read live from the durable store on
 /// each scrape (pull-model, always consistent, no in-process drift).
+#[utoipa::path(get, path = "/metrics", summary = "Prometheus gauges (ADR-0053)", responses((status = 200, description = "Prometheus text exposition")))]
 async fn metrics(State(st): State<AppState>) -> Result<Response, ApiError> {
     let mut out = String::new();
     out.push_str("# HELP scarab_runs Current run count by status.
@@ -3487,6 +3506,7 @@ async fn metrics(State(st): State<AppState>) -> Result<Response, ApiError> {
 /// `GET /readyz` (ADR-0053): readiness = can this replica actually serve —
 /// DB and object store reachable. Distinct from `/healthz` (liveness =
 /// process up): a server with a dead DB must leave rotation, not restart.
+#[utoipa::path(get, path = "/readyz", summary = "Readiness: DB + object store reachable (ADR-0053)", responses((status = 200, description = "ready"), (status = 503, description = "a dependency is unreachable")))]
 async fn readyz(State(st): State<AppState>) -> Response {
     if let Err(e) = st.db.run_status_counts().await {
         return (StatusCode::SERVICE_UNAVAILABLE, format!("db: {e}")).into_response();
@@ -3525,6 +3545,7 @@ pub async fn request_id_middleware(
     resp
 }
 
+#[utoipa::path(get, path = "/healthz", summary = "Liveness: process up (ADR-0053)", responses((status = 200, description = "alive")))]
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -3539,6 +3560,28 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        healthz,
+        readyz,
+        metrics,
+        jwks,
+        openid_configuration,
+        login,
+        oauth_login_redirect,
+        oauth_callback,
+        logout,
+        list_bindings,
+        put_binding,
+        delete_binding,
+        import_bindings,
+        github_webhook,
+        forgejo_webhook,
+        put_environment,
+        get_environment,
+        list_environments,
+        delete_environment,
+        list_deployments,
+        secret_matrix,
+        ingest_step_results,
         create_run,
         dispatch,
         list_pipelines,

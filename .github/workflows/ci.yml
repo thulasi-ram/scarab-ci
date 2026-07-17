@@ -1,0 +1,47 @@
+# Contract gates (ADR-0054): the committed OpenAPI spec and the generated UI
+# client must always match the code. A drifted spec fails the build — never a
+# silently stale contract.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  openapi-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Full-route coverage is asserted by the test suite
+      # (every_registered_route_is_in_the_openapi_spec); this job gates DRIFT:
+      # the committed openapi.json must equal the generated one.
+      - name: Regenerate the spec
+        run: cargo run -p scarab-server -- --emit-openapi openapi.json
+      - name: Fail on spec drift
+        run: |
+          git diff --exit-code openapi.json || {
+            echo '::error::openapi.json is stale — run: cargo run -p scarab-server -- --emit-openapi openapi.json'
+            exit 1
+          }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Regenerate the UI client
+        working-directory: ui/scarab-web-ui
+        run: |
+          npm ci
+          npm run gen
+          npm run typecheck
+      - name: Fail on client drift
+        run: |
+          git diff --exit-code ui/scarab-web-ui/src/api/schema.ts || {
+            echo '::error::the generated TS client is stale — run: npm run gen in ui/scarab-web-ui'
+            exit 1
+          }
