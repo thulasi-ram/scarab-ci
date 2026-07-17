@@ -1157,6 +1157,9 @@ h2 {
 .crumb-head-title {
   flex: 1;
   min-width: 0;
+  /* Run titles are commit messages — long. Smaller than the repo crumb so
+     the wide biform can accommodate them without sprawling. */
+  font-size: 20px;
   color: var(--soft-white);
   overflow: hidden;
   text-overflow: ellipsis;
