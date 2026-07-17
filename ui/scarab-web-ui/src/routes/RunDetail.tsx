@@ -125,7 +125,7 @@ export default function RunDetail() {
 
   return (
     <section class="page">
-      <Doodle icon="container" size={230} rotate={14} opacity={0.13} top="52px" right="48px" />
+      <Doodle icon="container" size={230} rotate={14} opacity={0.16} top="52px" right="48px" />
 
       <Show when={run()} fallback={<p class="empty">loading…</p>}>
         {(r) => (

@@ -1118,7 +1118,9 @@ h2 {
 .page-toolbar + .tabs { margin-top: 16px; }
 /* org prefix inside a repo header, e.g. "acme / web" (context, now that the
    top-bar breadcrumb is gone) */
-.head-org { color: var(--muted-sage); font-weight: 400; }
+/* The org is a prefix, not the title — smaller, so a repo header ("acme /
+   api") doesn't sprawl in the wide biform next to single-word pages. */
+.head-org { color: var(--muted-sage); font-weight: 400; font-size: 0.55em; }
 
 /* ---- run-screen breadcrumb heading ---- */
 /* The repo name is the header on the repo screen; on a run it stays at header
@@ -1126,17 +1128,29 @@ h2 {
 .crumb-head {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: 6px;
   margin: 0;
   flex: 0 1 auto;
   min-width: 0;
   font-family: var(--font-display);
-  font-size: 24px;
+  /* Header-scale like the other pages' h1 row — a run is still a page. */
+  font-size: 28px;
   font-weight: 700;
   letter-spacing: -0.6px;
 }
-.crumb-head-link { color: var(--muted-sage); text-decoration: none; flex: none; }
-.crumb-head-link:hover { color: var(--emerald); }
+/* The repo name IS a link back — it must read as one: emerald with a dotted
+   underline (the house dot language), solid on hover. */
+.crumb-head-link {
+  color: var(--emerald);
+  flex: none;
+  text-decoration: underline dotted;
+  text-decoration-color: color-mix(in srgb, var(--emerald) 45%, transparent);
+  text-underline-offset: 6px;
+}
+.crumb-head-link:hover {
+  color: var(--emerald-bright);
+  text-decoration-style: solid;
+}
 .crumb-head-sep { color: var(--muted-sage); align-self: center; flex: none; }
 .crumb-head-title {
   flex: 1;

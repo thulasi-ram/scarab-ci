@@ -88,7 +88,7 @@ export default function RepoView() {
 
   return (
     <section class="page">
-      <Doodle icon="workflow" size={230} rotate={12} opacity={0.13} top="52px" right="48px" />
+      <Doodle icon="workflow" size={230} rotate={12} opacity={0.16} top="52px" right="48px" />
 
       <div class="page-head">
         <h1>
