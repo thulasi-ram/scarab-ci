@@ -19,14 +19,43 @@ struct Cli {
 enum Command {
     /// Trigger a pipeline run (manual/API dispatch, ADR-0043).
     Run(RunArgs),
-    /// Lint a pipeline file for style/anti-patterns.
-    Lint,
-    /// Validate a pipeline file (compile + semantic checks).
-    Validate,
-    /// Stream logs for a run or step.
-    Logs,
-    /// Restart a failed or completed run.
-    Restart,
+    /// Lint a pipeline file (compile-time lints, e.g. missing-clone).
+    Lint(FileArgs),
+    /// Validate a pipeline file offline (compile + semantic checks).
+    Validate(FileArgs),
+    /// Stream a run's logs (replay + live tail via SSE).
+    Logs(LogsArgs),
+    /// Restart a step (and its dependents) of a run.
+    Restart(RestartArgs),
+}
+
+/// A local pipeline file (offline — no server needed).
+#[derive(Debug, Args)]
+struct FileArgs {
+    /// Path to the pipeline YAML (e.g. `.scarab/ci.yaml`).
+    file: String,
+}
+
+#[derive(Debug, Args)]
+struct LogsArgs {
+    /// The run id.
+    run: String,
+    #[arg(long, env = "SCARAB_SERVER", default_value = "http://localhost:8080")]
+    server: String,
+    #[arg(long, env = "SCARAB_TOKEN")]
+    token: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct RestartArgs {
+    /// The run id.
+    run: String,
+    /// The step to restart (its descendants re-run too, ADR-0027).
+    step: String,
+    #[arg(long, env = "SCARAB_SERVER", default_value = "http://localhost:8080")]
+    server: String,
+    #[arg(long, env = "SCARAB_TOKEN")]
+    token: Option<String>,
 }
 
 /// `scarab run <org>/<repo> <pipeline> [--ref] [--param k=v]... [--api] [--describe]`.
@@ -125,17 +154,136 @@ async fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
         Command::Run(args) => run(args).await,
-        Command::Lint => stub("lint"),
-        Command::Validate => stub("validate"),
-        Command::Logs => stub("logs"),
-        Command::Restart => stub("restart"),
+        Command::Lint(args) => lint(&args),
+        Command::Validate(args) => validate(&args),
+        Command::Logs(args) => logs(args).await,
+        Command::Restart(args) => restart(args).await,
     };
     std::process::exit(code);
 }
 
-fn stub(name: &str) -> i32 {
-    println!("scarab {name}: not yet implemented");
-    0
+/// Compile a pipeline file offline (the same compiler the server runs —
+/// invariant #5, one validator). Errors print one diagnostic per line.
+fn compile_file(path: &str) -> Result<scarab_pipeline::PipelineIr, i32> {
+    let yaml = match std::fs::read_to_string(path) {
+        Ok(y) => y,
+        Err(e) => {
+            eprintln!("error: cannot read {path}: {e}");
+            return Err(2);
+        }
+    };
+    match scarab_pipeline::compile_yaml(&yaml) {
+        Ok(ir) => Ok(ir),
+        Err(scarab_pipeline::PipelineError::Validation(diags)) => {
+            for d in diags {
+                eprintln!("error: {d}");
+            }
+            Err(1)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            Err(1)
+        }
+    }
+}
+
+/// `scarab validate <file>`: compile + semantic checks, offline. Non-zero on
+/// any failure.
+fn validate(args: &FileArgs) -> i32 {
+    match compile_file(&args.file) {
+        Ok(ir) => {
+            println!("ok: {} step(s), ir v{}", ir.steps.len(), ir.ir_version);
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+/// `scarab lint <file>`: the compile-time lints (e.g. a push/PR pipeline with
+/// no clone step, ADR-0045). Lint findings exit 1.
+fn lint(args: &FileArgs) -> i32 {
+    match compile_file(&args.file) {
+        Ok(ir) => {
+            let findings = scarab_pipeline::lint(&ir);
+            if findings.is_empty() {
+                println!("ok: no lint findings");
+                0
+            } else {
+                for f in &findings {
+                    eprintln!("lint: {f}");
+                }
+                1
+            }
+        }
+        Err(code) => code,
+    }
+}
+
+/// `scarab logs <run>`: replay + live-tail the run's logs (the same SSE the
+/// UI streams), printing data lines until the server closes the stream.
+async fn logs(args: LogsArgs) -> i32 {
+    let base = args.server.trim_end_matches('/');
+    let url = format!("{base}/v1/runs/{}/logs", args.run);
+    let client = reqwest::Client::new();
+    let resp = match with_auth(client.get(&url), &args.token).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: request to {url} failed: {e}");
+            return 1;
+        }
+    };
+    if !resp.status().is_success() {
+        eprintln!("logs failed ({})", resp.status().as_u16());
+        return 1;
+    }
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                buf.extend_from_slice(&chunk);
+                // SSE frames are newline-delimited; print each complete
+                // `data:` line as it arrives (live tail).
+                while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=pos).collect();
+                    let line = String::from_utf8_lossy(&line);
+                    if let Some(data) = line.strip_prefix("data:") {
+                        println!("{}", data.trim_start().trim_end_matches('\n'));
+                    }
+                }
+            }
+            Ok(None) => return 0, // run settled; server closed the stream
+            Err(e) => {
+                eprintln!("error: log stream: {e}");
+                return 1;
+            }
+        }
+    }
+}
+
+/// `scarab restart <run> <step>`: re-arm a step + its dependents (ADR-0027).
+async fn restart(args: RestartArgs) -> i32 {
+    let base = args.server.trim_end_matches('/');
+    let url = format!("{base}/v1/runs/{}/steps/{}/restart", args.run, args.step);
+    let client = reqwest::Client::new();
+    let resp = match with_auth(client.post(&url), &args.token).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: request to {url} failed: {e}");
+            return 1;
+        }
+    };
+    if resp.status().is_success() {
+        println!("restart accepted: {}/{}", args.run, args.step);
+        0
+    } else {
+        eprintln!(
+            "restart failed ({}): {}",
+            resp.status().as_u16(),
+            resp.text().await.unwrap_or_default().trim()
+        );
+        1
+    }
 }
 
 /// Attach the bearer token, when one is configured, to a request.
