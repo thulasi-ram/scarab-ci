@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use scarab_engine::{ConcurrencyPolicy, Db, StepStatus};
-use scarab_forge::{Event, Repo};
+use scarab_forge::{Event, RepoRef};
 use scarab_server::trigger_run_from_event;
 use scarab_testkit::{FakeClock, FakeForge, InMemoryDb};
 
@@ -19,8 +19,8 @@ steps:
   - { id: build, image: busybox, command: ["true"] }
 "#;
 
-fn repo() -> Repo {
-    Repo {
+fn repo() -> RepoRef {
+    RepoRef {
         owner: "acme".into(),
         name: "app".into(),
     }

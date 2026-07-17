@@ -22,8 +22,8 @@ pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor, LogChunks};
 pub use scheduler::{
-    record_gate_approval, release_gate, restart_step, RestartError, Scheduler, SchedulerError,
-    LAUNCH_STEP, RUN_STATUS_CHANGED,
+    cancel_run_request, record_gate_approval, release_gate, restart_step, RestartError, Scheduler,
+    SchedulerError, CANCEL_RUN, LAUNCH_STEP, RUN_STATUS_CHANGED,
 };
 
 use serde::{Deserialize, Serialize};
@@ -80,6 +80,10 @@ pub struct RunSummary {
     pub run: RunId,
     pub status: RunStatus,
     pub created_at: Timestamp,
+    /// The owning tenant `(org, project)` (ADR-0049), if the run was stamped
+    /// at creation — the tenancy filter for the list view.
+    #[serde(default)]
+    pub tenant: Option<(String, String)>,
 }
 
 /// Lifecycle status of a single step.
@@ -122,14 +126,28 @@ impl ConcurrencyPolicy {
     }
 }
 
-/// Classifies a failure so the engine can decide retry vs. dead-letter.
+/// Classifies a recorded attempt failure so the engine can decide retry vs.
+/// dead-letter (ADR-0020/0047). Mirrors the executor port's
+/// [`ports::FailureClass`] — the adapter classifies, the engine consumes.
 ///
-/// `Infra` failures (node died, image pull, network) are retried on fresh
-/// infra; `Step` failures (the user's command exited non-zero) are not.
+/// - `Infra { never_started: true }` — the platform failed the step before its
+///   main process ever ran (image pull, unschedulable, evicted-while-Pending):
+///   no side effect is possible, so bounded auto-retry is always safe.
+/// - `Infra { never_started: false }` — the platform killed a started process
+///   (OOM, eviction, node loss): a side effect may exist; retry only on the
+///   author's `retry:` assertion (ADR-0047, wired by the retry-loop slice).
+/// - `Step` — the user's command exited non-zero; never auto-retried.
+/// - `Timeout` — the step exceeded its deadline; post-start by definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureKind {
-    Infra,
+    Infra { never_started: bool },
     Step,
+    Timeout,
+    /// The backend lost the execution (vanished Pod, node stopped reporting).
+    /// Conservatively post-start — it cannot be proven the process never ran —
+    /// so retry is assertion-gated and **counts against the attempt budget**
+    /// (ADR-0047).
+    Lost,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +217,143 @@ pub struct StepSpec {
     pub add_capabilities: Vec<String>,
     #[serde(default)]
     pub privileged: bool,
+    /// The step's authored execution deadline in seconds (ADR-0047), if any.
+    /// `None` = the executor's configured global default (1h). The backend
+    /// enforces it primarily (kubelet `activeDeadlineSeconds` / local
+    /// kill-timer); the scheduler keeps an engine-side backstop.
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
+    /// The CAS tree roots of the workspaces this step consumes (ADR-0007/
+    /// 0029/0045): the outputs of its `needs` (or its explicit `inputs:`
+    /// subset), merged in order. Filled by the scheduler at launch; the
+    /// executor materializes them into `/workspace` before the step starts.
+    #[serde(default)]
+    pub workspace_inputs: Vec<String>,
+    /// Set when this is a **clone** step (ADR-0045): the engine runs the
+    /// canonical scarab-clone image with this context instead of an authored
+    /// image/command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<CloneConfig>,
+    /// Set when this is a **build** step (ADR-0018): the engine runs rootless
+    /// BuildKit with this context instead of an authored image/command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildConfig>,
+    /// Artifact publication globs (ADR-0052): filters what the backend
+    /// collects from `/scarab/artifacts/` post-step. Empty = everything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
+    /// The per-attempt OIDC token for keyless cloud federation (ADR-0015),
+    /// minted at LAUNCH — **never serialized** (in-memory enrichment only;
+    /// delivery to the Pod is a tmpfs file, never env/argv). `None` when the
+    /// issuer is not configured.
+    #[serde(skip)]
+    pub oidc_token: Option<String>,
+}
+
+/// The launch context of a `kind: build` step (ADR-0018): what to build
+/// (workspace-relative context/dockerfile) and the image tag to build and
+/// optionally push.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildConfig {
+    /// Workspace-relative build context directory (default `.`).
+    #[serde(default)]
+    pub context: String,
+    /// Dockerfile name within the context (default `Dockerfile`).
+    #[serde(default)]
+    pub dockerfile: String,
+    /// The image reference to build (and push), e.g. `ghcr.io/acme/app:sha`.
+    pub image: String,
+    /// The run's repo coordinate (from the trigger), pinned at creation —
+    /// what the scoped `REGISTRY_AUTH` secret resolves against and what the
+    /// forge derives its registry credential for. Empty for inline dev runs.
+    #[serde(default)]
+    pub repo_owner: String,
+    #[serde(default)]
+    pub repo_name: String,
+    /// Push after building.
+    #[serde(default)]
+    pub push: bool,
+    /// Allow pushing to an insecure (plain-HTTP) registry — dev/test clusters
+    /// only; never authored, set by the composition/test harness.
+    #[serde(default)]
+    pub insecure_push: bool,
+    /// A scoped `REGISTRY_AUTH` secret's dockerconfigjson, resolved at
+    /// LAUNCH — **never serialized**; mounted verbatim as the Pod's docker
+    /// config (tmpfs), never env (ADR-0018/0037). Takes precedence over
+    /// [`derived_auth`](Self::derived_auth).
+    #[serde(skip)]
+    pub registry_auth_json: Option<String>,
+    /// A forge-derived registry credential for the forge's own registry
+    /// (ADR-0018 amendment: zero-config GHCR/Forgejo push). Filled at LAUNCH,
+    /// **never serialized**; used only when no scoped `REGISTRY_AUTH` secret
+    /// resolves. Delivered to the Pod as a mounted dockerconfigjson, never env.
+    #[serde(skip)]
+    pub derived_auth: Option<RegistryCredential>,
+}
+
+/// The in-memory half of a derived registry credential (mirrors the forge
+/// port's type without a crate dependency; the engine stays forge-free).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryCredential {
+    /// Registry host, e.g. `ghcr.io`.
+    pub registry: String,
+    pub username: String,
+    pub token: String,
+}
+
+/// The launch context of a clone step (ADR-0045), resolved from the run's
+/// trigger at creation (owner/name/sha/read_only + the authored knobs) and
+/// enriched at launch (URL from the ForgeConnection registry; the short-TTL
+/// checkout credential — in-memory only, never persisted).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneConfig {
+    /// The forge coordinate, pinned at run creation.
+    pub owner: String,
+    pub name: String,
+    /// The commit the run is pinned to (resolved ONCE at trigger time,
+    /// ADR-0043/0044) — clone always fetches THIS, never re-resolves.
+    pub sha: String,
+    /// `depth: full` (complete history) vs the shallow default.
+    #[serde(default)]
+    pub depth_full: bool,
+    #[serde(default)]
+    pub submodules: bool,
+    #[serde(default)]
+    pub lfs: bool,
+    /// Fork-PR runs get a READ-ONLY credential (ADR-0045 trust model), fixed
+    /// immutably at run creation from the trigger.
+    #[serde(default)]
+    pub read_only: bool,
+    /// The credential-free clone URL — filled at LAUNCH by the composition
+    /// root (from the repo's ForgeConnection); empty in the stored spec.
+    #[serde(default)]
+    pub url: String,
+    /// The short-TTL checkout credential — filled at LAUNCH, **never
+    /// serialized** (in-memory enrichment only; delivery to the Pod is via a
+    /// tmpfs file, never env/URL/argv — ADR-0045 §Token delivery).
+    #[serde(skip)]
+    pub credential: Option<CloneCredential>,
+}
+
+/// The in-memory half of a minted checkout credential (mirrors the forge
+/// port's type without a crate dependency; the engine stays forge-free).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneCredential {
+    pub username: String,
+    pub token: String,
+}
+
+/// One artifact of record (ADR-0052): an output a step published to
+/// `/scarab/artifacts/`, name-addressed per run, immutable once written.
+/// The blob lives in the object store (NOT the workspace CAS — independent
+/// lifecycle); this is its metadata row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactMeta {
+    pub name: String,
+    pub size: u64,
+    pub content_type: String,
+    /// Object-store key holding the bytes.
+    pub object_key: String,
 }
 
 /// A manual/approval gate that suspends a run until released.
@@ -283,7 +438,11 @@ pub struct LogChunkMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeployContext {
     pub org: String,
-    pub repo: String,
+    /// The owning Project's name — its repo's forge name, 1:1 in v1
+    /// (ADR-0046: a Project IS the governed repo). Keys the protection-rule
+    /// lookup at admission.
+    #[serde(alias = "repo")]
+    pub project: String,
     pub environment: String,
     pub git_ref: String,
     /// Whether this run is locked out of secrets (a fork PR, ADR-0015/0037). When
@@ -310,6 +469,16 @@ pub enum EventPayload {
     /// prior output is carried forward rather than recomputed (ADR-0027). Surfaced
     /// explicitly so a "smart" skip is never mysterious.
     StepSkipped { step: StepId, reason: String },
+    /// The run was dead-lettered (ADR-0047): the system could not obtain a
+    /// verdict (infra retries exhausted / a lost execution / poison). The
+    /// **operator** signal — `reason` carries the diagnostics.
+    RunDeadLettered { reason: String },
+    /// An unapproved gate outlived its opt-in `gate_expires_after` deadline and
+    /// failed the run (ADR-0047).
+    GateExpired { step: StepId },
+    /// The run's opt-in active-time `budget:` was exhausted (ADR-0047);
+    /// in-flight steps were cancelled and the run fails.
+    RunBudgetExhausted { active_ms: i64, budget_ms: i64 },
     /// Escape hatch for forward-compatible payloads not yet modelled.
     Raw(serde_json::Value),
 }
@@ -582,9 +751,14 @@ impl StepRun {
     ///
     /// Outcome — and hence the *bounded* retry that guarantees forward progress:
     /// - success (`None`)            → `Succeeded`.
-    /// - `Step` failure              → `Failed` (user command; never retried).
-    /// - `Infra` failure, attempts left (`< max_attempts`) → back to `Ready` for a retry.
-    /// - `Infra` failure, attempts exhausted               → `Failed` (poison; caller dead-letters the run).
+    /// - `Step` / `Timeout` failure  → `Failed` (a verdict was produced; retry
+    ///   is only ever the author's opt-in `retry:` assertion, ADR-0047).
+    /// - never-started `Infra`, attempts left (`< max_attempts`) → back to
+    ///   `Ready` for an auto-retry (no side effect was possible).
+    /// - never-started `Infra`, attempts exhausted → `Failed` (poison; caller
+    ///   dead-letters the run).
+    /// - post-start `Infra` → `Failed` (a side effect may exist; assertion-gated
+    ///   retry lands with the ADR-0047 retry-loop slice).
     pub fn finish_attempt(
         &mut self,
         failure: Option<FailureKind>,
@@ -607,13 +781,19 @@ impl StepRun {
         let from = StepStatus::Running;
         let to = match failure {
             None => StepStatus::Succeeded,
-            Some(FailureKind::Step) => StepStatus::Failed,
-            Some(FailureKind::Infra) => {
+            Some(FailureKind::Step | FailureKind::Timeout) => StepStatus::Failed,
+            Some(FailureKind::Infra { never_started: true }) => {
                 if (self.attempts.len() as u32) < max_attempts {
                     StepStatus::Ready
                 } else {
                     StepStatus::Failed
                 }
+            }
+            // A started (or possibly-started, for Lost) process may have
+            // side-effected: retry only on the author's `retry:` assertion —
+            // the scheduler's settle path owns that decision (ADR-0047).
+            Some(FailureKind::Infra { never_started: false } | FailureKind::Lost) => {
+                StepStatus::Failed
             }
         };
         self.status = to;

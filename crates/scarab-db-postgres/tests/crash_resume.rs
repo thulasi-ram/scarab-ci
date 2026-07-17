@@ -46,6 +46,12 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
         run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
+        timeout_seconds: None,
+        workspace_inputs: vec![],
+        clone: None,
+        build: None,
+        artifacts: vec![],
+        oidc_token: None,
     };
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
     db.create_step_run(&run, &step, Some(&spec), &[], Timestamp(0))
@@ -138,10 +144,11 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
         "one terminal transition"
     );
 
-    // The resumed process re-attached to the same Pod (idempotent launch on the
-    // fence) rather than starting a second one — launch was *called* again, but
-    // to the identical handle, so the external effect happened once.
-    assert_eq!(exec.launch_count(&handle), 2, "re-attach to the same Pod fence");
+    // The resumed process ADOPTED the still-running Pod via the durable launch
+    // handle recorded by instance A (ADR-0047 re-adoption): same Attempt, same
+    // fence, supervision resumed — launch was never even re-called, so the
+    // external effect happened exactly once.
+    assert_eq!(exec.launch_count(&handle), 1, "adopted — never relaunched");
 
     tdb.cleanup().await;
 }

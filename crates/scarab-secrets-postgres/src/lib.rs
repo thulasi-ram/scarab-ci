@@ -4,13 +4,13 @@
 //! Each secret gets a fresh random 256-bit *data key*; the value is sealed with
 //! AES-256-GCM under that data key, and the data key is itself sealed
 //! (AES-256-GCM) under a *master key*. Postgres stores only ciphertext, the
-//! wrapped data key, and the two nonces — never plaintext. The master key comes
-//! from `SCARAB_MASTER_KEY` (base64, 32 bytes) for dev; the provider is
-//! pluggable (a KMS-backed master key later).
+//! wrapped data key, and the two nonces — never plaintext. The master key is
+//! provided explicitly by the composition root (`scarab_server::config` parses
+//! `SCARAB_MASTER_KEY` and gates boot on it, ADR-0048); the provider is
+//! pluggable (a KMS-backed master key later). This adapter never reads env.
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sqlx::{PgPool, Row};
@@ -18,48 +18,27 @@ use sqlx::{PgPool, Row};
 use async_trait::async_trait;
 use scarab_secrets::{Secret, SecretError, SecretProvider, SecretScope};
 
-/// A Postgres-backed, envelope-encrypting secret provider.
+/// A Postgres-backed, envelope-encrypting secret provider. Always connected:
+/// Postgres is mandatory (ADR-0048) — the unconnected construction was
+/// deleted, not guarded.
 pub struct PostgresSecrets {
-    pool: Option<PgPool>,
+    pool: PgPool,
     /// The 256-bit master key that wraps each secret's data key.
     master: [u8; 32],
 }
 
 impl PostgresSecrets {
-    /// No backend wired (unusable until [`with_pool`](Self::with_pool)); the
-    /// master key is a throwaway.
-    pub fn new() -> Self {
-        Self {
-            pool: None,
-            master: random_bytes(),
-        }
-    }
-
-    /// Wire a pool, taking the master key from `SCARAB_MASTER_KEY` (base64, 32
-    /// bytes). If unset, a random ephemeral key is used (dev only — secrets
-    /// written under it cannot be read after a restart).
-    pub fn with_pool(pool: PgPool) -> Self {
-        Self {
-            pool: Some(pool),
-            master: master_from_env().unwrap_or_else(random_bytes),
-        }
-    }
-
-    /// Connect a fresh pool from `url`, taking the master key from
-    /// `SCARAB_MASTER_KEY` (as [`with_pool`](Self::with_pool)).
-    pub async fn connect(url: &str) -> Result<Self, SecretError> {
+    /// Connect a fresh pool from `url` with an explicit master key.
+    pub async fn connect(url: &str, master: [u8; 32]) -> Result<Self, SecretError> {
         let pool = PgPool::connect(url)
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
-        Ok(Self::with_pool(pool))
+        Ok(Self::with_master(pool, master))
     }
 
-    /// Wire a pool with an explicit master key (tests / a KMS provider).
+    /// Wire a pool with an explicit master key.
     pub fn with_master(pool: PgPool, master: [u8; 32]) -> Self {
-        Self {
-            pool: Some(pool),
-            master,
-        }
+        Self { pool, master }
     }
 
     /// Ensure the `secrets` table exists. Idempotent (CREATE IF NOT EXISTS) so it
@@ -77,22 +56,14 @@ impl PostgresSecrets {
                 PRIMARY KEY (scope, key)
             )",
         )
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(())
     }
 
-    fn pool(&self) -> Result<&PgPool, SecretError> {
-        self.pool
-            .as_ref()
-            .ok_or_else(|| SecretError::Backend("no database pool wired".into()))
-    }
-}
-
-impl Default for PostgresSecrets {
-    fn default() -> Self {
-        Self::new()
+    fn pool(&self) -> &PgPool {
+        &self.pool
     }
 }
 
@@ -105,7 +76,7 @@ impl SecretProvider for PostgresSecrets {
         )
         .bind(scope_key(scope))
         .bind(key)
-        .fetch_optional(self.pool()?)
+        .fetch_optional(self.pool())
         .await
         .map_err(|e| SecretError::Backend(e.to_string()))?
         .ok_or(SecretError::NotFound)?;
@@ -151,7 +122,7 @@ impl SecretProvider for PostgresSecrets {
         .bind(value_nonce)
         .bind(wrapped_key)
         .bind(key_nonce)
-        .execute(self.pool()?)
+        .execute(self.pool())
         .await
         .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(())
@@ -160,7 +131,7 @@ impl SecretProvider for PostgresSecrets {
     async fn list_scoped(&self, scope: &SecretScope) -> Result<Vec<String>, SecretError> {
         let rows = sqlx::query("SELECT key FROM secrets WHERE scope = $1 ORDER BY key")
             .bind(scope_key(scope))
-            .fetch_all(self.pool()?)
+            .fetch_all(self.pool())
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(rows.into_iter().map(|r| r.get::<String, _>("key")).collect())
@@ -170,7 +141,7 @@ impl SecretProvider for PostgresSecrets {
         sqlx::query("DELETE FROM secrets WHERE scope = $1 AND key = $2")
             .bind(scope_key(scope))
             .bind(key)
-            .execute(self.pool()?)
+            .execute(self.pool())
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
         Ok(())
@@ -216,13 +187,4 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
     OsRng.fill_bytes(&mut buf);
     buf
-}
-
-/// The master key from `SCARAB_MASTER_KEY` (base64, exactly 32 bytes).
-fn master_from_env() -> Option<[u8; 32]> {
-    let b64 = std::env::var("SCARAB_MASTER_KEY").ok()?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .ok()?;
-    bytes.try_into().ok()
 }

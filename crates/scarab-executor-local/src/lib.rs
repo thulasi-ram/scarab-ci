@@ -21,26 +21,45 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use tokio::process::{Child, Command};
 
-use scarab_engine::ports::{ExecHandle, ExecState};
+use scarab_engine::ports::{ExecHandle, ExecState, FailureClass};
 use scarab_engine::{ExecError, Executor, StepRun, StepSpec};
 
-/// A tracked child: still running, or finished with an observed state.
+/// A tracked child: still running (with its ADR-0047 kill-timer deadline), or
+/// finished with an observed state.
 enum Proc {
-    Running(Child),
+    Running {
+        child: Child,
+        /// The kill-timer deadline (ADR-0047): once passed, `poll` kills the
+        /// child and reports a `Timeout` failure — the local mirror of the
+        /// kubelet's `activeDeadlineSeconds`.
+        deadline: std::time::Instant,
+    },
     Done(ExecState),
 }
+
+/// The global default step deadline in seconds (ADR-0047).
+pub const DEFAULT_STEP_TIMEOUT_SECS: u32 = 3_600;
 
 /// A local-process executor. Steps run as OS child processes; launched children
 /// are tracked by their fence handle so a relaunch re-attaches (idempotency).
 pub struct LocalExecutor {
     procs: Mutex<HashMap<String, Proc>>,
+    /// Global default step deadline (ADR-0047), when a step declares none.
+    default_step_timeout_secs: u32,
 }
 
 impl LocalExecutor {
     pub fn new() -> Self {
         Self {
             procs: Mutex::new(HashMap::new()),
+            default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
         }
+    }
+
+    /// Override the global default step deadline (ADR-0047).
+    pub fn with_default_step_timeout_secs(mut self, secs: u32) -> Self {
+        self.default_step_timeout_secs = secs;
+        self
     }
 
     /// The deterministic handle a step's fence `{run, step, attempt}` maps to — a
@@ -80,14 +99,22 @@ impl Default for LocalExecutor {
     }
 }
 
-/// Map a finished process's exit status to an [`ExecState`].
+/// Map a finished process's exit status to an [`ExecState`], classifying the
+/// failure (ADR-0047): a non-zero exit code is the step's own verdict (`Step`);
+/// a signal kill (`code() == None` on unix) means the platform — not the step's
+/// logic — ended a *started* process, so it is post-start `Infra`.
 fn state_of(status: std::process::ExitStatus) -> ExecState {
     if status.success() {
         ExecState::Succeeded
     } else {
-        ExecState::Failed {
-            exit_code: status.code(),
-        }
+        let exit_code = status.code();
+        let class = match exit_code {
+            Some(_) => FailureClass::Step,
+            None => FailureClass::Infra {
+                never_started: false,
+            },
+        };
+        ExecState::Failed { exit_code, class }
     }
 }
 
@@ -105,6 +132,25 @@ impl Executor for LocalExecutor {
             }
         }
 
+        // Clone steps run the canonical scarab-clone image with tmpfs token
+        // delivery (ADR-0045) — a Pod-shaped contract the host-process backend
+        // cannot honor. Fail with direction, never a silent no-source run.
+        if spec.clone.is_some() {
+            return Err(ExecError::Launch(
+                "clone steps require the k8s executor (scarab-clone image + tmpfs \
+                 credential delivery, ADR-0045); the local backend has no clone support"
+                    .into(),
+            ));
+        }
+        // Same contract for build steps (ADR-0018): rootless BuildKit is a
+        // Pod-shaped capability the host-process backend cannot honor.
+        if spec.build.is_some() {
+            return Err(ExecError::Launch(
+                "build steps require the k8s executor (rootless BuildKit, ADR-0018); \
+                 the local backend has no image-build support"
+                    .into(),
+            ));
+        }
         // The step contract is an OCI image + command; locally there is no image,
         // so a command is required (ADR-0036).
         let (program, args) = spec
@@ -145,10 +191,16 @@ impl Executor for LocalExecutor {
             .spawn()
             .map_err(|e| ExecError::Launch(format!("spawn `{program}`: {e}")))?;
 
+        // Kill-timer deadline (ADR-0047): the step's authored timeout or the
+        // configured global default.
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(
+                spec.timeout_seconds.unwrap_or(self.default_step_timeout_secs) as u64,
+            );
         self.procs
             .lock()
             .unwrap()
-            .insert(handle.0.clone(), Proc::Running(child));
+            .insert(handle.0.clone(), Proc::Running { child, deadline });
         Ok(handle)
     }
 
@@ -158,13 +210,25 @@ impl Executor for LocalExecutor {
             // Never launched here / lost across a restart — the orchestrator relaunches.
             None => Ok(ExecState::Lost),
             Some(Proc::Done(state)) => Ok(state.clone()),
-            Some(slot @ Proc::Running(_)) => {
-                let Proc::Running(child) = slot else {
+            Some(slot @ Proc::Running { .. }) => {
+                let Proc::Running { child, deadline } = slot else {
                     unreachable!()
                 };
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         let state = state_of(status);
+                        *slot = Proc::Done(state.clone());
+                        Ok(state)
+                    }
+                    // Kill-timer (ADR-0047): past the deadline, kill the child
+                    // and report a classified Timeout — the local mirror of
+                    // the kubelet's activeDeadlineSeconds.
+                    Ok(None) if std::time::Instant::now() >= *deadline => {
+                        let _ = child.start_kill();
+                        let state = ExecState::Failed {
+                            exit_code: None,
+                            class: FailureClass::Timeout,
+                        };
                         *slot = Proc::Done(state.clone());
                         Ok(state)
                     }
@@ -177,12 +241,18 @@ impl Executor for LocalExecutor {
 
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {
         let mut procs = self.procs.lock().unwrap();
-        if let Some(Proc::Running(child)) = procs.get_mut(&handle.0) {
+        if let Some(Proc::Running { child, .. }) = procs.get_mut(&handle.0) {
             // Best-effort kill; `kill_on_drop` also reaps if the slot is dropped.
+            // A cancel is the platform ending a started process (ADR-0047).
             let _ = child.start_kill();
             procs.insert(
                 handle.0.clone(),
-                Proc::Done(ExecState::Failed { exit_code: None }),
+                Proc::Done(ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Infra {
+                        never_started: false,
+                    },
+                }),
             );
         }
         Ok(())

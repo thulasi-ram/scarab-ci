@@ -42,6 +42,9 @@ echo "==> building scarab-server"
 
 echo "==> starting scarab-server (converged) in the background"
 export SCARAB_DATABASE_URL="postgres://scarab:scarab@127.0.0.1:55432/scarab"
+# Dev-only escape hatch (ADR-0048): boots without an authenticator/KEK, with
+# loud warnings. Production must never set this.
+export SCARAB_DEV_INSECURE=1
 export SCARAB_S3_BUCKET="scarab-logs"
 export SCARAB_S3_ENDPOINT="http://127.0.0.1:9000"
 export SCARAB_S3_ACCESS_KEY="scarab"

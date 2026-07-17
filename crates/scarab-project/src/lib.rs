@@ -1,34 +1,58 @@
-//! # scarab-projects — org / repo / project / environment model
+//! # scarab-project — the Org → Project → Environment governance model
 //!
-//! Pure domain crate. Holds the tenancy + configuration model, including
-//! environment [`ProtectionRules`]. Depends only on `serde` and the pure
-//! `scarab-secrets` crate (for [`SecretScope`]) — no infra.
+//! Pure domain crate (ADR-0046, CONTEXT §4.5). A [`Project`] is Scarab's
+//! **governed unit of CI** — the aggregate root beneath an [`Org`] that binds
+//! a source (a `RepoRef` on a forge) to its governance ([`Environment`]s with
+//! [`ProtectionRules`], the privilege whitelist, the secret scope) and owns
+//! the pipelines and runs produced from that source. There is **no separate
+//! governed "Repo" entity** — a Project *is* the governed repo (1:1 with a
+//! `RepoRef` in v1). Depends only on the pure `scarab-secrets` and
+//! `scarab-forge` crates — no infra.
 
 use async_trait::async_trait;
+use scarab_forge::RepoRef;
 use scarab_secrets::SecretScope;
 use serde::{Deserialize, Serialize};
 
-/// A top-level tenant.
+/// A top-level tenant. Owns Projects. The Scarab tenancy boundary — **not**
+/// the forge's `owner` namespace (one Org may span a GitHub org *and* a
+/// Forgejo instance).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Org {
     pub id: String,
     pub slug: String,
 }
 
-/// A repository owned by an org.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Repo {
-    pub id: String,
-    pub org: String,
-    pub name: String,
-}
-
-/// A project groups pipelines/config within a repo.
+/// Scarab's **governed unit of CI** and the aggregate root beneath an [`Org`]
+/// (ADR-0046, CONTEXT §4.5): binds a **source** (a [`RepoRef`] on a forge,
+/// resolved via a `ForgeConnection`) to its **governance** — the
+/// [`Environment`]s with their [`ProtectionRules`], privilege whitelist and
+/// secret scope — and owns the pipelines and runs produced from that source.
+/// RBAC is enforced at Project scope.
+///
+/// **1 Project : 1 RepoRef** in v1 (monorepo per-subdir governance is
+/// deferred to an optional path scope). The Project's natural key is
+/// `(org, name)` where `name` is the repo's forge name — the pair every
+/// trigger event carries — which is what the [`EnvironmentStore`] and the
+/// deploy-admission paths key on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
-    pub repo: String,
-    pub name: String,
+    /// The owning Org (tenancy boundary).
+    pub org: String,
+    /// The forge coordinate this Project governs (1:1 in v1).
+    pub repo: RepoRef,
+    /// The Project's deployment environments with their protection rules.
+    #[serde(default)]
+    pub environments: Vec<Environment>,
+}
+
+impl Project {
+    /// The Project's name — its repo's forge name (1:1 in v1), the second half
+    /// of the `(org, name)` natural key.
+    pub fn name(&self) -> &str {
+        &self.repo.name
+    }
 }
 
 /// A deployment environment with its protection rules.
@@ -225,11 +249,12 @@ fn image_digest(image: &str) -> Option<&str> {
 }
 
 /// A recorded deployment into an [`Environment`] — the deployment history
-/// (ADR-0024, 0037). Scoped to the owning repo (`org`/`repo`).
+/// (ADR-0024, 0037). Scoped to the owning [`Project`] (`org`/`project`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deployment {
     pub org: String,
-    pub repo: String,
+    /// The owning Project's name (its repo's forge name, 1:1 in v1).
+    pub project: String,
     pub environment: String,
     pub git_ref: String,
     pub run: String,
@@ -246,38 +271,40 @@ pub enum ProjectError {
 }
 
 /// Durable store for environments (with their protection rules) and the
-/// deployment history recorded against them. Environments are scoped to the
-/// owning repo (`org`/`repo`) — the key a run knows from its trigger (ADR-0037).
+/// deployment history recorded against them. Keyed by the owning
+/// [`Project`]'s natural key `(org, project)` (ADR-0046) — the project name
+/// is its repo's forge name (1:1 in v1), the key a run knows from its
+/// trigger (ADR-0037).
 #[async_trait]
 pub trait EnvironmentStore: Send + Sync {
-    /// Create or replace an environment's definition within a repo.
+    /// Create or replace an environment's definition within a Project.
     async fn put_environment(
         &self,
         org: &str,
-        repo: &str,
+        project: &str,
         env: &Environment,
     ) -> Result<(), ProjectError>;
 
-    /// Fetch an environment by repo + name.
+    /// Fetch an environment by Project + name.
     async fn get_environment(
         &self,
         org: &str,
-        repo: &str,
+        project: &str,
         name: &str,
     ) -> Result<Option<Environment>, ProjectError>;
 
-    /// List the environments defined in a repo.
+    /// List the environments defined in a Project.
     async fn list_environments(
         &self,
         org: &str,
-        repo: &str,
+        project: &str,
     ) -> Result<Vec<Environment>, ProjectError>;
 
     /// Remove an environment. Idempotent: removing an absent one is Ok.
     async fn delete_environment(
         &self,
         org: &str,
-        repo: &str,
+        project: &str,
         name: &str,
     ) -> Result<(), ProjectError>;
 
@@ -288,7 +315,7 @@ pub trait EnvironmentStore: Send + Sync {
     async fn deployments(
         &self,
         org: &str,
-        repo: &str,
+        project: &str,
         environment: &str,
     ) -> Result<Vec<Deployment>, ProjectError>;
 }

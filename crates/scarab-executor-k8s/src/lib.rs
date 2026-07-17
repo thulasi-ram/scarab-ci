@@ -16,10 +16,12 @@ use k8s_openapi::api::core::v1::{
     SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{Api, DeleteParams, LogParams, PostParams};
+use kube::api::{Api, AttachParams, DeleteParams, LogParams, Patch, PatchParams, PostParams};
+use std::sync::Arc;
 
-use scarab_engine::ports::{ExecHandle, ExecState, LogChunks};
+use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogChunks};
 use scarab_engine::{ExecError, Executor, StepRun, StepSpec};
+use scarab_storage::Cas;
 
 /// The step container's name in every step Pod (see [`build_pod`]). The log tail
 /// pins the source to this container so a results-egress sidecar (ADR-0042) never
@@ -55,6 +57,24 @@ pub struct K8sExecutor {
     client: Option<kube::Client>,
     namespace: String,
     results_egress: Option<ResultsEgress>,
+    /// Global default step deadline in seconds (ADR-0047), applied when a step
+    /// declares no `timeout:`. Default 1h.
+    default_step_timeout_secs: u32,
+    /// The canonical scarab-clone image a clone step runs (ADR-0045) —
+    /// digest-pinned in production, never the author's image.
+    clone_image: String,
+    /// The workspace CAS (ADR-0029/0045). When wired, every step Pod gets the
+    /// `/workspace` machinery: an init container that receives the merged
+    /// `needs` workspaces (materialized by the control plane and streamed in
+    /// over exec), and an egress sidecar the control plane snapshots back
+    /// into the CAS after the step exits. `None` = no workspace flow (tests /
+    /// object-store-less dev).
+    workspace_cas: Option<Arc<dyn Cas>>,
+    /// The artifact blob store (ADR-0052). When wired (and the workspace
+    /// flow is on), every step Pod gets a `/scarab/artifacts` emptyDir that
+    /// is harvested post-step: matching files upload as object blobs and the
+    /// metadata rides a Pod annotation the orchestrator persists.
+    artifact_store: Option<Arc<dyn scarab_storage::ObjectStore>>,
 }
 
 impl K8sExecutor {
@@ -63,6 +83,10 @@ impl K8sExecutor {
             client: None,
             namespace: namespace.into(),
             results_egress: None,
+            default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
+            workspace_cas: None,
+            artifact_store: None,
+            clone_image: DEFAULT_CLONE_IMAGE.to_string(),
         }
     }
 
@@ -71,12 +95,44 @@ impl K8sExecutor {
             client: Some(client),
             namespace: namespace.into(),
             results_egress: None,
+            default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
+            workspace_cas: None,
+            artifact_store: None,
+            clone_image: DEFAULT_CLONE_IMAGE.to_string(),
         }
+    }
+
+    /// Override the canonical scarab-clone image (ADR-0045).
+    pub fn with_clone_image(mut self, image: impl Into<String>) -> Self {
+        self.clone_image = image.into();
+        self
+    }
+
+    /// Enable artifact collection (ADR-0052): harvest `/scarab/artifacts`
+    /// post-step into `store` (requires the workspace flow — the harvest runs
+    /// in its egress leg).
+    pub fn with_artifact_store(mut self, store: Arc<dyn scarab_storage::ObjectStore>) -> Self {
+        self.artifact_store = Some(store);
+        self
+    }
+
+    /// Enable the workspace CAS flow (ADR-0029/0045): materialize `needs`
+    /// workspaces into each step Pod and snapshot `/workspace` back after it
+    /// exits.
+    pub fn with_workspace_cas(mut self, cas: Arc<dyn Cas>) -> Self {
+        self.workspace_cas = Some(cas);
+        self
     }
 
     /// Enable result capture via the per-Pod egress sidecar (ADR-0042).
     pub fn with_results_egress(mut self, egress: ResultsEgress) -> Self {
         self.results_egress = Some(egress);
+        self
+    }
+
+    /// Override the global default step deadline (ADR-0047).
+    pub fn with_default_step_timeout_secs(mut self, secs: u32) -> Self {
+        self.default_step_timeout_secs = secs;
         self
     }
 
@@ -93,6 +149,490 @@ impl K8sExecutor {
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         Ok(Api::namespaced(client, &self.namespace))
     }
+
+    /// Upsert the per-Pod Secret carrying the clone credential (ADR-0045
+    /// §Token delivery): mounted as tmpfs by the kubelet, read via
+    /// GIT_ASKPASS — the token is never in env, URL, or argv. Owner-referenced
+    /// to the Pod so it is garbage-collected with it. Re-drives refresh the
+    /// short-TTL token.
+    async fn ensure_clone_secret(
+        &self,
+        pod_name: &str,
+        pod: &Pod,
+        spec: &StepSpec,
+    ) -> Result<(), ExecError> {
+        let Some(cred) = spec.clone.as_ref().and_then(|c| c.credential.as_ref()) else {
+            return Ok(());
+        };
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(client, &self.namespace);
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some(clone_secret_name(pod_name)),
+                namespace: Some(self.namespace.clone()),
+                owner_references: pod.metadata.uid.clone().map(|uid| {
+                    vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                        api_version: "v1".into(),
+                        kind: "Pod".into(),
+                        name: pod_name.to_string(),
+                        uid,
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            },
+            string_data: Some(std::collections::BTreeMap::from([(
+                CLONE_TOKEN_KEY.to_string(),
+                cred.token.clone(),
+            )])),
+            ..Default::default()
+        };
+        match secrets
+            .create(&PostParams::default(), &secret)
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Exists: refresh the token in place (short-TTL rotation on re-drive).
+            Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                secrets
+                    .replace(&clone_secret_name(pod_name), &PostParams::default(), &secret)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| ExecError::Launch(format!("clone secret: {e}")))
+            }
+            Err(e) => Err(ExecError::Launch(format!("clone secret: {e}"))),
+        }
+    }
+
+    /// Upsert the per-Pod Secret carrying a build step's registry
+    /// dockerconfigjson (ADR-0018): mounted read-only as `DOCKER_CONFIG`
+    /// (tmpfs) — the credential is never in env, argv, or the stored spec.
+    /// Owner-referenced to the Pod; re-drives refresh it.
+    async fn ensure_registry_secret(
+        &self,
+        pod_name: &str,
+        pod: &Pod,
+        spec: &StepSpec,
+    ) -> Result<(), ExecError> {
+        let Some(config_json) = spec.build.as_ref().and_then(|b| registry_dockerconfig(b)) else {
+            return Ok(());
+        };
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(client, &self.namespace);
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some(registry_secret_name(pod_name)),
+                namespace: Some(self.namespace.clone()),
+                owner_references: pod.metadata.uid.clone().map(|uid| {
+                    vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                        api_version: "v1".into(),
+                        kind: "Pod".into(),
+                        name: pod_name.to_string(),
+                        uid,
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            },
+            string_data: Some(std::collections::BTreeMap::from([(
+                REGISTRY_AUTH_KEY.to_string(),
+                config_json,
+            )])),
+            ..Default::default()
+        };
+        match secrets.create(&PostParams::default(), &secret).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 409 => secrets
+                .replace(&registry_secret_name(pod_name), &PostParams::default(), &secret)
+                .await
+                .map(|_| ())
+                .map_err(|e| ExecError::Launch(format!("registry secret: {e}"))),
+            Err(e) => Err(ExecError::Launch(format!("registry secret: {e}"))),
+        }
+    }
+
+    /// Upsert the per-Pod Secret carrying the per-attempt OIDC token
+    /// (ADR-0015): mounted read-only on tmpfs, pointed at by
+    /// `SCARAB_OIDC_TOKEN_FILE`. Owner-referenced to the Pod; re-drives
+    /// refresh the short-lived token.
+    async fn ensure_oidc_secret(
+        &self,
+        pod_name: &str,
+        pod: &Pod,
+        spec: &StepSpec,
+    ) -> Result<(), ExecError> {
+        let Some(token) = &spec.oidc_token else {
+            return Ok(());
+        };
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(client, &self.namespace);
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some(oidc_secret_name(pod_name)),
+                namespace: Some(self.namespace.clone()),
+                owner_references: pod.metadata.uid.clone().map(|uid| {
+                    vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                        api_version: "v1".into(),
+                        kind: "Pod".into(),
+                        name: pod_name.to_string(),
+                        uid,
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            },
+            string_data: Some(std::collections::BTreeMap::from([(
+                OIDC_TOKEN_KEY.to_string(),
+                token.clone(),
+            )])),
+            ..Default::default()
+        };
+        match secrets.create(&PostParams::default(), &secret).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 409 => secrets
+                .replace(&oidc_secret_name(pod_name), &PostParams::default(), &secret)
+                .await
+                .map(|_| ())
+                .map_err(|e| ExecError::Launch(format!("oidc secret: {e}"))),
+            Err(e) => Err(ExecError::Launch(format!("oidc secret: {e}"))),
+        }
+    }
+
+    /// Drive the workspace lifecycle for `pod` (ADR-0029/0045). Two idempotent
+    /// legs, all state derived from the Pod itself:
+    ///
+    /// 1. **Feed** — while the `scarab-workspace-init` container is running
+    ///    (it waits on a marker), materialize the input CAS roots (from the
+    ///    Pod annotation) into a temp dir, stream them in as a tar over exec,
+    ///    and touch the marker. Only content the Pod lacks moves: the init
+    ///    container only ever runs before the step, exactly once per Pod.
+    /// 2. **Snapshot** — once the step container has terminated and the
+    ///    egress sidecar is still holding the Pod open, tar `/workspace` out
+    ///    (successful steps only), `Cas::ingest` it (per-file merkle dedup —
+    ///    unchanged blobs upload nothing), patch the root onto the Pod as an
+    ///    annotation, then release the sidecar.
+    async fn drive_workspace(
+        &self,
+        pods: &Api<Pod>,
+        pod: &Pod,
+        cas: &dyn Cas,
+    ) -> Result<(), String> {
+        let name = pod.metadata.name.clone().ok_or("pod has no name")?;
+        let annotations = pod.metadata.annotations.clone().unwrap_or_default();
+        // Not a workspace Pod (built before the CAS was wired) — nothing to do.
+        let Some(inputs_csv) = annotations.get(ANNOTATION_WS_INPUTS) else {
+            return Ok(());
+        };
+
+        // --- Leg 1: feed the waiting init container. -----------------------
+        if init_container_running(pod, WORKSPACE_INIT_CONTAINER) && !inputs_csv.is_empty() {
+            let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+            for root in inputs_csv.split(',').filter(|r| !r.is_empty()) {
+                // Later inputs overlay earlier ones (merge-in-order, ADR-0007).
+                cas.materialize(
+                    &scarab_storage::TreeHash(root.to_string()),
+                    tmp.path().to_str().ok_or("tmp path")?,
+                )
+                .await
+                .map_err(|e| format!("materialize {root}: {e}"))?;
+            }
+            let tar_bytes = pack_dir(tmp.path())?;
+            self.exec_with_stdin(
+                pods,
+                &name,
+                WORKSPACE_INIT_CONTAINER,
+                &format!(
+                    "tar -xf - -C {WORKSPACE_MOUNT_PATH} && touch {CTL_MOUNT_PATH}/init-done"
+                ),
+                tar_bytes,
+            )
+            .await?;
+        }
+
+        // --- Leg 2: snapshot after the step exits. --------------------------
+        let step_exit = step_terminated_exit(pod);
+        if let Some(exit) = step_exit {
+            if init_container_running(pod, WORKSPACE_EGRESS_CONTAINER) {
+                let already = annotations
+                    .get(ANNOTATION_WS_ROOT)
+                    .is_some_and(|v| !v.is_empty());
+                if exit == 0 && !already {
+                    let out = self
+                        .exec_capture_stdout(
+                            pods,
+                            &name,
+                            WORKSPACE_EGRESS_CONTAINER,
+                            &format!("tar -cf - -C {WORKSPACE_MOUNT_PATH} ."),
+                        )
+                        .await?;
+                    let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+                    unpack_dir(&out, tmp.path())?;
+                    let snapshot = cas
+                        .ingest(tmp.path().to_str().ok_or("tmp path")?)
+                        .await
+                        .map_err(|e| format!("ingest: {e}"))?;
+                    // Record the root on the Pod BEFORE releasing the sidecar:
+                    // output() reads it durably across control-plane restarts.
+                    let patch = serde_json::json!({
+                        "metadata": { "annotations": { ANNOTATION_WS_ROOT: snapshot.root.0 } }
+                    });
+                    pods.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                        .await
+                        .map_err(|e| format!("annotate root: {e}"))?;
+                }
+                // Harvest artifacts of record (ADR-0052): everything the
+                // step wrote to /scarab/artifacts, filtered by its authored
+                // globs, uploaded as plain object blobs (NOT the CAS — an
+                // independent lifecycle) and indexed on the Pod annotation.
+                if let Some(store) = &self.artifact_store {
+                    let already = annotations.contains_key(ANNOTATION_ARTIFACTS);
+                    if exit == 0 && !already {
+                        if let Err(e) = self
+                            .harvest_artifacts(pods, pod, &name, store.as_ref())
+                            .await
+                        {
+                            // Best-effort like logs: artifacts must never
+                            // wedge the run's settle path.
+                            eprintln!("scarab-executor: artifact harvest failed for {name}: {e}");
+                        }
+                    }
+                }
+                // Release the sidecar (idempotent): failed steps snapshot
+                // nothing — their workspace is not an output.
+                self.exec_with_stdin(
+                    pods,
+                    &name,
+                    WORKSPACE_EGRESS_CONTAINER,
+                    &format!("touch {CTL_MOUNT_PATH}/egress-done"),
+                    Vec::new(),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Tar `/scarab/artifacts` out of the egress container, filter by the
+    /// step's authored globs, upload each file as `artifacts/{run}/{name}`,
+    /// and record the metadata on the Pod (ADR-0052).
+    async fn harvest_artifacts(
+        &self,
+        pods: &Api<Pod>,
+        pod: &Pod,
+        name: &str,
+        store: &dyn scarab_storage::ObjectStore,
+    ) -> Result<(), String> {
+        let run = pod
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("scarab.io/run"))
+            .cloned()
+            .unwrap_or_default();
+        let globs: Vec<String> = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(ANNOTATION_ARTIFACT_GLOBS))
+            .and_then(|v| serde_json::from_str(v).ok())
+            .unwrap_or_default();
+        let out = self
+            .exec_capture_stdout(
+                pods,
+                name,
+                WORKSPACE_EGRESS_CONTAINER,
+                &format!("tar -cf - -C {ARTIFACTS_MOUNT_PATH} . 2>/dev/null || true"),
+            )
+            .await?;
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        if !out.is_empty() {
+            let _ = unpack_dir(&out, tmp.path()); // an empty dir tars to nothing
+        }
+
+        let mut metas: Vec<scarab_engine::ArtifactMeta> = Vec::new();
+        let mut stack = vec![tmp.path().to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
+            for entry in entries {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(tmp.path())
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                if !globs.is_empty() && !globs.iter().any(|g| glob_match(g, &rel)) {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                let key = format!("artifacts/{run}/{rel}");
+                store.put(&key, bytes.clone()).await.map_err(|e| e.to_string())?;
+                metas.push(scarab_engine::ArtifactMeta {
+                    name: rel.clone(),
+                    size: bytes.len() as u64,
+                    content_type: content_type_of(&rel).to_string(),
+                    object_key: key,
+                });
+            }
+        }
+        metas.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Record BEFORE the sidecar releases — artifacts() reads it durably.
+        let patch = serde_json::json!({
+            "metadata": { "annotations": {
+                ANNOTATION_ARTIFACTS: serde_json::to_string(&metas).unwrap_or_default()
+            } }
+        });
+        pods.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .map_err(|e| format!("annotate artifacts: {e}"))?;
+        Ok(())
+    }
+
+    /// Run `sh -c cmd` in `container`, streaming `stdin_bytes` to it.
+    async fn exec_with_stdin(
+        &self,
+        pods: &Api<Pod>,
+        pod: &str,
+        container: &str,
+        cmd: &str,
+        stdin_bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        use tokio::io::AsyncWriteExt;
+        let params = AttachParams::default()
+            .container(container)
+            .stdin(true)
+            .stdout(true)
+            .stderr(true);
+        let mut proc = pods
+            .exec(pod, ["sh", "-c", cmd], &params)
+            .await
+            .map_err(|e| format!("exec in {container}: {e}"))?;
+        if let Some(mut stdin) = proc.stdin() {
+            stdin.write_all(&stdin_bytes).await.map_err(|e| e.to_string())?;
+            stdin.shutdown().await.ok();
+            drop(stdin);
+        }
+        // Best-effort join: when this exec's command releases a wait-loop
+        // (touching a marker), the container exits immediately and the exec's
+        // status frame is torn down with it — a benign race. The workspace
+        // state machine is idempotent and derived from the Pod, so a feed
+        // that truly failed leaves the init container running and the next
+        // poll simply retries.
+        let _ = proc.join().await;
+        Ok(())
+    }
+
+    /// Run `sh -c cmd` in `container`, capturing its stdout.
+    async fn exec_capture_stdout(
+        &self,
+        pods: &Api<Pod>,
+        pod: &str,
+        container: &str,
+        cmd: &str,
+    ) -> Result<Vec<u8>, String> {
+        use tokio::io::AsyncReadExt as _;
+        let params = AttachParams::default()
+            .container(container)
+            .stdout(true)
+            .stderr(false);
+        let mut proc = pods
+            .exec(pod, ["sh", "-c", cmd], &params)
+            .await
+            .map_err(|e| format!("exec in {container}: {e}"))?;
+        let mut out = Vec::new();
+        if let Some(mut stdout) = proc.stdout() {
+            stdout.read_to_end(&mut out).await.map_err(|e| e.to_string())?;
+        }
+        proc.join().await.map_err(|e| format!("exec join: {e}"))?;
+        Ok(out)
+    }
+}
+
+/// Minimal artifact glob (ADR-0052): `*` matches any run of characters
+/// (including `/`); everything else is literal. Enough for `dist/*`,
+/// `*.tar.gz`, `coverage/*.html`.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    fn inner(p: &[u8], n: &[u8]) -> bool {
+        match (p.first(), n.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => inner(&p[1..], n) || (!n.is_empty() && inner(p, &n[1..])),
+            (Some(pc), Some(nc)) if pc == nc => inner(&p[1..], &n[1..]),
+            _ => false,
+        }
+    }
+    inner(pattern.as_bytes(), name.as_bytes())
+}
+
+/// A pragmatic content type from the artifact's extension.
+fn content_type_of(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or_default() {
+        "html" | "htm" => "text/html",
+        "txt" | "log" => "text/plain",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "pdf" => "application/pdf",
+        "gz" | "tgz" => "application/gzip",
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The per-Pod Secret carrying the clone credential (owner-referenced to the
+/// Pod, so it is garbage-collected with it).
+fn clone_secret_name(pod_name: &str) -> String {
+    format!("{pod_name}-token")
+}
+
+/// Is the named (init) container currently in a `running` state?
+fn init_container_running(pod: &Pod, name: &str) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|c| c.name == name && c.state.as_ref().is_some_and(|st| st.running.is_some()))
+}
+
+/// The step container's exit code once terminated, else `None`.
+fn step_terminated_exit(pod: &Pod) -> Option<i32> {
+    pod.status
+        .as_ref()?
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|c| c.name == STEP_CONTAINER)?
+        .state
+        .as_ref()?
+        .terminated
+        .as_ref()
+        .map(|t| t.exit_code)
+}
+
+/// Pack `dir` into an uncompressed tar (workspaces move within one cluster
+/// hop; compression buys little and costs CPU).
+fn pack_dir(dir: &std::path::Path) -> Result<Vec<u8>, String> {
+    let mut builder = tar::Builder::new(Vec::new());
+    builder
+        .append_dir_all(".", dir)
+        .map_err(|e| format!("tar pack: {e}"))?;
+    builder.into_inner().map_err(|e| format!("tar finish: {e}"))
+}
+
+/// Unpack a tar stream into `dir`.
+fn unpack_dir(bytes: &[u8], dir: &std::path::Path) -> Result<(), String> {
+    let mut archive = tar::Archive::new(bytes);
+    archive.unpack(dir).map_err(|e| format!("tar unpack: {e}"))
 }
 
 #[async_trait]
@@ -103,18 +643,35 @@ impl Executor for K8sExecutor {
 
         // Re-attach: if the Pod already exists (a prior launch we may not have
         // observed completing), adopt it instead of creating a duplicate.
-        if pods
+        let existing = pods
             .get_opt(&name)
             .await
-            .map_err(|e| ExecError::Launch(e.to_string()))?
-            .is_some()
-        {
+            .map_err(|e| ExecError::Launch(e.to_string()))?;
+        if let Some(pod) = existing {
+            // Refresh the short-TTL clone credential on re-drives (ADR-0045).
+            self.ensure_clone_secret(&name, &pod, spec).await?;
+            self.ensure_registry_secret(&name, &pod, spec).await?;
+            self.ensure_oidc_secret(&name, &pod, spec).await?;
             return Ok(ExecHandle(name));
         }
 
-        let pod = build_pod(&name, &self.namespace, step, spec, self.results_egress.as_ref());
+        let pod = build_pod(
+            &name,
+            &self.namespace,
+            step,
+            spec,
+            self.results_egress.as_ref(),
+            self.default_step_timeout_secs,
+            self.workspace_cas.is_some(),
+            &self.clone_image,
+        );
         match pods.create(&PostParams::default(), &pod).await {
-            Ok(_) => Ok(ExecHandle(name)),
+            Ok(created) => {
+                self.ensure_clone_secret(&name, &created, spec).await?;
+                self.ensure_registry_secret(&name, &created, spec).await?;
+                self.ensure_oidc_secret(&name, &created, spec).await?;
+                Ok(ExecHandle(name))
+            }
             // A concurrent launcher won the race — the Pod now exists, which is
             // exactly what we wanted; treat as a successful re-attach.
             Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(ExecHandle(name)),
@@ -129,10 +686,66 @@ impl Executor for K8sExecutor {
             .await
             .map_err(|e| ExecError::Other(e.to_string()))?
         {
-            Some(pod) => Ok(pod_state(&pod)),
+            Some(pod) => {
+                // Workspace orchestration (ADR-0029/0045): feed the init
+                // container / snapshot the finished workspace. Both legs are
+                // idempotent and derive ALL state from the Pod itself, so an
+                // adopted Pod after a control-plane restart resumes cleanly.
+                if let Some(cas) = &self.workspace_cas {
+                    if let Err(e) = self.drive_workspace(&pods, &pod, cas.as_ref()).await {
+                        return Err(ExecError::Other(format!("workspace: {e}")));
+                    }
+                    // Re-read: drive_workspace may have released the egress
+                    // sidecar (the Pod is about to settle).
+                }
+                Ok(pod_state(&pod))
+            }
             // The Pod is gone (evicted, GC'd, node lost) — the backend lost it.
             None => Ok(ExecState::Lost),
         }
+    }
+
+    /// The step's output workspace: the CAS root ingested at egress, recorded
+    /// as a Pod annotation (durable with the Pod across restarts).
+    async fn output(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        if self.workspace_cas.is_none() {
+            return Ok(None);
+        }
+        let pods = self.pods()?;
+        let pod = pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        Ok(pod.and_then(|p| {
+            p.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(ANNOTATION_WS_ROOT))
+                .filter(|v| !v.is_empty())
+                .cloned()
+        }))
+    }
+
+    /// The artifacts the step published (ADR-0052), from the Pod annotation
+    /// the harvest recorded (durable with the Pod across restarts).
+    async fn artifacts(&self, handle: &ExecHandle) -> Result<Vec<scarab_engine::ArtifactMeta>, ExecError> {
+        if self.artifact_store.is_none() {
+            return Ok(Vec::new());
+        }
+        let pods = self.pods()?;
+        let pod = pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        Ok(pod
+            .and_then(|p| {
+                p.metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(ANNOTATION_ARTIFACTS))
+                    .and_then(|v| serde_json::from_str(v).ok())
+            })
+            .unwrap_or_default())
     }
 
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {
@@ -228,6 +841,54 @@ pub fn pod_name(step: &StepRun) -> String {
     format!("scarab-{slug}-{hash:08x}")
 }
 
+/// The default canonical scarab-clone image (ADR-0045). Overridable via
+/// `SCARAB_CLONE_IMAGE` (digest-pin in production).
+pub const DEFAULT_CLONE_IMAGE: &str = "ghcr.io/thulasi-ram/scarab-clone:edge";
+/// The tmpfs mount the clone credential is delivered on (ADR-0045 §Token
+/// delivery): a per-Pod k8s Secret volume (tmpfs on the node), read by
+/// GIT_ASKPASS — the token is never in env, URL, or argv.
+const CLONE_SECRETS_MOUNT_PATH: &str = "/scarab/secrets";
+const CLONE_SECRETS_VOLUME: &str = "scarab-clone-token";
+/// The key/file name the token lives under.
+const CLONE_TOKEN_KEY: &str = "clone-token";
+
+/// The in-Pod workspace root (ADR-0007/0008): steps run here; the clone step
+/// and every producer write here; the snapshot covers it (incl. `.git`).
+pub const WORKSPACE_MOUNT_PATH: &str = "/workspace";
+/// The workspace `emptyDir` volume name.
+const WORKSPACE_VOLUME: &str = "scarab-workspace";
+/// Control-plane→Pod handshake dir (markers only; NEVER part of the snapshot).
+const CTL_MOUNT_PATH: &str = "/scarab-ctl";
+const CTL_VOLUME: &str = "scarab-ctl";
+/// The helper image for the workspace init/egress containers: they only run
+/// `sh`/`tar`/`sleep`, so a pinned busybox suffices.
+const WORKSPACE_HELPER_IMAGE: &str = "busybox:1.36";
+/// Names of the workspace helper containers.
+const WORKSPACE_INIT_CONTAINER: &str = "scarab-workspace-init";
+const WORKSPACE_EGRESS_CONTAINER: &str = "scarab-workspace-egress";
+/// Pod annotations: the input CAS roots (set at build, read at feed time so a
+/// resumed control plane needs no in-memory state) and the ingested output
+/// root (patched after egress; `Executor::output` reads it — durable with the
+/// Pod across control-plane restarts).
+const ANNOTATION_WS_INPUTS: &str = "scarab.io/workspace-inputs";
+/// The Pod annotation carrying the harvested artifacts' metadata (ADR-0052) —
+/// JSON `[{name,size,content_type,object_key}]`, durable with the Pod.
+const ANNOTATION_ARTIFACTS: &str = "scarab.io/artifacts";
+/// The Pod annotation carrying the step's artifact publication globs.
+const ANNOTATION_ARTIFACT_GLOBS: &str = "scarab.io/artifact-globs";
+/// Where a step publishes artifacts of record (ADR-0008/0052 convention).
+pub const ARTIFACTS_MOUNT_PATH: &str = "/scarab/artifacts";
+const ARTIFACTS_VOLUME: &str = "scarab-artifacts";
+const ANNOTATION_WS_ROOT: &str = "scarab.io/workspace-root";
+/// Grace period for workspace Pods: the egress sidecar ignores SIGTERM and
+/// waits for the control plane to snapshot `/workspace`, bounded by this.
+const WORKSPACE_TERMINATION_GRACE_SECS: i64 = 600;
+
+/// The global default step deadline in seconds (ADR-0047): mandatory, so a
+/// hung Pod can never wedge a run forever. Overridable per step (`timeout:`)
+/// and globally (`SCARAB_STEP_TIMEOUT_SECS`).
+pub const DEFAULT_STEP_TIMEOUT_SECS: u32 = 3_600;
+
 /// Absolute in-Pod path of the shared results directory (ADR-0008/0042). The
 /// step writes `<name>.json` files here; the egress sidecar reads them.
 const RESULTS_MOUNT_PATH: &str = "/scarab/results";
@@ -241,12 +902,16 @@ const RESULTS_VOLUME: &str = "scarab-results";
 /// (ADR-0042) — a native sidecar (an `initContainer` with `restartPolicy: Always`)
 /// that drains `/scarab/results` to the fence-scoped results API after the step
 /// exits. The untrusted step container never holds the token; only the sidecar does.
+#[allow(clippy::too_many_arguments)] // the one Pod-assembly point; splitting hides the shape
 pub fn build_pod(
     name: &str,
     namespace: &str,
     step: &StepRun,
     spec: &StepSpec,
     egress: Option<&ResultsEgress>,
+    default_timeout_secs: u32,
+    workspace: bool,
+    clone_image: &str,
 ) -> Pod {
     let attempt = step
         .current_attempt()
@@ -289,13 +954,180 @@ pub fn build_pod(
         ..Default::default()
     });
 
+    // Workspace machinery (ADR-0029/0045): the shared /workspace emptyDir the
+    // step runs in, plus the control handshake dir (markers only — never part
+    // of the snapshot).
+    let workspace_mount = workspace.then(|| VolumeMount {
+        name: WORKSPACE_VOLUME.to_string(),
+        mount_path: WORKSPACE_MOUNT_PATH.to_string(),
+        ..Default::default()
+    });
+    let ctl_mount = workspace.then(|| VolumeMount {
+        name: CTL_VOLUME.to_string(),
+        mount_path: CTL_MOUNT_PATH.to_string(),
+        ..Default::default()
+    });
+
+    // Artifacts of record (ADR-0052): an emptyDir the step publishes into,
+    // harvested post-step by the control plane via the workspace egress leg
+    // (so it exists only when the workspace flow is on).
+    let artifacts_mount = workspace.then(|| VolumeMount {
+        name: ARTIFACTS_VOLUME.to_string(),
+        mount_path: ARTIFACTS_MOUNT_PATH.to_string(),
+        ..Default::default()
+    });
+    if workspace {
+        env.push(EnvVar {
+            name: "SCARAB_ARTIFACTS".to_string(),
+            value: Some(ARTIFACTS_MOUNT_PATH.to_string()),
+            value_from: None,
+        });
+    }
+
+    let mut step_mounts: Vec<VolumeMount> = Vec::new();
+    if let Some(m) = results_mount.clone() {
+        step_mounts.push(m);
+    }
+    if let Some(m) = workspace_mount.clone() {
+        step_mounts.push(m);
+    }
+    if let Some(m) = artifacts_mount.clone() {
+        step_mounts.push(m);
+    }
+
+    // Clone steps (ADR-0045): the canonical scarab-clone image (never the
+    // author's), context via env — and the credential ONLY via the tmpfs
+    // secret volume (never env/URL/argv). `clone_image` is threaded through
+    // `build_pod`'s caller (the executor's config).
+    let mut clone_token_volume: Option<Volume> = None;
+    let (image, command) = if let Some(clone) = &spec.clone {
+        for (k, v) in [
+            ("SCARAB_CLONE_URL", clone.url.clone()),
+            ("SCARAB_CLONE_SHA", clone.sha.clone()),
+            (
+                "SCARAB_CLONE_DEPTH",
+                if clone.depth_full { "full".into() } else { "1".into() },
+            ),
+            ("SCARAB_CLONE_SUBMODULES", clone.submodules.to_string()),
+            ("SCARAB_CLONE_LFS", clone.lfs.to_string()),
+        ] {
+            env.push(EnvVar { name: k.to_string(), value: Some(v), value_from: None });
+        }
+        if let Some(cred) = &clone.credential {
+            // Point the askpass helper at the tmpfs file; the username is not
+            // secret. The token itself rides ONLY in the mounted Secret.
+            env.push(EnvVar {
+                name: "SCARAB_CLONE_TOKEN_FILE".to_string(),
+                value: Some(format!("{CLONE_SECRETS_MOUNT_PATH}/{CLONE_TOKEN_KEY}")),
+                value_from: None,
+            });
+            env.push(EnvVar {
+                name: "SCARAB_CLONE_USERNAME".to_string(),
+                value: Some(cred.username.clone()),
+                value_from: None,
+            });
+            step_mounts.push(VolumeMount {
+                name: CLONE_SECRETS_VOLUME.to_string(),
+                mount_path: CLONE_SECRETS_MOUNT_PATH.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+            clone_token_volume = Some(Volume {
+                name: CLONE_SECRETS_VOLUME.to_string(),
+                secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                    secret_name: Some(clone_secret_name(name)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        (clone_image.to_string(), Vec::new())
+    } else {
+        (spec.image.clone(), spec.command.clone())
+    };
+
+    // Build steps (ADR-0018): rootless BuildKit (never the author's image),
+    // registry auth ONLY via a mounted dockerconfigjson (a per-Pod Secret —
+    // tmpfs), and the image digest emitted as the `image` step result when
+    // the egress sidecar is present.
+    let mut registry_volume: Option<Volume> = None;
+    let (image, command, args) = if let Some(build) = &spec.build {
+        env.push(EnvVar {
+            // Rootless buildkitd cannot use the process sandbox.
+            name: "BUILDKITD_FLAGS".into(),
+            value: Some("--oci-worker-no-process-sandbox".into()),
+            value_from: None,
+        });
+        let has_auth = build.registry_auth_json.is_some() || build.derived_auth.is_some();
+        if has_auth {
+            env.push(EnvVar {
+                name: "DOCKER_CONFIG".into(),
+                value: Some(REGISTRY_AUTH_MOUNT_PATH.to_string()),
+                value_from: None,
+            });
+            step_mounts.push(VolumeMount {
+                name: REGISTRY_AUTH_VOLUME.to_string(),
+                mount_path: REGISTRY_AUTH_MOUNT_PATH.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+            registry_volume = Some(Volume {
+                name: REGISTRY_AUTH_VOLUME.to_string(),
+                secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                    secret_name: Some(registry_secret_name(name)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+        (
+            BUILDKIT_IMAGE.to_string(),
+            vec!["buildctl-daemonless.sh".to_string()],
+            buildctl_args(build, egress.is_some()),
+        )
+    } else {
+        (image, command, Vec::new())
+    };
+
+    // Per-attempt OIDC token (ADR-0015): tmpfs Secret mount + a pointer env
+    // var. The token itself NEVER rides in env or argv.
+    let mut oidc_volume: Option<Volume> = None;
+    if spec.oidc_token.is_some() {
+        env.push(EnvVar {
+            name: "SCARAB_OIDC_TOKEN_FILE".to_string(),
+            value: Some(format!("{OIDC_TOKEN_MOUNT_PATH}/{OIDC_TOKEN_KEY}")),
+            value_from: None,
+        });
+        step_mounts.push(VolumeMount {
+            name: OIDC_TOKEN_VOLUME.to_string(),
+            mount_path: OIDC_TOKEN_MOUNT_PATH.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+        oidc_volume = Some(Volume {
+            name: OIDC_TOKEN_VOLUME.to_string(),
+            secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                secret_name: Some(oidc_secret_name(name)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
     let container = Container {
         name: STEP_CONTAINER.to_string(),
-        image: Some(spec.image.clone()),
-        command: (!spec.command.is_empty()).then(|| spec.command.clone()),
+        image: Some(image),
+        command: (!command.is_empty()).then_some(command),
+        args: (!args.is_empty()).then_some(args),
         env: Some(env),
-        security_context: Some(step_security_context(spec)),
-        volume_mounts: results_mount.clone().map(|m| vec![m]),
+        security_context: Some(if spec.build.is_some() {
+            build_security_context()
+        } else {
+            step_security_context(spec)
+        }),
+        volume_mounts: (!step_mounts.is_empty()).then_some(step_mounts),
+        // Steps run in the workspace (ADR-0008 convention).
+        working_dir: workspace.then(|| WORKSPACE_MOUNT_PATH.to_string()),
         ..Default::default()
     };
 
@@ -313,24 +1145,115 @@ pub fn build_pod(
     // sidecar (initContainer with restartPolicy Always), so it starts alongside
     // the step and the kubelet terminates it after the step exits — its window to
     // drain results — without blocking the Pod's terminal phase.
-    let (volumes, init_containers) = match egress {
-        Some(e) => {
-            let volume = Volume {
-                name: RESULTS_VOLUME.to_string(),
-                empty_dir: Some(EmptyDirVolumeSource::default()),
-                ..Default::default()
-            };
-            let sidecar = egress_sidecar(step, &attempt, &results_mount.unwrap(), e);
-            (Some(vec![volume]), Some(vec![sidecar]))
+    let mut volumes: Vec<Volume> = Vec::new();
+    let mut init_containers: Vec<Container> = Vec::new();
+    if let Some(e) = egress {
+        volumes.push(Volume {
+            name: RESULTS_VOLUME.to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+        init_containers.push(egress_sidecar(
+            step,
+            &attempt,
+            results_mount.as_ref().unwrap(),
+            e,
+        ));
+    }
+    if let Some(v) = clone_token_volume {
+        volumes.push(v);
+    }
+    if let Some(v) = registry_volume {
+        volumes.push(v);
+    }
+    if let Some(v) = oidc_volume {
+        volumes.push(v);
+    }
+    let mut annotations = std::collections::BTreeMap::new();
+    if spec.build.is_some() {
+        // AppArmor unconfined for rootless buildkit (user-namespace worker).
+        annotations.insert(
+            format!("container.apparmor.security.beta.kubernetes.io/{STEP_CONTAINER}"),
+            "unconfined".to_string(),
+        );
+    }
+    if workspace {
+        volumes.push(Volume {
+            name: WORKSPACE_VOLUME.to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+        volumes.push(Volume {
+            name: CTL_VOLUME.to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+        // The input CAS roots ride on the Pod itself, so a resumed control
+        // plane can feed an adopted Pod with no in-memory state.
+        annotations.insert(
+            ANNOTATION_WS_INPUTS.to_string(),
+            spec.workspace_inputs.join(","),
+        );
+        let ws = workspace_mount.clone().unwrap();
+        let ctl = ctl_mount.clone().unwrap();
+        // Ordinary init container: blocks the step until the control plane
+        // has streamed the merged input workspaces in (exits immediately when
+        // there is nothing to feed).
+        let wait = if spec.workspace_inputs.is_empty() {
+            "exit 0".to_string()
+        } else {
+            format!("until [ -f {CTL_MOUNT_PATH}/init-done ]; do sleep 0.2; done")
+        };
+        init_containers.push(Container {
+            name: WORKSPACE_INIT_CONTAINER.to_string(),
+            image: Some(WORKSPACE_HELPER_IMAGE.to_string()),
+            command: Some(vec!["sh".into(), "-c".into(), wait]),
+            volume_mounts: Some(vec![ws.clone(), ctl.clone()]),
+            ..Default::default()
+        });
+        // Native egress sidecar: outlives the step (ignoring SIGTERM) until
+        // the control plane has snapshotted /workspace into the CAS and
+        // touches the release marker.
+        init_containers.push(Container {
+            name: WORKSPACE_EGRESS_CONTAINER.to_string(),
+            image: Some(WORKSPACE_HELPER_IMAGE.to_string()),
+            restart_policy: Some("Always".to_string()),
+            command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "trap '' TERM; until [ -f {CTL_MOUNT_PATH}/egress-done ]; do sleep 0.2; done"
+                ),
+            ]),
+            volume_mounts: Some(match artifacts_mount.clone() {
+                Some(am) => vec![ws, ctl, am],
+                None => vec![ws, ctl],
+            }),
+            ..Default::default()
+        });
+    }
+    if workspace {
+        volumes.push(Volume {
+            name: ARTIFACTS_VOLUME.to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+        if !spec.artifacts.is_empty() {
+            annotations.insert(
+                ANNOTATION_ARTIFACT_GLOBS.to_string(),
+                serde_json::to_string(&spec.artifacts).unwrap_or_default(),
+            );
         }
-        None => (None, None),
-    };
+    }
+    let volumes = (!volumes.is_empty()).then_some(volumes);
+    let init_containers = (!init_containers.is_empty()).then_some(init_containers);
 
     Pod {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             labels: Some(labels),
+            annotations: (!annotations.is_empty()).then_some(annotations),
             ..Default::default()
         },
         spec: Some(PodSpec {
@@ -338,6 +1261,23 @@ pub fn build_pod(
             init_containers,
             volumes,
             restart_policy: Some("Never".to_string()),
+            // Step deadline (ADR-0047): enforced by the kubelet, so a hung Pod
+            // dies even if the control plane is down. Exceeding it surfaces as
+            // `DeadlineExceeded` → the `Timeout` failure class.
+            active_deadline_seconds: Some(
+                spec.timeout_seconds.unwrap_or(default_timeout_secs) as i64
+            ),
+            // Workspace Pods: the emptyDir must be writable by the non-root
+            // step (fsGroup), and the egress sidecar needs time to be
+            // snapshotted before SIGKILL.
+            security_context: workspace.then(|| {
+                k8s_openapi::api::core::v1::PodSecurityContext {
+                    fs_group: Some(65532),
+                    ..Default::default()
+                }
+            }),
+            termination_grace_period_seconds: workspace
+                .then_some(WORKSPACE_TERMINATION_GRACE_SECS),
             ..Default::default()
         }),
         ..Default::default()
@@ -425,111 +1365,88 @@ fn step_security_context(spec: &StepSpec) -> SecurityContext {
 
 /// The rootless BuildKit image used by a `kind: build` step (ADR-0018).
 const BUILDKIT_IMAGE: &str = "moby/buildkit:rootless";
+/// Where the registry dockerconfigjson is mounted (`DOCKER_CONFIG` points
+/// here); a per-Pod Secret volume — tmpfs on the node, never env (ADR-0018).
+const REGISTRY_AUTH_MOUNT_PATH: &str = "/scarab/registry";
+const REGISTRY_AUTH_VOLUME: &str = "scarab-registry-auth";
+/// The file name inside the mount — what `DOCKER_CONFIG` clients expect.
+const REGISTRY_AUTH_KEY: &str = "config.json";
 
-/// What a built-in `kind: build` step builds (ADR-0018). The context/dockerfile
-/// are workspace-relative; `image` is the tag to build and (optionally) push.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuildSpec {
-    pub context: String,
-    pub dockerfile: String,
-    pub image: String,
-    pub push: bool,
+/// The per-Pod Secret carrying the registry dockerconfigjson.
+fn registry_secret_name(pod_name: &str) -> String {
+    format!("{pod_name}-registry")
 }
 
-impl BuildSpec {
-    /// The `buildctl` args this build compiles to.
-    fn buildctl_args(&self) -> Vec<String> {
-        vec![
-            "build".into(),
-            "--frontend".into(),
-            "dockerfile.v0".into(),
-            "--local".into(),
-            format!("context={}", self.context),
-            "--local".into(),
-            format!("dockerfile={}", self.context),
-            "--opt".into(),
-            format!("filename={}", self.dockerfile),
-            "--output".into(),
-            format!("type=image,name={},push={}", self.image, self.push),
-        ]
+/// Where the per-attempt OIDC federation token is mounted (ADR-0015):
+/// a per-Pod Secret volume (tmpfs on the node), pointed at by
+/// `SCARAB_OIDC_TOKEN_FILE` — never env, never argv.
+const OIDC_TOKEN_MOUNT_PATH: &str = "/scarab/oidc";
+const OIDC_TOKEN_VOLUME: &str = "scarab-oidc-token";
+const OIDC_TOKEN_KEY: &str = "token";
+
+/// The per-Pod Secret carrying the OIDC token.
+fn oidc_secret_name(pod_name: &str) -> String {
+    format!("{pod_name}-oidc")
+}
+
+/// The `buildctl` args a build step compiles to (ADR-0018). With the egress
+/// sidecar present, the image digest is written to the results volume as the
+/// `image` result — the ImageArtifact of record (`containerimage.digest`).
+fn buildctl_args(build: &scarab_engine::BuildConfig, with_metadata: bool) -> Vec<String> {
+    let mut push_opt = format!("type=image,name={},push={}", build.image, build.push);
+    if build.push && build.insecure_push {
+        push_opt.push_str(",registry.insecure=true");
     }
-}
-
-/// Build the Pod for a `kind: build` step: **rootless BuildKit** (no
-/// Docker-in-Docker, no privileged container) invoking `buildctl` to build the
-/// image and push it (ADR-0018). Runs as a non-root user with an unconfined
-/// seccomp/AppArmor profile — what rootless buildkitd needs without privilege.
-pub fn build_pod_for_build(
-    name: &str,
-    namespace: &str,
-    step: &StepRun,
-    build: &BuildSpec,
-) -> Pod {
-    let attempt = step
-        .current_attempt()
-        .map(|a| a.id.0.clone())
-        .unwrap_or_else(|| "0".to_string());
-
-    let env = vec![
-        // Rootless buildkitd cannot use the process sandbox.
-        EnvVar {
-            name: "BUILDKITD_FLAGS".into(),
-            value: Some("--oci-worker-no-process-sandbox".into()),
-            value_from: None,
-        },
-        EnvVar { name: "SCARAB_RUN".into(), value: Some(step.run.0.clone()), value_from: None },
-        EnvVar { name: "SCARAB_STEP".into(), value: Some(step.step.0.clone()), value_from: None },
-        EnvVar { name: "SCARAB_ATTEMPT".into(), value: Some(attempt.clone()), value_from: None },
+    let mut args = vec![
+        "build".to_string(),
+        "--frontend".into(),
+        "dockerfile.v0".into(),
+        "--local".into(),
+        format!("context={}", build.context),
+        "--local".into(),
+        format!("dockerfile={}", build.context),
+        "--opt".into(),
+        format!("filename={}", build.dockerfile),
+        "--output".into(),
+        push_opt,
     ];
+    if with_metadata {
+        args.push("--metadata-file".into());
+        args.push(format!("{RESULTS_MOUNT_PATH}/image.json"));
+    }
+    args
+}
 
-    let container = Container {
-        name: "build".to_string(),
-        image: Some(BUILDKIT_IMAGE.to_string()),
-        command: Some(vec!["buildctl-daemonless.sh".to_string()]),
-        args: Some(build.buildctl_args()),
-        env: Some(env),
-        // Rootless: explicitly NOT privileged; non-root; unconfined seccomp so
-        // the user-namespace worker can run (ADR-0018).
-        security_context: Some(SecurityContext {
-            privileged: Some(false),
-            run_as_non_root: Some(true),
-            run_as_user: Some(1000),
-            seccomp_profile: Some(SeccompProfile {
-                type_: "Unconfined".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-
-    let labels = std::collections::BTreeMap::from([
-        ("app.kubernetes.io/managed-by".to_string(), "scarab".to_string()),
-        ("scarab.io/run".to_string(), sanitize_label(&step.run.0)),
-        ("scarab.io/step".to_string(), sanitize_label(&step.step.0)),
-        ("scarab.io/attempt".to_string(), sanitize_label(&attempt)),
-    ]);
-    // AppArmor unconfined for the build container (rootless buildkit).
-    let annotations = std::collections::BTreeMap::from([(
-        "container.apparmor.security.beta.kubernetes.io/build".to_string(),
-        "unconfined".to_string(),
-    )]);
-
-    Pod {
-        metadata: ObjectMeta {
-            name: Some(name.to_string()),
-            namespace: Some(namespace.to_string()),
-            labels: Some(labels),
-            annotations: Some(annotations),
-            ..Default::default()
-        },
-        spec: Some(PodSpec {
-            containers: vec![container],
-            restart_policy: Some("Never".to_string()),
+/// The security context of a build step: rootless BuildKit needs a non-root
+/// uid with an unconfined seccomp profile (user-namespace worker) — explicitly
+/// NOT privileged, and never the author's request (a build step cannot ask
+/// for escalation; the pipeline compiler rejects it).
+fn build_security_context() -> SecurityContext {
+    SecurityContext {
+        privileged: Some(false),
+        allow_privilege_escalation: Some(true), // setuid newuidmap needs it
+        run_as_non_root: Some(true),
+        run_as_user: Some(1000),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "Unconfined".to_string(),
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+
+/// The dockerconfigjson for a build Pod (ADR-0018): the scoped secret's JSON
+/// verbatim when present, else synthesized from the forge-derived credential.
+fn registry_dockerconfig(build: &scarab_engine::BuildConfig) -> Option<String> {
+    if let Some(json) = &build.registry_auth_json {
+        return Some(json.clone());
+    }
+    build.derived_auth.as_ref().map(|cred| {
+        use base64::Engine;
+        let auth = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", cred.username, cred.token));
+        serde_json::json!({ "auths": { cred.registry.clone(): { "auth": auth } } }).to_string()
+    })
 }
 
 /// The image an image-build step produced, recorded as an Artifact of record
@@ -541,7 +1458,7 @@ pub struct ImageArtifact {
 }
 
 /// Record a built image's digest as an [`ImageArtifact`].
-pub fn image_artifact(build: &BuildSpec, digest: &str) -> ImageArtifact {
+pub fn image_artifact(build: &scarab_engine::BuildConfig, digest: &str) -> ImageArtifact {
     ImageArtifact {
         image: build.image.clone(),
         digest: digest.to_string(),
@@ -556,7 +1473,9 @@ pub fn push_fence(image: &str, digest: &str) -> String {
 
 /// Map a Pod's observed status to the domain [`ExecState`]. For a
 /// `restartPolicy: Never` Pod the phase is terminal on completion; the exit code
-/// is lifted from the container's terminated state.
+/// is lifted from the container's terminated state, and every terminal failure
+/// carries a [`FailureClass`] (ADR-0047) — only this adapter sees the execution
+/// conditions around the opaque step, so only it can classify.
 pub fn pod_state(pod: &Pod) -> ExecState {
     let phase = pod
         .status
@@ -565,20 +1484,160 @@ pub fn pod_state(pod: &Pod) -> ExecState {
         .unwrap_or("Pending");
     match phase {
         "Succeeded" => ExecState::Succeeded,
-        "Failed" => ExecState::Failed {
-            exit_code: container_exit_code(pod),
-        },
+        "Failed" => {
+            let exit_code = container_exit_code(pod);
+            // A just-killed Pod can surface `phase: Failed` BEFORE the kubelet
+            // finishes writing the verdict — no status reason, no terminated
+            // container state (observed on k3s enforcing
+            // activeDeadlineSeconds). Classifying that snapshot would misread
+            // a timeout as never-started infra. A Failed phase never reverts,
+            // so defer: report Pending and classify on the next poll, when the
+            // settled status (e.g. `reason: DeadlineExceeded`) has landed. The
+            // engine's timeout backstop bounds the pathological
+            // never-settling case.
+            let reason = pod.status.as_ref().and_then(|s| s.reason.as_deref());
+            // `ContainerStatusUnknown` means the kubelet could not locate the
+            // container when the Pod was killed — its exit code (137) is
+            // synthesized, not the step's verdict.
+            let synthetic =
+                step_terminated_reason(pod).as_deref() == Some("ContainerStatusUnknown");
+            let no_verdict = exit_code.is_none() && step_terminated_reason(pod).is_none();
+            if reason.is_none() && (no_verdict || synthetic) {
+                return ExecState::Pending;
+            }
+            ExecState::Failed {
+                exit_code,
+                class: classify_failed_pod(pod, exit_code),
+            }
+        }
         "Running" => ExecState::Running,
         // "Unknown" means the node stopped reporting — the backend lost it.
+        // Conservatively post-start (ADR-0047): can't prove it never ran.
         "Unknown" => ExecState::Lost,
         // A Pending Pod is normally still scheduling or pulling — but some
-        // container `waiting` reasons are terminal: the kubelet will never start
-        // the container without a new Pod spec (bad config, unpullable image).
-        // Such a Pod stays Pending forever, hanging the run (and hot-looping the
-        // best-effort log tail). Surface it as a failure so the step fails fast.
-        _ if has_terminal_waiting_reason(pod) => ExecState::Failed { exit_code: None },
+        // states are terminal-while-Pending: a container `waiting` reason the
+        // kubelet can never recover from (bad config, unpullable image), or a
+        // scheduler verdict of Unschedulable. Such a Pod stays Pending forever,
+        // hanging the run. Surface it as a *never-started infra* failure
+        // (ADR-0047): the main process never ran, so no side effect is
+        // possible and auto-retry is safe.
+        _ if has_terminal_waiting_reason(pod) || is_unschedulable(pod) => ExecState::Failed {
+            exit_code: None,
+            class: FailureClass::Infra { never_started: true },
+        },
         _ => ExecState::Pending,
     }
+}
+
+/// Classify a `phase: Failed` Pod (ADR-0047).
+///
+/// Order matters: the kubelet's own verdicts (deadline, eviction, OOM-kill)
+/// take precedence over the container exit code — an OOM-killed container also
+/// reports exit 137, but the *platform* killed it, not the step's own logic.
+fn classify_failed_pod(pod: &Pod, exit_code: Option<i32>) -> FailureClass {
+    let pod_reason = pod.status.as_ref().and_then(|s| s.reason.as_deref());
+    match pod_reason {
+        // activeDeadlineSeconds elapsed — the kubelet killed the Pod.
+        Some("DeadlineExceeded") => return FailureClass::Timeout,
+        // Evicted: infra reclaimed the Pod. Whether a side effect is possible
+        // depends on whether the step's process had started.
+        Some("Evicted") => {
+            return FailureClass::Infra {
+                never_started: !step_container_started(pod),
+            }
+        }
+        _ => {}
+    }
+    // The platform OOM-killed the started process: post-start infra.
+    if step_terminated_reason(pod).as_deref() == Some("OOMKilled") {
+        return FailureClass::Infra { never_started: false };
+    }
+    // `reason: DeadlineExceeded` can propagate a beat AFTER the kubelet kills
+    // the containers (observed on k3s: the first Failed observation carries
+    // only the SIGKILL exit 137). The Pod itself is authoritative: if it
+    // outlived its own spec'd deadline, the kill is a timeout — never the
+    // step's verdict.
+    if outlived_deadline(pod) {
+        return FailureClass::Timeout;
+    }
+    match exit_code {
+        // The step's own code produced a verdict.
+        Some(_) => FailureClass::Step,
+        // Failed with no exit code: the container never produced a verdict —
+        // infra, with side-effect possibility keyed on whether it started.
+        None => FailureClass::Infra {
+            never_started: !step_container_started(pod),
+        },
+    }
+}
+
+/// True if the Pod ran past its own `activeDeadlineSeconds` — the
+/// deterministic timeout signal, independent of the (sometimes-late)
+/// `DeadlineExceeded` status reason.
+fn outlived_deadline(pod: &Pod) -> bool {
+    let Some(deadline) = pod.spec.as_ref().and_then(|s| s.active_deadline_seconds) else {
+        return false;
+    };
+    let Some(start) = pod.status.as_ref().and_then(|s| s.start_time.as_ref()) else {
+        return false;
+    };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(i64::MAX);
+    now_secs - start.0.as_second() >= deadline
+}
+
+/// True once the step container's main process has (ever) started: a running
+/// or terminated state now, a prior terminated state, or the kubelet's
+/// `started` flag. Point-in-time observations of an evicted/failed Pod retain
+/// these fields, so this distinguishes never-started from post-start.
+fn step_container_started(pod: &Pod) -> bool {
+    let Some(c) = step_container_status(pod) else {
+        return false;
+    };
+    c.started == Some(true)
+        || c.state
+            .as_ref()
+            .is_some_and(|s| s.running.is_some() || s.terminated.is_some())
+        || c.last_state.as_ref().is_some_and(|s| s.terminated.is_some())
+}
+
+/// The step container's terminated `reason` (e.g. `OOMKilled`), current or last.
+fn step_terminated_reason(pod: &Pod) -> Option<String> {
+    let c = step_container_status(pod)?;
+    c.state
+        .as_ref()
+        .and_then(|s| s.terminated.as_ref())
+        .or_else(|| c.last_state.as_ref().and_then(|s| s.terminated.as_ref()))
+        .and_then(|t| t.reason.clone())
+}
+
+/// The step container's status — by name, falling back to the first (mirrors
+/// [`container_exit_code`]'s selection).
+fn step_container_status(pod: &Pod) -> Option<&k8s_openapi::api::core::v1::ContainerStatus> {
+    let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
+    statuses
+        .iter()
+        .find(|c| c.name == STEP_CONTAINER)
+        .or_else(|| statuses.first())
+}
+
+/// True if the scheduler has verdict-ed the Pod `Unschedulable`
+/// (`PodScheduled=False`). The Pod would otherwise sit Pending indefinitely;
+/// ADR-0047 treats it as never-started infra churn to self-heal via bounded
+/// auto-retry.
+fn is_unschedulable(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|c| {
+            c.type_ == "PodScheduled"
+                && c.status == "False"
+                && c.reason.as_deref() == Some("Unschedulable")
+        })
 }
 
 /// True if any container (step or native sidecar) is stuck in a `waiting` state
@@ -695,13 +1754,19 @@ mod tests {
             run_as_root: false,
             add_capabilities: vec![],
             privileged: false,
+        timeout_seconds: None,
+        workspace_inputs: vec![],
+        clone: None,
+            build: None,
+            artifacts: vec![],
+            oidc_token: None,
         }
     }
 
     #[test]
     fn step_pod_is_hardened_restricted_by_default() {
         let step = step_with_attempt("run-1", "build", "a1");
-        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), None);
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
         let sc = pod.spec.unwrap().containers[0]
             .security_context
             .clone()
@@ -727,8 +1792,14 @@ mod tests {
             run_as_root: true,
             add_capabilities: vec!["NET_ADMIN".into()],
             privileged: true,
+        timeout_seconds: None,
+        workspace_inputs: vec![],
+        clone: None,
+            build: None,
+            artifacts: vec![],
+            oidc_token: None,
         };
-        let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None);
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
         let sc = pod.spec.unwrap().containers[0].security_context.clone().unwrap();
         assert_eq!(sc.run_as_non_root, Some(false));
         assert_eq!(sc.run_as_user, Some(0));
@@ -747,7 +1818,7 @@ mod tests {
             run_as_root: true,
             ..busybox()
         };
-        let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None);
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
         let sc = pod.spec.unwrap().containers[0].security_context.clone().unwrap();
         assert_eq!(sc.run_as_non_root, Some(false));
         assert_eq!(sc.privileged, Some(false));
@@ -798,7 +1869,7 @@ mod tests {
     #[test]
     fn build_pod_sets_image_command_restart_policy_and_fence_env() {
         let step = step_with_attempt("run-1", "build", "a1");
-        let pod = build_pod("scarab-build-a1-deadbeef", "scarab-run-1", &step, &busybox(), None);
+        let pod = build_pod("scarab-build-a1-deadbeef", "scarab-run-1", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
 
         let spec = pod.spec.unwrap();
         assert_eq!(spec.restart_policy.as_deref(), Some("Never"));
@@ -830,7 +1901,7 @@ mod tests {
     #[test]
     fn build_pod_without_egress_has_no_results_volume_or_sidecar() {
         let step = step_with_attempt("run-1", "build", "a1");
-        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), None);
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
         let spec = pod.spec.unwrap();
         assert!(spec.volumes.is_none(), "no shared volume without egress");
         assert!(spec.init_containers.is_none(), "no sidecar without egress");
@@ -846,7 +1917,7 @@ mod tests {
             sidecar_image: "ghcr.io/acme/scarab-sidecar:1".into(),
         };
         let step = step_with_attempt("run-1", "build", "a1");
-        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), Some(&egress));
+        let pod = build_pod("scarab-x", "scarab-run-1", &step, &busybox(), Some(&egress), DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
         let spec = pod.spec.unwrap();
 
         // Shared results emptyDir.
@@ -885,48 +1956,212 @@ mod tests {
         );
     }
 
-    fn sample_build() -> BuildSpec {
-        BuildSpec {
-            context: "workspace".into(),
+    fn sample_build() -> scarab_engine::BuildConfig {
+        scarab_engine::BuildConfig {
+            context: ".".into(),
             dockerfile: "Dockerfile".into(),
             image: "registry.example/app:1.0".into(),
+            repo_owner: "acme".into(),
+            repo_name: "app".into(),
             push: true,
+            insecure_push: false,
+            registry_auth_json: None,
+            derived_auth: None,
         }
     }
 
     #[test]
     fn build_pod_is_rootless_buildkit_and_not_privileged() {
         let step = step_with_attempt("run-1", "image", "a1");
-        let pod = build_pod_for_build("scarab-image-a1", "scarab-run-1", &step, &sample_build());
+        let mut spec = busybox();
+        spec.image = String::new();
+        spec.command = vec![];
+        spec.build = Some(sample_build());
+        let pod = build_pod("scarab-image-a1", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, true, DEFAULT_CLONE_IMAGE);
         let c = &pod.spec.as_ref().unwrap().containers[0];
 
         assert_eq!(c.image.as_deref(), Some("moby/buildkit:rootless"));
         assert_eq!(c.command.as_ref().unwrap(), &vec!["buildctl-daemonless.sh".to_string()]);
+        let args = c.args.as_ref().unwrap().join(" ");
+        assert!(args.contains("--frontend dockerfile.v0"), "{args}");
+        assert!(args.contains("filename=Dockerfile"), "{args}");
+        assert!(args.contains("type=image,name=registry.example/app:1.0,push=true"), "{args}");
 
         // Rootless security posture: never privileged, non-root, unconfined seccomp.
         let sc = c.security_context.as_ref().unwrap();
         assert_eq!(sc.privileged, Some(false));
         assert_eq!(sc.run_as_non_root, Some(true));
         assert_eq!(sc.seccomp_profile.as_ref().unwrap().type_, "Unconfined");
-        // AppArmor unconfined annotation for the build container.
+        // AppArmor unconfined annotation for the step container.
         assert_eq!(
             pod.metadata
                 .annotations
                 .as_ref()
                 .unwrap()
-                .get("container.apparmor.security.beta.kubernetes.io/build")
+                .get(&format!(
+                    "container.apparmor.security.beta.kubernetes.io/{STEP_CONTAINER}"
+                ))
                 .map(String::as_str),
             Some("unconfined")
         );
+        // No auth resolved => no registry mount, no DOCKER_CONFIG.
+        assert!(c.env.as_ref().unwrap().iter().all(|e| e.name != "DOCKER_CONFIG"));
+        // The build consumes its `needs` workspace like any step.
+        assert!(pod
+            .spec
+            .as_ref()
+            .unwrap()
+            .init_containers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|i| i.name == WORKSPACE_INIT_CONTAINER));
     }
 
     #[test]
-    fn build_args_carry_context_dockerfile_and_pushed_image() {
-        let args = sample_build().buildctl_args().join(" ");
-        assert!(args.contains("--frontend dockerfile.v0"));
-        assert!(args.contains("context=workspace"));
-        assert!(args.contains("filename=Dockerfile"));
-        assert!(args.contains("type=image,name=registry.example/app:1.0,push=true"));
+    fn build_pod_mounts_registry_auth_and_never_puts_the_token_in_env() {
+        let step = step_with_attempt("run-1", "image", "a1");
+        let mut spec = busybox();
+        spec.image = String::new();
+        spec.command = vec![];
+        let mut build = sample_build();
+        build.derived_auth = Some(scarab_engine::RegistryCredential {
+            registry: "registry.example".into(),
+            username: "x-access-token".into(),
+            token: "sekret-registry-token".into(),
+        });
+        spec.build = Some(build.clone());
+        let pod = build_pod("scarab-image-a1", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        let env = c.env.as_ref().unwrap();
+        assert_eq!(
+            env.iter().find(|e| e.name == "DOCKER_CONFIG").and_then(|e| e.value.clone()),
+            Some("/scarab/registry".to_string())
+        );
+        // THE INVARIANT (ADR-0018/0037): the token rides ONLY in the mounted
+        // Secret — never in env.
+        assert!(env.iter().all(|e| e.value.as_deref() != Some("sekret-registry-token")));
+        let m = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "scarab-registry-auth")
+            .unwrap();
+        assert_eq!(m.mount_path, "/scarab/registry");
+        assert_eq!(m.read_only, Some(true));
+        let vols = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap();
+        let v = vols.iter().find(|v| v.name == "scarab-registry-auth").unwrap();
+        assert_eq!(
+            v.secret.as_ref().unwrap().secret_name.as_deref(),
+            Some("scarab-image-a1-registry")
+        );
+
+        // The synthesized dockerconfigjson carries the derived credential.
+        let json = registry_dockerconfig(&build).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["auths"]["registry.example"]["auth"].is_string());
+        // A scoped secret takes precedence, verbatim.
+        build.registry_auth_json = Some("{\"auths\":{}}".into());
+        assert_eq!(registry_dockerconfig(&build).unwrap(), "{\"auths\":{}}");
+    }
+
+    #[test]
+    fn build_args_capture_the_digest_when_egress_is_present() {
+        let step = step_with_attempt("run-1", "image", "a1");
+        let mut spec = busybox();
+        spec.image = String::new();
+        spec.command = vec![];
+        spec.build = Some(sample_build());
+        let egress = ResultsEgress {
+            base_url: "http://scarab:8080".into(),
+            token_secret: b"k".to_vec(),
+            sidecar_image: "ghcr.io/scarab/egress:1".into(),
+        };
+        let pod = build_pod("scarab-image-a1", "ns", &step, &spec, Some(&egress), DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        let args = pod.spec.as_ref().unwrap().containers[0].args.as_ref().unwrap().join(" ");
+        // The digest lands as the `image` result (ADR-0041/0042) — the
+        // ImageArtifact of record.
+        assert!(args.contains("--metadata-file /scarab/results/image.json"), "{args}");
+    }
+
+    #[test]
+    fn oidc_token_is_tmpfs_mounted_never_env() {
+        let step = step_with_attempt("run-1", "deploy", "a1");
+        let mut spec = busybox();
+        spec.oidc_token = Some("eyJhbGciOi.sekret-oidc-jwt.sig".into());
+        let pod = build_pod("scarab-x", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        let env = c.env.as_ref().unwrap();
+        assert_eq!(
+            env.iter().find(|e| e.name == "SCARAB_OIDC_TOKEN_FILE").and_then(|e| e.value.clone()),
+            Some("/scarab/oidc/token".to_string())
+        );
+        // THE INVARIANT (ADR-0015): the token itself never rides in env.
+        assert!(env.iter().all(|e| e.value.as_deref() != spec.oidc_token.as_deref()));
+        let m = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "scarab-oidc-token")
+            .unwrap();
+        assert_eq!(m.mount_path, "/scarab/oidc");
+        assert_eq!(m.read_only, Some(true));
+        let vols = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap();
+        let v = vols.iter().find(|v| v.name == "scarab-oidc-token").unwrap();
+        assert_eq!(v.secret.as_ref().unwrap().secret_name.as_deref(), Some("scarab-x-oidc"));
+
+        // OIDC disabled (no token) => none of the machinery appears.
+        let pod = build_pod("scarab-x", "ns", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        assert!(c.env.as_ref().unwrap().iter().all(|e| e.name != "SCARAB_OIDC_TOKEN_FILE"));
+        assert!(pod.spec.as_ref().unwrap().volumes.is_none());
+    }
+
+    #[test]
+    fn artifact_globs_match_segments_and_extensions() {
+        assert!(glob_match("dist/*", "dist/app.tar.gz"));
+        assert!(glob_match("*.tar.gz", "release.tar.gz"));
+        assert!(glob_match("coverage/*.html", "coverage/index.html"));
+        assert!(!glob_match("*.html", "coverage.txt"));
+        assert!(glob_match("exact.txt", "exact.txt"));
+        assert!(!glob_match("exact.txt", "other.txt"));
+    }
+
+    #[test]
+    fn workspace_pods_get_the_artifacts_volume_and_globs_annotation() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        spec.artifacts = vec!["dist/*".into()];
+        let pod = build_pod("scarab-x", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, true, DEFAULT_CLONE_IMAGE);
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        let m = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "scarab-artifacts")
+            .expect("artifacts mount");
+        assert_eq!(m.mount_path, "/scarab/artifacts");
+        assert!(c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| e.name == "SCARAB_ARTIFACTS" && e.value.as_deref() == Some("/scarab/artifacts")));
+        assert_eq!(
+            pod.metadata.annotations.as_ref().unwrap().get("scarab.io/artifact-globs").map(String::as_str),
+            Some(r#"["dist/*"]"#)
+        );
+        // The egress container (the harvest surface) also mounts it.
+        let inits = pod.spec.as_ref().unwrap().init_containers.as_ref().unwrap();
+        let egress = inits.iter().find(|c| c.name == WORKSPACE_EGRESS_CONTAINER).unwrap();
+        assert!(egress.volume_mounts.as_ref().unwrap().iter().any(|m| m.name == "scarab-artifacts"));
+
+        // No workspace flow => no artifacts machinery.
+        let pod = build_pod("scarab-x", "ns", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        assert!(pod.spec.as_ref().unwrap().volumes.is_none());
     }
 
     #[test]
@@ -980,13 +2215,139 @@ mod tests {
             pod_state(&with_phase("Succeeded", Some(0))),
             ExecState::Succeeded
         );
+        // A container exit code is the step's own verdict (ADR-0047).
         assert_eq!(
             pod_state(&with_phase("Failed", Some(1))),
-            ExecState::Failed { exit_code: Some(1) }
+            ExecState::Failed {
+                exit_code: Some(1),
+                class: FailureClass::Step,
+            }
         );
         assert_eq!(pod_state(&with_phase("Unknown", None)), ExecState::Lost);
         // No status yet -> not scheduled -> Pending.
         assert_eq!(pod_state(&Pod::default()), ExecState::Pending);
+    }
+
+    #[test]
+    fn build_pod_workspace_machinery_shape() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        spec.workspace_inputs = vec!["tree-a".into(), "tree-b".into()];
+        let pod = build_pod("scarab-x", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, true, DEFAULT_CLONE_IMAGE);
+
+        // The input roots ride on the Pod (a resumed control plane feeds an
+        // adopted Pod with no in-memory state).
+        assert_eq!(
+            pod.metadata.annotations.as_ref().unwrap()["scarab.io/workspace-inputs"],
+            "tree-a,tree-b"
+        );
+        let ps = pod.spec.as_ref().unwrap();
+        // /workspace + the control handshake dir are emptyDirs.
+        let vols: Vec<_> = ps.volumes.as_ref().unwrap().iter().map(|v| v.name.as_str()).collect();
+        assert!(vols.contains(&"scarab-workspace") && vols.contains(&"scarab-ctl"), "{vols:?}");
+        // Init container waits for the feed; egress sidecar (restartPolicy
+        // Always) holds the Pod for the snapshot.
+        let inits = ps.init_containers.as_ref().unwrap();
+        let init = inits.iter().find(|c| c.name == WORKSPACE_INIT_CONTAINER).unwrap();
+        assert!(init.command.as_ref().unwrap()[2].contains("init-done"));
+        let egress = inits.iter().find(|c| c.name == WORKSPACE_EGRESS_CONTAINER).unwrap();
+        assert_eq!(egress.restart_policy.as_deref(), Some("Always"));
+        assert!(egress.command.as_ref().unwrap()[2].contains("egress-done"));
+        // The step runs IN the workspace, which is writable via fsGroup.
+        assert_eq!(ps.containers[0].working_dir.as_deref(), Some("/workspace"));
+        assert_eq!(ps.security_context.as_ref().unwrap().fs_group, Some(65532));
+        assert_eq!(ps.termination_grace_period_seconds, Some(600));
+
+        // No inputs => the init container exits immediately (nothing to feed).
+        let mut spec = busybox();
+        spec.workspace_inputs = vec![];
+        let pod = build_pod("scarab-x", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, true, DEFAULT_CLONE_IMAGE);
+        let inits = pod.spec.as_ref().unwrap().init_containers.clone().unwrap();
+        let init = inits.iter().find(|c| c.name == WORKSPACE_INIT_CONTAINER).unwrap();
+        assert_eq!(init.command.as_ref().unwrap()[2], "exit 0");
+
+        // workspace=false => none of the machinery appears (unchanged shape).
+        let pod = build_pod("scarab-x", "ns", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        assert!(pod.metadata.annotations.is_none());
+        assert!(pod.spec.as_ref().unwrap().init_containers.is_none());
+    }
+
+    #[test]
+    fn build_pod_clone_step_shape() {
+        use scarab_engine::{CloneConfig, CloneCredential};
+        let step = step_with_attempt("run-1", "checkout", "a1");
+        let mut spec = busybox();
+        spec.image = String::new();
+        spec.command = vec![];
+        spec.clone = Some(CloneConfig {
+            owner: "acme".into(),
+            name: "web".into(),
+            sha: "cafe1234".into(),
+            depth_full: true,
+            submodules: true,
+            lfs: false,
+            read_only: true,
+            url: "https://github.com/acme/web.git".into(),
+            credential: Some(CloneCredential {
+                username: "x-access-token".into(),
+                token: "sekret-token".into(),
+            }),
+        });
+        let pod = build_pod("scarab-x", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, true, "ghcr.io/acme/scarab-clone@sha256:abc");
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        // The canonical image, never the author's; entrypoint from the image.
+        assert_eq!(c.image.as_deref(), Some("ghcr.io/acme/scarab-clone@sha256:abc"));
+        assert!(c.command.is_none());
+        let env = c.env.as_ref().unwrap();
+        let get = |k: &str| env.iter().find(|e| e.name == k).and_then(|e| e.value.clone());
+        assert_eq!(get("SCARAB_CLONE_URL").as_deref(), Some("https://github.com/acme/web.git"));
+        assert_eq!(get("SCARAB_CLONE_SHA").as_deref(), Some("cafe1234"));
+        assert_eq!(get("SCARAB_CLONE_DEPTH").as_deref(), Some("full"));
+        assert_eq!(get("SCARAB_CLONE_SUBMODULES").as_deref(), Some("true"));
+        assert_eq!(get("SCARAB_CLONE_LFS").as_deref(), Some("false"));
+        assert_eq!(
+            get("SCARAB_CLONE_TOKEN_FILE").as_deref(),
+            Some("/scarab/secrets/clone-token")
+        );
+        // THE INVARIANT (ADR-0045): the token appears in NO env var — tmpfs only.
+        assert!(
+            env.iter().all(|e| e.value.as_deref() != Some("sekret-token")),
+            "token must never ride in env"
+        );
+        // The tmpfs secret volume is mounted read-only at /scarab/secrets.
+        let mounts = c.volume_mounts.as_ref().unwrap();
+        let m = mounts.iter().find(|m| m.name == "scarab-clone-token").unwrap();
+        assert_eq!(m.mount_path, "/scarab/secrets");
+        assert_eq!(m.read_only, Some(true));
+        let vols = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap();
+        let v = vols.iter().find(|v| v.name == "scarab-clone-token").unwrap();
+        assert_eq!(
+            v.secret.as_ref().unwrap().secret_name.as_deref(),
+            Some("scarab-x-token")
+        );
+
+        // Anonymous clone (no credential): no token volume, no TOKEN_FILE env.
+        spec.clone.as_mut().unwrap().credential = None;
+        let pod = build_pod("scarab-x", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, true, "img");
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        assert!(c.env.as_ref().unwrap().iter().all(|e| e.name != "SCARAB_CLONE_TOKEN_FILE"));
+        assert!(pod.spec.as_ref().unwrap().volumes.as_ref().unwrap().iter().all(|v| v.name != "scarab-clone-token"));
+    }
+
+    #[test]
+    fn build_pod_sets_the_step_deadline() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        // Default: the global default deadline.
+        let pod = build_pod("scarab-x", "ns", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        assert_eq!(
+            pod.spec.as_ref().unwrap().active_deadline_seconds,
+            Some(DEFAULT_STEP_TIMEOUT_SECS as i64),
+        );
+        // Authored `timeout:` overrides it (ADR-0047).
+        let mut spec = busybox();
+        spec.timeout_seconds = Some(120);
+        let pod = build_pod("scarab-x", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        assert_eq!(pod.spec.as_ref().unwrap().active_deadline_seconds, Some(120));
     }
 
     #[test]
@@ -1025,9 +2386,14 @@ mod tests {
             "ErrImagePull",
             "ImagePullBackOff",
         ] {
+            // The main process never ran: never-started infra (ADR-0047),
+            // safe to auto-retry.
             assert_eq!(
                 pod_state(&waiting(reason)),
-                ExecState::Failed { exit_code: None },
+                ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Infra { never_started: true },
+                },
                 "{reason} should be terminal"
             );
         }
@@ -1035,5 +2401,147 @@ mod tests {
         // A benign transient wait (e.g. still pulling) stays Pending.
         assert_eq!(pod_state(&waiting("ContainerCreating")), ExecState::Pending);
         assert_eq!(pod_state(&waiting("PodInitializing")), ExecState::Pending);
+    }
+
+    /// One fixture per ADR-0047 classification rule.
+    mod failure_classification {
+        use super::*;
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStatus,
+            PodCondition, PodStatus,
+        };
+
+        fn class_of(pod: &Pod) -> FailureClass {
+            match pod_state(pod) {
+                ExecState::Failed { class, .. } => class,
+                other => panic!("expected Failed, got {other:?}"),
+            }
+        }
+
+        fn failed_pod(reason: Option<&str>, container: Option<ContainerStatus>) -> Pod {
+            Pod {
+                status: Some(PodStatus {
+                    phase: Some("Failed".into()),
+                    reason: reason.map(String::from),
+                    container_statuses: container.map(|c| vec![c]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn terminated(exit_code: i32, reason: Option<&str>) -> ContainerStatus {
+            ContainerStatus {
+                name: STEP_CONTAINER.into(),
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code,
+                        reason: reason.map(String::from),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn deadline_exceeded_is_timeout() {
+            let pod = failed_pod(Some("DeadlineExceeded"), Some(terminated(137, None)));
+            assert_eq!(class_of(&pod), FailureClass::Timeout);
+        }
+
+        #[test]
+        fn oom_kill_is_post_start_infra_despite_exit_code() {
+            let pod = failed_pod(None, Some(terminated(137, Some("OOMKilled"))));
+            assert_eq!(
+                class_of(&pod),
+                FailureClass::Infra { never_started: false },
+                "the platform killed the process — not the step's verdict"
+            );
+        }
+
+        #[test]
+        fn evicted_while_running_is_post_start_infra() {
+            // An evicted Pod whose step container had started (terminated state
+            // exists) — a side effect may have occurred.
+            let pod = failed_pod(Some("Evicted"), Some(terminated(137, None)));
+            assert_eq!(class_of(&pod), FailureClass::Infra { never_started: false });
+        }
+
+        #[test]
+        fn evicted_before_start_is_never_started_infra() {
+            // Evicted with no container ever started: no side effect possible.
+            let pod = failed_pod(Some("Evicted"), None);
+            assert_eq!(class_of(&pod), FailureClass::Infra { never_started: true });
+        }
+
+        #[test]
+        fn verdictless_failed_snapshot_defers_classification() {
+            // phase=Failed but the kubelet hasn't written the verdict yet (no
+            // reason, no exit code, no terminated state) — classification is
+            // deferred to the next poll rather than misread (observed on k3s
+            // enforcing activeDeadlineSeconds).
+            let pod = failed_pod(None, None);
+            assert_eq!(pod_state(&pod), ExecState::Pending);
+        }
+
+        #[test]
+        fn running_container_counts_as_started() {
+            // Failed phase but the container status still shows `running`
+            // (point-in-time race): post-start.
+            let container = ContainerStatus {
+                name: STEP_CONTAINER.into(),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let pod = failed_pod(Some("Evicted"), Some(container));
+            assert_eq!(class_of(&pod), FailureClass::Infra { never_started: false });
+        }
+
+        #[test]
+        fn unschedulable_is_never_started_infra() {
+            let pod = Pod {
+                status: Some(PodStatus {
+                    phase: Some("Pending".into()),
+                    conditions: Some(vec![PodCondition {
+                        type_: "PodScheduled".into(),
+                        status: "False".into(),
+                        reason: Some("Unschedulable".into()),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                pod_state(&pod),
+                ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Infra { never_started: true },
+                }
+            );
+        }
+
+        #[test]
+        fn scheduled_pending_pod_stays_pending() {
+            // PodScheduled=True (or no verdict yet) must NOT fail the step.
+            let pod = Pod {
+                status: Some(PodStatus {
+                    phase: Some("Pending".into()),
+                    conditions: Some(vec![PodCondition {
+                        type_: "PodScheduled".into(),
+                        status: "True".into(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(pod_state(&pod), ExecState::Pending);
+        }
     }
 }

@@ -1,0 +1,46 @@
+#!/bin/sh
+# Pre-snapshot guard (ADR-0045): because `.git` enters the CAS workspace
+# snapshot, assert NOTHING credential-shaped lives under it before the
+# snapshot is taken. Exits non-zero on any finding — belt-and-suspenders on
+# top of the askpass design that keeps credentials out in the first place.
+#
+# Usage: scarab-config-scrub [workspace-root]   (default /workspace)
+set -u
+
+root="${1:-/workspace}"
+fail=0
+
+# 1. A userinfo-bearing URL (token@ / user:pass@) in any git config under
+#    .git (including submodule configs in .git/modules/**).
+if find "$root/.git" -name config -type f 2>/dev/null \
+    | xargs -r grep -l -E 'url[[:space:]]*=.*://[^/@[:space:]]+@' 2>/dev/null \
+    | grep -q .; then
+  echo "scarab-config-scrub: credential-bearing remote URL found under .git" >&2
+  fail=1
+fi
+
+# 2. Credential-store files.
+for f in "$root/.git/credentials" "$root/.git-credentials"; do
+  if [ -e "$f" ]; then
+    echo "scarab-config-scrub: credential store file present: $f" >&2
+    fail=1
+  fi
+done
+
+# 3. The literal token bytes anywhere in git config files (defense against a
+#    tool that copied the secret somewhere unexpected).
+tok_file="${SCARAB_CLONE_TOKEN_FILE:-/scarab/secrets/clone-token}"
+if [ -s "$tok_file" ]; then
+  if find "$root/.git" -name config -type f 2>/dev/null \
+      | xargs -r grep -l -F "$(cat "$tok_file")" 2>/dev/null \
+      | grep -q .; then
+    echo "scarab-config-scrub: token bytes found in a git config under .git" >&2
+    fail=1
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  echo "scarab-config-scrub: FAILED — refusing to let this workspace be snapshotted" >&2
+  exit 1
+fi
+exit 0

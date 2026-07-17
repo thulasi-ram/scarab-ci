@@ -148,6 +148,21 @@ Without Docker/kind, the server still runs API-only against a local Postgres and
 a filesystem object store (`--object-dir`); the background driver is skipped
 until a cluster is reachable.
 
+## API contract workflow (ADR-0054)
+
+`openapi.json` (committed at the repo root) and the generated TS client
+(`ui/scarab-web-ui/src/api/schema.ts`) are **gated against drift in CI** —
+the build fails if either is stale. After changing any route or DTO:
+
+```sh
+cargo run -p scarab-server -- --emit-openapi openapi.json
+cd ui/scarab-web-ui && npm run gen && npm run typecheck
+```
+
+Full-route coverage is enforced by the test
+`every_registered_route_is_in_the_openapi_spec` — a new `.route(...)` without
+a `#[utoipa::path]` annotation fails the suite.
+
 ## License
 
 [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`). Running a

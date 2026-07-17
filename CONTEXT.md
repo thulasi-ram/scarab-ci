@@ -80,6 +80,7 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 | **Trigger (`on:`)** | What starts a Pipeline: `push`, `pull_request`, `tag`, `release`, comment-command, `cron`, `manual`, `api`, `upstream`. Matched against the normalized **Event** via CEL. |
 | **Gate** | A built-in Step kind: a **durable suspend point** awaiting human approval, a timer, or an external event. |
 | **Service** | A built-in Step kind: a sidecar (db/redis) alive for the duration of dependent Steps. |
+| **`clone`** | A built-in Step kind: forge-aware checkout (ADR-0008, 0045). Runs `git` in a restricted Pod, pinned to the resolved commit SHA, producing the Run's **workspace root** that downstream Steps inherit via `needs`. Zero-config — repo/ref/SHA/token are implicit from the Run's trigger context; `depth`/`submodules`/`lfs`/`ref` are optional. Authored explicitly (no implicit checkout); a `push`/`pull_request` Pipeline with no `clone` step is a lint warning, not an error. |
 | **Environment** | A first-class deployment target (staging/prod) with **protection rules**: approvers, wait timer, allowed refs, concurrency, secret scope, OIDC subject, deployment history, and a **privilege whitelist** (which image digests may run with which governed grants — ADR-0039). |
 | **Grant** | A named, closed-vocabulary escalation above the hardened "restricted" step baseline (ADR-0039). `run-as-root` (self-service — does not escape the sandbox); `add-capabilities` and `privileged` (**governed** — require an Environment whitelist entry keyed on the image **digest**, Administer-only). Requested by the pipeline author, granted by the Environment admin, admitted fail-closed. A grant is a ceiling, not a default. |
 
@@ -112,6 +113,15 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 | **Adapter** | A concrete implementation of a Port, in a **separate vendor crate** (`scarab-forge-github`, `scarab-db-postgres`, …), holding all infra deps. |
 | **IR** | The typed, versioned **Pipeline Intermediate Representation** — the *real* DSL. YAML is one frontend; the API schema *is* the IR. |
 | **Forge** | The domain *concept* of a source-of-repos/sink-of-status (GitHub, GitLab, Forgejo). Vendors are **adapters**, never their own domain. |
+
+### 4.5 Tenancy & forge binding
+
+| Term | Meaning |
+|---|---|
+| **Org** | A top-level tenant. Owns Projects. The Scarab tenancy boundary — **not** the forge's `owner` namespace (one Org may span a GitHub org *and* a Forgejo instance). |
+| **Project** | Scarab's **governed unit of CI** and the **aggregate root** beneath an Org: it binds a **source** (a `RepoRef` on a forge, via a `ForgeConnection`) to its **governance** (Environments + `ProtectionRules`, privilege whitelist, secret scope, OIDC subject) and owns the **Pipelines and Runs** produced from that source. RBAC is enforced at the Project scope. **1:1 with a repo** in v1 (monorepo per-subdir governance deferred to an optional path scope). There is no separate governed "Repo" entity — a Project *is* the governed repo. |
+| **`RepoRef`** | A **forge coordinate** — `{owner, name}` as the forge addresses a repository, plus the forge it lives on. External and mutable (a forge rename/transfer changes it). Carried by `Event`/`Status`. Lives in `scarab-forge`; it is the *only* concept named "Repo". Resolved to a Project via a `ForgeConnection`. |
+| **`ForgeConnection`** | A configured link between Scarab and a forge account (a GitHub App installation, a Forgejo connection): `{forge_kind, base_url, credential_ref}` owning a set of `RepoRef`s. The **seam** that resolves `RepoRef` → Project and supplies credentials. The *type* is pure (`scarab-forge`, holds a credential **reference**, not secret bytes); persistence is a store **port** + adapter; credentials live in `SecretProvider`. |
 
 ---
 
@@ -150,11 +160,11 @@ Pure domain crates carry **zero infra deps** (compiler-enforced by crate boundar
 ```
 scarab-engine      durable core: DAG state machine, scheduler, ports (Db, Clock, Executor). DST lives here.
 scarab-pipeline    IR, YAML→IR compile, CEL binding, validation
-scarab-forge       ForgePort + canonical Event/Status/Repo
+scarab-forge       ForgePort + canonical Event/Status/RepoRef + ForgeConnection type
 scarab-identity    Authenticator, OidcIssuer, RBAC
 scarab-secrets     SecretProvider
 scarab-storage     ObjectStore + Cas (merkle content-addressing)
-scarab-projects    Org/Repo/Project/Environment + protection rules
+scarab-project     Org/Project/Environment + protection rules (Project = governed repo; ADR-0046)
 ```
 
 Adapter crates (infra lives here; one per vendor):

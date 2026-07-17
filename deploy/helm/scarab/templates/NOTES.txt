@@ -7,10 +7,25 @@ scarab-server is deployed as release "{{ .Release.Name }}" in namespace "{{ .Rel
 {{- if not .Values.secrets.existingSecret }}
 {{- if not .Values.secrets.databaseUrl }}
 
-  ⚠  No SCARAB_DATABASE_URL is set — scarab-server runs API-only (no durable
-     scheduler/executor driver). Set secrets.databaseUrl (or secrets.existingSecret)
-     to enable durable execution.
+  ⚠  No SCARAB_DATABASE_URL is set — scarab-server will REFUSE TO START
+     (ADR-0048: Postgres is mandatory; there is no API-only mode). Set
+     secrets.databaseUrl (or secrets.existingSecret) before the Pod can boot.
 {{- end }}
+{{- if and (not .Values.secrets.masterKey) (not .Values.scarab.devInsecure) }}
+
+  ⚠  No SCARAB_MASTER_KEY is set — scarab-server will REFUSE TO START
+     (ADR-0048). Set secrets.masterKey (base64, 32 bytes) or use
+     secrets.existingSecret.
+{{- end }}
+{{- end }}
+{{- if .Values.scarab.devInsecure }}
+
+  ⚠  scarab.devInsecure is ON — auth is disabled (every caller is Owner).
+     Dev/eval only; never run production like this.
+{{- else }}
+
+  Note: no authenticator ships yet (ADR-0049). Until it lands, boot requires
+  scarab.devInsecure=true — an honest red line, not a silent default.
 {{- end }}
 
 Check health:

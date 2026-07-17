@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Attempt, AttemptId, ConcurrencyPolicy, DbError, EventKind, ExecError, LogChunkMeta, OutboxId,
-    OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, ConcurrencyPolicy, DbError, EventKind, ExecError, FailureKind,
+    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun,
+    StepSpec, StepStatus, Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -22,14 +23,40 @@ pub struct Lease {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecHandle(pub String);
 
+/// Why a launched execution failed, as classified by the **executor adapter**
+/// (ADR-0047). A step is an opaque black box (ADR-0002), so only the adapter —
+/// which alone observes the execution conditions around the box — can classify;
+/// the pure engine consumes the class and never inspects backend state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailureClass {
+    /// The platform failed the step, not the step's own code (image pull,
+    /// unschedulable, eviction, OOM-kill, node loss). `never_started: true`
+    /// means the main process never ran ⇒ **no side effect is possible** ⇒
+    /// safe to auto-retry without any author assertion (ADR-0047).
+    Infra { never_started: bool },
+    /// The step's own code produced a failing verdict (non-zero exit).
+    Step,
+    /// The step exceeded its deadline (kubelet `DeadlineExceeded`, local
+    /// kill-timer). Post-start by definition.
+    Timeout,
+}
+
 /// Observed state of a launched execution when polled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecState {
     Pending,
     Running,
     Succeeded,
-    Failed { exit_code: Option<i32> },
-    /// The backend lost the execution (node died, pod evicted…).
+    /// Terminal failure, classified by the adapter (ADR-0047). `exit_code` is
+    /// the step container's exit code when one exists (`Step` failures); infra
+    /// failures that never produced a verdict carry `None`.
+    Failed {
+        exit_code: Option<i32>,
+        class: FailureClass,
+    },
+    /// The backend lost the execution (vanished Pod, node stopped reporting).
+    /// Conservatively treated as post-start — it cannot be proven the process
+    /// never ran (ADR-0047).
     Lost,
 }
 
@@ -215,6 +242,19 @@ pub trait Db: Send + Sync {
     /// A run's project, if set.
     async fn run_project(&self, run: &RunId) -> Result<Option<String>, DbError>;
 
+    /// Stamp the run's owning tenant `(org, project)` (ADR-0049): resolved
+    /// from the trigger's repo at creation; untenanted runs (inline dev
+    /// submissions) never call this and stay visible to global roles only.
+    async fn set_run_tenant(
+        &self,
+        run: &RunId,
+        org: &str,
+        project: &str,
+    ) -> Result<(), DbError>;
+
+    /// The run's owning tenant, if stamped.
+    async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError>;
+
     /// How many runs are in-flight (started, not terminal). With `project`,
     /// scoped to that project (fairness cap); without, the global count
     /// (backpressure).
@@ -302,6 +342,46 @@ pub trait Db: Send + Sync {
         attempt: &Attempt,
     ) -> Result<(), DbError>;
 
+    /// All attempts of a step, in start order — the retry loop's budget source
+    /// (ADR-0047: every retry consumes the attempt budget).
+    async fn attempts_of_step(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Vec<Attempt>, DbError>;
+
+    /// Record the executor handle an attempt was launched with — the durable
+    /// "launch happened" marker (ADR-0047). Its presence turns a later missing
+    /// backend object into `Lost` (assertion-gated retry on a NEW fence)
+    /// instead of a blind same-fence relaunch, which would make a zombie and a
+    /// retry indistinguishable.
+    async fn set_attempt_handle(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        handle: &str,
+    ) -> Result<(), DbError>;
+
+    /// The stored launch handle of an attempt, or `None` if that attempt was
+    /// never observed launching (crash before the marker → safe to launch:
+    /// the deterministic fence makes it create-or-adopt).
+    async fn attempt_handle(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<String>, DbError>;
+
+    /// Record the classified failure on a finished attempt (ADR-0047).
+    async fn set_attempt_failure(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        failure: FailureKind,
+    ) -> Result<(), DbError>;
+
     /// Append one entry to the run's append-only event log.
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError>;
 
@@ -328,6 +408,73 @@ pub trait Db: Send + Sync {
 
     /// Mark a claimed outbox message dispatched, so it is never redelivered.
     async fn mark_dispatched(&self, id: OutboxId) -> Result<(), DbError>;
+
+    /// Record one failed delivery of an outbox message (ADR-0047 poison
+    /// handling) and return the total failures so far. Benign redeliveries of
+    /// in-flight work never call this — only a processing *error* counts.
+    async fn record_outbox_failure(&self, id: OutboxId) -> Result<u32, DbError>;
+
+    /// Permanently stop redelivering a poison message (ADR-0047): it is never
+    /// claimed again but retained for diagnosis.
+    async fn dead_letter_outbox(&self, id: OutboxId) -> Result<(), DbError>;
+
+    /// Runs that still hold log chunks, are TERMINAL, and settled before
+    /// `cutoff` — the retention sweeper's work list (ADR-0050). Lifecycle-keyed
+    /// by contract: a non-terminal run (including one suspended on a gate for
+    /// weeks) is NEVER returned, regardless of age.
+    async fn prunable_log_runs(
+        &self,
+        cutoff: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError>;
+
+    /// Every log-chunk object key a run holds (across steps/attempts) — what
+    /// the sweeper deletes from the object store before dropping the index.
+    async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError>;
+
+    /// Drop a run's entire log-chunk INDEX (bodies are deleted from the object
+    /// store first — at-least-once: a crash between the two re-sweeps). Run
+    /// metadata (state row, event log) is retained for audit (ADR-0050).
+    async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError>;
+
+    /// Current run counts by status token (ADR-0053 metrics gauge).
+    async fn run_status_counts(&self) -> Result<Vec<(String, u64)>, DbError>;
+
+    /// Undispatched, non-dead-lettered outbox messages (ADR-0053 gauge — the
+    /// backlog a stalled driver shows up as).
+    async fn outbox_depth(&self) -> Result<u64, DbError>;
+
+    /// Persist a step's published artifacts (ADR-0052): name-addressed per
+    /// run — a re-drive overwrites deterministically (same fence, same bytes).
+    async fn put_artifacts(
+        &self,
+        run: &RunId,
+        artifacts: &[crate::ArtifactMeta],
+        at: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// A run's artifacts, name-ordered.
+    async fn artifacts_of_run(&self, run: &RunId) -> Result<Vec<crate::ArtifactMeta>, DbError>;
+
+    /// Runs that still hold artifacts, are TERMINAL, and settled before
+    /// `cutoff` — the artifact class's sweep list (ADR-0050/0052).
+    async fn prunable_artifact_runs(
+        &self,
+        cutoff: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError>;
+
+    /// Drop a run's artifact metadata (blobs deleted from the store first).
+    async fn delete_artifacts_of_run(&self, run: &RunId) -> Result<(), DbError>;
+
+    /// The workspace-CAS **mark set** roots (ADR-0050): the output snapshots
+    /// of every step of every non-terminal run, plus terminal runs that
+    /// settled at/after `terminal_cutoff`. A gate-suspended run is
+    /// non-terminal, so its roots are ALWAYS marked, regardless of age.
+    async fn gc_workspace_roots(
+        &self,
+        terminal_cutoff: Timestamp,
+    ) -> Result<Vec<String>, DbError>;
 
     /// Acquire (or renew) a time-bounded lease over a named `resource` (a step
     /// id, `"scheduler"` leadership, …) for `owner`. Only an expired lease is
@@ -395,6 +542,16 @@ pub trait Executor: Send + Sync {
         _handle: &ExecHandle,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ExecError> {
         Ok(std::collections::BTreeMap::new())
+    }
+
+    /// The **artifacts** a finished execution published to `/scarab/artifacts/`
+    /// (ADR-0052): collected post-step by the backend, blobs already in the
+    /// object store; the orchestrator persists the metadata. Default empty.
+    async fn artifacts(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Vec<crate::ArtifactMeta>, ExecError> {
+        Ok(Vec::new())
     }
 
     /// Open a best-effort **live tail** of the unit's stdout/stderr for `step`,

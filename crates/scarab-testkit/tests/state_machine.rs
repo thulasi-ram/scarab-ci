@@ -150,7 +150,7 @@ fn forward_progress_poison_step_is_bounded() {
     for i in 1..=MAX {
         step.start_attempt(scarab_engine::AttemptId(format!("a{i}")), at)
             .unwrap();
-        step.finish_attempt(Some(FailureKind::Infra), MAX, at)
+        step.finish_attempt(Some(FailureKind::Infra { never_started: true }), MAX, at)
             .unwrap();
         if i < MAX {
             // Attempts remain: re-armed for another try.
@@ -176,6 +176,26 @@ fn step_failure_is_not_retried() {
     step.finish_attempt(Some(FailureKind::Step), 5, at).unwrap();
     assert_eq!(step.status, StepStatus::Failed);
     assert_eq!(step.attempt_count(), 1);
+}
+
+/// ADR-0047: a `Timeout` and a *post-start* `Infra` failure are terminal too —
+/// a side effect may exist, so re-running is only ever the author's opt-in
+/// `retry:` assertion (wired by the retry-loop slice), never automatic.
+#[test]
+fn timeout_and_post_start_infra_are_not_auto_retried() {
+    for failure in [
+        FailureKind::Timeout,
+        FailureKind::Infra { never_started: false },
+    ] {
+        let mut step = StepRun::new(run_id(), StepId("effectful".into()));
+        let at = scarab_engine::Timestamp(0);
+        step.mark_ready(at).unwrap();
+        step.start_attempt(scarab_engine::AttemptId("a1".into()), at)
+            .unwrap();
+        step.finish_attempt(Some(failure), 5, at).unwrap();
+        assert_eq!(step.status, StepStatus::Failed, "{failure:?}");
+        assert_eq!(step.attempt_count(), 1);
+    }
 }
 
 /// Terminal run states are sinks: no transition leaves them.

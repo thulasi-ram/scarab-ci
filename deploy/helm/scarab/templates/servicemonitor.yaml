@@ -1,0 +1,17 @@
+{{- if .Values.serviceMonitor.enabled }}
+# Prometheus Operator scrape config for /metrics (ADR-0053).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "scarab.fullname" . }}
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "scarab.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

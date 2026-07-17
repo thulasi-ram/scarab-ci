@@ -27,3 +27,21 @@ Secure-by-default for the most common job.
 
 - **Bring-your-own builder** — zero builder code, but punts the #1 task + security footguns.
 - **Kaniko** — simpler/daemonless, but slower, weaker cache, fading.
+
+## Amendment (2026-07-17) — registry authentication
+
+`build_pod_for_build` exists but is unwired, and there is **no registry auth**
+(no push/pull credentials). Decision:
+
+- **Registry credentials are a generic scoped secret** (ADR-0037) — a
+  `dockerconfigjson`-shaped secret in the Project/Environment scope, injected
+  into BuildKit's auth path for both push and private-`FROM` pull. No new
+  first-class `registry:` concept (that would reinvent secret-scoping); reuses
+  scope inheritance, fork-PR lockout, and log redaction as-is.
+- **Zero-config convenience:** the forge adapter may *derive* a registry
+  credential for pushing to the forge's **own** registry (GHCR via the GitHub
+  installation token; the Forgejo package registry via its token) from the
+  `ForgeConnection` (ADR-0046) — the common "push to my forge" case with no
+  secret to configure.
+- The push stays fenced via the existing `push:{image}@{digest}` idempotency key
+  (ADR-0021).

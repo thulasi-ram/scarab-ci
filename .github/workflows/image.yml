@@ -1,9 +1,15 @@
-# Build (and publish) the scarab-server container image.
+# Build (and publish) Scarab's first-party container images:
+#   - scarab-server  (the converged API/worker binary, ./Dockerfile)
+#   - scarab-clone   (the canonical clone step image, ADR-0045,
+#                     ./deploy/clone/Dockerfile)
+#   - scarab-results-sidecar (the trusted results-egress sidecar, ADR-0042,
+#                     ./deploy/sidecar/Dockerfile)
 #
 # - PRs: build only, to catch a broken Dockerfile before merge (no push).
 # - push to main: build + push, tagged `edge` and by commit SHA.
 # - v* tags: build + push a release, tagged with the semver + `latest`.
-# The README calls out this image + the Rust CI job as in-progress edges.
+# Digest pinning: every push step exports the image digest into the job
+# summary so a deploy can pin `image@sha256:…` (ADR-0018/0045).
 name: image
 
 on:
@@ -17,14 +23,13 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      - 'deploy/clone/**'
+      - 'deploy/sidecar/**'
       - '.github/workflows/image.yml'
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
-  # ghcr.io/thulasi-ram/scarab-server — namespaced to the repo owner so the
-  # (future) sidecar image can sit alongside it.
-  IMAGE_NAME: ${{ github.repository_owner }}/scarab-server
 
 # One build per ref; a newer push supersedes an in-flight one.
 concurrency:
@@ -37,6 +42,19 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: scarab-server
+            context: .
+            dockerfile: Dockerfile
+          - image: scarab-clone
+            context: deploy/clone
+            dockerfile: deploy/clone/Dockerfile
+          - image: scarab-results-sidecar
+            context: deploy/sidecar
+            dockerfile: deploy/sidecar/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +62,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=ref,event=pr
             type=sha,format=long
@@ -65,11 +83,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+      # The digest is the deployable identity (pin `image@sha256:…`).
+      - name: Record image digest
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "**${{ matrix.image }}**: \`${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"

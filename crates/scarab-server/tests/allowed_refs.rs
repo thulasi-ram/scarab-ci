@@ -13,16 +13,16 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use scarab_engine::Db;
-use scarab_forge::{Event, Repo};
-use scarab_projects::{
+use scarab_forge::{Event, RepoRef};
+use scarab_project::{
     Deployment, Environment, EnvironmentStore, ProjectError, ProtectionRules,
 };
 use scarab_secrets::SecretScope;
 use scarab_server::trigger_run_from_event;
 use scarab_testkit::{FakeClock, FakeForge, InMemoryDb};
 
-fn repo() -> Repo {
-    Repo { owner: "acme".into(), name: "web".into() }
+fn repo() -> RepoRef {
+    RepoRef { owner: "acme".into(), name: "web".into() }
 }
 
 // A deploy pipeline (targets an Environment) that runs on push OR pull_request.

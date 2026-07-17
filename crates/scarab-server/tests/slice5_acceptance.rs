@@ -12,7 +12,7 @@ use std::sync::Arc;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Db, RunId, StepId, StepRun};
-use scarab_executor_k8s::{build_pod_for_build, image_artifact, BuildSpec};
+use scarab_executor_k8s::{build_pod, image_artifact, DEFAULT_CLONE_IMAGE, DEFAULT_STEP_TIMEOUT_SECS};
 use scarab_identity::{Claims, OidcIssuer};
 use scarab_secrets::{Secret, SecretProvider, SecretScope};
 use scarab_secrets_postgres::PostgresSecrets;
@@ -99,14 +99,39 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
     assert_eq!(verified["run_id"], "run-1");
 
     // --- 3. A build step compiles to a rootless-BuildKit Pod + records a digest. ---
-    let build = BuildSpec {
+    let build = scarab_engine::BuildConfig {
         context: "workspace".into(),
         dockerfile: "Dockerfile".into(),
         image: "registry.example/app:1.0".into(),
         push: true,
+        ..Default::default()
     };
     let build_step = StepRun::new(run.clone(), StepId("image".into()));
-    let pod = build_pod_for_build("scarab-image", "scarab-run-1", &build_step, &build);
+    let build_spec = scarab_engine::StepSpec {
+        image: String::new(),
+        command: vec![],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: None,
+        workspace_inputs: vec![],
+        clone: None,
+        build: Some(build.clone()),
+        artifacts: vec![],
+        oidc_token: None,
+    };
+    let pod = build_pod(
+        "scarab-image",
+        "scarab-run-1",
+        &build_step,
+        &build_spec,
+        None,
+        DEFAULT_STEP_TIMEOUT_SECS,
+        false,
+        DEFAULT_CLONE_IMAGE,
+    );
     let container = &pod.spec.as_ref().unwrap().containers[0];
     assert_eq!(container.image.as_deref(), Some("moby/buildkit:rootless"));
     assert_eq!(container.security_context.as_ref().unwrap().privileged, Some(false));

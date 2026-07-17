@@ -18,6 +18,9 @@ use crate::LogTailer;
 /// Run one converged cycle across all active runs: tick the scheduler, ensure a
 /// live log tail is running for every in-flight step (if a `tailer` is wired),
 /// then (if a `forge` is wired) post any pending commit statuses back.
+// Wiring seam: all inputs are distinct composition-root dependencies (see
+// `spawn_driver`); a config struct would only add indirection.
+#[allow(clippy::too_many_arguments)]
 pub async fn tick_once(
     db: &Arc<dyn Db>,
     clock: &Arc<dyn Clock>,
@@ -26,9 +29,12 @@ pub async fn tick_once(
     tailer: Option<&LogTailer>,
     owner: &str,
     visibility_ms: i64,
+    step_timeout_ms: i64,
+    public_url: &str,
 ) -> Result<(), SchedulerError> {
     Scheduler::new(&**db, &**clock, &**executor, owner)
         .with_outbox_visibility_ms(visibility_ms)
+        .with_default_step_timeout_ms(step_timeout_ms)
         .tick_all()
         .await?;
     // Log tail (ADR-0013): pull each running step's stdout/stderr into the log
@@ -42,7 +48,9 @@ pub async fn tick_once(
     if let Some(forge) = forge {
         // Status posting is best-effort within a tick; a failed post stays on the
         // outbox for the next cycle (at-least-once, idempotent).
-        if let Err(e) = crate::drain_forge_statuses(&**forge, &**db, owner, 32, 30_000).await {
+        if let Err(e) =
+            crate::drain_forge_statuses(&**forge, &**db, owner, 32, 30_000, public_url).await
+        {
             tracing::warn!(error = %e, "forge status drain failed");
         }
     }
@@ -82,8 +90,13 @@ pub fn spawn_driver(
     owner: String,
     interval: Duration,
     visibility_ms: i64,
+    step_timeout_ms: i64,
+    public_url: String,
 ) -> tokio::task::JoinHandle<()> {
-    let tailer = logs.map(|logs| LogTailer::new(executor.clone(), logs));
+    // Claim-to-tail lease (ADR-0051): with 2+ replicas, only the fence's
+    // lease holder tails a step — deduping ingestion and spreading log I/O.
+    let tailer =
+        logs.map(|logs| LogTailer::new(executor.clone(), logs).with_lease(db.clone(), owner.clone()));
     tokio::spawn(async move {
         loop {
             if let Err(e) = tick_once(
@@ -94,6 +107,8 @@ pub fn spawn_driver(
                 tailer.as_ref(),
                 &owner,
                 visibility_ms,
+                step_timeout_ms,
+                &public_url,
             )
             .await
             {

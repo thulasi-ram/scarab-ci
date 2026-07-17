@@ -75,6 +75,12 @@ pub struct PipelineIr {
     /// Distinct from the per-step workspace `inputs:`/`outputs:` (ADR-0007, 0035).
     #[serde(default, skip_serializing_if = "Interface::is_empty")]
     pub interface: Interface,
+    /// Opt-in run budget in seconds (ADR-0047): the run fails once its
+    /// **active** time (gate-suspended time excluded) exceeds this. No default
+    /// — a run suspended for weeks on a gate is the wedge, not a hang; forward
+    /// progress rests on step timeouts and gate expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<u32>,
     pub steps: Vec<StepSpec>,
 }
 
@@ -267,6 +273,21 @@ pub struct StepSpec {
     /// released. The engine wiring is `Db::set_step_gate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
+    /// If set, this is a **clone** step (ADR-0045): first-class source
+    /// provisioning. Zero-config by design — repo/ref/SHA/token are implicit
+    /// from the run's trigger context; the engine runs the canonical
+    /// `scarab-clone` image (never the author's). Downstream steps inherit
+    /// the cloned workspace via plain `needs` (ADR-0007 — no new inheritance
+    /// rule). Image-less like `gate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<CloneSpec>,
+    /// If set, this is a **build** step (ADR-0018): a first-class rootless
+    /// BuildKit image build. The engine runs the blessed BuildKit image
+    /// (never the author's); the context/dockerfile are workspace-relative,
+    /// so a build step normally `needs` the clone step. Image-less like
+    /// `gate`/`clone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildSpec>,
     /// If set, this is an **invoke** step (ADR-0038): a repo-relative path to a
     /// Library pipeline (under `.scarab/lib/` by convention) that is *inlined at
     /// compile time*, not a runtime object. The step launches nothing itself;
@@ -290,6 +311,18 @@ pub struct StepSpec {
     /// any other kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_after: Option<u32>,
+    /// Opt-in gate **expiry** (ADR-0047), in seconds: fail the gate (and hence
+    /// the run) if it is still unapproved this long after the run suspended.
+    /// Distinct from [`gate_after`](StepSpec::gate_after) (a timer's
+    /// auto-release). Default = indefinite — gates may wait forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_expires_after: Option<u32>,
+    /// Artifact publication globs (ADR-0052): which files under
+    /// `/scarab/artifacts/` this step publishes as artifacts of record.
+    /// Default (empty) = everything the step wrote there. `*` matches within
+    /// a path segment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
     /// Entrypoint/command (empty = the image default).
     #[serde(default)]
     pub command: Vec<String>,
@@ -325,6 +358,27 @@ pub struct StepSpec {
     /// (ADR-0029); authored + validated here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<String>>,
+    /// Per-step execution deadline in **seconds** (ADR-0047). Absent = the
+    /// global default (1h). Enforced primarily by the backend (kubelet
+    /// `activeDeadlineSeconds` / the local kill-timer — it survives
+    /// control-plane downtime), with an engine-side backstop. Exceeding it is
+    /// a `Timeout` failure: terminal unless the step opted into `retry:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+    /// Opt-in retry policy (ADR-0020/0047): `retry: { on: failure, max: N }`.
+    ///
+    /// ⚠ **At-least-once:** retry re-runs the whole step at-least-once; enable
+    /// only if the step is idempotent or fenced against a cooperating sink
+    /// (ADR-0021). Non-cooperating side effects (a bare POST, an email) *will*
+    /// double-fire on retry — no fence token can prevent that.
+    ///
+    /// Setting this is the author's assertion "this step is safe to re-run":
+    /// it gates retry of *post-start* failures (post-start infra, step
+    /// verdict, timeout). Never-started infra failures (image pull,
+    /// unschedulable) auto-retry independently of this field — no side effect
+    /// is possible when the process never ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<Retry>,
     /// Authoring-only fan-out modifier; `None` on every compiled step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix: Option<Matrix>,
@@ -344,6 +398,16 @@ impl StepSpec {
     /// Is this an image-less gate step (a durable suspend point)?
     pub fn is_gate(&self) -> bool {
         self.gate.is_some()
+    }
+
+    /// Is this a clone step (ADR-0045 source provisioning)?
+    pub fn is_clone(&self) -> bool {
+        self.clone.is_some()
+    }
+
+    /// Is this a build step (ADR-0018 rootless image build)?
+    pub fn is_build(&self) -> bool {
+        self.build.is_some()
     }
 
     /// Is this an image-less invoke step (a compile-time library inline point)?
@@ -383,6 +447,133 @@ impl StepSecurity {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Configuration of a `clone` step (ADR-0045). Everything is optional —
+/// `clone: {}` is the common case; repo/ref/SHA/token come from the run's
+/// trigger context, never from the author.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneSpec {
+    /// `1` (default — shallow, small CAS snapshots) or `full` (complete
+    /// history + all refs, for history-dependent workloads). Any other value
+    /// is a compile error.
+    #[serde(default)]
+    pub depth: CloneDepth,
+    /// Recursive submodule fetch with the run's token. Cross-installation
+    /// private submodules are a documented limitation (ADR-0045).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub submodules: bool,
+    /// git-lfs fetch (served by the canonical `scarab-clone` image).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lfs: bool,
+    /// Override the ref to clone. Default = the run's trigger ref, pinned to
+    /// its resolved SHA (ADR-0043/0044) — restarts always re-clone that SHA.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
+    pub r#ref: Option<String>,
+}
+
+/// Configuration of a `build` step (ADR-0018): what to build and where to
+/// push. Registry credentials are NEVER authored here — they are a scoped
+/// `REGISTRY_AUTH` secret (ADR-0037) or derived from the forge connection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildSpec {
+    /// Workspace-relative build context directory (default `.`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub context: String,
+    /// Dockerfile name within the context (default `Dockerfile`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dockerfile: String,
+    /// The image reference to build (and push), e.g. `ghcr.io/acme/app:v1`.
+    /// Serde-defaulted so an absent tag surfaces as a validation diagnostic,
+    /// not a parse error.
+    #[serde(default)]
+    pub image: String,
+    /// Push the built image (default false — build-only validation).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub push: bool,
+}
+
+/// The `depth:` of a [`CloneSpec`]: shallow (`1`, the default) or `full`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CloneDepth {
+    /// `depth: 1` — the working tree at the pinned SHA, minimal history.
+    #[default]
+    Shallow,
+    /// `depth: full` — complete history and all refs.
+    Full,
+}
+
+impl Serialize for CloneDepth {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            CloneDepth::Shallow => s.serialize_u64(1),
+            CloneDepth::Full => s.serialize_str("full"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CloneDepth {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = CloneDepth;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("`1` (shallow) or `full`")
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<CloneDepth, E> {
+                if v == 1 {
+                    Ok(CloneDepth::Shallow)
+                } else {
+                    Err(E::custom(format!(
+                        "invalid clone depth {v}: only `1` (shallow) or `full` are supported"
+                    )))
+                }
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<CloneDepth, E> {
+                u64::try_from(v)
+                    .map_err(|_| E::custom("invalid clone depth"))
+                    .and_then(|v| self.visit_u64(v))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<CloneDepth, E> {
+                match v {
+                    "1" => Ok(CloneDepth::Shallow),
+                    "full" => Ok(CloneDepth::Full),
+                    other => Err(E::custom(format!(
+                        "invalid clone depth `{other}`: only `1` (shallow) or `full` are supported"
+                    ))),
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// A step's opt-in retry policy (ADR-0020 syntax, ADR-0047 semantics).
+///
+/// ⚠ **At-least-once warning** (surfaced verbatim to authors): *retry re-runs
+/// the whole step at-least-once; enable only if the step is idempotent or
+/// fenced against a cooperating sink.*
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retry {
+    /// Which failures the author's assertion covers. `failure` (the default
+    /// and only value today) selects every *post-start* class: post-start
+    /// infra, step verdict, and timeout. Never-started infra retries
+    /// automatically regardless.
+    #[serde(default)]
+    pub on: RetryOn,
+    /// The re-run budget: up to `max` additional attempts after the first.
+    /// Bounded by [`validate`] to 1..=10 — a liveness bound, not a safety one
+    /// (ADR-0047): side-effect safety remains at-least-once.
+    pub max: u32,
+}
+
+/// The failure selector of a [`Retry`] policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RetryOn {
+    /// Any post-start failure: post-start infra, step verdict, or timeout.
+    #[default]
+    Failure,
 }
 
 /// The upstream steps this step depends on (its DAG edges).
@@ -532,6 +723,7 @@ pub fn compile_yaml_with_libs(
         concurrency: authored.concurrency,
         environment: authored.environment,
         interface: authored.interface,
+        budget: authored.budget,
         steps: expanded,
     };
 
@@ -1190,8 +1382,38 @@ fn expand_step(step: &StepSpec) -> Result<Vec<StepSpec>, String> {
 /// Validate a compiled [`PipelineIr`], returning **all** discovered problems at
 /// once. Checks: unique step ids, no unexpanded matrix (a compile-invariant),
 /// `needs` resolve to real steps, and the `needs` graph is acyclic.
+/// Non-fatal lint diagnostics over a compiled pipeline (ADR-0045) — the rules
+/// behind `scarab lint`, also surfaced (as warnings, never failures) wherever
+/// a pipeline compiles. First rule: a `push`/`pull_request` pipeline with no
+/// `clone` step almost certainly forgot its source; some triggered pipelines
+/// legitimately need none, hence a lint and not a hard error. Repo-less
+/// triggers (`cron`, `upstream`, …) never warn.
+pub fn lint(ir: &PipelineIr) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let source_triggered = ir
+        .triggers
+        .0
+        .keys()
+        .any(|k| k == "push" || k == "pull_request");
+    let has_clone = ir.steps.iter().any(|s| s.is_clone());
+    if source_triggered && !has_clone {
+        warnings.push(
+            "pipeline triggers on push/pull_request but has no `clone` step — its steps will \
+             run without source (ADR-0045); add `- { id: checkout, clone: {} }` and depend on \
+             it via `needs`"
+                .to_string(),
+        );
+    }
+    warnings
+}
+
 pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
     let mut diagnostics = Vec::new();
+
+    // Run budget (ADR-0047): opt-in, active-time-only; zero is nonsense.
+    if ir.budget == Some(0) {
+        diagnostics.push("`budget` must be greater than zero seconds".to_string());
+    }
 
     // Unique ids.
     let mut seen = BTreeSet::new();
@@ -1210,6 +1432,62 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         }
         if step.invoke.is_some() {
             diagnostics.push(format!("step `{}`: invoke was not inlined", step.id));
+        }
+        // Step kinds are mutually exclusive: a step is a gate, a clone, or an
+        // ordinary executed step — never two at once.
+        if [step.gate.is_some(), step.clone.is_some(), step.build.is_some()]
+            .iter()
+            .filter(|k| **k)
+            .count()
+            > 1
+        {
+            diagnostics.push(format!(
+                "step `{}`: `gate`, `clone`, and `build` are mutually exclusive step kinds",
+                step.id
+            ));
+        }
+        // A build step runs the blessed rootless BuildKit image (ADR-0018):
+        // the author names no image/command and needs no privilege (rootless
+        // by construction).
+        if let Some(build) = &step.build {
+            if build.image.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: a build step must name the `image:` to build",
+                    step.id
+                ));
+            }
+            if !step.image.is_empty() || !step.command.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: a build step runs the blessed BuildKit image — it must not \
+                     set an image or command",
+                    step.id
+                ));
+            }
+            if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
+                diagnostics.push(format!(
+                    "step `{}`: a build step is rootless by construction — it must not request \
+                     privilege escalation",
+                    step.id
+                ));
+            }
+        }
+        // A clone step is zero-config by design (ADR-0045): the engine runs
+        // the canonical scarab-clone image with the run's trigger context —
+        // the author supplies no image/command/security.
+        if step.clone.is_some() {
+            if !step.image.is_empty() || !step.command.is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: a clone step runs the canonical scarab-clone image — it must not \
+                     set an image or command",
+                    step.id
+                ));
+            }
+            if step.security.as_ref().is_some_and(|s| !s.is_baseline()) {
+                diagnostics.push(format!(
+                    "step `{}`: a clone step must not request privilege escalation",
+                    step.id
+                ));
+            }
         }
         // Step kind: a gate launches nothing (image-less); every other step must
         // name an image. A gate with an image/command is a contradiction.
@@ -1235,6 +1513,28 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                         step.id
                     ));
                 }
+                // A gate executes nothing, so there is nothing to re-run.
+                if step.retry.is_some() {
+                    diagnostics.push(format!(
+                        "step `{}`: a gate step launches nothing — it must not set `retry`",
+                        step.id
+                    ));
+                }
+                // A gate has no execution to deadline (`gate_after` covers
+                // timer gates; gate *expiry* is `gate_expires_after`).
+                if step.timeout.is_some() {
+                    diagnostics.push(format!(
+                        "step `{}`: a gate step launches nothing — it must not set `timeout`",
+                        step.id
+                    ));
+                }
+                // Gate expiry (ADR-0047): opt-in, positive.
+                if step.gate_expires_after == Some(0) {
+                    diagnostics.push(format!(
+                        "step `{}`: `gate_expires_after` must be greater than zero seconds",
+                        step.id
+                    ));
+                }
                 // A `timer` gate needs a positive wait; other kinds must not set one.
                 match (kind.as_str(), step.gate_after) {
                     ("timer", None) => diagnostics.push(format!(
@@ -1253,7 +1553,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 }
             }
             None => {
-                if step.image.is_empty() {
+                if step.image.is_empty() && !step.is_clone() && !step.is_build() {
                     diagnostics.push(format!("step `{}`: missing image", step.id));
                 }
                 if step.gate_after.is_some() {
@@ -1272,6 +1572,33 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                                 step.id
                             ));
                         }
+                    }
+                }
+                // Gate expiry is only meaningful on a gate.
+                if step.gate_expires_after.is_some() {
+                    diagnostics.push(format!(
+                        "step `{}`: `gate_expires_after` is only valid on a gate step",
+                        step.id
+                    ));
+                }
+                // A zero deadline would kill every step instantly (ADR-0047).
+                if step.timeout == Some(0) {
+                    diagnostics.push(format!(
+                        "step `{}`: `timeout` must be greater than zero seconds",
+                        step.id
+                    ));
+                }
+                // Retry budget bounds (ADR-0047): a liveness bound. Zero re-runs
+                // is "no retry" (omit the field); an unbounded budget hides
+                // flakiness and burns minutes on doomed code.
+                if let Some(retry) = &step.retry {
+                    if !(1..=10).contains(&retry.max) {
+                        diagnostics.push(format!(
+                            "step `{}`: `retry.max` must be between 1 and 10 (got {}) — retry re-runs \
+                             the whole step at-least-once; enable only if the step is idempotent or \
+                             fenced against a cooperating sink",
+                            step.id, retry.max
+                        ));
                     }
                 }
             }
@@ -2716,6 +3043,309 @@ mod tests {
         match compile_yaml("steps: [ this is : not valid") {
             Err(PipelineError::Parse(_)) => {}
             other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    // --- retry: {on, max} (ADR-0020 syntax, ADR-0047 semantics) -------------
+
+    #[test]
+    fn retry_parses_and_lands_in_the_compiled_ir() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: flaky
+                image: busybox
+                retry: { on: failure, max: 3 }
+            "#,
+        );
+        assert_eq!(
+            ir.steps[0].retry,
+            Some(Retry { on: RetryOn::Failure, max: 3 })
+        );
+    }
+
+    #[test]
+    fn retry_on_defaults_to_failure() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: flaky
+                image: busybox
+                retry: { max: 2 }
+            "#,
+        );
+        assert_eq!(
+            ir.steps[0].retry,
+            Some(Retry { on: RetryOn::Failure, max: 2 })
+        );
+    }
+
+    #[test]
+    fn no_retry_is_the_default() {
+        let ir = compile("steps: [{ id: a, image: busybox }]");
+        assert_eq!(ir.steps[0].retry, None);
+        // And the compiled IR round-trips without a retry key at all.
+        let json = serde_json::to_value(&ir).unwrap();
+        assert!(json["steps"][0].get("retry").is_none());
+    }
+
+    #[test]
+    fn retry_max_bounds_are_validated() {
+        for max in [0, 11] {
+            let yaml = format!(
+                "steps: [{{ id: a, image: busybox, retry: {{ max: {max} }} }}]"
+            );
+            match compile_yaml(&yaml) {
+                Err(PipelineError::Validation(errs)) => {
+                    // The bound error carries the at-least-once warning at the
+                    // opt-in point (ADR-0047: never over-promise safety).
+                    assert!(
+                        errs.iter().any(|e| e.contains("retry.max")
+                            && e.contains("at-least-once")),
+                        "max={max}: {errs:?}"
+                    );
+                }
+                other => panic!("max={max}: expected validation error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn retry_on_a_gate_step_is_rejected() {
+        match compile_yaml(
+            r#"
+            steps:
+              - id: approve
+                gate: manual
+                retry: { max: 1 }
+            "#,
+        ) {
+            Err(PipelineError::Validation(errs)) => {
+                assert!(
+                    errs.iter().any(|e| e.contains("must not set `retry`")),
+                    "{errs:?}"
+                );
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    // --- clone step kind + missing-clone lint (ADR-0045) --------------------
+
+    #[test]
+    fn clone_compiles_to_a_distinct_kind_with_zero_config() {
+        let ir = compile(
+            r#"
+            steps:
+              - { id: checkout, clone: {} }
+              - { id: build, image: busybox, needs: [checkout] }
+            "#,
+        );
+        let checkout = &ir.steps[0];
+        assert!(checkout.is_clone());
+        assert!(!checkout.is_gate());
+        assert_eq!(
+            checkout.clone,
+            Some(CloneSpec {
+                depth: CloneDepth::Shallow, // default
+                submodules: false,
+                lfs: false,
+                r#ref: None,
+            })
+        );
+        // Downstream inherits the clone workspace via a plain needs edge
+        // (ADR-0007 — no new inheritance rule).
+        assert_eq!(ir.steps[1].needs.0, vec!["checkout".to_string()]);
+    }
+
+    // --- build step kind (ADR-0018) -----------------------------------------
+
+    #[test]
+    fn build_compiles_to_a_distinct_kind_with_defaults() {
+        let ir = compile(
+            r#"
+            steps:
+              - { id: checkout, clone: {} }
+              - id: image
+                needs: [checkout]
+                build:
+                  image: ghcr.io/acme/app:v1
+                  push: true
+            "#,
+        );
+        let image = &ir.steps[1];
+        assert!(image.is_build());
+        assert!(!image.is_clone() && !image.is_gate());
+        let b = image.build.as_ref().unwrap();
+        assert_eq!(b.image, "ghcr.io/acme/app:v1");
+        assert!(b.push);
+        assert!(b.context.is_empty() && b.dockerfile.is_empty(), "defaults resolve at persist");
+    }
+
+    #[test]
+    fn build_step_rejects_image_command_privilege_and_missing_tag() {
+        // An authored image/command contradicts the blessed BuildKit image.
+        let err = errors(
+            r#"
+            steps:
+              - id: image
+                image: busybox
+                build: { image: "ghcr.io/a/b:1" }
+            "#,
+        );
+        assert!(err.iter().any(|d| d.contains("must not") && d.contains("image")), "{err:?}");
+
+        // The image to build is mandatory.
+        let err = errors(
+            r#"
+            steps:
+              - id: image
+                build: {}
+            "#,
+        );
+        assert!(err.iter().any(|d| d.contains("must name the `image:`")), "{err:?}");
+
+        // Build steps are rootless by construction — no escalation.
+        let err = errors(
+            r#"
+            steps:
+              - id: image
+                build: { image: "ghcr.io/a/b:1" }
+                security: { run_as_root: true }
+            "#,
+        );
+        assert!(err.iter().any(|d| d.contains("rootless")), "{err:?}");
+
+        // Kinds are mutually exclusive.
+        let err = errors(
+            r#"
+            steps:
+              - id: image
+                gate: manual
+                build: { image: "ghcr.io/a/b:1" }
+            "#,
+        );
+        assert!(err.iter().any(|d| d.contains("mutually exclusive")), "{err:?}");
+    }
+
+    #[test]
+    fn clone_knobs_parse_and_round_trip() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: checkout
+                clone: { depth: full, submodules: true, lfs: true, ref: refs/heads/release }
+            "#,
+        );
+        let spec = ir.steps[0].clone.as_ref().unwrap();
+        assert_eq!(spec.depth, CloneDepth::Full);
+        assert!(spec.submodules);
+        assert!(spec.lfs);
+        assert_eq!(spec.r#ref.as_deref(), Some("refs/heads/release"));
+        // The compiled IR serializes depth canonically (1 | "full").
+        let json = serde_json::to_value(&ir).unwrap();
+        assert_eq!(json["steps"][0]["clone"]["depth"], "full");
+        let shallow = compile("steps: [{ id: c, clone: { depth: 1 } }]");
+        let json = serde_json::to_value(&shallow).unwrap();
+        assert_eq!(json["steps"][0]["clone"]["depth"], 1);
+    }
+
+    #[test]
+    fn invalid_clone_depth_is_a_compile_error() {
+        for depth in ["2", "\"deep\"", "0"] {
+            let yaml = format!("steps: [{{ id: c, clone: {{ depth: {depth} }} }}]");
+            match compile_yaml(&yaml) {
+                Err(PipelineError::Parse(e)) => {
+                    assert!(e.to_string().contains("depth"), "depth={depth}: {e}")
+                }
+                other => panic!("depth={depth}: expected parse error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn clone_is_zero_config_image_and_gate_are_rejected() {
+        match compile_yaml("steps: [{ id: c, clone: {}, image: busybox }]") {
+            Err(PipelineError::Validation(errs)) => {
+                assert!(errs.iter().any(|e| e.contains("scarab-clone")), "{errs:?}")
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+        match compile_yaml("steps: [{ id: c, clone: {}, gate: manual }]") {
+            Err(PipelineError::Validation(errs)) => {
+                assert!(errs.iter().any(|e| e.contains("mutually exclusive")), "{errs:?}")
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_clone_on_push_pipeline_lints_but_compiles() {
+        // The lint fires — and compilation still SUCCEEDS (non-fatal).
+        let ir = compile(
+            r#"
+            on: { push: {} }
+            steps: [{ id: build, image: busybox }]
+            "#,
+        );
+        let warnings = lint(&ir);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("without source"), "{warnings:?}");
+
+        // pull_request triggers warn too.
+        let ir = compile(
+            r#"
+            on: { pull_request: {} }
+            steps: [{ id: test, image: busybox }]
+            "#,
+        );
+        assert_eq!(lint(&ir).len(), 1);
+    }
+
+    #[test]
+    fn lint_is_quiet_with_a_clone_or_on_repo_less_triggers() {
+        // A push pipeline WITH a clone: quiet.
+        let ir = compile(
+            r#"
+            on: { push: {} }
+            steps:
+              - { id: checkout, clone: {} }
+              - { id: build, image: busybox, needs: [checkout] }
+            "#,
+        );
+        assert!(lint(&ir).is_empty());
+
+        // Repo-less triggers (cron/upstream) never warn — they legitimately
+        // may have no source.
+        let ir = compile(
+            r#"
+            on: { cron: {} }
+            steps: [{ id: sweep, image: busybox }]
+            "#,
+        );
+        assert!(lint(&ir).is_empty());
+
+        // No triggers at all (API/manual-only): quiet.
+        let ir = compile("steps: [{ id: a, image: busybox }]");
+        assert!(lint(&ir).is_empty());
+    }
+
+    #[test]
+    fn retry_survives_matrix_expansion() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: test
+                image: busybox
+                retry: { max: 2 }
+                matrix:
+                  dimensions:
+                    os: [linux, mac]
+            "#,
+        );
+        assert_eq!(ir.steps.len(), 2);
+        for step in &ir.steps {
+            assert_eq!(step.retry, Some(Retry { on: RetryOn::Failure, max: 2 }));
         }
     }
 }

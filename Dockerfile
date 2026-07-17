@@ -36,6 +36,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/scarab-server /usr/local/bin/scarab-server
 
 # --- runtime ---------------------------------------------------------------
+# --- The web UI (ADR-0054): built once, baked into the runtime image. -----
+FROM node:22-bookworm-slim AS ui
+WORKDIR /ui
+COPY ui/scarab-web-ui/package.json ui/scarab-web-ui/package-lock.json ./
+RUN npm ci
+COPY ui/scarab-web-ui .
+COPY openapi.json /openapi.json
+RUN sed -i 's|../../openapi.json|/openapi.json|' package.json && npm run gen && npm run build
+
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -45,6 +54,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         --home-dir /home/scarab --create-home --shell /usr/sbin/nologin scarab
 
 COPY --from=builder /usr/local/bin/scarab-server /usr/local/bin/scarab-server
+# The same-origin web UI (ADR-0054): the server serves it at / when present.
+COPY --from=ui /ui/dist /usr/share/scarab/ui
+ENV SCARAB_UI_DIR=/usr/share/scarab/ui
 
 # Default object-store fallback dir lives under the writable home when no S3 is
 # configured; production sets SCARAB_S3_BUCKET and never touches it.

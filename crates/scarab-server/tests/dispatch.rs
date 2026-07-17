@@ -21,16 +21,16 @@ use scarab_engine::ports::{ExecHandle, ExecState, Executor};
 use scarab_engine::{
     Clock, Db, EventPayload, ExecError, RunId, RunStatus, Scheduler, StepRun, StepSpec,
 };
-use scarab_forge::Repo;
-use scarab_projects::{
+use scarab_forge::RepoRef;
+use scarab_project::{
     Deployment, Environment, EnvironmentStore, ProjectError, ProtectionRules,
 };
 use scarab_secrets::SecretScope;
 use scarab_server::{dispatch_run, router, AppState, DispatchError, DispatchKind, LogService};
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb, InMemoryObjectStore};
 
-fn repo() -> Repo {
-    Repo { owner: "acme".into(), name: "web".into() }
+fn repo() -> RepoRef {
+    RepoRef { owner: "acme".into(), name: "web".into() }
 }
 
 // A single-step pipeline that opts into manual dispatch and interpolates a param.
@@ -91,7 +91,7 @@ impl EnvironmentStore for FakeEnvironments {
             .lock()
             .unwrap()
             .iter()
-            .filter(|d| d.org == org && d.repo == repo && d.environment == environment)
+            .filter(|d| d.org == org && d.project == repo && d.environment == environment)
             .cloned()
             .collect())
     }

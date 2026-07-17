@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Lease};
 use scarab_engine::{
     Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, ExecError, Executor,
-    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec,
-    StepStatus, Timestamp,
+    FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId,
+    StepRun, StepSpec, StepStatus, Timestamp,
 };
 use scarab_storage::{ObjectStore, StorageError};
 
@@ -68,6 +68,10 @@ struct OutboxEntry {
     msg: OutboxMessage,
     claimed: bool,
     dispatched: bool,
+    /// Failed-delivery count (ADR-0047 poison handling).
+    delivery_attempts: u32,
+    /// Poison marker: never redelivered, retained for diagnosis.
+    dead_lettered: bool,
 }
 
 /// A step's in-memory row: status, durable spec, dependency edges, and attempts.
@@ -109,6 +113,9 @@ struct InMemoryState {
     outbox: Vec<OutboxEntry>,
     /// Per-(run, step, attempt) log-chunk index (offsets only, no bodies).
     logs: HashMap<(RunId, StepId, AttemptId), Vec<LogChunkMeta>>,
+    /// Per-(run, step, attempt) launch handle — the durable "launch happened"
+    /// marker (ADR-0047).
+    attempt_handles: HashMap<(RunId, StepId, AttemptId), String>,
     /// Per-run concurrency group + policy.
     concurrency: HashMap<RunId, (String, ConcurrencyPolicy)>,
     /// The single slot holder per concurrency group.
@@ -120,6 +127,17 @@ struct InMemoryState {
     /// Per-run project (fairness) and admission priority.
     run_project: HashMap<RunId, String>,
     run_priority: HashMap<RunId, i32>,
+    run_tenant: HashMap<RunId, (String, String)>,
+    /// ForgeConnection registry rows (ADR-0046).
+    forge_connections: HashMap<String, scarab_forge::ForgeConnection>,
+    /// Repo bindings: (owner, name) → (connection id, org, project).
+    forge_repos: HashMap<(String, String), (String, String, String)>,
+    /// Webhook delivery-id replay guard: (forge kind token, delivery id).
+    webhook_deliveries: std::collections::HashSet<(String, String)>,
+    /// Lease table: resource → (owner, expiry instant).
+    leases: HashMap<String, (String, std::time::Instant)>,
+    /// Artifact metadata (ADR-0052), keyed (run, name).
+    artifacts: HashMap<(RunId, String), scarab_engine::ArtifactMeta>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -456,6 +474,24 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().run_project.get(run).cloned())
     }
 
+    async fn set_run_tenant(
+        &self,
+        run: &RunId,
+        org: &str,
+        project: &str,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_tenant
+            .insert(run.clone(), (org.to_string(), project.to_string()));
+        Ok(())
+    }
+
+    async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError> {
+        Ok(self.state.lock().unwrap().run_tenant.get(run).cloned())
+    }
+
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
         let st = self.state.lock().unwrap();
         let n = st
@@ -589,6 +625,7 @@ impl Db for InMemoryDb {
                 run: run.clone(),
                 status: *status,
                 created_at: st.run_created.get(run).copied().unwrap_or(Timestamp(0)),
+                tenant: st.run_tenant.get(run).cloned(),
             })
             .collect();
         // Newest first, then id — matches the adapter's ORDER BY.
@@ -719,6 +756,60 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn attempts_of_step(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .map(|rec| rec.attempts.clone())
+            .unwrap_or_default())
+    }
+
+    async fn set_attempt_handle(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        handle: &str,
+    ) -> Result<(), DbError> {
+        self.state.lock().unwrap().attempt_handles.insert(
+            (run.clone(), step.clone(), attempt.clone()),
+            handle.to_string(),
+        );
+        Ok(())
+    }
+
+    async fn attempt_handle(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .attempt_handles
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .cloned())
+    }
+
+    async fn set_attempt_failure(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        failure: FailureKind,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
+            if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
+                a.failure = Some(failure);
+            }
+        }
+        Ok(())
+    }
+
     async fn record_transition(
         &self,
         run: &RunId,
@@ -759,6 +850,8 @@ impl Db for InMemoryDb {
             msg,
             claimed: false,
             dispatched: false,
+            delivery_attempts: 0,
+            dead_lettered: false,
         });
         Ok(())
     }
@@ -768,16 +861,24 @@ impl Db for InMemoryDb {
         _owner: &str,
         kind: Option<&str>,
         limit: u32,
-        _visibility_ms: i64,
+        visibility_ms: i64,
     ) -> Result<Vec<OutboxMessage>, DbError> {
         let mut st = self.state.lock().unwrap();
         let mut out = Vec::new();
+        // A zero (or negative) visibility window models an already-expired
+        // claim lease: the message is immediately reclaimable — how tests
+        // drive crash/restart re-polls of in-flight work (ADR-0047).
+        let reclaimable = visibility_ms <= 0;
         for entry in st.outbox.iter_mut() {
             if out.len() as u32 >= limit {
                 break;
             }
             let kind_ok = kind.is_none_or(|k| entry.msg.kind == k);
-            if !entry.dispatched && !entry.claimed && kind_ok {
+            if !entry.dispatched
+                && !entry.dead_lettered
+                && (!entry.claimed || reclaimable)
+                && kind_ok
+            {
                 entry.claimed = true;
                 out.push(entry.msg.clone());
             }
@@ -793,11 +894,173 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
-    async fn lease(&self, _resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
-        Ok(Lease {
-            owner: owner.to_string(),
-            expires_at: Timestamp(ttl_ms),
-        })
+    async fn record_outbox_failure(&self, id: OutboxId) -> Result<u32, DbError> {
+        let mut st = self.state.lock().unwrap();
+        Ok(st
+            .outbox
+            .iter_mut()
+            .find(|e| e.msg.id == id)
+            .map(|e| {
+                e.delivery_attempts += 1;
+                e.delivery_attempts
+            })
+            .unwrap_or(0))
+    }
+
+    async fn dead_letter_outbox(&self, id: OutboxId) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(e) = st.outbox.iter_mut().find(|e| e.msg.id == id) {
+            e.dead_lettered = true;
+        }
+        Ok(())
+    }
+
+    async fn run_status_counts(&self) -> Result<Vec<(String, u64)>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for status in st.runs.values() {
+            *counts.entry(format!("{status:?}").to_lowercase()).or_default() += 1;
+        }
+        let mut out: Vec<_> = counts.into_iter().collect();
+        out.sort();
+        Ok(out)
+    }
+
+    async fn outbox_depth(&self) -> Result<u64, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st.outbox.iter().filter(|e| !e.dispatched && !e.dead_lettered).count() as u64)
+    }
+
+    async fn put_artifacts(
+        &self,
+        run: &RunId,
+        artifacts: &[scarab_engine::ArtifactMeta],
+        _at: Timestamp,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        for a in artifacts {
+            st.artifacts.insert((run.clone(), a.name.clone()), a.clone());
+        }
+        Ok(())
+    }
+
+    async fn artifacts_of_run(&self, run: &RunId) -> Result<Vec<scarab_engine::ArtifactMeta>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<_> = st
+            .artifacts
+            .iter()
+            .filter(|((r, _), _)| r == run)
+            .map(|(_, a)| a.clone())
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    async fn prunable_artifact_runs(
+        &self,
+        cutoff: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<RunId> = st
+            .runs
+            .iter()
+            .filter(|(run, status)| {
+                status.is_terminal()
+                    && st.run_created.get(*run).copied().unwrap_or(Timestamp(0)).0 < cutoff.0
+                    && st.artifacts.keys().any(|(r, _)| r == *run)
+            })
+            .map(|(run, _)| run.clone())
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    async fn delete_artifacts_of_run(&self, run: &RunId) -> Result<(), DbError> {
+        self.state.lock().unwrap().artifacts.retain(|(r, _), _| r != run);
+        Ok(())
+    }
+
+    async fn prunable_log_runs(
+        &self,
+        cutoff: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<RunId> = st
+            .runs
+            .iter()
+            .filter(|(run, status)| {
+                status.is_terminal()
+                    && st.run_created.get(*run).copied().unwrap_or(Timestamp(0)).0 < cutoff.0
+                    && st.logs.keys().any(|(r, _, _)| r == *run)
+            })
+            .map(|(run, _)| run.clone())
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .logs
+            .iter()
+            .filter(|((r, _, _), _)| r == run)
+            .flat_map(|(_, metas)| metas.iter().map(|m| m.object_key.clone()))
+            .collect())
+    }
+
+    async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError> {
+        self.state.lock().unwrap().logs.retain(|(r, _, _), _| r != run);
+        Ok(())
+    }
+
+    async fn gc_workspace_roots(
+        &self,
+        terminal_cutoff: Timestamp,
+    ) -> Result<Vec<String>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .steps
+            .iter()
+            .filter(|((run, _), rec)| {
+                rec.output.is_some()
+                    && st.runs.get(run).is_some_and(|status| {
+                        !status.is_terminal()
+                            || st.run_created.get(run).copied().unwrap_or(Timestamp(0)).0
+                                >= terminal_cutoff.0
+                    })
+            })
+            .filter_map(|(_, rec)| rec.output.clone())
+            .collect())
+    }
+
+    async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
+        // Real lease semantics (the PG adapter's contract): the holder renews;
+        // a peer only takes over an EXPIRED lease. Wall-clock via Instant —
+        // a process-local fake needs no injected clock for expiry.
+        let mut st = self.state.lock().unwrap();
+        let now = std::time::Instant::now();
+        let entry = st.leases.entry(resource.to_string());
+        use std::collections::hash_map::Entry;
+        match entry {
+            Entry::Occupied(mut e) => {
+                let (holder, expires) = e.get().clone();
+                if holder == owner || now >= expires {
+                    e.insert((owner.to_string(), now + std::time::Duration::from_millis(ttl_ms as u64)));
+                    Ok(Lease { owner: owner.to_string(), expires_at: Timestamp(ttl_ms) })
+                } else {
+                    Ok(Lease { owner: holder, expires_at: Timestamp(ttl_ms) })
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert((owner.to_string(), now + std::time::Duration::from_millis(ttl_ms as u64)));
+                Ok(Lease { owner: owner.to_string(), expires_at: Timestamp(ttl_ms) })
+            }
+        }
     }
 }
 
@@ -830,13 +1093,21 @@ struct FakeExecState {
 /// is idempotent on the step's fence, mirroring the real executor's re-attach.
 pub struct FakeExecutor {
     inner: Mutex<FakeExecState>,
+    /// Handles `cancel` was called with (teardown assertions).
+    cancelled: Mutex<Vec<String>>,
 }
 
 impl FakeExecutor {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(FakeExecState::default()),
+            cancelled: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The handles torn down via `cancel`, in call order.
+    pub fn cancelled_handles(&self) -> Vec<String> {
+        self.cancelled.lock().unwrap().clone()
     }
 
     /// Push the next outcome `poll` should report.
@@ -929,7 +1200,8 @@ impl Executor for FakeExecutor {
         }
     }
 
-    async fn cancel(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+    async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        self.cancelled.lock().unwrap().push(handle.0.clone());
         Ok(())
     }
 
@@ -966,13 +1238,21 @@ impl Executor for FakeExecutor {
 #[derive(Default)]
 pub struct InMemoryObjectStore {
     blobs: Mutex<HashMap<String, Vec<u8>>>,
+    /// Per-key last-modified (unix-ms) for GC tests; unset = 0 (ancient).
+    modified: Mutex<HashMap<String, i64>>,
 }
 
 impl InMemoryObjectStore {
     pub fn new() -> Self {
         Self {
             blobs: Mutex::new(HashMap::new()),
+            modified: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Set a key's last-modified time (what the GC grace window reads).
+    pub fn set_modified(&self, key: &str, ms: i64) {
+        self.modified.lock().unwrap().insert(key.to_string(), ms);
     }
 
     /// Number of stored objects (for assertions).
@@ -1005,6 +1285,21 @@ impl ObjectStore for InMemoryObjectStore {
         self.blobs.lock().unwrap().remove(key);
         Ok(())
     }
+    async fn list_objects(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<scarab_storage::StoredObject>, StorageError> {
+        let objects = self.blobs.lock().unwrap();
+        let modified = self.modified.lock().unwrap();
+        Ok(objects
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .map(|k| scarab_storage::StoredObject {
+                key: k.clone(),
+                modified_ms: modified.get(k).copied().unwrap_or(0),
+            })
+            .collect())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,7 +1307,8 @@ impl ObjectStore for InMemoryObjectStore {
 // ---------------------------------------------------------------------------
 
 use scarab_forge::{
-    Commit, Event, ForgeError, ForgePort, Permissions, Repo, Status, WebhookDelivery,
+    CheckoutCredential, Commit, Event, ForgeError, ForgePort, Permissions, RepoRef, Status,
+    WebhookDelivery,
 };
 
 /// An in-memory [`ForgePort`]: serves seeded in-repo files (by path, e.g.
@@ -1027,6 +1323,9 @@ pub struct FakeForge {
     /// A ref with no mapping resolves to itself (identity) — the default that
     /// keeps ref-agnostic tests simple.
     commits: Mutex<HashMap<String, String>>,
+    /// A seeded derived registry credential (ADR-0018); `None` (default)
+    /// mirrors a forge with no derivable registry.
+    registry_credential: Mutex<Option<scarab_forge::RegistryCredential>>,
 }
 
 impl FakeForge {
@@ -1037,6 +1336,12 @@ impl FakeForge {
     /// Seed the content the forge returns for `path` at any ref.
     pub fn with_file(self, path: impl Into<String>, content: impl Into<Vec<u8>>) -> Self {
         self.files.lock().unwrap().insert(path.into(), content.into());
+        self
+    }
+
+    /// Seed the derived registry credential (ADR-0018 zero-config push).
+    pub fn with_registry_credential(self, cred: scarab_forge::RegistryCredential) -> Self {
+        *self.registry_credential.lock().unwrap() = Some(cred);
         self
     }
 
@@ -1060,8 +1365,127 @@ impl FakeForge {
 }
 
 #[async_trait]
+impl scarab_forge::ForgeConnectionStore for InMemoryDb {
+    async fn put_connection(
+        &self,
+        conn: &scarab_forge::ForgeConnection,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        self.state
+            .lock()
+            .unwrap()
+            .forge_connections
+            .insert(conn.id.clone(), conn.clone());
+        Ok(())
+    }
+
+    async fn get_connection(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_forge::ForgeConnection>, scarab_forge::RegistryError> {
+        Ok(self.state.lock().unwrap().forge_connections.get(id).cloned())
+    }
+
+    async fn list_connections(
+        &self,
+    ) -> Result<Vec<scarab_forge::ForgeConnection>, scarab_forge::RegistryError> {
+        let mut out: Vec<_> = self
+            .state
+            .lock()
+            .unwrap()
+            .forge_connections
+            .values()
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    async fn delete_connection(&self, id: &str) -> Result<(), scarab_forge::RegistryError> {
+        let mut st = self.state.lock().unwrap();
+        st.forge_connections.remove(id);
+        st.forge_repos.retain(|_, (conn, _, _)| conn != id);
+        Ok(())
+    }
+
+    async fn bind_repo(
+        &self,
+        connection_id: &str,
+        repo: &scarab_forge::RepoRef,
+        org: &str,
+        project: &str,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        self.state.lock().unwrap().forge_repos.insert(
+            (repo.owner.clone(), repo.name.clone()),
+            (connection_id.to_string(), org.to_string(), project.to_string()),
+        );
+        Ok(())
+    }
+
+    async fn unbind_repo(
+        &self,
+        connection_id: &str,
+        repo: &scarab_forge::RepoRef,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        let mut st = self.state.lock().unwrap();
+        let key = (repo.owner.clone(), repo.name.clone());
+        if st.forge_repos.get(&key).is_some_and(|(c, _, _)| c == connection_id) {
+            st.forge_repos.remove(&key);
+        }
+        Ok(())
+    }
+
+    async fn repos_of(
+        &self,
+        connection_id: &str,
+    ) -> Result<Vec<scarab_forge::RepoRef>, scarab_forge::RegistryError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<_> = st
+            .forge_repos
+            .iter()
+            .filter(|(_, (c, _, _))| c == connection_id)
+            .map(|((owner, name), _)| scarab_forge::RepoRef {
+                owner: owner.clone(),
+                name: name.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.owner, &a.name).cmp(&(&b.owner, &b.name)));
+        Ok(out)
+    }
+
+    async fn resolve(
+        &self,
+        repo: &scarab_forge::RepoRef,
+    ) -> Result<Option<scarab_forge::ResolvedRepo>, scarab_forge::RegistryError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .forge_repos
+            .get(&(repo.owner.clone(), repo.name.clone()))
+            .and_then(|(conn_id, org, project)| {
+                st.forge_connections.get(conn_id).map(|c| scarab_forge::ResolvedRepo {
+                    connection: c.clone(),
+                    org: org.clone(),
+                    project: project.clone(),
+                })
+            }))
+    }
+
+    async fn record_delivery(
+        &self,
+        forge: scarab_forge::ForgeKind,
+        delivery_id: &str,
+    ) -> Result<bool, scarab_forge::RegistryError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .webhook_deliveries
+            .insert((forge.as_str().to_string(), delivery_id.to_string())))
+    }
+}
+
+#[async_trait]
 impl ForgePort for FakeForge {
-    async fn latest_commit(&self, _repo: &Repo, r#ref: &str) -> Result<Commit, ForgeError> {
+    async fn latest_commit(&self, _repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError> {
         let sha = self
             .commits
             .lock()
@@ -1077,7 +1501,7 @@ impl ForgePort for FakeForge {
 
     async fn read_file_at_ref(
         &self,
-        _repo: &Repo,
+        _repo: &RepoRef,
         _ref: &str,
         path: &str,
     ) -> Result<Vec<u8>, ForgeError> {
@@ -1091,7 +1515,7 @@ impl ForgePort for FakeForge {
 
     async fn list_dir_at_ref(
         &self,
-        _repo: &Repo,
+        _repo: &RepoRef,
         _ref: &str,
         dir: &str,
     ) -> Result<Vec<String>, ForgeError> {
@@ -1112,17 +1536,21 @@ impl ForgePort for FakeForge {
         Ok(out)
     }
 
-    async fn register_webhook(&self, _repo: &Repo, _callback_url: &str) -> Result<(), ForgeError> {
+    async fn register_webhook(&self, _repo: &RepoRef, _callback_url: &str) -> Result<(), ForgeError> {
         Ok(())
     }
 
-    async fn normalize_event(&self, _raw: WebhookDelivery) -> Result<Event, ForgeError> {
-        Err(ForgeError::UnsupportedEvent("fake forge does not normalize".into()))
+    async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError> {
+        // The fake's wire format IS the canonical vocabulary: the payload is a
+        // serialized `Event`. Keeps the fake contract-capable (ADR-0046)
+        // without inventing a vendor format.
+        serde_json::from_value(raw.payload)
+            .map_err(|e| ForgeError::Malformed(format!("fake payload is not an Event: {e}")))
     }
 
     async fn set_status(
         &self,
-        _repo: &Repo,
+        _repo: &RepoRef,
         _commit: &Commit,
         status: Status,
     ) -> Result<(), ForgeError> {
@@ -1130,16 +1558,38 @@ impl ForgePort for FakeForge {
         Ok(())
     }
 
-    async fn create_deployment(&self, _repo: &Repo, _environment: &str) -> Result<(), ForgeError> {
+    async fn create_deployment(&self, _repo: &RepoRef, _environment: &str) -> Result<(), ForgeError> {
         Ok(())
     }
 
-    async fn post_comment(&self, _repo: &Repo, issue: u64, body: &str) -> Result<(), ForgeError> {
+    async fn post_comment(&self, _repo: &RepoRef, issue: u64, body: &str) -> Result<(), ForgeError> {
         self.comments.lock().unwrap().push((issue, body.to_string()));
         Ok(())
     }
 
-    async fn get_permissions(&self, _repo: &Repo, _user: &str) -> Result<Permissions, ForgeError> {
+    async fn registry_credential(
+        &self,
+        _repo: &RepoRef,
+    ) -> Result<Option<scarab_forge::RegistryCredential>, ForgeError> {
+        Ok(self.registry_credential.lock().unwrap().clone())
+    }
+
+    async fn mint_checkout_credential(
+        &self,
+        repo: &RepoRef,
+        read_only: bool,
+    ) -> Result<CheckoutCredential, ForgeError> {
+        // Deterministic fake credential: scoped to the repo, short TTL,
+        // read-only honored verbatim (the contract forbids widening it).
+        Ok(CheckoutCredential {
+            username: "x-access-token".into(),
+            token: format!("fake-token-{}-{}", repo.owner, repo.name),
+            expires_at: 9_999_999_999_999,
+            read_only,
+        })
+    }
+
+    async fn get_permissions(&self, _repo: &RepoRef, _user: &str) -> Result<Permissions, ForgeError> {
         Ok(Permissions {
             read: true,
             write: true,
@@ -1214,6 +1664,111 @@ impl SessionStore for InMemorySessions {
 
     async fn get(&self, id: &str) -> Result<Option<Session>, IdentityError> {
         Ok(self.sessions.lock().unwrap().get(id).cloned())
+    }
+
+    async fn delete(&self, id: &str) -> Result<(), IdentityError> {
+        self.sessions.lock().unwrap().remove(id);
+        Ok(())
+    }
+}
+
+/// An in-memory [`scarab_identity::RbacStore`] with the same origin semantics
+/// as the Postgres adapter: native rows are authoritative (imports never
+/// clobber them), a native revoke is a tombstone imports cannot resurrect,
+/// and `role_of` applies Org→Project inheritance.
+#[derive(Default)]
+pub struct InMemoryRbac {
+    /// (subject, org, project) → (role, origin); project "" = org scope;
+    /// role None = native tombstone.
+    rows: Mutex<HashMap<(String, String, String), (Option<scarab_identity::Role>, scarab_identity::BindingOrigin)>>,
+}
+
+impl InMemoryRbac {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+fn rbac_key(subject: &str, scope: &scarab_identity::Scope) -> (String, String, String) {
+    match scope {
+        scarab_identity::Scope::Org(org) => (subject.to_string(), org.clone(), String::new()),
+        scarab_identity::Scope::Project { org, name } => {
+            (subject.to_string(), org.clone(), name.clone())
+        }
+    }
+}
+
+#[async_trait]
+impl scarab_identity::RbacStore for InMemoryRbac {
+    async fn grant(
+        &self,
+        binding: &scarab_identity::Binding,
+        origin: scarab_identity::BindingOrigin,
+    ) -> Result<(), IdentityError> {
+        let key = rbac_key(&binding.subject, &binding.scope);
+        let mut rows = self.rows.lock().unwrap();
+        match origin {
+            scarab_identity::BindingOrigin::Native => {
+                rows.insert(key, (Some(binding.role), origin));
+            }
+            scarab_identity::BindingOrigin::Import => {
+                let native_owned = matches!(
+                    rows.get(&key),
+                    Some((_, scarab_identity::BindingOrigin::Native))
+                );
+                if !native_owned {
+                    rows.insert(key, (Some(binding.role), origin));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn revoke(
+        &self,
+        subject: &str,
+        scope: &scarab_identity::Scope,
+    ) -> Result<(), IdentityError> {
+        self.rows.lock().unwrap().insert(
+            rbac_key(subject, scope),
+            (None, scarab_identity::BindingOrigin::Native),
+        );
+        Ok(())
+    }
+
+    async fn role_of(
+        &self,
+        subject: &str,
+        scope: &scarab_identity::Scope,
+    ) -> Result<Option<scarab_identity::Role>, IdentityError> {
+        let rows = self.rows.lock().unwrap();
+        let exact = rows.get(&rbac_key(subject, scope)).and_then(|(r, _)| *r);
+        let org = rows
+            .get(&rbac_key(subject, &scarab_identity::Scope::Org(scope.org().to_string())))
+            .and_then(|(r, _)| *r);
+        Ok(exact.max(org))
+    }
+
+    async fn bindings(
+        &self,
+        org: &str,
+    ) -> Result<Vec<scarab_identity::Binding>, IdentityError> {
+        let rows = self.rows.lock().unwrap();
+        let mut out: Vec<scarab_identity::Binding> = rows
+            .iter()
+            .filter(|((_, o, _), (role, _))| o == org && role.is_some())
+            .map(|((subject, o, p), (role, _))| scarab_identity::Binding {
+                subject: subject.clone(),
+                scope: if p.is_empty() {
+                    scarab_identity::Scope::Org(o.clone())
+                } else {
+                    scarab_identity::Scope::Project { org: o.clone(), name: p.clone() }
+                },
+                role: role.unwrap(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.subject.cmp(&b.subject));
+        Ok(out)
     }
 }
 
