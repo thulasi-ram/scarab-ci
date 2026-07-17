@@ -95,15 +95,17 @@ export default function RepoView() {
           <span class="head-org">{org()}/</span>{repo()}
         </h1>
       </div>
-      <Show when={cta()}>
-        {(c) => (
-          <div class="page-toolbar">
+      {/* Always rendered (fixed height) so the tab row never shifts between
+          tabs with and without a CTA. */}
+      <div class="page-toolbar">
+        <Show when={cta()}>
+          {(c) => (
             <button class="btn btn-primary" onClick={() => c().onClick()}>
               <Icon icon={c().icon} size={14} /> {c().label}
             </button>
-          </div>
-        )}
-      </Show>
+          )}
+        </Show>
+      </div>
 
       <div class="tabs">
         <For each={TABS}>
