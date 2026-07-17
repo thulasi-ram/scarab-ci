@@ -14,11 +14,16 @@ steps:
   - id: check
     image: rust:1-bookworm
     needs: [checkout]
-    # Root inside the caps-dropped, unprivileged, seccomp-confined sandbox
-    # (self-service, ADR-0039) so cargo/rustc own their caches without
-    # fighting the non-root workspace ownership.
+    # The stock rust image's USER is root, so the non-root baseline would
+    # reject it — opt into root (self-service, ADR-0039). But the baseline
+    # drops CAP_DAC_OVERRIDE, and the CAS-restored /workspace is owned by the
+    # clone's uid (65532), so uid-0 cannot write there. Cargo only needs to
+    # READ the source from /workspace; send its writable target dir to a
+    # container-owned path instead.
     security:
       run_as_root: true
+    env:
+      - [CARGO_TARGET_DIR, /tmp/scarab-target]
     command:
       # `-c`, not `-lc`: a login shell sources /etc/profile and resets PATH,
       # dropping the rust image's /usr/local/cargo/bin (rustc/cargo vanish).
