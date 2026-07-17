@@ -61,8 +61,16 @@ spec:
             # files, since the root filesystem is read-only. Unused when S3 is set.
             - name: scratch
               mountPath: /home/scarab/.scarab
+            # Writable /tmp: with readOnlyRootFilesystem the executor's post-step
+            # settle (tar the step's /workspace out, unpack into a tempdir before
+            # CAS ingest) would hit EROFS on the default TMPDIR and dead-letter
+            # the run. A dedicated emptyDir keeps /tmp writable.
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: scratch
+          emptyDir: {}
+        - name: tmp
           emptyDir: {}
       {{- with .Values.nodeSelector }}
       nodeSelector:
