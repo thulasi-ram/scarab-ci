@@ -92,7 +92,7 @@ export default function RepoView() {
 
       <div class="page-head">
         <h1>
-          <span class="head-org">{org()} /</span> {repo()}
+          <span class="head-org">{org()}/</span>{repo()}
         </h1>
       </div>
       <Show when={cta()}>

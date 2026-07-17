@@ -1120,9 +1120,9 @@ h2 {
 .page-toolbar + .tabs { margin-top: 16px; }
 /* org prefix inside a repo header, e.g. "acme / web" (context, now that the
    top-bar breadcrumb is gone) */
-/* The org is a prefix, not the title — smaller, so a repo header ("acme /
-   api") doesn't sprawl in the wide biform next to single-word pages. */
-.head-org { color: var(--muted-sage); font-weight: 400; font-size: 0.55em; }
+/* The org is a prefix, not the title — smaller and tight against the slash,
+   so a repo header ("acme/api") doesn't sprawl in the wide biform. */
+.head-org { color: var(--muted-sage); font-weight: 400; font-size: 0.7em; }
 
 /* ---- run-screen breadcrumb heading ---- */
 /* The repo name is the header on the repo screen; on a run it stays at header
