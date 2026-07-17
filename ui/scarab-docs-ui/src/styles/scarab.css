@@ -53,6 +53,10 @@
   --ascii-emerald: oklch(50% 0.11 162);
   --ascii-gold: oklch(55% 0.1 80);
   --ascii-gray: oklch(62% 0.02 160);
+
+  /* Pixel display face: broken glyphs read lighter than solid text, so they
+   * get the deepest ink to hold hierarchy against (Geist) sub-headings. */
+  --scarab-display-ink: oklch(14% 0.015 160);
 }
 
 :root[data-theme='dark'] {
@@ -66,6 +70,8 @@
   --ascii-emerald: oklch(74% 0.13 162);
   --ascii-gold: oklch(76% 0.11 85);
   --ascii-gray: oklch(52% 0.02 160);
+
+  --scarab-display-ink: oklch(98% 0.005 160);
 }
 
 /* ---- Display voice on the page title + wordmark -------------------------
@@ -79,21 +85,26 @@
   --radius: 0.375rem;
 }
 h1[data-page-title],
-h1#_top /* Starlight inner-page titles carry id=_top, not data-page-title */,
+/* Starlight inner-page titles carry id=_top; :where() keeps the ID from
+ * out-ranking the wordmark override below (the hero h1 has BOTH). */
+h1:where(#_top),
 .sl-markdown-content h1 {
   font-family: var(--scarab-display), var(--sl-font-mono);
   /* 700 rides 10 Pixel's real Bold cut (use 400 for single-weight faces). */
   font-weight: 700;
   letter-spacing: 0;
   font-synthesis: none;
+  color: var(--scarab-display-ink);
 }
 /* The wordmark (site title) and the landing hero title ARE the brand name —
- * they stay in the normal face; the pixel voice belongs to inner page titles
- * and the ASCII scenes. */
+ * an identity mark, so it earns its own one-off face: the biform Major Mono
+ * Display, used here and nowhere else. Single weight. */
+.site-title span,
 body:has(.hero) h1[data-page-title] {
-  font-family: var(--sl-font);
-  font-weight: 600;
-  letter-spacing: -0.02em;
+  font-family: 'Major Mono Display', var(--sl-font-mono);
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--scarab-display-ink);
 }
 
 /* ---- ASCII beetle scenes (landing page only; ui/brand/ascii README) ---- */

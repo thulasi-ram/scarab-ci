@@ -145,12 +145,17 @@ lives only in the doodles.
 
 ### Families
 - **10 Pixel** (`--font-display`; MagicType, OFL, vendored `ui/brand/fonts/`)
-  — display only: page titles (`h1`), section headings (`h2`), the run title,
-  repo/card names. Real Regular + Bold cuts; **zero tracking** (pixel glyphs
-  collide when tracked negative). A rounded pixel face — it makes sense
-  *because* of the ASCII beetles; they share a language.
-- **Space Grotesk** — the **`Scarab` wordmark only**. The brand name is an
-  identity, not a rendering, so it stays in a normal face.
+  — the page heading/breadcrumb row ONLY: `h1`, `.crumb-head`, `.run-title`
+  (docs: page titles). Section headings, card/repo names and everything else
+  stay Space Grotesk — the pixel voice over-accents at small/dense sizes.
+  Real Regular + Bold cuts; **zero tracking** (pixel glyphs collide when
+  tracked negative). Broken glyphs read lighter than solid text, so the pixel
+  face uses the deepest ink (`--display-ink`) to hold hierarchy. It makes
+  sense *because* of the ASCII beetles; they share a language.
+- **Major Mono Display** — the **`Scarab` wordmark only** (topbar brand,
+  docs site title + landing hero title). An identity mark earns a one-off
+  face: the biform (uppercase skeletons at lowercase heights) is distinctive
+  at wordmark doses and would tire as page titles. Single weight, tracking 0.
 - **Inter** (`--font-ui`) — body & UI: paragraphs, buttons, table body, nav.
   Weights 400/500/600.
 - **JetBrains Mono** (`--font-mono`) — **all chrome and machine tokens**:
@@ -167,10 +172,10 @@ Space Grotesk.
 | Role | Family | Size | Weight | Tracking |
 |------|--------|------|--------|----------|
 | Display / Hero (`h1`) | 10 Pixel | 40px | **700** | 0 |
-| Run title | 10 Pixel | 22px | 700 | 0 |
-| Section heading (`h2`) | 10 Pixel | 20px | **700** | 0 |
-| Card / repo name | 10 Pixel | 15px | **700** | 0 |
-| Wordmark (`.brand`) | Space Grotesk | 21px | 700 | -0.6px |
+| Run title / breadcrumb | 10 Pixel | 22–24px | 700 | 0 |
+| Section heading (`h2`) | Space Grotesk | 20px | 600 | -0.4px |
+| Card / repo name | Space Grotesk | 15px | 600 | -0.3px |
+| Wordmark (`.brand`) | Major Mono Display | 19px | 400 | 0 |
 | Body / button | Inter | 14–16px | 400–600 | -0.16px |
 | Eyebrow / label / column head | **Mono** | 10–11px | 500 | +0.8–1.2px, UPPERCASE |
 | Filter pill / chip | Mono | 11.5px | 400 | 0 |
@@ -216,9 +221,9 @@ the SVG root (see `components/Doodle.tsx` and docs `scripts/gen-doodles.mjs`):
 
 | Option | Value | Note |
 |---|---|---|
-| `stroke-dasharray` | `0 2.6` | zero-length dash + round cap = round dots at a 2.6-unit pitch (24-unit viewBox) |
+| `stroke-dasharray` | `0 1.2` | zero-length dash + round cap = round dots at a 1.2-unit pitch (24-unit viewBox) — the same grain as the 10 Pixel face |
 | `stroke-linecap` | `round` | this is what makes the dots |
-| `stroke-width` | `1.6` | dot diameter |
+| `stroke-width` | `0.6` | dot diameter |
 | `stroke` | copper `#c0873f` | a literal hex — an SVG presentation attribute, where CSS custom properties don't resolve |
 | `fill` | none | dots only |
 
@@ -226,8 +231,8 @@ the SVG root (see `components/Doodle.tsx` and docs `scripts/gen-doodles.mjs`):
 - **1–2 doodles per page. Never more.** Background layer only
   (`z-index` below text; `pointer-events: none`).
 - **Rotated & scaled**: ~8–20°, 120–260px, so they read as texture.
-- **Faint**: opacity ~5–8% so they never fight contrast (on paper they're
-  ambient; that's intended).
+- **Faint**: opacity ~12–16% — fine dots carry ~1/3 the ink of a solid
+  stroke, so they need more opacity for the same ambient presence.
 - **Related to the page**: `boxes`/`workflow` on lists, `container` on run
   detail, `key-round` on secrets, `shield-check` on environments, `bug` as the
   house motif.
@@ -338,7 +343,7 @@ Placement is stricter than doodles, because motion competes with content:
   doodle ink, SHAs, trigger glyphs.
 - Put mono on every label, header, id, and machine token — it *is* the voice.
 - Keep the dot-grid faint; dots are the signature, not a texture bath.
-- Set only titles in 10 Pixel (the display face); the wordmark in Space Grotesk; body in Inter.
+- Set only the h1/breadcrumb row in 10 Pixel; the wordmark in Major Mono Display; body in Inter.
 - Sprinkle **1–2** dotted doodles per page — background, faint, page-relevant.
 
 ### Don't
@@ -395,7 +400,7 @@ Placement is stricter than doodles, because motion competes with content:
 1. Light default (cool, not warm); dark is a clean toggle; both styled. Logs/DAG stay pine-black.
 2. Emerald is the only working accent; gold is edges + rare tokens, never a fill.
 3. Zero shadows on flat chrome; depth = shade.
-4. Mono on every label/header/id; 10 Pixel 700 for titles (wordmark = Space Grotesk); Inter for body.
+4. Mono on every label/header/id; 10 Pixel 700 for the h1/breadcrumb row only (wordmark = Major Mono Display); Inter for body.
 5. One dotted decoration language — faint dot-grid + dotted doodles (1–2/page) + ASCII beetles.
 
 ## 10. Documentation surface (a distinct skin)

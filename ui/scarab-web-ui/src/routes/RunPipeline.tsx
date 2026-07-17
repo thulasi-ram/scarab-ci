@@ -126,7 +126,7 @@ export default function RunPipeline() {
 
   return (
     <section class="page">
-      <Doodle icon="rocket" size={230} rotate={12} opacity={0.05} top="52px" right="48px" />
+      <Doodle icon="rocket" size={230} rotate={12} opacity={0.13} top="52px" right="48px" />
 
       <div class="run-head">
         <h1 class="crumb-head">

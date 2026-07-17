@@ -9,10 +9,11 @@ import { iconNode } from "../icons";
 
 // Canonical doodle ink. `stroke` is a literal hex (not `var(--copper)`): it's
 // an SVG presentation attribute, where CSS custom properties don't resolve.
-// dasharray "0 2.6" + round caps = dots Ø strokeWidth at a 2.6-unit pitch.
+// dasharray "0 1.2" + round caps = dots Ø strokeWidth at a 1.2-unit pitch —
+// the same grain as the 10 Pixel display face.
 const STROKE = "#c0873f";
-const STROKE_WIDTH = 1.6;
-const DASH = "0 2.6";
+const STROKE_WIDTH = 0.6;
+const DASH = "0 1.2";
 
 export default function Doodle(props: {
   icon: string;
