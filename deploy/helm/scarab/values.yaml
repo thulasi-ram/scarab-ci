@@ -91,6 +91,13 @@ secrets:
   githubWebhookSecret: ""
   gateTokenSecret: ""
   resultsTokenSecret: ""
+  # GitHub App private-key PEM (enh 245a99c): supplies the App credential at
+  # boot, GitOps-style — no PUT /v1/secrets reseed, and it survives DB recreate.
+  # Overrides any DB-stored `_forge` credential. For existingSecret mode, add a
+  # SCARAB_GITHUB_APP_PEM key to your Secret instead (both arrive via envFrom).
+  # NB: connection/installation registration is separate state — still seeded
+  # via reseed.sh's synthetic webhook or a real GitHub delivery.
+  githubAppPem: ""
 
 # RBAC the k8s executor needs to run one Pod per step in scarab.namespace.
 rbac:
