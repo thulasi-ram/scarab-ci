@@ -915,6 +915,22 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn run_status_counts(&self) -> Result<Vec<(String, u64)>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for status in st.runs.values() {
+            *counts.entry(format!("{status:?}").to_lowercase()).or_default() += 1;
+        }
+        let mut out: Vec<_> = counts.into_iter().collect();
+        out.sort();
+        Ok(out)
+    }
+
+    async fn outbox_depth(&self) -> Result<u64, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st.outbox.iter().filter(|e| !e.dispatched && !e.dead_lettered).count() as u64)
+    }
+
     async fn put_artifacts(
         &self,
         run: &RunId,

@@ -3457,6 +3457,74 @@ pub fn fork_policy(event: &scarab_forge::Event, target_env: &str) -> ForkPolicy 
     }
 }
 
+/// `GET /metrics` (ADR-0053): Prometheus text exposition of the key gauges —
+/// runs by status and outbox backlog, read live from the durable store on
+/// each scrape (pull-model, always consistent, no in-process drift).
+async fn metrics(State(st): State<AppState>) -> Result<Response, ApiError> {
+    let mut out = String::new();
+    out.push_str("# HELP scarab_runs Current run count by status.
+# TYPE scarab_runs gauge
+");
+    for (status, n) in st.db.run_status_counts().await? {
+        out.push_str(&format!("scarab_runs{{status=\"{status}\"}} {n}
+"));
+    }
+    out.push_str(
+        "# HELP scarab_outbox_depth Undispatched outbox messages.
+# TYPE scarab_outbox_depth gauge
+",
+    );
+    out.push_str(&format!("scarab_outbox_depth {}
+", st.db.outbox_depth().await?));
+    let mut resp = out.into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    Ok(resp)
+}
+
+/// `GET /readyz` (ADR-0053): readiness = can this replica actually serve —
+/// DB and object store reachable. Distinct from `/healthz` (liveness =
+/// process up): a server with a dead DB must leave rotation, not restart.
+async fn readyz(State(st): State<AppState>) -> Response {
+    if let Err(e) = st.db.run_status_counts().await {
+        return (StatusCode::SERVICE_UNAVAILABLE, format!("db: {e}")).into_response();
+    }
+    if let Some(store) = &st.artifact_store {
+        // NotFound = reachable; only a backend error is unready.
+        if let Err(scarab_storage::StorageError::Backend(e)) =
+            store.get("readyz/probe").await
+        {
+            return (StatusCode::SERVICE_UNAVAILABLE, format!("store: {e}")).into_response();
+        }
+    }
+    "ready".into_response()
+}
+
+/// Request-id middleware (ADR-0053): every response carries `x-request-id`
+/// (honoring an inbound one), and a tracing span correlates the logs.
+pub async fn request_id_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let span = tracing::info_span!("request", request_id = %id, method = %req.method(), path = %req.uri().path());
+    let mut resp = {
+        let _enter = span.enter();
+        next.run(req).await
+    };
+    if let Ok(v) = axum::http::HeaderValue::from_str(&id) {
+        resp.headers_mut().insert("x-request-id", v);
+    }
+    resp
+}
+
 async fn healthz() -> &'static str {
     "ok"
 }
@@ -3520,8 +3588,14 @@ pub fn openapi_json() -> String {
 
 /// Build the HTTP router bound to `state`.
 pub fn router(state: AppState) -> Router {
+    router_inner(state)
+}
+
+fn router_inner(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .route("/openapi.json", get(openapi))
         .route("/.well-known/jwks.json", get(jwks))
         .route("/.well-known/openid-configuration", get(openid_configuration))
@@ -3571,6 +3645,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/repos/{org}/{repo}/dispatch", post(dispatch))
         .route("/webhooks/github", post(github_webhook))
         .route("/webhooks/forgejo", post(forgejo_webhook))
+        // Request-id correlation on every route (ADR-0053).
+        .layer(axum::middleware::from_fn(request_id_middleware))
         .with_state(state)
 }
 

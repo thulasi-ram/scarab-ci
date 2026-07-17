@@ -1154,6 +1154,28 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn run_status_counts(&self) -> Result<Vec<(String, u64)>, DbError> {
+        let rows = sqlx::query("SELECT status, count(*) AS n FROM runs GROUP BY status")
+            .fetch_all(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("status"), r.get::<i64, _>("n") as u64))
+            .collect())
+    }
+
+    async fn outbox_depth(&self) -> Result<u64, DbError> {
+        let row = sqlx::query(
+            "SELECT count(*) AS n FROM outbox
+             WHERE dispatched_at IS NULL AND dead_lettered_at IS NULL",
+        )
+        .fetch_one(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.get::<i64, _>("n") as u64)
+    }
+
     async fn put_artifacts(
         &self,
         run: &RunId,

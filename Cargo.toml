@@ -55,7 +55,7 @@ flate2 = "1"
 tower = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "migrate", "macros", "json"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 # Pin the rustls default CryptoProvider (ring) at the composition root; see the

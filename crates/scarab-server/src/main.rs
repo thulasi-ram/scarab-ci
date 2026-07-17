@@ -26,7 +26,18 @@ use scarab_storage_s3::S3Storage;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    // Structured logging (ADR-0053): EnvFilter honors RUST_LOG; the JSON
+    // formatter is the production default — SCARAB_LOG_FORMAT=text opts into
+    // the human-readable dev format.
+    {
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        if std::env::var("SCARAB_LOG_FORMAT").as_deref() == Ok("text") {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        } else {
+            tracing_subscriber::fmt().with_env_filter(filter).json().init();
+        }
+    }
 
     // rustls 0.23 refuses to pick a process-level default CryptoProvider when
     // more than one backend is linked — and this binary links both: `ring`
@@ -219,6 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // connects (without a reachable cluster the driver is skipped — a degraded
     // state, reported loudly); the local backend needs nothing but a working
     // host (dev/CLI, ADR-0036).
+    let mut driver_handle: Option<tokio::task::JoinHandle<()>> = None;
     if config.role.runs_driver() {
         let executor: Option<Arc<dyn Executor>> = match config.executor {
             ExecutorKind::Local => {
@@ -292,7 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             // Forge-status posting (ADR-0046): the registry-routed forge posts
             // Running/Succeeded/Failed commit statuses with run deep-links.
-            converged::spawn_driver(
+            driver_handle = Some(converged::spawn_driver(
                 db.clone(),
                 clock.clone(),
                 executor,
@@ -304,7 +316,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 visibility_ms,
                 (config.step_timeout_secs as i64).saturating_mul(1000),
                 config.public_url.clone(),
-            );
+            ));
             tracing::info!("converged driver started");
         }
     }
@@ -364,7 +376,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     println!("listening on {}", config.addr);
-    axum::serve(listener, app).await?;
+    // Graceful shutdown (ADR-0053): SIGTERM/ctrl-c stops accepting, drains
+    // in-flight connections (incl. SSE), then stops the driver — no torn
+    // work on a rollout (safety still rests on crash-idempotency).
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    if let Some(handle) = driver_handle {
+        tracing::info!("shutdown: stopping the converged driver");
+        handle.abort();
+        let _ = handle.await;
+    }
+    tracing::info!("shutdown complete");
 
     Ok(())
+}
+
+/// Resolves on SIGTERM (k8s rollout) or ctrl-c (dev).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        let mut sig =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        sig.recv().await;
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = term => {},
+    }
+    tracing::info!("shutdown signal received — draining");
 }

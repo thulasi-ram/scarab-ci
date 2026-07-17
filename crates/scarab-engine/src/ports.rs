@@ -437,6 +437,13 @@ pub trait Db: Send + Sync {
     /// metadata (state row, event log) is retained for audit (ADR-0050).
     async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError>;
 
+    /// Current run counts by status token (ADR-0053 metrics gauge).
+    async fn run_status_counts(&self) -> Result<Vec<(String, u64)>, DbError>;
+
+    /// Undispatched, non-dead-lettered outbox messages (ADR-0053 gauge — the
+    /// backlog a stalled driver shows up as).
+    async fn outbox_depth(&self) -> Result<u64, DbError>;
+
     /// Persist a step's published artifacts (ADR-0052): name-addressed per
     /// run — a re-drive overwrites deterministically (same fence, same bytes).
     async fn put_artifacts(

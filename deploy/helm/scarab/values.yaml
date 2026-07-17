@@ -118,7 +118,9 @@ livenessProbe:
   periodSeconds: 15
 readinessProbe:
   httpGet:
-    path: /healthz
+    # Readiness = can this replica serve (DB + store reachable, ADR-0053) —
+    # distinct from liveness (/healthz = process up).
+    path: /readyz
     port: http
   initialDelaySeconds: 3
   periodSeconds: 10
@@ -139,3 +141,9 @@ podAnnotations: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# Prometheus scraping (ADR-0053): render a ServiceMonitor when the Prometheus
+# Operator CRDs are installed.
+serviceMonitor:
+  enabled: false
+  interval: 30s
