@@ -56,11 +56,13 @@
 }
 
 /* ---- Display voice on the page title + wordmark -------------------------
- * Zero tracking, weight 700. h2+ and body stay Geist — the display
+ * Zero tracking (dot/pixel faces collide when tracked tight); weight 700 so
+ * dot-matrix strokes hold a line. h2+ and body stay Geist — the display
  * voice is an accent, not the whole page. */
 :root {
-  /* Display voice: Space Grotesk — carries headings AND the wordmark. */
-  --scarab-display: 'Space Grotesk';
+  /* Display voice: Major Mono Display — the biform carries headings AND the
+   * wordmark. Single weight. */
+  --scarab-display: 'Major Mono Display';
   /* Sharpened from Lucode's 0.625rem — crisp corners pair with the dotted
      language and the ASCII scenes. */
   --radius: 0.375rem;
@@ -70,7 +72,7 @@ h1#_top /* Starlight inner-page titles carry id=_top, not data-page-title */,
 .sl-markdown-content h1,
 .site-title span {
   font-family: var(--scarab-display), var(--sl-font-mono);
-  font-weight: 700; /* Space Grotesk bold for display headings */
+  font-weight: 400; /* single-weight face — no synthetic bold */
   letter-spacing: 0;
   font-synthesis: none;
   color: var(--scarab-display-ink);

@@ -1,41 +1,6 @@
-<div align="center">
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="ui/brand/logo/scarab-emblem-dark-square.svg">
-  <img alt="The Scarab emblem — a scarab with spread wings inside a ring" src="ui/brand/logo/scarab-emblem-square.svg" width="132" height="132">
-</picture>
-
 # Scarab
 
-**A modern CI engine for Kubernetes — forge-native, on a durable core.**
-
-A forge-native CI with the batteries included, on an engine that treats a run
-as durable **state** — so a control-plane restart resumes it, never restarts it.
-Written in Rust.
-
-<br>
-
-[![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-137a52?style=flat-square)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-137a52?style=flat-square&logo=rust&logoColor=white)](#building)
-[![Kubernetes](https://img.shields.io/badge/Kubernetes-137a52?style=flat-square&logo=kubernetes&logoColor=white)](docs/adr/0005-tenancy-and-k8s-only.md)
-[![Status: proven core](https://img.shields.io/badge/status-proven%20core%20%C2%B7%20edges%20wiring-b8860b?style=flat-square)](#status-honest)
-
-[Context](CONTEXT.md) · [ADRs](docs/adr/) · [Positioning](docs/positioning.md) · [Run it locally](#local-dev-cluster-free)
-
-</div>
-
----
-
-<div align="center">
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/dashboard-dark.jpg">
-  <img alt="Scarab dashboard — an action inbox of runs suspended on a gate, recently-visited repos as pass/fail status cards, and the recency-sorted repo list" src="docs/assets/screenshots/dashboard-light.jpg" width="820">
-</picture>
-
-<sub>The dashboard: an **action inbox** of runs suspended on a gate, **recently-visited repos** as pass/fail status cards, and the recency-sorted repo list. ⌘K to jump anywhere.</sub>
-
-</div>
+**A modern CI engine for Kubernetes — forge-native, on a durable core.** Written in Rust.
 
 CI tools fall into two camps, and neither covers the whole job. **Workflow engines** — Argo,
 Tekton, Temporal — have a durable, crash-safe core, but they aren't CI: the forge
@@ -84,47 +49,22 @@ live forge* and *a live cluster* are not yet demonstrated. Implementation procee
 tracer-bullet vertical slices. See [docs/positioning.md](docs/positioning.md) for what we do
 and don't claim, and why.
 
-## Documentation
-
-The full docs site — **[docs.scarab](https://thulasi-ram.github.io/scarab-ci/)** — is built
-with Astro Starlight and published to GitHub Pages on tag (ADR-0040). It carries the
-getting-started guides, the pipeline authoring/config reference, the generated OpenAPI, and
-all ~40 ADRs. In-repo, the same sources live under:
+## Start here
 
 - **[CONTEXT.md](CONTEXT.md)** — the thesis, the durability contract, non-goals, and the
   **ubiquitous language** every crate/API/UI must use.
-- **[docs/adr/](docs/adr/)** — ~40 Architecture Decision Records (the *why* behind every
+- **[docs/adr/](docs/adr/)** — ~30 Architecture Decision Records (the *why* behind every
   load-bearing choice).
-- **[docs/positioning.md](docs/positioning.md)** — what we do and don't claim, and why.
 - **Issues** — tracked in [git-bug](https://github.com/git-bug/git-bug) (embedded in this
   repo): `git-bug bug` to list, `git-bug termui` for the TUI.
 
-## The run view
-
-<div align="center">
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/run-detail-dark.jpg">
-  <img alt="Scarab run detail — the step DAG, live logs, and an event timeline showing a retried step and the run suspended on a manual deploy gate" src="docs/assets/screenshots/run-detail-light.jpg" width="820">
-</picture>
-
-<sub>A run is durable **state**: the step DAG, live logs, and an append-only event timeline —
-here a flaky step auto-retried, then the run parked on a manual <code>deploy-prod</code> gate,
-held at near-zero cost until someone approves.</sub>
-
-</div>
-
 ## What makes it different
 
-|  |  |
-|---|---|
-| **Cohesion, not assembly** | One forge-native CI product — DSL, secrets, approvals, identity, UI — on a durable engine. Not a workflow engine you build a CI on top of, nor a job-runner CI with no durable core. |
-| **Runs are state, not processes** | A DBOS-pattern durable state machine on Postgres. A control-plane restart resumes the run from its last completed step, with exactly-once step execution — the architecture, not a boast. |
-| **Keyless identity** | Forge-agnostic OIDC, with Scarab itself as an OIDC issuer for keyless federation to your cloud. *(Designed forge-native; the live GitHub adapter is in progress — see Status.)* |
-| **A real DSL** | A typed IR (the actual DSL) with a YAML frontend and CEL expressions — a flat recursive DAG where `invoke` is reuse and matrix is a modifier. |
-
-The durable core is the *architectural* wedge ([ADR-0001](docs/adr/0001-ci-as-durable-execution.md)) —
-the thing every other decision is judged against — but the *public* pitch is the cohesion. See
+**Cohesion.** One forge-native CI product — DSL, secrets, approvals, identity, UI — on a
+durable engine, rather than a workflow engine (Argo/Tekton/Temporal) you assemble a CI on top
+of, or a job-runner CI (Actions/Woodpecker) with no durable engine underneath. The durable
+core is the *architectural* wedge ([ADR-0001](docs/adr/0001-ci-as-durable-execution.md)) — the
+thing every other decision is judged against — but the *public* pitch is the cohesion. See
 [docs/positioning.md](docs/positioning.md) for how we talk about it, and the honest boundaries.
 
 ## Design at a glance

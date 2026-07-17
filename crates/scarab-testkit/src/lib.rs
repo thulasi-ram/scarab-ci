@@ -621,16 +621,11 @@ impl Db for InMemoryDb {
         let mut out: Vec<RunSummary> = st
             .runs
             .iter()
-            .map(|(run, status)| {
-                let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
-                RunSummary {
-                    run: run.clone(),
-                    status: *status,
-                    created_at: created,
-                    // The fake has no clock at transition time; report zero duration.
-                    updated_at: created,
-                    tenant: st.run_tenant.get(run).cloned(),
-                }
+            .map(|(run, status)| RunSummary {
+                run: run.clone(),
+                status: *status,
+                created_at: st.run_created.get(run).copied().unwrap_or(Timestamp(0)),
+                tenant: st.run_tenant.get(run).cloned(),
             })
             .collect();
         // Newest first, then id — matches the adapter's ORDER BY.
@@ -639,35 +634,6 @@ impl Db for InMemoryDb {
                 .cmp(&a.created_at)
                 .then(b.run.0.cmp(&a.run.0))
         });
-        out.truncate(limit as usize);
-        Ok(out)
-    }
-
-    async fn list_runs_for_tenant(
-        &self,
-        org: &str,
-        project: &str,
-        limit: u32,
-    ) -> Result<Vec<RunSummary>, DbError> {
-        let want = (org.to_string(), project.to_string());
-        let st = self.state.lock().unwrap();
-        let mut out: Vec<RunSummary> = st
-            .runs
-            .iter()
-            .filter(|(run, _)| st.run_tenant.get(*run) == Some(&want))
-            .map(|(run, status)| {
-                let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
-                RunSummary {
-                    run: run.clone(),
-                    status: *status,
-                    created_at: created,
-                    // The fake has no clock at transition time; report zero duration.
-                    updated_at: created,
-                    tenant: st.run_tenant.get(run).cloned(),
-                }
-            })
-            .collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.run.0.cmp(&a.run.0)));
         out.truncate(limit as usize);
         Ok(out)
     }
@@ -1360,9 +1326,6 @@ pub struct FakeForge {
     /// A seeded derived registry credential (ADR-0018); `None` (default)
     /// mirrors a forge with no derivable registry.
     registry_credential: Mutex<Option<scarab_forge::RegistryCredential>>,
-    /// When set, [`set_status`](ForgePort::set_status) fails — models a forge
-    /// rejecting the post (e.g. an App missing `statuses:write` → HTTP 403).
-    fail_status: Mutex<bool>,
 }
 
 impl FakeForge {
@@ -1387,13 +1350,6 @@ impl FakeForge {
     /// distinct from the branch ref it dispatched (ADR-0043).
     pub fn with_commit(self, git_ref: impl Into<String>, sha: impl Into<String>) -> Self {
         self.commits.lock().unwrap().insert(git_ref.into(), sha.into());
-        self
-    }
-
-    /// Make [`set_status`](ForgePort::set_status) fail — models a forge that
-    /// rejects the post (e.g. an App lacking `statuses:write`).
-    pub fn failing_status(self) -> Self {
-        *self.fail_status.lock().unwrap() = true;
         self
     }
 
@@ -1598,11 +1554,6 @@ impl ForgePort for FakeForge {
         _commit: &Commit,
         status: Status,
     ) -> Result<(), ForgeError> {
-        if *self.fail_status.lock().unwrap() {
-            return Err(ForgeError::Api(
-                "resource not accessible by integration".into(),
-            ));
-        }
         self.statuses.lock().unwrap().push(status);
         Ok(())
     }

@@ -217,14 +217,6 @@ pub struct Config {
     /// GitHub App id (ADR-0046). `Some` = App mode (connection credentials
     /// are the App private-key PEM); `None` = token mode (dev).
     pub github_app_id: Option<String>,
-    /// GitHub App private-key PEM supplied inline (`SCARAB_GITHUB_APP_PEM`) — a
-    /// bootstrap-free / GitOps OVERRIDE of the DB-stored `_forge` credential, so
-    /// a fresh DB needs no `reseed.sh` PUT. App mode only; inline wins over file.
-    pub github_app_pem: Option<String>,
-    /// Path to a mounted file holding the App PEM (`SCARAB_GITHUB_APP_PEM_FILE`).
-    /// Read at boot (a bad path is a boot failure, ADR-0048), mirroring the OIDC
-    /// signing key. Overridden by `github_app_pem` if both are set.
-    pub github_app_pem_file: Option<String>,
     /// The canonical scarab-clone image (ADR-0045) — the image every `clone`
     /// step runs, digest-pinned in production.
     pub clone_image: String,
@@ -487,8 +479,6 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "http://localhost:8080".into()),
             github_app_id: env("SCARAB_GITHUB_APP_ID").filter(|v| !v.is_empty()),
-            github_app_pem: env("SCARAB_GITHUB_APP_PEM").filter(|v| !v.is_empty()),
-            github_app_pem_file: env("SCARAB_GITHUB_APP_PEM_FILE").filter(|v| !v.is_empty()),
             clone_image: env("SCARAB_CLONE_IMAGE")
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "ghcr.io/thulasi-ram/scarab-clone:edge".into()),
@@ -707,31 +697,6 @@ mod tests {
         let warnings = cfg.boot_warnings().join("\n");
         assert!(warnings.contains("AUTH DISABLED"), "{warnings}");
         assert!(warnings.contains("EPHEMERAL SECRET KEY"), "{warnings}");
-    }
-
-    #[test]
-    fn github_app_pem_env_and_file_populate_for_bootstrap_free_auth() {
-        // enh 245a99c: the App PEM can be supplied at boot (inline or via a
-        // mounted file), so a fresh DB / GitOps deploy needs no reseed PUT.
-        let cfg = Config::resolve_from(
-            &cli(Some("postgres://l/scarab")),
-            dev_env(&[
-                ("SCARAB_GITHUB_APP_ID", "12345"),
-                ("SCARAB_GITHUB_APP_PEM", "-----BEGIN RSA PRIVATE KEY-----\nk\n-----END RSA PRIVATE KEY-----"),
-                ("SCARAB_GITHUB_APP_PEM_FILE", "/etc/scarab/app.pem"),
-            ]),
-        )
-        .unwrap();
-        assert_eq!(cfg.github_app_id.as_deref(), Some("12345"));
-        assert!(cfg.github_app_pem.as_deref().unwrap().contains("BEGIN RSA PRIVATE KEY"));
-        assert_eq!(cfg.github_app_pem_file.as_deref(), Some("/etc/scarab/app.pem"));
-    }
-
-    #[test]
-    fn github_app_pem_is_absent_by_default() {
-        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(&[])).unwrap();
-        assert!(cfg.github_app_pem.is_none());
-        assert!(cfg.github_app_pem_file.is_none());
     }
 
     #[test]

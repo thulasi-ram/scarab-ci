@@ -23,7 +23,7 @@ pub mod scheduler;
 pub use ports::{Clock, Db, Executor, LogChunks};
 pub use scheduler::{
     cancel_run_request, record_gate_approval, release_gate, restart_step, RestartError, Scheduler,
-    SchedulerError, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
+    SchedulerError, CANCEL_RUN, LAUNCH_STEP, RUN_STATUS_CHANGED,
 };
 
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,7 @@ pub struct AttemptId(pub String);
 /// A logical timestamp in unix milliseconds. Kept as a plain integer so the
 /// domain crate need not depend on `chrono`/`time` (infra-adjacent) — the
 /// [`Clock`] port is the only source of "now".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Timestamp(pub i64);
 
 // ---------------------------------------------------------------------------
@@ -80,10 +80,6 @@ pub struct RunSummary {
     pub run: RunId,
     pub status: RunStatus,
     pub created_at: Timestamp,
-    /// Last status-transition time (epoch millis). For a terminal run this is
-    /// its finish; `updated_at - created_at` is the run's duration.
-    #[serde(default)]
-    pub updated_at: Timestamp,
     /// The owning tenant `(org, project)` (ADR-0049), if the run was stamped
     /// at creation — the tenancy filter for the list view.
     #[serde(default)]

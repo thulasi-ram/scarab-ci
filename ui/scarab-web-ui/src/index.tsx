@@ -4,9 +4,10 @@ import App from "./App";
 
 // Self-hosted typefaces (docs/DESIGN.md §3): Space Grotesk for display, Inter for
 // body/UI, JetBrains Mono for machine tokens/labels. Then the design stylesheet.
-// Display voice (DESIGN.md §5): Space Grotesk — headings + wordmark.
 import "@fontsource/space-grotesk/500.css";
 import "@fontsource/space-grotesk/700.css";
+// Display voice (DESIGN.md §5): Major Mono Display — headings + wordmark.
+import "@fontsource/major-mono-display";
 import "@fontsource/inter/400.css";
 import "@fontsource/inter/500.css";
 import "@fontsource/inter/600.css";
