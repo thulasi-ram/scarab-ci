@@ -26,3 +26,6 @@
 
 # Git worktrees for parallel agents (local, not shared)
 .workspaces/
+
+# Local dogfood config (secrets) — never commit
+/deploy/local/.env

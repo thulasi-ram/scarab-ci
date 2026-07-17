@@ -1,0 +1,59 @@
+# Dev-only in-cluster Postgres for the local Helm dogfood (NOT for production —
+# use a managed Postgres there). One replica, a PVC via k3s local-path so the
+# durable state (incl. the stored GitHub App PEM) survives pod restarts. Wipe a
+# clean slate by deleting the PVC (see deploy/local/README.md).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scarab-postgres
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scarab-postgres
+  labels: { app: scarab-postgres }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }        # single RWO volume — never two pods at once
+  selector:
+    matchLabels: { app: scarab-postgres }
+  template:
+    metadata:
+      labels: { app: scarab-postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine   # official image is multi-arch (runs on arm64)
+          env:
+            - { name: POSTGRES_USER, value: scarab }
+            - { name: POSTGRES_PASSWORD, value: scarab }
+            - { name: POSTGRES_DB, value: scarab }
+            # Subdir so the volume's lost+found doesn't collide with initdb.
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "scarab", "-d", "scarab"] }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: scarab-postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scarab-postgres
+  labels: { app: scarab-postgres }
+spec:
+  selector: { app: scarab-postgres }
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432 }

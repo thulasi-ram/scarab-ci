@@ -1,15 +1,17 @@
-# Build (and publish) Scarab's first-party container images:
-#   - scarab-server  (the converged API/worker binary, ./Dockerfile)
-#   - scarab-clone   (the canonical clone step image, ADR-0045,
-#                     ./deploy/clone/Dockerfile)
-#   - scarab-results-sidecar (the trusted results-egress sidecar, ADR-0042,
-#                     ./deploy/sidecar/Dockerfile)
+# Build (and publish) Scarab's first-party container images, multi-arch:
+#   - scarab-server           (the converged API/worker binary, ./Dockerfile)
+#   - scarab-clone            (the canonical clone step image, ADR-0045)
+#   - scarab-results-sidecar  (the trusted results-egress sidecar, ADR-0042)
 #
-# - PRs: build only, to catch a broken Dockerfile before merge (no push).
-# - push to main: build + push, tagged `edge` and by commit SHA.
+# Multi-arch via NATIVE runners (fast — no QEMU): each image is built once per
+# platform on a runner of that architecture, pushed BY DIGEST, then a `merge`
+# job stitches the per-arch digests into one multi-arch manifest list per tag.
+# This lets an arm64 host (e.g. Apple-silicon colima) pull the same tag CI
+# publishes for amd64.
+#
+# - PRs: build only, both arches, no push (catch a broken Dockerfile).
+# - push to main: build + push, tagged `edge` and by commit SHA (`sha-<sha>`).
 # - v* tags: build + push a release, tagged with the semver + `latest`.
-# Digest pinning: every push step exports the image digest into the job
-# summary so a deploy can pin `image@sha256:…` (ADR-0018/0045).
 name: image
 
 on:
@@ -23,6 +25,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      - 'ui/**'
+      - 'openapi.json'
       - 'deploy/clone/**'
       - 'deploy/sidecar/**'
       - '.github/workflows/image.yml'
@@ -37,15 +41,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Per-image, per-arch build on a native runner. On push/tags each build is
+  # pushed by digest (no tag yet); PRs just validate the Dockerfile.
   build:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
+        image: [scarab-server, scarab-clone, scarab-results-sidecar]
+        platform: [linux/amd64, linux/arm64]
         include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
           - image: scarab-server
             context: .
             dockerfile: Dockerfile
@@ -58,19 +70,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Docker metadata (tags + labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
-          tags: |
-            type=ref,event=pr
-            type=sha,format=long
-            type=edge,branch=main
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-
       - uses: docker/setup-buildx-action@v3
 
       # Only authenticate when we intend to push (never on PRs from forks).
@@ -82,20 +81,85 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      # PR => build-only (validate). push/tag => push by digest (tags come later).
+      - name: Build ${{ matrix.image }} (${{ matrix.platform }})
         id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0}/{1}/{2},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, github.repository_owner, matrix.image) || 'type=cacheonly' }}
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.platform }}
 
-      # The digest is the deployable identity (pin `image@sha256:…`).
-      - name: Record image digest
+      - name: Export digest
         if: github.event_name != 'pull_request'
         run: |
-          echo "**${{ matrix.image }}**: \`${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          # One artifact per (image, job) — job-index is unique across the matrix.
+          name: digests-${{ matrix.image }}-${{ strategy.job-index }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Stitch each image's per-arch digests into one multi-arch manifest list and
+  # apply the human tags (edge / sha-<sha> / semver / latest).
+  merge:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [scarab-server, scarab-clone, scarab-results-sidecar]
+    steps:
+      - name: Download this image's digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=sha,format=long
+            type=edge,branch=main
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create + push the manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}@sha256:%s ' *)
+
+      - name: Record image reference
+        run: |
+          echo "**${{ matrix.image }}**: \`${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}\` (multi-arch)" >> "$GITHUB_STEP_SUMMARY"
