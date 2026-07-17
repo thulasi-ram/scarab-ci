@@ -265,6 +265,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(secret) = config.gate_token_secret.clone() {
         state = state.with_gate_token_secret(secret);
     }
+    // Real authn (ADR-0049): OAuth/OIDC login + PG-backed sessions. Absent
+    // OAuth config the process only booted under SCARAB_DEV_INSECURE (ADR-0048
+    // default-deny) — sessions stay unwired and authz is off, loudly.
+    if let Some(oauth_cfg) = config.oauth.clone() {
+        let login = Arc::new(scarab_server::oauth::OAuthAuthenticator::new(oauth_cfg));
+        state = state
+            .with_auth(login.clone(), pg.clone())
+            .with_oauth_login(login, config.public_url.clone());
+        tracing::info!("authn: OAuth/OIDC login + PG sessions wired (ADR-0049)");
+    }
     // OIDC issuer for keyless federation (ADR-0014): serve JWKS + discovery so a
     // cloud provider can verify Scarab-minted tokens. The signing key is loaded
     // from the configured PEM — persistent across restarts/replicas — and any

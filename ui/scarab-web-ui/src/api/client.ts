@@ -12,6 +12,26 @@ export type DispatchKind = components["schemas"]["DispatchKind"];
 
 export const api = createClient<paths>({ baseUrl: "/" });
 
+// CSRF double-submit (ADR-0049): the session rides as an HttpOnly cookie; the
+// server pairs it with a script-READABLE `scarab_csrf` cookie whose value we
+// echo in `x-csrf-token` on every mutation. A cross-site page can trigger the
+// cookie, but it can never read this token.
+api.use({
+  onRequest({ request }) {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      const csrf = document.cookie
+        .split(";")
+        .map((c) => c.trim())
+        .find((c) => c.startsWith("scarab_csrf="))
+        ?.slice("scarab_csrf=".length);
+      if (csrf) {
+        request.headers.set("x-csrf-token", csrf);
+      }
+    }
+    return request;
+  },
+});
+
 /** List recent runs, newest first (dogfoods `GET /v1/runs`). */
 export async function listRuns(limit = 50): Promise<RunSummary[]> {
   const { data, error } = await api.GET("/v1/runs", {

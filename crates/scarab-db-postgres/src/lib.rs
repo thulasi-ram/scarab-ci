@@ -1560,3 +1560,58 @@ fn db_err(e: sqlx::Error) -> DbError {
         other => DbError::Other(other.to_string()),
     }
 }
+
+// ---------------------------------------------------------------------------
+// SessionStore (ADR-0049 C1): server-side login sessions in Postgres.
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl scarab_identity::SessionStore for PostgresDb {
+    async fn put(&self, session: &scarab_identity::Session) -> Result<(), scarab_identity::IdentityError> {
+        let principal = serde_json::to_value(&session.principal)
+            .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO sessions (id, principal, csrf, expires_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (id) DO UPDATE SET
+                 principal = EXCLUDED.principal,
+                 csrf = EXCLUDED.csrf,
+                 expires_at = EXCLUDED.expires_at",
+        )
+        .bind(&session.id)
+        .bind(&principal)
+        .bind(&session.csrf)
+        .bind(session.expires_at)
+        .execute(self.pool())
+        .await
+        .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<scarab_identity::Session>, scarab_identity::IdentityError> {
+        let row = sqlx::query("SELECT principal, csrf, expires_at FROM sessions WHERE id = $1")
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
+        let Some(row) = row else { return Ok(None) };
+        let principal: scarab_identity::Principal =
+            serde_json::from_value(row.get::<serde_json::Value, _>("principal"))
+                .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
+        Ok(Some(scarab_identity::Session {
+            id: id.to_string(),
+            principal,
+            csrf: row.get::<String, _>("csrf"),
+            expires_at: row.get::<i64, _>("expires_at"),
+        }))
+    }
+
+    async fn delete(&self, id: &str) -> Result<(), scarab_identity::IdentityError> {
+        sqlx::query("DELETE FROM sessions WHERE id = $1")
+            .bind(id)
+            .execute(self.pool())
+            .await
+            .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
+        Ok(())
+    }
+}

@@ -115,6 +115,11 @@ pub struct Session {
     pub principal: Principal,
     /// Unix-ms expiry.
     pub expires_at: i64,
+    /// The session's CSRF token (ADR-0049): random, minted with the session,
+    /// double-submitted by browsers (readable cookie → `x-csrf-token` header)
+    /// on every mutation. Bearer (API/CLI) requests never need it.
+    #[serde(default)]
+    pub csrf: String,
 }
 
 impl Session {
@@ -130,6 +135,8 @@ impl Session {
 pub trait SessionStore: Send + Sync {
     async fn put(&self, session: &Session) -> Result<(), IdentityError>;
     async fn get(&self, id: &str) -> Result<Option<Session>, IdentityError>;
+    /// Revoke a session (logout). Deleting an unknown id is a no-op.
+    async fn delete(&self, id: &str) -> Result<(), IdentityError>;
 }
 
 /// Claims to embed in a minted per-run OIDC JWT for keyless cloud federation
@@ -269,6 +276,7 @@ mod tests {
                 roles: vec![Role::Owner],
             },
             expires_at: 1_000,
+            csrf: String::new(),
         };
         assert!(s.is_valid(999));
         assert!(!s.is_valid(1_000));

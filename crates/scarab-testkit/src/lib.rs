@@ -1452,6 +1452,11 @@ impl SessionStore for InMemorySessions {
     async fn get(&self, id: &str) -> Result<Option<Session>, IdentityError> {
         Ok(self.sessions.lock().unwrap().get(id).cloned())
     }
+
+    async fn delete(&self, id: &str) -> Result<(), IdentityError> {
+        self.sessions.lock().unwrap().remove(id);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

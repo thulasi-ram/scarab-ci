@@ -36,6 +36,9 @@
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
 //! | `SCARAB_CLONE_IMAGE` | env | the canonical scarab-clone image a `clone` step runs (ADR-0045); default `ghcr.io/thulasi-ram/scarab-clone:edge` — digest-pin in production |
 //! | `SCARAB_GITHUB_APP_ID` | env | GitHub App id (ADR-0046): when set, GitHub connections authenticate in **App mode** (their credential secret is the App PEM); absent = token mode (dev) |
+//! | `SCARAB_OAUTH_CLIENT_ID` … `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | env | OAuth/OIDC login provider (ADR-0049): all five together enable real authn (GitHub, Forgejo, or any OIDC issuer); a partial set refuses boot |
+//! | `SCARAB_OAUTH_SCOPES` | env | space-separated scopes for the authorize redirect (optional; e.g. `read:user` for GitHub, `openid profile` for OIDC) |
+//! | `SCARAB_OAUTH_OWNERS` | env | comma-separated subjects granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer` |
 //!
 //! Step-runtime env (`SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`/
 //! `SCARAB_RESULTS*`/`SCARAB_PARAM_*`) is injected *into* step containers by
@@ -210,6 +213,29 @@ pub struct Config {
     /// The canonical scarab-clone image (ADR-0045) — the image every `clone`
     /// step runs, digest-pinned in production.
     pub clone_image: String,
+    /// OAuth/OIDC login (ADR-0049 C1). `Some` = real authn wired; `None` is
+    /// only bootable under `SCARAB_DEV_INSECURE=1`.
+    pub oauth: Option<OAuthConfig>,
+}
+
+/// The forge-agnostic OAuth/OIDC login provider (ADR-0049): explicit
+/// endpoints work identically for GitHub, Forgejo, and any OIDC issuer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    /// The provider's authorization endpoint the browser is redirected to.
+    pub authorize_url: String,
+    /// The token endpoint the code is exchanged at.
+    pub token_url: String,
+    /// The userinfo endpoint the access token is presented to; its `sub` (or
+    /// `login`/`id`) becomes the Principal subject.
+    pub userinfo_url: String,
+    /// Space-separated scopes for the authorize redirect (may be empty).
+    pub scopes: String,
+    /// Subjects granted `Owner` at login (bootstrap until scoped RBAC, C2);
+    /// everyone else authenticates as `Viewer`.
+    pub owners: Vec<String>,
 }
 
 /// A configuration the process must refuse to start under, with a message
@@ -258,10 +284,18 @@ pub enum ConfigError {
 
     #[error(
         "no authenticator configured (ADR-0048 auth default-deny). A server that can \
-         authenticate no one must not pretend to be up. Wire auth (ADR-0049, not yet \
-         available) or set SCARAB_DEV_INSECURE=1 (dev only — every caller is Owner)."
+         authenticate no one must not pretend to be up. Configure OAuth/OIDC login \
+         (SCARAB_OAUTH_CLIENT_ID/CLIENT_SECRET/AUTHORIZE_URL/TOKEN_URL/USERINFO_URL, \
+         ADR-0049) or set SCARAB_DEV_INSECURE=1 (dev only — every caller is Owner)."
     )]
     NoAuthenticator,
+
+    #[error(
+        "OAuth login is partially configured (ADR-0049) — missing: {0}. All five \
+         SCARAB_OAUTH_* endpoints/credentials must be set together (a partial \
+         provider would fail at first login, not at boot)."
+    )]
+    PartialOAuth(String),
 
     #[error(
         "SCARAB_STEP_TIMEOUT_SECS is set but invalid — want a positive integer number \
@@ -335,11 +369,51 @@ impl Config {
             None => None,
         };
 
-        // Auth default-deny (ADR-0048): no authenticator exists yet (it lands
-        // with ADR-0049), so a boot that is not explicitly dev-insecure would
-        // be a server that can authenticate no one — refuse. When ADR-0049
-        // wires an authenticator, this check keys off its configuration.
-        if !dev_insecure {
+        // OAuth/OIDC login (ADR-0049 C1). All five knobs or none: a partial
+        // provider is a misconfiguration, never silently ignored.
+        let oauth_keys = [
+            "SCARAB_OAUTH_CLIENT_ID",
+            "SCARAB_OAUTH_CLIENT_SECRET",
+            "SCARAB_OAUTH_AUTHORIZE_URL",
+            "SCARAB_OAUTH_TOKEN_URL",
+            "SCARAB_OAUTH_USERINFO_URL",
+        ];
+        let oauth_vals: Vec<Option<String>> = oauth_keys
+            .iter()
+            .map(|k| env(k).filter(|v| !v.is_empty()))
+            .collect();
+        let oauth = if oauth_vals.iter().all(Option::is_some) {
+            Some(OAuthConfig {
+                client_id: oauth_vals[0].clone().unwrap(),
+                client_secret: oauth_vals[1].clone().unwrap(),
+                authorize_url: oauth_vals[2].clone().unwrap(),
+                token_url: oauth_vals[3].clone().unwrap(),
+                userinfo_url: oauth_vals[4].clone().unwrap(),
+                scopes: env("SCARAB_OAUTH_SCOPES").unwrap_or_default(),
+                owners: env("SCARAB_OAUTH_OWNERS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect(),
+            })
+        } else if oauth_vals.iter().any(Option::is_some) {
+            let missing: Vec<&str> = oauth_keys
+                .iter()
+                .zip(&oauth_vals)
+                .filter(|(_, v)| v.is_none())
+                .map(|(k, _)| *k)
+                .collect();
+            return Err(ConfigError::PartialOAuth(missing.join(", ")));
+        } else {
+            None
+        };
+
+        // Auth default-deny (ADR-0048): a boot that can authenticate no one
+        // must not pretend to be up — OAuth login (ADR-0049) or the loud
+        // dev escape hatch.
+        if oauth.is_none() && !dev_insecure {
             return Err(ConfigError::NoAuthenticator);
         }
 
@@ -381,6 +455,7 @@ impl Config {
             clone_image: env("SCARAB_CLONE_IMAGE")
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "ghcr.io/thulasi-ram/scarab-clone:edge".into()),
+            oauth,
         })
     }
 
@@ -450,10 +525,15 @@ impl Config {
             ),
             format!(
                 "auth: {}",
-                if self.dev_insecure {
-                    "DISABLED — SCARAB_DEV_INSECURE (all callers are Owner)"
-                } else {
-                    "enabled"
+                match (&self.oauth, self.dev_insecure) {
+                    (Some(o), _) => format!(
+                        "OAuth/OIDC login enabled (authorize={}, {} owner(s), ADR-0049)",
+                        o.authorize_url,
+                        o.owners.len(),
+                    ),
+                    (None, true) =>
+                        "DISABLED — SCARAB_DEV_INSECURE (all callers are Owner)".to_string(),
+                    (None, false) => "enabled".to_string(),
                 },
             ),
             format!("results egress: {} (ADR-0042)", on_off(self.results_egress.is_some())),

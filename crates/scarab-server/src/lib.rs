@@ -37,6 +37,7 @@ use scarab_identity::{Action, Principal, Session};
 pub mod config;
 pub mod converged;
 pub mod clone_executor;
+pub mod oauth;
 pub mod forge_router;
 pub mod log_tail;
 pub mod logs;
@@ -102,6 +103,12 @@ pub struct AppState {
     /// `None` disables the results-ingest endpoint (rejects with 404). Shared with
     /// the k8s executor, which mints the per-step token the egress sidecar presents.
     pub results_token_secret: Option<Vec<u8>>,
+    /// The browser OAuth login flow (ADR-0049): redirect + callback. `None`
+    /// leaves only the credential-exchange `POST /v1/auth/login` (API/CLI).
+    pub oauth_login: Option<Arc<oauth::OAuthAuthenticator>>,
+    /// Scarab's public base URL — the OAuth callback `redirect_uri` is
+    /// `{public_url}/v1/auth/callback`.
+    pub public_url: String,
 }
 
 impl AppState {
@@ -121,6 +128,8 @@ impl AppState {
             gate_token_secret: None,
             secrets: None,
             results_token_secret: None,
+            oauth_login: None,
+            public_url: "http://localhost:8080".into(),
         }
     }
 
@@ -192,6 +201,19 @@ impl AppState {
     ) -> Self {
         self.auth = Some(auth);
         self.sessions = Some(sessions);
+        self
+    }
+
+    /// Enable the browser OAuth login flow (ADR-0049): `GET /v1/auth/login`
+    /// redirects to the provider; the callback lands on
+    /// `{public_url}/v1/auth/callback`.
+    pub fn with_oauth_login(
+        mut self,
+        login: Arc<oauth::OAuthAuthenticator>,
+        public_url: impl Into<String>,
+    ) -> Self {
+        self.oauth_login = Some(login);
+        self.public_url = public_url.into();
         self
     }
 }
@@ -2070,6 +2092,9 @@ pub struct LoginRequest {
 pub struct LoginResponse {
     pub session: String,
     pub subject: String,
+    /// The session's CSRF token — browsers echo it in `x-csrf-token` on every
+    /// mutation (also delivered as the readable `scarab_csrf` cookie).
+    pub csrf: String,
 }
 
 /// Exchange an OAuth/OIDC credential for a Scarab session (ADR-0010, 0032):
@@ -2087,27 +2112,133 @@ async fn login(
         .await
         .map_err(|_| ApiError::Unauthorized)?;
     let now = st.clock.now().await.0;
-    let session = Session {
-        id: Uuid::new_v4().to_string(),
-        principal: principal.clone(),
-        expires_at: now + SESSION_TTL_MS,
-    };
+    let session = mint_session(principal.clone(), now);
     sessions.put(&session).await.map_err(|_| ApiError::Unauthorized)?;
 
-    let cookie = format!(
-        "scarab_session={}; HttpOnly; Path=/; SameSite=Lax",
-        session.id
-    );
     let mut resp = (
         StatusCode::OK,
         Json(LoginResponse {
             session: session.id.clone(),
             subject: principal.subject,
+            csrf: session.csrf.clone(),
         }),
     )
         .into_response();
+    set_session_cookies(resp.headers_mut(), &session);
+    Ok(resp)
+}
+
+/// Mint a fresh [`Session`] (opaque id + CSRF token, 24h TTL).
+fn mint_session(principal: Principal, now_ms: i64) -> Session {
+    Session {
+        id: Uuid::new_v4().to_string(),
+        principal,
+        expires_at: now_ms + SESSION_TTL_MS,
+        csrf: Uuid::new_v4().to_string(),
+    }
+}
+
+/// Append the login cookies (ADR-0049): the session cookie is `HttpOnly` +
+/// `Secure` + `SameSite=Lax` (script-unreadable); the CSRF cookie is
+/// deliberately script-READABLE — the UI double-submits it as `x-csrf-token`,
+/// which a cross-site attacker cannot do.
+fn set_session_cookies(headers: &mut HeaderMap, session: &Session) {
+    for cookie in [
+        format!(
+            "scarab_session={}; HttpOnly; Secure; Path=/; SameSite=Lax",
+            session.id
+        ),
+        format!(
+            "scarab_csrf={}; Secure; Path=/; SameSite=Lax",
+            session.csrf
+        ),
+    ] {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
+            headers.append(axum::http::header::SET_COOKIE, v);
+        }
+    }
+}
+
+/// `GET /v1/auth/login` (ADR-0049): begin the browser OAuth flow — set an
+/// unguessable `state` (HttpOnly cookie, 10 min) and redirect to the
+/// provider's authorize endpoint.
+async fn oauth_login_redirect(State(st): State<AppState>) -> Result<Response, ApiError> {
+    let Some(flow) = st.oauth_login.as_ref() else {
+        return Err(ApiError::NotFound);
+    };
+    let state = Uuid::new_v4().to_string();
+    let redirect_uri = format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'));
+    let location = flow.authorize_redirect(&redirect_uri, &state);
+    let mut resp = (StatusCode::FOUND, ()).into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
+        resp.headers_mut().insert(axum::http::header::LOCATION, v);
+    }
+    let cookie = format!(
+        "scarab_oauth_state={state}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=600"
+    );
     if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
-        resp.headers_mut().insert(axum::http::header::SET_COOKIE, v);
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    Ok(resp)
+}
+
+/// `GET /v1/auth/callback?code&state` (ADR-0049): finish the browser OAuth
+/// flow — verify the `state` echo against the cookie, exchange the code for a
+/// [`Principal`], mint the PG session + CSRF token, and land on `/`.
+async fn oauth_callback(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let (Some(auth), Some(sessions)) = (st.auth.as_ref(), st.sessions.as_ref()) else {
+        return Err(ApiError::NotFound);
+    };
+    let (Some(code), Some(state)) = (q.get("code"), q.get("state")) else {
+        return Err(ApiError::BadRequest("missing code/state".into()));
+    };
+    // The state cookie proves THIS browser started the flow (login-CSRF guard).
+    if cookie_value(&headers, "scarab_oauth_state").as_deref() != Some(state.as_str()) {
+        return Err(ApiError::Unauthorized);
+    }
+    let principal = auth
+        .authenticate(code)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
+    let now = st.clock.now().await.0;
+    let session = mint_session(principal, now);
+    sessions.put(&session).await.map_err(|_| ApiError::Unauthorized)?;
+
+    let mut resp = (StatusCode::FOUND, ()).into_response();
+    resp.headers_mut()
+        .insert(axum::http::header::LOCATION, axum::http::HeaderValue::from_static("/"));
+    set_session_cookies(resp.headers_mut(), &session);
+    // The one-shot state cookie is spent.
+    if let Ok(v) = axum::http::HeaderValue::from_str(
+        "scarab_oauth_state=; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=0",
+    ) {
+        resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+    }
+    Ok(resp)
+}
+
+/// `POST /v1/auth/logout` (ADR-0049): revoke the presented session server-side
+/// and expire the browser cookies. Exempt from the CSRF guard by design — the
+/// worst a forged logout achieves is logging the victim out.
+async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    let Some(sessions) = st.sessions.as_ref() else {
+        return Err(ApiError::NotFound);
+    };
+    if let Some((sid, _)) = session_id(&headers) {
+        sessions.delete(&sid).await.map_err(|_| ApiError::Unauthorized)?;
+    }
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    for cookie in [
+        "scarab_session=; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=0",
+        "scarab_csrf=; Secure; Path=/; SameSite=Lax; Max-Age=0",
+    ] {
+        if let Ok(v) = axum::http::HeaderValue::from_str(cookie) {
+            resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
+        }
     }
     Ok(resp)
 }
@@ -2128,7 +2259,7 @@ async fn authorize(
             roles: vec![scarab_identity::Role::Owner],
         });
     };
-    let sid = session_id(headers).ok_or(ApiError::Unauthorized)?;
+    let (sid, via) = session_id(headers).ok_or(ApiError::Unauthorized)?;
     let session = sessions
         .get(&sid)
         .await
@@ -2137,26 +2268,50 @@ async fn authorize(
     if !session.is_valid(st.clock.now().await.0) {
         return Err(ApiError::Unauthorized);
     }
+    // CSRF (ADR-0049): a cookie-authenticated MUTATION must double-submit the
+    // session's token in `x-csrf-token` — a cross-site form can make the
+    // browser send the cookie, but it can never read the token. Bearer
+    // requests (API/CLI) carry the credential explicitly; no CSRF surface.
+    if action != Action::Read && via == AuthVia::Cookie {
+        let presented = headers.get("x-csrf-token").and_then(|v| v.to_str().ok());
+        if session.csrf.is_empty() || presented != Some(session.csrf.as_str()) {
+            return Err(ApiError::Forbidden);
+        }
+    }
     if !session.principal.can(action) {
         return Err(ApiError::Forbidden);
     }
     Ok(session.principal)
 }
 
+/// How a request presented its session — Bearer carries the credential
+/// explicitly (API/CLI); Cookie rides ambiently on browser requests and
+/// therefore needs CSRF proof on mutations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthVia {
+    Bearer,
+    Cookie,
+}
+
 /// Extract a session id from `Authorization: Bearer <id>` or a
 /// `scarab_session=<id>` cookie.
-fn session_id(headers: &HeaderMap) -> Option<String> {
+fn session_id(headers: &HeaderMap) -> Option<(String, AuthVia)> {
     if let Some(tok) = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
     {
-        return Some(tok.to_string());
+        return Some((tok.to_string(), AuthVia::Bearer));
     }
+    cookie_value(headers, "scarab_session").map(|v| (v, AuthVia::Cookie))
+}
+
+/// The value of cookie `name`, if present.
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let cookie = headers.get("cookie").and_then(|v| v.to_str().ok())?;
     cookie
         .split(';')
-        .filter_map(|p| p.trim().strip_prefix("scarab_session="))
+        .filter_map(|p| p.trim().strip_prefix(&format!("{name}=")))
         .map(str::to_string)
         .next()
 }
@@ -2870,7 +3025,9 @@ pub fn router(state: AppState) -> Router {
         .route("/openapi.json", get(openapi))
         .route("/.well-known/jwks.json", get(jwks))
         .route("/.well-known/openid-configuration", get(openid_configuration))
-        .route("/v1/auth/login", post(login))
+        .route("/v1/auth/login", post(login).get(oauth_login_redirect))
+        .route("/v1/auth/callback", get(oauth_callback))
+        .route("/v1/auth/logout", post(logout))
         .route("/v1/runs", post(create_run).get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))
