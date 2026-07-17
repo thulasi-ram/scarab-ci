@@ -20,8 +20,10 @@ steps:
     security:
       run_as_root: true
     command:
+      # `-c`, not `-lc`: a login shell sources /etc/profile and resets PATH,
+      # dropping the rust image's /usr/local/cargo/bin (rustc/cargo vanish).
       - bash
-      - -lc
+      - -c
       - |
         set -euxo pipefail
         rustc --version
