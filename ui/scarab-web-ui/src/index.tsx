@@ -6,6 +6,11 @@ import App from "./App";
 // body/UI, JetBrains Mono for machine tokens/labels. Then the design stylesheet.
 import "@fontsource/space-grotesk/500.css";
 import "@fontsource/space-grotesk/700.css";
+// Display-voice trials (DESIGN.md §5): Doto (dot matrix) is live; Major Mono
+// Display and 10 Pixel (styles.css @font-face) stand by — unused families
+// don't download. Swap the first family of --font-display to switch.
+import "@fontsource-variable/doto";
+import "@fontsource/major-mono-display";
 import "@fontsource/inter/400.css";
 import "@fontsource/inter/500.css";
 import "@fontsource/inter/600.css";

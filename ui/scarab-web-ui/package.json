@@ -12,8 +12,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource-variable/doto": "^5.2.10",
     "@fontsource/inter": "^5.2.8",
     "@fontsource/jetbrains-mono": "^5.2.8",
+    "@fontsource/major-mono-display": "^5.2.8",
     "@fontsource/space-grotesk": "^5.2.10",
     "@solidjs/router": "^0.16.1",
     "lucide": "^1.24.0",

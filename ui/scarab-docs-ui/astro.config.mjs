@@ -45,6 +45,10 @@ export default defineConfig({
         '@fontsource-variable/geist/index.css',
         '@fontsource/jetbrains-mono/400.css',
         '@fontsource/jetbrains-mono/500.css',
+        // Display-voice trials (scarab.css --scarab-display): Doto live,
+        // Major Mono Display standing by. Unused families don't download.
+        '@fontsource-variable/doto/index.css',
+        '@fontsource/major-mono-display/index.css',
         './src/styles/scarab.css',
       ],
       social: [
