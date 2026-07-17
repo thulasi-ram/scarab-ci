@@ -34,7 +34,9 @@ steps:
         rustc --version
         cargo check -p scarab-identity
         mkdir -p /scarab/artifacts
-        rustc --version                 > /scarab/artifacts/toolchain.txt
+        rustc --version                  > /scarab/artifacts/toolchain.txt
+        # uid 0 vs the clone's 65532-owned tree trips git's ownership guard.
+        git config --global --add safe.directory /workspace
         git -C /workspace rev-parse HEAD > /scarab/artifacts/checked-sha.txt
     artifacts:
       - "*.txt"
