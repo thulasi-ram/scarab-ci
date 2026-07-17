@@ -238,6 +238,54 @@ impl K8sExecutor {
         }
     }
 
+    /// Upsert the per-Pod Secret carrying the per-attempt OIDC token
+    /// (ADR-0015): mounted read-only on tmpfs, pointed at by
+    /// `SCARAB_OIDC_TOKEN_FILE`. Owner-referenced to the Pod; re-drives
+    /// refresh the short-lived token.
+    async fn ensure_oidc_secret(
+        &self,
+        pod_name: &str,
+        pod: &Pod,
+        spec: &StepSpec,
+    ) -> Result<(), ExecError> {
+        let Some(token) = &spec.oidc_token else {
+            return Ok(());
+        };
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(client, &self.namespace);
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some(oidc_secret_name(pod_name)),
+                namespace: Some(self.namespace.clone()),
+                owner_references: pod.metadata.uid.clone().map(|uid| {
+                    vec![k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                        api_version: "v1".into(),
+                        kind: "Pod".into(),
+                        name: pod_name.to_string(),
+                        uid,
+                        ..Default::default()
+                    }]
+                }),
+                ..Default::default()
+            },
+            string_data: Some(std::collections::BTreeMap::from([(
+                OIDC_TOKEN_KEY.to_string(),
+                token.clone(),
+            )])),
+            ..Default::default()
+        };
+        match secrets.create(&PostParams::default(), &secret).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 409 => secrets
+                .replace(&oidc_secret_name(pod_name), &PostParams::default(), &secret)
+                .await
+                .map(|_| ())
+                .map_err(|e| ExecError::Launch(format!("oidc secret: {e}"))),
+            Err(e) => Err(ExecError::Launch(format!("oidc secret: {e}"))),
+        }
+    }
+
     /// Drive the workspace lifecycle for `pod` (ADR-0029/0045). Two idempotent
     /// legs, all state derived from the Pod itself:
     ///
@@ -458,6 +506,7 @@ impl Executor for K8sExecutor {
             // Refresh the short-TTL clone credential on re-drives (ADR-0045).
             self.ensure_clone_secret(&name, &pod, spec).await?;
             self.ensure_registry_secret(&name, &pod, spec).await?;
+            self.ensure_oidc_secret(&name, &pod, spec).await?;
             return Ok(ExecHandle(name));
         }
 
@@ -475,6 +524,7 @@ impl Executor for K8sExecutor {
             Ok(created) => {
                 self.ensure_clone_secret(&name, &created, spec).await?;
                 self.ensure_registry_secret(&name, &created, spec).await?;
+                self.ensure_oidc_secret(&name, &created, spec).await?;
                 Ok(ExecHandle(name))
             }
             // A concurrent launcher won the race — the Pod now exists, which is
@@ -845,6 +895,31 @@ pub fn build_pod(
         (image, command, Vec::new())
     };
 
+    // Per-attempt OIDC token (ADR-0015): tmpfs Secret mount + a pointer env
+    // var. The token itself NEVER rides in env or argv.
+    let mut oidc_volume: Option<Volume> = None;
+    if spec.oidc_token.is_some() {
+        env.push(EnvVar {
+            name: "SCARAB_OIDC_TOKEN_FILE".to_string(),
+            value: Some(format!("{OIDC_TOKEN_MOUNT_PATH}/{OIDC_TOKEN_KEY}")),
+            value_from: None,
+        });
+        step_mounts.push(VolumeMount {
+            name: OIDC_TOKEN_VOLUME.to_string(),
+            mount_path: OIDC_TOKEN_MOUNT_PATH.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+        oidc_volume = Some(Volume {
+            name: OIDC_TOKEN_VOLUME.to_string(),
+            secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+                secret_name: Some(oidc_secret_name(name)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
+
     let container = Container {
         name: STEP_CONTAINER.to_string(),
         image: Some(image),
@@ -895,6 +970,9 @@ pub fn build_pod(
         volumes.push(v);
     }
     if let Some(v) = registry_volume {
+        volumes.push(v);
+    }
+    if let Some(v) = oidc_volume {
         volumes.push(v);
     }
     let mut annotations = std::collections::BTreeMap::new();
@@ -1087,6 +1165,18 @@ const REGISTRY_AUTH_KEY: &str = "config.json";
 /// The per-Pod Secret carrying the registry dockerconfigjson.
 fn registry_secret_name(pod_name: &str) -> String {
     format!("{pod_name}-registry")
+}
+
+/// Where the per-attempt OIDC federation token is mounted (ADR-0015):
+/// a per-Pod Secret volume (tmpfs on the node), pointed at by
+/// `SCARAB_OIDC_TOKEN_FILE` — never env, never argv.
+const OIDC_TOKEN_MOUNT_PATH: &str = "/scarab/oidc";
+const OIDC_TOKEN_VOLUME: &str = "scarab-oidc-token";
+const OIDC_TOKEN_KEY: &str = "token";
+
+/// The per-Pod Secret carrying the OIDC token.
+fn oidc_secret_name(pod_name: &str) -> String {
+    format!("{pod_name}-oidc")
 }
 
 /// The `buildctl` args a build step compiles to (ADR-0018). With the egress
@@ -1458,6 +1548,7 @@ mod tests {
         workspace_inputs: vec![],
         clone: None,
             build: None,
+            oidc_token: None,
         }
     }
 
@@ -1494,6 +1585,7 @@ mod tests {
         workspace_inputs: vec![],
         clone: None,
             build: None,
+            oidc_token: None,
         };
         let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
         let sc = pod.spec.unwrap().containers[0].security_context.clone().unwrap();
@@ -1779,6 +1871,40 @@ mod tests {
         // The digest lands as the `image` result (ADR-0041/0042) — the
         // ImageArtifact of record.
         assert!(args.contains("--metadata-file /scarab/results/image.json"), "{args}");
+    }
+
+    #[test]
+    fn oidc_token_is_tmpfs_mounted_never_env() {
+        let step = step_with_attempt("run-1", "deploy", "a1");
+        let mut spec = busybox();
+        spec.oidc_token = Some("eyJhbGciOi.sekret-oidc-jwt.sig".into());
+        let pod = build_pod("scarab-x", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        let env = c.env.as_ref().unwrap();
+        assert_eq!(
+            env.iter().find(|e| e.name == "SCARAB_OIDC_TOKEN_FILE").and_then(|e| e.value.clone()),
+            Some("/scarab/oidc/token".to_string())
+        );
+        // THE INVARIANT (ADR-0015): the token itself never rides in env.
+        assert!(env.iter().all(|e| e.value.as_deref() != spec.oidc_token.as_deref()));
+        let m = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "scarab-oidc-token")
+            .unwrap();
+        assert_eq!(m.mount_path, "/scarab/oidc");
+        assert_eq!(m.read_only, Some(true));
+        let vols = pod.spec.as_ref().unwrap().volumes.as_ref().unwrap();
+        let v = vols.iter().find(|v| v.name == "scarab-oidc-token").unwrap();
+        assert_eq!(v.secret.as_ref().unwrap().secret_name.as_deref(), Some("scarab-x-oidc"));
+
+        // OIDC disabled (no token) => none of the machinery appears.
+        let pod = build_pod("scarab-x", "ns", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        assert!(c.env.as_ref().unwrap().iter().all(|e| e.name != "SCARAB_OIDC_TOKEN_FILE"));
+        assert!(pod.spec.as_ref().unwrap().volumes.is_none());
     }
 
     #[test]

@@ -30,6 +30,7 @@
 //! | `SCARAB_GATE_TOKEN_SECRET` | env | enables external-gate release tokens (ADR-0034) |
 //! | `SCARAB_OIDC_ISSUER` | env | enables the OIDC issuer (keyless federation, ADR-0015) |
 //! | `SCARAB_OIDC_SIGNING_KEY_FILE` | env | PKCS#8 RSA PEM the issuer signs with — **required** when the issuer is enabled (persistent across restarts/replicas) |
+//! | `SCARAB_OIDC_AUDIENCE` | env | `aud` of minted per-run tokens (ADR-0015); default `scarab` |
 //! | `SCARAB_MASTER_KEY` | env | base64 32-byte KEK for envelope encryption (ADR-0014) — **required** unless `SCARAB_DEV_INSECURE=1` |
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
@@ -174,6 +175,9 @@ pub struct OidcConfig {
     pub issuer_url: String,
     /// Path to the PKCS#8 RSA private-key PEM the issuer signs with.
     pub signing_key_file: String,
+    /// The `aud` claim of minted per-run tokens (ADR-0015) — what the cloud's
+    /// trust policy is configured to expect. Default `scarab`.
+    pub audience: String,
 }
 
 /// A validated boot configuration: if a `Config` exists, the process may
@@ -365,6 +369,9 @@ impl Config {
                 signing_key_file: env("SCARAB_OIDC_SIGNING_KEY_FILE")
                     .filter(|v| !v.is_empty())
                     .ok_or(ConfigError::MissingOidcSigningKey)?,
+                audience: env("SCARAB_OIDC_AUDIENCE")
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "scarab".into()),
             }),
             None => None,
         };

@@ -80,6 +80,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        oidc_token: None,
     };
 
     // launch, then launch again — the second call must re-attach, not relaunch.
@@ -141,6 +142,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        oidc_token: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -193,6 +195,7 @@ async fn log_stream_tails_pod_stdout() {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        oidc_token: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -280,6 +283,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         workspace_inputs: inputs,
         clone: None,
         build: None,
+        oidc_token: None,
     };
     async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
         for _ in 0..90 {
@@ -397,6 +401,7 @@ async fn clone_step_produces_a_source_workspace() {
             ..Default::default()
         }),
         build: None,
+        oidc_token: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch clone");
@@ -472,6 +477,7 @@ async fn clone_step_produces_a_source_workspace() {
         workspace_inputs: vec![root.clone()],
         clone: None,
         build: None,
+        oidc_token: None,
     };
     let bh = exec.launch(&build, &build_spec).await.expect("launch downstream");
     let mut terminal = None;
@@ -549,6 +555,7 @@ async fn clone_depth_full_exposes_history() {
             ..Default::default()
         }),
         build: None,
+        oidc_token: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch full clone");
     let mut terminal = None;
@@ -595,6 +602,7 @@ async fn clone_depth_full_exposes_history() {
         workspace_inputs: vec![root],
         clone: None,
         build: None,
+        oidc_token: None,
     };
     let ch = exec.launch(&count, &count_spec).await.expect("launch history check");
     let mut terminal = None;
@@ -671,6 +679,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
             ..Default::default()
         }),
         build: None,
+        oidc_token: None,
     };
 
     let started = std::time::Instant::now();
@@ -772,6 +781,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
             insecure_push: true, // the local test registry is plain HTTP
             ..Default::default()
         }),
+        oidc_token: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch build");
     let mut terminal = None;
@@ -820,6 +830,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        oidc_token: None,
     };
     let vh = exec.launch(&verify, &verify_spec).await.expect("launch verify");
     let mut terminal = None;

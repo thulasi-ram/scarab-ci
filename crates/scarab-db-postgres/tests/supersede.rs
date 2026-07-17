@@ -23,6 +23,7 @@ fn spec() -> StepSpec {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        oidc_token: None,
     }
 }
 

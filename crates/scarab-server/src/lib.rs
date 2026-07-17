@@ -628,6 +628,7 @@ async fn create_run(
             workspace_inputs: vec![],
         clone: None,
             build: None,
+            oidc_token: None,
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -1775,6 +1776,7 @@ async fn persist_run_from_ir(
                     credential: None,
                 }),
                 build: None,
+                oidc_token: None,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -1822,6 +1824,7 @@ async fn persist_run_from_ir(
                 workspace_inputs: vec![],
                 clone: None,
                 build,
+                oidc_token: None,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;

@@ -48,6 +48,7 @@ fn clone_spec(read_only: bool) -> StepSpec {
             ..Default::default()
         }),
         build: None,
+        oidc_token: None,
     }
 }
 
@@ -156,6 +157,7 @@ fn build_spec(image: &str) -> StepSpec {
             push: true,
             ..Default::default()
         }),
+        oidc_token: None,
     }
 }
 

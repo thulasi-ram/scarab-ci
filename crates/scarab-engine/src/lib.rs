@@ -238,6 +238,12 @@ pub struct StepSpec {
     /// BuildKit with this context instead of an authored image/command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildConfig>,
+    /// The per-attempt OIDC token for keyless cloud federation (ADR-0015),
+    /// minted at LAUNCH — **never serialized** (in-memory enrichment only;
+    /// delivery to the Pod is a tmpfs file, never env/argv). `None` when the
+    /// issuer is not configured.
+    #[serde(skip)]
+    pub oidc_token: Option<String>,
 }
 
 /// The launch context of a `kind: build` step (ADR-0018): what to build

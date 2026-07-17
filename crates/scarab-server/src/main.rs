@@ -116,6 +116,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(s)
     };
 
+    // The OIDC issuer (ADR-0015), built BEFORE the driver so the launch path
+    // can mint per-attempt federation tokens; also serves JWKS + discovery.
+    // The signing key is the configured PEM — persistent across restarts and
+    // replicas — and any failure here is a boot failure (ADR-0048).
+    let oidc_issuer: Option<Arc<scarab_server::oidc::Rs256Issuer>> = match &config.oidc {
+        Some(oidc) => {
+            let pem = std::fs::read_to_string(&oidc.signing_key_file).map_err(|e| {
+                format!(
+                    "cannot read SCARAB_OIDC_SIGNING_KEY_FILE {}: {e}",
+                    oidc.signing_key_file
+                )
+            })?;
+            let issuer =
+                scarab_server::oidc::Rs256Issuer::from_pem(oidc.issuer_url.clone(), &pem)
+                    .map_err(|e| {
+                        format!("invalid OIDC signing key {}: {e}", oidc.signing_key_file)
+                    })?;
+            Some(Arc::new(issuer))
+        }
+        None => None,
+    };
+
     // The production forge (ADR-0046): a registry-routed ForgePort — each call
     // resolves its repo through the ForgeConnection registry, constructs the
     // vendor adapter (GitHub App/token, Forgejo token) with credentials
@@ -195,12 +217,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(executor) = executor {
             // Inject env-scoped secrets into deploy-run pods at launch
             // (ADR-0037).
-            let executor: Arc<dyn Executor> = Arc::new(SecretInjectingExecutor::new(
+            let mut secret_exec = SecretInjectingExecutor::new(
                 executor,
                 db.clone(),
                 secrets.clone(),
                 logs.clone(),
-            ));
+            );
+            // Per-attempt OIDC federation tokens (ADR-0015), tmpfs-delivered.
+            if let (Some(issuer), Some(oidc_cfg)) = (oidc_issuer.clone(), &config.oidc) {
+                secret_exec = secret_exec.with_oidc(
+                    issuer,
+                    oidc_cfg.issuer_url.clone(),
+                    oidc_cfg.audience.clone(),
+                );
+                tracing::info!("per-run OIDC token injection enabled (ADR-0015)");
+            }
+            let executor: Arc<dyn Executor> = Arc::new(secret_exec);
             // Enrich clone-step launches (ADR-0045): resolve the clone URL
             // from the registry and mint the short-TTL, read-only-for-forks
             // checkout credential — in memory only, delivered via tmpfs.
@@ -285,16 +317,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cloud provider can verify Scarab-minted tokens. The signing key is loaded
     // from the configured PEM — persistent across restarts/replicas — and any
     // failure here is a boot failure, not a degraded warn (ADR-0048).
-    if let Some(oidc) = &config.oidc {
-        let pem = std::fs::read_to_string(&oidc.signing_key_file).map_err(|e| {
-            format!(
-                "cannot read SCARAB_OIDC_SIGNING_KEY_FILE {}: {e}",
-                oidc.signing_key_file
-            )
-        })?;
-        let issuer = scarab_server::oidc::Rs256Issuer::from_pem(oidc.issuer_url.clone(), &pem)
-            .map_err(|e| format!("invalid OIDC signing key {}: {e}", oidc.signing_key_file))?;
-        state = state.with_oidc(Arc::new(issuer));
+    if let Some(issuer) = oidc_issuer.clone() {
+        state = state.with_oidc(issuer);
         tracing::info!("OIDC issuer enabled (persistent signing key)");
     }
     let app = router(state);
