@@ -9,6 +9,8 @@ export type CreateRunRequest = components["schemas"]["CreateRunRequest"];
 export type RunSummary = components["schemas"]["RunSummaryDto"];
 export type CatalogEntry = components["schemas"]["CatalogEntry"];
 export type DispatchKind = components["schemas"]["DispatchKind"];
+export type Project = components["schemas"]["ProjectDto"];
+export type Artifact = components["schemas"]["ArtifactDto"];
 
 export const api = createClient<paths>({ baseUrl: "/" });
 
@@ -41,6 +43,80 @@ export async function listRuns(limit = 50): Promise<RunSummary[]> {
     throw new Error("failed to list runs");
   }
   return data.runs;
+}
+
+/** List the registered projects (`GET /v1/repos`, ADR-0046) — the dashboard's
+ * repo cards. Scoped server-side to what the caller may Read. */
+export async function listProjects(): Promise<Project[]> {
+  const { data, error } = await api.GET("/v1/repos");
+  if (error || !data) {
+    throw new Error("failed to list projects");
+  }
+  return data;
+}
+
+/** List a run's artifacts of record (`GET /v1/runs/{id}/artifacts`, ADR-0052). */
+export async function listArtifacts(id: string): Promise<Artifact[]> {
+  const { data, error } = await api.GET("/v1/runs/{id}/artifacts", {
+    params: { path: { id } },
+  });
+  if (error || !data) {
+    throw new Error(`failed to list artifacts for ${id}`);
+  }
+  return data;
+}
+
+/** Browser URL for one artifact's bytes (`GET /v1/runs/{id}/artifacts/{name}`,
+ * streamed through the server — usable directly as an `<a href>` download). */
+export function artifactUrl(id: string, name: string): string {
+  return `/v1/runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(name)}`;
+}
+
+// --- Environments (ADR-0024/0037). The generated schema types these responses
+// opaquely (no body declared), so they're plain-fetched — same pattern as the
+// secret parity matrix below — and hand-typed against the server's serialized
+// `scarab_project::Environment` / `Deployment` shapes. ---
+
+/** An environment's protection rules, as serialized by the server. */
+export type ProtectionRules = {
+  approvers: string[];
+  wait_timer: number;
+  allowed_refs: string[];
+  concurrency: number;
+};
+export type RepoEnvironment = { name: string; protection: ProtectionRules };
+
+/** List a repo's environments (`GET …/environments`). */
+export async function listEnvironments(org: string, repo: string): Promise<RepoEnvironment[]> {
+  const res = await fetch(
+    `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments`,
+  );
+  if (!res.ok) throw new Error("failed to list environments");
+  return (await res.json()) as RepoEnvironment[];
+}
+
+/** A recorded deployment into an environment (`at` is epoch millis). */
+export type Deployment = {
+  org: string;
+  project: string;
+  environment: string;
+  git_ref: string;
+  run: string;
+  approved_by: string[];
+  at: number;
+};
+
+/** An environment's deployment history, most recent first (`GET …/deployments`). */
+export async function listDeployments(
+  org: string,
+  repo: string,
+  name: string,
+): Promise<Deployment[]> {
+  const res = await fetch(
+    `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments/${encodeURIComponent(name)}/deployments`,
+  );
+  if (!res.ok) throw new Error("failed to list deployments");
+  return (await res.json()) as Deployment[];
 }
 
 /** Fetch a run's status + steps (dogfoods `GET /v1/runs/{id}`). */

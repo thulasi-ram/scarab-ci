@@ -189,6 +189,28 @@
         }
       }
     },
+    "/v1/repos": {
+      "get": {
+        "tags": [],
+        "summary": "List the registered projects (ADR-0046 registry — what the dashboard's\nrepo cards render). Scoped: global roles see all; otherwise only orgs/\nprojects the caller's bindings grant Read on.",
+        "operationId": "list_projects",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectDto"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/repos/{org}/{repo}/bindings/import": {
       "post": {
         "tags": [],
@@ -1236,6 +1258,31 @@
           }
         }
       },
+      "ProjectDto": {
+        "type": "object",
+        "description": "One registered project (governed repo, ADR-0046) in the repos list.",
+        "required": [
+          "org",
+          "project",
+          "owner",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string",
+            "description": "The forge coordinate backing it (1:1 in v1)."
+          },
+          "project": {
+            "type": "string"
+          }
+        }
+      },
       "PutSecretRequest": {
         "type": "object",
         "description": "`POST /v1/secrets` body: define (or overwrite) a secret at a scope. The\n`value` is **write-only** — no endpoint ever returns it.",
@@ -1316,7 +1363,7 @@
       },
       "RunSummaryDto": {
         "type": "object",
-        "description": "One run in the list view: identity, status, and creation time (epoch millis).",
+        "description": "One run in the list view: identity, status, creation time (epoch millis),\nand — when the run was stamped at creation (ADR-0049) — its owning tenant.",
         "required": [
           "id",
           "status",
@@ -1329,6 +1376,20 @@
           },
           "id": {
             "type": "string"
+          },
+          "org": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The owning org, if the run is tenanted (trigger-created)."
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The owning project (repo name), if tenanted."
           },
           "status": {
             "type": "string"

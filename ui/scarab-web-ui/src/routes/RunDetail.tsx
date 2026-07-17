@@ -1,10 +1,9 @@
 // Run detail — the operator view. A provenance header answers "what is this
-// run" (timing derived from the event log), the DAG shows the real step graph
-// (ADR-0006), selecting a node reveals that step's detail, and logs stream live
-// (ADR-0013). Repo/commit/trigger provenance and per-step log attribution land
-// with the forge + log-source backend slices; this view is built to show them
-// the moment they exist.
-import { createSignal, createEffect, onMount, onCleanup, For, Show } from "solid-js";
+// run" (timing derived from the event log, launch params from the run itself),
+// the DAG shows the real step graph (ADR-0006), selecting a node reveals that
+// step's detail, logs stream live (ADR-0013), and the run's artifacts of record
+// (ADR-0052) list with download links once they exist.
+import { createSignal, createEffect, createResource, onMount, onCleanup, For, Show } from "solid-js";
 import { A, useParams, useNavigate } from "@solidjs/router";
 import {
   getRun,
@@ -14,12 +13,13 @@ import {
   cancelRun,
   isTerminal,
   runParams,
+  listArtifacts,
+  artifactUrl,
   type RunStatus,
   type RunEvent,
 } from "../api/client";
 import { describeEvent } from "../events";
 import { relTime, absTime, duration } from "../fmt";
-import { enrichProvenance, TRIGGER_GLYPH } from "../data/catalog";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
@@ -27,15 +27,19 @@ import Dag, { type DagStep } from "../components/Dag";
 
 const POLL_MS = 1200;
 
+/** Human byte size for an artifact row. */
+function fmtSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export default function RunDetail() {
   const params = useParams();
   const nav = useNavigate();
   const id = () => params.id!;
   const org = () => params.org!;
   const repo = () => params.repo!;
-  // Representative commit/trigger provenance until the forge slice lands; the
-  // rest of this view (status, DAG, events, logs, restart) is fully live.
-  const prov = () => enrichProvenance(id(), repo());
 
   const [run, setRun] = createSignal<RunStatus | null>(null);
   const [events, setEvents] = createSignal<RunEvent[]>([]);
@@ -48,6 +52,13 @@ export default function RunDetail() {
   const [wrap, setWrap] = createSignal(true);
 
   const runningCount = () => steps().filter((s) => s.status === "running").length;
+
+  // Artifacts of record (ADR-0052): fetched once up front, re-fetched when the
+  // run settles terminal (steps publish as they finish; the final list is only
+  // complete then). Errors degrade to an empty list — the panel just hides.
+  const [artifacts, { refetch: refetchArtifacts }] = createResource(id, (rid) =>
+    listArtifacts(rid).catch(() => []),
+  );
 
   let logRef: HTMLPreElement | undefined;
   let poll: ReturnType<typeof setInterval> | undefined;
@@ -89,6 +100,7 @@ export default function RunDetail() {
         clearInterval(poll);
         poll = undefined;
       }
+      void refetchArtifacts();
     }
   }
 
@@ -148,7 +160,7 @@ export default function RunDetail() {
               <h1 class="crumb-head">
                 <A href={`/${org()}/${repo()}`} class="crumb-head-link">{repo()}</A>
                 <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
-                <span class="crumb-head-title" title={id()}>{prov().message}</span>
+                <span class="crumb-head-title mono" title={id()}>run {id().slice(0, 8)}</span>
               </h1>
               <StatusBadge status={r().status} />
               <Show when={live()}>
@@ -190,20 +202,19 @@ export default function RunDetail() {
 
             <div class="prov">
               <div class="cell">
-                <div class="k">commit</div>
-                <div class="v mono"><span class="sha">{prov().sha}</span> on {prov().branch}</div>
+                <div class="k">run</div>
+                <div class="v mono"><span class="sha">{id()}</span></div>
               </div>
-              <div class="cell">
-                <div class="k">trigger</div>
-                <div class="v">
-                  <span class="tglyph">{TRIGGER_GLYPH[prov().trigger]}</span>{" "}
-                  {prov().trigger === "pull_request" ? `PR #${prov().prNumber}` : prov().trigger} · {prov().author}
+              <Show when={Object.keys(runParams(r())).length > 0}>
+                <div class="cell">
+                  <div class="k">params</div>
+                  <div class="v mono">
+                    {Object.entries(runParams(r()))
+                      .map(([k, v]) => `${k}=${String(v)}`)
+                      .join(" · ")}
+                  </div>
                 </div>
-              </div>
-              <div class="cell">
-                <div class="k">pipeline</div>
-                <div class="v mono">.scarab/ci.yaml</div>
-              </div>
+              </Show>
               <Show when={startedAt()}>
                 {(t) => (
                   <div class="cell">
@@ -261,6 +272,30 @@ export default function RunDetail() {
                 </pre>
               </div>
             </div>
+
+            <Show when={(artifacts() ?? []).length > 0}>
+              <div class="panel artifacts-panel">
+                <div class="panel-h">
+                  <span>Artifacts</span>
+                  <span class="subtle">{artifacts()!.length}</span>
+                </div>
+                <ul class="secret-list" style={{ padding: "12px 16px" }}>
+                  <For each={artifacts()}>
+                    {(a) => (
+                      <li class="secret-row">
+                        <Icon icon="package" size={15} />
+                        <a class="mono" href={artifactUrl(id(), a.name)} download={a.name}>
+                          {a.name}
+                        </a>
+                        <span class="subtle mono">
+                          {fmtSize(a.size)} · {a.content_type}
+                        </span>
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </div>
+            </Show>
 
             <div class="panel activity-panel">
               <div class="panel-h"><span>Activity</span></div>

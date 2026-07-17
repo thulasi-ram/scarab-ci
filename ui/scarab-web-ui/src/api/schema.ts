@@ -160,6 +160,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/repos": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List the registered projects (ADR-0046 registry — what the dashboard's
+         *     repo cards render). Scoped: global roles see all; otherwise only orgs/
+         *     projects the caller's bindings grant Read on.
+         */
+        get: operations["list_projects"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/repos/{org}/{repo}/bindings/import": {
         parameters: {
             query?: never;
@@ -771,6 +792,14 @@ export interface components {
              */
             sha: string;
         };
+        /** @description One registered project (governed repo, ADR-0046) in the repos list. */
+        ProjectDto: {
+            name: string;
+            org: string;
+            /** @description The forge coordinate backing it (1:1 in v1). */
+            owner: string;
+            project: string;
+        };
         /**
          * @description `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
          *     `value` is **write-only** — no endpoint ever returns it.
@@ -803,11 +832,18 @@ export interface components {
             status: string;
             steps: components["schemas"]["StepStatusDto"][];
         };
-        /** @description One run in the list view: identity, status, and creation time (epoch millis). */
+        /**
+         * @description One run in the list view: identity, status, creation time (epoch millis),
+         *     and — when the run was stamped at creation (ADR-0049) — its owning tenant.
+         */
         RunSummaryDto: {
             /** Format: int64 */
             created_at: number;
             id: string;
+            /** @description The owning org, if the run is tenanted (trigger-created). */
+            org?: string | null;
+            /** @description The owning project (repo name), if tenanted. */
+            project?: string | null;
             status: string;
         };
         /**
@@ -1161,6 +1197,25 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_projects: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectDto"][];
+                };
             };
         };
     };

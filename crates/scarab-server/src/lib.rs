@@ -436,12 +436,19 @@ pub struct RunListResponse {
     pub runs: Vec<RunSummaryDto>,
 }
 
-/// One run in the list view: identity, status, and creation time (epoch millis).
+/// One run in the list view: identity, status, creation time (epoch millis),
+/// and — when the run was stamped at creation (ADR-0049) — its owning tenant.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunSummaryDto {
     pub id: String,
     pub status: String,
     pub created_at: i64,
+    /// The owning org, if the run is tenanted (trigger-created).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+    /// The owning project (repo name), if tenanted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 /// `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
@@ -948,6 +955,8 @@ async fn list_runs(
                 id: s.run.0,
                 status: run_status_name(s.status).to_string(),
                 created_at: s.created_at.0,
+                org: s.tenant.as_ref().map(|(o, _)| o.clone()),
+                project: s.tenant.as_ref().map(|(_, p)| p.clone()),
             })
             .collect(),
     }))
@@ -1172,6 +1181,80 @@ async fn cancel_run(
         }
         Err(e) => Err(ApiError::BadRequest(e.to_string())),
     }
+}
+
+/// One registered project (governed repo, ADR-0046) in the repos list.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProjectDto {
+    pub org: String,
+    pub project: String,
+    /// The forge coordinate backing it (1:1 in v1).
+    pub owner: String,
+    pub name: String,
+}
+
+/// List the registered projects (ADR-0046 registry — what the dashboard's
+/// repo cards render). Scoped: global roles see all; otherwise only orgs/
+/// projects the caller's bindings grant Read on.
+#[utoipa::path(
+    get,
+    path = "/v1/repos",
+    responses((status = 200, body = [ProjectDto]))
+)]
+async fn list_projects(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ProjectDto>>, ApiError> {
+    let principal = authenticate(&st, &headers, Action::Read).await?;
+    let Some(connections) = st.connections.as_ref() else {
+        return Ok(Json(Vec::new())); // no registry wired (dev): empty, honest
+    };
+    let conns = connections
+        .list_connections()
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let mut out = Vec::new();
+    for conn in conns {
+        let repos = connections
+            .repos_of(&conn.id)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        for repo in repos {
+            let Some(resolved) = connections
+                .resolve(&repo)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?
+            else {
+                continue;
+            };
+            // Tenancy (ADR-0049): scoped principals see only their projects.
+            if !principal.can(Action::Read) {
+                let scope = scarab_identity::Scope::Project {
+                    org: resolved.org.clone(),
+                    name: resolved.project.clone(),
+                };
+                let allowed = match st.rbac.as_ref() {
+                    Some(rbac) => rbac
+                        .role_of(&principal.subject, &scope)
+                        .await
+                        .map_err(|_| ApiError::Forbidden)?
+                        .is_some_and(|r| r.allows(Action::Read)),
+                    None => false,
+                };
+                if !allowed {
+                    continue;
+                }
+            }
+            out.push(ProjectDto {
+                org: resolved.org,
+                project: resolved.project,
+                owner: repo.owner,
+                name: repo.name,
+            });
+        }
+    }
+    out.sort_by(|a, b| (&a.org, &a.project).cmp(&(&b.org, &b.project)));
+    Ok(Json(out))
 }
 
 /// One artifact in a run's list (ADR-0052).
@@ -3598,6 +3681,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         list_pipelines,
         pipeline_interface,
         list_runs,
+        list_projects,
         get_run,
         get_events,
         get_logs,
@@ -3661,6 +3745,7 @@ fn router_inner(state: AppState) -> Router {
             get(list_bindings).put(put_binding).delete(delete_binding),
         )
         .route("/v1/repos/{org}/{repo}/bindings/import", post(import_bindings))
+        .route("/v1/repos", get(list_projects))
         .route("/v1/runs", post(create_run).get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))
