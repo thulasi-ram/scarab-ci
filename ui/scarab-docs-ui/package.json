@@ -20,6 +20,7 @@
     "@astrojs/starlight": "^0.41.3",
     "@fontsource-variable/doto": "^5.2.10",
     "@fontsource-variable/geist": "^5.2.9",
+    "@fontsource/iosevka": "^5.2.5",
     "@fontsource/jetbrains-mono": "^5.2.8",
     "@fontsource/major-mono-display": "^5.2.8",
     "astro": "^7.0.2",

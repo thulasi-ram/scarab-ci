@@ -38,7 +38,10 @@
 :root,
 :root[data-theme='light'] {
   --sl-font: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
-  --sl-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+  /* Iosevka: the narrow programmer mono — machine tokens, code blocks, the
+   * terminal voice throughout the docs. (ASCII scenes stay JetBrains Mono —
+   * their baked geometry assumes its 0.6em advance.) */
+  --sl-font-mono: 'Iosevka', ui-monospace, SFMono-Regular, monospace;
 
   /* Deep pine-emerald — AA on paper. Copper deep enough to read on white. */
   --scarab-emerald: oklch(52% 0.1 162);

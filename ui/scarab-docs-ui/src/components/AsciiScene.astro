@@ -105,7 +105,9 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
     padding: 0;
     background: none;
     border: none;
-    font-family: var(--sl-font-mono, ui-monospace, monospace);
+    /* Pinned (NOT --sl-font-mono): the baked cell geometry assumes JetBrains
+       Mono's exact 0.6em advance; a narrower mono would squash the scenes. */
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
     font-size: var(--ascii-fs, 8px);
     line-height: calc(var(--ascii-fs, 8px) * 1.667);
     user-select: none;

@@ -40,11 +40,15 @@ export default defineConfig({
         { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/scarab-ci/apple-touch-icon.png' } },
       ],
       customCss: [
-        // Geist is the face shadcn/ui (and thus the Lucode base) is drawn with —
-        // JetBrains Mono stays for machine tokens (ids, logs, durations).
+        // Geist is the face shadcn/ui (and thus the Lucode base) is drawn with.
+        // Iosevka is the docs mono (machine tokens, code blocks) — the narrow
+        // terminal voice. JetBrains Mono stays ONLY for the ASCII beetle
+        // scenes: their baked geometry assumes its 0.6em advance (Iosevka's
+        // 0.5em would squash the nimbus).
         '@fontsource-variable/geist/index.css',
+        '@fontsource/iosevka/400.css',
+        '@fontsource/iosevka/500.css',
         '@fontsource/jetbrains-mono/400.css',
-        '@fontsource/jetbrains-mono/500.css',
         // Display-voice trials (scarab.css --scarab-display): Doto live,
         // Major Mono Display standing by. Unused families don't download.
         '@fontsource-variable/doto/index.css',
