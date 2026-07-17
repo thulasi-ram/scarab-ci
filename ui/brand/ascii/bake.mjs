@@ -30,7 +30,9 @@ mkdirSync(outDir, { recursive: true });
 // read as a dot matrix, one language with the dotted doodles and the page
 // dot-grid. All four glyphs are single-cell in JetBrains Mono.
 const RAMP = " .·•●";
-const GAMMA = 0.8;
+// Low gamma pushes mid-tone fills up the (short) dot ramp — at small font
+// sizes '·' is sub-pixel, so bodies must land on '•'/'●' to stay visible.
+const GAMMA = 0.55;
 const FPS = 12;
 
 // cell -> brand-role layer: 0 emerald, 1 gold, 2 gray

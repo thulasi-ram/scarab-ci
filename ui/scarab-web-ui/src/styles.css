@@ -254,7 +254,7 @@ code,
    working". Travel is CSS; the frames only animate legs + ball spin. */
 .dash-footer {
   position: relative;
-  height: 214px;
+  height: 252px;
   overflow: hidden;
 }
 .dash-footer::after {
@@ -276,7 +276,7 @@ code,
   animation: scarab-roll 52s linear infinite;
 }
 @keyframes scarab-roll {
-  from { transform: translateX(-240px); }
+  from { transform: translateX(-320px); }
   to   { transform: translateX(calc(100vw + 48px)); }
 }
 @media (prefers-reduced-motion: reduce) {

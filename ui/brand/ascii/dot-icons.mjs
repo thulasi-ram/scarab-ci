@@ -28,13 +28,14 @@ const MOTIFS = {
   "shield-check": ShieldCheck, timer: Timer, network: Network,
 };
 
-// Icon space is 24×24 with stroke-width 2 → on a 24-cell grid every stroke
-// lights ~2 cells across ("multiple rows of dots"). Rendered oversampled.
-const GRID = 24;
-const SS = 10;                    // supersample: 10px per cell
+// Icon space is 24×24 with stroke-width 2 → on a 40-cell grid every stroke
+// lights ~3 cells across ("multiple rows of dots"), and the dots themselves
+// stay tiny — fine matrix grain, not beads.
+const GRID = 40;
+const SS = 6;                     // supersample: 6px per cell
 const STROKE_W = 2;               // lucide's native stroke width
 const THRESHOLD = 0.28;           // min cell coverage to earn a dot
-const DOT_R = 0.34;               // dot radius in grid units
+const DOT_R = 0.18;               // dot radius in grid units
 const INK = "#c0873f";            // copper — a literal hex (SVG attribute)
 
 function toPairs(points) {
@@ -79,7 +80,7 @@ for (const [name, iconNode] of Object.entries(MOTIFS)) {
   const px = GRID * SS;
   const canvas = createCanvas(px, px);
   const x = canvas.getContext("2d");
-  x.scale(SS, SS);
+  x.scale((SS * GRID) / 24, (SS * GRID) / 24);
   x.strokeStyle = "#ffffff";
   x.lineWidth = STROKE_W;
   x.lineCap = "round";

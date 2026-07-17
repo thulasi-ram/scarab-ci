@@ -197,7 +197,7 @@ export default function Repos() {
         carry the legs and the rolling ball. */}
     <footer class="dash-footer" classList={{ rolling: rolling() }} aria-hidden="true">
       <div class="roller">
-        <AsciiScene scene={dungroller} fontSize={4} playing={rolling()} />
+        <AsciiScene scene={dungroller} fontSize={5} playing={rolling()} />
       </div>
     </footer>
     </>
