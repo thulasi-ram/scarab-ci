@@ -627,6 +627,7 @@ const RESULTS_VOLUME: &str = "scarab-results";
 /// (ADR-0042) — a native sidecar (an `initContainer` with `restartPolicy: Always`)
 /// that drains `/scarab/results` to the fence-scoped results API after the step
 /// exits. The untrusted step container never holds the token; only the sidecar does.
+#[allow(clippy::too_many_arguments)] // the one Pod-assembly point; splitting hides the shape
 pub fn build_pod(
     name: &str,
     namespace: &str,

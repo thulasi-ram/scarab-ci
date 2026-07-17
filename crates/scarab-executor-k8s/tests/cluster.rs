@@ -34,6 +34,17 @@ fn opted_in() -> Option<String> {
     Some(std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()))
 }
 
+/// A per-invocation unique run id: live tests re-launch by fence, so a fixed
+/// id would re-attach to a leftover Pod from a previous invocation whose CAS
+/// (a tempdir) is gone.
+fn unique_run(prefix: &str) -> String {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    format!("{prefix}-{t}")
+}
+
 fn step() -> StepRun {
     StepRun {
         run: RunId("run-1".into()),
@@ -334,6 +345,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn clone_step_produces_a_source_workspace() {
     use scarab_storage::Cas;
+    let run_id = unique_run("run-clone");
     let Some(ns) = opted_in() else { return };
     let Ok(clone_image) = std::env::var("SCARAB_TEST_CLONE_IMAGE") else {
         eprintln!("skipping: set SCARAB_TEST_CLONE_IMAGE to a scarab-clone image in the cluster");
@@ -352,7 +364,7 @@ async fn clone_step_produces_a_source_workspace() {
         .with_clone_image(&clone_image);
 
     let step = StepRun {
-        run: RunId("run-clone".into()),
+        run: RunId(run_id.clone()),
         step: StepId("checkout".into()),
         status: StepStatus::Running,
         attempts: vec![Attempt {
@@ -399,7 +411,7 @@ async fn clone_step_produces_a_source_workspace() {
     let root = exec.output(&h).await.expect("output").expect("workspace snapshot");
     let out = tempfile::tempdir().expect("materialize dir");
     cas.materialize(
-        &scarab_storage::TreeHash(root),
+        &scarab_storage::TreeHash(root.clone()),
         out.path().to_str().unwrap(),
     )
     .await
@@ -413,6 +425,269 @@ async fn clone_step_produces_a_source_workspace() {
         "no credential-bearing URL: {config}"
     );
     assert!(config.contains("https://github.com/thulasi-ram/scarab-ci.git"), "{config}");
+
+    // A downstream `needs: [checkout]` step consumes the snapshot: the source
+    // AND its .git materialize into /workspace (clone → CAS → materialize),
+    // and HEAD is the pinned SHA — asserted from inside the cluster.
+    let build = StepRun {
+        run: RunId(run_id.clone()),
+        step: StepId("build".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![StepId("checkout".into())],
+        gate_kind: None,
+    };
+    let build_spec = StepSpec {
+        image: clone_image.clone(), // has git; entrypoint overridden by command
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            // -c safe.directory: the workspace is materialized by the init
+            // container's uid, the step runs as the image's — same situation
+            // every CI runner handles for authored git use.
+            format!(
+                "ls /workspace | head -5; \
+                 head=$(git -C /workspace -c safe.directory=/workspace rev-parse HEAD); \
+                 echo \"head=$head\"; \
+                 test -f /workspace/Cargo.toml && \
+                 test \"$head\" = \"{sha}\" && \
+                 echo DOWNSTREAM-SEES-PINNED-SOURCE"
+            ),
+        ],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(300),
+        workspace_inputs: vec![root.clone()],
+        clone: None,
+    };
+    let bh = exec.launch(&build, &build_spec).await.expect("launch downstream");
+    let mut terminal = None;
+    for _ in 0..120 {
+        match exec.poll(&bh).await.expect("poll") {
+            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
+                terminal = Some(s);
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    assert_eq!(
+        terminal,
+        Some(ExecState::Succeeded),
+        "downstream step sees the pinned source"
+    );
+
+    exec.cancel(&bh).await.expect("cleanup downstream");
+    exec.cancel(&h).await.expect("cleanup");
+}
+
+/// LIVE `depth: full` variant (ADR-0045): the full-history clone exposes more
+/// than one commit — asserted by a downstream step running `git rev-list
+/// --count HEAD` on the materialized workspace.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn clone_depth_full_exposes_history() {
+    use scarab_storage::Cas;
+    let run_id = unique_run("run-clone-full");
+    let Some(ns) = opted_in() else { return };
+    let Ok(clone_image) = std::env::var("SCARAB_TEST_CLONE_IMAGE") else {
+        eprintln!("skipping: set SCARAB_TEST_CLONE_IMAGE to a scarab-clone image in the cluster");
+        return;
+    };
+    let sha = std::env::var("SCARAB_TEST_CLONE_SHA").expect("SCARAB_TEST_CLONE_SHA");
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    let tmp = tempfile::tempdir().expect("cas dir");
+    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
+        scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local cas"),
+    );
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(cas.clone())
+        .with_clone_image(&clone_image);
+
+    let step = StepRun {
+        run: RunId(run_id.clone()),
+        step: StepId("checkout".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let spec = StepSpec {
+        image: String::new(),
+        command: vec![],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(300),
+        workspace_inputs: vec![],
+        clone: Some(scarab_engine::CloneConfig {
+            owner: "thulasi-ram".into(),
+            name: "scarab-ci".into(),
+            sha: sha.clone(),
+            depth_full: true,
+            url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
+            ..Default::default()
+        }),
+    };
+    let h = exec.launch(&step, &spec).await.expect("launch full clone");
+    let mut terminal = None;
+    for _ in 0..180 {
+        match exec.poll(&h).await.expect("poll") {
+            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
+                terminal = Some(s);
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    assert_eq!(terminal, Some(ExecState::Succeeded), "full clone succeeds");
+    let root = exec.output(&h).await.expect("output").expect("workspace snapshot");
+
+    let count = StepRun {
+        run: RunId(run_id.clone()),
+        step: StepId("history".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![StepId("checkout".into())],
+        gate_kind: None,
+    };
+    let count_spec = StepSpec {
+        image: clone_image.clone(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            // >1 commit = real history, not a shallow graft.
+            "n=$(git -C /workspace -c safe.directory=/workspace rev-list --count HEAD) && \
+             echo \"commits=$n\" && [ \"$n\" -gt 1 ]"
+                .into(),
+        ],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(300),
+        workspace_inputs: vec![root],
+        clone: None,
+    };
+    let ch = exec.launch(&count, &count_spec).await.expect("launch history check");
+    let mut terminal = None;
+    for _ in 0..120 {
+        match exec.poll(&ch).await.expect("poll") {
+            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
+                terminal = Some(s);
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    assert_eq!(
+        terminal,
+        Some(ExecState::Succeeded),
+        "depth: full exposes >1 commit of history"
+    );
+
+    exec.cancel(&ch).await.expect("cleanup history");
+    exec.cancel(&h).await.expect("cleanup clone");
+}
+
+/// LIVE vanished-SHA case (ADR-0045 fencing): a pinned commit that no longer
+/// exists upstream is TERMINAL — SourceUnavailable (exit 86), surfaced fast,
+/// never a retry loop.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
+    use scarab_storage::Cas;
+    let Some(ns) = opted_in() else { return };
+    let Ok(clone_image) = std::env::var("SCARAB_TEST_CLONE_IMAGE") else {
+        eprintln!("skipping: set SCARAB_TEST_CLONE_IMAGE to a scarab-clone image in the cluster");
+        return;
+    };
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    let tmp = tempfile::tempdir().expect("cas dir");
+    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
+        scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local cas"),
+    );
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(cas)
+        .with_clone_image(&clone_image);
+
+    let step = StepRun {
+        run: RunId(unique_run("run-clone-gone")),
+        step: StepId("checkout".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let spec = StepSpec {
+        image: String::new(),
+        command: vec![],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(300),
+        workspace_inputs: vec![],
+        clone: Some(scarab_engine::CloneConfig {
+            owner: "thulasi-ram".into(),
+            name: "scarab-ci".into(),
+            // A well-formed SHA that exists on no forge: the rewritten-history
+            // case. The fetch fails, the guard exits 86 — SourceUnavailable.
+            sha: "0000000000000000000000000000000000000001".into(),
+            url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
+            ..Default::default()
+        }),
+    };
+
+    let started = std::time::Instant::now();
+    let h = exec.launch(&step, &spec).await.expect("launch doomed clone");
+    let mut terminal = None;
+    for _ in 0..120 {
+        match exec.poll(&h).await.expect("poll") {
+            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
+                terminal = Some(s);
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    match terminal {
+        Some(ExecState::Failed { exit_code, .. }) => {
+            assert_eq!(exit_code, Some(86), "SourceUnavailable is exit 86");
+        }
+        other => panic!("expected a terminal Failed(86), got {other:?}"),
+    }
+    // Fast = one attempt, no retry loop: well under the 2-minute poll window.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(115),
+        "vanished SHA must fail fast, took {:?}",
+        started.elapsed()
+    );
 
     exec.cancel(&h).await.expect("cleanup");
 }
