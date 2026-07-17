@@ -155,6 +155,25 @@ impl K8sExecutor {
     /// GIT_ASKPASS — the token is never in env, URL, or argv. Owner-referenced
     /// to the Pod so it is garbage-collected with it. Re-drives refresh the
     /// short-TTL token.
+    /// Upsert every per-Pod Secret a step may need before it can run: the clone
+    /// token (ADR-0045), the per-attempt OIDC token (ADR-0015), and a build
+    /// step's registry dockerconfig (ADR-0018). Each helper is a no-op when the
+    /// step doesn't use that credential. Idempotent (create-or-replace), so it
+    /// is safe on the fresh-create path, on re-drive re-attach, and after a
+    /// create-409 race — every path that ends with an existing Pod must call
+    /// this, or the Pod can mount a Secret that never gets created (FailedMount).
+    async fn ensure_step_secrets(
+        &self,
+        pod_name: &str,
+        pod: &Pod,
+        spec: &StepSpec,
+    ) -> Result<(), ExecError> {
+        self.ensure_clone_secret(pod_name, pod, spec).await?;
+        self.ensure_registry_secret(pod_name, pod, spec).await?;
+        self.ensure_oidc_secret(pod_name, pod, spec).await?;
+        Ok(())
+    }
+
     async fn ensure_clone_secret(
         &self,
         pod_name: &str,
@@ -649,9 +668,7 @@ impl Executor for K8sExecutor {
             .map_err(|e| ExecError::Launch(e.to_string()))?;
         if let Some(pod) = existing {
             // Refresh the short-TTL clone credential on re-drives (ADR-0045).
-            self.ensure_clone_secret(&name, &pod, spec).await?;
-            self.ensure_registry_secret(&name, &pod, spec).await?;
-            self.ensure_oidc_secret(&name, &pod, spec).await?;
+            self.ensure_step_secrets(&name, &pod, spec).await?;
             return Ok(ExecHandle(name));
         }
 
@@ -667,14 +684,25 @@ impl Executor for K8sExecutor {
         );
         match pods.create(&PostParams::default(), &pod).await {
             Ok(created) => {
-                self.ensure_clone_secret(&name, &created, spec).await?;
-                self.ensure_registry_secret(&name, &created, spec).await?;
-                self.ensure_oidc_secret(&name, &created, spec).await?;
+                self.ensure_step_secrets(&name, &created, spec).await?;
                 Ok(ExecHandle(name))
             }
-            // A concurrent launcher won the race — the Pod now exists, which is
-            // exactly what we wanted; treat as a successful re-attach.
-            Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(ExecHandle(name)),
+            // A concurrent launcher (or a re-drive) won the create race — the
+            // Pod now exists. Adopt it, but still upsert its Secrets: the create
+            // winner may have created the Pod and not (yet) provisioned them,
+            // and a Pod that mounts a Secret which never appears stays in
+            // FailedMount forever. Fetch the live Pod so the Secrets are
+            // owner-referenced to it, mirroring the re-attach path above.
+            Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                if let Some(pod) = pods
+                    .get_opt(&name)
+                    .await
+                    .map_err(|e| ExecError::Launch(e.to_string()))?
+                {
+                    self.ensure_step_secrets(&name, &pod, spec).await?;
+                }
+                Ok(ExecHandle(name))
+            }
             Err(e) => Err(ExecError::Launch(e.to_string())),
         }
     }
