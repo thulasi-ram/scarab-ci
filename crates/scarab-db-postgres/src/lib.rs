@@ -1154,6 +1154,83 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn put_artifacts(
+        &self,
+        run: &RunId,
+        artifacts: &[scarab_engine::ArtifactMeta],
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        for a in artifacts {
+            sqlx::query(
+                "INSERT INTO artifacts (run_id, name, size, content_type, object_key, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (run_id, name) DO UPDATE SET
+                     size = EXCLUDED.size,
+                     content_type = EXCLUDED.content_type,
+                     object_key = EXCLUDED.object_key",
+            )
+            .bind(&run.0)
+            .bind(&a.name)
+            .bind(a.size as i64)
+            .bind(&a.content_type)
+            .bind(&a.object_key)
+            .bind(at.0)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    async fn artifacts_of_run(&self, run: &RunId) -> Result<Vec<scarab_engine::ArtifactMeta>, DbError> {
+        let rows = sqlx::query(
+            "SELECT name, size, content_type, object_key FROM artifacts
+             WHERE run_id = $1 ORDER BY name",
+        )
+        .bind(&run.0)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| scarab_engine::ArtifactMeta {
+                name: r.get::<String, _>("name"),
+                size: r.get::<i64, _>("size") as u64,
+                content_type: r.get::<String, _>("content_type"),
+                object_key: r.get::<String, _>("object_key"),
+            })
+            .collect())
+    }
+
+    async fn prunable_artifact_runs(
+        &self,
+        cutoff: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT r.id FROM runs r
+             JOIN artifacts a ON a.run_id = r.id
+             WHERE r.status IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
+               AND r.updated_at < $1
+             LIMIT $2",
+        )
+        .bind(cutoff.0)
+        .bind(limit as i64)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
+    }
+
+    async fn delete_artifacts_of_run(&self, run: &RunId) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM artifacts WHERE run_id = $1")
+            .bind(&run.0)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn prunable_log_runs(
         &self,
         cutoff: Timestamp,

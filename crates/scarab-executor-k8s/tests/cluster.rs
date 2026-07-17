@@ -80,6 +80,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
 
@@ -142,6 +143,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
 
@@ -195,6 +197,7 @@ async fn log_stream_tails_pod_stdout() {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
 
@@ -283,6 +286,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         workspace_inputs: inputs,
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
     async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
@@ -401,6 +405,7 @@ async fn clone_step_produces_a_source_workspace() {
             ..Default::default()
         }),
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
 
@@ -477,6 +482,7 @@ async fn clone_step_produces_a_source_workspace() {
         workspace_inputs: vec![root.clone()],
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
     let bh = exec.launch(&build, &build_spec).await.expect("launch downstream");
@@ -555,6 +561,7 @@ async fn clone_depth_full_exposes_history() {
             ..Default::default()
         }),
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch full clone");
@@ -602,6 +609,7 @@ async fn clone_depth_full_exposes_history() {
         workspace_inputs: vec![root],
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
     let ch = exec.launch(&count, &count_spec).await.expect("launch history check");
@@ -679,6 +687,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
             ..Default::default()
         }),
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
 
@@ -781,6 +790,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
             insecure_push: true, // the local test registry is plain HTTP
             ..Default::default()
         }),
+        artifacts: vec![],
         oidc_token: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch build");
@@ -830,6 +840,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
     let vh = exec.launch(&verify, &verify_spec).await.expect("launch verify");
@@ -940,6 +951,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -1010,6 +1022,7 @@ async fn cancel_tears_down_a_running_pod() {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -1037,4 +1050,82 @@ async fn cancel_tears_down_a_running_pod() {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     assert!(gone, "the Pod was torn down, not left running");
+}
+
+/// LIVE artifacts (ADR-0052): a step writes files to /scarab/artifacts; the
+/// harvest uploads the glob-selected ones as object blobs and records the
+/// metadata on the Pod, surfaced via `Executor::artifacts`.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn artifacts_are_harvested_post_step() {
+    use scarab_storage::ObjectStore;
+    let Some(ns) = opted_in() else { return };
+    let run_id = unique_run("run-artifacts");
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    let tmp = tempfile::tempdir().expect("store dir");
+    let storage = std::sync::Arc::new(
+        scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local store"),
+    );
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(storage.clone())
+        .with_artifact_store(storage.clone());
+
+    let step = StepRun {
+        run: RunId(run_id.clone()),
+        step: StepId("emit".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let spec = StepSpec {
+        image: "busybox:latest".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "mkdir -p /scarab/artifacts/dist && \
+             echo report > /scarab/artifacts/dist/report.txt && \
+             echo scratch > /scarab/artifacts/notes.tmp"
+                .into(),
+        ],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: true, // busybox
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(120),
+        workspace_inputs: vec![],
+        clone: None,
+        build: None,
+        artifacts: vec!["dist/*".into()], // the .tmp is NOT published
+        oidc_token: None,
+    };
+    let h = exec.launch(&step, &spec).await.expect("launch");
+    let mut terminal = None;
+    for _ in 0..120 {
+        match exec.poll(&h).await.expect("poll") {
+            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
+                terminal = Some(s);
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    assert_eq!(terminal, Some(ExecState::Succeeded), "step succeeds");
+
+    // The glob-selected artifact was harvested; the .tmp was not.
+    let artifacts = exec.artifacts(&h).await.expect("artifacts");
+    assert_eq!(artifacts.len(), 1, "{artifacts:?}");
+    assert_eq!(artifacts[0].name, "dist/report.txt");
+    assert_eq!(artifacts[0].content_type, "text/plain");
+    // The blob is real and downloadable from the store.
+    let bytes = storage.get(&artifacts[0].object_key).await.expect("blob");
+    assert_eq!(bytes, b"report\n");
+
+    exec.cancel(&h).await.expect("cleanup");
 }

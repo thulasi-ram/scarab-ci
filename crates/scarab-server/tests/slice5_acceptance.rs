@@ -119,6 +119,7 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         workspace_inputs: vec![],
         clone: None,
         build: Some(build.clone()),
+        artifacts: vec![],
         oidc_token: None,
     };
     let pod = build_pod(

@@ -437,6 +437,29 @@ pub trait Db: Send + Sync {
     /// metadata (state row, event log) is retained for audit (ADR-0050).
     async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError>;
 
+    /// Persist a step's published artifacts (ADR-0052): name-addressed per
+    /// run — a re-drive overwrites deterministically (same fence, same bytes).
+    async fn put_artifacts(
+        &self,
+        run: &RunId,
+        artifacts: &[crate::ArtifactMeta],
+        at: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// A run's artifacts, name-ordered.
+    async fn artifacts_of_run(&self, run: &RunId) -> Result<Vec<crate::ArtifactMeta>, DbError>;
+
+    /// Runs that still hold artifacts, are TERMINAL, and settled before
+    /// `cutoff` — the artifact class's sweep list (ADR-0050/0052).
+    async fn prunable_artifact_runs(
+        &self,
+        cutoff: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError>;
+
+    /// Drop a run's artifact metadata (blobs deleted from the store first).
+    async fn delete_artifacts_of_run(&self, run: &RunId) -> Result<(), DbError>;
+
     /// The workspace-CAS **mark set** roots (ADR-0050): the output snapshots
     /// of every step of every non-terminal run, plus terminal runs that
     /// settled at/after `terminal_cutoff`. A gate-suspended run is
@@ -512,6 +535,16 @@ pub trait Executor: Send + Sync {
         _handle: &ExecHandle,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, ExecError> {
         Ok(std::collections::BTreeMap::new())
+    }
+
+    /// The **artifacts** a finished execution published to `/scarab/artifacts/`
+    /// (ADR-0052): collected post-step by the backend, blobs already in the
+    /// object store; the orchestrator persists the metadata. Default empty.
+    async fn artifacts(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Vec<crate::ArtifactMeta>, ExecError> {
+        Ok(Vec::new())
     }
 
     /// Open a best-effort **live tail** of the unit's stdout/stderr for `step`,

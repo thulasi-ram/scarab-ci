@@ -317,6 +317,12 @@ pub struct StepSpec {
     /// auto-release). Default = indefinite — gates may wait forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_expires_after: Option<u32>,
+    /// Artifact publication globs (ADR-0052): which files under
+    /// `/scarab/artifacts/` this step publishes as artifacts of record.
+    /// Default (empty) = everything the step wrote there. `*` matches within
+    /// a path segment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
     /// Entrypoint/command (empty = the image default).
     #[serde(default)]
     pub command: Vec<String>,

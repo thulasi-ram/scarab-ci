@@ -100,6 +100,27 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
     )
     .await;
 
+    // The old terminal run also holds an ARTIFACT (its own class, 20d TTL
+    // here so it is also due); the suspended run's artifact must survive.
+    for id in ["r-old-done", "r-old-suspended"] {
+        store
+            .put(&format!("artifacts/{id}/report.txt"), b"r".to_vec())
+            .await
+            .unwrap();
+        db.put_artifacts(
+            &RunId(id.into()),
+            &[scarab_engine::ArtifactMeta {
+                name: "report.txt".into(),
+                size: 1,
+                content_type: "text/plain".into(),
+                object_key: format!("artifacts/{id}/report.txt"),
+            }],
+            old,
+        )
+        .await
+        .unwrap();
+    }
+
     // Sweep at day 40 with a 30-day TTL.
     let db: Arc<dyn Db> = Arc::new(db);
     let store_dyn: Arc<dyn ObjectStore> = store.clone();
@@ -109,11 +130,15 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         &store_dyn,
         &clock,
         "sweeper-1",
-        RetentionConfig { log_ttl_ms: 30 * DAY_MS },
+        RetentionConfig { log_ttl_ms: 30 * DAY_MS, artifact_ttl_ms: 20 * DAY_MS },
     )
     .await
     .unwrap();
-    assert_eq!(pruned, 1, "exactly the old terminal run");
+    assert_eq!(pruned, 2, "the old terminal run's logs AND artifacts classes");
+    // The artifact class: old-done pruned (blob + rows), suspended kept.
+    assert!(store.get("artifacts/r-old-done/report.txt").await.is_err());
+    assert!(db.artifacts_of_run(&RunId("r-old-done".into())).await.unwrap().is_empty());
+    assert!(store.get("artifacts/r-old-suspended/report.txt").await.is_ok());
 
     // The pruned run: blobs gone, index gone — metadata retained.
     let gone = RunId("r-old-done".into());
@@ -139,7 +164,7 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         &store_dyn,
         &clock,
         "sweeper-1",
-        RetentionConfig { log_ttl_ms: 30 * DAY_MS },
+        RetentionConfig { log_ttl_ms: 30 * DAY_MS, artifact_ttl_ms: 20 * DAY_MS },
     )
     .await
     .unwrap();
@@ -151,7 +176,7 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         &store_dyn,
         &clock,
         "sweeper-2",
-        RetentionConfig { log_ttl_ms: 30 * DAY_MS },
+        RetentionConfig { log_ttl_ms: 30 * DAY_MS, artifact_ttl_ms: 20 * DAY_MS },
     )
     .await
     .unwrap();

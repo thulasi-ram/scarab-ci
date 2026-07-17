@@ -70,6 +70,11 @@ pub struct K8sExecutor {
     /// into the CAS after the step exits. `None` = no workspace flow (tests /
     /// object-store-less dev).
     workspace_cas: Option<Arc<dyn Cas>>,
+    /// The artifact blob store (ADR-0052). When wired (and the workspace
+    /// flow is on), every step Pod gets a `/scarab/artifacts` emptyDir that
+    /// is harvested post-step: matching files upload as object blobs and the
+    /// metadata rides a Pod annotation the orchestrator persists.
+    artifact_store: Option<Arc<dyn scarab_storage::ObjectStore>>,
 }
 
 impl K8sExecutor {
@@ -80,6 +85,7 @@ impl K8sExecutor {
             results_egress: None,
             default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
             workspace_cas: None,
+            artifact_store: None,
             clone_image: DEFAULT_CLONE_IMAGE.to_string(),
         }
     }
@@ -91,6 +97,7 @@ impl K8sExecutor {
             results_egress: None,
             default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
             workspace_cas: None,
+            artifact_store: None,
             clone_image: DEFAULT_CLONE_IMAGE.to_string(),
         }
     }
@@ -98,6 +105,14 @@ impl K8sExecutor {
     /// Override the canonical scarab-clone image (ADR-0045).
     pub fn with_clone_image(mut self, image: impl Into<String>) -> Self {
         self.clone_image = image.into();
+        self
+    }
+
+    /// Enable artifact collection (ADR-0052): harvest `/scarab/artifacts`
+    /// post-step into `store` (requires the workspace flow — the harvest runs
+    /// in its egress leg).
+    pub fn with_artifact_store(mut self, store: Arc<dyn scarab_storage::ObjectStore>) -> Self {
+        self.artifact_store = Some(store);
         self
     }
 
@@ -368,6 +383,23 @@ impl K8sExecutor {
                         .await
                         .map_err(|e| format!("annotate root: {e}"))?;
                 }
+                // Harvest artifacts of record (ADR-0052): everything the
+                // step wrote to /scarab/artifacts, filtered by its authored
+                // globs, uploaded as plain object blobs (NOT the CAS — an
+                // independent lifecycle) and indexed on the Pod annotation.
+                if let Some(store) = &self.artifact_store {
+                    let already = annotations.contains_key(ANNOTATION_ARTIFACTS);
+                    if exit == 0 && !already {
+                        if let Err(e) = self
+                            .harvest_artifacts(pods, pod, &name, store.as_ref())
+                            .await
+                        {
+                            // Best-effort like logs: artifacts must never
+                            // wedge the run's settle path.
+                            eprintln!("scarab-executor: artifact harvest failed for {name}: {e}");
+                        }
+                    }
+                }
                 // Release the sidecar (idempotent): failed steps snapshot
                 // nothing — their workspace is not an output.
                 self.exec_with_stdin(
@@ -380,6 +412,87 @@ impl K8sExecutor {
                 .await?;
             }
         }
+        Ok(())
+    }
+
+    /// Tar `/scarab/artifacts` out of the egress container, filter by the
+    /// step's authored globs, upload each file as `artifacts/{run}/{name}`,
+    /// and record the metadata on the Pod (ADR-0052).
+    async fn harvest_artifacts(
+        &self,
+        pods: &Api<Pod>,
+        pod: &Pod,
+        name: &str,
+        store: &dyn scarab_storage::ObjectStore,
+    ) -> Result<(), String> {
+        let run = pod
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("scarab.io/run"))
+            .cloned()
+            .unwrap_or_default();
+        let globs: Vec<String> = pod
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(ANNOTATION_ARTIFACT_GLOBS))
+            .and_then(|v| serde_json::from_str(v).ok())
+            .unwrap_or_default();
+        let out = self
+            .exec_capture_stdout(
+                pods,
+                name,
+                WORKSPACE_EGRESS_CONTAINER,
+                &format!("tar -cf - -C {ARTIFACTS_MOUNT_PATH} . 2>/dev/null || true"),
+            )
+            .await?;
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        if !out.is_empty() {
+            let _ = unpack_dir(&out, tmp.path()); // an empty dir tars to nothing
+        }
+
+        let mut metas: Vec<scarab_engine::ArtifactMeta> = Vec::new();
+        let mut stack = vec![tmp.path().to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).map_err(|e| e.to_string())?;
+            for entry in entries {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(tmp.path())
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .into_owned();
+                if !globs.is_empty() && !globs.iter().any(|g| glob_match(g, &rel)) {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                let key = format!("artifacts/{run}/{rel}");
+                store.put(&key, bytes.clone()).await.map_err(|e| e.to_string())?;
+                metas.push(scarab_engine::ArtifactMeta {
+                    name: rel.clone(),
+                    size: bytes.len() as u64,
+                    content_type: content_type_of(&rel).to_string(),
+                    object_key: key,
+                });
+            }
+        }
+        metas.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // Record BEFORE the sidecar releases — artifacts() reads it durably.
+        let patch = serde_json::json!({
+            "metadata": { "annotations": {
+                ANNOTATION_ARTIFACTS: serde_json::to_string(&metas).unwrap_or_default()
+            } }
+        });
+        pods.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .map_err(|e| format!("annotate artifacts: {e}"))?;
         Ok(())
     }
 
@@ -440,6 +553,38 @@ impl K8sExecutor {
         }
         proc.join().await.map_err(|e| format!("exec join: {e}"))?;
         Ok(out)
+    }
+}
+
+/// Minimal artifact glob (ADR-0052): `*` matches any run of characters
+/// (including `/`); everything else is literal. Enough for `dist/*`,
+/// `*.tar.gz`, `coverage/*.html`.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    fn inner(p: &[u8], n: &[u8]) -> bool {
+        match (p.first(), n.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => inner(&p[1..], n) || (!n.is_empty() && inner(p, &n[1..])),
+            (Some(pc), Some(nc)) if pc == nc => inner(&p[1..], &n[1..]),
+            _ => false,
+        }
+    }
+    inner(pattern.as_bytes(), name.as_bytes())
+}
+
+/// A pragmatic content type from the artifact's extension.
+fn content_type_of(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or_default() {
+        "html" | "htm" => "text/html",
+        "txt" | "log" => "text/plain",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "pdf" => "application/pdf",
+        "gz" | "tgz" => "application/gzip",
+        "zip" => "application/zip",
+        "tar" => "application/x-tar",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        _ => "application/octet-stream",
     }
 }
 
@@ -581,6 +726,28 @@ impl Executor for K8sExecutor {
         }))
     }
 
+    /// The artifacts the step published (ADR-0052), from the Pod annotation
+    /// the harvest recorded (durable with the Pod across restarts).
+    async fn artifacts(&self, handle: &ExecHandle) -> Result<Vec<scarab_engine::ArtifactMeta>, ExecError> {
+        if self.artifact_store.is_none() {
+            return Ok(Vec::new());
+        }
+        let pods = self.pods()?;
+        let pod = pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        Ok(pod
+            .and_then(|p| {
+                p.metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.get(ANNOTATION_ARTIFACTS))
+                    .and_then(|v| serde_json::from_str(v).ok())
+            })
+            .unwrap_or_default())
+    }
+
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {
         let pods = self.pods()?;
         // Graceful: SIGTERM, then SIGKILL after the grace period (ADR-0020).
@@ -704,6 +871,14 @@ const WORKSPACE_EGRESS_CONTAINER: &str = "scarab-workspace-egress";
 /// root (patched after egress; `Executor::output` reads it — durable with the
 /// Pod across control-plane restarts).
 const ANNOTATION_WS_INPUTS: &str = "scarab.io/workspace-inputs";
+/// The Pod annotation carrying the harvested artifacts' metadata (ADR-0052) —
+/// JSON `[{name,size,content_type,object_key}]`, durable with the Pod.
+const ANNOTATION_ARTIFACTS: &str = "scarab.io/artifacts";
+/// The Pod annotation carrying the step's artifact publication globs.
+const ANNOTATION_ARTIFACT_GLOBS: &str = "scarab.io/artifact-globs";
+/// Where a step publishes artifacts of record (ADR-0008/0052 convention).
+pub const ARTIFACTS_MOUNT_PATH: &str = "/scarab/artifacts";
+const ARTIFACTS_VOLUME: &str = "scarab-artifacts";
 const ANNOTATION_WS_ROOT: &str = "scarab.io/workspace-root";
 /// Grace period for workspace Pods: the egress sidecar ignores SIGTERM and
 /// waits for the control plane to snapshot `/workspace`, bounded by this.
@@ -793,11 +968,30 @@ pub fn build_pod(
         ..Default::default()
     });
 
+    // Artifacts of record (ADR-0052): an emptyDir the step publishes into,
+    // harvested post-step by the control plane via the workspace egress leg
+    // (so it exists only when the workspace flow is on).
+    let artifacts_mount = workspace.then(|| VolumeMount {
+        name: ARTIFACTS_VOLUME.to_string(),
+        mount_path: ARTIFACTS_MOUNT_PATH.to_string(),
+        ..Default::default()
+    });
+    if workspace {
+        env.push(EnvVar {
+            name: "SCARAB_ARTIFACTS".to_string(),
+            value: Some(ARTIFACTS_MOUNT_PATH.to_string()),
+            value_from: None,
+        });
+    }
+
     let mut step_mounts: Vec<VolumeMount> = Vec::new();
     if let Some(m) = results_mount.clone() {
         step_mounts.push(m);
     }
     if let Some(m) = workspace_mount.clone() {
+        step_mounts.push(m);
+    }
+    if let Some(m) = artifacts_mount.clone() {
         step_mounts.push(m);
     }
 
@@ -1031,9 +1225,25 @@ pub fn build_pod(
                     "trap '' TERM; until [ -f {CTL_MOUNT_PATH}/egress-done ]; do sleep 0.2; done"
                 ),
             ]),
-            volume_mounts: Some(vec![ws, ctl]),
+            volume_mounts: Some(match artifacts_mount.clone() {
+                Some(am) => vec![ws, ctl, am],
+                None => vec![ws, ctl],
+            }),
             ..Default::default()
         });
+    }
+    if workspace {
+        volumes.push(Volume {
+            name: ARTIFACTS_VOLUME.to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+        if !spec.artifacts.is_empty() {
+            annotations.insert(
+                ANNOTATION_ARTIFACT_GLOBS.to_string(),
+                serde_json::to_string(&spec.artifacts).unwrap_or_default(),
+            );
+        }
     }
     let volumes = (!volumes.is_empty()).then_some(volumes);
     let init_containers = (!init_containers.is_empty()).then_some(init_containers);
@@ -1548,6 +1758,7 @@ mod tests {
         workspace_inputs: vec![],
         clone: None,
             build: None,
+            artifacts: vec![],
             oidc_token: None,
         }
     }
@@ -1585,6 +1796,7 @@ mod tests {
         workspace_inputs: vec![],
         clone: None,
             build: None,
+            artifacts: vec![],
             oidc_token: None,
         };
         let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
@@ -1904,6 +2116,51 @@ mod tests {
         let pod = build_pod("scarab-x", "ns", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
         let c = &pod.spec.as_ref().unwrap().containers[0];
         assert!(c.env.as_ref().unwrap().iter().all(|e| e.name != "SCARAB_OIDC_TOKEN_FILE"));
+        assert!(pod.spec.as_ref().unwrap().volumes.is_none());
+    }
+
+    #[test]
+    fn artifact_globs_match_segments_and_extensions() {
+        assert!(glob_match("dist/*", "dist/app.tar.gz"));
+        assert!(glob_match("*.tar.gz", "release.tar.gz"));
+        assert!(glob_match("coverage/*.html", "coverage/index.html"));
+        assert!(!glob_match("*.html", "coverage.txt"));
+        assert!(glob_match("exact.txt", "exact.txt"));
+        assert!(!glob_match("exact.txt", "other.txt"));
+    }
+
+    #[test]
+    fn workspace_pods_get_the_artifacts_volume_and_globs_annotation() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        spec.artifacts = vec!["dist/*".into()];
+        let pod = build_pod("scarab-x", "ns", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, true, DEFAULT_CLONE_IMAGE);
+        let c = &pod.spec.as_ref().unwrap().containers[0];
+        let m = c
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "scarab-artifacts")
+            .expect("artifacts mount");
+        assert_eq!(m.mount_path, "/scarab/artifacts");
+        assert!(c
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| e.name == "SCARAB_ARTIFACTS" && e.value.as_deref() == Some("/scarab/artifacts")));
+        assert_eq!(
+            pod.metadata.annotations.as_ref().unwrap().get("scarab.io/artifact-globs").map(String::as_str),
+            Some(r#"["dist/*"]"#)
+        );
+        // The egress container (the harvest surface) also mounts it.
+        let inits = pod.spec.as_ref().unwrap().init_containers.as_ref().unwrap();
+        let egress = inits.iter().find(|c| c.name == WORKSPACE_EGRESS_CONTAINER).unwrap();
+        assert!(egress.volume_mounts.as_ref().unwrap().iter().any(|m| m.name == "scarab-artifacts"));
+
+        // No workspace flow => no artifacts machinery.
+        let pod = build_pod("scarab-x", "ns", &step, &busybox(), None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
         assert!(pod.spec.as_ref().unwrap().volumes.is_none());
     }
 

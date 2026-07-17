@@ -103,6 +103,9 @@ pub struct AppState {
     /// `None` disables the results-ingest endpoint (rejects with 404). Shared with
     /// the k8s executor, which mints the per-step token the egress sidecar presents.
     pub results_token_secret: Option<Vec<u8>>,
+    /// The artifact blob store (ADR-0052): serves downloads. `None` disables
+    /// the artifact endpoints (404).
+    pub artifact_store: Option<Arc<dyn scarab_storage::ObjectStore>>,
     /// Scoped role bindings (ADR-0049 C2): the native RBAC model authorize()
     /// consults per request against the path's Org/Project. `None` = only the
     /// principal's flat global roles decide (the C1 bootstrap).
@@ -132,6 +135,7 @@ impl AppState {
             gate_token_secret: None,
             secrets: None,
             results_token_secret: None,
+            artifact_store: None,
             rbac: None,
             oauth_login: None,
             public_url: "http://localhost:8080".into(),
@@ -206,6 +210,12 @@ impl AppState {
     ) -> Self {
         self.auth = Some(auth);
         self.sessions = Some(sessions);
+        self
+    }
+
+    /// Enable the artifact endpoints (ADR-0052), serving blobs from `store`.
+    pub fn with_artifact_store(mut self, store: Arc<dyn scarab_storage::ObjectStore>) -> Self {
+        self.artifact_store = Some(store);
         self
     }
 
@@ -628,6 +638,7 @@ async fn create_run(
             workspace_inputs: vec![],
         clone: None,
             build: None,
+            artifacts: vec![],
             oidc_token: None,
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
@@ -1150,6 +1161,80 @@ async fn cancel_run(
         }
         Err(e) => Err(ApiError::BadRequest(e.to_string())),
     }
+}
+
+/// One artifact in a run's list (ADR-0052).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ArtifactDto {
+    pub name: String,
+    pub size: u64,
+    pub content_type: String,
+}
+
+/// List a run's artifacts of record (ADR-0052). Read at the run's tenant.
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/artifacts",
+    params(("id" = String, Path, description = "run id")),
+    responses((status = 200, body = [ArtifactDto]), (status = 404, description = "no such run"))
+)]
+async fn list_artifacts(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<ArtifactDto>>, ApiError> {
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
+    if st.db.run_status(&run).await?.is_none() {
+        return Err(ApiError::NotFound);
+    }
+    let artifacts = st.db.artifacts_of_run(&run).await?;
+    Ok(Json(
+        artifacts
+            .into_iter()
+            .map(|a| ArtifactDto { name: a.name, size: a.size, content_type: a.content_type })
+            .collect(),
+    ))
+}
+
+/// Download one artifact's bytes (ADR-0052). Streams through the server (a
+/// presigned-URL fast path can replace this when the store backend supports
+/// signing). Read at the run's tenant; immutable content.
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/artifacts/{name}",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("name" = String, Path, description = "artifact name (may contain slashes)")
+    ),
+    responses((status = 200, description = "the artifact bytes"), (status = 404, description = "no such artifact"))
+)]
+async fn download_artifact(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
+    let store = st.artifact_store.as_ref().ok_or(ApiError::NotFound)?;
+    let artifact = st
+        .db
+        .artifacts_of_run(&run)
+        .await?
+        .into_iter()
+        .find(|a| a.name == name)
+        .ok_or(ApiError::NotFound)?;
+    let bytes = store
+        .get(&artifact.object_key)
+        .await
+        .map_err(|_| ApiError::NotFound)?;
+    let mut resp = bytes.into_response();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&artifact.content_type) {
+        resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, v);
+    }
+    Ok(resp)
 }
 
 /// In-repo directory holding pipeline definitions (ADR-0010). Every
@@ -1847,6 +1932,7 @@ async fn persist_run_from_ir(
                     credential: None,
                 }),
                 build: None,
+                artifacts: vec![],
                 oidc_token: None,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
@@ -1895,6 +1981,7 @@ async fn persist_run_from_ir(
                 workspace_inputs: vec![],
                 clone: None,
                 build,
+                artifacts: step.artifacts.clone(),
                 oidc_token: None,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
@@ -3394,6 +3481,8 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         get_logs,
         restart_step,
         cancel_run,
+        list_artifacts,
+        download_artifact,
         approve_gate,
         release_gate_external,
         put_secret,
@@ -3450,6 +3539,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/{id}/logs", get(get_logs))
         .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
         .route("/v1/runs/{id}/cancel", post(cancel_run))
+        .route("/v1/runs/{id}/artifacts", get(list_artifacts))
+        .route("/v1/runs/{id}/artifacts/{*name}", get(download_artifact))
         .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
         .route("/v1/runs/{id}/gates/{step}/release", post(release_gate_external))
         .route("/v1/runs/{id}/steps/{step}/results", post(ingest_step_results))

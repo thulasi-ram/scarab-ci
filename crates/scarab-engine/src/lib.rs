@@ -238,6 +238,10 @@ pub struct StepSpec {
     /// BuildKit with this context instead of an authored image/command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<BuildConfig>,
+    /// Artifact publication globs (ADR-0052): filters what the backend
+    /// collects from `/scarab/artifacts/` post-step. Empty = everything.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
     /// The per-attempt OIDC token for keyless cloud federation (ADR-0015),
     /// minted at LAUNCH — **never serialized** (in-memory enrichment only;
     /// delivery to the Pod is a tmpfs file, never env/argv). `None` when the
@@ -337,6 +341,19 @@ pub struct CloneConfig {
 pub struct CloneCredential {
     pub username: String,
     pub token: String,
+}
+
+/// One artifact of record (ADR-0052): an output a step published to
+/// `/scarab/artifacts/`, name-addressed per run, immutable once written.
+/// The blob lives in the object store (NOT the workspace CAS — independent
+/// lifecycle); this is its metadata row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactMeta {
+    pub name: String,
+    pub size: u64,
+    pub content_type: String,
+    /// Object-store key holding the bytes.
+    pub object_key: String,
 }
 
 /// A manual/approval gate that suspends a run until released.

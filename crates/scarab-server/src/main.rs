@@ -133,6 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             replica_id.clone(),
             scarab_server::retention::RetentionConfig {
                 log_ttl_ms: (config.retention_log_days as i64) * 24 * 60 * 60 * 1000,
+                artifact_ttl_ms: (config.retention_artifact_days as i64) * 24 * 60 * 60 * 1000,
             },
             scarab_server::retention::GcConfig {
                 workspace_ttl_ms: (config.retention_workspace_days as i64) * 24 * 60 * 60 * 1000,
@@ -234,7 +235,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // into /workspace, snapshot it back after the step.
                         .with_workspace_cas(workspace_cas.clone())
                         // The canonical clone image (ADR-0045).
-                        .with_clone_image(config.clone_image.clone());
+                        .with_clone_image(config.clone_image.clone())
+                        // Artifact harvest (ADR-0052): /scarab/artifacts →
+                        // object blobs + Pod-annotation metadata.
+                        .with_artifact_store(store.clone());
                     if let Some(egress) = results_egress.clone() {
                         exec = exec.with_results_egress(egress);
                         tracing::info!("results egress sidecar enabled (ADR-0042)");
@@ -317,7 +321,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // in-repo `.scarab` config through it for real.
         .with_forge(forge.clone())
         // /v1/secrets management with the secrets store built above (ADR-0014).
-        .with_secrets(secrets.clone());
+        .with_secrets(secrets.clone())
+        // Artifact list/download (ADR-0052), served from the object store.
+        .with_artifact_store(store.clone());
     if let Some(secret) = config.github_webhook_secret.clone() {
         state = state.with_github_webhook_secret(secret);
     }

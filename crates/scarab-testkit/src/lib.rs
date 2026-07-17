@@ -136,6 +136,8 @@ struct InMemoryState {
     webhook_deliveries: std::collections::HashSet<(String, String)>,
     /// Lease table: resource → (owner, expiry instant).
     leases: HashMap<String, (String, std::time::Instant)>,
+    /// Artifact metadata (ADR-0052), keyed (run, name).
+    artifacts: HashMap<(RunId, String), scarab_engine::ArtifactMeta>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -910,6 +912,57 @@ impl Db for InMemoryDb {
         if let Some(e) = st.outbox.iter_mut().find(|e| e.msg.id == id) {
             e.dead_lettered = true;
         }
+        Ok(())
+    }
+
+    async fn put_artifacts(
+        &self,
+        run: &RunId,
+        artifacts: &[scarab_engine::ArtifactMeta],
+        _at: Timestamp,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        for a in artifacts {
+            st.artifacts.insert((run.clone(), a.name.clone()), a.clone());
+        }
+        Ok(())
+    }
+
+    async fn artifacts_of_run(&self, run: &RunId) -> Result<Vec<scarab_engine::ArtifactMeta>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<_> = st
+            .artifacts
+            .iter()
+            .filter(|((r, _), _)| r == run)
+            .map(|(_, a)| a.clone())
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    async fn prunable_artifact_runs(
+        &self,
+        cutoff: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<RunId> = st
+            .runs
+            .iter()
+            .filter(|(run, status)| {
+                status.is_terminal()
+                    && st.run_created.get(*run).copied().unwrap_or(Timestamp(0)).0 < cutoff.0
+                    && st.artifacts.keys().any(|(r, _)| r == *run)
+            })
+            .map(|(run, _)| run.clone())
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    async fn delete_artifacts_of_run(&self, run: &RunId) -> Result<(), DbError> {
+        self.state.lock().unwrap().artifacts.retain(|(r, _), _| r != run);
         Ok(())
     }
 

@@ -56,6 +56,7 @@ fn spec_with_secret() -> StepSpec {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     }
 }
@@ -198,6 +199,7 @@ fn plain_spec() -> StepSpec {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     }
 }

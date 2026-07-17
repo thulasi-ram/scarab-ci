@@ -50,6 +50,7 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
         workspace_inputs: vec![],
         clone: None,
         build: None,
+        artifacts: vec![],
         oidc_token: None,
     };
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();

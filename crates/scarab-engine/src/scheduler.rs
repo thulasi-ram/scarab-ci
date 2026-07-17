@@ -861,6 +861,14 @@ impl<'a> Scheduler<'a> {
                     if !results.is_empty() {
                         self.db.set_step_results(&run, &step, &results).await?;
                     }
+                    // Persist the artifacts of record the step published
+                    // (ADR-0052) — blobs are already in the object store;
+                    // this durably indexes them for list/download.
+                    let artifacts = self.executor.artifacts(&handle).await?;
+                    if !artifacts.is_empty() {
+                        let now = self.clock.now().await;
+                        self.db.put_artifacts(&run, &artifacts, now).await?;
+                    }
                     self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;

@@ -19,6 +19,9 @@ use scarab_storage::ObjectStore;
 pub struct RetentionConfig {
     /// How long a terminal run's LOGS are kept, in milliseconds.
     pub log_ttl_ms: i64,
+    /// How long a terminal run's ARTIFACTS are kept, in milliseconds
+    /// (ADR-0052: independent class, ~90d default).
+    pub artifact_ttl_ms: i64,
 }
 
 /// The lease name gating the sweeper to one replica at a time.
@@ -54,6 +57,24 @@ pub async fn sweep_retention(
     let mut pruned = 0u32;
     for run in runs {
         prune_run_logs(db, store, &run).await?;
+        pruned += 1;
+    }
+
+    // The artifact class (ADR-0052): same lifecycle key, its own TTL.
+    let cutoff = Timestamp(now.0 - cfg.artifact_ttl_ms);
+    let runs = db
+        .prunable_artifact_runs(cutoff, SWEEP_BATCH)
+        .await
+        .map_err(|e| e.to_string())?;
+    for run in runs {
+        let artifacts = db.artifacts_of_run(&run).await.map_err(|e| e.to_string())?;
+        for a in &artifacts {
+            if let Err(e) = store.delete(&a.object_key).await {
+                return Err(format!("delete {}: {e}", a.object_key));
+            }
+        }
+        db.delete_artifacts_of_run(&run).await.map_err(|e| e.to_string())?;
+        tracing::info!(run = %run.0, artifacts = artifacts.len(), "retention: pruned run artifacts");
         pruned += 1;
     }
     Ok(pruned)
