@@ -1089,7 +1089,7 @@ impl Db for PostgresDb {
                    AND dead_lettered_at IS NULL
                    AND ($4::text IS NULL OR kind = $4)
                    AND (claimed_until IS NULL
-                        OR claimed_until < (extract(epoch from now()) * 1000)::bigint)
+                        OR claimed_until <= (extract(epoch from now()) * 1000)::bigint)
                  ORDER BY id
                  FOR UPDATE SKIP LOCKED
                  LIMIT $2
