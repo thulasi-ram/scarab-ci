@@ -225,6 +225,53 @@ pub struct StepSpec {
     /// executor materializes them into `/workspace` before the step starts.
     #[serde(default)]
     pub workspace_inputs: Vec<String>,
+    /// Set when this is a **clone** step (ADR-0045): the engine runs the
+    /// canonical scarab-clone image with this context instead of an authored
+    /// image/command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone: Option<CloneConfig>,
+}
+
+/// The launch context of a clone step (ADR-0045), resolved from the run's
+/// trigger at creation (owner/name/sha/read_only + the authored knobs) and
+/// enriched at launch (URL from the ForgeConnection registry; the short-TTL
+/// checkout credential — in-memory only, never persisted).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloneConfig {
+    /// The forge coordinate, pinned at run creation.
+    pub owner: String,
+    pub name: String,
+    /// The commit the run is pinned to (resolved ONCE at trigger time,
+    /// ADR-0043/0044) — clone always fetches THIS, never re-resolves.
+    pub sha: String,
+    /// `depth: full` (complete history) vs the shallow default.
+    #[serde(default)]
+    pub depth_full: bool,
+    #[serde(default)]
+    pub submodules: bool,
+    #[serde(default)]
+    pub lfs: bool,
+    /// Fork-PR runs get a READ-ONLY credential (ADR-0045 trust model), fixed
+    /// immutably at run creation from the trigger.
+    #[serde(default)]
+    pub read_only: bool,
+    /// The credential-free clone URL — filled at LAUNCH by the composition
+    /// root (from the repo's ForgeConnection); empty in the stored spec.
+    #[serde(default)]
+    pub url: String,
+    /// The short-TTL checkout credential — filled at LAUNCH, **never
+    /// serialized** (in-memory enrichment only; delivery to the Pod is via a
+    /// tmpfs file, never env/URL/argv — ADR-0045 §Token delivery).
+    #[serde(skip)]
+    pub credential: Option<CloneCredential>,
+}
+
+/// The in-memory half of a minted checkout credential (mirrors the forge
+/// port's type without a crate dependency; the engine stays forge-free).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloneCredential {
+    pub username: String,
+    pub token: String,
 }
 
 /// A manual/approval gate that suspends a run until released.

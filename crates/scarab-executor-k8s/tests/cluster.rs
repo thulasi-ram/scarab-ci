@@ -67,6 +67,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         privileged: false,
         timeout_seconds: None,
         workspace_inputs: vec![],
+        clone: None,
     };
 
     // launch, then launch again — the second call must re-attach, not relaunch.
@@ -126,6 +127,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         privileged: false,
         timeout_seconds: Some(5),
         workspace_inputs: vec![],
+        clone: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -176,6 +178,7 @@ async fn log_stream_tails_pod_stdout() {
         privileged: false,
         timeout_seconds: None,
         workspace_inputs: vec![],
+        clone: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -261,6 +264,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         privileged: false,
         timeout_seconds: Some(120),
         workspace_inputs: inputs,
+        clone: None,
     };
     async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
         for _ in 0..90 {
@@ -318,4 +322,97 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
     for h in [ha, hb, ha2] {
         exec.cancel(&h).await.expect("cleanup");
     }
+}
+
+/// LIVE clone step (ADR-0045): the canonical scarab-clone image clones a real
+/// public repo at a pinned SHA into /workspace, the workspace (incl. .git) is
+/// snapshotted into the CAS, and .git/config is credential-free. Anonymous
+/// (public) clone — the token path is covered by unit + enrichment tests.
+/// Needs the image in the cluster: SCARAB_TEST_CLONE_IMAGE (e.g. a locally
+/// imported scarab-clone:test). `#[ignore]`d + SCARAB_TEST_KUBE gated.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn clone_step_produces_a_source_workspace() {
+    use scarab_storage::Cas;
+    let Some(ns) = opted_in() else { return };
+    let Ok(clone_image) = std::env::var("SCARAB_TEST_CLONE_IMAGE") else {
+        eprintln!("skipping: set SCARAB_TEST_CLONE_IMAGE to a scarab-clone image in the cluster");
+        return;
+    };
+    let sha = std::env::var("SCARAB_TEST_CLONE_SHA").expect("SCARAB_TEST_CLONE_SHA");
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    let tmp = tempfile::tempdir().expect("cas dir");
+    let cas_dir = tmp.path().to_string_lossy().into_owned();
+    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
+        scarab_storage_s3::S3Storage::local(&cas_dir).expect("local cas"),
+    );
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(cas.clone())
+        .with_clone_image(&clone_image);
+
+    let step = StepRun {
+        run: RunId("run-clone".into()),
+        step: StepId("checkout".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let spec = StepSpec {
+        image: String::new(),
+        command: vec![],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: false, // scarab-clone is non-root by construction
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(300),
+        workspace_inputs: vec![],
+        clone: Some(scarab_engine::CloneConfig {
+            owner: "thulasi-ram".into(),
+            name: "scarab-ci".into(),
+            sha: sha.clone(),
+            url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
+            ..Default::default()
+        }),
+    };
+
+    let h = exec.launch(&step, &spec).await.expect("launch clone");
+    let mut terminal = None;
+    for _ in 0..120 {
+        match exec.poll(&h).await.expect("poll") {
+            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
+                terminal = Some(s);
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    assert_eq!(terminal, Some(ExecState::Succeeded), "clone step succeeds");
+
+    // The workspace snapshot is the run's source tree — WITH .git (ADR-0045).
+    let root = exec.output(&h).await.expect("output").expect("workspace snapshot");
+    let out = tempfile::tempdir().expect("materialize dir");
+    cas.materialize(
+        &scarab_storage::TreeHash(root),
+        out.path().to_str().unwrap(),
+    )
+    .await
+    .expect("materialize the cloned workspace");
+    assert!(out.path().join("Cargo.toml").exists(), "source is present");
+    assert!(out.path().join(".git").is_dir(), ".git retained in the snapshot");
+    // .git/config is credential-free (S2 guard held).
+    let config = std::fs::read_to_string(out.path().join(".git/config")).expect("git config");
+    assert!(
+        !config.contains('@') || config.contains("github.com/thulasi-ram"),
+        "no credential-bearing URL: {config}"
+    );
+    assert!(config.contains("https://github.com/thulasi-ram/scarab-ci.git"), "{config}");
+
+    exec.cancel(&h).await.expect("cleanup");
 }

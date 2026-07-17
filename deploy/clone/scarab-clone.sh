@@ -24,6 +24,11 @@ depth="${SCARAB_CLONE_DEPTH:-1}"
 export GIT_ASKPASS=/usr/local/bin/scarab-askpass
 export GIT_TERMINAL_PROMPT=0
 
+# The workspace volume is group-owned (Pod fsGroup), not uid-owned — inside
+# this single-purpose container git's dubious-ownership guard is noise, and it
+# must also cover submodule paths.
+git config --global --add safe.directory '*'
+
 mkdir -p "$dest"
 cd "$dest"
 git init -q .

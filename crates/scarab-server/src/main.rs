@@ -177,7 +177,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .with_default_step_timeout_secs(config.step_timeout_secs)
                         // Workspace flow (ADR-0029/0045): materialize `needs`
                         // into /workspace, snapshot it back after the step.
-                        .with_workspace_cas(workspace_cas.clone());
+                        .with_workspace_cas(workspace_cas.clone())
+                        // The canonical clone image (ADR-0045).
+                        .with_clone_image(config.clone_image.clone());
                     if let Some(egress) = results_egress.clone() {
                         exec = exec.with_results_egress(egress);
                         tracing::info!("results egress sidecar enabled (ADR-0042)");
@@ -199,6 +201,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 secrets.clone(),
                 logs.clone(),
             ));
+            // Enrich clone-step launches (ADR-0045): resolve the clone URL
+            // from the registry and mint the short-TTL, read-only-for-forks
+            // checkout credential — in memory only, delivered via tmpfs.
+            let executor: Arc<dyn Executor> = Arc::new(
+                scarab_server::clone_executor::CloneEnrichingExecutor::new(
+                    executor,
+                    pg.clone(),
+                    forge.clone(),
+                ),
+            );
             // Local host processes finish instantly, so re-poll them quickly; k8s
             // Pods take time, so the default window avoids thundering re-claims.
             // A short window is safe either way — `launch` is idempotent (ADR-0021).

@@ -132,6 +132,16 @@ impl Executor for LocalExecutor {
             }
         }
 
+        // Clone steps run the canonical scarab-clone image with tmpfs token
+        // delivery (ADR-0045) — a Pod-shaped contract the host-process backend
+        // cannot honor. Fail with direction, never a silent no-source run.
+        if spec.clone.is_some() {
+            return Err(ExecError::Launch(
+                "clone steps require the k8s executor (scarab-clone image + tmpfs \
+                 credential delivery, ADR-0045); the local backend has no clone support"
+                    .into(),
+            ));
+        }
         // The step contract is an OCI image + command; locally there is no image,
         // so a command is required (ADR-0036).
         let (program, args) = spec

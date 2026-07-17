@@ -54,6 +54,7 @@ fn spec_with_secret() -> StepSpec {
         privileged: false,
         timeout_seconds: None,
         workspace_inputs: vec![],
+        clone: None,
     }
 }
 fn logs(db: Arc<dyn Db>) -> Arc<LogService> {

@@ -36,6 +36,7 @@ use scarab_identity::{Action, Principal, Session};
 
 pub mod config;
 pub mod converged;
+pub mod clone_executor;
 pub mod forge_router;
 pub mod log_tail;
 pub mod logs;
@@ -591,6 +592,7 @@ async fn create_run(
             privileged: admitted.privileged,
             timeout_seconds: step.timeout,
             workspace_inputs: vec![],
+        clone: None,
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -1552,6 +1554,23 @@ fn admit_step_grants(
 
 /// Durably materialize a compiled pipeline IR into a Run: store the IR on the
 /// run (self-describing, ADR-0022), record RunCreated + the normalized trigger
+/// The (repo, pinned sha) a clone step fetches, from a sha-carrying trigger
+/// (ADR-0045: the run pins its commit ONCE at trigger time and clone always
+/// fetches that — never a re-resolved ref). `None` for triggers without a
+/// concrete commit (tag/release resolution is a follow-up; cron/comment/
+/// upstream have no source).
+fn clone_context(event: &scarab_forge::Event) -> Option<(scarab_forge::RepoRef, String)> {
+    use scarab_forge::Event;
+    match event {
+        Event::Push { repo, after, .. } => Some((repo.clone(), after.clone())),
+        Event::PullRequest { repo, head, .. } => Some((repo.clone(), head.clone())),
+        Event::Manual { repo, sha, .. } | Event::Api { repo, sha, .. } => {
+            Some((repo.clone(), sha.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// on the event log, and create each step with its `needs`.
 #[allow(clippy::too_many_arguments)] // a cohesive persist routine; splitting hides the flow
 async fn persist_run_from_ir(
@@ -1636,6 +1655,44 @@ async fn persist_run_from_ir(
             db.create_step_run(run, &step_id, None, &needs, now).await?;
             let timer = step.gate_after.map(|s| s as i64);
             db.set_step_gate(run, &step_id, kind, timer).await?;
+        } else if let Some(clone) = &step.clone {
+            // A clone step (ADR-0045): the engine runs the canonical
+            // scarab-clone image with context pinned from the trigger. The
+            // URL and the short-TTL credential are resolved at LAUNCH by the
+            // composition root (registry + forge); read_only is fixed here —
+            // a fork PR can never escalate to a writable credential later.
+            let Some((repo, sha)) = clone_context(event) else {
+                return Err(TriggerError::Pipeline(format!(
+                    "step `{}`: a clone step needs a sha-carrying trigger \
+                     (push/pull_request/manual/api) — this run was triggered by `{}`",
+                    step.id,
+                    event.trigger_kind().as_str()
+                )));
+            };
+            let spec = StepSpec {
+                image: String::new(),
+                command: Vec::new(),
+                env: step.env.clone(),
+                secrets: Vec::new(),
+                run_as_root: false,
+                add_capabilities: Vec::new(),
+                privileged: false,
+                timeout_seconds: step.timeout,
+                workspace_inputs: vec![],
+                clone: Some(scarab_engine::CloneConfig {
+                    owner: repo.owner.clone(),
+                    name: repo.name.clone(),
+                    sha,
+                    depth_full: clone.depth == scarab_pipeline::CloneDepth::Full,
+                    submodules: clone.submodules,
+                    lfs: clone.lfs,
+                    read_only: locked_out || event.is_fork_pr(),
+                    url: String::new(),
+                    credential: None,
+                }),
+            };
+            db.create_step_run(run, &step_id, Some(&spec), &needs, now)
+                .await?;
         } else {
             // ADR-0039: admit the step's privilege request against the target
             // Environment's whitelist, fail-closed. A rejected request aborts the
@@ -1659,6 +1716,7 @@ async fn persist_run_from_ir(
                 privileged: admitted.privileged,
                 timeout_seconds: step.timeout,
             workspace_inputs: vec![],
+        clone: None,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
