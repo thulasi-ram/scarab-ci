@@ -13,14 +13,9 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 ENVFILE="${ENVFILE:-$HERE/.env}"
 if [ -f "$ENVFILE" ]; then
-  # File-wins (see deploy.sh). Split on the FIRST '=' so base64 values survive.
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      ''|\#*) continue ;;
-      *=*) ;;
-      *) continue ;;
-    esac
-    export "${line%%=*}=${line#*=}"
+  while IFS='=' read -r k v; do
+    case "$k" in ''|\#*) continue ;; esac
+    [ -z "${!k:-}" ] && export "$k=$v" || true
   done < "$ENVFILE"
 fi
 

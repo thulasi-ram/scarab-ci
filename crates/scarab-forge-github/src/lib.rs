@@ -688,10 +688,12 @@ impl ForgePort for GithubForge {
     }
 
     /// App mode: mint a fresh installation token **downscoped** to this one
-    /// repository with `contents: read` (or `write` when `read_only` is
-    /// false) — the ADR-0045 clone credential. Fixed-token mode hands back
-    /// the configured token (dev only: a PAT cannot be downscoped, so
-    /// `read_only` is advisory there).
+    /// repository with `contents: read` — a checkout only ever READS the tree
+    /// (ADR-0045 clone credential), so it never requests write, regardless of
+    /// `read_only` (which governs the fork-PR lockdown downstream, not the
+    /// token scope). Requesting write would 422 on any install granted only
+    /// `contents: read`. Fixed-token mode hands back the configured token
+    /// (dev only: a PAT cannot be downscoped, so `read_only` is advisory there).
     async fn mint_checkout_credential(
         &self,
         repo: &RepoRef,
@@ -729,7 +731,8 @@ impl ForgePort for GithubForge {
                     self.url(&format!("/app/installations/{installation_id}/access_tokens"));
                 let body = serde_json::json!({
                     "repositories": [repo.name],
-                    "permissions": { "contents": if read_only { "read" } else { "write" } },
+                    // A checkout only reads — never request write (see doc above).
+                    "permissions": { "contents": "read" },
                 });
                 let resp = self.send(|| self.client.post(&url).json(&body), &jwt).await?;
                 ok_json(resp)
