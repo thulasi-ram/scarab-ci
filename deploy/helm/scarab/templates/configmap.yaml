@@ -24,6 +24,18 @@ data:
   {{- if .Values.scarab.devInsecure }}
   SCARAB_DEV_INSECURE: "1"
   {{- end }}
+  {{- with .Values.scarab.githubAppId }}
+  SCARAB_GITHUB_APP_ID: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.scarab.publicUrl }}
+  SCARAB_PUBLIC_URL: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.scarab.cloneImage }}
+  SCARAB_CLONE_IMAGE: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.scarab.stepTimeoutSecs }}
+  SCARAB_STEP_TIMEOUT_SECS: {{ . | quote }}
+  {{- end }}
   {{- if .Values.secrets.resultsTokenSecret }}
   SCARAB_SIDECAR_IMAGE: {{ .Values.scarab.sidecarImage | quote }}
   SCARAB_RESULTS_API_URL: {{ .Values.scarab.resultsApiUrl | default (printf "http://%s.%s.svc" (include "scarab.fullname" .) .Release.Namespace) | quote }}
