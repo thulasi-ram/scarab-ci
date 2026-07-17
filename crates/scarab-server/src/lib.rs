@@ -106,6 +106,10 @@ pub struct AppState {
     /// The artifact blob store (ADR-0052): serves downloads. `None` disables
     /// the artifact endpoints (404).
     pub artifact_store: Option<Arc<dyn scarab_storage::ObjectStore>>,
+    /// The built SPA's dist directory (ADR-0054). `Some` serves the web UI at
+    /// `/` with an SPA fallback — same-origin with the API, so no CORS layer
+    /// exists or is needed. `None` (dev) leaves non-API paths 404.
+    pub ui_dir: Option<std::path::PathBuf>,
     /// Scoped role bindings (ADR-0049 C2): the native RBAC model authorize()
     /// consults per request against the path's Org/Project. `None` = only the
     /// principal's flat global roles decide (the C1 bootstrap).
@@ -136,6 +140,7 @@ impl AppState {
             secrets: None,
             results_token_secret: None,
             artifact_store: None,
+            ui_dir: None,
             rbac: None,
             oauth_login: None,
             public_url: "http://localhost:8080".into(),
@@ -210,6 +215,12 @@ impl AppState {
     ) -> Self {
         self.auth = Some(auth);
         self.sessions = Some(sessions);
+        self
+    }
+
+    /// Serve the built web UI from `dir` (ADR-0054): `/` + SPA fallback.
+    pub fn with_ui_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.ui_dir = Some(dir.into());
         self
     }
 
@@ -3688,9 +3699,55 @@ fn router_inner(state: AppState) -> Router {
         .route("/v1/repos/{org}/{repo}/dispatch", post(dispatch))
         .route("/webhooks/github", post(github_webhook))
         .route("/webhooks/forgejo", post(forgejo_webhook))
+        // The embedded web UI (ADR-0054): everything no API route claimed
+        // falls through here — a real file from dist/, else index.html (SPA
+        // client routing). Same-origin by construction: no CORS anywhere.
+        .fallback(serve_ui)
         // Request-id correlation on every route (ADR-0053).
         .layer(axum::middleware::from_fn(request_id_middleware))
         .with_state(state)
+}
+
+/// Serve the SPA (ADR-0054): a request for a real file under the dist dir
+/// gets it; anything else (a client-side route like `/acme/web/runs/…`) gets
+/// index.html. Path traversal is rejected by segment sanitization. With no
+/// UI dir configured (dev API-only), non-API paths are plain 404s.
+async fn serve_ui(State(st): State<AppState>, uri: axum::http::Uri) -> Response {
+    let Some(dir) = &st.ui_dir else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let rel = uri.path().trim_start_matches('/');
+    let mut path = dir.clone();
+    // Segment-wise join: never let `..` (or an absolute segment) escape dist.
+    for seg in rel.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." || seg.contains('\\') {
+            continue;
+        }
+        path.push(seg);
+    }
+    let file = if path.is_file() { path } else { dir.join("index.html") };
+    match tokio::fs::read(&file).await {
+        Ok(bytes) => {
+            let mime = match file.extension().and_then(|e| e.to_str()).unwrap_or_default() {
+                "html" => "text/html; charset=utf-8",
+                "js" => "application/javascript",
+                "css" => "text/css",
+                "svg" => "image/svg+xml",
+                "png" => "image/png",
+                "ico" => "image/x-icon",
+                "json" => "application/json",
+                "woff2" => "font/woff2",
+                _ => "application/octet-stream",
+            };
+            let mut resp = bytes.into_response();
+            resp.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static(mime),
+            );
+            resp
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------

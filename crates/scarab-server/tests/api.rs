@@ -271,3 +271,62 @@ fn every_registered_route_is_in_the_openapi_spec() {
     let extra: Vec<&String> = have.iter().filter(|p| !routes.contains(p)).collect();
     assert!(extra.is_empty(), "spec paths with no registered route: {extra:?}");
 }
+
+/// The embedded web UI (ADR-0054): `/` serves index.html, real assets serve
+/// with their content type, an SPA client route falls back to index, and the
+/// API keeps winning under /v1. Path traversal cannot escape the dist dir.
+#[tokio::test]
+async fn embedded_ui_serves_index_assets_and_spa_fallback() {
+    let dist = tempfile::tempdir().unwrap();
+    std::fs::write(dist.path().join("index.html"), "<html>scarab-ui</html>").unwrap();
+    std::fs::create_dir(dist.path().join("assets")).unwrap();
+    std::fs::write(dist.path().join("assets/app.js"), "console.log(1)").unwrap();
+
+    let db = std::sync::Arc::new(scarab_testkit::InMemoryDb::new());
+    let store = std::sync::Arc::new(scarab_testkit::InMemoryObjectStore::new());
+    let logs = std::sync::Arc::new(scarab_server::LogService::new(store, db.clone()));
+    let app = scarab_server::router(
+        scarab_server::AppState::new(
+            db,
+            std::sync::Arc::new(scarab_testkit::FakeClock::new(0)),
+            logs,
+        )
+        .with_ui_dir(dist.path()),
+    );
+
+    let get = |uri: &str| {
+        axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()
+    };
+    let body = |resp: axum::response::Response| async {
+        axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()
+    };
+
+    // Index at /.
+    let resp = app.clone().oneshot(get("/")).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body(resp).await).contains("scarab-ui"));
+
+    // A real asset with its content type.
+    let resp = app.clone().oneshot(get("/assets/app.js")).await.unwrap();
+    assert_eq!(
+        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        Some("application/javascript")
+    );
+
+    // An SPA client route falls back to index (client routing takes over).
+    let resp = app.clone().oneshot(get("/acme/web/runs/r-123")).await.unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body(resp).await).contains("scarab-ui"));
+
+    // The API still wins under /v1 (JSON, not HTML).
+    let resp = app.clone().oneshot(get("/v1/runs")).await.unwrap();
+    assert_eq!(
+        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        Some("application/json")
+    );
+
+    // Traversal cannot escape dist: `..` segments are dropped, so this is
+    // the SPA fallback, never /etc/passwd.
+    let resp = app.clone().oneshot(get("/../../../../etc/passwd")).await.unwrap();
+    assert!(String::from_utf8_lossy(&body(resp).await).contains("scarab-ui"));
+}

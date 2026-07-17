@@ -372,6 +372,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state = state.with_oidc(issuer);
         tracing::info!("OIDC issuer enabled (persistent signing key)");
     }
+    // The embedded web UI (ADR-0054): served when the baked dist exists
+    // (the production image sets SCARAB_UI_DIR); dev stays API-only.
+    let ui_dir = std::env::var("SCARAB_UI_DIR")
+        .unwrap_or_else(|_| "/usr/share/scarab/ui".into());
+    if std::path::Path::new(&ui_dir).join("index.html").is_file() {
+        state = state.with_ui_dir(&ui_dir);
+        tracing::info!(dir = %ui_dir, "web UI embedded (same-origin, ADR-0054)");
+    }
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
