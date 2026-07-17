@@ -141,6 +141,28 @@ impl LogService {
         Ok(meta)
     }
 
+    /// Read a stream's chunks from `from_seq` onward (durable index + store) —
+    /// the replica-agnostic live-tail path (ADR-0051): ANY replica serves new
+    /// chunks by re-reading the index the tailing replica writes. Returns the
+    /// concatenated bodies and the next `from_seq`.
+    pub async fn read_from(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        from_seq: u64,
+    ) -> Result<(Vec<u8>, u64), LogError> {
+        let chunks = self.db.log_chunks(run, step, attempt).await?;
+        let mut out = Vec::new();
+        let mut next = from_seq;
+        for c in chunks.into_iter().filter(|c| c.seq >= from_seq) {
+            let blob = self.store.get(&c.object_key).await?;
+            out.extend(gunzip(&blob).map_err(|e| LogError::Gzip(e.to_string()))?);
+            next = c.seq + 1;
+        }
+        Ok((out, next))
+    }
+
     /// Replay a stream's full log by reading every indexed chunk from the object
     /// store and decompressing in order (the post-completion path).
     pub async fn read_all(

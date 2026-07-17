@@ -93,7 +93,10 @@ pub fn spawn_driver(
     step_timeout_ms: i64,
     public_url: String,
 ) -> tokio::task::JoinHandle<()> {
-    let tailer = logs.map(|logs| LogTailer::new(executor.clone(), logs));
+    // Claim-to-tail lease (ADR-0051): with 2+ replicas, only the fence's
+    // lease holder tails a step — deduping ingestion and spreading log I/O.
+    let tailer =
+        logs.map(|logs| LogTailer::new(executor.clone(), logs).with_lease(db.clone(), owner.clone()));
     tokio::spawn(async move {
         loop {
             if let Err(e) = tick_once(

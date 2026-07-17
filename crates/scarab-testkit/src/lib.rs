@@ -134,6 +134,8 @@ struct InMemoryState {
     forge_repos: HashMap<(String, String), (String, String, String)>,
     /// Webhook delivery-id replay guard: (forge kind token, delivery id).
     webhook_deliveries: std::collections::HashSet<(String, String)>,
+    /// Lease table: resource → (owner, expiry instant).
+    leases: HashMap<String, (String, std::time::Instant)>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -967,11 +969,29 @@ impl Db for InMemoryDb {
             .collect())
     }
 
-    async fn lease(&self, _resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
-        Ok(Lease {
-            owner: owner.to_string(),
-            expires_at: Timestamp(ttl_ms),
-        })
+    async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
+        // Real lease semantics (the PG adapter's contract): the holder renews;
+        // a peer only takes over an EXPIRED lease. Wall-clock via Instant —
+        // a process-local fake needs no injected clock for expiry.
+        let mut st = self.state.lock().unwrap();
+        let now = std::time::Instant::now();
+        let entry = st.leases.entry(resource.to_string());
+        use std::collections::hash_map::Entry;
+        match entry {
+            Entry::Occupied(mut e) => {
+                let (holder, expires) = e.get().clone();
+                if holder == owner || now >= expires {
+                    e.insert((owner.to_string(), now + std::time::Duration::from_millis(ttl_ms as u64)));
+                    Ok(Lease { owner: owner.to_string(), expires_at: Timestamp(ttl_ms) })
+                } else {
+                    Ok(Lease { owner: holder, expires_at: Timestamp(ttl_ms) })
+                }
+            }
+            Entry::Vacant(v) => {
+                v.insert((owner.to_string(), now + std::time::Duration::from_millis(ttl_ms as u64)));
+                Ok(Lease { owner: owner.to_string(), expires_at: Timestamp(ttl_ms) })
+            }
+        }
     }
 }
 

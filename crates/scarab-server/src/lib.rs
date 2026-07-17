@@ -24,7 +24,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::{self, BoxStream, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio_stream::wrappers::BroadcastStream;
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
@@ -1019,17 +1018,22 @@ async fn get_logs(
     let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
     let steps = st.db.steps_of_run(&run).await?;
 
+    // Replay everything committed so far, remembering how far each stream was
+    // consumed (the live tail resumes from these seqs — never duplicating).
     let mut replay: Vec<Result<Event, Infallible>> = Vec::new();
-    let mut receivers = Vec::new();
+    let mut seen: std::collections::HashMap<(String, String), u64> =
+        std::collections::HashMap::new();
     for s in &steps {
         for a in &s.attempts {
-            let body = st.logs.read_all(&run, &s.step, &a.id).await.unwrap_or_default();
+            let (body, next) = st
+                .logs
+                .read_from(&run, &s.step, &a.id, 0)
+                .await
+                .unwrap_or_default();
             if !body.is_empty() {
                 replay.push(Ok(Event::default().data(String::from_utf8_lossy(&body))));
             }
-            if !status.is_terminal() {
-                receivers.push(st.logs.subscribe(&run, &s.step, &a.id));
-            }
+            seen.insert((s.step.0.clone(), a.id.0.clone()), next);
         }
     }
 
@@ -1038,16 +1042,46 @@ async fn get_logs(
         // Nothing more will be written: replay and close.
         Ok(Sse::new(replay_stream.boxed()))
     } else {
-        // Replay what's committed, then live-tail new chunks.
-        let live = futures::stream::select_all(receivers.into_iter().map(|rx| {
-            BroadcastStream::new(rx).map(|r| {
-                Ok(match r {
-                    Ok(bytes) => Event::default().data(String::from_utf8_lossy(&bytes)),
-                    // A slow reader that lagged the broadcast buffer: note the gap.
-                    Err(_) => Event::default().comment("log stream lagged"),
-                })
-            })
-        }));
+        // Live tail (ADR-0051): poll the DURABLE index for new chunks, so ANY
+        // replica serves live logs regardless of which replica tails the Pod.
+        // (The in-process broadcast is only a same-replica fast-path, not the
+        // source of truth — this path never depends on it.) The stream ends
+        // one poll after the run settles.
+        let live = futures::stream::unfold(
+            (st.clone(), run.clone(), seen, false),
+            |(st, run, mut seen, done)| async move {
+                if done {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let terminal = matches!(
+                    st.db.run_status(&run).await,
+                    Ok(Some(s)) if s.is_terminal()
+                );
+                let steps = st.db.steps_of_run(&run).await.unwrap_or_default();
+                let mut body = Vec::new();
+                for s in &steps {
+                    for a in &s.attempts {
+                        let key = (s.step.0.clone(), a.id.0.clone());
+                        let from = seen.get(&key).copied().unwrap_or(0);
+                        if let Ok((bytes, next)) =
+                            st.logs.read_from(&run, &s.step, &a.id, from).await
+                        {
+                            if !bytes.is_empty() {
+                                body.extend(bytes);
+                            }
+                            seen.insert(key, next);
+                        }
+                    }
+                }
+                let event = if body.is_empty() {
+                    Event::default().comment("keepalive")
+                } else {
+                    Event::default().data(String::from_utf8_lossy(&body))
+                };
+                Some((Ok(event), (st, run, seen, terminal)))
+            },
+        );
         Ok(Sse::new(replay_stream.chain(live).boxed()))
     }
 }

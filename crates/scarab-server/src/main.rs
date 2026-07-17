@@ -72,6 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // This replica's identity for leases + outbox claims (ADR-0051): MUST be
+    // unique per process — identical owners would make every replica believe
+    // it holds every lease (leader election + tail dedup would be void).
+    let replica_id = format!("scarab-server-{}", uuid::Uuid::new_v4());
+
     // Durable store — mandatory, already guaranteed by the config gate.
     let pg = PostgresDb::connect(&config.database_url).await?;
     pg.migrate().await?;
@@ -125,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             workspace_cas.clone(),
             Arc::clone(&store),
             clock.clone(),
-            "scarab-server".to_string(),
+            replica_id.clone(),
             scarab_server::retention::RetentionConfig {
                 log_ttl_ms: (config.retention_log_days as i64) * 24 * 60 * 60 * 1000,
             },
@@ -290,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(forge.clone()),
                 // Feed the log pipeline from the executor's live tail (ADR-0013).
                 Some(logs.clone()),
-                "scarab-server".to_string(),
+                replica_id.clone(),
                 Duration::from_millis(500),
                 visibility_ms,
                 (config.step_timeout_secs as i64).saturating_mul(1000),
