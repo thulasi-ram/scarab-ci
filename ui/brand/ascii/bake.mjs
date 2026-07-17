@@ -18,7 +18,9 @@ import { createCanvas, Path2D } from "@napi-rs/canvas";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { drawScarab, drawBeetle, VB_W, VB_H, BEETLE_VB_H, CELL_ASPECT } from "./scenes.mjs";
+import {
+  drawScarab, drawBeetle, VB_W, VB_H, BEETLE_VB_H, BEETLE_VB_H_BARE, CELL_ASPECT,
+} from "./scenes.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const outDir = join(here, "generated");
@@ -70,11 +72,18 @@ function bakeScene(name, { cols, rows, frames, draw }) {
 
 // Scarab rows: cols * (VB_H/VB_W) * CELL_ASPECT keeps the nimbus round.
 const scarabRows = (cols) => Math.round(cols * (VB_H / VB_W) * CELL_ASPECT);
-const beetleRows = (cols) => Math.round(cols * (BEETLE_VB_H / 96) * CELL_ASPECT);
+const beetleRows = (cols, vbH) => Math.round(cols * (vbH / 96) * CELL_ASPECT);
 
 bakeScene("wingspread-hero", { cols: 84, rows: scarabRows(84), frames: 48, draw: drawScarab });
-bakeScene("wingspread-small", { cols: 60, rows: scarabRows(60), frames: 48, draw: drawScarab });
-bakeScene("dungroller", { cols: 88, rows: beetleRows(88), frames: 72, draw: drawBeetle });
+bakeScene("dungroller", { cols: 88, rows: beetleRows(88, BEETLE_VB_H), frames: 72, draw: drawBeetle });
+// Traveling variant: no ground in the scene (crops at the feet) — the host
+// provides the ground line and moves the beetle across it.
+bakeScene("dungroller-bare", {
+  cols: 88,
+  rows: beetleRows(88, BEETLE_VB_H_BARE),
+  frames: 72,
+  draw: (x, u, c, r) => drawBeetle(x, u, c, r, { ground: false }),
+});
 
 // ---- static mark: the traced emblem, verbatim ------------------------------
 // The dark layer is ONE compound path (holes by winding); it renders correctly

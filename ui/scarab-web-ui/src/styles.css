@@ -224,19 +224,55 @@ code,
   flex: none;
 }
 .ascii-scene pre {
+  position: absolute;
+  inset: 0;
   margin: 0;
   font-family: var(--font-mono);
   font-size: var(--ascii-fs, 8px);
   line-height: calc(var(--ascii-fs, 8px) * 1.667);
   user-select: none;
 }
-.ascii-scene pre + pre {
-  position: absolute;
-  inset: 0;
-}
 .ascii-scene .ascii-em { color: var(--emerald); }
 .ascii-scene .ascii-au { color: var(--copper); }
 .ascii-scene .ascii-fe { color: var(--muted-sage); }
+
+/* Dashboard footer: the dung beetle walks its ball across the full viewport
+   on a copper ground line. `.rolling` = work in flight (frames + travel run);
+   otherwise it parks beside the ball, frozen — motion means "something is
+   working". Travel is CSS; the frames only animate legs + ball spin. */
+.dash-footer {
+  position: relative;
+  height: 214px;
+  overflow: hidden;
+}
+.dash-footer::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 28px;
+  border-top: 1px dashed var(--border-copper);
+}
+.dash-footer .roller {
+  position: absolute;
+  bottom: 24px; /* feet on the line (the crop leaves ~1 row of slack) */
+  left: 0;
+  /* parked spot — visible, right of center */
+  transform: translateX(min(72vw, 900px));
+}
+.dash-footer.rolling .roller {
+  animation: scarab-roll 52s linear infinite;
+}
+@keyframes scarab-roll {
+  from { transform: translateX(-240px); }
+  to   { transform: translateX(calc(100vw + 48px)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dash-footer .roller {
+    animation: none !important;
+    transform: translateX(min(72vw, 900px)) !important;
+  }
+}
 
 /* The traced emblem as a faint background mark (doodle placement rules). */
 .ascii-watermark {
@@ -1407,7 +1443,7 @@ h2 {
   padding: 20px 22px; border: 1px solid var(--border); border-radius: 11px;
   background: var(--emerald-surface);
 }
-.allclear .ac-scene { flex: none; }
+.allclear .ac-ico { color: var(--emerald); flex: none; }
 .allclear .ac-title { font-family: var(--font-display); font-size: 15px; font-weight: 600; color: var(--soft-white); }
 .allclear .ac-sub { font-size: 13px; color: var(--muted-sage); margin-top: 2px; }
 

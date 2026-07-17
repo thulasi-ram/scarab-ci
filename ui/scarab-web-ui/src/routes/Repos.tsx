@@ -23,7 +23,7 @@ import {
 import Icon from "../components/Icon";
 import Sparkline from "../components/Sparkline";
 import AsciiScene from "../components/AsciiScene";
-import wingspread from "../../../brand/ascii/generated/wingspread-small.json";
+import dungroller from "../../../brand/ascii/generated/dungroller-bare.json";
 import emblemMark from "../../../brand/ascii/generated/emblem-mark.txt?raw";
 
 // Per-kind presentation for an inbox row: the verb chip carries the row (the
@@ -55,8 +55,12 @@ export default function Repos() {
   const calm = createMemo(() => inbox().length === 0 && inFlight() === 0);
 
   const openRun = (repo: string, id: string) => nav(`/${ORG}/${repo}/runs/${id}`);
+  // The footer beetle rolls while work is in flight — motion literally means
+  // "something is working". Quiet dashboard → it parks beside its ball.
+  const rolling = createMemo(() => inFlight() > 0);
 
   return (
+    <>
     <section class="page">
       {/* Faint brand mark in the background — the traced emblem as ASCII
           (ui/brand/ascii). Static on purpose: nothing animates behind data. */}
@@ -83,9 +87,7 @@ export default function Repos() {
         when={inbox().length > 0}
         fallback={
           <div class="allclear">
-            {/* The calm moment earns the beetle: wings spread, nimbus pulsing.
-                A state illustration, not ambient decoration (ui/brand/ascii). */}
-            <AsciiScene scene={wingspread} fontSize={4.5} class="ac-scene" />
+            <Icon icon="shield-check" size={22} class="ac-ico" />
             <div>
               <div class="ac-title">All clear — nothing needs you</div>
               <div class="ac-sub">
@@ -188,5 +190,16 @@ export default function Repos() {
         </For>
       </div>
     </section>
+
+    {/* ── Footer: the dung-roller (ui/brand/ascii) ─────────────────────────
+        Scroll past everything and find the beetle walking its ball across the
+        page on the copper ground line. CSS carries the travel; baked frames
+        carry the legs and the rolling ball. */}
+    <footer class="dash-footer" classList={{ rolling: rolling() }} aria-hidden="true">
+      <div class="roller">
+        <AsciiScene scene={dungroller} fontSize={4} playing={rolling()} />
+      </div>
+    </footer>
+    </>
   );
 }

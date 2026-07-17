@@ -261,9 +261,12 @@ Placement is stricter than doodles, because motion competes with content:
 
 - **Docs**: the landing page ONLY — the hero (wing-spread in its nimbus) plus
   at most one accent (the dung-roller). Inner pages keep static doodles.
-- **Web-UI**: state moments only — all-clear, empty, loading. Never ambient
-  behind live data; an operator surface is scanned, and a permanently moving
-  background fights the "what needs me" read.
+- **Web-UI**: state moments (all-clear, empty, loading) and the **dashboard
+  footer roller** — the dung beetle walks its ball across the bottom of the
+  page while runs are in flight and parks when the dashboard is quiet, so
+  motion literally means "something is working". Never ambient behind live
+  data; an operator surface is scanned, and a permanently moving background
+  fights the "what needs me" read.
 - **Static ASCII marks** (the traced emblem) follow the doodle rules: faint,
   background, ≤2 per page.
 - Players honor `prefers-reduced-motion` (hold an open frame) and skip work

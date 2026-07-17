@@ -20,6 +20,8 @@ export default function AsciiScene(props: {
   /** accessible name; omit → decorative (aria-hidden) */
   label?: string;
   class?: string;
+  /** reactive gate: false freezes the loop on its current frame */
+  playing?: boolean;
 }) {
   const pres: HTMLPreElement[] = [];
   const { frames, fps } = props.scene;
@@ -33,17 +35,24 @@ export default function AsciiScene(props: {
     }
     let f = 0;
     const t = setInterval(() => {
-      if (document.hidden) return;
+      if (document.hidden || props.playing === false) return;
       f = (f + 1) % frames.length;
       for (let i = 0; i < 3; i++) pres[i].textContent = frames[f][i];
     }, 1000 / fps);
     onCleanup(() => clearInterval(t));
   });
 
+  // Explicit box: layers are absolutely positioned, and the trimmed text lines
+  // must not size the scene (a layer can be much narrower than the grid).
+  // JetBrains Mono's advance is exactly 0.6em.
   return (
     <div
       class={`ascii-scene ${props.class ?? ""}`}
-      style={{ "--ascii-fs": `${props.fontSize ?? 8}px` }}
+      style={{
+        "--ascii-fs": `${props.fontSize ?? 8}px`,
+        width: `${props.scene.cols * (props.fontSize ?? 8) * 0.6}px`,
+        height: `${props.scene.rows * (props.fontSize ?? 8) * 1.667}px`,
+      }}
       role={props.label ? "img" : undefined}
       aria-label={props.label}
       aria-hidden={props.label ? undefined : "true"}

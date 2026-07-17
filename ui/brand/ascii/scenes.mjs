@@ -139,14 +139,19 @@ export function drawScarab(x, u, cols, rows) {
 // The viewport starts at VB_Y0 (crops the empty sky above the ball).
 const BEETLE_VB_W = 96;
 const BEETLE_VB_Y0 = 26;
-export const BEETLE_VB_H = 59;
+export const BEETLE_VB_H = 59;       // with ground dots (treadmill variant)
+export const BEETLE_VB_H_BARE = 48;  // cropped at the feet (traveling variant)
 const GY = 72;              // ground line
 const BALL = { x: 63, r: 20 };
 const LEG_CYCLES = 14;      // integer → seamless loop
 const DOTS = 29;            // ground dots; spacing chosen so one loop = one wrap
 
-/** Dung beetle pushing its ball — treadmill loop at phase u. */
-export function drawBeetle(x, u, cols, rows) {
+/** Dung beetle pushing its ball at phase u.
+ *  opts.ground=true  → treadmill: beetle in place, ground dots scroll past.
+ *  opts.ground=false → traveling: no ground (the host moves the whole scene —
+ *  e.g. the web-ui footer walks it across the viewport on a CSS animation). */
+export function drawBeetle(x, u, cols, rows, opts = {}) {
+  const { ground = true } = opts;
   const s = cols / BEETLE_VB_W;
   x.clearRect(0, 0, cols, rows);
   x.save();
@@ -155,12 +160,14 @@ export function drawBeetle(x, u, cols, rows) {
 
   // one ball revolution per loop; ground scrolls at the ball's surface speed
   const roll = u * TAU;
-  const travel = roll * BALL.r;              // 2πr per loop
-  const spacing = (TAU * BALL.r) / DOTS;     // pattern wraps exactly once
-  x.fillStyle = "#57685e";
-  for (let i = 0; i < DOTS + 6; i++) {
-    const gx = ((i * spacing - travel) % (DOTS * spacing) + DOTS * spacing) % (DOTS * spacing) - spacing * 3;
-    x.fillRect(gx, GY + 1.2, 1.5, 1.5);
+  if (ground) {
+    const travel = roll * BALL.r;              // 2πr per loop
+    const spacing = (TAU * BALL.r) / DOTS;     // pattern wraps exactly once
+    x.fillStyle = "#57685e";
+    for (let i = 0; i < DOTS + 6; i++) {
+      const gx = ((i * spacing - travel) % (DOTS * spacing) + DOTS * spacing) % (DOTS * spacing) - spacing * 3;
+      x.fillRect(gx, GY + 1.2, 1.5, 1.5);
+    }
   }
 
   // dung ball — outline + rotating flecks, resting on the ground

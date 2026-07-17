@@ -15,8 +15,8 @@ npm install && npm run bake     # deterministic; reruns don't churn
 | Asset | What | Used by |
 |---|---|---|
 | `wingspread-hero.json` | scarab spreads wings inside its nimbus, 84×45 | docs landing hero |
-| `wingspread-small.json` | same loop, 60×32 | web-ui all-clear state |
-| `dungroller.json` | dung beetle rolling its ball, 88×47 | docs landing accent |
+| `dungroller.json` | dung beetle + ball, treadmill (ground scrolls), 88×32 | docs landing accent |
+| `dungroller-bare.json` | same loop without ground, cropped at the feet, 88×26 | web-ui dashboard footer (CSS walks it across the viewport) |
 | `emblem-mark.txt` | the **traced** emblem, static, 64×34 | faint background marks |
 
 ## Format

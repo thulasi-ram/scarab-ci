@@ -35,7 +35,14 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
   id={id}
   data-ascii={name}
   data-fps={scene.fps}
-  style={`--ascii-fs:${fontSize}px`}
+  style={
+    // Explicit box: layers are absolutely positioned, and trimmed text lines
+    // must not size the scene (a layer can be much narrower than the grid).
+    // JetBrains Mono's advance is exactly 0.6em.
+    `--ascii-fs:${fontSize}px;` +
+    `width:${scene.cols * fontSize * 0.6}px;` +
+    `height:${(scene.rows * fontSize * 1.667).toFixed(1)}px`
+  }
   role={label ? "img" : undefined}
   aria-label={label}
   aria-hidden={label ? undefined : "true"}
@@ -92,6 +99,8 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
     overflow: hidden;
   }
   .ascii-scene pre {
+    position: absolute;
+    inset: 0;
     margin: 0;
     padding: 0;
     background: none;
@@ -101,10 +110,6 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
     line-height: calc(var(--ascii-fs, 8px) * 1.667);
     user-select: none;
     overflow: hidden;
-  }
-  .ascii-scene pre + pre {
-    position: absolute;
-    inset: 0;
   }
   /* brand-role layers; tokens themed in scarab.css */
   .ascii-scene .ascii-em { color: var(--ascii-emerald); }
