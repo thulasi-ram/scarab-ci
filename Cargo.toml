@@ -37,6 +37,7 @@ scarab-storage = { path = "crates/scarab-storage" }
 scarab-project = { path = "crates/scarab-project" }
 scarab-db-postgres = { path = "crates/scarab-db-postgres" }
 scarab-forge-github = { path = "crates/scarab-forge-github" }
+scarab-forge-forgejo = { path = "crates/scarab-forge-forgejo" }
 scarab-secrets-postgres = { path = "crates/scarab-secrets-postgres" }
 scarab-storage-s3 = { path = "crates/scarab-storage-s3" }
 scarab-executor-k8s = { path = "crates/scarab-executor-k8s" }
