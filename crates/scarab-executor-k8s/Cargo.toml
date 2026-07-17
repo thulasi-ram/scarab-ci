@@ -25,4 +25,5 @@ futures = { workspace = true }
 
 [dev-dependencies]
 scarab-storage-s3 = { workspace = true }
+axum = { workspace = true }
 tokio = { workspace = true }

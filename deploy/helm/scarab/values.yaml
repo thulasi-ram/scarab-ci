@@ -50,7 +50,7 @@ scarab:
 
   # Results-egress sidecar image injected into step Pods (ADR-0042). Only used
   # when secrets.resultsTokenSecret is set.
-  sidecarImage: "ghcr.io/thulasi-ram/scarab-sidecar:latest"
+  sidecarImage: "ghcr.io/thulasi-ram/scarab-results-sidecar:edge"
   # Base URL step-Pod sidecars POST results back to. Empty => the in-cluster
   # Service DNS name derived from the release.
   resultsApiUrl: ""

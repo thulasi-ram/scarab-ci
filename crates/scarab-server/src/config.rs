@@ -437,7 +437,8 @@ impl Config {
             token_secret: secret.into_bytes(),
             api_url: env("SCARAB_RESULTS_API_URL").unwrap_or_else(|| "http://scarab-server".into()),
             sidecar_image: env("SCARAB_SIDECAR_IMAGE")
-                .unwrap_or_else(|| "ghcr.io/scarab/sidecar:latest".into()),
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "ghcr.io/thulasi-ram/scarab-results-sidecar:edge".into()),
         });
 
         Ok(Config {

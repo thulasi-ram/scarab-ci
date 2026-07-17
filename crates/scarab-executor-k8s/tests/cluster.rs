@@ -852,3 +852,126 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
     exec.cancel(&vh).await.expect("cleanup verify");
     exec.cancel(&h).await.expect("cleanup build");
 }
+
+/// LIVE results egress (ADR-0042/0041): a step writes a named result to
+/// /scarab/results; the trusted sidecar (the real scarab-results-sidecar
+/// image) drains it on step exit and POSTs it — token-authenticated — to the
+/// ingest URL (a stub listener on the host standing in for the control
+/// plane). Needs SCARAB_TEST_SIDECAR_IMAGE (in-cluster image) and
+/// SCARAB_TEST_HOST_IP (host address reachable from Pods; colima:
+/// 192.168.5.2). `#[ignore]`d + SCARAB_TEST_KUBE gated.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn results_sidecar_captures_a_named_result_end_to_end() {
+    let Some(ns) = opted_in() else { return };
+    let Ok(sidecar_image) = std::env::var("SCARAB_TEST_SIDECAR_IMAGE") else {
+        eprintln!("skipping: set SCARAB_TEST_SIDECAR_IMAGE to a scarab-results-sidecar image");
+        return;
+    };
+    let Ok(host_ip) = std::env::var("SCARAB_TEST_HOST_IP") else {
+        eprintln!("skipping: set SCARAB_TEST_HOST_IP (host address reachable from Pods)");
+        return;
+    };
+    let run_id = unique_run("run-results");
+
+    // A stub ingest endpoint: records the one POST the sidecar makes.
+    use axum::routing::post;
+    let received: std::sync::Arc<tokio::sync::Mutex<Option<(String, String, serde_json::Value)>>> =
+        Default::default();
+    let rec = received.clone();
+    let app = axum::Router::new().route(
+        "/v1/runs/{run}/steps/{step}/results",
+        post(
+            move |headers: axum::http::HeaderMap,
+                  axum::extract::Path((run, step)): axum::extract::Path<(String, String)>,
+                  axum::Json(body): axum::Json<serde_json::Value>| {
+                let rec = rec.clone();
+                async move {
+                    let token = headers
+                        .get("x-scarab-results-token")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    *rec.lock().await = Some((format!("{run}/{step}"), token, body));
+                    axum::http::StatusCode::ACCEPTED
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let secret = b"live-results-secret".to_vec();
+    let client = kube::Client::try_default().await.expect("kube client");
+    let exec = K8sExecutor::with_client(ns, client).with_results_egress(
+        scarab_executor_k8s::ResultsEgress {
+            base_url: format!("http://{host_ip}:{port}"),
+            token_secret: secret.clone(),
+            sidecar_image,
+        },
+    );
+
+    let step = StepRun {
+        run: RunId(run_id.clone()),
+        step: StepId("emit".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let spec = StepSpec {
+        image: "busybox:latest".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "echo '{\"answer\":42}' > /scarab/results/compute.json && echo emitted".into(),
+        ],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: true, // busybox
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(120),
+        workspace_inputs: vec![],
+        clone: None,
+        build: None,
+        oidc_token: None,
+    };
+    let h = exec.launch(&step, &spec).await.expect("launch");
+    let mut terminal = None;
+    for _ in 0..120 {
+        match exec.poll(&h).await.expect("poll") {
+            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
+                terminal = Some(s);
+                break;
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
+        }
+    }
+    assert_eq!(terminal, Some(ExecState::Succeeded), "step succeeds");
+
+    // The kubelet SIGTERMs the sidecar after the step exits; the drain POST
+    // arrives within its termination window.
+    let mut got = None;
+    for _ in 0..60 {
+        if let Some(r) = received.lock().await.clone() {
+            got = Some(r);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let (fence, token, body) = got.expect("the sidecar posted the results");
+    assert_eq!(fence, format!("{run_id}/emit"));
+    // The fence token is the real HMAC the executor minted.
+    let expected =
+        scarab_forge_github::sign_hex(&secret, format!("{run_id}:emit:a1").as_bytes());
+    assert_eq!(token, expected, "fence-scoped token authenticated");
+    assert_eq!(body["compute"]["answer"], 42, "named result captured: {body}");
+
+    exec.cancel(&h).await.expect("cleanup");
+}

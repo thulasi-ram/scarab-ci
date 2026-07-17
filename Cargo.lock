@@ -2647,6 +2647,7 @@ name = "scarab-executor-k8s"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64",
  "futures",
  "k8s-openapi",
