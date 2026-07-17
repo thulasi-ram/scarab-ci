@@ -57,7 +57,7 @@
   /* Display voice (DESIGN.md §5) — pairs with the ASCII beetle scenes.
      TRIAL ORDER: "Doto Variable" → "Major Mono Display" → "Ten Pixel";
      swap the first family to switch the whole app's display face. */
-  --font-display: "Major Mono Display", "Space Grotesk", "Inter", system-ui, sans-serif;
+  --font-display: "Ten Pixel", "Space Grotesk", "Inter", system-ui, sans-serif;
   --font-ui: "Inter", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
@@ -1540,8 +1540,6 @@ h2 {
 h1, h2, .brand, .crumb-head, .run-title, .repo-name, .ac-title {
   letter-spacing: 0;
   font-synthesis: none;
-  /* Major Mono Display trial: single-weight face, no synthetic bold.
-     (Doto/10 Pixel trials: drop this line and bump h2/.repo-name/.ac-title
-     to 700 instead.) */
-  font-weight: 400;
 }
+/* 10 Pixel trial: real Bold cut — let the mids use it. */
+h2, .repo-name, .ac-title { font-weight: 700; }
