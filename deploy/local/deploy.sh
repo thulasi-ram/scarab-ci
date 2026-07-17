@@ -15,9 +15,17 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 # Load .env WITHOUT clobbering vars already set in the environment (env wins).
 ENVFILE="${ENVFILE:-$HERE/.env}"
 if [ -f "$ENVFILE" ]; then
-  while IFS='=' read -r k v; do
-    case "$k" in ''|\#*) continue ;; esac
-    [ -z "${!k:-}" ] && export "$k=$v" || true
+  # The .env file is authoritative for a deploy (file-wins): a stale ambient
+  # value — e.g. direnv-loaded .env.local — must NOT silently override the
+  # in-cluster config. Split on the FIRST '=' only, so base64 values that end
+  # in '=' survive (IFS='=' read would truncate them).
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|\#*) continue ;;   # skip blank + comment lines
+      *=*) ;;               # KEY=VALUE — process
+      *) continue ;;        # anything else — skip
+    esac
+    export "${line%%=*}=${line#*=}"
   done < "$ENVFILE"
 else
   echo "missing $ENVFILE (cp deploy/local/.env.example deploy/local/.env and fill it)" >&2
