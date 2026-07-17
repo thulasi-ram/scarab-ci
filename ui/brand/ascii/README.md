@@ -17,6 +17,11 @@ npm install && npm run bake     # deterministic; reruns don't churn
 | `dungroller.json` | dung beetle + ball, treadmill (ground scrolls), 88×32 | docs landing accent |
 | `dungroller-bare.json` | same loop without ground, cropped at the feet, 88×26 | web-ui dashboard footer (CSS walks it across the viewport) |
 | `emblem-mark.txt` | the **traced** emblem, static, 64×34 | faint background marks |
+| `doodles/*.svg` | Lucide icons rasterized to a 24×24 **dot matrix** (dot-icons.mjs) | docs + web-ui background doodles |
+
+Scenes render with a **dots-only ramp** (`" .·•●"`): luminance maps to dot
+size, so the ASCII art, the dot-matrix doodles, and the page dot-grid speak
+one language.
 
 The wing-spread scene (`drawScarab`) stays in `scenes.mjs` but is currently
 unbaked — the docs hero uses the square emblem SVG. Re-add its `bakeScene`

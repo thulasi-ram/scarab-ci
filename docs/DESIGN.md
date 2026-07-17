@@ -23,7 +23,7 @@ DAG canvas) that stay pine-black in *both* themes so the machine surface always
 looks like the machine. The signature is no longer "everything is dark green";
 it's **restraint plus technical marks**: gold shows up only as an edge, mono
 carries every label, and decoration speaks one **dotted** language — the page
-dot-grid, dotted doodles, the dot/pixel display face, and the ASCII beetles.
+dot-grid, dot-matrix doodles, and the dots-only ASCII beetles.
 
 Influence: the crisp, blueprint-y, mono-annotated feel of engineering marketing
 sites (dot-grid textures, spec-sheet framing) — adapted to a control plane,
@@ -62,8 +62,8 @@ corners are sharp-ish (5px cards / 3px controls) rather than soft.
 **Key characteristics**
 - Light-first cool-white ladder; opt-in carapace dark; pine-black terminals in both.
 - Emerald = the single interactive accent. Gold = edges & rare tokens only, never a fill.
-- One **dotted** decoration language (dot-grid, dotted doodles, pixel display face, ASCII beetles); corners sharp-ish (5px/3px), never boxy-round.
-- Four typefaces, one job each: **10 Pixel** (display), **Space Grotesk** (wordmark), **Inter** (body/UI), **JetBrains Mono** (all chrome/labels/machine).
+- One **dotted** decoration language (dot-grid, dot-matrix doodles, dots-only ASCII beetles); corners sharp-ish (5px/3px), never boxy-round.
+- Four typefaces, one job each: **Major Mono Display** (display + wordmark), **Space Grotesk** (section headings, card names), **Inter** (body/UI), **JetBrains Mono** (all chrome/labels/machine).
 - Zero shadows (modal overlay excepted).
 
 ## 2. Color Palette & Roles
@@ -144,35 +144,31 @@ lives only in the doodles.
 ## 3. Typography
 
 ### Families
-- **10 Pixel** (`--font-display`; MagicType, OFL, vendored `ui/brand/fonts/`)
-  — the page heading/breadcrumb row ONLY: `h1`, `.crumb-head`, `.run-title`
-  (docs: page titles). Section headings, card/repo names and everything else
-  stay Space Grotesk — the pixel voice over-accents at small/dense sizes.
-  Real Regular + Bold cuts; **zero tracking** (pixel glyphs collide when
-  tracked negative). Broken glyphs read lighter than solid text, so the pixel
-  face uses the deepest ink (`--display-ink`) to hold hierarchy. It makes
-  sense *because* of the ASCII beetles; they share a language.
-- **Major Mono Display** — the **`Scarab` wordmark only** (topbar brand,
-  docs site title + landing hero title). An identity mark earns a one-off
-  face: the biform (uppercase skeletons at lowercase heights) is distinctive
-  at wordmark doses and would tire as page titles. Single weight, tracking 0.
+- **Major Mono Display** (`--font-display`; OFL, fontsource) — the display
+  voice: the page heading/breadcrumb row (`h1`, `.crumb-head`, `.run-title`;
+  docs page titles) AND the `Scarab` wordmark. The biform (uppercase skeletons
+  at lowercase heights) is the brand's typographic signature. Single weight —
+  never synthesize bold — and **zero tracking**. Its light strokes read
+  quieter than solid text, so it takes the deepest ink (`--display-ink`).
+  Section headings, card/repo names and everything else stay Space Grotesk —
+  a display voice over-accents at small/dense sizes.
 - **Inter** (`--font-ui`) — body & UI: paragraphs, buttons, table body, nav.
   Weights 400/500/600.
 - **JetBrains Mono** (`--font-mono`) — **all chrome and machine tokens**:
   eyebrows, section labels, table/column headers, filter pills, badges,
   breadcrumbs, provenance keys, ids, SHAs, durations, log lines. Weights 400/500.
 
-Four typefaces, each with one clear job (display / wordmark / body / machine).
+Four typefaces, each with one clear job (display / headings / body / machine).
 The **mono-for-chrome** rule is the technical voice: anything that labels or
-identifies is mono; prose is Inter; titles are 10 Pixel; the wordmark alone is
-Space Grotesk.
+identifies is mono; prose is Inter; the h1/breadcrumb row and the wordmark are
+Major Mono Display; section headings stay Space Grotesk.
 
 ### Scale
 
 | Role | Family | Size | Weight | Tracking |
 |------|--------|------|--------|----------|
-| Display / Hero (`h1`) | 10 Pixel | 40px | **700** | 0 |
-| Run title / breadcrumb | 10 Pixel | 22–24px | 700 | 0 |
+| Display / Hero (`h1`) | Major Mono Display | 40px | 400 | 0 |
+| Run title / breadcrumb | Major Mono Display | 22–24px | 400 | 0 |
 | Section heading (`h2`) | Space Grotesk | 20px | 600 | -0.4px |
 | Card / repo name | Space Grotesk | 15px | 600 | -0.3px |
 | Wordmark (`.brand`) | Major Mono Display | 19px | 400 | 0 |
@@ -198,7 +194,7 @@ One cheap, CSS-only language gives Scarab its spec-sheet identity. Use it as
 described; don't invent new decoration.
 
 (The corner-**rivet** era is retired — dots carry the signature now, echoed by
-the dotted doodles, the pixel display face, and the ASCII beetles. Corner radii
+the dot-matrix doodles and the dots-only ASCII beetles. Corner radii
 are deliberately sharp-ish: `--radius: 5px`, `--radius-sm: 3px`,
 `--radius-lg: 7px` — crisp, not boxy.)
 
@@ -210,22 +206,24 @@ content (`z-index:0`) alongside the doodles.
 ## 5. Doodle & Decoration System
 
 Still the one place Scarab lets its hair down. Take clean **Lucide** line
-icons and re-draw them **dotted**: zero-length dashes with round caps turn
-every stroke into a run of round dots — the same dot-matrix language as the
-pixel display face, the page dot-grid, and the ASCII beetles. (The rough.js
-hand-sketched era is retired; sketchiness was a different accent.)
+icons and rasterize them onto a coarse **dot matrix**: one dot per lit grid
+cell, so a stroke is *several dots wide* — a true dot-matrix rendering, the
+same language as the ASCII beetle scenes (dots-only ramp), the page dot-grid,
+and the biform display voice. (The rough.js hand-sketched era and the earlier
+single-dotted-outline pass are both retired.)
 
 ### Rendering recipe
-Emit each Lucide icon's primitives verbatim with dotted stroke attributes on
-the SVG root (see `components/Doodle.tsx` and docs `scripts/gen-doodles.mjs`):
+Baked offline by `ui/brand/ascii/dot-icons.mjs` (part of `npm run bake` —
+docs and web-ui consume the SAME committed SVGs from
+`ui/brand/ascii/generated/doodles/`):
 
 | Option | Value | Note |
 |---|---|---|
-| `stroke-dasharray` | `0 1.2` | zero-length dash + round cap = round dots at a 1.2-unit pitch (24-unit viewBox) — the same grain as the 10 Pixel face |
-| `stroke-linecap` | `round` | this is what makes the dots |
-| `stroke-width` | `0.6` | dot diameter |
-| `stroke` | copper `#c0873f` | a literal hex — an SVG presentation attribute, where CSS custom properties don't resolve |
-| `fill` | none | dots only |
+| grid | 24×24 cells | over the icon's 24-unit viewBox (pitch 1) |
+| coverage threshold | 0.28 | a cell earns a dot when ≥28% inked (10× supersampled) |
+| dot radius | 0.34 | grid units |
+| ink | copper `#c0873f` | a literal hex — an SVG presentation attribute |
+| stroke sampled | width 2, round caps | Lucide's native stroke → ~2 dots wide |
 
 ### Placement rules
 - **1–2 doodles per page. Never more.** Background layer only
@@ -343,8 +341,8 @@ Placement is stricter than doodles, because motion competes with content:
   doodle ink, SHAs, trigger glyphs.
 - Put mono on every label, header, id, and machine token — it *is* the voice.
 - Keep the dot-grid faint; dots are the signature, not a texture bath.
-- Set only the h1/breadcrumb row in 10 Pixel; the wordmark in Major Mono Display; body in Inter.
-- Sprinkle **1–2** dotted doodles per page — background, faint, page-relevant.
+- Set the h1/breadcrumb row and the wordmark in Major Mono Display; body in Inter.
+- Sprinkle **1–2** dot-matrix doodles per page — background, faint, page-relevant.
 
 ### Don't
 - Don't use gold/copper as a **fill**, or as body text.
@@ -376,7 +374,7 @@ Placement is stricter than doodles, because motion competes with content:
 
 ### Iconography
 - **Functional**: Lucide (`lucide`), crisp, 1.5px stroke, `currentColor` (`components/Icon`).
-- **Doodles**: same Lucide icons, dotted at the §5 settings, 1–2/page, faint.
+- **Doodles**: same Lucide icons, dot-matrixed at the §5 settings, 1–2/page, faint.
 
 ### Fonts
 - **Space Grotesk** for titles only; **Inter** for body/UI; **JetBrains Mono**
@@ -400,8 +398,8 @@ Placement is stricter than doodles, because motion competes with content:
 1. Light default (cool, not warm); dark is a clean toggle; both styled. Logs/DAG stay pine-black.
 2. Emerald is the only working accent; gold is edges + rare tokens, never a fill.
 3. Zero shadows on flat chrome; depth = shade.
-4. Mono on every label/header/id; 10 Pixel 700 for the h1/breadcrumb row only (wordmark = Major Mono Display); Inter for body.
-5. One dotted decoration language — faint dot-grid + dotted doodles (1–2/page) + ASCII beetles.
+4. Mono on every label/header/id; Major Mono Display for the h1/breadcrumb row + wordmark; Inter for body.
+5. One dotted decoration language — faint dot-grid + dot-matrix doodles (1–2/page) + dots-only ASCII beetles.
 
 ## 10. Documentation surface (a distinct skin)
 

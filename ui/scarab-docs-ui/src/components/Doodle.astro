@@ -1,13 +1,13 @@
 ---
 // Background doodle — ADR-0040 + docs/DESIGN.md §5.
-// Places a committed, pre-generated DOTTED icon SVG (see
-// scripts/gen-doodles.mjs) faintly in the page background: rotated, scaled,
+// Places a committed, pre-generated DOT-MATRIX icon SVG (baked by
+// ui/brand/ascii — the same pipeline as the ASCII beetle scenes, so both UIs
+// share identical assets) faintly in the page background: rotated, scaled,
 // low-opacity, pointer-events none, behind content, never on a control.
 // ≤2 per page. No generator code here — we only serve the static SVG.
 //
-// The SVG is inlined (not <img>) so motion can target it. Dots preclude the
-// old stroke-dashoffset draw-on (it would overwrite the dash pattern), so
-// entry is a soft fade; parallax stays. Reduced-motion disables both.
+// The SVG is inlined (not <img>) so motion can target it; entry is a soft
+// fade, parallax stays. Reduced-motion disables both.
 interface Props {
   icon: string;
   size?: number;      // px, 120–260 per DESIGN.md
@@ -18,10 +18,10 @@ interface Props {
 }
 const { icon, size = 200, rotate = 0, opacity = 0.08, top, right, bottom, left, parallax = 0.15 } = Astro.props;
 
-const svgs = import.meta.glob('../assets/doodles/*.svg', { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
+const svgs = import.meta.glob('../../../brand/ascii/generated/doodles/*.svg', { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
 const entry = Object.entries(svgs).find(([p]) => p.endsWith(`/${icon}.svg`));
 const raw = entry?.[1];
-if (!raw) throw new Error(`Doodle: unknown motif "${icon}" (run npm run gen:doodles)`);
+if (!raw) throw new Error(`Doodle: unknown motif "${icon}" (run npm run bake in ui/brand/ascii)`);
 ---
 {raw && (
   <span

@@ -2,11 +2,12 @@
   "name": "scarab-brand-ascii",
   "private": true,
   "type": "module",
-  "description": "Offline ASCII scene baker — renders the brand beetle scenes to committed text frames (see README.md)",
+  "description": "Offline ASCII scene baker \u2014 renders the brand beetle scenes to committed text frames (see README.md)",
   "scripts": {
-    "bake": "node bake.mjs"
+    "bake": "node bake.mjs && node dot-icons.mjs"
   },
   "devDependencies": {
-    "@napi-rs/canvas": "^0.1.65"
+    "@napi-rs/canvas": "^0.1.65",
+    "lucide": "^1.24.0"
   }
 }

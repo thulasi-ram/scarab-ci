@@ -57,10 +57,9 @@
   --radius-sm: 3px;
   --radius-lg: 7px;
 
-  /* Display voice (DESIGN.md §5) — pairs with the ASCII beetle scenes.
-     TRIAL ORDER: "Doto Variable" → "Major Mono Display" → "Ten Pixel";
-     swap the first family to switch the whole app's display face. */
-  --font-display: "Ten Pixel", "Space Grotesk", "Inter", system-ui, sans-serif;
+  /* Display voice (DESIGN.md §5): Major Mono Display — the biform carries
+     the heading/breadcrumb row AND the wordmark. Single weight. */
+  --font-display: "Major Mono Display", "Space Grotesk", "Inter", system-ui, sans-serif;
   --font-ui: "Inter", system-ui, -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
 
@@ -102,21 +101,6 @@
   --badge-ink: #0b120e;
 
   color-scheme: dark;
-}
-
-/* Trial candidate: 10 Pixel (MagicType, OFL — ui/brand/fonts/10-pixel). Two
-   real cuts; loaded only if --font-display selects "Ten Pixel". */
-@font-face {
-  font-family: "Ten Pixel";
-  src: url("./assets/fonts/10Pixel-Regular.woff2") format("woff2");
-  font-weight: 400 500;
-  font-display: swap;
-}
-@font-face {
-  font-family: "Ten Pixel";
-  src: url("./assets/fonts/10Pixel-Bold.woff2") format("woff2");
-  font-weight: 600 800;
-  font-display: swap;
 }
 
 * {
@@ -230,8 +214,14 @@ code,
 .doodle {
   position: absolute;
   z-index: 0;
+  display: block;
   pointer-events: none;
   overflow: visible;
+}
+.doodle svg {
+  display: block;
+  width: 100%;
+  height: 100%;
 }
 
 /* ---- ASCII beetle scenes (ui/brand/ascii) ------------------------------
@@ -1084,9 +1074,7 @@ h2 {
   display: inline-flex;
   align-items: center;
   gap: 9px;
-  /* The wordmark is an identity mark, so it earns its own one-off face: the
-     biform Major Mono Display — used here and nowhere else. Single weight. */
-  font-family: "Major Mono Display", "Space Grotesk", var(--font-ui);
+  font-family: var(--font-display);
   font-size: 19px;
   font-weight: 400;
   letter-spacing: 0;
@@ -1461,11 +1449,11 @@ h2 {
 .rp-hint code { color: var(--copper); }
 
 /* ---- Display-face normalization (keep LAST — order wins) -----------------
-   The pixel face is scoped to the page heading/breadcrumb row ONLY (h1,
-   .crumb-head, .run-title). It can't take negative tracking (glyphs collide),
-   and its broken glyphs read lighter than solid text, so it gets the deepest
-   ink to hold hierarchy against sub-headings. */
+   The biform display face is scoped to the page heading/breadcrumb row + the
+   wordmark. Single weight (no synthetic bold), zero tracking, deepest ink so
+   its light strokes hold hierarchy against sub-headings. */
 h1, .crumb-head, .run-title {
+  font-weight: 400;
   letter-spacing: 0;
   font-synthesis: none;
   color: var(--display-ink);

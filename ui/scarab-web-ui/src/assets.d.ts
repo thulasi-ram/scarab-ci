@@ -11,3 +11,9 @@ declare module "*.txt?raw" {
   const text: string;
   export default text;
 }
+
+// import.meta.glob (Vite) — declared here because tsconfig `types: []`
+// deliberately skips vite/client.
+interface ImportMeta {
+  glob<T = unknown>(pattern: string, opts?: Record<string, unknown>): Record<string, T>;
+}

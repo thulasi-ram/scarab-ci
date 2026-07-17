@@ -16,32 +16,10 @@
  * --sl-color-text-accent unlayered (its default blue), which outranks anything
  * in @layer lucode. To win, our brand tokens must also be unlayered — loaded
  * after Starlight, so source order decides. */
-/* Display voice (DESIGN.md §5) — pairs with the ASCII beetle scenes; page
- * title + wordmark only, body stays Geist.
- * TRIAL ORDER (swap --scarab-display below): 'Doto Variable' (fontsource,
- * imported in astro.config) → 'Major Mono Display' (fontsource) →
- * 'Ten Pixel' (vendored, ui/brand/fonts/10-pixel). Unused @font-face
- * families don't download. */
-@font-face {
-  font-family: 'Ten Pixel';
-  src: url('../assets/fonts/10Pixel-Regular.woff2') format('woff2');
-  font-weight: 400 500;
-  font-display: swap;
-}
-@font-face {
-  font-family: 'Ten Pixel';
-  src: url('../assets/fonts/10Pixel-Bold.woff2') format('woff2');
-  font-weight: 600 800;
-  font-display: swap;
-}
-
 :root,
 :root[data-theme='light'] {
   --sl-font: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
-  /* Iosevka: the narrow programmer mono — machine tokens, code blocks, the
-   * terminal voice throughout the docs. (ASCII scenes stay JetBrains Mono —
-   * their baked geometry assumes its 0.6em advance.) */
-  --sl-font-mono: 'Iosevka', ui-monospace, SFMono-Regular, monospace;
+  --sl-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
 
   /* Deep pine-emerald — AA on paper. Copper deep enough to read on white. */
   --scarab-emerald: oklch(52% 0.1 162);
@@ -82,31 +60,21 @@
  * dot-matrix strokes hold a line. h2+ and body stay Geist — the display
  * voice is an accent, not the whole page. */
 :root {
-  --scarab-display: 'Ten Pixel';
-  /* Sharpened from Lucode's 0.625rem — crisp corners pair with the pixel
-     voice and the ASCII scenes. */
+  /* Display voice: Major Mono Display — the biform carries headings AND the
+   * wordmark. Single weight. */
+  --scarab-display: 'Major Mono Display';
+  /* Sharpened from Lucode's 0.625rem — crisp corners pair with the dotted
+     language and the ASCII scenes. */
   --radius: 0.375rem;
 }
 h1[data-page-title],
-/* Starlight inner-page titles carry id=_top; :where() keeps the ID from
- * out-ranking the wordmark override below (the hero h1 has BOTH). */
-h1:where(#_top),
-.sl-markdown-content h1 {
+h1#_top /* Starlight inner-page titles carry id=_top, not data-page-title */,
+.sl-markdown-content h1,
+.site-title span {
   font-family: var(--scarab-display), var(--sl-font-mono);
-  /* 700 rides 10 Pixel's real Bold cut (use 400 for single-weight faces). */
-  font-weight: 700;
+  font-weight: 400; /* single-weight face — no synthetic bold */
   letter-spacing: 0;
   font-synthesis: none;
-  color: var(--scarab-display-ink);
-}
-/* The wordmark (site title) and the landing hero title ARE the brand name —
- * an identity mark, so it earns its own one-off face: the biform Major Mono
- * Display, used here and nowhere else. Single weight. */
-.site-title span,
-body:has(.hero) h1[data-page-title] {
-  font-family: 'Major Mono Display', var(--sl-font-mono);
-  font-weight: 400;
-  letter-spacing: 0;
   color: var(--scarab-display-ink);
 }
 

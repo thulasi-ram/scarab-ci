@@ -1,19 +1,14 @@
-// Background doodle: a Lucide icon re-drawn DOTTED, per docs/DESIGN.md §5 —
-// zero-length dashes with round caps turn every stroke into a run of round
-// dots, the same dot-matrix language as the pixel display face, the page
-// dot-grid texture, and the ASCII beetle scenes. Placed 1–2 per page, rotated/
-// scaled/faint, in the background — never on a control.
-import { For } from "solid-js";
-import { Dynamic } from "solid-js/web";
-import { iconNode } from "../icons";
-
-// Canonical doodle ink. `stroke` is a literal hex (not `var(--copper)`): it's
-// an SVG presentation attribute, where CSS custom properties don't resolve.
-// dasharray "0 1.2" + round caps = dots Ø strokeWidth at a 1.2-unit pitch —
-// the same grain as the 10 Pixel display face.
-const STROKE = "#c0873f";
-const STROKE_WIDTH = 0.6;
-const DASH = "0 1.2";
+// Background doodle — docs/DESIGN.md §5.
+// Serves a committed, pre-generated DOT-MATRIX icon SVG (baked by
+// ui/brand/ascii — the same pipeline as the ASCII beetle scenes, so both UIs
+// share identical assets): the icon's strokes rasterized onto a dot grid,
+// several dots wide. Placed 1–2 per page, rotated/scaled/faint, in the
+// background — never on a control. No generator code ships.
+const svgs = import.meta.glob("../../../brand/ascii/generated/doodles/*.svg", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+}) as Record<string, string>;
 
 export default function Doodle(props: {
   icon: string;
@@ -25,22 +20,20 @@ export default function Doodle(props: {
   bottom?: string;
   left?: string;
 }) {
-  const node = () => iconNode(props.icon) ?? [];
+  const raw = () => {
+    const entry = Object.entries(svgs).find(([p]) => p.endsWith(`/${props.icon}.svg`));
+    if (!entry) throw new Error(`Doodle: unknown motif "${props.icon}" (run npm run bake in ui/brand/ascii)`);
+    return entry[1];
+  };
   const size = () => props.size ?? 200;
   return (
-    <svg
+    <span
       class="doodle"
-      viewBox="0 0 24 24"
-      width={size()}
-      height={size()}
-      fill="none"
-      stroke={STROKE}
-      stroke-width={STROKE_WIDTH}
-      stroke-dasharray={DASH}
-      stroke-linecap="round"
-      stroke-linejoin="round"
       aria-hidden="true"
+      innerHTML={raw()}
       style={{
+        width: `${size()}px`,
+        height: `${size()}px`,
         top: props.top,
         right: props.right,
         bottom: props.bottom,
@@ -48,10 +41,6 @@ export default function Doodle(props: {
         opacity: String(props.opacity ?? 0.08),
         transform: `rotate(${props.rotate ?? 0}deg)`,
       }}
-    >
-      <For each={node()}>
-        {([tag, attrs]) => <Dynamic component={tag} {...attrs} />}
-      </For>
-    </svg>
+    />
   );
 }

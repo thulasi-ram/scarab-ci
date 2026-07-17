@@ -26,7 +26,10 @@ const here = dirname(fileURLToPath(import.meta.url));
 const outDir = join(here, "generated");
 mkdirSync(outDir, { recursive: true });
 
-const RAMP = " .`:;i+=ox*XO#@";
+// Dots-only ramp: luminance maps to dot SIZE, not glyph shape — the scenes
+// read as a dot matrix, one language with the dotted doodles and the page
+// dot-grid. All four glyphs are single-cell in JetBrains Mono.
+const RAMP = " .·•●";
 const GAMMA = 0.8;
 const FPS = 12;
 
