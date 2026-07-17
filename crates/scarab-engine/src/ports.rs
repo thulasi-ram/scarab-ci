@@ -418,6 +418,25 @@ pub trait Db: Send + Sync {
     /// claimed again but retained for diagnosis.
     async fn dead_letter_outbox(&self, id: OutboxId) -> Result<(), DbError>;
 
+    /// Runs that still hold log chunks, are TERMINAL, and settled before
+    /// `cutoff` — the retention sweeper's work list (ADR-0050). Lifecycle-keyed
+    /// by contract: a non-terminal run (including one suspended on a gate for
+    /// weeks) is NEVER returned, regardless of age.
+    async fn prunable_log_runs(
+        &self,
+        cutoff: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError>;
+
+    /// Every log-chunk object key a run holds (across steps/attempts) — what
+    /// the sweeper deletes from the object store before dropping the index.
+    async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError>;
+
+    /// Drop a run's entire log-chunk INDEX (bodies are deleted from the object
+    /// store first — at-least-once: a crash between the two re-sweeps). Run
+    /// metadata (state row, event log) is retained for audit (ADR-0050).
+    async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError>;
+
     /// Acquire (or renew) a time-bounded lease over a named `resource` (a step
     /// id, `"scheduler"` leadership, …) for `owner`. Only an expired lease is
     /// taken over; the returned [`Lease`] names the current holder.

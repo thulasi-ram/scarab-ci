@@ -39,6 +39,7 @@
 //! | `SCARAB_GITHUB_APP_ID` | env | GitHub App id (ADR-0046): when set, GitHub connections authenticate in **App mode** (their credential secret is the App PEM); absent = token mode (dev) |
 //! | `SCARAB_OAUTH_CLIENT_ID` … `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | env | OAuth/OIDC login provider (ADR-0049): all five together enable real authn (GitHub, Forgejo, or any OIDC issuer); a partial set refuses boot |
 //! | `SCARAB_OAUTH_SCOPES` | env | space-separated scopes for the authorize redirect (optional; e.g. `read:user` for GitHub, `openid profile` for OIDC) |
+//! | `SCARAB_RETENTION_LOG_DAYS` | env | terminal runs' log TTL in days (ADR-0050); default 30 — metadata is retained regardless |
 //! | `SCARAB_OAUTH_OWNERS` | env | comma-separated subjects granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer` |
 //!
 //! Step-runtime env (`SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`/
@@ -220,6 +221,9 @@ pub struct Config {
     /// OAuth/OIDC login (ADR-0049 C1). `Some` = real authn wired; `None` is
     /// only bootable under `SCARAB_DEV_INSECURE=1`.
     pub oauth: Option<OAuthConfig>,
+    /// How long a terminal run's logs are retained, in days (ADR-0050;
+    /// ADR-0030 default 30). Run metadata is retained regardless.
+    pub retention_log_days: u32,
 }
 
 /// The forge-agnostic OAuth/OIDC login provider (ADR-0049): explicit
@@ -300,6 +304,12 @@ pub enum ConfigError {
          provider would fail at first login, not at boot)."
     )]
     PartialOAuth(String),
+
+    #[error(
+        "SCARAB_RETENTION_LOG_DAYS is set but invalid — want a positive integer number \
+         of days (terminal runs' log TTL, ADR-0050)."
+    )]
+    InvalidRetention,
 
     #[error(
         "SCARAB_STEP_TIMEOUT_SECS is set but invalid — want a positive integer number \
@@ -464,6 +474,14 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "ghcr.io/thulasi-ram/scarab-clone:edge".into()),
             oauth,
+            retention_log_days: match env("SCARAB_RETENTION_LOG_DAYS").filter(|v| !v.is_empty()) {
+                Some(v) => v
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|d| *d > 0)
+                    .ok_or(ConfigError::InvalidRetention)?,
+                None => 30,
+            },
         })
     }
 

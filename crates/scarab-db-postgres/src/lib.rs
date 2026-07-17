@@ -1154,6 +1154,44 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn prunable_log_runs(
+        &self,
+        cutoff: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT r.id FROM runs r
+             JOIN log_chunks lc ON lc.run_id = r.id
+             WHERE r.status IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
+               AND r.updated_at < $1
+             LIMIT $2",
+        )
+        .bind(cutoff.0)
+        .bind(limit as i64)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
+    }
+
+    async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError> {
+        let rows = sqlx::query("SELECT object_key FROM log_chunks WHERE run_id = $1")
+            .bind(&run.0)
+            .fetch_all(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(rows.into_iter().map(|r| r.get::<String, _>("object_key")).collect())
+    }
+
+    async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM log_chunks WHERE run_id = $1")
+            .bind(&run.0)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
         // Acquire or renew, taking over only an expired lease. RETURNING yields
         // the winning holder; if the incumbent lease is still valid the DO

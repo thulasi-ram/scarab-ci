@@ -911,6 +911,42 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
+    async fn prunable_log_runs(
+        &self,
+        cutoff: Timestamp,
+        limit: u32,
+    ) -> Result<Vec<RunId>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<RunId> = st
+            .runs
+            .iter()
+            .filter(|(run, status)| {
+                status.is_terminal()
+                    && st.run_created.get(*run).copied().unwrap_or(Timestamp(0)).0 < cutoff.0
+                    && st.logs.keys().any(|(r, _, _)| r == *run)
+            })
+            .map(|(run, _)| run.clone())
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
+    async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .logs
+            .iter()
+            .filter(|((r, _, _), _)| r == run)
+            .flat_map(|(_, metas)| metas.iter().map(|m| m.object_key.clone()))
+            .collect())
+    }
+
+    async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError> {
+        self.state.lock().unwrap().logs.retain(|(r, _, _), _| r != run);
+        Ok(())
+    }
+
     async fn lease(&self, _resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
         Ok(Lease {
             owner: owner.to_string(),

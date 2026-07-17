@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let store: Arc<dyn ObjectStore> = storage.clone();
     let workspace_cas: Arc<dyn scarab_storage::Cas> = storage;
-    let logs = Arc::new(LogService::new(store, db.clone()));
+    let logs = Arc::new(LogService::new(store.clone(), db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
     // Secrets store (envelope-encrypted, ADR-0014): built up-front — before the
@@ -115,6 +115,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         s.migrate().await?;
         Arc::new(s)
     };
+
+    // Retention sweeper (ADR-0050): leader-gated, prunes terminal runs' log
+    // blobs + index past the class TTL. Non-terminal (incl. gate-suspended)
+    // runs are never eligible by construction; metadata is retained.
+    if config.role.runs_driver() {
+        scarab_server::retention::spawn_sweeper(
+            db.clone(),
+            Arc::clone(&store),
+            clock.clone(),
+            "scarab-server".to_string(),
+            scarab_server::retention::RetentionConfig {
+                log_ttl_ms: (config.retention_log_days as i64) * 24 * 60 * 60 * 1000,
+            },
+            Duration::from_secs(300),
+        );
+        tracing::info!(
+            "retention sweeper on (logs {}d; metadata retained, ADR-0050)",
+            config.retention_log_days
+        );
+    }
 
     // The OIDC issuer (ADR-0015), built BEFORE the driver so the launch path
     // can mint per-attempt federation tokens; also serves JWKS + discovery.
