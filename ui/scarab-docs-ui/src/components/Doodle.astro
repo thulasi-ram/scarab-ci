@@ -1,13 +1,13 @@
 ---
 // Background doodle — ADR-0040 + docs/DESIGN.md §5.
-// Places a committed, pre-generated rough.js SVG (see scripts/gen-doodles.mjs)
-// faintly in the page background: rotated, scaled, low-opacity, pointer-events
-// none, behind content, never on a control. ≤2 per page. No rough.js here — we
-// only serve the static SVG the generator produced.
+// Places a committed, pre-generated DOTTED icon SVG (see
+// scripts/gen-doodles.mjs) faintly in the page background: rotated, scaled,
+// low-opacity, pointer-events none, behind content, never on a control.
+// ≤2 per page. No generator code here — we only serve the static SVG.
 //
-// The SVG is inlined (not <img>) so the motion script can target its <path>s
-// for the "draw-on" (stroke-dashoffset) effect. Motion is best-effort and
-// disabled under prefers-reduced-motion.
+// The SVG is inlined (not <img>) so motion can target it. Dots preclude the
+// old stroke-dashoffset draw-on (it would overwrite the dash pattern), so
+// entry is a soft fade; parallax stays. Reduced-motion disables both.
 interface Props {
   icon: string;
   size?: number;      // px, 120–260 per DESIGN.md
@@ -59,18 +59,16 @@ if (!raw) throw new Error(`Doodle: unknown motif "${icon}" (run npm run gen:dood
   const doodles = Array.from(document.querySelectorAll<HTMLElement>('.doodle'));
 
   if (!reduce && doodles.length) {
-    // Draw-on: sketch each path in when the doodle scrolls into view.
+    // Soft fade-in when the doodle scrolls into view (dots rule out the old
+    // stroke-dashoffset draw-on — it would overwrite the dash pattern).
     const io = new IntersectionObserver((entries) => {
       for (const e of entries) {
         if (!e.isIntersecting) continue;
-        const paths = (e.target as HTMLElement).querySelectorAll<SVGPathElement>('path');
-        paths.forEach((p, i) => {
-          const len = p.getTotalLength();
-          p.style.strokeDasharray = String(len);
-          p.style.strokeDashoffset = String(len);
-          p.style.transition = `stroke-dashoffset 1.1s ease ${i * 0.06}s`;
-          requestAnimationFrame(() => { p.style.strokeDashoffset = '0'; });
-        });
+        const el = e.target as HTMLElement;
+        const target = el.style.getPropertyValue('--doodle-opacity') || '0.08';
+        el.style.opacity = '0';
+        el.style.transition = 'opacity 1.2s ease';
+        requestAnimationFrame(() => { el.style.opacity = target; });
         io.unobserve(e.target);
       }
     }, { threshold: 0.15 });

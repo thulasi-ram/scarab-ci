@@ -29,10 +29,9 @@
   --emerald: #137a52;        /* links, active nav, focus — deepened for white contrast */
   --emerald-bright: #0f6644; /* hover */
 
-  /* ── Edge — gold (strokes, rivets, doodles, rare accent text) ────────── */
+  /* ── Edge — gold (strokes, doodles, rare accent text) ────────────────── */
   --copper: #8a6416;         /* deepened so gold text/edges read on white. Never a fill. */
   --border-copper: rgba(138, 100, 22, 0.5);
-  --rivet: var(--copper);    /* registration-rivet color (§4) */
 
   /* ── Text (ink on light) ─────────────────────────────────────────────── */
   --soft-white: #0f1a15;     /* primary ink (near-black pine) */
@@ -51,8 +50,10 @@
   --danger: #c4443b;
   --badge-ink: #f6f9f6;      /* text on solid status pills */
 
-  --radius: 8px;
-  --radius-sm: 6px;
+  /* Sharpened (pairs with the pixel display face): crisp, not boxy. */
+  --radius: 5px;
+  --radius-sm: 3px;
+  --radius-lg: 7px;
 
   /* Display voice (DESIGN.md §5) — pairs with the ASCII beetle scenes.
      TRIAL ORDER: "Doto Variable" → "Major Mono Display" → "Ten Pixel";
@@ -335,36 +336,6 @@ h2 {
 
 .subtle {
   color: var(--muted-sage);
-}
-
-/* ---- Registration rivets (the house signature) ------------------------ */
-/* Four small square "rivets" at the corners, drawn as a single ::after overlay
-   so they sit cleanly on ANY element regardless of its own border or fill (the
-   old inset L-brackets fought bordered/filled cards). The overlay spans the box
-   and paints one 3px square in each corner. Rivet color defaults to gold but is
-   overridable per element via --rivet (e.g. light rivets on the dark button). */
-.riveted {
-  position: relative;
-}
-.riveted::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  pointer-events: none;
-  border-radius: inherit;
-  background-image:
-    linear-gradient(var(--rivet) 0 0),
-    linear-gradient(var(--rivet) 0 0),
-    linear-gradient(var(--rivet) 0 0),
-    linear-gradient(var(--rivet) 0 0);
-  background-size: 3px 3px;
-  background-position:
-    var(--rivet-inset, 5px) var(--rivet-inset, 5px),
-    calc(100% - var(--rivet-inset, 5px)) var(--rivet-inset, 5px),
-    var(--rivet-inset, 5px) calc(100% - var(--rivet-inset, 5px)),
-    calc(100% - var(--rivet-inset, 5px)) calc(100% - var(--rivet-inset, 5px));
-  background-repeat: no-repeat;
 }
 
 /* ---- Buttons ---------------------------------------------------------- */
@@ -1107,7 +1078,9 @@ h2 {
   display: inline-flex;
   align-items: center;
   gap: 9px;
-  font-family: var(--font-display);
+  /* The wordmark is an identity, not a rendering — it stays in the normal
+     grotesque; the pixel voice belongs to page titles + the ASCII scenes. */
+  font-family: "Space Grotesk", var(--font-ui);
   font-size: 21px;
   font-weight: 700;
   letter-spacing: -0.6px;
@@ -1211,41 +1184,13 @@ h2 {
 .btn-copper:hover { background: color-mix(in srgb, var(--copper) 10%, transparent); }
 .btn-sm { padding: 5px 11px; font-size: 12px; }
 
-/* Riveted CTAs (Convey button motif): four corner rivets. The dark-pine primary
-   gets light rivets; the gold-outline featured button gets gold rivets. Gold
-   stays an edge, never a fill. */
-.btn-primary,
-.btn-copper {
-  position: relative;
-}
-.btn-primary { --btn-rivet: rgba(242, 246, 244, 0.8); }
-.btn-copper { --btn-rivet: var(--copper); }
-.btn-primary::after,
-.btn-copper::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  pointer-events: none;
-  border-radius: inherit;
-  background-image:
-    linear-gradient(var(--btn-rivet) 0 0),
-    linear-gradient(var(--btn-rivet) 0 0),
-    linear-gradient(var(--btn-rivet) 0 0),
-    linear-gradient(var(--btn-rivet) 0 0);
-  background-size: 2.5px 2.5px;
-  background-position: 4px 4px, calc(100% - 4px) 4px, 4px calc(100% - 4px),
-    calc(100% - 4px) calc(100% - 4px);
-  background-repeat: no-repeat;
-}
-
 /* ---- repo cards ---- */
 .repo-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
 @media (max-width: 720px) { .repo-grid { grid-template-columns: 1fr; } }
 .repo-card {
   position: relative;
   display: block; text-decoration: none; color: inherit;
-  background: var(--emerald-surface); border: 1px solid var(--border); border-radius: 12px;
+  background: var(--emerald-surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
   padding: 18px 20px; transition: border-color 0.12s ease, background 0.12s ease;
 }
 .repo-card:hover { border-color: var(--emerald); }
@@ -1290,7 +1235,7 @@ h2 {
 .filters-refresh { margin-left: auto; }
 
 /* ---- run list rows ---- */
-.runlist { border: 1px solid var(--border); border-radius: 11px; overflow: hidden; background: var(--emerald-surface); }
+.runlist { border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; background: var(--emerald-surface); }
 .runrow {
   display: grid; grid-template-columns: 16px 1.8fr 1fr 0.7fr 0.7fr; gap: 14px; align-items: center;
   padding: 12px 16px; border-bottom: 1px solid var(--border-soft); cursor: pointer;
@@ -1331,7 +1276,7 @@ h2 {
 .modal {
   position: relative;
   width: min(460px, 92vw); background: var(--emerald-elevated); border: 1px solid var(--border);
-  border-radius: 12px; overflow: hidden;
+  border-radius: var(--radius-lg); overflow: hidden;
   box-shadow: 0 24px 60px -28px rgba(10, 20, 14, 0.45);
 }
 .modal-body { padding: 18px; display: flex; flex-direction: column; gap: 12px; }
@@ -1385,30 +1330,6 @@ h2 {
   color: var(--muted-sage);
 }
 
-/* ---- Rivet signature (used sparingly, docs/DESIGN.md §4) --------------- */
-/* Only the landing repo cards and the run *summary* block get container rivets
-   — panels, the run list, environments, and secrets stay clean (their CTAs
-   carry the rivet motif instead). Both selectors are position:relative already. */
-.repo-card::after,
-.prov::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  pointer-events: none;
-  border-radius: inherit;
-  background-image:
-    linear-gradient(var(--rivet) 0 0),
-    linear-gradient(var(--rivet) 0 0),
-    linear-gradient(var(--rivet) 0 0),
-    linear-gradient(var(--rivet) 0 0);
-  background-size: 3px 3px;
-  background-position: 7px 7px, calc(100% - 7px) 7px, 7px calc(100% - 7px),
-    calc(100% - 7px) calc(100% - 7px);
-  background-repeat: no-repeat;
-  opacity: 0.6;
-}
-
 /* ════════════════════════════════════════════════════════════════════════
    Dashboard (engineer landing): action inbox · activity · all-clear
    ════════════════════════════════════════════════════════════════════════ */
@@ -1433,7 +1354,7 @@ h2 {
 }
 
 /* ---- action inbox ---- */
-.inbox { border: 1px solid var(--border); border-radius: 11px; overflow: hidden; background: var(--emerald-surface); }
+.inbox { border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; background: var(--emerald-surface); }
 .inbox-row {
   display: grid; grid-template-columns: 84px 1fr auto auto; gap: 14px; align-items: center;
   padding: 13px 16px; border-bottom: 1px solid var(--border-soft); cursor: pointer;
@@ -1458,7 +1379,7 @@ h2 {
 /* ---- all-clear (calm state) ---- */
 .allclear {
   display: flex; align-items: center; gap: 15px; margin-top: 8px;
-  padding: 20px 22px; border: 1px solid var(--border); border-radius: 11px;
+  padding: 20px 22px; border: 1px solid var(--border); border-radius: var(--radius-lg);
   background: var(--emerald-surface);
 }
 .allclear .ac-ico { color: var(--emerald); flex: none; }
@@ -1537,9 +1458,9 @@ h2 {
    Pixel/dot display faces can't take the negative tracking the old grotesque
    wore (glyphs collide/merge). Weights stay as declared — Doto is variable.
    Dot-matrix needs a little extra weight to hold a line, so bump the mids. */
-h1, h2, .brand, .crumb-head, .run-title, .repo-name, .ac-title {
+h1, h2, .crumb-head, .run-title, .repo-name, .ac-title {
   letter-spacing: 0;
   font-synthesis: none;
 }
-/* 10 Pixel trial: real Bold cut — let the mids use it. */
+/* 10 Pixel: real Bold cut — let the mids use it. */
 h2, .repo-name, .ac-title { font-weight: 700; }

@@ -1,7 +1,7 @@
 // Lucide icon data (the framework-agnostic `lucide` package exports each icon as
 // an IconNode — an array of [tag, attrs] primitives on a 24×24 canvas). We use
 // the SAME data two ways: rendered crisp for functional UI (see components/Icon)
-// and re-drawn hand-sketched via rough.js for the background doodles
+// and re-drawn dotted for the background doodles
 // (components/Doodle) — per the doodle system in docs/DESIGN.md §5.
 import {
   Bug,
