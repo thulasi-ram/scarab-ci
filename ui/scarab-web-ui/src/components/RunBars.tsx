@@ -1,6 +1,6 @@
-// A repo's recent runs as a duration bar strip (status-page style): oldest →
-// newest, one bar per run. Colour = outcome (green pass / red fail / amber gate
-// / muted in-flight); HEIGHT = how long the run took (`duration_ms`), sqrt-scaled
+// A repo's recent runs as a thin duration sparkline: oldest → newest, one bar
+// per run. Colour = outcome (green pass / red fail / grey cancelled / amber gate
+// / yellow in-flight); HEIGHT = how long the run took (`duration_ms`), sqrt-scaled
 // against the strip's peak so one long run doesn't flatten the rest, with a floor
 // so short runs stay visible. Fed by GET /v1/repos/{org}/{repo}/runs.
 import { For } from "solid-js";
@@ -9,9 +9,11 @@ import { duration } from "../fmt";
 
 function tone(status: string): string {
   if (status === "succeeded") return "ok";
-  if (status === "failed" || status === "cancelled") return "fail";
+  if (status === "failed") return "fail";
+  if (status === "cancelled") return "cancelled";
   if (status === "suspended") return "warn";
-  return "idle"; // running / pending
+  if (status === "running") return "run";
+  return "idle"; // pending
 }
 
 const FLOOR = 18; // %, so the shortest runs still read
