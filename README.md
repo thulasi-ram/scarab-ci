@@ -208,6 +208,26 @@ Without Docker/kind, the server still runs API-only against a local Postgres and
 a filesystem object store (`--object-dir`); the background driver is skipped
 until a cluster is reachable.
 
+## Helm dogfood (in-cluster, colima)
+
+To exercise the **real chart + published image** in-cluster (prod-shaped, e.g.
+Scarab-on-Scarab), use the `local-helm` mode:
+
+```sh
+just local-helm             # pull + deploy the latest ghcr `edge`
+just local-helm sha-<sha>   # pull + deploy a specific published SHA
+just local-helm local       # build server+clone+sidecar from the tree, then deploy
+```
+
+Needs `deploy/local-helm/.env` and kube context `colima`; see
+`deploy/local-helm/README.md`.
+
+> **Running or testing Scarab locally: use the `just` recipes as the canonical
+> entrypoints** (`just up`/`demo`/`down`, `just local-helm`, `just test`) rather
+> than hand-rolled `docker`/`kubectl`/`helm` commands — they carry the right
+> env, isolated kubeconfig, image source, and colima guards. Missing something?
+> Add a recipe. (Agents: this is also in `CLAUDE.md`.)
+
 ## API contract workflow (ADR-0054)
 
 `openapi.json` (committed at the repo root) and the generated TS client
