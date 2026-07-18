@@ -5,8 +5,9 @@
 // the active tab (run a pipeline, add an environment, add a secret).
 import { createResource, createSignal, createEffect, For, Show } from "solid-js";
 import { useParams, useNavigate } from "@solidjs/router";
+import { recordVisit } from "../visited";
 import {
-  listRuns,
+  listRepoRuns,
   listSecrets,
   putSecret,
   deleteSecret,
@@ -36,15 +37,13 @@ export default function RepoView() {
   const org = () => params.org!;
   const repo = () => params.repo!;
 
-  // Only this repo's tenanted runs (run.org/project stamped at creation,
-  // ADR-0049). Untenanted dev runs (inline `POST /v1/runs`) don't belong to
-  // any repo, so they never show here — the dashboard's activity feed has them.
+  // Remember this repo for the dashboard's "recently visited" row (browser-local).
+  createEffect(() => recordVisit(org(), repo()));
+
+  // Only this repo's tenanted runs, straight from the per-repo endpoint (ADR-0046).
   const [rows, { refetch }] = createResource(
     () => ({ org: org(), repo: repo() }),
-    async (k): Promise<RunSummary[]> => {
-      const runs = await listRuns(50);
-      return runs.filter((r) => r.org === k.org && r.project === k.repo);
-    },
+    (k): Promise<RunSummary[]> => listRepoRuns(k.org, k.repo, 50),
   );
 
   const [tab, setTab] = createSignal<Tab>("runs");

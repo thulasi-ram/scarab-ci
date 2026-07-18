@@ -21,7 +21,7 @@ fn repo(owner: &str, name: &str) -> RepoRef {
 async fn unregistered_repo_fails_with_a_clear_error() {
     let registry = Arc::new(InMemoryDb::new());
     let secrets = Arc::new(FakeSecrets::new());
-    let forge = RegistryForge::new(registry, secrets, None, None);
+    let forge = RegistryForge::new(registry, secrets, None);
 
     let err = forge
         .latest_commit(&repo("stranger", "danger"), "main")
@@ -47,7 +47,7 @@ async fn missing_credential_material_fails_loudly_at_use_time() {
         .await
         .unwrap();
     // No secret registered under the handle → the adapter cannot be built.
-    let forge = RegistryForge::new(registry, Arc::new(FakeSecrets::new()), None, None);
+    let forge = RegistryForge::new(registry, Arc::new(FakeSecrets::new()), None);
 
     let err = forge
         .latest_commit(&repo("acme", "web"), "main")
@@ -94,7 +94,7 @@ async fn production_path_posts_a_status_with_run_deep_link_live() {
     let scope = SecretScope::Org { org: FORGE_CREDENTIALS_ORG.to_string() };
     let secrets = Arc::new(FakeSecrets::new().with_secret(&scope, "gh-live-token", token.as_bytes()));
 
-    let forge = RegistryForge::new(registry, secrets, None, None);
+    let forge = RegistryForge::new(registry, secrets, None);
 
     // Webhook-triggered config reads go through the same routed port.
     let commit = forge.latest_commit(&target, "main").await.expect("resolve main");

@@ -144,6 +144,28 @@
         }
       }
     },
+    "/v1/me": {
+      "get": {
+        "tags": [],
+        "summary": "Return the current authenticated principal. In dev (auth disabled) this is\nthe synthetic Owner.",
+        "operationId": "me",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "not authenticated"
+          }
+        }
+      }
+    },
     "/v1/orgs/{org}/bindings": {
       "get": {
         "tags": [],
@@ -448,6 +470,56 @@
           },
           "404": {
             "description": "no pipeline by that name at the ref"
+          }
+        }
+      }
+    },
+    "/v1/repos/{org}/{repo}/runs": {
+      "get": {
+        "tags": [],
+        "summary": "A repo's most recent runs, newest first (ADR-0046) — the dashboard's per-repo\nhistory and pass/fail chart source. Scoped to the repo's tenant.",
+        "operationId": "list_repo_runs",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "project (repo) name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "max runs (default 50, capped 200)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunListResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -1171,6 +1243,34 @@
           }
         }
       },
+      "MeResponse": {
+        "type": "object",
+        "description": "The authenticated principal (ADR-0049) — powers the UI's identity menu.",
+        "required": [
+          "subject",
+          "roles"
+        ],
+        "properties": {
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human display name, when the identity provides one."
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The principal's Scarab-native roles (e.g. `[\"Owner\"]`)."
+          },
+          "subject": {
+            "type": "string",
+            "description": "Stable, forge-agnostic identity subject."
+          }
+        }
+      },
       "PipelineCatalogResponse": {
         "type": "object",
         "description": "`GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable\ncatalog at a ref (ADR-0043 §4). Lightweight — each entry is an `on:`-only\nread, not a full compile. `sha` is the ref resolved to a concrete commit.",
@@ -1268,6 +1368,14 @@
           "name"
         ],
         "properties": {
+          "last_run_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Epoch millis of the project's most recent run, or `null` if it has never\nrun — the dashboard's recency signal (ADR-0046). The domain carries no\npush/created_at yet, so never-run repos have no ordering key here."
+          },
           "name": {
             "type": "string"
           },

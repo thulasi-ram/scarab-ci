@@ -29,8 +29,7 @@ use uuid::Uuid;
 
 use scarab_engine::{
     Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RestartError, RunId, RunStatus,
-    StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION, MAX_DELIVERY_ATTEMPTS,
-    RUN_STATUS_CHANGED,
+    StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION, RUN_STATUS_CHANGED,
 };
 use scarab_identity::{Action, Principal, Session};
 
@@ -1192,6 +1191,40 @@ pub struct ProjectDto {
     /// The forge coordinate backing it (1:1 in v1).
     pub owner: String,
     pub name: String,
+    /// Epoch millis of the project's most recent run, or `null` if it has never
+    /// run — the dashboard's recency signal (ADR-0046). The domain carries no
+    /// push/created_at yet, so never-run repos have no ordering key here.
+    pub last_run_at: Option<i64>,
+}
+
+/// The authenticated principal (ADR-0049) — powers the UI's identity menu.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeResponse {
+    /// Stable, forge-agnostic identity subject.
+    pub subject: String,
+    /// Human display name, when the identity provides one.
+    pub display_name: Option<String>,
+    /// The principal's Scarab-native roles (e.g. `["Owner"]`).
+    pub roles: Vec<String>,
+}
+
+/// Return the current authenticated principal. In dev (auth disabled) this is
+/// the synthetic Owner.
+#[utoipa::path(
+    get,
+    path = "/v1/me",
+    responses(
+        (status = 200, body = MeResponse),
+        (status = 401, description = "not authenticated")
+    )
+)]
+async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeResponse>, ApiError> {
+    let principal = authenticate(&st, &headers, Action::Read).await?;
+    Ok(Json(MeResponse {
+        subject: principal.subject,
+        display_name: principal.display_name,
+        roles: principal.roles.iter().map(|r| format!("{r:?}")).collect(),
+    }))
 }
 
 /// List the registered projects (ADR-0046 registry — what the dashboard's
@@ -1246,16 +1279,69 @@ async fn list_projects(
                     continue;
                 }
             }
+            // Recency signal (ADR-0046): the tenant's most recent run, if any.
+            let last_run_at = st
+                .db
+                .list_runs_for_tenant(&resolved.org, &resolved.project, 1)
+                .await?
+                .first()
+                .map(|r| r.created_at.0);
             out.push(ProjectDto {
                 org: resolved.org,
                 project: resolved.project,
                 owner: repo.owner,
                 name: repo.name,
+                last_run_at,
             });
         }
     }
-    out.sort_by(|a, b| (&a.org, &a.project).cmp(&(&b.org, &b.project)));
+    // Most-recently-active first; never-run repos fall back to (org, project)
+    // alphabetical (no push/created_at exists in the domain yet).
+    out.sort_by(|a, b| {
+        b.last_run_at
+            .cmp(&a.last_run_at)
+            .then_with(|| (&a.org, &a.project).cmp(&(&b.org, &b.project)))
+    });
     Ok(Json(out))
+}
+
+/// A repo's most recent runs, newest first (ADR-0046) — the dashboard's per-repo
+/// history and pass/fail chart source. Scoped to the repo's tenant.
+#[utoipa::path(
+    get,
+    path = "/v1/repos/{org}/{repo}/runs",
+    params(
+        ("org" = String, Path, description = "org slug"),
+        ("repo" = String, Path, description = "project (repo) name"),
+        ("limit" = Option<u32>, Query, description = "max runs (default 50, capped 200)")
+    ),
+    responses((status = 200, body = RunListResponse))
+)]
+async fn list_repo_runs(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo)): Path<(String, String)>,
+    Query(q): Query<ListRunsQuery>,
+) -> Result<Json<RunListResponse>, ApiError> {
+    let scope = scarab_identity::Scope::Project {
+        org: org.clone(),
+        name: repo.clone(),
+    };
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
+    let runs = st.db.list_runs_for_tenant(&org, &repo, limit).await?;
+    Ok(Json(RunListResponse {
+        runs: runs
+            .into_iter()
+            .map(|s| RunSummaryDto {
+                id: s.run.0,
+                status: run_status_name(s.status).to_string(),
+                created_at: s.created_at.0,
+                org: s.tenant.as_ref().map(|(o, _)| o.clone()),
+                project: s.tenant.as_ref().map(|(_, p)| p.clone()),
+            })
+            .collect(),
+    }))
 }
 
 /// One artifact in a run's list (ADR-0052).
@@ -2154,42 +2240,10 @@ pub async fn drain_forge_statuses(
             sha,
             message: String::new(),
         };
-        // Post the status. A failed post stays on the outbox for redelivery
-        // (at-least-once; set_status is idempotent on the forge) but is no
-        // longer SILENT: log it, count the failed delivery, and dead-letter the
-        // MESSAGE after MAX_DELIVERY_ATTEMPTS so a permanently-rejected post —
-        // e.g. HTTP 403 "Resource not accessible by integration" when the App
-        // lacks statuses:write — surfaces instead of retrying forever. Mirrors
-        // scheduler::reconcile poison handling (ADR-0047), but never dead-letters
-        // the run: the run's verdict is independent of the forge accepting it.
-        match forge.set_status(&repo, &commit, status).await {
-            Ok(()) => {
-                db.mark_dispatched(msg.id).await?;
-                posted += 1;
-            }
-            Err(e) => {
-                let failures = db.record_outbox_failure(msg.id).await?;
-                tracing::warn!(
-                    run = %msg.run.0,
-                    repo = %format!("{}/{}", repo.owner, repo.name),
-                    sha = %commit.sha,
-                    failures,
-                    error = %e,
-                    "forge set_status failed; left on outbox for redelivery"
-                );
-                if failures >= MAX_DELIVERY_ATTEMPTS {
-                    db.dead_letter_outbox(msg.id).await?;
-                    tracing::error!(
-                        run = %msg.run.0,
-                        repo = %format!("{}/{}", repo.owner, repo.name),
-                        sha = %commit.sha,
-                        failures,
-                        error = %e,
-                        "forge set_status dead-lettered as poison — status will NOT be \
-                         posted; check the forge App's statuses:write permission"
-                    );
-                }
-            }
+        // Leave a failed post unclaimed for redelivery rather than dropping it.
+        if forge.set_status(&repo, &commit, status).await.is_ok() {
+            db.mark_dispatched(msg.id).await?;
+            posted += 1;
         }
     }
     Ok(posted)
@@ -3696,6 +3750,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         oauth_login_redirect,
         oauth_callback,
         logout,
+        me,
         list_bindings,
         put_binding,
         delete_binding,
@@ -3715,6 +3770,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         pipeline_interface,
         list_runs,
         list_projects,
+        list_repo_runs,
         get_run,
         get_events,
         get_logs,
@@ -3743,7 +3799,8 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         RunStatusResponse,
         StepStatusDto,
         PutSecretRequest,
-        SecretListResponse
+        SecretListResponse,
+        MeResponse
     ))
 )]
 pub struct ApiDoc;
@@ -3773,12 +3830,14 @@ fn router_inner(state: AppState) -> Router {
         .route("/v1/auth/login", post(login).get(oauth_login_redirect))
         .route("/v1/auth/callback", get(oauth_callback))
         .route("/v1/auth/logout", post(logout))
+        .route("/v1/me", get(me))
         .route(
             "/v1/orgs/{org}/bindings",
             get(list_bindings).put(put_binding).delete(delete_binding),
         )
         .route("/v1/repos/{org}/{repo}/bindings/import", post(import_bindings))
         .route("/v1/repos", get(list_projects))
+        .route("/v1/repos/{org}/{repo}/runs", get(list_repo_runs))
         .route("/v1/runs", post(create_run).get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))

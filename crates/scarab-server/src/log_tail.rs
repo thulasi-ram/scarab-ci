@@ -204,20 +204,11 @@ impl LogTailer {
                     drained.lock().unwrap().insert(fence.clone());
                     retry_at.lock().unwrap().remove(&fence);
                 }
-                // Best-effort: a lost tail never fails the run (ADR-0013). The
-                // common benign case is a step Pod that hasn't started its
-                // container yet (Pending / PodInitializing / ContainerCreating) —
-                // an expected pre-start state, not a failure. On a cold image
-                // pull that can last minutes, so log it at debug and back off
-                // quietly; only WARN on a genuine tail error. Either way, back
-                // off before retrying so we don't hammer the API each tick.
+                // Best-effort: a lost tail never fails the run (ADR-0013). Common
+                // benign case: the Pod is still Pending, so its log isn't ready —
+                // back off before retrying so we don't hammer the API each tick.
                 Err(e) => {
-                    let msg = e.to_string();
-                    if is_pod_not_ready(&msg) {
-                        tracing::debug!(run = %run.0, step = %step_id.0, error = %msg, "log tail: step Pod not ready yet, backing off");
-                    } else {
-                        tracing::warn!(run = %run.0, step = %step_id.0, error = %msg, "log tail ended with error");
-                    }
+                    tracing::warn!(run = %run.0, step = %step_id.0, error = %e, "log tail ended with error");
                     retry_at
                         .lock()
                         .unwrap()
@@ -227,17 +218,6 @@ impl LogTailer {
             active.lock().unwrap().remove(&fence);
         });
     }
-}
-
-/// True when a log-tail error just means the step Pod hasn't started its
-/// container yet — an expected pre-start state the tail should retry quietly,
-/// not a genuine failure. We match on the specific benign container-waiting
-/// *reasons* (PodInitializing / ContainerCreating), NOT the generic "is waiting
-/// to start:" prefix — that prefix also carries the reasons we DO want to warn
-/// about (ImagePullBackOff, ErrImagePull, CrashLoopBackOff, …).
-fn is_pod_not_ready(err: &str) -> bool {
-    const NOT_READY: [&str; 2] = ["PodInitializing", "ContainerCreating"];
-    NOT_READY.iter().any(|m| err.contains(m))
 }
 
 /// Open the executor's log source for `step` and pump it into the pipeline. A
@@ -257,28 +237,5 @@ async fn drain(
             Ok(())
         }
         None => Ok(()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_pod_not_ready;
-
-    #[test]
-    fn pre_start_states_are_quiet() {
-        // The real dogfood message: kube exec against a Pod still initializing.
-        assert!(is_pod_not_ready(
-            "executor error: exec error: ApiError: container \"step\" in pod \
-             \"scarab-check-a1-7893ca80\" is waiting to start: PodInitializing: BadRequest"
-        ));
-        assert!(is_pod_not_ready("container \"step\" is waiting to start: ContainerCreating"));
-    }
-
-    #[test]
-    fn genuine_errors_still_warn() {
-        assert!(!is_pod_not_ready("ApiError: pods \"x\" is forbidden: cannot get pods/log"));
-        assert!(!is_pod_not_ready("connection refused"));
-        // A failing image pull is a real problem, not a pre-start state.
-        assert!(!is_pod_not_ready("container \"step\" is waiting to start: ImagePullBackOff"));
     }
 }

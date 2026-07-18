@@ -23,7 +23,7 @@ pub mod scheduler;
 pub use ports::{Clock, Db, Executor, LogChunks};
 pub use scheduler::{
     cancel_run_request, record_gate_approval, release_gate, restart_step, RestartError, Scheduler,
-    SchedulerError, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
+    SchedulerError, CANCEL_RUN, LAUNCH_STEP, RUN_STATUS_CHANGED,
 };
 
 use serde::{Deserialize, Serialize};

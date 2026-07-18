@@ -359,26 +359,12 @@ impl K8sExecutor {
                 .map_err(|e| format!("materialize {root}: {e}"))?;
             }
             let tar_bytes = pack_dir(tmp.path())?;
-            // The CAS tarball carries the server's uid/gid/mode (65532, 0755) on
-            // every entry incl. `.`, so extracting it resets /workspace itself to
-            // `65532:65532 0755` — clobbering the group-writability that fsGroup
-            // (also 65532) set up at mount time. A `run_as_root` step (uid 0, all
-            // caps incl. DAC_OVERRIDE dropped), or any non-root image whose uid
-            // isn't 65532, is then a member of group 65532 via fsGroup but can't
-            // write the group-unwritable tree (b04697f: `Permission denied` on
-            // e.g. cargo's target dir). Restore group write (g+w) so every step
-            // process — which is always in group 65532 — can write, and setgid on
-            // dirs (g+s) so files it creates stay in group 65532 for the egress
-            // snapshot. Grants no capability/ownership the operator didn't ask for.
             self.exec_with_stdin(
                 pods,
                 &name,
                 WORKSPACE_INIT_CONTAINER,
                 &format!(
-                    "tar -xf - -C {WORKSPACE_MOUNT_PATH} \
-                     && chmod -R g+rwX {WORKSPACE_MOUNT_PATH} \
-                     && find {WORKSPACE_MOUNT_PATH} -type d -exec chmod g+s {{}} ';' \
-                     && touch {CTL_MOUNT_PATH}/init-done"
+                    "tar -xf - -C {WORKSPACE_MOUNT_PATH} && touch {CTL_MOUNT_PATH}/init-done"
                 ),
                 tar_bytes,
             )
@@ -737,35 +723,8 @@ impl Executor for K8sExecutor {
                     if let Err(e) = self.drive_workspace(&pods, &pod, cas.as_ref()).await {
                         return Err(ExecError::Other(format!("workspace: {e}")));
                     }
-                    // The settle (workspace snapshot + artifact harvest) runs in
-                    // the egress NATIVE sidecar and patches the durable Pod
-                    // annotations that output()/artifacts() read. A native
-                    // sidecar does NOT gate the Pod phase, so a workspace Pod
-                    // reports phase=Succeeded the instant the step exits — BEFORE
-                    // the settle has patched them, which would let the scheduler
-                    // read an empty artifact set exactly once and index nothing
-                    // (98ea804). drive_workspace touches egress-done only AFTER
-                    // patching, so the sidecar terminating is the settle-complete
-                    // signal: re-read and withhold ONLY the Succeeded verdict
-                    // while that sidecar is still running. Every other verdict
-                    // passes through verbatim so infra failures are never masked;
-                    // the scheduler re-polls next tick and drives settle to done
-                    // (deterministic, no sleeps).
-                    let pod = match pods
-                        .get_opt(&handle.0)
-                        .await
-                        .map_err(|e| ExecError::Other(e.to_string()))?
-                    {
-                        Some(pod) => pod,
-                        None => return Ok(ExecState::Lost),
-                    };
-                    let state = pod_state(&pod);
-                    if matches!(state, ExecState::Succeeded)
-                        && init_container_running(&pod, WORKSPACE_EGRESS_CONTAINER)
-                    {
-                        return Ok(ExecState::Running);
-                    }
-                    return Ok(state);
+                    // Re-read: drive_workspace may have released the egress
+                    // sidecar (the Pod is about to settle).
                 }
                 Ok(pod_state(&pod))
             }

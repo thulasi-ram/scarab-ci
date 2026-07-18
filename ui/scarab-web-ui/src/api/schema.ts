@@ -141,6 +141,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Return the current authenticated principal. In dev (auth disabled) this is
+         *     the synthetic Owner.
+         */
+        get: operations["me"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/bindings": {
         parameters: {
             query?: never;
@@ -318,6 +338,26 @@ export interface paths {
          *     dispatch. Read capability.
          */
         get: operations["pipeline_interface"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/repos/{org}/{repo}/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A repo's most recent runs, newest first (ADR-0046) — the dashboard's per-repo
+         *     history and pass/fail chart source. Scoped to the repo's tenant.
+         */
+        get: operations["list_repo_runs"];
         put?: never;
         post?: never;
         delete?: never;
@@ -731,6 +771,15 @@ export interface components {
             session: string;
             subject: string;
         };
+        /** @description The authenticated principal (ADR-0049) — powers the UI's identity menu. */
+        MeResponse: {
+            /** @description Human display name, when the identity provides one. */
+            display_name?: string | null;
+            /** @description The principal's Scarab-native roles (e.g. `["Owner"]`). */
+            roles: string[];
+            /** @description Stable, forge-agnostic identity subject. */
+            subject: string;
+        };
         /**
          * @description `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
          *     catalog at a ref (ADR-0043 §4). Lightweight — each entry is an `on:`-only
@@ -794,6 +843,13 @@ export interface components {
         };
         /** @description One registered project (governed repo, ADR-0046) in the repos list. */
         ProjectDto: {
+            /**
+             * Format: int64
+             * @description Epoch millis of the project's most recent run, or `null` if it has never
+             *     run — the dashboard's recency signal (ADR-0046). The domain carries no
+             *     push/created_at yet, so never-run repos have no ordering key here.
+             */
+            last_run_at?: number | null;
             name: string;
             org: string;
             /** @description The forge coordinate backing it (1:1 in v1). */
@@ -1138,6 +1194,32 @@ export interface operations {
             };
         };
     };
+    me: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeResponse"];
+                };
+            };
+            /** @description not authenticated */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_bindings: {
         parameters: {
             query?: never;
@@ -1433,6 +1515,33 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_repo_runs: {
+        parameters: {
+            query?: {
+                /** @description max runs (default 50, capped 200) */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description org slug */
+                org: string;
+                /** @description project (repo) name */
+                repo: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RunListResponse"];
+                };
             };
         };
     };

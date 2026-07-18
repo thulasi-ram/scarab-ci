@@ -183,19 +183,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    // Bootstrap-free App PEM (enh 245a99c): env/file OVERRIDES the DB-stored
-    // `_forge` credential so a fresh DB (or a GitOps deploy) needs no reseed PUT.
-    // Inline `SCARAB_GITHUB_APP_PEM` wins; a bad `..._FILE` path is a boot
-    // failure (ADR-0048), mirroring the OIDC signing key above.
-    let github_app_pem: Option<String> =
-        match (&config.github_app_pem, &config.github_app_pem_file) {
-            (Some(pem), _) => Some(pem.clone()),
-            (None, Some(path)) => Some(std::fs::read_to_string(path).map_err(|e| {
-                format!("cannot read SCARAB_GITHUB_APP_PEM_FILE {path}: {e}")
-            })?),
-            (None, None) => None,
-        };
-
     // The production forge (ADR-0046): a registry-routed ForgePort — each call
     // resolves its repo through the ForgeConnection registry, constructs the
     // vendor adapter (GitHub App/token, Forgejo token) with credentials
@@ -205,24 +192,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pg.clone(),
             secrets.clone(),
             config.github_app_id.clone(),
-            github_app_pem.clone(),
         ),
     );
     // Startup validation (ADR-0046): every registered connection's credential
     // handle must resolve. Missing material is a loud DEGRADED warning — the
-    // connection cannot serve until the secret is registered. When a boot-time
-    // App PEM is supplied, it overrides the DB credential for GitHub App-mode
-    // connections, so an absent `_forge` secret there is expected — skip it.
+    // connection cannot serve until the secret is registered.
     {
         use scarab_forge::ForgeConnectionStore;
-        let app_pem_overrides_github =
-            github_app_pem.is_some() && config.github_app_id.is_some();
         match pg.list_connections().await {
             Ok(conns) => {
                 for conn in conns {
-                    if app_pem_overrides_github && conn.kind == scarab_forge::ForgeKind::GitHub {
-                        continue;
-                    }
                     if let Err(e) =
                         scarab_server::connection_credential(secrets.as_ref(), &conn).await
                     {
