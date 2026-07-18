@@ -12,13 +12,21 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 
-# Load .env WITHOUT clobbering vars already set in the environment (env wins).
+# Image SOURCE (repository + clone/sidecar refs) is a per-invocation choice —
+# build locally vs pull a published tag — so a caller (e.g. `just local-helm`)
+# may override it even though .env is otherwise file-wins for durable config +
+# secrets. Capture caller-provided image refs now; re-apply after the .env load.
+_img_repo="${IMAGE_REPOSITORY:-}"
+_img_clone="${SCARAB_CLONE_IMAGE:-}"
+_img_sidecar="${SCARAB_SIDECAR_IMAGE:-}"
+
+# Load .env. It is authoritative (file-wins) for durable config + secrets: a
+# stale ambient value — e.g. a direnv-loaded .env.local — must NOT silently
+# override the in-cluster config.
 ENVFILE="${ENVFILE:-$HERE/.env}"
 if [ -f "$ENVFILE" ]; then
-  # The .env file is authoritative for a deploy (file-wins): a stale ambient
-  # value — e.g. direnv-loaded .env.local — must NOT silently override the
-  # in-cluster config. Split on the FIRST '=' only, so base64 values that end
-  # in '=' survive (IFS='=' read would truncate them).
+  # Split on the FIRST '=' only, so base64 values that end in '=' survive
+  # (IFS='=' read would truncate them).
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       ''|\#*) continue ;;   # skip blank + comment lines
@@ -31,6 +39,11 @@ else
   echo "missing $ENVFILE (cp deploy/local-helm/.env.example deploy/local-helm/.env and fill it)" >&2
   exit 1
 fi
+
+# Caller-provided image source wins over .env (see capture above).
+[ -n "$_img_repo" ] && export IMAGE_REPOSITORY="$_img_repo"
+[ -n "$_img_clone" ] && export SCARAB_CLONE_IMAGE="$_img_clone"
+[ -n "$_img_sidecar" ] && export SCARAB_SIDECAR_IMAGE="$_img_sidecar"
 
 # HARD GUARD: only ever touch the local colima cluster, never a Acme EKS ctx.
 ctx="$(kubectl config current-context)"
@@ -50,7 +63,7 @@ cat > "$VALUES" <<YAML
 image:
   repository: ${IMAGE_REPOSITORY:-scarab-server}
   tag: ${TAG}
-  pullPolicy: IfNotPresent
+  pullPolicy: ${IMAGE_PULL_POLICY:-IfNotPresent}
 scarab:
   role: converged
   executor: k8s

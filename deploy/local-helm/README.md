@@ -51,11 +51,25 @@ new access** — the change is not live until approved. Webhook URL is
   `imagePullSecrets` entry.)
 
 ## Deploy / expose / seed
+Convenience (recommended) — `just` picks the image source for you:
+```sh
+just local-helm             # pull + deploy the latest ghcr `edge` (pullPolicy Always)
+just local-helm sha-<sha>   # pull + deploy a specific published SHA
+just local-helm local       # build server+clone+sidecar from the tree, then deploy
+```
+Or drive the script directly (image source then comes from `.env`):
 ```sh
 deploy/local-helm/deploy.sh [image-tag]         # postgres + helm upgrade --install
 kubectl port-forward -n scarab svc/scarab 8899:80   # leave running; cloudflared -> :8899
 deploy/local-helm/reseed.sh                     # fresh DB only: store PEM + register
 ```
+> **`just local-helm local` caveat:** it builds into the local **Docker** store
+> and deploys with `pullPolicy: IfNotPresent`, so the images must be visible to
+> the colima **Kubernetes** node. If a Pod reports `ErrImageNeverPull` /
+> `ImagePullBackOff`, the node can't see the local build (colima's k8s reads
+> containerd, not the Docker store) — prefer the ghcr path, or import the images
+> into the node's store. The pull paths avoid this entirely (the node pulls from
+> ghcr directly).
 `deploy.sh` renders a transient Helm values file from `.env` (deleted on exit — no
 secrets on the CLI or on disk). `reseed.sh` reads the webhook secret from the
 deployed Secret, so it isn't written down anywhere.

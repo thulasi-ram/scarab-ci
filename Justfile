@@ -41,6 +41,34 @@ down:
 logs:
     tail -f deploy/local-proc/server.log
 
+# Requires deploy/local-helm/.env and kube context `colima`. Usage:
+#   just local-helm             # pull + deploy the latest ghcr `edge`
+#   just local-helm sha-abc123  # pull + deploy a specific published SHA
+#   just local-helm local       # build server+clone+sidecar locally, then deploy
+
+# Deploy the Helm dogfood stack on colima; pulls ghcr by default, `local` builds.
+local-helm ref="edge":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    owner=ghcr.io/thulasi-ram
+    if [ "{{ref}}" = "local" ]; then
+      echo "==> building server + clone + sidecar from the working tree"
+      docker build -t scarab-server:dogfood-local -f docker/server/Dockerfile .
+      docker build -t scarab-clone:dogfood docker/clone
+      docker build -t scarab-results-sidecar:dogfood docker/sidecar
+      IMAGE_REPOSITORY=scarab-server \
+      SCARAB_CLONE_IMAGE=scarab-clone:dogfood \
+      SCARAB_SIDECAR_IMAGE=scarab-results-sidecar:dogfood \
+        bash deploy/local-helm/deploy.sh dogfood-local
+    else
+      echo "==> pulling + deploying published images @ {{ref}} (ghcr, pullPolicy Always)"
+      IMAGE_REPOSITORY="$owner/scarab-server" \
+      IMAGE_PULL_POLICY=Always \
+      SCARAB_CLONE_IMAGE="$owner/scarab-clone:{{ref}}" \
+      SCARAB_SIDECAR_IMAGE="$owner/scarab-results-sidecar:{{ref}}" \
+        bash deploy/local-helm/deploy.sh {{ref}}
+    fi
+
 # Run scarab-server in the FOREGROUND against the dev stack (Ctrl-C to stop).
 # Useful when iterating; `just up` runs it in the background instead.
 serve:
