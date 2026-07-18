@@ -17,6 +17,30 @@ cp deploy/local/.env.example deploy/local/.env
 ```
 Context **must** be `colima` (deploy.sh refuses otherwise — never target EKS).
 
+## GitHub App configuration (REQUIRED — both gaps fail *silently*)
+The webhook URL + secret are not enough. Two App settings must be right or the
+loop half-works with **no error anywhere**:
+
+1. **Subscribe to events.** In the App's *Permissions & events → Subscribe to
+   events*, check **Push** and **Pull request** (and **Status** if you want
+   status-of-status). If this list is empty, `push`/`pull_request` are **never
+   delivered**, so nothing triggers — yet `installation` /
+   `installation_repositories` events still arrive (they are App-management
+   events, independent of the subscription list), so the connection registers
+   and `GET /v1/repos` looks healthy. The confusing symptom: *"the repo is
+   registered but nothing ever runs."*
+2. **Grant `statuses: write`.** *Permissions → Repository → Commit statuses:
+   Read & write.* Without it, every commit-status post is rejected with HTTP
+   403 `Resource not accessible by integration`. Scarab now logs this and
+   dead-letters the status message after retries (it used to be dropped
+   silently), but the run itself still succeeds — so you must fix the grant or
+   the PR never shows a status. Also grant **Contents: read** (clone) and
+   **Metadata: read**; add **Checks: read & write** only if using checks.
+
+After changing permissions, GitHub emails an installation owner to **approve the
+new access** — the change is not live until approved. Webhook URL is
+`<SCARAB_PUBLIC_URL>/webhooks/github`, secret is `SCARAB_GITHUB_WEBHOOK_SECRET`.
+
 ## Image
 - **Local (arm64, now):** `docker build -t scarab-server:dogfood-local .` plus the
   clone/sidecar images (`docker build -t scarab-clone:dogfood deploy/clone`,

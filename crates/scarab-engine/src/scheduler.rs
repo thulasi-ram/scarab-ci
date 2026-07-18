@@ -35,7 +35,7 @@ const NEVER_STARTED_AUTO_ATTEMPTS: u32 = 3;
 /// dead-lettered (ADR-0047 poison handling). Benign redeliveries of in-flight
 /// work (a Running step re-polled each tick) never count — only processing
 /// errors do — so this only trips on a permanently-failing message.
-const MAX_DELIVERY_ATTEMPTS: u32 = 10;
+pub const MAX_DELIVERY_ATTEMPTS: u32 = 10;
 
 /// Slack the engine-side timeout backstop waits past a step's deadline before
 /// enforcing it (ADR-0047). The backend's own enforcement (kubelet

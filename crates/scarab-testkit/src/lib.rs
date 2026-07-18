@@ -1350,6 +1350,9 @@ pub struct FakeForge {
     /// A seeded derived registry credential (ADR-0018); `None` (default)
     /// mirrors a forge with no derivable registry.
     registry_credential: Mutex<Option<scarab_forge::RegistryCredential>>,
+    /// When set, [`set_status`](ForgePort::set_status) fails — models a forge
+    /// rejecting the post (e.g. an App missing `statuses:write` → HTTP 403).
+    fail_status: Mutex<bool>,
 }
 
 impl FakeForge {
@@ -1374,6 +1377,13 @@ impl FakeForge {
     /// distinct from the branch ref it dispatched (ADR-0043).
     pub fn with_commit(self, git_ref: impl Into<String>, sha: impl Into<String>) -> Self {
         self.commits.lock().unwrap().insert(git_ref.into(), sha.into());
+        self
+    }
+
+    /// Make [`set_status`](ForgePort::set_status) fail — models a forge that
+    /// rejects the post (e.g. an App lacking `statuses:write`).
+    pub fn failing_status(self) -> Self {
+        *self.fail_status.lock().unwrap() = true;
         self
     }
 
@@ -1578,6 +1588,11 @@ impl ForgePort for FakeForge {
         _commit: &Commit,
         status: Status,
     ) -> Result<(), ForgeError> {
+        if *self.fail_status.lock().unwrap() {
+            return Err(ForgeError::Api(
+                "resource not accessible by integration".into(),
+            ));
+        }
         self.statuses.lock().unwrap().push(status);
         Ok(())
     }

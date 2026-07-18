@@ -29,7 +29,8 @@ use uuid::Uuid;
 
 use scarab_engine::{
     Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RestartError, RunId, RunStatus,
-    StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION, RUN_STATUS_CHANGED,
+    StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION, MAX_DELIVERY_ATTEMPTS,
+    RUN_STATUS_CHANGED,
 };
 use scarab_identity::{Action, Principal, Session};
 
@@ -2240,10 +2241,42 @@ pub async fn drain_forge_statuses(
             sha,
             message: String::new(),
         };
-        // Leave a failed post unclaimed for redelivery rather than dropping it.
-        if forge.set_status(&repo, &commit, status).await.is_ok() {
-            db.mark_dispatched(msg.id).await?;
-            posted += 1;
+        // Post the status. A failed post stays on the outbox for redelivery
+        // (at-least-once; set_status is idempotent on the forge) but is no
+        // longer SILENT: log it, count the failed delivery, and dead-letter the
+        // MESSAGE after MAX_DELIVERY_ATTEMPTS so a permanently-rejected post —
+        // e.g. HTTP 403 "Resource not accessible by integration" when the App
+        // lacks statuses:write — surfaces instead of retrying forever. Mirrors
+        // scheduler::reconcile poison handling (ADR-0047), but never dead-letters
+        // the run: the run's verdict is independent of the forge accepting it.
+        match forge.set_status(&repo, &commit, status).await {
+            Ok(()) => {
+                db.mark_dispatched(msg.id).await?;
+                posted += 1;
+            }
+            Err(e) => {
+                let failures = db.record_outbox_failure(msg.id).await?;
+                tracing::warn!(
+                    run = %msg.run.0,
+                    repo = %format!("{}/{}", repo.owner, repo.name),
+                    sha = %commit.sha,
+                    failures,
+                    error = %e,
+                    "forge set_status failed; left on outbox for redelivery"
+                );
+                if failures >= MAX_DELIVERY_ATTEMPTS {
+                    db.dead_letter_outbox(msg.id).await?;
+                    tracing::error!(
+                        run = %msg.run.0,
+                        repo = %format!("{}/{}", repo.owner, repo.name),
+                        sha = %commit.sha,
+                        failures,
+                        error = %e,
+                        "forge set_status dead-lettered as poison — status will NOT be \
+                         posted; check the forge App's statuses:write permission"
+                    );
+                }
+            }
         }
     }
     Ok(posted)
