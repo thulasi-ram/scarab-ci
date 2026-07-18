@@ -1864,3 +1864,25 @@ h1, .crumb-head, .run-title {
 .fvrow:hover { background: color-mix(in srgb, var(--emerald-bright) 6%, transparent); }
 .fvrow .lgln { color: var(--terminal-line); text-align: right; padding-right: 14px; user-select: none; }
 .fvrow .lgtx { color: var(--terminal-ink); white-space: pre-wrap; word-break: break-word; }
+
+/* ── Debug shell (interactive attach) ─────────────────────────────────────── */
+.shell-overlay {
+  position: fixed; inset: 0; z-index: 60; display: grid; place-items: center;
+  background: color-mix(in srgb, var(--carapace-black) 70%, transparent);
+  backdrop-filter: blur(2px);
+}
+.shell-modal {
+  width: min(880px, 92vw); border: 1px solid var(--terminal-line);
+  border-radius: var(--radius-lg); overflow: hidden; background: var(--terminal);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
+}
+.shell-h {
+  display: flex; align-items: center; gap: 12px; padding: 10px 14px;
+  background: var(--terminal-elev); border-bottom: 1px solid var(--terminal-line);
+  font-size: 12px; color: var(--terminal-ink);
+}
+.shell-h .shell-sub { margin-left: auto; font-size: 10.5px; color: var(--muted-sage); }
+.shell-h .shell-close { background: none; border: none; color: var(--muted-sage); cursor: pointer; font-size: 13px; }
+.shell-h .shell-close:hover { color: var(--danger); }
+.shell-term { height: 60vh; padding: 8px 10px; background: var(--terminal); }
+.shell-term .xterm { height: 100%; }

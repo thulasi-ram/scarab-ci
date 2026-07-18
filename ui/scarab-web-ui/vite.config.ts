@@ -15,7 +15,8 @@ export default defineConfig({
     fs: { allow: ["../.."] },
     port: 5173,
     proxy: {
-      "/v1": { target: apiTarget, changeOrigin: true },
+      // `ws: true` so the debug-shell attach WebSocket upgrades through the proxy.
+      "/v1": { target: apiTarget, changeOrigin: true, ws: true },
       "/healthz": { target: apiTarget, changeOrigin: true },
     },
   },

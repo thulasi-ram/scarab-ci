@@ -26,6 +26,7 @@ import Doodle from "../components/Doodle";
 import Dag, { type DagStep } from "../components/Dag";
 import StepLogs from "../components/StepLogs";
 import Inspector from "../components/Inspector";
+import DebugShell from "../components/DebugShell";
 
 const POLL_MS = 1200;
 
@@ -42,8 +43,11 @@ export default function RunDetail() {
   const [sel, setSel] = createSignal<string | null>(null);
   const [restarting, setRestarting] = createSignal<string | null>(null);
   const [cancelling, setCancelling] = createSignal(false);
+  const [shellOpen, setShellOpen] = createSignal(false);
 
   const stepList = (): StepStatus[] => run()?.steps ?? [];
+  const selectedRunning = () =>
+    !!sel() && stepList().find((s) => s.id === sel())?.status === "running";
   const runningCount = () => stepList().filter((s) => s.status === "running").length;
 
   // Per-step wall-clock from the event log: first AttemptStarted → last
@@ -198,6 +202,18 @@ export default function RunDetail() {
               >
                 {cancelling() ? "cancelling…" : "Cancel"}
               </button>
+              <button
+                class="btn btn-ghost btn-sm"
+                onClick={() => setShellOpen(true)}
+                disabled={!selectedRunning()}
+                title={
+                  selectedRunning()
+                    ? `open a debug shell into ${sel()}`
+                    : "select a running step to shell into"
+                }
+              >
+                <Icon icon="terminal" size={13} /> Debug shell
+              </button>
             </div>
 
             <div class="prov">
@@ -283,6 +299,9 @@ export default function RunDetail() {
                 </For>
               </div>
             </div>
+            <Show when={shellOpen() && sel()}>
+              <DebugShell runId={id()} step={sel()!} onClose={() => setShellOpen(false)} />
+            </Show>
           </>
         )}
       </Show>
