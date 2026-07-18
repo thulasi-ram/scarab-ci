@@ -1,38 +1,33 @@
 // Run detail — the operator view. A provenance header answers "what is this
-// run" (timing derived from the event log, launch params from the run itself),
-// the DAG shows the real step graph (ADR-0006), selecting a node reveals that
-// step's detail, logs stream live (ADR-0013), and the run's artifacts of record
-// (ADR-0052) list with download links once they exist.
+// run", the DAG (blueprint spine) shows the real step graph with live status,
+// retries, and elapsed (ADR-0006/0047); logs fold per step → attempt and stream
+// lazily (ADR-0013); the Inspector browses each step's results/outputs/artifacts/
+// workspace (ADR-0041/0029/0052); and the Activity rail is the durable event log
+// made legible — retries and recovery you can read at a glance.
 import { createSignal, createEffect, createResource, onMount, onCleanup, For, Show } from "solid-js";
 import { A, useParams, useNavigate } from "@solidjs/router";
 import {
   getRun,
   fetchEvents,
-  streamLogs,
   restartStep,
   cancelRun,
   isTerminal,
   runParams,
   listArtifacts,
-  artifactUrl,
   type RunStatus,
   type RunEvent,
+  type StepStatus,
 } from "../api/client";
-import { describeEvent } from "../events";
+import { describeEvent, eventCategory, EVENT_GLYPH } from "../events";
 import { relTime, absTime, duration } from "../fmt";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 import Dag, { type DagStep } from "../components/Dag";
+import StepLogs from "../components/StepLogs";
+import Inspector from "../components/Inspector";
 
 const POLL_MS = 1200;
-
-/** Human byte size for an artifact row. */
-function fmtSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
 
 export default function RunDetail() {
   const params = useParams();
@@ -43,37 +38,32 @@ export default function RunDetail() {
 
   const [run, setRun] = createSignal<RunStatus | null>(null);
   const [events, setEvents] = createSignal<RunEvent[]>([]);
-  const [log, setLog] = createSignal("");
   const [live, setLive] = createSignal(true);
   const [sel, setSel] = createSignal<string | null>(null);
   const [restarting, setRestarting] = createSignal<string | null>(null);
   const [cancelling, setCancelling] = createSignal(false);
-  const [follow, setFollow] = createSignal(true);
-  const [wrap, setWrap] = createSignal(true);
 
-  const runningCount = () => steps().filter((s) => s.status === "running").length;
+  const stepList = (): StepStatus[] => run()?.steps ?? [];
+  const runningCount = () => stepList().filter((s) => s.status === "running").length;
 
-  // Artifacts of record (ADR-0052): fetched once up front, re-fetched when the
-  // run settles terminal (steps publish as they finish; the final list is only
-  // complete then). Errors degrade to an empty list — the panel just hides.
-  const [artifacts, { refetch: refetchArtifacts }] = createResource(id, (rid) =>
-    listArtifacts(rid).catch(() => []),
-  );
-
-  let logRef: HTMLPreElement | undefined;
-  let poll: ReturnType<typeof setInterval> | undefined;
-  let closeLogs: (() => void) | undefined;
-
-  const steps = (): DagStep[] =>
-    (run()?.steps ?? []).map((s) => ({
+  // DAG nodes: the graph shape + live status. A running step's `runningSince`
+  // (its latest attempt's start) drives the node's in-place elapsed counter.
+  const dagSteps = (): DagStep[] =>
+    stepList().map((s) => ({
       id: s.id,
       status: s.status,
       attempts: s.attempts,
       needs: s.needs ?? [],
       gate: s.gate,
+      runningSince:
+        s.status === "running" ? s.attempt_list?.[s.attempt_list.length - 1]?.started_at ?? null : null,
     }));
 
-  const selectedStep = () => steps().find((s) => s.id === sel()) ?? null;
+  const [artifacts, { refetch: refetchArtifacts }] = createResource(id, (rid) =>
+    listArtifacts(rid).catch(() => []),
+  );
+
+  let poll: ReturnType<typeof setInterval> | undefined;
 
   // Timing from the event log: first event = created, last = latest transition.
   const startedAt = () => (events().length ? Math.min(...events().map((e) => e.at)) : null);
@@ -89,7 +79,6 @@ export default function RunDetail() {
     ]);
     setRun(status);
     setEvents(evs);
-    // Default the selection to a running step, else the first.
     if (!sel() && status.steps.length) {
       const running = status.steps.find((s) => s.status === "running");
       setSel((running ?? status.steps[0]).id);
@@ -106,29 +95,16 @@ export default function RunDetail() {
 
   onMount(async () => {
     await refresh();
-    closeLogs = streamLogs(
-      id(),
-      (chunk) => setLog((prev) => prev + chunk + "\n"),
-      () => void refresh(),
-    );
     if (live()) poll = setInterval(() => void refresh(), POLL_MS);
   });
-
   onCleanup(() => {
-    closeLogs?.();
     if (poll) clearInterval(poll);
-  });
-
-  createEffect(() => {
-    log();
-    if (logRef && follow()) logRef.scrollTop = logRef.scrollHeight;
   });
 
   async function onRestart(step: string) {
     setRestarting(step);
     try {
       await restartStep(id(), step);
-      setLog((p) => p + `\n— restarted ${step} —\n`);
       setLive(true);
       await refresh();
       if (!poll && live()) poll = setInterval(() => void refresh(), POLL_MS);
@@ -141,7 +117,6 @@ export default function RunDetail() {
     setCancelling(true);
     try {
       await cancelRun(id());
-      setLog((p) => p + `\n— cancelled —\n`);
       await refresh();
     } finally {
       setCancelling(false);
@@ -182,9 +157,7 @@ export default function RunDetail() {
               <button
                 class="btn btn-ghost btn-sm"
                 onClick={() =>
-                  nav(`/${org()}/${repo()}/run`, {
-                    state: { prefillParams: runParams(r()) },
-                  })
+                  nav(`/${org()}/${repo()}/run`, { state: { prefillParams: runParams(r()) } })
                 }
                 title="re-run this pipeline, pre-filled with these parameters"
               >
@@ -226,9 +199,7 @@ export default function RunDetail() {
               <div class="cell">
                 <div class="k">elapsed</div>
                 <div class="v mono">
-                  {startedAt()
-                    ? duration(startedAt()!, finishedAt() ?? Date.now())
-                    : "—"}
+                  {startedAt() ? duration(startedAt()!, finishedAt() ?? Date.now()) : "—"}
                 </div>
               </div>
             </div>
@@ -241,76 +212,43 @@ export default function RunDetail() {
                     {r().steps.length} steps{runningCount() ? ` · ${runningCount()} running` : ""}
                   </span>
                 </div>
-                <Dag steps={steps()} selected={sel()} onSelect={setSel} />
+                <Dag steps={dagSteps()} selected={sel()} onSelect={setSel} />
               </div>
 
               <div class="panel logs-panel">
                 <div class="panel-h">
-                  <span>Logs{sel() ? ` · ${sel()}` : ""}</span>
-                  <span class="logtoolbar">
-                    <button class={`logtool ${follow() ? "on" : ""}`} onClick={() => setFollow((v) => !v)}>
-                      follow
-                    </button>
-                    <button class={`logtool ${wrap() ? "on" : ""}`} onClick={() => setWrap((v) => !v)}>
-                      wrap
-                    </button>
-                  </span>
+                  <span>Logs</span>
+                  <span class="subtle">fold by step · retries fold by attempt</span>
                 </div>
-                <Show when={selectedStep()}>
-                  {(s) => (
-                    <div class="log-substep mono">
-                      <span class={`sdot ${s().status}`} /> {s().status}
-                      <span class="dotsep">·</span> {s().attempts} attempt{s().attempts === 1 ? "" : "s"}
-                      <Show when={s().needs.length}>
-                        <span class="dotsep">·</span> needs {s().needs.join(", ")}
-                      </Show>
-                    </div>
-                  )}
-                </Show>
-                <pre ref={logRef} class="logs" style={{ "white-space": wrap() ? "pre-wrap" : "pre" }}>
-                  {log() || (live() ? "waiting for output…" : "no log output — a step log source lands with the executor wiring")}
-                </pre>
+                <StepLogs runId={id()} steps={stepList()} selected={sel()} onSelect={setSel} />
               </div>
             </div>
 
-            <Show when={(artifacts() ?? []).length > 0}>
-              <div class="panel artifacts-panel">
-                <div class="panel-h">
-                  <span>Artifacts</span>
-                  <span class="subtle">{artifacts()!.length}</span>
-                </div>
-                <ul class="secret-list" style={{ padding: "12px 16px" }}>
-                  <For each={artifacts()}>
-                    {(a) => (
-                      <li class="secret-row">
-                        <Icon icon="package" size={15} />
-                        <a class="mono" href={artifactUrl(id(), a.name)} download={a.name}>
-                          {a.name}
-                        </a>
-                        <span class="subtle mono">
-                          {fmtSize(a.size)} · {a.content_type}
-                        </span>
-                      </li>
-                    )}
-                  </For>
-                </ul>
-              </div>
-            </Show>
+            <Inspector runId={id()} selectedStep={sel()} artifacts={artifacts() ?? []} />
 
             <div class="panel activity-panel">
-              <div class="panel-h"><span>Activity</span></div>
-              <ul class="timeline">
-                <For each={events()} fallback={<li class="empty">no events yet</li>}>
-                  {(e) => (
-                    <li class="timeline-row">
-                      <span class="mono timeline-at" title={absTime(e.at)}>
-                        {new Date(e.at).toLocaleTimeString()}
-                      </span>
-                      <span class="timeline-msg">{describeEvent(e)}</span>
-                    </li>
-                  )}
+              <div class="panel-h">
+                <span>Activity</span>
+                <span class="subtle">{events().length} events</span>
+              </div>
+              <div class="tl">
+                <For each={events()} fallback={<div class="tl-empty">no events yet</div>}>
+                  {(e) => {
+                    const cat = eventCategory(e);
+                    return (
+                      <div class="tl-item">
+                        <div class="tl-time" title={absTime(e.at)}>{relTime(e.at)}</div>
+                        <div class="tl-rail">
+                          <div class={`tl-glyph ${cat}`}>{EVENT_GLYPH[cat]}</div>
+                        </div>
+                        <div class="tl-body">
+                          <div class="tl-msg">{describeEvent(e)}</div>
+                        </div>
+                      </div>
+                    );
+                  }}
                 </For>
-              </ul>
+              </div>
             </div>
           </>
         )}

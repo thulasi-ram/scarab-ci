@@ -29,3 +29,43 @@ export function describeEvent(e: RunEvent): string {
       return tag;
   }
 }
+
+/** The activity-rail category for an event — drives its glyph and colour. `err`
+ * covers a failed attempt (the retry story) and a run/step that ended failed. */
+export type EventCat = "info" | "ok" | "run" | "err" | "gate";
+
+export function eventCategory(e: RunEvent): EventCat {
+  const k = e.kind;
+  if (typeof k === "string") return "info";
+  const tag = Object.keys(k)[0];
+  const v = k[tag] ?? {};
+  const to = String(v.to ?? "");
+  switch (tag) {
+    case "RunTransitioned":
+    case "StepTransitioned":
+      return to === "succeeded"
+        ? "ok"
+        : to === "failed" || to === "cancelled"
+          ? "err"
+          : to === "running"
+            ? "run"
+            : "info";
+    case "AttemptStarted":
+      return "run";
+    case "AttemptFinished":
+      return v.failure ? "err" : "ok";
+    case "GateReleased":
+      return "gate";
+    default:
+      return "info";
+  }
+}
+
+/** The glyph shown in the rail node for a category. */
+export const EVENT_GLYPH: Record<EventCat, string> = {
+  info: "◆",
+  ok: "✓",
+  run: "●",
+  err: "↻",
+  gate: "◷",
+};

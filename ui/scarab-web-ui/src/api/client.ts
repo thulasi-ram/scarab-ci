@@ -11,6 +11,13 @@ export type CatalogEntry = components["schemas"]["CatalogEntry"];
 export type DispatchKind = components["schemas"]["DispatchKind"];
 export type Project = components["schemas"]["ProjectDto"];
 export type Artifact = components["schemas"]["ArtifactDto"];
+export type StepResult = components["schemas"]["StepResultDto"];
+export type WorkspaceListing = components["schemas"]["WorkspaceListing"];
+export type WorkspaceEntry = components["schemas"]["WorkspaceEntryDto"];
+/** One attempt at a step (ADR-0047) — the rerun/retry unit. */
+export type Attempt = components["schemas"]["AttemptDto"];
+/** One step's status projection in a run's DAG. */
+export type StepStatus = components["schemas"]["StepStatusDto"];
 
 export const api = createClient<paths>({ baseUrl: "/" });
 
@@ -102,6 +109,48 @@ export async function listArtifacts(id: string): Promise<Artifact[]> {
  * streamed through the server — usable directly as an `<a href>` download). */
 export function artifactUrl(id: string, name: string): string {
   return `/v1/runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(name)}`;
+}
+
+// --- Run detail Inspector: a step's browseable outputs. Results are the typed
+// values a step published (ADR-0041); the workspace is its output snapshot,
+// walked read-only from the content-addressed store (ADR-0029). ---
+
+/** A step's named results (`GET …/steps/{step}/results`). Empty if it emitted
+ * none. The Results tab, and the source the Outputs view derives from. */
+export async function getStepResults(id: string, step: string): Promise<StepResult[]> {
+  const { data, error } = await api.GET("/v1/runs/{id}/steps/{step}/results", {
+    params: { path: { id, step } },
+  });
+  if (error || !data) {
+    throw new Error(`failed to load results for ${step}`);
+  }
+  return data;
+}
+
+/** List a directory in a step's output workspace snapshot
+ * (`GET …/steps/{step}/workspace?path=`). `available:false` when the step
+ * produced no snapshot (still running, a gate, or a non-snapshotting backend). */
+export async function listWorkspace(
+  id: string,
+  step: string,
+  path = "",
+): Promise<WorkspaceListing> {
+  const { data, error } = await api.GET("/v1/runs/{id}/steps/{step}/workspace", {
+    params: { path: { id, step }, query: { path } },
+  });
+  if (error || !data) {
+    throw new Error(`failed to browse workspace for ${step}`);
+  }
+  return data;
+}
+
+/** Browser URL for one workspace file's bytes (`GET …/steps/{step}/workspace/file?path=`,
+ * streamed through the server — usable directly as an `<a href>`). */
+export function workspaceFileUrl(id: string, step: string, path: string): string {
+  return (
+    `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}` +
+    `/workspace/file?path=${encodeURIComponent(path)}`
+  );
 }
 
 // --- Environments (ADR-0024/0037). The generated schema types these responses
@@ -312,6 +361,37 @@ export function streamLogs(
     // Fires when the server closes a terminal run's stream (or on a real error).
     close();
     onEnd?.();
+  };
+  return close;
+}
+
+/**
+ * Live-stream ONE step's log output (`GET …/steps/{step}/logs`), optionally
+ * scoped to a single `attempt` — the per-step fold's source, and how a rerun's
+ * earlier (failed) attempt is read in isolation. Replays that scope's committed
+ * chunks then live-tails while the run is going and the latest attempt is in
+ * scope; the server closes the stream when nothing more will be written. Returns
+ * a cleanup fn.
+ */
+export function streamStepLogs(
+  id: string,
+  step: string,
+  opts: { attempt?: string; onChunk: (text: string) => void; onEnd?: () => void },
+): () => void {
+  const base = `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}/logs`;
+  const url = opts.attempt ? `${base}?attempt=${encodeURIComponent(opts.attempt)}` : base;
+  const es = new EventSource(url);
+  let closed = false;
+  const close = () => {
+    if (!closed) {
+      closed = true;
+      es.close();
+    }
+  };
+  es.onmessage = (e) => opts.onChunk(e.data);
+  es.onerror = () => {
+    close();
+    opts.onEnd?.();
   };
   return close;
 }

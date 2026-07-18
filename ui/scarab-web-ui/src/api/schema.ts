@@ -568,6 +568,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/runs/{id}/steps/{step}/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * SSE of ONE step's log bodies (ADR-0013), the source for the run detail's
+         *     per-step fold. Same machinery as the run-wide `/logs`, scoped to the step —
+         *     and, with `?attempt=`, to a single attempt so a rerun's earlier (failed)
+         *     output can be read in isolation. Replays committed chunks then live-tails
+         *     only when the run is still going AND the latest attempt is in scope
+         *     (historical attempts are immutable). Read at the run's tenant.
+         */
+        get: operations["get_step_logs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/runs/{id}/steps/{step}/restart": {
         parameters: {
             query?: never;
@@ -596,7 +620,13 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * A step's named results (ADR-0041), read from `step_runs.results`. The read
+         *     side of the results-ingest write path (`POST …/steps/{step}/results`): the
+         *     Inspector's Results tab, and the source the Outputs view derives from. Read
+         *     at the run's tenant.
+         */
+        get: operations["get_step_results"];
         put?: never;
         /**
          * Ingest a step's named results (ADR-0040/0042): the trusted per-Pod egress
@@ -608,6 +638,48 @@ export interface paths {
          *     fence (a re-drive overwrites deterministically, ADR-0021).
          */
         post: operations["ingest_step_results"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{id}/steps/{step}/workspace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List a directory inside a step's output workspace snapshot (ADR-0029). The
+         *     live Pod workspace is gone once the step ends (`restartPolicy: Never`); what
+         *     survives is the content-addressed snapshot, walked read-only here. Read at
+         *     the run's tenant.
+         */
+        get: operations["list_workspace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{id}/steps/{step}/workspace/file": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Stream one file's bytes from a step's output workspace snapshot (ADR-0029).
+         *     Read at the run's tenant; immutable content.
+         */
+        get: operations["get_workspace_file"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -681,6 +753,26 @@ export interface components {
             name: string;
             /** Format: int64 */
             size: number;
+        };
+        /**
+         * @description One attempt at executing a step (ADR-0047) — the rerun unit. A step with more
+         *     than one attempt is one that failed-and-retried (or was restarted); the last
+         *     attempt carries the current outcome.
+         */
+        AttemptDto: {
+            /**
+             * @description `true` if this attempt ended in failure. A later attempt may still have
+             *     succeeded — that divergence is exactly the retry story worth showing.
+             */
+            failed: boolean;
+            /** @description Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`. */
+            failure?: string | null;
+            id: string;
+            /**
+             * Format: int64
+             * @description When this attempt started (unix-ms).
+             */
+            started_at: number;
         };
         BindingDto: {
             /** @description Empty = org-scoped. */
@@ -965,7 +1057,25 @@ export interface components {
              */
             timeout?: number | null;
         };
+        /**
+         * @description One named result a step published (ADR-0041) — the `${{ outputs.<step>.<name> }}`
+         *     values, exposed read-only for the run detail Inspector. `type_name` is a
+         *     coarse JSON kind (string/number/bool/object/array/null) so the UI can badge it
+         *     without re-deriving.
+         */
+        StepResultDto: {
+            name: string;
+            type_name: string;
+            value: Record<string, never>;
+        };
         StepStatusDto: {
+            /**
+             * @description Per-attempt detail (ADR-0047) — the rerun/retry history in append order.
+             *     `attempts` is the count; this is the list, so the UI can show retries (a
+             *     failed attempt followed by a succeeding one — the durable-execution story)
+             *     and fold a step's logs per attempt. Empty until the step first launches.
+             */
+            attempt_list?: components["schemas"]["AttemptDto"][];
             attempts: number;
             /**
              * @description `manual`/`timer`/`external` if this step is a gate (ADR-0008), else absent.
@@ -979,6 +1089,26 @@ export interface components {
              */
             needs?: string[];
             status: string;
+        };
+        /**
+         * @description One entry in a workspace directory listing — the merkle-tree children under a
+         *     step's output snapshot (ADR-0029).
+         */
+        WorkspaceEntryDto: {
+            /** @description `"dir"` (a sub-tree) or `"file"` (a blob). */
+            kind: string;
+            name: string;
+        };
+        /** @description A directory listing within a step's output workspace snapshot. */
+        WorkspaceListing: {
+            /**
+             * @description `false` when the step produced no snapshot (e.g. a still-running step, a
+             *     gate, or the local executor which doesn't snapshot). `entries` is empty.
+             */
+            available: boolean;
+            entries: components["schemas"]["WorkspaceEntryDto"][];
+            /** @description The path listed (empty string = snapshot root). */
+            path: string;
         };
     };
     responses: never;
@@ -1849,6 +1979,39 @@ export interface operations {
             };
         };
     };
+    get_step_logs: {
+        parameters: {
+            query?: {
+                /** @description restrict to one attempt id (default = all) */
+                attempt?: string;
+            };
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description SSE stream of this step's log output */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such run or step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     restart_step: {
         parameters: {
             query?: never;
@@ -1871,6 +2034,37 @@ export interface operations {
                 content?: never;
             };
             /** @description no such run or step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_step_results: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StepResultDto"][];
+                };
+            };
+            /** @description no such run */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1908,6 +2102,73 @@ export interface operations {
                 content?: never;
             };
             /** @description no such step, or results ingest disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_workspace: {
+        parameters: {
+            query?: {
+                /** @description sub-path within the snapshot (default = root) */
+                path?: string;
+            };
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceListing"];
+                };
+            };
+            /** @description no such run/path or browse disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_workspace_file: {
+        parameters: {
+            query: {
+                /** @description file path within the snapshot */
+                path: string;
+            };
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description the file bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such file or browse disabled */
             404: {
                 headers: {
                     [name: string]: unknown;

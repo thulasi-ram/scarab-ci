@@ -29,6 +29,9 @@ import {
   ArrowUp,
   ArrowLeft,
   RotateCw,
+  AlertTriangle,
+  File,
+  Folder,
   Sun,
   Moon,
 } from "lucide";
@@ -62,6 +65,9 @@ const ICONS: Record<string, IconNode> = {
   "arrow-up": ArrowUp as IconNode,
   "arrow-left": ArrowLeft as IconNode,
   "rotate-cw": RotateCw as IconNode,
+  "alert-triangle": AlertTriangle as IconNode,
+  file: File as IconNode,
+  folder: Folder as IconNode,
   sun: Sun as IconNode,
   moon: Moon as IconNode,
 };
