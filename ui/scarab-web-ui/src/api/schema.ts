@@ -895,6 +895,13 @@ export interface components {
         RunSummaryDto: {
             /** Format: int64 */
             created_at: number;
+            /**
+             * Format: int64
+             * @description Run duration in millis: `updated_at - created_at`. For a terminal run
+             *     this is its total wall time; for an in-flight run, elapsed-to-last-update.
+             *     Drives the dashboard's per-run bar heights (ADR-0046).
+             */
+            duration_ms: number;
             id: string;
             /** @description The owning org, if the run is tenanted (trigger-created). */
             org?: string | null;

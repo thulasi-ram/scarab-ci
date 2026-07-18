@@ -621,11 +621,16 @@ impl Db for InMemoryDb {
         let mut out: Vec<RunSummary> = st
             .runs
             .iter()
-            .map(|(run, status)| RunSummary {
-                run: run.clone(),
-                status: *status,
-                created_at: st.run_created.get(run).copied().unwrap_or(Timestamp(0)),
-                tenant: st.run_tenant.get(run).cloned(),
+            .map(|(run, status)| {
+                let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
+                RunSummary {
+                    run: run.clone(),
+                    status: *status,
+                    created_at: created,
+                    // The fake has no clock at transition time; report zero duration.
+                    updated_at: created,
+                    tenant: st.run_tenant.get(run).cloned(),
+                }
             })
             .collect();
         // Newest first, then id — matches the adapter's ORDER BY.
@@ -650,11 +655,16 @@ impl Db for InMemoryDb {
             .runs
             .iter()
             .filter(|(run, _)| st.run_tenant.get(*run) == Some(&want))
-            .map(|(run, status)| RunSummary {
-                run: run.clone(),
-                status: *status,
-                created_at: st.run_created.get(run).copied().unwrap_or(Timestamp(0)),
-                tenant: st.run_tenant.get(run).cloned(),
+            .map(|(run, status)| {
+                let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
+                RunSummary {
+                    run: run.clone(),
+                    status: *status,
+                    created_at: created,
+                    // The fake has no clock at transition time; report zero duration.
+                    updated_at: created,
+                    tenant: st.run_tenant.get(run).cloned(),
+                }
             })
             .collect();
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.run.0.cmp(&a.run.0)));

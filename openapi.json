@@ -1475,12 +1475,18 @@
         "required": [
           "id",
           "status",
-          "created_at"
+          "created_at",
+          "duration_ms"
         ],
         "properties": {
           "created_at": {
             "type": "integer",
             "format": "int64"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Run duration in millis: `updated_at - created_at`. For a terminal run\nthis is its total wall time; for an in-flight run, elapsed-to-last-update.\nDrives the dashboard's per-run bar heights (ADR-0046)."
           },
           "id": {
             "type": "string"

@@ -444,6 +444,10 @@ pub struct RunSummaryDto {
     pub id: String,
     pub status: String,
     pub created_at: i64,
+    /// Run duration in millis: `updated_at - created_at`. For a terminal run
+    /// this is its total wall time; for an in-flight run, elapsed-to-last-update.
+    /// Drives the dashboard's per-run bar heights (ADR-0046).
+    pub duration_ms: i64,
     /// The owning org, if the run is tenanted (trigger-created).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub org: Option<String>,
@@ -956,6 +960,7 @@ async fn list_runs(
                 id: s.run.0,
                 status: run_status_name(s.status).to_string(),
                 created_at: s.created_at.0,
+                duration_ms: (s.updated_at.0 - s.created_at.0).max(0),
                 org: s.tenant.as_ref().map(|(o, _)| o.clone()),
                 project: s.tenant.as_ref().map(|(_, p)| p.clone()),
             })
@@ -1338,6 +1343,7 @@ async fn list_repo_runs(
                 id: s.run.0,
                 status: run_status_name(s.status).to_string(),
                 created_at: s.created_at.0,
+                duration_ms: (s.updated_at.0 - s.created_at.0).max(0),
                 org: s.tenant.as_ref().map(|(o, _)| o.clone()),
                 project: s.tenant.as_ref().map(|(_, p)| p.clone()),
             })

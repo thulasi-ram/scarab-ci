@@ -1505,18 +1505,17 @@ h1, .crumb-head, .run-title {
 .rcard-foot .warn { color: var(--copper); }
 .rcard-foot .fail { color: var(--danger); }
 
-/* Pass/fail bar strip (status-page style): rounded, red/green. */
-.runbars { display: flex; align-items: flex-end; gap: 3px; height: 26px; }
-.runbar { flex: 1; min-width: 3px; height: 100%; border-radius: 3px; background: var(--border); }
+/* Duration bar strip (status-page style): bottom-aligned, rounded tops; bar
+   height = run duration, colour = outcome. */
+.runbars { display: flex; align-items: flex-end; gap: 3px; height: 38px; }
+.runbar {
+  flex: 1; min-width: 3px; min-height: 3px; border-radius: 3px 3px 1px 1px;
+  background: var(--border); transition: height 0.18s ease;
+}
 .runbar.ok { background: var(--ok); }
 .runbar.fail { background: var(--danger); }
 .runbar.warn { background: var(--copper); }
-.runbar.idle {
-  background: repeating-linear-gradient(
-    -45deg, var(--running), var(--running) 2px, transparent 2px, transparent 4px
-  );
-  opacity: 0.85;
-}
+.runbar.idle { background: color-mix(in srgb, var(--running) 50%, transparent); }
 
 /* Repo list — recency-sorted, searchable. */
 .repos-label { display: flex; align-items: center; }
