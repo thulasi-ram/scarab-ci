@@ -1426,36 +1426,6 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
     }))
 }
 
-/// The authenticated principal (ADR-0049) — powers the UI's identity menu.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct MeResponse {
-    /// Stable, forge-agnostic identity subject.
-    pub subject: String,
-    /// Human display name, when the identity provides one.
-    pub display_name: Option<String>,
-    /// The principal's Scarab-native roles (e.g. `["Owner"]`).
-    pub roles: Vec<String>,
-}
-
-/// Return the current authenticated principal. In dev (auth disabled) this is
-/// the synthetic Owner.
-#[utoipa::path(
-    get,
-    path = "/v1/me",
-    responses(
-        (status = 200, body = MeResponse),
-        (status = 401, description = "not authenticated")
-    )
-)]
-async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeResponse>, ApiError> {
-    let principal = authenticate(&st, &headers, Action::Read).await?;
-    Ok(Json(MeResponse {
-        subject: principal.subject,
-        display_name: principal.display_name,
-        roles: principal.roles.iter().map(|r| format!("{r:?}")).collect(),
-    }))
-}
-
 /// List the registered projects (ADR-0046 registry — what the dashboard's
 /// repo cards render). Scoped: global roles see all; otherwise only orgs/
 /// projects the caller's bindings grant Read on.
