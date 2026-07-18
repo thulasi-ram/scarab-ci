@@ -1,6 +1,6 @@
 # 0051. Multi-replica operation: tail lease, replica-agnostic SSE, shared OIDC key
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-17
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0011](0011-durable-scheduler.md) (leader lease),

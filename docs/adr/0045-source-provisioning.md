@@ -1,6 +1,6 @@
 # 0045. Source provisioning: the `clone` step kind
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-16
 - **Deciders:** thulasi.ram (architect)
 

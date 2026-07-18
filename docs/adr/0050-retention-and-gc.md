@@ -1,6 +1,6 @@
 # 0050. Retention & GC: mark-sweep CAS, lifecycle-keyed eligibility
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-17
 - **Deciders:** thulasi.ram (architect)
 - **Implements:** [0030](0030-operational-defaults.md) (retention/GC defaults);

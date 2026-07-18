@@ -1,6 +1,6 @@
 # 0047. Retry classification, attempt/fence model, and dead-letter (implements 0020)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-16
 - **Deciders:** thulasi.ram (architect)
 - **Amends:** [0020](0020-retry-and-failure.md) (retry & failure taxonomy)

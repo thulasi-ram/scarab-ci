@@ -1,6 +1,6 @@
 # 0046. Forge auth is adapter-internal; GitHub + Forgejo adapters in v1
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-16
 - **Deciders:** thulasi.ram (architect)
 - **Amends:** [0010](0010-forge-integration.md) (forge integration)

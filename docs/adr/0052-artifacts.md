@@ -1,6 +1,6 @@
 # 0052. Artifacts: a dedicated per-run store, convention-emitted
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-17
 - **Deciders:** thulasi.ram (architect)
 - **Implements:** [0007](0007-data-passing-model.md) (Artifact concept);

@@ -1,6 +1,6 @@
 # 0049. Identity & access: forge-agnostic authn, Scarab-native RBAC
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-17
 - **Deciders:** thulasi.ram (architect)
 - **Refines:** [0032](0032-slices-3-5-implementation-decisions.md) (auth sketch),

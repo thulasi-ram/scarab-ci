@@ -60,16 +60,16 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0042](0042-trusted-egress-sidecar.md) | Trusted per-Pod egress sidecar → fence-scoped results API → Postgres (how k8s captures results) | Accepted |
 | [0043](0043-launch-parameters-and-manual-dispatch.md) | Launch parameters (typed `interface.inputs`) + manual dispatch as a repo-aware trigger | Accepted |
 | [0044](0044-protection-ref-vs-read-ref.md) | Branch protection matches a symbolic ref, not the commit SHA (fixes `allowed_refs`) | Accepted |
-| [0045](0045-source-provisioning.md) | Source provisioning: `clone` step kind — SHA-pinned `git` clone in a `scarab-clone` Pod, `.git` into CAS, read-only fork token | Proposed |
-| [0046](0046-forge-auth-and-multi-adapter.md) | Forge auth is adapter-internal; GitHub + Forgejo adapters in v1; `ForgeConnection` registry; `Project` = governed repo (amends 0010) | Proposed |
-| [0047](0047-retry-classification-and-attempt-model.md) | Retry classification (`FailureClass`), never-started vs post-start retry, new-fence-per-retry, dead-letter/timeout model (implements/amends 0020) | Proposed |
-| [0048](0048-fail-closed-startup.md) | Fail-closed startup: validated config, boot refusal on unsafe/auth-off, mandatory Postgres (no API-only mode), opt-in `SCARAB_DEV_INSECURE` | Proposed |
-| [0049](0049-identity-and-access.md) | Identity & access: forge-agnostic OAuth/OIDC authn + PG session; Scarab-native RBAC (Org/Project scope, forge-import bootstrap); tenancy scoping | Proposed |
-| [0050](0050-retention-and-gc.md) | Retention & GC: mark-sweep workspace-CAS GC, eligibility keyed on run lifecycle (suspended runs never collected), per-class TTLs (implements 0030) | Proposed |
-| [0051](0051-multi-replica-operation.md) | Multi-replica: per-step tail lease, replica-agnostic live-SSE (durable index), shared persistent OIDC key | Proposed |
-| [0052](0052-artifacts.md) | Artifacts: dedicated per-run store (not CAS), convention-emitted (`/scarab/artifacts/` + globs), presigned download, own TTL | Proposed |
-| [0053](0053-observability-and-lifecycle.md) | Observability & lifecycle: Prometheus `/metrics`, JSON logs + request-ids, `/readyz` vs `/healthz`, graceful shutdown (implements 0030) | Proposed |
-| [0054](0054-product-surface-serving.md) | Product surface: embed UI in the binary, run-cancel API, OpenAPI drift gate, CLI truthfulness (stubs exit non-zero) | Proposed |
+| [0045](0045-source-provisioning.md) | Source provisioning: `clone` step kind — SHA-pinned `git` clone in a `scarab-clone` Pod, `.git` into CAS, read-only fork token | Accepted |
+| [0046](0046-forge-auth-and-multi-adapter.md) | Forge auth is adapter-internal; GitHub + Forgejo adapters in v1; `ForgeConnection` registry; `Project` = governed repo (amends 0010) | Accepted |
+| [0047](0047-retry-classification-and-attempt-model.md) | Retry classification (`FailureClass`), never-started vs post-start retry, new-fence-per-retry, dead-letter/timeout model (implements/amends 0020) | Accepted |
+| [0048](0048-fail-closed-startup.md) | Fail-closed startup: validated config, boot refusal on unsafe/auth-off, mandatory Postgres (no API-only mode), opt-in `SCARAB_DEV_INSECURE` | Accepted |
+| [0049](0049-identity-and-access.md) | Identity & access: forge-agnostic OAuth/OIDC authn + PG session; Scarab-native RBAC (Org/Project scope, forge-import bootstrap); tenancy scoping | Accepted |
+| [0050](0050-retention-and-gc.md) | Retention & GC: mark-sweep workspace-CAS GC, eligibility keyed on run lifecycle (suspended runs never collected), per-class TTLs (implements 0030) | Accepted |
+| [0051](0051-multi-replica-operation.md) | Multi-replica: per-step tail lease, replica-agnostic live-SSE (durable index), shared persistent OIDC key | Accepted |
+| [0052](0052-artifacts.md) | Artifacts: dedicated per-run store (not CAS), convention-emitted (`/scarab/artifacts/` + globs), presigned download, own TTL | Accepted |
+| [0053](0053-observability-and-lifecycle.md) | Observability & lifecycle: Prometheus `/metrics`, JSON logs + request-ids, `/readyz` vs `/healthz`, graceful shutdown (implements 0030) | Accepted |
+| [0054](0054-product-surface-serving.md) | Product surface: embed UI in the binary, run-cancel API, OpenAPI drift gate, CLI truthfulness (stubs exit non-zero) | Accepted |
 
 > For *features* deliberately deferred until demand appears (as opposed to ADRs
 > to be written), see [`docs/followups.md`](../followups.md).

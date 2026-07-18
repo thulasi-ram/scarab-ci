@@ -1,6 +1,6 @@
 # 0054. Product surface: embedded UI, run cancellation, API/CLI truthfulness
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-17
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0028](0028-ui-stack.md) (UI stack), [0012](0012-api-surface.md) (API)

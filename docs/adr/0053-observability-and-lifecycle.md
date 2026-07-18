@@ -1,6 +1,6 @@
 # 0053. Observability & lifecycle: metrics, structured logs, readiness, graceful shutdown
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-17
 - **Deciders:** thulasi.ram (architect)
 - **Implements:** [0030](0030-operational-defaults.md) (operational defaults)

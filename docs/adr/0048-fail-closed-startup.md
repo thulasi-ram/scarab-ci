@@ -1,6 +1,6 @@
 # 0048. Fail-closed startup: validated config, boot refusal, mandatory Postgres
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-16
 - **Deciders:** thulasi.ram (architect)
 
