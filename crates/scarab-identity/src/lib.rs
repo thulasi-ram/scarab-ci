@@ -139,11 +139,7 @@ pub trait RbacStore: Send + Sync {
     /// Upsert a binding. `Native` grants always win; an `Import` grant seeds
     /// or refreshes only rows that are still import-owned — it never clobbers
     /// a native grant or a native revoke.
-    async fn grant(
-        &self,
-        binding: &Binding,
-        origin: BindingOrigin,
-    ) -> Result<(), IdentityError>;
+    async fn grant(&self, binding: &Binding, origin: BindingOrigin) -> Result<(), IdentityError>;
     /// Natively revoke `subject`'s binding at `scope`: a durable tombstone —
     /// later imports cannot resurrect the grant.
     async fn revoke(&self, subject: &str, scope: &Scope) -> Result<(), IdentityError>;
@@ -299,8 +295,14 @@ mod tests {
         let mut rbac = Rbac::default();
         rbac.grant("alice", Scope::Org("acme".into()), Role::Member);
 
-        let app = Scope::Project { org: "acme".into(), name: "app".into() };
-        let foreign = Scope::Project { org: "evil".into(), name: "app".into() };
+        let app = Scope::Project {
+            org: "acme".into(),
+            name: "app".into(),
+        };
+        let foreign = Scope::Project {
+            org: "evil".into(),
+            name: "app".into(),
+        };
         // The org role reaches every project of THAT org…
         assert_eq!(rbac.role_of("alice", &app), Some(Role::Member));
         assert!(rbac.can("alice", &app, Action::Write));

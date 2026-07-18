@@ -22,14 +22,20 @@ fn app_state(db: Arc<InMemoryDb>, clock: Arc<FakeClock>) -> AppState {
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
 /// Create a run stamped at `at` millis and bound to `(org, project)`.
 async fn tenanted_run(db: &InMemoryDb, id: &str, org: &str, project: &str, at: i64) {
-    db.create_run(&RunId(id.into()), 1, 1, Timestamp(at)).await.unwrap();
-    db.set_run_tenant(&RunId(id.into()), org, project).await.unwrap();
+    db.create_run(&RunId(id.into()), 1, 1, Timestamp(at))
+        .await
+        .unwrap();
+    db.set_run_tenant(&RunId(id.into()), org, project)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -39,7 +45,12 @@ async fn me_returns_the_authenticated_principal() {
     let app = router(app_state(db, clock));
 
     let resp = app
-        .oneshot(Request::builder().uri("/v1/me").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -108,9 +119,17 @@ async fn projects_are_ordered_by_last_run_at() {
     .await
     .unwrap();
     for name in ["web", "api", "mobile"] {
-        db.bind_repo("gh", &RepoRef { owner: "acme".into(), name: name.into() }, "acme", name)
-            .await
-            .unwrap();
+        db.bind_repo(
+            "gh",
+            &RepoRef {
+                owner: "acme".into(),
+                name: name.into(),
+            },
+            "acme",
+            name,
+        )
+        .await
+        .unwrap();
     }
     // api ran most recently, web earlier, mobile never.
     tenanted_run(&db, "web-run", "acme", "web", 1_000).await;
@@ -118,7 +137,12 @@ async fn projects_are_ordered_by_last_run_at() {
 
     let app = router(app_state(db.clone(), clock).with_forge_connections(db));
     let resp = app
-        .oneshot(Request::builder().uri("/v1/repos").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/repos")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -131,5 +155,8 @@ async fn projects_are_ordered_by_last_run_at() {
     assert_eq!(projects[1]["project"], "web");
     assert_eq!(projects[1]["last_run_at"], 1_000);
     assert_eq!(projects[2]["project"], "mobile");
-    assert!(projects[2]["last_run_at"].is_null(), "never-run repo has no recency key");
+    assert!(
+        projects[2]["last_run_at"].is_null(),
+        "never-run repo has no recency key"
+    );
 }

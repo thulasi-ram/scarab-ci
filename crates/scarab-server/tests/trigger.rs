@@ -36,7 +36,11 @@ fn push(branch: &str) -> Event {
 
 async fn setup() -> (FakeForge, Arc<InMemoryDb>, Arc<FakeClock>) {
     let forge = FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML);
-    (forge, Arc::new(InMemoryDb::new()), Arc::new(FakeClock::new(1_000)))
+    (
+        forge,
+        Arc::new(InMemoryDb::new()),
+        Arc::new(FakeClock::new(1_000)),
+    )
 }
 
 #[tokio::test]
@@ -101,7 +105,12 @@ async fn committed_scarab_authors_concurrency_and_gate() {
     assert!(approve.is_gate(), "approve should be a gate step");
     assert_eq!(approve.gate_kind.as_deref(), Some("manual"));
     assert!(
-        steps.iter().find(|s| s.step.0 == "build").unwrap().gate_kind.is_none(),
+        steps
+            .iter()
+            .find(|s| s.step.0 == "build")
+            .unwrap()
+            .gate_kind
+            .is_none(),
         "build is an ordinary step"
     );
 }
@@ -118,17 +127,29 @@ async fn deploy_pipeline_opts_out_of_supersede() {
     let db = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
 
-    let first = trigger_run_from_event(&deploy_forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger")
-        .pop()
-        .expect("first deploy run");
+    let first = trigger_run_from_event(
+        &deploy_forge,
+        db.as_ref(),
+        clock.as_ref(),
+        None,
+        &push("main"),
+    )
+    .await
+    .expect("trigger")
+    .pop()
+    .expect("first deploy run");
     clock.advance(1_000); // a strictly-later creation time for the second run
-    let second = trigger_run_from_event(&deploy_forge, db.as_ref(), clock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger")
-        .pop()
-        .expect("second deploy run");
+    let second = trigger_run_from_event(
+        &deploy_forge,
+        db.as_ref(),
+        clock.as_ref(),
+        None,
+        &push("main"),
+    )
+    .await
+    .expect("trigger")
+    .pop()
+    .expect("second deploy run");
     assert!(
         db.superseded_by(&second).await.unwrap().is_empty(),
         "a newer deploy must not supersede the older one"
@@ -142,17 +163,29 @@ async fn deploy_pipeline_opts_out_of_supersede() {
     );
     let cdb = Arc::new(InMemoryDb::new());
     let cclock = Arc::new(FakeClock::new(1_000));
-    let older = trigger_run_from_event(&ci_forge, cdb.as_ref(), cclock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger")
-        .pop()
-        .unwrap();
+    let older = trigger_run_from_event(
+        &ci_forge,
+        cdb.as_ref(),
+        cclock.as_ref(),
+        None,
+        &push("main"),
+    )
+    .await
+    .expect("trigger")
+    .pop()
+    .unwrap();
     cclock.advance(1_000);
-    let newer = trigger_run_from_event(&ci_forge, cdb.as_ref(), cclock.as_ref(), None, &push("main"))
-        .await
-        .expect("trigger")
-        .pop()
-        .unwrap();
+    let newer = trigger_run_from_event(
+        &ci_forge,
+        cdb.as_ref(),
+        cclock.as_ref(),
+        None,
+        &push("main"),
+    )
+    .await
+    .expect("trigger")
+    .pop()
+    .unwrap();
     assert_eq!(
         cdb.superseded_by(&newer).await.unwrap(),
         vec![older],
@@ -183,8 +216,17 @@ steps:
         .expect("trigger")
         .pop()
         .unwrap();
-    let deploy = db.steps_of_run(&run).await.unwrap().into_iter().find(|s| s.step.0 == "deploy");
-    assert_eq!(deploy.map(|s| s.status), Some(StepStatus::Pending), "deploy runs on main");
+    let deploy = db
+        .steps_of_run(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.step.0 == "deploy");
+    assert_eq!(
+        deploy.map(|s| s.status),
+        Some(StepStatus::Pending),
+        "deploy runs on main"
+    );
 
     // Push to a feature branch: the guard fails, so deploy is present but Skipped.
     let run = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("feature"))
@@ -192,8 +234,17 @@ steps:
         .expect("trigger")
         .pop()
         .unwrap();
-    let deploy = db.steps_of_run(&run).await.unwrap().into_iter().find(|s| s.step.0 == "deploy");
-    assert_eq!(deploy.map(|s| s.status), Some(StepStatus::Skipped), "deploy skipped off main");
+    let deploy = db
+        .steps_of_run(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.step.0 == "deploy");
+    assert_eq!(
+        deploy.map(|s| s.status),
+        Some(StepStatus::Skipped),
+        "deploy skipped off main"
+    );
 }
 
 /// Transitive skip (ADR-0033): a `when:`-guarded-off step and every descendant
@@ -233,8 +284,16 @@ steps:
         }
     }
 
-    assert_eq!(db_steps_status(&db, &run, "build").await, StepStatus::Succeeded, "build ran");
-    assert_eq!(db_steps_status(&db, &run, "deploy").await, StepStatus::Skipped, "deploy guarded off");
+    assert_eq!(
+        db_steps_status(&db, &run, "build").await,
+        StepStatus::Succeeded,
+        "build ran"
+    );
+    assert_eq!(
+        db_steps_status(&db, &run, "deploy").await,
+        StepStatus::Skipped,
+        "deploy guarded off"
+    );
     assert_eq!(
         db_steps_status(&db, &run, "notify").await,
         StepStatus::Skipped,
@@ -247,8 +306,18 @@ steps:
     );
 }
 
-async fn db_steps_status(db: &InMemoryDb, run: &scarab_engine::RunId, id: &str) -> scarab_engine::StepStatus {
-    db.steps_of_run(run).await.unwrap().into_iter().find(|s| s.step.0 == id).unwrap().status
+async fn db_steps_status(
+    db: &InMemoryDb,
+    run: &scarab_engine::RunId,
+    id: &str,
+) -> scarab_engine::StepStatus {
+    db.steps_of_run(run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.step.0 == id)
+        .unwrap()
+        .status
 }
 
 #[tokio::test]
@@ -258,7 +327,10 @@ async fn push_to_non_matching_ref_starts_no_run() {
     let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("dev"))
         .await
         .expect("trigger");
-    assert!(runs.is_empty(), "push to dev is filtered out by the on:push when");
+    assert!(
+        runs.is_empty(),
+        "push to dev is filtered out by the on:push when"
+    );
     assert!(db.active_runs().await.unwrap().is_empty());
 }
 
@@ -301,7 +373,11 @@ async fn multiple_pipelines_each_start_a_run() {
     let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
         .await
         .expect("trigger");
-    assert_eq!(runs.len(), 2, "ci + nightly match the push; deploy (tag) does not");
+    assert_eq!(
+        runs.len(),
+        2,
+        "ci + nightly match the push; deploy (tag) does not"
+    );
 
     // Collect the single step id of each started run to confirm which pipelines ran.
     let mut ran: Vec<String> = Vec::new();
@@ -391,11 +467,18 @@ steps:
     let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
         .await
         .expect("trigger");
-    assert_eq!(runs.len(), 1, "only `.scarab/ci.yaml` triggers; the lib file does not");
+    assert_eq!(
+        runs.len(),
+        1,
+        "only `.scarab/ci.yaml` triggers; the lib file does not"
+    );
     let run = runs.into_iter().next().unwrap();
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(steps.len(), 1);
-    assert_eq!(steps[0].step.0, "build", "the run is ci.yaml's, not the lib's");
+    assert_eq!(
+        steps[0].step.0, "build",
+        "the run is ci.yaml's, not the lib's"
+    );
 }
 
 /// ADR-0038 (nesting): a library that itself `invoke:`s another library is

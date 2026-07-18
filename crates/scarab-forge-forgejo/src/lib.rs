@@ -40,7 +40,8 @@ pub fn verify_signature(
     let provided = decode_hex(hex).ok_or(ForgeError::BadSignature)?;
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| ForgeError::BadSignature)?;
     mac.update(body);
-    mac.verify_slice(&provided).map_err(|_| ForgeError::BadSignature)
+    mac.verify_slice(&provided)
+        .map_err(|_| ForgeError::BadSignature)
 }
 
 /// Compute the hex signature Forgejo would send for `body` under `secret`.
@@ -62,7 +63,10 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
             let r#ref = string_at(p, "ref")?;
             let after = string_at(p, "after")?;
             if let Some(tag) = r#ref.strip_prefix("refs/tags/") {
-                Ok(Event::Tag { repo, tag: tag.to_string() })
+                Ok(Event::Tag {
+                    repo,
+                    tag: tag.to_string(),
+                })
             } else {
                 Ok(Event::Push { repo, r#ref, after })
             }
@@ -87,7 +91,12 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 (Some(base), Some(head_repo)) => head_repo != base,
                 _ => head_repo.is_none(),
             };
-            Ok(Event::PullRequest { repo, number, head, fork })
+            Ok(Event::PullRequest {
+                repo,
+                number,
+                head,
+                fork,
+            })
         }
         "release" => {
             let repo = repo_of(p)?;
@@ -127,7 +136,10 @@ fn repo_of(payload: &Value) -> Result<RepoRef, ForgeError> {
         .pointer("/repository/name")
         .and_then(Value::as_str)
         .ok_or_else(|| ForgeError::Malformed("repository.name".into()))?;
-    Ok(RepoRef { owner: owner.to_string(), name: name.to_string() })
+    Ok(RepoRef {
+        owner: owner.to_string(),
+        name: name.to_string(),
+    })
 }
 
 fn string_at(payload: &Value, key: &str) -> Result<String, ForgeError> {
@@ -202,7 +214,10 @@ impl ForgejoForge {
 /// Fail non-2xx with the body in the error; parse JSON otherwise.
 async fn ok_json(resp: reqwest::Response) -> Result<Value, ForgeError> {
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| ForgeError::Api(e.to_string()))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| ForgeError::Api(e.to_string()))?;
     if !status.is_success() {
         return Err(ForgeError::Api(format!("{status}: {text}")));
     }
@@ -213,10 +228,26 @@ async fn ok_json(resp: reqwest::Response) -> Result<Value, ForgeError> {
 /// Gitea/GitHub).
 fn permissions_from_str(p: &str) -> Permissions {
     match p {
-        "admin" | "owner" => Permissions { read: true, write: true, admin: true },
-        "write" => Permissions { read: true, write: true, admin: false },
-        "read" => Permissions { read: true, write: false, admin: false },
-        _ => Permissions { read: false, write: false, admin: false },
+        "admin" | "owner" => Permissions {
+            read: true,
+            write: true,
+            admin: true,
+        },
+        "write" => Permissions {
+            read: true,
+            write: true,
+            admin: false,
+        },
+        "read" => Permissions {
+            read: true,
+            write: false,
+            admin: false,
+        },
+        _ => Permissions {
+            read: false,
+            write: false,
+            admin: false,
+        },
     }
 }
 
@@ -263,7 +294,10 @@ impl ForgePort for ForgejoForge {
         ));
         let resp = self.send(|| self.client.get(&url)).await?;
         let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| ForgeError::Api(e.to_string()))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ForgeError::Api(e.to_string()))?;
         if !status.is_success() {
             return Err(ForgeError::Api(format!(
                 "{status}: {}",
@@ -310,9 +344,8 @@ impl ForgePort for ForgejoForge {
         let exists = hooks
             .as_array()
             .map(|arr| {
-                arr.iter().any(|h| {
-                    h.pointer("/config/url").and_then(Value::as_str) == Some(callback_url)
-                })
+                arr.iter()
+                    .any(|h| h.pointer("/config/url").and_then(Value::as_str) == Some(callback_url))
             })
             .unwrap_or(false);
         if exists {
@@ -324,7 +357,9 @@ impl ForgePort for ForgejoForge {
             "events": ["push", "pull_request", "release", "issue_comment"],
             "config": { "url": callback_url, "content_type": "json" },
         });
-        let resp = self.send(|| self.client.post(&hooks_url).json(&body)).await?;
+        let resp = self
+            .send(|| self.client.post(&hooks_url).json(&body))
+            .await?;
         ok_json(resp).await.map(|_| ())
     }
 
@@ -355,7 +390,11 @@ impl ForgePort for ForgejoForge {
     /// Forgejo has no deployments API — accepted and ignored ("Forgejo
     /// ignores what it can't render", ADR-0046). Deployment history is
     /// Scarab's own durable record (ADR-0024) either way.
-    async fn create_deployment(&self, _repo: &RepoRef, _environment: &str) -> Result<(), ForgeError> {
+    async fn create_deployment(
+        &self,
+        _repo: &RepoRef,
+        _environment: &str,
+    ) -> Result<(), ForgeError> {
         Ok(())
     }
 
@@ -377,7 +416,9 @@ impl ForgePort for ForgejoForge {
         let resp = self.send(|| self.client.get(&url)).await?;
         let body = ok_json(resp).await?;
         Ok(permissions_from_str(
-            body.get("permission").and_then(Value::as_str).unwrap_or("none"),
+            body.get("permission")
+                .and_then(Value::as_str)
+                .unwrap_or("none"),
         ))
     }
 
@@ -462,7 +503,10 @@ mod tests {
         assert_eq!(
             normalize(&delivery("push", payload)).unwrap(),
             Event::Push {
-                repo: RepoRef { owner: "acme".into(), name: "app".into() },
+                repo: RepoRef {
+                    owner: "acme".into(),
+                    name: "app".into()
+                },
                 r#ref: "refs/heads/main".into(),
                 after: "abc123".into(),
             }

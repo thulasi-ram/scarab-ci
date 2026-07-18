@@ -28,7 +28,10 @@ fn spec() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
@@ -37,9 +40,15 @@ async fn seed_run(db: &PostgresDb, id: &str, group: &str, policy: ConcurrencyPol
     let run = RunId(id.into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
     db.set_run_concurrency(&run, group, policy).await.unwrap();
-    db.create_step_run(&run, &StepId("build".into()), Some(&spec()), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("build".into()),
+        Some(&spec()),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     run
 }
 
@@ -65,7 +74,11 @@ async fn queue_group_serializes_runs() {
     sched.admit(&a).await.unwrap();
     sched.admit(&b).await.unwrap();
     assert_eq!(db.run_status(&a).await.unwrap(), Some(RunStatus::Running));
-    assert_eq!(db.run_status(&b).await.unwrap(), Some(RunStatus::Pending), "B queued behind A");
+    assert_eq!(
+        db.run_status(&b).await.unwrap(),
+        Some(RunStatus::Pending),
+        "B queued behind A"
+    );
 
     // Complete A: its step succeeds, the run settles and releases the slot.
     exec.script_outcome(ExecState::Succeeded);
@@ -75,7 +88,11 @@ async fn queue_group_serializes_runs() {
 
     // Now B can take the freed slot and start.
     sched.admit(&b).await.unwrap();
-    assert_eq!(db.run_status(&b).await.unwrap(), Some(RunStatus::Running), "B starts after A frees the slot");
+    assert_eq!(
+        db.run_status(&b).await.unwrap(),
+        Some(RunStatus::Running),
+        "B starts after A frees the slot"
+    );
 
     tdb.cleanup().await;
 }
@@ -103,11 +120,19 @@ async fn cancel_in_progress_group_cancels_the_older() {
 
     // B arrives: the older holder A is cancelled, freeing the slot.
     sched.admit(&b).await.unwrap();
-    assert_eq!(db.run_status(&a).await.unwrap(), Some(RunStatus::Cancelled), "older A cancelled");
+    assert_eq!(
+        db.run_status(&a).await.unwrap(),
+        Some(RunStatus::Cancelled),
+        "older A cancelled"
+    );
 
     // B then takes the slot.
     sched.admit(&b).await.unwrap();
-    assert_eq!(db.run_status(&b).await.unwrap(), Some(RunStatus::Running), "newer B proceeds");
+    assert_eq!(
+        db.run_status(&b).await.unwrap(),
+        Some(RunStatus::Running),
+        "newer B proceeds"
+    );
 
     tdb.cleanup().await;
 }
@@ -125,9 +150,15 @@ async fn cancel_run_reaches_terminal() {
 
     let run = RunId("run-x".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &StepId("build".into()), Some(&spec()), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("build".into()),
+        Some(&spec()),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
@@ -139,7 +170,10 @@ async fn cancel_run_reaches_terminal() {
 
     // Cancel: the run and its in-flight step both reach a terminal Cancelled.
     sched.cancel_run(&run).await.unwrap();
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Cancelled));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Cancelled)
+    );
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(steps[0].status, StepStatus::Cancelled);
     assert!(db.run_status(&run).await.unwrap().unwrap().is_terminal());

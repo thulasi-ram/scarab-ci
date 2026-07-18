@@ -17,11 +17,16 @@ use scarab_testkit::{FakeClock, InMemoryDb, InMemoryObjectStore};
 const SECRET: &[u8] = b"results-secret";
 
 async fn seed_step(db: &InMemoryDb, run: &RunId, step: &StepId) {
-    db.create_step_run(run, step, None, &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(run, step, None, &[], Timestamp(0))
+        .await
+        .unwrap();
 }
 
 fn state(db: Arc<InMemoryDb>, secret: Option<&[u8]>) -> AppState {
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
     let mut st = AppState::new(db, Arc::new(FakeClock::new(1_000)), logs);
     if let Some(s) = secret {
         st = st.with_results_token_secret(s.to_vec());
@@ -29,7 +34,13 @@ fn state(db: Arc<InMemoryDb>, secret: Option<&[u8]>) -> AppState {
     st
 }
 
-fn ingest_req(run: &str, step: &str, attempt: &str, token: Option<&str>, body: &str) -> Request<Body> {
+fn ingest_req(
+    run: &str,
+    step: &str,
+    attempt: &str,
+    token: Option<&str>,
+    body: &str,
+) -> Request<Body> {
     let mut b = Request::builder()
         .method("POST")
         .uri(format!("/v1/runs/{run}/steps/{step}/results"))
@@ -49,15 +60,28 @@ async fn valid_token_persists_named_results() {
     seed_step(&db, &run, &step).await;
     let app = router(state(db.clone(), Some(SECRET)));
 
-    let token = scarab_forge_github::sign_hex(SECRET, results_token_message("r1", "deploy", "a1").as_bytes());
+    let token = scarab_forge_github::sign_hex(
+        SECRET,
+        results_token_message("r1", "deploy", "a1").as_bytes(),
+    );
     let body = r#"{"url":"https://svc.example","replicas":3}"#;
-    let resp = app.oneshot(ingest_req("r1", "deploy", "a1", Some(&token), body)).await.unwrap();
+    let resp = app
+        .oneshot(ingest_req("r1", "deploy", "a1", Some(&token), body))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
     // Typed values round-trip into step_runs.results.
     let results = db.step_results(&run, &step).await.unwrap();
-    assert_eq!(results.get("url").unwrap(), &serde_json::json!("https://svc.example"));
-    assert_eq!(results.get("replicas").unwrap(), &serde_json::json!(3), "int type preserved");
+    assert_eq!(
+        results.get("url").unwrap(),
+        &serde_json::json!("https://svc.example")
+    );
+    assert_eq!(
+        results.get("replicas").unwrap(),
+        &serde_json::json!(3),
+        "int type preserved"
+    );
 }
 
 #[tokio::test]
@@ -69,28 +93,56 @@ async fn bad_or_missing_token_is_unauthorized() {
     let app = router(state(db.clone(), Some(SECRET)));
 
     // Wrong secret.
-    let wrong = scarab_forge_github::sign_hex(b"nope", results_token_message("r1", "deploy", "a1").as_bytes());
+    let wrong = scarab_forge_github::sign_hex(
+        b"nope",
+        results_token_message("r1", "deploy", "a1").as_bytes(),
+    );
     let resp = app
         .clone()
-        .oneshot(ingest_req("r1", "deploy", "a1", Some(&wrong), r#"{"url":"x"}"#))
+        .oneshot(ingest_req(
+            "r1",
+            "deploy",
+            "a1",
+            Some(&wrong),
+            r#"{"url":"x"}"#,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // A token for a different attempt does not authenticate this fence.
-    let other_attempt = scarab_forge_github::sign_hex(SECRET, results_token_message("r1", "deploy", "a2").as_bytes());
+    let other_attempt = scarab_forge_github::sign_hex(
+        SECRET,
+        results_token_message("r1", "deploy", "a2").as_bytes(),
+    );
     let resp = app
         .clone()
-        .oneshot(ingest_req("r1", "deploy", "a1", Some(&other_attempt), r#"{"url":"x"}"#))
+        .oneshot(ingest_req(
+            "r1",
+            "deploy",
+            "a1",
+            Some(&other_attempt),
+            r#"{"url":"x"}"#,
+        ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "token is fence-scoped to the attempt");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "token is fence-scoped to the attempt"
+    );
 
     // Missing token.
-    let resp = app.oneshot(ingest_req("r1", "deploy", "a1", None, r#"{"url":"x"}"#)).await.unwrap();
+    let resp = app
+        .oneshot(ingest_req("r1", "deploy", "a1", None, r#"{"url":"x"}"#))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    assert!(db.step_results(&run, &step).await.unwrap().is_empty(), "nothing persisted");
+    assert!(
+        db.step_results(&run, &step).await.unwrap().is_empty(),
+        "nothing persisted"
+    );
 }
 
 #[tokio::test]
@@ -101,8 +153,20 @@ async fn ingest_disabled_without_a_secret_is_404() {
     seed_step(&db, &run, &step).await;
     let app = router(state(db, None)); // no results_token_secret
 
-    let token = scarab_forge_github::sign_hex(SECRET, results_token_message("r1", "deploy", "a1").as_bytes());
-    let resp = app.oneshot(ingest_req("r1", "deploy", "a1", Some(&token), r#"{"url":"x"}"#)).await.unwrap();
+    let token = scarab_forge_github::sign_hex(
+        SECRET,
+        results_token_message("r1", "deploy", "a1").as_bytes(),
+    );
+    let resp = app
+        .oneshot(ingest_req(
+            "r1",
+            "deploy",
+            "a1",
+            Some(&token),
+            r#"{"url":"x"}"#,
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -111,7 +175,19 @@ async fn results_for_an_unknown_step_are_404() {
     let db = Arc::new(InMemoryDb::new());
     let app = router(state(db, Some(SECRET))); // no step seeded
 
-    let token = scarab_forge_github::sign_hex(SECRET, results_token_message("r1", "ghost", "a1").as_bytes());
-    let resp = app.oneshot(ingest_req("r1", "ghost", "a1", Some(&token), r#"{"url":"x"}"#)).await.unwrap();
+    let token = scarab_forge_github::sign_hex(
+        SECRET,
+        results_token_message("r1", "ghost", "a1").as_bytes(),
+    );
+    let resp = app
+        .oneshot(ingest_req(
+            "r1",
+            "ghost",
+            "a1",
+            Some(&token),
+            r#"{"url":"x"}"#,
+        ))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

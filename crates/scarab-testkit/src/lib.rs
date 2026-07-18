@@ -162,7 +162,13 @@ impl InMemoryDb {
     }
 
     /// Seed a step row with a status and optional launch spec.
-    pub fn seed_step(&self, run: &RunId, step: &StepId, status: StepStatus, spec: Option<StepSpec>) {
+    pub fn seed_step(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        status: StepStatus,
+        spec: Option<StepSpec>,
+    ) {
         self.state.lock().unwrap().steps.insert(
             (run.clone(), step.clone()),
             StepRec {
@@ -221,7 +227,9 @@ impl Db for InMemoryDb {
             .filter(|(_, r)| r.status == Some(StepStatus::Ready))
             .map(|(k, _)| k.clone())
             .collect();
-        keys.sort_by(|a, b| (a.0 .0.as_str(), a.1 .0.as_str()).cmp(&(b.0 .0.as_str(), b.1 .0.as_str())));
+        keys.sort_by(|a, b| {
+            (a.0 .0.as_str(), a.1 .0.as_str()).cmp(&(b.0 .0.as_str(), b.1 .0.as_str()))
+        });
         for key in keys.into_iter().take(limit as usize) {
             let rec = st.steps.get_mut(&key).unwrap();
             rec.status = Some(StepStatus::Running);
@@ -474,12 +482,7 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().run_project.get(run).cloned())
     }
 
-    async fn set_run_tenant(
-        &self,
-        run: &RunId,
-        org: &str,
-        project: &str,
-    ) -> Result<(), DbError> {
+    async fn set_run_tenant(&self, run: &RunId, org: &str, project: &str) -> Result<(), DbError> {
         self.state
             .lock()
             .unwrap()
@@ -498,7 +501,9 @@ impl Db for InMemoryDb {
             .runs
             .iter()
             .filter(|(_, s)| matches!(s, RunStatus::Running | RunStatus::Suspended))
-            .filter(|(r, _)| project.is_none_or(|p| st.run_project.get(*r).map(String::as_str) == Some(p)))
+            .filter(|(r, _)| {
+                project.is_none_or(|p| st.run_project.get(*r).map(String::as_str) == Some(p))
+            })
             .count();
         Ok(n as u32)
     }
@@ -518,11 +523,7 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
-    async fn gate_timer_seconds(
-        &self,
-        run: &RunId,
-        step: &StepId,
-    ) -> Result<Option<i64>, DbError> {
+    async fn gate_timer_seconds(&self, run: &RunId, step: &StepId) -> Result<Option<i64>, DbError> {
         Ok(self
             .state
             .lock()
@@ -634,11 +635,7 @@ impl Db for InMemoryDb {
             })
             .collect();
         // Newest first, then id — matches the adapter's ORDER BY.
-        out.sort_by(|a, b| {
-            b.created_at
-                .cmp(&a.created_at)
-                .then(b.run.0.cmp(&a.run.0))
-        });
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.run.0.cmp(&a.run.0)));
         out.truncate(limit as usize);
         Ok(out)
     }
@@ -777,10 +774,7 @@ impl Db for InMemoryDb {
         attempt: &Attempt,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
-        let rec = st
-            .steps
-            .entry((run.clone(), step.clone()))
-            .or_default();
+        let rec = st.steps.entry((run.clone(), step.clone())).or_default();
         // Idempotent on the attempt id.
         if let Some(existing) = rec.attempts.iter_mut().find(|a| a.id == attempt.id) {
             *existing = attempt.clone();
@@ -953,7 +947,9 @@ impl Db for InMemoryDb {
         let st = self.state.lock().unwrap();
         let mut counts: HashMap<String, u64> = HashMap::new();
         for status in st.runs.values() {
-            *counts.entry(format!("{status:?}").to_lowercase()).or_default() += 1;
+            *counts
+                .entry(format!("{status:?}").to_lowercase())
+                .or_default() += 1;
         }
         let mut out: Vec<_> = counts.into_iter().collect();
         out.sort();
@@ -962,7 +958,11 @@ impl Db for InMemoryDb {
 
     async fn outbox_depth(&self) -> Result<u64, DbError> {
         let st = self.state.lock().unwrap();
-        Ok(st.outbox.iter().filter(|e| !e.dispatched && !e.dead_lettered).count() as u64)
+        Ok(st
+            .outbox
+            .iter()
+            .filter(|e| !e.dispatched && !e.dead_lettered)
+            .count() as u64)
     }
 
     async fn put_artifacts(
@@ -973,12 +973,16 @@ impl Db for InMemoryDb {
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
         for a in artifacts {
-            st.artifacts.insert((run.clone(), a.name.clone()), a.clone());
+            st.artifacts
+                .insert((run.clone(), a.name.clone()), a.clone());
         }
         Ok(())
     }
 
-    async fn artifacts_of_run(&self, run: &RunId) -> Result<Vec<scarab_engine::ArtifactMeta>, DbError> {
+    async fn artifacts_of_run(
+        &self,
+        run: &RunId,
+    ) -> Result<Vec<scarab_engine::ArtifactMeta>, DbError> {
         let st = self.state.lock().unwrap();
         let mut out: Vec<_> = st
             .artifacts
@@ -1012,7 +1016,11 @@ impl Db for InMemoryDb {
     }
 
     async fn delete_artifacts_of_run(&self, run: &RunId) -> Result<(), DbError> {
-        self.state.lock().unwrap().artifacts.retain(|(r, _), _| r != run);
+        self.state
+            .lock()
+            .unwrap()
+            .artifacts
+            .retain(|(r, _), _| r != run);
         Ok(())
     }
 
@@ -1048,14 +1056,15 @@ impl Db for InMemoryDb {
     }
 
     async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError> {
-        self.state.lock().unwrap().logs.retain(|(r, _, _), _| r != run);
+        self.state
+            .lock()
+            .unwrap()
+            .logs
+            .retain(|(r, _, _), _| r != run);
         Ok(())
     }
 
-    async fn gc_workspace_roots(
-        &self,
-        terminal_cutoff: Timestamp,
-    ) -> Result<Vec<String>, DbError> {
+    async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError> {
         let st = self.state.lock().unwrap();
         Ok(st
             .steps
@@ -1084,15 +1093,30 @@ impl Db for InMemoryDb {
             Entry::Occupied(mut e) => {
                 let (holder, expires) = e.get().clone();
                 if holder == owner || now >= expires {
-                    e.insert((owner.to_string(), now + std::time::Duration::from_millis(ttl_ms as u64)));
-                    Ok(Lease { owner: owner.to_string(), expires_at: Timestamp(ttl_ms) })
+                    e.insert((
+                        owner.to_string(),
+                        now + std::time::Duration::from_millis(ttl_ms as u64),
+                    ));
+                    Ok(Lease {
+                        owner: owner.to_string(),
+                        expires_at: Timestamp(ttl_ms),
+                    })
                 } else {
-                    Ok(Lease { owner: holder, expires_at: Timestamp(ttl_ms) })
+                    Ok(Lease {
+                        owner: holder,
+                        expires_at: Timestamp(ttl_ms),
+                    })
                 }
             }
             Entry::Vacant(v) => {
-                v.insert((owner.to_string(), now + std::time::Duration::from_millis(ttl_ms as u64)));
-                Ok(Lease { owner: owner.to_string(), expires_at: Timestamp(ttl_ms) })
+                v.insert((
+                    owner.to_string(),
+                    now + std::time::Duration::from_millis(ttl_ms as u64),
+                ));
+                Ok(Lease {
+                    owner: owner.to_string(),
+                    expires_at: Timestamp(ttl_ms),
+                })
             }
         }
     }
@@ -1190,7 +1214,12 @@ impl FakeExecutor {
     /// The spec `handle` was most recently launched with (after launch-time
     /// interpolation, ADR-0041), or `None` if it was never launched.
     pub fn launched_spec(&self, handle: &ExecHandle) -> Option<StepSpec> {
-        self.inner.lock().unwrap().launched_specs.get(&handle.0).cloned()
+        self.inner
+            .lock()
+            .unwrap()
+            .launched_specs
+            .get(&handle.0)
+            .cloned()
     }
 
     /// How many times the given handle was launched (0 if never).
@@ -1372,7 +1401,10 @@ impl FakeForge {
 
     /// Seed the content the forge returns for `path` at any ref.
     pub fn with_file(self, path: impl Into<String>, content: impl Into<Vec<u8>>) -> Self {
-        self.files.lock().unwrap().insert(path.into(), content.into());
+        self.files
+            .lock()
+            .unwrap()
+            .insert(path.into(), content.into());
         self
     }
 
@@ -1386,7 +1418,10 @@ impl FakeForge {
     /// returns for `git_ref` — lets a test assert a run pins to a resolved sha
     /// distinct from the branch ref it dispatched (ADR-0043).
     pub fn with_commit(self, git_ref: impl Into<String>, sha: impl Into<String>) -> Self {
-        self.commits.lock().unwrap().insert(git_ref.into(), sha.into());
+        self.commits
+            .lock()
+            .unwrap()
+            .insert(git_ref.into(), sha.into());
         self
     }
 
@@ -1426,7 +1461,13 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         &self,
         id: &str,
     ) -> Result<Option<scarab_forge::ForgeConnection>, scarab_forge::RegistryError> {
-        Ok(self.state.lock().unwrap().forge_connections.get(id).cloned())
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .forge_connections
+            .get(id)
+            .cloned())
     }
 
     async fn list_connections(
@@ -1460,7 +1501,11 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
     ) -> Result<(), scarab_forge::RegistryError> {
         self.state.lock().unwrap().forge_repos.insert(
             (repo.owner.clone(), repo.name.clone()),
-            (connection_id.to_string(), org.to_string(), project.to_string()),
+            (
+                connection_id.to_string(),
+                org.to_string(),
+                project.to_string(),
+            ),
         );
         Ok(())
     }
@@ -1472,7 +1517,11 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
     ) -> Result<(), scarab_forge::RegistryError> {
         let mut st = self.state.lock().unwrap();
         let key = (repo.owner.clone(), repo.name.clone());
-        if st.forge_repos.get(&key).is_some_and(|(c, _, _)| c == connection_id) {
+        if st
+            .forge_repos
+            .get(&key)
+            .is_some_and(|(c, _, _)| c == connection_id)
+        {
             st.forge_repos.remove(&key);
         }
         Ok(())
@@ -1505,11 +1554,13 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
             .forge_repos
             .get(&(repo.owner.clone(), repo.name.clone()))
             .and_then(|(conn_id, org, project)| {
-                st.forge_connections.get(conn_id).map(|c| scarab_forge::ResolvedRepo {
-                    connection: c.clone(),
-                    org: org.clone(),
-                    project: project.clone(),
-                })
+                st.forge_connections
+                    .get(conn_id)
+                    .map(|c| scarab_forge::ResolvedRepo {
+                        connection: c.clone(),
+                        org: org.clone(),
+                        project: project.clone(),
+                    })
             }))
     }
 
@@ -1580,7 +1631,11 @@ impl ForgePort for FakeForge {
         Ok(out)
     }
 
-    async fn register_webhook(&self, _repo: &RepoRef, _callback_url: &str) -> Result<(), ForgeError> {
+    async fn register_webhook(
+        &self,
+        _repo: &RepoRef,
+        _callback_url: &str,
+    ) -> Result<(), ForgeError> {
         Ok(())
     }
 
@@ -1607,12 +1662,24 @@ impl ForgePort for FakeForge {
         Ok(())
     }
 
-    async fn create_deployment(&self, _repo: &RepoRef, _environment: &str) -> Result<(), ForgeError> {
+    async fn create_deployment(
+        &self,
+        _repo: &RepoRef,
+        _environment: &str,
+    ) -> Result<(), ForgeError> {
         Ok(())
     }
 
-    async fn post_comment(&self, _repo: &RepoRef, issue: u64, body: &str) -> Result<(), ForgeError> {
-        self.comments.lock().unwrap().push((issue, body.to_string()));
+    async fn post_comment(
+        &self,
+        _repo: &RepoRef,
+        issue: u64,
+        body: &str,
+    ) -> Result<(), ForgeError> {
+        self.comments
+            .lock()
+            .unwrap()
+            .push((issue, body.to_string()));
         Ok(())
     }
 
@@ -1638,7 +1705,11 @@ impl ForgePort for FakeForge {
         })
     }
 
-    async fn get_permissions(&self, _repo: &RepoRef, _user: &str) -> Result<Permissions, ForgeError> {
+    async fn get_permissions(
+        &self,
+        _repo: &RepoRef,
+        _user: &str,
+    ) -> Result<Permissions, ForgeError> {
         Ok(Permissions {
             read: true,
             write: true,
@@ -1651,9 +1722,7 @@ impl ForgePort for FakeForge {
 // FakeAuthenticator + InMemorySessions — identity fakes
 // ---------------------------------------------------------------------------
 
-use scarab_identity::{
-    Authenticator, IdentityError, Principal, Session, SessionStore,
-};
+use scarab_identity::{Authenticator, IdentityError, Principal, Session, SessionStore};
 
 /// An [`Authenticator`] that maps a seeded credential string to a [`Principal`]
 /// — the login boundary mocked for tests (no real OAuth round-trip).
@@ -1729,7 +1798,15 @@ impl SessionStore for InMemorySessions {
 pub struct InMemoryRbac {
     /// (subject, org, project) → (role, origin); project "" = org scope;
     /// role None = native tombstone.
-    rows: Mutex<HashMap<(String, String, String), (Option<scarab_identity::Role>, scarab_identity::BindingOrigin)>>,
+    rows: Mutex<
+        HashMap<
+            (String, String, String),
+            (
+                Option<scarab_identity::Role>,
+                scarab_identity::BindingOrigin,
+            ),
+        >,
+    >,
 }
 
 impl InMemoryRbac {
@@ -1793,15 +1870,15 @@ impl scarab_identity::RbacStore for InMemoryRbac {
         let rows = self.rows.lock().unwrap();
         let exact = rows.get(&rbac_key(subject, scope)).and_then(|(r, _)| *r);
         let org = rows
-            .get(&rbac_key(subject, &scarab_identity::Scope::Org(scope.org().to_string())))
+            .get(&rbac_key(
+                subject,
+                &scarab_identity::Scope::Org(scope.org().to_string()),
+            ))
             .and_then(|(r, _)| *r);
         Ok(exact.max(org))
     }
 
-    async fn bindings(
-        &self,
-        org: &str,
-    ) -> Result<Vec<scarab_identity::Binding>, IdentityError> {
+    async fn bindings(&self, org: &str) -> Result<Vec<scarab_identity::Binding>, IdentityError> {
         let rows = self.rows.lock().unwrap();
         let mut out: Vec<scarab_identity::Binding> = rows
             .iter()
@@ -1811,7 +1888,10 @@ impl scarab_identity::RbacStore for InMemoryRbac {
                 scope: if p.is_empty() {
                     scarab_identity::Scope::Org(o.clone())
                 } else {
-                    scarab_identity::Scope::Project { org: o.clone(), name: p.clone() }
+                    scarab_identity::Scope::Project {
+                        org: o.clone(),
+                        name: p.clone(),
+                    }
                 },
                 role: role.unwrap(),
             })
@@ -1917,9 +1997,14 @@ mod tests {
         let run = RunId("r".into());
         let step = StepId("build".into());
         db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-        db.create_step_run(&run, &step, None, &[], Timestamp(0)).await.unwrap();
+        db.create_step_run(&run, &step, None, &[], Timestamp(0))
+            .await
+            .unwrap();
 
-        assert!(db.step_results(&run, &step).await.unwrap().is_empty(), "no results yet");
+        assert!(
+            db.step_results(&run, &step).await.unwrap().is_empty(),
+            "no results yet"
+        );
 
         let mut results = std::collections::BTreeMap::new();
         results.insert("url".to_string(), serde_json::json!("https://svc"));
@@ -1928,6 +2013,10 @@ mod tests {
 
         let got = db.step_results(&run, &step).await.unwrap();
         assert_eq!(got.get("url").unwrap(), &serde_json::json!("https://svc"));
-        assert_eq!(got.get("replicas").unwrap(), &serde_json::json!(3), "int type preserved");
+        assert_eq!(
+            got.get("replicas").unwrap(),
+            &serde_json::json!(3),
+            "int type preserved"
+        );
     }
 }

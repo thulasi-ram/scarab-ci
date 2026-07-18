@@ -29,7 +29,10 @@ async fn github_adapter_passes_the_port_contract() {
         eprintln!("skipping: set SCARAB_TEST_GITHUB=1 (+ creds) to run");
         return;
     }
-    let forge = match (env("SCARAB_TEST_GITHUB_APP_ID"), env("SCARAB_TEST_GITHUB_PEM_FILE")) {
+    let forge = match (
+        env("SCARAB_TEST_GITHUB_APP_ID"),
+        env("SCARAB_TEST_GITHUB_PEM_FILE"),
+    ) {
         (Some(app_id), Some(pem_file)) => GithubForge::app(GithubApp {
             app_id,
             private_key_pem: std::fs::read_to_string(pem_file).expect("read PEM"),
@@ -41,7 +44,10 @@ async fn github_adapter_passes_the_port_contract() {
 
     let full = env("SCARAB_TEST_GITHUB_REPO").expect("SCARAB_TEST_GITHUB_REPO");
     let (owner, name) = full.split_once('/').expect("owner/name");
-    let repo = RepoRef { owner: owner.into(), name: name.into() };
+    let repo = RepoRef {
+        owner: owner.into(),
+        name: name.into(),
+    };
     let r#ref = env("SCARAB_TEST_GITHUB_REF").unwrap_or_else(|| "refs/heads/main".into());
     let sha = env("SCARAB_TEST_GITHUB_SHA").expect("SCARAB_TEST_GITHUB_SHA");
     let file = env("SCARAB_TEST_GITHUB_FILE").unwrap_or_else(|| "README.md".into());
@@ -52,7 +58,10 @@ async fn github_adapter_passes_the_port_contract() {
         .read_file_at_ref(&repo, &r#ref, &file)
         .await
         .expect("fixture file readable");
-    let dir = file.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+    let dir = file
+        .rsplit_once('/')
+        .map(|(d, _)| d.to_string())
+        .unwrap_or_default();
 
     let fx = ContractFixture {
         repo: repo.clone(),
@@ -74,6 +83,9 @@ async fn github_adapter_passes_the_port_contract() {
     assert_contract(&forge, &fx).await;
 
     // Sanity beyond the suite: the normalized event round-trips the coordinate.
-    let ev = forge.normalize_event(fx.push_delivery.clone()).await.unwrap();
+    let ev = forge
+        .normalize_event(fx.push_delivery.clone())
+        .await
+        .unwrap();
     assert!(matches!(ev, Event::Push { .. }));
 }

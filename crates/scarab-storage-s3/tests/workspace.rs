@@ -36,7 +36,9 @@ async fn output_workspace_flows_to_dependent_input() {
     let b = StepId("B".into());
     // B depends on A (implicit-by-default: B inherits A's output workspace).
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &a, None, &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &a, None, &[], Timestamp(0))
+        .await
+        .unwrap();
     db.create_step_run(&run, &b, None, std::slice::from_ref(&a), Timestamp(0))
         .await
         .unwrap();
@@ -45,8 +47,13 @@ async fn output_workspace_flows_to_dependent_input() {
     //     snapshotted to CAS and recorded as A's output (post-step upload). ---
     std::fs::create_dir_all(a_work.join("out")).unwrap();
     std::fs::write(a_work.join("out/a.txt"), b"produced-by-A").unwrap();
-    let snapshot = cas.ingest(a_work.to_str().unwrap()).await.expect("ingest A");
-    db.set_step_output(&run, &a, &snapshot.root.0).await.unwrap();
+    let snapshot = cas
+        .ingest(a_work.to_str().unwrap())
+        .await
+        .expect("ingest A");
+    db.set_step_output(&run, &a, &snapshot.root.0)
+        .await
+        .unwrap();
 
     // --- Step B starts: resolve its input workspace from its needs, then
     //     materialize it (init-container fetch). ---

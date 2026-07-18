@@ -15,9 +15,7 @@ use tower::ServiceExt;
 
 use scarab_engine::{Attempt, AttemptId, Db, FailureKind, RunId, RunStatus, StepId, Timestamp};
 use scarab_server::{router, AppState, LogService};
-use scarab_storage::{
-    BlobHash, Cas, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget,
-};
+use scarab_storage::{BlobHash, Cas, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget};
 use scarab_testkit::{FakeClock, InMemoryDb, InMemoryObjectStore};
 
 // ── a trivial content-addressed store for the test ─────────────────────────
@@ -71,7 +69,10 @@ impl Cas for MemCas {
 }
 
 fn state(db: Arc<InMemoryDb>, cas: Option<Arc<dyn Cas>>) -> AppState {
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
     let mut st = AppState::new(db, Arc::new(FakeClock::new(1_000)), logs);
     if let Some(c) = cas {
         st = st.with_workspace_cas(c);
@@ -81,7 +82,9 @@ fn state(db: Arc<InMemoryDb>, cas: Option<Arc<dyn Cas>>) -> AppState {
 
 async fn seed_run_step(db: &InMemoryDb, run: &RunId, step: &StepId) {
     db.create_run(run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(run, step, None, &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(run, step, None, &[], Timestamp(0))
+        .await
+        .unwrap();
 }
 
 fn get(uri: &str) -> Request<Body> {
@@ -89,7 +92,10 @@ fn get(uri: &str) -> Request<Body> {
 }
 
 async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
-    axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
 }
 
 #[tokio::test]
@@ -99,12 +105,18 @@ async fn step_results_read_back_typed() {
     let step = StepId("build".into());
     seed_run_step(&db, &run, &step).await;
     let mut results = std::collections::BTreeMap::new();
-    results.insert("image".to_string(), serde_json::json!("ghcr.io/x@sha256:9f"));
+    results.insert(
+        "image".to_string(),
+        serde_json::json!("ghcr.io/x@sha256:9f"),
+    );
     results.insert("tests_passed".to_string(), serde_json::json!(214));
     db.set_step_results(&run, &step, &results).await.unwrap();
 
     let app = router(state(db, None));
-    let resp = app.oneshot(get("/v1/runs/r1/steps/build/results")).await.unwrap();
+    let resp = app
+        .oneshot(get("/v1/runs/r1/steps/build/results"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     let arr = v.as_array().unwrap();
@@ -121,23 +133,40 @@ async fn step_results_read_back_typed() {
 async fn step_results_unknown_run_is_404() {
     let db = Arc::new(InMemoryDb::new());
     let app = router(state(db, None));
-    let resp = app.oneshot(get("/v1/runs/ghost/steps/build/results")).await.unwrap();
+    let resp = app
+        .oneshot(get("/v1/runs/ghost/steps/build/results"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 /// Build root/{crates/{Cargo.toml}, ci.yaml} in the CAS and pin it as `build`'s
 /// output snapshot. Returns the shared app + CAS-backed state.
-async fn seed_workspace(db: &Arc<InMemoryDb>, cas: &MemCas, run: &RunId, step: &StepId) -> TreeHash {
+async fn seed_workspace(
+    db: &Arc<InMemoryDb>,
+    cas: &MemCas,
+    run: &RunId,
+    step: &StepId,
+) -> TreeHash {
     let ci = cas.put_blob(b"on: push\n").await.unwrap();
     let cargo = cas.put_blob(b"[package]\nname = \"x\"\n").await.unwrap();
     let crates = cas
-        .put_tree(vec![TreeEntry { name: "Cargo.toml".into(), target: TreeTarget::Blob(cargo) }])
+        .put_tree(vec![TreeEntry {
+            name: "Cargo.toml".into(),
+            target: TreeTarget::Blob(cargo),
+        }])
         .await
         .unwrap();
     let root = cas
         .put_tree(vec![
-            TreeEntry { name: "ci.yaml".into(), target: TreeTarget::Blob(ci) },
-            TreeEntry { name: "crates".into(), target: TreeTarget::Tree(crates) },
+            TreeEntry {
+                name: "ci.yaml".into(),
+                target: TreeTarget::Blob(ci),
+            },
+            TreeEntry {
+                name: "crates".into(),
+                target: TreeTarget::Tree(crates),
+            },
         ])
         .await
         .unwrap();
@@ -157,7 +186,11 @@ async fn workspace_lists_directories_first_and_streams_a_file() {
     let app = router(state(db, Some(Arc::new(cas))));
 
     // Root listing: dir ("crates") sorts before file ("ci.yaml").
-    let resp = app.clone().oneshot(get("/v1/runs/r1/steps/build/workspace")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get("/v1/runs/r1/steps/build/workspace"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(v["available"], true);
@@ -168,7 +201,11 @@ async fn workspace_lists_directories_first_and_streams_a_file() {
     assert_eq!(entries[1]["kind"], "file");
 
     // Descend into the sub-tree.
-    let resp = app.clone().oneshot(get("/v1/runs/r1/steps/build/workspace?path=crates")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get("/v1/runs/r1/steps/build/workspace?path=crates"))
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(v["entries"][0]["name"], "Cargo.toml");
 
@@ -196,7 +233,10 @@ async fn workspace_without_snapshot_is_available_false() {
     let step = StepId("build".into());
     seed_run_step(&db, &run, &step).await; // no set_step_output
     let app = router(state(db, Some(Arc::new(MemCas::default()))));
-    let resp = app.oneshot(get("/v1/runs/r1/steps/build/workspace")).await.unwrap();
+    let resp = app
+        .oneshot(get("/v1/runs/r1/steps/build/workspace"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(v["available"], false);
@@ -209,18 +249,34 @@ async fn run_detail_exposes_attempt_list_for_reruns() {
     let run = RunId("r1".into());
     let step = StepId("test".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &step, None, &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &step, None, &[], Timestamp(0))
+        .await
+        .unwrap();
     // Attempt 1 failed on infra, attempt 2 succeeded — the retry story.
-    db.record_attempt(&run, &step, &Attempt {
-        id: AttemptId("a1".into()),
-        started_at: Timestamp(10),
-        failure: Some(FailureKind::Infra { never_started: false }),
-    }).await.unwrap();
-    db.record_attempt(&run, &step, &Attempt {
-        id: AttemptId("a2".into()),
-        started_at: Timestamp(20),
-        failure: None,
-    }).await.unwrap();
+    db.record_attempt(
+        &run,
+        &step,
+        &Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(10),
+            failure: Some(FailureKind::Infra {
+                never_started: false,
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    db.record_attempt(
+        &run,
+        &step,
+        &Attempt {
+            id: AttemptId("a2".into()),
+            started_at: Timestamp(20),
+            failure: None,
+        },
+    )
+    .await
+    .unwrap();
 
     let app = router(state(db, None));
     let resp = app.oneshot(get("/v1/runs/r1")).await.unwrap();
@@ -233,7 +289,10 @@ async fn run_detail_exposes_attempt_list_for_reruns() {
     assert_eq!(al[0]["failed"], true);
     assert_eq!(al[0]["failure"], "infra");
     assert_eq!(al[1]["failed"], false);
-    assert!(al[1].get("failure").is_none() || al[1]["failure"].is_null(), "no failure on the winning attempt");
+    assert!(
+        al[1].get("failure").is_none() || al[1]["failure"].is_null(),
+        "no failure on the winning attempt"
+    );
 }
 
 #[tokio::test]
@@ -243,40 +302,84 @@ async fn step_logs_scope_by_attempt() {
     let step = StepId("build".into());
     // Terminal run so the SSE stream replays and closes (no live tail).
     db.seed_run(&run, RunStatus::Succeeded);
-    db.create_step_run(&run, &step, None, &[], Timestamp(0)).await.unwrap();
-    db.record_attempt(&run, &step, &Attempt {
-        id: AttemptId("a1".into()),
-        started_at: Timestamp(10),
-        failure: Some(FailureKind::Step),
-    }).await.unwrap();
-    db.record_attempt(&run, &step, &Attempt {
-        id: AttemptId("a2".into()),
-        started_at: Timestamp(20),
-        failure: None,
-    }).await.unwrap();
+    db.create_step_run(&run, &step, None, &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.record_attempt(
+        &run,
+        &step,
+        &Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(10),
+            failure: Some(FailureKind::Step),
+        },
+    )
+    .await
+    .unwrap();
+    db.record_attempt(
+        &run,
+        &step,
+        &Attempt {
+            id: AttemptId("a2".into()),
+            started_at: Timestamp(20),
+            failure: None,
+        },
+    )
+    .await
+    .unwrap();
 
     // Append distinct output per attempt through the same LogService the app uses.
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
-    logs.append(&run, &step, &AttemptId("a1".into()), b"boom: failed attempt\n").await.unwrap();
-    logs.append(&run, &step, &AttemptId("a2".into()), b"ok: retry passed\n").await.unwrap();
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    logs.append(
+        &run,
+        &step,
+        &AttemptId("a1".into()),
+        b"boom: failed attempt\n",
+    )
+    .await
+    .unwrap();
+    logs.append(&run, &step, &AttemptId("a2".into()), b"ok: retry passed\n")
+        .await
+        .unwrap();
     let app = router(AppState::new(db, Arc::new(FakeClock::new(1_000)), logs));
 
     // Whole step = both attempts.
-    let resp = app.clone().oneshot(get("/v1/runs/r1/steps/build/logs")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get("/v1/runs/r1/steps/build/logs"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = String::from_utf8(body_bytes(resp).await).unwrap();
     assert!(body.contains("boom: failed attempt") && body.contains("ok: retry passed"));
 
     // Scoped to just the failed attempt.
-    let resp = app.clone().oneshot(get("/v1/runs/r1/steps/build/logs?attempt=a1")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get("/v1/runs/r1/steps/build/logs?attempt=a1"))
+        .await
+        .unwrap();
     let body = String::from_utf8(body_bytes(resp).await).unwrap();
     assert!(body.contains("boom: failed attempt"));
-    assert!(!body.contains("ok: retry passed"), "attempt scope excludes the retry");
+    assert!(
+        !body.contains("ok: retry passed"),
+        "attempt scope excludes the retry"
+    );
 
     // Unknown attempt / unknown step → 404.
-    let resp = app.clone().oneshot(get("/v1/runs/r1/steps/build/logs?attempt=ghost")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get("/v1/runs/r1/steps/build/logs?attempt=ghost"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    let resp = app.oneshot(get("/v1/runs/r1/steps/ghost/logs")).await.unwrap();
+    let resp = app
+        .oneshot(get("/v1/runs/r1/steps/ghost/logs"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -287,6 +390,9 @@ async fn workspace_browse_disabled_without_cas_is_404() {
     let step = StepId("build".into());
     seed_run_step(&db, &run, &step).await;
     let app = router(state(db, None)); // no workspace CAS wired
-    let resp = app.oneshot(get("/v1/runs/r1/steps/build/workspace")).await.unwrap();
+    let resp = app
+        .oneshot(get("/v1/runs/r1/steps/build/workspace"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

@@ -39,19 +39,30 @@ async fn injected_secret_is_redacted_from_stored_and_streamed_logs() {
     let mut live = logs.subscribe(&run, &step, &attempt);
 
     // The step echoes its secret to stdout.
-    logs.append(&run, &step, &attempt, b"connecting with TOKEN=sup3r-s3cret ok\n")
-        .await
-        .unwrap();
+    logs.append(
+        &run,
+        &step,
+        &attempt,
+        b"connecting with TOKEN=sup3r-s3cret ok\n",
+    )
+    .await
+    .unwrap();
 
     // Streamed (live) chunk is redacted.
     let streamed = live.try_recv().expect("a live chunk");
     let streamed = String::from_utf8_lossy(&streamed);
-    assert!(!streamed.contains("sup3r-s3cret"), "streamed log leaked the secret: {streamed}");
+    assert!(
+        !streamed.contains("sup3r-s3cret"),
+        "streamed log leaked the secret: {streamed}"
+    );
     assert!(streamed.contains("TOKEN=***"));
 
     // Stored (replayed) log is redacted too.
     let stored = logs.read_all(&run, &step, &attempt).await.unwrap();
     let stored = String::from_utf8_lossy(&stored);
-    assert!(!stored.contains("sup3r-s3cret"), "stored log leaked the secret: {stored}");
+    assert!(
+        !stored.contains("sup3r-s3cret"),
+        "stored log leaked the secret: {stored}"
+    );
     assert!(stored.contains("TOKEN=***"));
 }

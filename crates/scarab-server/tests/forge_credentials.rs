@@ -29,5 +29,7 @@ async fn credential_material_resolves_by_handle_at_use_time() {
     assert_eq!(bytes, b"PEM BYTES");
 
     // A dangling handle fails loudly — never a silent empty credential.
-    assert!(connection_credential(&secrets, &conn("missing")).await.is_err());
+    assert!(connection_credential(&secrets, &conn("missing"))
+        .await
+        .is_err());
 }

@@ -51,7 +51,10 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
     db.create_step_run(&run, &step, Some(&spec), &[], Timestamp(0))
@@ -124,7 +127,8 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
     );
 
     let events = db.events(&run).await.unwrap();
-    let count = |pred: &dyn Fn(&EventPayload) -> bool| events.iter().filter(|e| pred(&e.kind)).count();
+    let count =
+        |pred: &dyn Fn(&EventPayload) -> bool| events.iter().filter(|e| pred(&e.kind)).count();
     assert_eq!(
         count(&|k| matches!(k, EventPayload::AttemptStarted { .. })),
         1,
@@ -138,7 +142,10 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
     assert_eq!(
         count(&|k| matches!(
             k,
-            EventPayload::StepTransitioned { to: StepStatus::Succeeded, .. }
+            EventPayload::StepTransitioned {
+                to: StepStatus::Succeeded,
+                ..
+            }
         )),
         1,
         "one terminal transition"

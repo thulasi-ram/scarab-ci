@@ -694,7 +694,8 @@ pub fn compile_yaml_with_libs(
     // Inline `invoke:` steps first (ADR-0038): the result is a flat step list
     // with no invoke steps, over which matrix expansion and validation run
     // unchanged. A library's own matrices thus expand normally.
-    let authored_steps = inline_invokes(&authored.steps, libs).map_err(PipelineError::Validation)?;
+    let authored_steps =
+        inline_invokes(&authored.steps, libs).map_err(PipelineError::Validation)?;
 
     let mut diagnostics = Vec::new();
     let mut expanded: Vec<StepSpec> = Vec::new();
@@ -835,7 +836,9 @@ fn resolve_lib_path(raw: &str) -> Result<String, String> {
         ));
     }
     if path.starts_with('/') {
-        return Err(format!("invoke path `{raw}` must be repo-relative (no leading `/`)"));
+        return Err(format!(
+            "invoke path `{raw}` must be repo-relative (no leading `/`)"
+        ));
     }
     if path.contains('\\') {
         return Err(format!("invoke path `{raw}` must use `/` path separators"));
@@ -845,12 +848,16 @@ fn resolve_lib_path(raw: &str) -> Result<String, String> {
     for comp in path.split('/') {
         match comp {
             "" => return Err(format!("invoke path `{raw}` has an empty path segment")),
-            "." => return Err(format!(
-                "invoke path `{raw}` must be a plain repo-relative path (no `.` segments)"
-            )),
-            ".." => return Err(format!(
-                "invoke path `{raw}` must not escape the repo tree with `..`"
-            )),
+            "." => {
+                return Err(format!(
+                    "invoke path `{raw}` must be a plain repo-relative path (no `.` segments)"
+                ))
+            }
+            ".." => {
+                return Err(format!(
+                    "invoke path `{raw}` must not escape the repo tree with `..`"
+                ))
+            }
             c => components.push(c),
         }
     }
@@ -970,7 +977,10 @@ fn inline_level(
         let lib: PipelineIr = match serde_yaml::from_str(src) {
             Ok(ir) => ir,
             Err(e) => {
-                diagnostics.push(format!("step `{}`: library `{key}` failed to parse: {e}", step.id));
+                diagnostics.push(format!(
+                    "step `{}`: library `{key}` failed to parse: {e}",
+                    step.id
+                ));
                 continue;
             }
         };
@@ -1034,17 +1044,29 @@ fn inline_level(
                 inst.needs = if ls.needs.0.is_empty() {
                     inv.needs.clone()
                 } else {
-                    Needs(ls.needs.0.iter().map(|n| namespace_ref(n, &internal, &ns)).collect())
+                    Needs(
+                        ls.needs
+                            .0
+                            .iter()
+                            .map(|n| namespace_ref(n, &internal, &ns))
+                            .collect(),
+                    )
                 };
                 if let Some(inputs) = &ls.inputs {
-                    inst.inputs =
-                        Some(inputs.iter().map(|n| namespace_ref(n, &internal, &ns)).collect());
+                    inst.inputs = Some(
+                        inputs
+                            .iter()
+                            .map(|n| namespace_ref(n, &internal, &ns))
+                            .collect(),
+                    );
                 }
                 // Propagate the invoke coordinate so CEL inside the subgraph can
                 // read it; a library step's own coordinate (added later by the
                 // main matrix pass) wins on key conflict.
                 for (k, v) in &inv.matrix_values {
-                    inst.matrix_values.entry(k.clone()).or_insert_with(|| v.clone());
+                    inst.matrix_values
+                        .entry(k.clone())
+                        .or_insert_with(|| v.clone());
                 }
                 // Inject the caller's inputs as `SCARAB_PARAM_<NAME>` env
                 // (ADR-0008 param convention), coerced to their declared types
@@ -1061,7 +1083,10 @@ fn inline_level(
                         Ok(resolved) => resolved
                             .iter()
                             .map(|(k, v)| {
-                                (format!("SCARAB_PARAM_{}", k.to_uppercase()), params::stringify(v))
+                                (
+                                    format!("SCARAB_PARAM_{}", k.to_uppercase()),
+                                    params::stringify(v),
+                                )
                             })
                             .collect(),
                         // A resolution error was already reported by
@@ -1224,7 +1249,12 @@ fn validate_interface(
             diagnostics.push(format!(
                 "step `{}`: unknown input `{k}` (library `{key}` declares inputs: [{}])",
                 step.id,
-                iface.inputs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+                iface
+                    .inputs
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
@@ -1470,10 +1500,14 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         }
         // Step kinds are mutually exclusive: a step is a gate, a clone, or an
         // ordinary executed step — never two at once.
-        if [step.gate.is_some(), step.clone.is_some(), step.build.is_some()]
-            .iter()
-            .filter(|k| **k)
-            .count()
+        if [
+            step.gate.is_some(),
+            step.clone.is_some(),
+            step.build.is_some(),
+        ]
+        .iter()
+        .filter(|k| **k)
+        .count()
             > 1
         {
             diagnostics.push(format!(
@@ -1658,10 +1692,7 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         // Dangling needs.
         for need in &step.needs.0 {
             if !ids.contains(need.as_str()) {
-                diagnostics.push(format!(
-                    "step `{}`: needs unknown step `{need}`",
-                    step.id
-                ));
+                diagnostics.push(format!("step `{}`: needs unknown step `{need}`", step.id));
             }
         }
         // Explicit inputs must be a subset of needs — a step can only consume the
@@ -1754,7 +1785,10 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
     // graph is well-formed enough to be meaningful (no dangling edges).
     if diagnostics.is_empty() {
         if let Some(cycle) = find_cycle(&ir.steps) {
-            diagnostics.push(format!("dependency cycle among steps: {}", cycle.join(" -> ")));
+            diagnostics.push(format!(
+                "dependency cycle among steps: {}",
+                cycle.join(" -> ")
+            ));
         }
     }
 
@@ -1797,7 +1831,10 @@ fn find_cycle(steps: &[StepSpec]) -> Option<Vec<String>> {
     for step in steps {
         for need in &step.needs.0 {
             *indegree.get_mut(step.id.as_str()).unwrap() += 1;
-            dependents.entry(need.as_str()).or_default().push(step.id.as_str());
+            dependents
+                .entry(need.as_str())
+                .or_default()
+                .push(step.id.as_str());
         }
     }
 
@@ -1938,10 +1975,16 @@ mod tests {
             "#,
         );
         let s = &ir.steps[0];
-        assert_eq!(s.placement_profiles, vec!["arm64".to_string(), "critical".to_string()]);
+        assert_eq!(
+            s.placement_profiles,
+            vec!["arm64".to_string(), "critical".to_string()]
+        );
         assert_eq!(s.resources.cpu_millis, Some(8000));
         assert_eq!(s.resources.memory_mib, Some(16384));
-        assert_eq!(s.k8s_overlay.as_ref().unwrap()["spec"]["schedulerName"], json!("my-scheduler"));
+        assert_eq!(
+            s.k8s_overlay.as_ref().unwrap()["spec"]["schedulerName"],
+            json!("my-scheduler")
+        );
         // A step with no placement omits the fields on serialize.
         let bare = compile("steps: [{ id: a, image: busybox }]");
         let json = serde_json::to_string(&bare).unwrap();
@@ -1952,7 +1995,9 @@ mod tests {
     #[test]
     fn k8s_overlay_must_be_a_mapping() {
         let errs = errors("steps: [{ id: a, image: busybox, k8s_overlay: [1, 2] }]");
-        assert!(errs.iter().any(|e| e.contains("`k8s_overlay` must be a mapping")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("`k8s_overlay` must be a mapping")));
     }
 
     #[test]
@@ -2103,7 +2148,9 @@ mod tests {
             "#,
         );
         assert!(
-            diags.iter().any(|d| d.contains("dimension `os` has no values")),
+            diags
+                .iter()
+                .any(|d| d.contains("dimension `os` has no values")),
             "got {diags:?}"
         );
     }
@@ -2141,9 +2188,11 @@ mod tests {
         );
 
         // On main the guard holds — nothing excluded.
-        assert!(excluded_steps(&ir, &json!({ "event": { "branch": "main" } }))
-            .unwrap()
-            .is_empty());
+        assert!(
+            excluded_steps(&ir, &json!({ "event": { "branch": "main" } }))
+                .unwrap()
+                .is_empty()
+        );
 
         // Off main only `deploy` (the guarded step) is excluded; the DAG keeps its
         // edges so the engine transitively skips `notify` (ADR-0033).
@@ -2169,7 +2218,10 @@ mod tests {
 
         // push fires only when the predicate holds.
         assert!(matches_trigger(&ir, "push", &on_main).unwrap());
-        assert!(!matches_trigger(&ir, "push", &on_dev).unwrap(), "ref filtered out");
+        assert!(
+            !matches_trigger(&ir, "push", &on_dev).unwrap(),
+            "ref filtered out"
+        );
         // pull_request has no predicate → always fires when declared.
         assert!(matches_trigger(&ir, "pull_request", &on_main).unwrap());
         // a kind not in `on:` never fires.
@@ -2187,7 +2239,10 @@ mod tests {
               - { id: a, image: busybox }
             "#,
         );
-        assert!(diags.iter().any(|d| d.contains("trigger `push`")), "got {diags:?}");
+        assert!(
+            diags.iter().any(|d| d.contains("trigger `push`")),
+            "got {diags:?}"
+        );
     }
 
     #[test]
@@ -2208,7 +2263,10 @@ mod tests {
               - { id: a, image: alpine }
             "#,
         );
-        assert!(diags.iter().any(|d| d.contains("duplicate step id `a`")), "got {diags:?}");
+        assert!(
+            diags.iter().any(|d| d.contains("duplicate step id `a`")),
+            "got {diags:?}"
+        );
     }
 
     #[test]
@@ -2226,8 +2284,7 @@ mod tests {
         assert_eq!(c.policy, "queue", "policy defaults to the safe queue");
 
         // Round-trips through serde_json unchanged (self-describing IR).
-        let back: PipelineIr =
-            serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+        let back: PipelineIr = serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
         assert_eq!(ir, back);
     }
 
@@ -2248,7 +2305,9 @@ mod tests {
             "#,
         );
         assert!(
-            diags.iter().any(|d| d.contains("unknown policy `nonsense`")),
+            diags
+                .iter()
+                .any(|d| d.contains("unknown policy `nonsense`")),
             "got {diags:?}"
         );
     }
@@ -2284,8 +2343,7 @@ mod tests {
             "#,
         );
         assert_eq!(ir.environment.as_deref(), Some("prod"));
-        let back: PipelineIr =
-            serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+        let back: PipelineIr = serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
         assert_eq!(ir, back);
 
         // A pipeline with no environment stays a plain CI pipeline.
@@ -2302,7 +2360,9 @@ mod tests {
             "#,
         );
         assert!(
-            diags.iter().any(|d| d.contains("environment: target must not be empty")),
+            diags
+                .iter()
+                .any(|d| d.contains("environment: target must not be empty")),
             "got {diags:?}"
         );
     }
@@ -2329,7 +2389,9 @@ mod tests {
     fn gate_step_rejects_unknown_kind_and_a_stray_image() {
         let unknown = errors(r#"steps: [{ id: g, gate: whenever }]"#);
         assert!(
-            unknown.iter().any(|d| d.contains("unknown gate kind `whenever`")),
+            unknown
+                .iter()
+                .any(|d| d.contains("unknown gate kind `whenever`")),
             "got {unknown:?}"
         );
         let with_image = errors(r#"steps: [{ id: g, gate: manual, image: busybox }]"#);
@@ -2363,7 +2425,9 @@ mod tests {
             r#"steps: [{ id: w, image: busybox, gate_after: 60 }]"#,
         ] {
             assert!(
-                errors(yaml).iter().any(|d| d.contains("only valid on a timer gate")),
+                errors(yaml)
+                    .iter()
+                    .any(|d| d.contains("only valid on a timer gate")),
                 "expected rejection for {yaml}"
             );
         }
@@ -2400,7 +2464,9 @@ mod tests {
             "#,
         );
         assert!(
-            diags.iter().any(|d| d.contains("input `c` is not among its needs")),
+            diags
+                .iter()
+                .any(|d| d.contains("input `c` is not among its needs")),
             "got {diags:?}"
         );
     }
@@ -2409,15 +2475,22 @@ mod tests {
     fn explicit_outputs_compile_and_must_be_workspace_relative() {
         let ir = compile(r#"steps: [{ id: build, image: rust, outputs: [dist/, VERSION] }]"#);
         let b = ir.steps.iter().find(|s| s.id == "build").unwrap();
-        assert_eq!(b.outputs.as_deref(), Some(["dist/".to_string(), "VERSION".to_string()].as_slice()));
+        assert_eq!(
+            b.outputs.as_deref(),
+            Some(["dist/".to_string(), "VERSION".to_string()].as_slice())
+        );
 
         // Absolute paths, `..` traversal, and an empty list are rejected.
-        assert!(errors(r#"steps: [{ id: b, image: rust, outputs: ["/etc/passwd"] }]"#)
-            .iter()
-            .any(|d| d.contains("workspace-relative")));
-        assert!(errors(r#"steps: [{ id: b, image: rust, outputs: ["../x"] }]"#)
-            .iter()
-            .any(|d| d.contains("workspace-relative")));
+        assert!(
+            errors(r#"steps: [{ id: b, image: rust, outputs: ["/etc/passwd"] }]"#)
+                .iter()
+                .any(|d| d.contains("workspace-relative"))
+        );
+        assert!(
+            errors(r#"steps: [{ id: b, image: rust, outputs: ["../x"] }]"#)
+                .iter()
+                .any(|d| d.contains("workspace-relative"))
+        );
         assert!(errors(r#"steps: [{ id: b, image: rust, outputs: [] }]"#)
             .iter()
             .any(|d| d.contains("at least one path")));
@@ -2445,7 +2518,10 @@ mod tests {
     // --- invoke / local reuse (ADR-0038) --------------------------------------
 
     fn libs(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
-        entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     fn compile_with(yaml: &str, libs: &BTreeMap<String, String>) -> PipelineIr {
@@ -2495,8 +2571,7 @@ mod tests {
         assert_eq!(publish.needs.0, vec!["ci/test".to_string()]);
 
         // The result is a single valid flat DAG that round-trips.
-        let back: PipelineIr =
-            serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+        let back: PipelineIr = serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
         assert_eq!(ir, back);
     }
 
@@ -2526,7 +2601,10 @@ mod tests {
         }
         // Both leaves (c, d — nothing inside needs them) anchor the exit seam.
         let after = ir.steps.iter().find(|s| s.id == "after").unwrap();
-        assert_eq!(after.needs.0, vec!["mod/c".to_string(), "mod/d".to_string()]);
+        assert_eq!(
+            after.needs.0,
+            vec!["mod/c".to_string(), "mod/d".to_string()]
+        );
     }
 
     #[test]
@@ -2564,7 +2642,11 @@ mod tests {
             &libs(&[(".scarab/lib/a.yaml", a), (".scarab/lib/b.yaml", b)]),
         );
         let y = ir.steps.iter().find(|s| s.id == "second/y").unwrap();
-        assert_eq!(y.needs.0, vec!["first/x".to_string()], "second's root chains onto first's leaf");
+        assert_eq!(
+            y.needs.0,
+            vec!["first/x".to_string()],
+            "second's root chains onto first's leaf"
+        );
     }
 
     #[test]
@@ -2594,7 +2676,8 @@ mod tests {
             &BTreeMap::new(),
         );
         assert!(
-            errs.iter().any(|e| e.contains("no library found at `.scarab/lib/absent.yaml`")),
+            errs.iter()
+                .any(|e| e.contains("no library found at `.scarab/lib/absent.yaml`")),
             "got {errs:?}"
         );
     }
@@ -2614,7 +2697,10 @@ mod tests {
         "#;
         let ir = compile_with(
             "steps: [{ id: deploy, invoke: .scarab/lib/deploy.yaml }]",
-            &libs(&[(".scarab/lib/deploy.yaml", deploy), (".scarab/lib/db.yaml", db)]),
+            &libs(&[
+                (".scarab/lib/deploy.yaml", deploy),
+                (".scarab/lib/db.yaml", db),
+            ]),
         );
         let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
         // Two levels of namespacing compose: `deploy` / `db` / `migrate`.
@@ -2677,7 +2763,10 @@ mod tests {
             ]),
         );
         let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"pa/x/leaf") && ids.contains(&"pb/y/leaf"), "got {ids:?}");
+        assert!(
+            ids.contains(&"pa/x/leaf") && ids.contains(&"pb/y/leaf"),
+            "got {ids:?}"
+        );
     }
 
     #[test]
@@ -2688,7 +2777,10 @@ mod tests {
             let mut m = BTreeMap::new();
             for i in 0..len {
                 let src = if i + 1 < len {
-                    format!("steps: [{{ id: s{i}, invoke: .scarab/lib/l{}.yaml }}]", i + 1)
+                    format!(
+                        "steps: [{{ id: s{i}, invoke: .scarab/lib/l{}.yaml }}]",
+                        i + 1
+                    )
                 } else {
                     format!("steps: [{{ id: s{i}, image: busybox }}]")
                 };
@@ -2717,7 +2809,12 @@ mod tests {
             "steps: [{ id: s, invoke: .scarab/lib/a.yaml, image: busybox }]",
             &libs(&[(".scarab/lib/a.yaml", lib)]),
         );
-        assert!(with_image.iter().any(|e| e.contains("must not set an image")), "got {with_image:?}");
+        assert!(
+            with_image
+                .iter()
+                .any(|e| e.contains("must not set an image")),
+            "got {with_image:?}"
+        );
     }
 
     #[test]
@@ -2740,20 +2837,39 @@ mod tests {
         let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
         // Each copy's ids carry both the coordinate and the invoke namespace,
         // uniquely.
-        for id in ["svc[svc=api]/build", "svc[svc=api]/test", "svc[svc=web]/build", "svc[svc=web]/test"] {
+        for id in [
+            "svc[svc=api]/build",
+            "svc[svc=api]/test",
+            "svc[svc=web]/build",
+            "svc[svc=web]/test",
+        ] {
             assert!(ids.contains(&id), "missing {id} in {ids:?}");
         }
         // Internal edges rewrite per copy.
-        let api_test = ir.steps.iter().find(|s| s.id == "svc[svc=api]/test").unwrap();
+        let api_test = ir
+            .steps
+            .iter()
+            .find(|s| s.id == "svc[svc=api]/test")
+            .unwrap();
         assert_eq!(api_test.needs.0, vec!["svc[svc=api]/build".to_string()]);
         // The coordinate is visible to the inlined steps (for CEL interpolation).
-        let api_build = ir.steps.iter().find(|s| s.id == "svc[svc=api]/build").unwrap();
-        assert_eq!(api_build.matrix_values.get("svc").map(String::as_str), Some("api"));
+        let api_build = ir
+            .steps
+            .iter()
+            .find(|s| s.id == "svc[svc=api]/build")
+            .unwrap();
+        assert_eq!(
+            api_build.matrix_values.get("svc").map(String::as_str),
+            Some("api")
+        );
         // Exit seam: `needs: [svc]` fans onto every copy's leaf.
         let gate = ir.steps.iter().find(|s| s.id == "gate").unwrap();
         assert_eq!(
             gate.needs.0,
-            vec!["svc[svc=api]/test".to_string(), "svc[svc=web]/test".to_string()]
+            vec![
+                "svc[svc=api]/test".to_string(),
+                "svc[svc=web]/test".to_string()
+            ]
         );
     }
 
@@ -2777,7 +2893,10 @@ mod tests {
         let ids: Vec<&str> = ir.steps.iter().map(|s| s.id.as_str()).collect();
         // 2x2 minus one excluded combination = 3 copies, each a unique id.
         assert_eq!(ir.steps.len(), 3, "got {ids:?}");
-        assert!(!ids.contains(&"m[arch=arm64,os=windows]/run"), "excluded combo absent");
+        assert!(
+            !ids.contains(&"m[arch=arm64,os=windows]/run"),
+            "excluded combo absent"
+        );
         assert!(ids.contains(&"m[arch=amd64,os=windows]/run"));
         assert!(ids.contains(&"m[arch=arm64,os=linux]/run"));
     }
@@ -2794,7 +2913,10 @@ mod tests {
         // `./` is normalized; the traversal path is omitted (unsafe → not fetched).
         assert_eq!(
             invoke_refs(yaml),
-            vec![".scarab/lib/one.yaml".to_string(), ".scarab/lib/two.yaml".to_string()]
+            vec![
+                ".scarab/lib/one.yaml".to_string(),
+                ".scarab/lib/two.yaml".to_string()
+            ]
         );
     }
 
@@ -2824,8 +2946,12 @@ mod tests {
         );
         // Inputs reach every inlined step as SCARAB_PARAM_* env (ADR-0008).
         let plan = ir.steps.iter().find(|s| s.id == "deploy/plan").unwrap();
-        assert!(plan.env.contains(&("SCARAB_PARAM_REGION".to_string(), "us-east-1".to_string())));
-        assert!(plan.env.contains(&("SCARAB_PARAM_REPLICAS".to_string(), "3".to_string())));
+        assert!(plan
+            .env
+            .contains(&("SCARAB_PARAM_REGION".to_string(), "us-east-1".to_string())));
+        assert!(plan
+            .env
+            .contains(&("SCARAB_PARAM_REPLICAS".to_string(), "3".to_string())));
         // The invoke step is gone; the exposed-output reference compiled fine.
         assert!(ir.steps.iter().all(|s| !s.is_invoke()));
         assert!(ir.steps.iter().any(|s| s.id == "deploy/url"));
@@ -2847,7 +2973,8 @@ mod tests {
             &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
         );
         assert!(
-            errs.iter().any(|e| e.contains("missing required input `replicas`")),
+            errs.iter()
+                .any(|e| e.contains("missing required input `replicas`")),
             "got {errs:?}"
         );
     }
@@ -2863,7 +2990,10 @@ mod tests {
             "#,
             &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
         );
-        assert!(errs.iter().any(|e| e.contains("unknown input `bogus`")), "got {errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("unknown input `bogus`")),
+            "got {errs:?}"
+        );
     }
 
     #[test]
@@ -2879,7 +3009,8 @@ mod tests {
             &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
         );
         assert!(
-            errs.iter().any(|e| e.contains("references undeclared output `outputs.deploy.secret_ip`")),
+            errs.iter()
+                .any(|e| e.contains("references undeclared output `outputs.deploy.secret_ip`")),
             "got {errs:?}"
         );
     }
@@ -2897,7 +3028,8 @@ mod tests {
             &libs(&[(".scarab/lib/deploy.yaml", IFACE_LIB)]),
         );
         assert!(
-            errs.iter().any(|e| e.contains("does not `needs: [deploy]`")),
+            errs.iter()
+                .any(|e| e.contains("does not `needs: [deploy]`")),
             "got {errs:?}"
         );
     }
@@ -2924,7 +3056,10 @@ mod tests {
     #[test]
     fn interpolate_spec_resolves_outputs_and_matrix_and_fails_fast() {
         use serde_json::json;
-        let mut spec = compile("steps: [{ id: notify, image: busybox }]").steps.pop().unwrap();
+        let mut spec = compile("steps: [{ id: notify, image: busybox }]")
+            .steps
+            .pop()
+            .unwrap();
         spec.command = vec!["post".into(), r#"${{ outputs["deploy/url"].url }}"#.into()];
         spec.env = vec![("TARGET".into(), "${{ matrix.region }}".into())];
 
@@ -2954,7 +3089,8 @@ mod tests {
             &libs(&[(".scarab/lib/bad.yaml", bad_lib)]),
         );
         assert!(
-            errs.iter().any(|e| e.contains("exposes output `ghost` but has no step `ghost`")),
+            errs.iter()
+                .any(|e| e.contains("exposes output `ghost` but has no step `ghost`")),
             "got {errs:?}"
         );
     }
@@ -2966,7 +3102,8 @@ mod tests {
             &BTreeMap::new(),
         );
         assert!(
-            errs.iter().any(|e| e.contains("only valid on an `invoke` step")),
+            errs.iter()
+                .any(|e| e.contains("only valid on an `invoke` step")),
             "got {errs:?}"
         );
     }
@@ -2988,8 +3125,7 @@ mod tests {
         assert_eq!(ir.interface.inputs[0].r#type, ParamType::String);
         assert!(ir.interface.inputs[0].required);
         assert_eq!(ir.interface.outputs, vec!["url".to_string()]);
-        let back: PipelineIr =
-            serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+        let back: PipelineIr = serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
         assert_eq!(ir, back);
     }
 
@@ -3030,8 +3166,7 @@ mod tests {
         assert_eq!(by("env").options.as_ref().unwrap().len(), 2);
         assert_eq!(by("force").r#type, ParamType::Boolean);
         // Round-trips through JSON (serialize emits the map form).
-        let back: PipelineIr =
-            serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
+        let back: PipelineIr = serde_json::from_str(&serde_json::to_string(&ir).unwrap()).unwrap();
         assert_eq!(ir, back);
     }
 
@@ -3043,7 +3178,10 @@ mod tests {
             steps: [{ id: a, image: busybox }]
             "#,
         );
-        assert!(errs.iter().any(|e| e.contains("also declares a `default`")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("also declares a `default`")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -3054,7 +3192,10 @@ mod tests {
             steps: [{ id: a, image: busybox }]
             "#,
         );
-        assert!(errs.iter().any(|e| e.contains("must declare a `default`")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("must declare a `default`")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -3065,7 +3206,10 @@ mod tests {
             steps: [{ id: a, image: busybox }]
             "#,
         );
-        assert!(errs.iter().any(|e| e.contains("non-empty `options`")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("non-empty `options`")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -3076,7 +3220,10 @@ mod tests {
             steps: [{ id: a, image: busybox }]
             "#,
         );
-        assert!(errs.iter().any(|e| e.contains("duplicate parameter")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("duplicate parameter")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -3099,7 +3246,9 @@ mod tests {
             &libs(&[(".scarab/lib/x.yaml", lib)]),
         );
         let run = ir.steps.iter().find(|s| s.id == "deploy/run").unwrap();
-        assert!(run.env.contains(&("SCARAB_PARAM_REPLICAS".to_string(), "3".to_string())));
+        assert!(run
+            .env
+            .contains(&("SCARAB_PARAM_REPLICAS".to_string(), "3".to_string())));
     }
 
     #[test]
@@ -3119,7 +3268,10 @@ mod tests {
             "#,
             &libs(&[(".scarab/lib/x.yaml", lib)]),
         );
-        assert!(errs.iter().any(|e| e.contains("is not a number")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("is not a number")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -3151,7 +3303,10 @@ mod tests {
         );
         assert_eq!(
             ir.steps[0].retry,
-            Some(Retry { on: RetryOn::Failure, max: 3 })
+            Some(Retry {
+                on: RetryOn::Failure,
+                max: 3
+            })
         );
     }
 
@@ -3167,7 +3322,10 @@ mod tests {
         );
         assert_eq!(
             ir.steps[0].retry,
-            Some(Retry { on: RetryOn::Failure, max: 2 })
+            Some(Retry {
+                on: RetryOn::Failure,
+                max: 2
+            })
         );
     }
 
@@ -3183,16 +3341,14 @@ mod tests {
     #[test]
     fn retry_max_bounds_are_validated() {
         for max in [0, 11] {
-            let yaml = format!(
-                "steps: [{{ id: a, image: busybox, retry: {{ max: {max} }} }}]"
-            );
+            let yaml = format!("steps: [{{ id: a, image: busybox, retry: {{ max: {max} }} }}]");
             match compile_yaml(&yaml) {
                 Err(PipelineError::Validation(errs)) => {
                     // The bound error carries the at-least-once warning at the
                     // opt-in point (ADR-0047: never over-promise safety).
                     assert!(
-                        errs.iter().any(|e| e.contains("retry.max")
-                            && e.contains("at-least-once")),
+                        errs.iter()
+                            .any(|e| e.contains("retry.max") && e.contains("at-least-once")),
                         "max={max}: {errs:?}"
                     );
                 }
@@ -3270,7 +3426,10 @@ mod tests {
         let b = image.build.as_ref().unwrap();
         assert_eq!(b.image, "ghcr.io/acme/app:v1");
         assert!(b.push);
-        assert!(b.context.is_empty() && b.dockerfile.is_empty(), "defaults resolve at persist");
+        assert!(
+            b.context.is_empty() && b.dockerfile.is_empty(),
+            "defaults resolve at persist"
+        );
     }
 
     #[test]
@@ -3284,7 +3443,11 @@ mod tests {
                 build: { image: "ghcr.io/a/b:1" }
             "#,
         );
-        assert!(err.iter().any(|d| d.contains("must not") && d.contains("image")), "{err:?}");
+        assert!(
+            err.iter()
+                .any(|d| d.contains("must not") && d.contains("image")),
+            "{err:?}"
+        );
 
         // The image to build is mandatory.
         let err = errors(
@@ -3294,7 +3457,10 @@ mod tests {
                 build: {}
             "#,
         );
-        assert!(err.iter().any(|d| d.contains("must name the `image:`")), "{err:?}");
+        assert!(
+            err.iter().any(|d| d.contains("must name the `image:`")),
+            "{err:?}"
+        );
 
         // Build steps are rootless by construction — no escalation.
         let err = errors(
@@ -3316,7 +3482,10 @@ mod tests {
                 build: { image: "ghcr.io/a/b:1" }
             "#,
         );
-        assert!(err.iter().any(|d| d.contains("mutually exclusive")), "{err:?}");
+        assert!(
+            err.iter().any(|d| d.contains("mutually exclusive")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -3364,7 +3533,10 @@ mod tests {
         }
         match compile_yaml("steps: [{ id: c, clone: {}, gate: manual }]") {
             Err(PipelineError::Validation(errs)) => {
-                assert!(errs.iter().any(|e| e.contains("mutually exclusive")), "{errs:?}")
+                assert!(
+                    errs.iter().any(|e| e.contains("mutually exclusive")),
+                    "{errs:?}"
+                )
             }
             other => panic!("expected validation error, got {other:?}"),
         }
@@ -3436,7 +3608,13 @@ mod tests {
         );
         assert_eq!(ir.steps.len(), 2);
         for step in &ir.steps {
-            assert_eq!(step.retry, Some(Retry { on: RetryOn::Failure, max: 2 }));
+            assert_eq!(
+                step.retry,
+                Some(Retry {
+                    on: RetryOn::Failure,
+                    max: 2
+                })
+            );
         }
     }
 }

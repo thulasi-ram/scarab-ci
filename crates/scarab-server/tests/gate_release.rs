@@ -18,12 +18,17 @@ const SECRET: &[u8] = b"gate-secret";
 /// Seed a run suspended on an external gate `step`.
 async fn suspended_on_external_gate(db: &InMemoryDb, run: &RunId, step: &StepId) {
     db.seed_run(run, RunStatus::Suspended);
-    db.create_step_run(run, step, None, &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(run, step, None, &[], Timestamp(0))
+        .await
+        .unwrap();
     db.set_step_gate(run, step, "external", None).await.unwrap();
 }
 
 fn state(db: Arc<InMemoryDb>, secret: Option<&[u8]>) -> AppState {
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
     let mut st = AppState::new(db, Arc::new(FakeClock::new(1_000)), logs);
     if let Some(s) = secret {
         st = st.with_gate_token_secret(s.to_vec());
@@ -50,11 +55,24 @@ async fn valid_token_releases_external_gate_and_resumes_run() {
     let app = router(state(db.clone(), Some(SECRET)));
 
     let token = scarab_forge_github::sign_hex(SECRET, b"r1:ship");
-    let resp = app.oneshot(release_req("r1", "ship", Some(&token))).await.unwrap();
+    let resp = app
+        .oneshot(release_req("r1", "ship", Some(&token)))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Running), "run resumed");
-    let gate = db.steps_of_run(&run).await.unwrap().into_iter().find(|s| s.step == step).unwrap();
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Running),
+        "run resumed"
+    );
+    let gate = db
+        .steps_of_run(&run)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.step == step)
+        .unwrap();
     assert_eq!(gate.status, StepStatus::Succeeded, "gate released");
 }
 
@@ -66,7 +84,11 @@ async fn bad_or_missing_token_is_unauthorized() {
 
     // Wrong secret → wrong token.
     let wrong = scarab_forge_github::sign_hex(b"not-it", b"r1:ship");
-    let resp = app.clone().oneshot(release_req("r1", "ship", Some(&wrong))).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(release_req("r1", "ship", Some(&wrong)))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // Missing token.
@@ -74,7 +96,10 @@ async fn bad_or_missing_token_is_unauthorized() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
     // The run stays suspended — no release happened.
-    assert_eq!(db.run_status(&RunId("r1".into())).await.unwrap(), Some(RunStatus::Suspended));
+    assert_eq!(
+        db.run_status(&RunId("r1".into())).await.unwrap(),
+        Some(RunStatus::Suspended)
+    );
 }
 
 #[tokio::test]
@@ -84,7 +109,10 @@ async fn token_release_disabled_without_a_secret_is_404() {
     let app = router(state(db, None)); // no gate_token_secret configured
 
     let token = scarab_forge_github::sign_hex(SECRET, b"r1:ship");
-    let resp = app.oneshot(release_req("r1", "ship", Some(&token))).await.unwrap();
+    let resp = app
+        .oneshot(release_req("r1", "ship", Some(&token)))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -94,12 +122,24 @@ async fn a_manual_gate_is_not_token_releasable() {
     let run = RunId("r1".into());
     let step = StepId("approve".into());
     db.seed_run(&run, RunStatus::Suspended);
-    db.create_step_run(&run, &step, None, &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &step, None, &[], Timestamp(0))
+        .await
+        .unwrap();
     db.set_step_gate(&run, &step, "manual", None).await.unwrap(); // manual, not external
     let app = router(state(db.clone(), Some(SECRET)));
 
     let token = scarab_forge_github::sign_hex(SECRET, b"r1:approve");
-    let resp = app.oneshot(release_req("r1", "approve", Some(&token))).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "manual gates release via approve, not token");
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Suspended));
+    let resp = app
+        .oneshot(release_req("r1", "approve", Some(&token)))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "manual gates release via approve, not token"
+    );
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Suspended)
+    );
 }

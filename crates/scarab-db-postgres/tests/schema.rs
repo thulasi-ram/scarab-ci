@@ -25,14 +25,20 @@ async fn migrations_apply_cleanly() {
     db.migrate().await.expect("migrations apply");
 
     // All six tables exist.
-    for table in ["runs", "step_runs", "attempts", "events", "outbox", "leases"] {
-        let exists: bool =
-            sqlx::query("SELECT to_regclass($1) IS NOT NULL AS present")
-                .bind(format!("public.{table}"))
-                .fetch_one(&pool)
-                .await
-                .unwrap()
-                .get("present");
+    for table in [
+        "runs",
+        "step_runs",
+        "attempts",
+        "events",
+        "outbox",
+        "leases",
+    ] {
+        let exists: bool = sqlx::query("SELECT to_regclass($1) IS NOT NULL AS present")
+            .bind(format!("public.{table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("present");
         assert!(exists, "table {table} should exist after migrate");
     }
     // Re-running is a no-op (idempotent).
@@ -81,7 +87,9 @@ async fn tables_round_trip_via_adapter() {
     assert!(matches!(dup, Err(DbError::Conflict)));
 
     // step_runs
-    db.create_step_run(&run, &step, None, &[], at).await.unwrap();
+    db.create_step_run(&run, &step, None, &[], at)
+        .await
+        .unwrap();
     assert_eq!(
         db.step_status(&run, &step).await.unwrap(),
         Some(StepStatus::Pending)
@@ -91,7 +99,9 @@ async fn tables_round_trip_via_adapter() {
     let attempt = Attempt {
         id: AttemptId("a1".into()),
         started_at: Timestamp(1_100),
-        failure: Some(FailureKind::Infra { never_started: false }),
+        failure: Some(FailureKind::Infra {
+            never_started: false,
+        }),
     };
     db.record_attempt(&run, &step, &attempt).await.unwrap();
     let got = db.attempts(&run, &step).await.unwrap();
@@ -99,7 +109,9 @@ async fn tables_round_trip_via_adapter() {
 
     // The full ADR-0047 taxonomy round-trips through the TEXT codec.
     for (i, failure) in [
-        FailureKind::Infra { never_started: true },
+        FailureKind::Infra {
+            never_started: true,
+        },
         FailureKind::Step,
         FailureKind::Timeout,
     ]
@@ -180,7 +192,10 @@ async fn expand_contract_old_binary_survives_new_schema() {
     assert_eq!(v2.version, 2);
 
     // --- v1 only ---
-    sqlx::raw_sql(&v1.sql).execute(&pool).await.expect("apply v1");
+    sqlx::raw_sql(&v1.sql)
+        .execute(&pool)
+        .await
+        .expect("apply v1");
 
     // "Old binary" INSERT: original column set, no parked_reason.
     sqlx::query(
@@ -192,7 +207,10 @@ async fn expand_contract_old_binary_survives_new_schema() {
     .expect("old-binary insert on v1");
 
     // --- expand to v2 ---
-    sqlx::raw_sql(&v2.sql).execute(&pool).await.expect("apply v2");
+    sqlx::raw_sql(&v2.sql)
+        .execute(&pool)
+        .await
+        .expect("apply v2");
 
     // Old data survived the expand.
     let status: String = sqlx::query("SELECT status FROM runs WHERE id = 'r-old'")

@@ -76,7 +76,9 @@ impl S3Storage {
             // MinIO / non-AWS endpoints are plain HTTP path-style.
             builder = builder.with_endpoint(endpoint).with_allow_http(true);
         }
-        let s3 = builder.build().map_err(|e| StorageError::Backend(e.to_string()))?;
+        let s3 = builder
+            .build()
+            .map_err(|e| StorageError::Backend(e.to_string()))?;
         Ok(Self::with_backend(bucket, Arc::new(s3)))
     }
 
@@ -180,7 +182,10 @@ impl ObjectStore for S3Storage {
         Ok(())
     }
 
-    async fn list_objects(&self, prefix: &str) -> Result<Vec<scarab_storage::StoredObject>, StorageError> {
+    async fn list_objects(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<scarab_storage::StoredObject>, StorageError> {
         use futures::TryStreamExt;
         let prefix_path = ObjPath::from(prefix);
         let metas: Vec<object_store::ObjectMeta> = self
@@ -236,7 +241,8 @@ impl Cas for S3Storage {
         let bytes =
             serde_json::to_vec(&entries).map_err(|e| StorageError::Backend(e.to_string()))?;
         let hash = TreeHash(hash_hex(&bytes));
-        self.put_if_absent(&format!("trees/{}", hash.0), bytes).await?;
+        self.put_if_absent(&format!("trees/{}", hash.0), bytes)
+            .await?;
         Ok(hash)
     }
 

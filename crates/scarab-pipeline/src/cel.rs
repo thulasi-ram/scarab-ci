@@ -83,9 +83,9 @@ pub fn interpolate(template: &str, ctx: &serde_json::Value) -> Result<String, Pi
     while let Some(start) = rest.find("${{") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 3..];
-        let end = after.find("}}").ok_or_else(|| {
-            PipelineError::Cel(format!("unterminated `${{{{` in `{template}`"))
-        })?;
+        let end = after
+            .find("}}")
+            .ok_or_else(|| PipelineError::Cel(format!("unterminated `${{{{` in `{template}`")))?;
         let expr = after[..end].trim();
         out.push_str(&render(&eval(expr, ctx)?));
         rest = &after[end + 2..];
@@ -101,9 +101,9 @@ pub(crate) fn interpolations(template: &str) -> Result<Vec<&str>, PipelineError>
     let mut rest = template;
     while let Some(start) = rest.find("${{") {
         let after = &rest[start + 3..];
-        let end = after.find("}}").ok_or_else(|| {
-            PipelineError::Cel(format!("unterminated `${{{{` in `{template}`"))
-        })?;
+        let end = after
+            .find("}}")
+            .ok_or_else(|| PipelineError::Cel(format!("unterminated `${{{{` in `{template}`")))?;
         exprs.push(after[..end].trim());
         rest = &after[end + 2..];
     }

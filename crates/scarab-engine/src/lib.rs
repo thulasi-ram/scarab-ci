@@ -144,7 +144,9 @@ impl ConcurrencyPolicy {
 /// - `Timeout` — the step exceeded its deadline; post-start by definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureKind {
-    Infra { never_started: bool },
+    Infra {
+        never_started: bool,
+    },
     Step,
     Timeout,
     /// The backend lost the execution (vanished Pod, node stopped reporting).
@@ -474,30 +476,59 @@ pub struct DeployContext {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventPayload {
     RunCreated,
-    RunTransitioned { from: RunStatus, to: RunStatus },
-    StepTransitioned { step: StepId, from: StepStatus, to: StepStatus },
-    AttemptStarted { step: StepId, attempt: AttemptId },
-    AttemptFinished { step: StepId, attempt: AttemptId, failure: Option<FailureKind> },
+    RunTransitioned {
+        from: RunStatus,
+        to: RunStatus,
+    },
+    StepTransitioned {
+        step: StepId,
+        from: StepStatus,
+        to: StepStatus,
+    },
+    AttemptStarted {
+        step: StepId,
+        attempt: AttemptId,
+    },
+    AttemptFinished {
+        step: StepId,
+        attempt: AttemptId,
+        failure: Option<FailureKind>,
+    },
     /// A single approval was recorded against a `manual` gate by the named
     /// principal (ADR-0037). Append-only, accumulating — the run stays suspended
     /// until enough distinct approvers satisfy the environment's rules, at which
     /// point [`GateReleased`](EventPayload::GateReleased) finalizes the gate.
-    GateApproved { step: StepId, by: String },
-    GateReleased { step: StepId },
+    GateApproved {
+        step: StepId,
+        by: String,
+    },
+    GateReleased {
+        step: StepId,
+    },
     /// A step was skipped on restart because its inputs were unchanged — its
     /// prior output is carried forward rather than recomputed (ADR-0027). Surfaced
     /// explicitly so a "smart" skip is never mysterious.
-    StepSkipped { step: StepId, reason: String },
+    StepSkipped {
+        step: StepId,
+        reason: String,
+    },
     /// The run was dead-lettered (ADR-0047): the system could not obtain a
     /// verdict (infra retries exhausted / a lost execution / poison). The
     /// **operator** signal — `reason` carries the diagnostics.
-    RunDeadLettered { reason: String },
+    RunDeadLettered {
+        reason: String,
+    },
     /// An unapproved gate outlived its opt-in `gate_expires_after` deadline and
     /// failed the run (ADR-0047).
-    GateExpired { step: StepId },
+    GateExpired {
+        step: StepId,
+    },
     /// The run's opt-in active-time `budget:` was exhausted (ADR-0047);
     /// in-flight steps were cancelled and the run fails.
-    RunBudgetExhausted { active_ms: i64, budget_ms: i64 },
+    RunBudgetExhausted {
+        active_ms: i64,
+        budget_ms: i64,
+    },
     /// Escape hatch for forward-compatible payloads not yet modelled.
     Raw(serde_json::Value),
 }
@@ -586,7 +617,13 @@ pub fn input_signature(
 ) -> String {
     let mut parts: Vec<String> = needs
         .iter()
-        .map(|n| format!("{}={}", n.0, output_of.get(n).map(|s| s.as_str()).unwrap_or("")))
+        .map(|n| {
+            format!(
+                "{}={}",
+                n.0,
+                output_of.get(n).map(|s| s.as_str()).unwrap_or("")
+            )
+        })
         .collect();
     parts.sort();
     parts.join(";")
@@ -596,10 +633,7 @@ pub fn input_signature(
 /// every step that (transitively) `needs` it. Computed by reverse reachability
 /// over the DAG edges — so smart restart re-runs the target and its descendants,
 /// leaving siblings and ancestors intact (ADR-0027).
-pub fn invalidation_set(
-    target: &StepId,
-    steps: &[StepRun],
-) -> std::collections::HashSet<StepId> {
+pub fn invalidation_set(target: &StepId, steps: &[StepRun]) -> std::collections::HashSet<StepId> {
     let mut invalid = std::collections::HashSet::new();
     invalid.insert(target.clone());
     // Fixpoint: a step joins the set once any of its needs is in the set.
@@ -670,7 +704,11 @@ impl Run {
     /// Rejected (leaving `self` untouched) if `self` is already terminal or the
     /// edge is not declared legal — including a no-op `from == to`, so a crashed
     /// worker replaying the same transition is refused rather than double-counted.
-    pub fn transition(&mut self, to: RunStatus, at: Timestamp) -> Result<EventKind, TransitionError> {
+    pub fn transition(
+        &mut self,
+        to: RunStatus,
+        at: Timestamp,
+    ) -> Result<EventKind, TransitionError> {
         let from = self.status;
         if from.is_terminal() {
             return Err(TransitionError::RunTerminal(from));
@@ -801,7 +839,9 @@ impl StepRun {
         let to = match failure {
             None => StepStatus::Succeeded,
             Some(FailureKind::Step | FailureKind::Timeout) => StepStatus::Failed,
-            Some(FailureKind::Infra { never_started: true }) => {
+            Some(FailureKind::Infra {
+                never_started: true,
+            }) => {
                 if (self.attempts.len() as u32) < max_attempts {
                     StepStatus::Ready
                 } else {
@@ -811,9 +851,12 @@ impl StepRun {
             // A started (or possibly-started, for Lost) process may have
             // side-effected: retry only on the author's `retry:` assertion —
             // the scheduler's settle path owns that decision (ADR-0047).
-            Some(FailureKind::Infra { never_started: false } | FailureKind::Lost) => {
-                StepStatus::Failed
-            }
+            Some(
+                FailureKind::Infra {
+                    never_started: false,
+                }
+                | FailureKind::Lost,
+            ) => StepStatus::Failed,
         };
         self.status = to;
         Ok(vec![

@@ -371,7 +371,9 @@ impl Config {
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(b64.trim())
                     .map_err(|_| ConfigError::InvalidMasterKey)?;
-                let key: [u8; 32] = bytes.try_into().map_err(|_| ConfigError::InvalidMasterKey)?;
+                let key: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| ConfigError::InvalidMasterKey)?;
                 Some(key)
             }
             None if dev_insecure => None,
@@ -571,13 +573,20 @@ impl Config {
         vec![
             format!("role: {:?}", self.role),
             format!("addr: {}", self.addr),
-            format!("database: {} (mandatory, ADR-0048)", redact_url(&self.database_url)),
+            format!(
+                "database: {} (mandatory, ADR-0048)",
+                redact_url(&self.database_url)
+            ),
             format!("object store: {store}"),
             format!(
                 "executor: {:?} (namespace={}, driver {})",
                 self.executor,
                 self.namespace,
-                if self.role.runs_driver() { "on" } else { "off — role does not drive" },
+                if self.role.runs_driver() {
+                    "on"
+                } else {
+                    "off — role does not drive"
+                },
             ),
             format!(
                 "step timeout default: {}s (ADR-0047; per-step `timeout:` overrides)",
@@ -594,7 +603,11 @@ impl Config {
             ),
             format!(
                 "secrets store: enabled (envelope encryption, ADR-0014; KEK {})",
-                if self.master_key.is_some() { "persistent" } else { "EPHEMERAL" },
+                if self.master_key.is_some() {
+                    "persistent"
+                } else {
+                    "EPHEMERAL"
+                },
             ),
             format!(
                 "auth: {}",
@@ -609,10 +622,22 @@ impl Config {
                     (None, false) => "enabled".to_string(),
                 },
             ),
-            format!("results egress: {} (ADR-0042)", on_off(self.results_egress.is_some())),
-            format!("github webhook: {}", on_off(self.github_webhook_secret.is_some())),
-            format!("forgejo webhook: {}", on_off(self.forgejo_webhook_secret.is_some())),
-            format!("gate release tokens: {}", on_off(self.gate_token_secret.is_some())),
+            format!(
+                "results egress: {} (ADR-0042)",
+                on_off(self.results_egress.is_some())
+            ),
+            format!(
+                "github webhook: {}",
+                on_off(self.github_webhook_secret.is_some())
+            ),
+            format!(
+                "forgejo webhook: {}",
+                on_off(self.forgejo_webhook_secret.is_some())
+            ),
+            format!(
+                "gate release tokens: {}",
+                on_off(self.gate_token_secret.is_some())
+            ),
             match &self.oidc {
                 Some(o) => format!(
                     "oidc issuer: {} (signing key: {})",
@@ -725,14 +750,24 @@ mod tests {
             &cli(Some("postgres://l/scarab")),
             dev_env(&[
                 ("SCARAB_GITHUB_APP_ID", "12345"),
-                ("SCARAB_GITHUB_APP_PEM", "-----BEGIN RSA PRIVATE KEY-----\nk\n-----END RSA PRIVATE KEY-----"),
+                (
+                    "SCARAB_GITHUB_APP_PEM",
+                    "-----BEGIN RSA PRIVATE KEY-----\nk\n-----END RSA PRIVATE KEY-----",
+                ),
                 ("SCARAB_GITHUB_APP_PEM_FILE", "/etc/scarab/app.pem"),
             ]),
         )
         .unwrap();
         assert_eq!(cfg.github_app_id.as_deref(), Some("12345"));
-        assert!(cfg.github_app_pem.as_deref().unwrap().contains("BEGIN RSA PRIVATE KEY"));
-        assert_eq!(cfg.github_app_pem_file.as_deref(), Some("/etc/scarab/app.pem"));
+        assert!(cfg
+            .github_app_pem
+            .as_deref()
+            .unwrap()
+            .contains("BEGIN RSA PRIVATE KEY"));
+        assert_eq!(
+            cfg.github_app_pem_file.as_deref(),
+            Some("/etc/scarab/app.pem")
+        );
     }
 
     #[test]
@@ -842,7 +877,10 @@ mod tests {
         .unwrap();
         let report = cfg.startup_report().join("\n");
         assert!(!report.contains("hunter2"), "{report}");
-        assert!(report.contains("postgres://scarab:***@db:5432/scarab"), "{report}");
+        assert!(
+            report.contains("postgres://scarab:***@db:5432/scarab"),
+            "{report}"
+        );
         // The insecure posture is visible in the report, not hidden.
         assert!(report.contains("auth: DISABLED"), "{report}");
         assert!(report.contains("KEK EPHEMERAL"), "{report}");

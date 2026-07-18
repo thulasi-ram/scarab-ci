@@ -134,7 +134,10 @@ impl SecretProvider for PostgresSecrets {
             .fetch_all(self.pool())
             .await
             .map_err(|e| SecretError::Backend(e.to_string()))?;
-        Ok(rows.into_iter().map(|r| r.get::<String, _>("key")).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("key"))
+            .collect())
     }
 
     async fn delete(&self, scope: &SecretScope, key: &str) -> Result<(), SecretError> {

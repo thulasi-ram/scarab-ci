@@ -11,7 +11,9 @@ use tower::ServiceExt;
 
 use scarab_identity::{Principal, Role};
 use scarab_server::{router, AppState, LogService};
-use scarab_testkit::{FakeAuthenticator, FakeClock, InMemoryDb, InMemoryObjectStore, InMemorySessions};
+use scarab_testkit::{
+    FakeAuthenticator, FakeClock, InMemoryDb, InMemoryObjectStore, InMemorySessions,
+};
 
 fn principal(subject: &str, role: Role) -> Principal {
     Principal {
@@ -37,7 +39,9 @@ fn app() -> axum::Router {
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -85,7 +89,11 @@ async fn login_issues_a_session_that_authorizes_writes() {
     assert_eq!(v["subject"], "alice");
 
     // With the session, a Member may create a run.
-    let resp = app.clone().oneshot(create_run_req(Some(&session))).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(create_run_req(Some(&session)))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
@@ -105,7 +113,11 @@ async fn viewer_session_is_forbidden_from_writing() {
         .to_string();
 
     // Viewer authenticates fine but lacks the Write capability.
-    let resp = app.clone().oneshot(create_run_req(Some(&session))).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(create_run_req(Some(&session)))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
@@ -115,7 +127,10 @@ async fn bad_credential_and_bogus_session_are_rejected() {
     // Unknown credential → login fails.
     assert_eq!(login(&app, "nope").await.status(), StatusCode::UNAUTHORIZED);
     // A made-up bearer token is not a valid session.
-    let resp = app.oneshot(create_run_req(Some("not-a-session"))).await.unwrap();
+    let resp = app
+        .oneshot(create_run_req(Some("not-a-session")))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -160,7 +175,10 @@ async fn login_sets_hardened_session_and_readable_csrf_cookies() {
         .find(|c| c.starts_with("scarab_session="))
         .expect("session cookie");
     for attr in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
-        assert!(session_cookie.contains(attr), "{attr} missing: {session_cookie}");
+        assert!(
+            session_cookie.contains(attr),
+            "{attr} missing: {session_cookie}"
+        );
     }
     let csrf_cookie = cookies
         .iter()
@@ -184,7 +202,11 @@ async fn cookie_mutation_requires_the_csrf_token_bearer_does_not() {
 
     // Cookie-authenticated mutation WITHOUT the token: forbidden (a cross-site
     // form could have sent this).
-    let resp = app.clone().oneshot(browser_create_run_req(&session, None)).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(browser_create_run_req(&session, None))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // With a WRONG token: forbidden.
@@ -204,7 +226,11 @@ async fn cookie_mutation_requires_the_csrf_token_bearer_does_not() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     // Bearer (API/CLI) carries the credential explicitly — no CSRF needed.
-    let resp = app.clone().oneshot(create_run_req(Some(&session))).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(create_run_req(Some(&session)))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
@@ -235,9 +261,15 @@ async fn logout_revokes_the_session_and_expires_cookies() {
         .iter()
         .map(|v| v.to_str().unwrap().to_string())
         .collect();
-    assert!(cookies.iter().any(|c| c.starts_with("scarab_session=;") && c.contains("Max-Age=0")));
+    assert!(cookies
+        .iter()
+        .any(|c| c.starts_with("scarab_session=;") && c.contains("Max-Age=0")));
 
     // The session is gone server-side, not just in the browser.
-    let resp = app.clone().oneshot(create_run_req(Some(&session))).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(create_run_req(Some(&session)))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

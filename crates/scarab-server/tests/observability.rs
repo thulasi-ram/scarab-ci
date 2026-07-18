@@ -19,7 +19,9 @@ fn app(db: Arc<InMemoryDb>) -> axum::Router {
 }
 
 async fn text(resp: axum::response::Response) -> String {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
@@ -31,17 +33,30 @@ async fn metrics_expose_run_and_outbox_gauges() {
     db.seed_run(&RunId("r3".into()), RunStatus::Succeeded);
 
     let resp = app(db)
-        .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
         Some("text/plain; version=0.0.4")
     );
     let body = text(resp).await;
-    assert!(body.contains(r#"scarab_runs{status="running"} 1"#), "{body}");
-    assert!(body.contains(r#"scarab_runs{status="succeeded"} 2"#), "{body}");
+    assert!(
+        body.contains(r#"scarab_runs{status="running"} 1"#),
+        "{body}"
+    );
+    assert!(
+        body.contains(r#"scarab_runs{status="succeeded"} 2"#),
+        "{body}"
+    );
     assert!(body.contains("scarab_outbox_depth 0"), "{body}");
 }
 
@@ -52,11 +67,19 @@ async fn readyz_is_ok_and_every_response_carries_a_request_id() {
 
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(resp.headers().contains_key("x-request-id"), "request id stamped");
+    assert!(
+        resp.headers().contains_key("x-request-id"),
+        "request id stamped"
+    );
 
     // An inbound id is honored (correlation across services).
     let resp = app
@@ -71,7 +94,9 @@ async fn readyz_is_ok_and_every_response_carries_a_request_id() {
         .await
         .unwrap();
     assert_eq!(
-        resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok()),
         Some("corr-123")
     );
 }

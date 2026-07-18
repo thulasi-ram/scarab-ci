@@ -29,7 +29,10 @@ fn spec() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
@@ -61,14 +64,28 @@ async fn timer_gate_auto_releases_after_its_wait() {
     db.migrate().await.unwrap();
 
     let run = RunId("run-timer".into());
-    let (a, g, b) = (StepId("a".into()), StepId("wait".into()), StepId("b".into()));
+    let (a, g, b) = (
+        StepId("a".into()),
+        StepId("wait".into()),
+        StepId("b".into()),
+    );
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &a, Some(&spec()), &[], Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &g, None, std::slice::from_ref(&a), Timestamp(0)).await.unwrap();
-    db.set_step_gate(&run, &g, "timer", Some(60)).await.unwrap(); // 60s wait
-    db.create_step_run(&run, &b, Some(&spec()), std::slice::from_ref(&g), Timestamp(0))
+    db.create_step_run(&run, &a, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
+    db.create_step_run(&run, &g, None, std::slice::from_ref(&a), Timestamp(0))
+        .await
+        .unwrap();
+    db.set_step_gate(&run, &g, "timer", Some(60)).await.unwrap(); // 60s wait
+    db.create_step_run(
+        &run,
+        &b,
+        Some(&spec()),
+        std::slice::from_ref(&g),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
@@ -79,7 +96,11 @@ async fn timer_gate_auto_releases_after_its_wait() {
     // Run A, then reach the gate and suspend (at clock = 1_000ms).
     sched.tick(&run).await.unwrap();
     sched.tick(&run).await.unwrap();
-    assert_eq!(status(&db, "run-timer").await, RunStatus::Suspended, "suspends at the timer gate");
+    assert_eq!(
+        status(&db, "run-timer").await,
+        RunStatus::Suspended,
+        "suspends at the timer gate"
+    );
 
     // Before the wait elapses, a tick does NOT release it.
     clock.advance(59_000);
@@ -102,7 +123,10 @@ async fn timer_gate_auto_releases_after_its_wait() {
     // Drive to completion: B runs and the run settles.
     sched.tick(&run).await.unwrap();
     assert_eq!(status(&db, "run-timer").await, RunStatus::Succeeded);
-    assert_eq!(step_status(&db.steps_of_run(&run).await.unwrap(), "b"), StepStatus::Succeeded);
+    assert_eq!(
+        step_status(&db.steps_of_run(&run).await.unwrap(), "b"),
+        StepStatus::Succeeded
+    );
 
     tdb.cleanup().await;
 }
@@ -121,14 +145,28 @@ async fn record_gate_approval_accumulates_without_resuming() {
     db.migrate().await.unwrap();
 
     let run = RunId("run-accum".into());
-    let (a, g, b) = (StepId("a".into()), StepId("gate".into()), StepId("b".into()));
+    let (a, g, b) = (
+        StepId("a".into()),
+        StepId("gate".into()),
+        StepId("b".into()),
+    );
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &a, Some(&spec()), &[], Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &g, None, std::slice::from_ref(&a), Timestamp(0)).await.unwrap();
-    db.set_step_gate(&run, &g, "manual", None).await.unwrap();
-    db.create_step_run(&run, &b, Some(&spec()), std::slice::from_ref(&g), Timestamp(0))
+    db.create_step_run(&run, &a, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
+    db.create_step_run(&run, &g, None, std::slice::from_ref(&a), Timestamp(0))
+        .await
+        .unwrap();
+    db.set_step_gate(&run, &g, "manual", None).await.unwrap();
+    db.create_step_run(
+        &run,
+        &b,
+        Some(&spec()),
+        std::slice::from_ref(&g),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
@@ -141,24 +179,44 @@ async fn record_gate_approval_accumulates_without_resuming() {
     assert_eq!(status(&db, "run-accum").await, RunStatus::Suspended);
 
     // Alice approves: recorded as an event, but the gate does NOT resume.
-    record_gate_approval(&db, &clock, &run, &g, "alice").await.unwrap();
-    assert_eq!(status(&db, "run-accum").await, RunStatus::Suspended, "one approval does not resume");
-    assert_eq!(step_status(&db.steps_of_run(&run).await.unwrap(), "gate"), StepStatus::Pending);
+    record_gate_approval(&db, &clock, &run, &g, "alice")
+        .await
+        .unwrap();
+    assert_eq!(
+        status(&db, "run-accum").await,
+        RunStatus::Suspended,
+        "one approval does not resume"
+    );
+    assert_eq!(
+        step_status(&db.steps_of_run(&run).await.unwrap(), "gate"),
+        StepStatus::Pending
+    );
     assert_eq!(approval_count(&db, &run).await, 1);
 
     // Alice approves again: idempotent, still exactly one approval event.
-    record_gate_approval(&db, &clock, &run, &g, "alice").await.unwrap();
-    assert_eq!(approval_count(&db, &run).await, 1, "repeat approval by same principal is a no-op");
+    record_gate_approval(&db, &clock, &run, &g, "alice")
+        .await
+        .unwrap();
+    assert_eq!(
+        approval_count(&db, &run).await,
+        1,
+        "repeat approval by same principal is a no-op"
+    );
 
     // Bob approves: a second distinct approval; run still suspended.
-    record_gate_approval(&db, &clock, &run, &g, "bob").await.unwrap();
+    record_gate_approval(&db, &clock, &run, &g, "bob")
+        .await
+        .unwrap();
     assert_eq!(approval_count(&db, &run).await, 2);
     assert_eq!(status(&db, "run-accum").await, RunStatus::Suspended);
 
     // Only an explicit release finalizes and resumes.
     release_gate(&db, &clock, &run, &g).await.unwrap();
     assert_eq!(status(&db, "run-accum").await, RunStatus::Running);
-    assert_eq!(step_status(&db.steps_of_run(&run).await.unwrap(), "gate"), StepStatus::Succeeded);
+    assert_eq!(
+        step_status(&db.steps_of_run(&run).await.unwrap(), "gate"),
+        StepStatus::Succeeded
+    );
 
     tdb.cleanup().await;
 }
@@ -175,15 +233,29 @@ async fn gate_suspends_survives_restart_and_resumes_once() {
     db.migrate().await.unwrap();
 
     let run = RunId("run-1".into());
-    let (a, g, b) = (StepId("a".into()), StepId("gate".into()), StepId("b".into()));
+    let (a, g, b) = (
+        StepId("a".into()),
+        StepId("gate".into()),
+        StepId("b".into()),
+    );
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &a, Some(&spec()), &[], Timestamp(0)).await.unwrap();
-    // The gate: no launch spec, depends on A.
-    db.create_step_run(&run, &g, None, std::slice::from_ref(&a), Timestamp(0)).await.unwrap();
-    db.set_step_gate(&run, &g, "manual", None).await.unwrap();
-    db.create_step_run(&run, &b, Some(&spec()), std::slice::from_ref(&g), Timestamp(0))
+    db.create_step_run(&run, &a, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
+    // The gate: no launch spec, depends on A.
+    db.create_step_run(&run, &g, None, std::slice::from_ref(&a), Timestamp(0))
+        .await
+        .unwrap();
+    db.set_step_gate(&run, &g, "manual", None).await.unwrap();
+    db.create_step_run(
+        &run,
+        &b,
+        Some(&spec()),
+        std::slice::from_ref(&g),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
@@ -198,7 +270,11 @@ async fn gate_suspends_survives_restart_and_resumes_once() {
         assert_eq!(step_status(&steps, "a"), StepStatus::Succeeded);
         sched.tick(&run).await.unwrap();
     }
-    assert_eq!(status(&db, "run-1").await, RunStatus::Suspended, "run suspends at the gate");
+    assert_eq!(
+        status(&db, "run-1").await,
+        RunStatus::Suspended,
+        "run suspends at the gate"
+    );
 
     // Restart: a fresh scheduler over the same durable state does not un-suspend
     // it on its own — the gate persists across the restart.
@@ -206,13 +282,27 @@ async fn gate_suspends_survives_restart_and_resumes_once() {
         let sched = Scheduler::new(&db, &clock, &exec, "sched");
         sched.tick(&run).await.unwrap();
     }
-    assert_eq!(status(&db, "run-1").await, RunStatus::Suspended, "still suspended after restart");
-    assert_eq!(step_status(&db.steps_of_run(&run).await.unwrap(), "b"), StepStatus::Pending);
+    assert_eq!(
+        status(&db, "run-1").await,
+        RunStatus::Suspended,
+        "still suspended after restart"
+    );
+    assert_eq!(
+        step_status(&db.steps_of_run(&run).await.unwrap(), "b"),
+        StepStatus::Pending
+    );
 
     // Approve the gate: it completes and the run resumes.
     release_gate(&db, &clock, &run, &g).await.unwrap();
-    assert_eq!(status(&db, "run-1").await, RunStatus::Running, "resumed on approval");
-    assert_eq!(step_status(&db.steps_of_run(&run).await.unwrap(), "gate"), StepStatus::Succeeded);
+    assert_eq!(
+        status(&db, "run-1").await,
+        RunStatus::Running,
+        "resumed on approval"
+    );
+    assert_eq!(
+        step_status(&db.steps_of_run(&run).await.unwrap(), "gate"),
+        StepStatus::Succeeded
+    );
 
     // A second approval is a no-op (exactly-once) — no double transition.
     release_gate(&db, &clock, &run, &g).await.unwrap();
@@ -226,7 +316,16 @@ async fn gate_suspends_survives_restart_and_resumes_once() {
     assert_eq!(status(&db, "run-1").await, RunStatus::Succeeded);
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(step_status(&steps, "b"), StepStatus::Succeeded);
-    assert_eq!(steps.iter().find(|s| s.step.0 == "b").unwrap().attempts.len(), 1, "B ran once");
+    assert_eq!(
+        steps
+            .iter()
+            .find(|s| s.step.0 == "b")
+            .unwrap()
+            .attempts
+            .len(),
+        1,
+        "B ran once"
+    );
 
     tdb.cleanup().await;
 }

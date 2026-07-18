@@ -54,7 +54,10 @@ impl RegistryForge {
 
     /// Build the vendor adapter for `conn`, fetching its credential material
     /// at use-time (ADR-0046).
-    async fn build_adapter(&self, conn: &ForgeConnection) -> Result<Arc<dyn ForgePort>, ForgeError> {
+    async fn build_adapter(
+        &self,
+        conn: &ForgeConnection,
+    ) -> Result<Arc<dyn ForgePort>, ForgeError> {
         // The DB-stored credential, fetched only when actually needed — a
         // boot-provided App PEM (below) serves GitHub connections without it.
         let db_credential = || async {
@@ -127,7 +130,10 @@ impl RegistryForge {
 #[async_trait]
 impl ForgePort for RegistryForge {
     async fn latest_commit(&self, repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError> {
-        self.adapter_for(repo).await?.latest_commit(repo, r#ref).await
+        self.adapter_for(repo)
+            .await?
+            .latest_commit(repo, r#ref)
+            .await
     }
 
     async fn read_file_at_ref(
@@ -136,7 +142,10 @@ impl ForgePort for RegistryForge {
         r#ref: &str,
         path: &str,
     ) -> Result<Vec<u8>, ForgeError> {
-        self.adapter_for(repo).await?.read_file_at_ref(repo, r#ref, path).await
+        self.adapter_for(repo)
+            .await?
+            .read_file_at_ref(repo, r#ref, path)
+            .await
     }
 
     async fn list_dir_at_ref(
@@ -145,11 +154,17 @@ impl ForgePort for RegistryForge {
         r#ref: &str,
         dir: &str,
     ) -> Result<Vec<String>, ForgeError> {
-        self.adapter_for(repo).await?.list_dir_at_ref(repo, r#ref, dir).await
+        self.adapter_for(repo)
+            .await?
+            .list_dir_at_ref(repo, r#ref, dir)
+            .await
     }
 
     async fn register_webhook(&self, repo: &RepoRef, callback_url: &str) -> Result<(), ForgeError> {
-        self.adapter_for(repo).await?.register_webhook(repo, callback_url).await
+        self.adapter_for(repo)
+            .await?
+            .register_webhook(repo, callback_url)
+            .await
     }
 
     /// Not routable: normalization has no repo until AFTER it runs. The
@@ -168,19 +183,31 @@ impl ForgePort for RegistryForge {
         commit: &Commit,
         status: Status,
     ) -> Result<(), ForgeError> {
-        self.adapter_for(repo).await?.set_status(repo, commit, status).await
+        self.adapter_for(repo)
+            .await?
+            .set_status(repo, commit, status)
+            .await
     }
 
     async fn create_deployment(&self, repo: &RepoRef, environment: &str) -> Result<(), ForgeError> {
-        self.adapter_for(repo).await?.create_deployment(repo, environment).await
+        self.adapter_for(repo)
+            .await?
+            .create_deployment(repo, environment)
+            .await
     }
 
     async fn post_comment(&self, repo: &RepoRef, issue: u64, body: &str) -> Result<(), ForgeError> {
-        self.adapter_for(repo).await?.post_comment(repo, issue, body).await
+        self.adapter_for(repo)
+            .await?
+            .post_comment(repo, issue, body)
+            .await
     }
 
     async fn get_permissions(&self, repo: &RepoRef, user: &str) -> Result<Permissions, ForgeError> {
-        self.adapter_for(repo).await?.get_permissions(repo, user).await
+        self.adapter_for(repo)
+            .await?
+            .get_permissions(repo, user)
+            .await
     }
 
     async fn mint_checkout_credential(
@@ -188,13 +215,19 @@ impl ForgePort for RegistryForge {
         repo: &RepoRef,
         read_only: bool,
     ) -> Result<CheckoutCredential, ForgeError> {
-        self.adapter_for(repo).await?.mint_checkout_credential(repo, read_only).await
+        self.adapter_for(repo)
+            .await?
+            .mint_checkout_credential(repo, read_only)
+            .await
     }
 
     async fn registry_credential(
         &self,
         repo: &RepoRef,
     ) -> Result<Option<scarab_forge::RegistryCredential>, ForgeError> {
-        self.adapter_for(repo).await?.registry_credential(repo).await
+        self.adapter_for(repo)
+            .await?
+            .registry_credential(repo)
+            .await
     }
 }

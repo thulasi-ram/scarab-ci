@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use scarab_forge::{Event, RepoRef};
 use scarab_identity::Claims;
-use scarab_server::{fork_policy, resolve_step_secrets, LogService};
 use scarab_secrets::SecretScope;
+use scarab_server::{fork_policy, resolve_step_secrets, LogService};
 use scarab_testkit::{FakeSecrets, InMemoryDb, InMemoryObjectStore};
 
 fn scope() -> SecretScope {
@@ -47,7 +47,10 @@ async fn fork_pr_is_locked_out_of_secrets_and_gets_env_none() {
     assert!(env.is_empty(), "a fork PR must read no secrets");
 
     let subject = Claims::run_subject("acme", "app", &policy.oidc_env, "refs/pull/1/head");
-    assert_eq!(subject, "scarab:org/acme/repo/app/env/none/ref/refs/pull/1/head");
+    assert_eq!(
+        subject,
+        "scarab:org/acme/repo/app/env/none/ref/refs/pull/1/head"
+    );
 
     // A trusted (same-repo) PR keeps its secrets and target environment.
     let trusted = fork_policy(&pr(false), "prod");

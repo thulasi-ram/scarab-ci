@@ -203,9 +203,8 @@ impl ProtectionRules {
                 ]);
             }
             let digest = image_digest(image);
-            let entry = digest.and_then(|d| {
-                self.privileged_images.iter().find(|g| g.image_digest == d)
-            });
+            let entry =
+                digest.and_then(|d| self.privileged_images.iter().find(|g| g.image_digest == d));
             match (digest, entry) {
                 (None, _) => violations.push(format!(
                     "image `{image}` requests a governed grant but is not pinned to a digest (repo@sha256:…)"
@@ -428,7 +427,9 @@ mod tests {
     #[test]
     fn run_as_root_is_self_service_no_whitelist_needed() {
         let r = rules(&[], &[]); // empty whitelist
-        let g = r.admit_grants(&req(true, &[], false), "busybox:latest", false).unwrap();
+        let g = r
+            .admit_grants(&req(true, &[], false), "busybox:latest", false)
+            .unwrap();
         assert!(g.run_as_root);
         assert!(!g.privileged);
         assert!(g.add_capabilities.is_empty());
@@ -438,14 +439,18 @@ mod tests {
     fn run_as_root_survives_fork_lockout() {
         let r = rules(&[], &[]);
         // Even locked out (fork PR), self-service root is fine — it cannot escape.
-        let g = r.admit_grants(&req(true, &[], false), "busybox:latest", true).unwrap();
+        let g = r
+            .admit_grants(&req(true, &[], false), "busybox:latest", true)
+            .unwrap();
         assert!(g.run_as_root);
     }
 
     #[test]
     fn privileged_rejected_without_whitelist() {
         let r = rules(&[], &[]);
-        let err = r.admit_grants(&req(false, &[], true), IMG, false).unwrap_err();
+        let err = r
+            .admit_grants(&req(false, &[], true), IMG, false)
+            .unwrap_err();
         assert!(err.iter().any(|v| v.contains("not whitelisted")));
     }
 
@@ -485,7 +490,9 @@ mod tests {
             capabilities: vec!["NET_ADMIN".into()],
         }];
         // Whitelisted digest, but locked_out (fork) → still rejected.
-        let err = r.admit_grants(&req(false, &[], true), IMG, true).unwrap_err();
+        let err = r
+            .admit_grants(&req(false, &[], true), IMG, true)
+            .unwrap_err();
         assert!(err.iter().any(|v| v.contains("locked out")));
     }
 
@@ -498,7 +505,9 @@ mod tests {
             capabilities: vec!["NET_ADMIN".into()],
         }];
         // Requested cap is whitelisted → admitted.
-        let g = r.admit_grants(&req(false, &["NET_ADMIN"], false), IMG, false).unwrap();
+        let g = r
+            .admit_grants(&req(false, &["NET_ADMIN"], false), IMG, false)
+            .unwrap();
         assert_eq!(g.add_capabilities, vec!["NET_ADMIN".to_string()]);
         assert!(!g.privileged);
         // A cap outside the allow-list → rejected (fail closed).

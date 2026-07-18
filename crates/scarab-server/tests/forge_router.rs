@@ -14,7 +14,10 @@ use scarab_server::FORGE_CREDENTIALS_ORG;
 use scarab_testkit::{FakeSecrets, InMemoryDb};
 
 fn repo(owner: &str, name: &str) -> RepoRef {
-    RepoRef { owner: owner.into(), name: name.into() }
+    RepoRef {
+        owner: owner.into(),
+        name: name.into(),
+    }
 }
 
 #[tokio::test]
@@ -91,13 +94,19 @@ async fn production_path_posts_a_status_with_run_deep_link_live() {
         .bind_repo("gh-live", &target, owner, name)
         .await
         .unwrap();
-    let scope = SecretScope::Org { org: FORGE_CREDENTIALS_ORG.to_string() };
-    let secrets = Arc::new(FakeSecrets::new().with_secret(&scope, "gh-live-token", token.as_bytes()));
+    let scope = SecretScope::Org {
+        org: FORGE_CREDENTIALS_ORG.to_string(),
+    };
+    let secrets =
+        Arc::new(FakeSecrets::new().with_secret(&scope, "gh-live-token", token.as_bytes()));
 
     let forge = RegistryForge::new(registry, secrets, None, None);
 
     // Webhook-triggered config reads go through the same routed port.
-    let commit = forge.latest_commit(&target, "main").await.expect("resolve main");
+    let commit = forge
+        .latest_commit(&target, "main")
+        .await
+        .expect("resolve main");
     let readme = forge
         .read_file_at_ref(&target, "main", "README.md")
         .await

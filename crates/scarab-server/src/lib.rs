@@ -36,20 +36,20 @@ use scarab_engine::{
 };
 use scarab_identity::{Action, Principal, Session};
 
+pub mod clone_executor;
 pub mod config;
 pub mod converged;
-pub mod clone_executor;
-pub mod oauth;
-pub mod retention;
 pub mod forge_router;
 pub mod log_tail;
 pub mod logs;
+pub mod oauth;
 pub mod oidc;
+pub mod retention;
 pub mod secret_executor;
 
-pub use secret_executor::SecretInjectingExecutor;
 pub use log_tail::{pump_log_stream, LogTailer};
 pub use logs::LogService;
+pub use secret_executor::SecretInjectingExecutor;
 
 /// A wall-clock [`Clock`] for production wiring (tests inject `FakeClock`).
 pub struct SystemClock;
@@ -743,10 +743,8 @@ async fn create_run(
             })?;
         // ADR-0055: a raw k8s_overlay carries no authority. An inline API run
         // targets no Environment, so any overlay is rejected fail-closed.
-        let k8s_overlay =
-            admit_k8s_overlay(None, step.k8s_overlay.as_ref()).map_err(|v| {
-                ApiError::BadRequest(format!("step `{}`: {}", step.id, v.join("; ")))
-            })?;
+        let k8s_overlay = admit_k8s_overlay(None, step.k8s_overlay.as_ref())
+            .map_err(|v| ApiError::BadRequest(format!("step `{}`: {}", step.id, v.join("; "))))?;
         let spec = StepSpec {
             image: step.image.clone(),
             command: step.command.clone(),
@@ -761,7 +759,7 @@ async fn create_run(
             privileged: admitted.privileged,
             timeout_seconds: step.timeout,
             workspace_inputs: vec![],
-        clone: None,
+            clone: None,
             build: None,
             artifacts: vec![],
             placement_profiles: step.placement_profiles.clone(),
@@ -804,7 +802,10 @@ async fn dispatch(
     headers: HeaderMap,
     Json(req): Json<DispatchRequest>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), ApiError> {
-    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
+    let scope = scarab_identity::Scope::Project {
+        org: org.clone(),
+        name: repo.clone(),
+    };
     let principal = authorize_scoped(&st, &headers, Action::Write, Some(&scope)).await?;
 
     // Dispatch rides the read-at-ref machinery, so a forge must be wired.
@@ -819,7 +820,10 @@ async fn dispatch(
         st.clock.as_ref(),
         st.environments.as_deref(),
         principal.subject,
-        scarab_forge::RepoRef { owner: org, name: repo },
+        scarab_forge::RepoRef {
+            owner: org,
+            name: repo,
+        },
         req.r#ref,
         req.pipeline,
         req.params,
@@ -843,9 +847,7 @@ async fn dispatch(
 /// (the path-addressable interface endpoint needs a slash-free segment, and
 /// [`dispatch_candidate_paths`] re-derives the `.yaml`/`.yml` candidates).
 fn bare_pipeline_name(path: &str) -> String {
-    let p = path
-        .strip_prefix(&format!("{CONFIG_DIR}/"))
-        .unwrap_or(path);
+    let p = path.strip_prefix(&format!("{CONFIG_DIR}/")).unwrap_or(path);
     p.strip_suffix(".yaml")
         .or_else(|| p.strip_suffix(".yml"))
         .unwrap_or(p)
@@ -876,13 +878,19 @@ async fn list_pipelines(
     Path((org, repo)): Path<(String, String)>,
     Query(q): Query<PipelineRefQuery>,
 ) -> Result<Json<PipelineCatalogResponse>, ApiError> {
-    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
+    let scope = scarab_identity::Scope::Project {
+        org: org.clone(),
+        name: repo.clone(),
+    };
     authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
     let forge = st
         .forge
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
-    let repo = scarab_forge::RepoRef { owner: org, name: repo };
+    let repo = scarab_forge::RepoRef {
+        owner: org,
+        name: repo,
+    };
 
     // Resolve the ref to a concrete commit; the catalog reflects exactly it.
     let sha = forge
@@ -898,7 +906,10 @@ async fn list_pipelines(
         Err(scarab_forge::ForgeError::Api(_)) => Vec::new(),
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };
-    let mut paths: Vec<String> = entries.into_iter().filter(|p| is_pipeline_file(p)).collect();
+    let mut paths: Vec<String> = entries
+        .into_iter()
+        .filter(|p| is_pipeline_file(p))
+        .collect();
     paths.sort();
 
     let mut pipelines = Vec::with_capacity(paths.len());
@@ -914,7 +925,12 @@ async fn list_pipelines(
                         api: triggers.0.contains_key("api"),
                         error: None,
                     },
-                    Err(e) => CatalogEntry { name, manual: false, api: false, error: Some(e.to_string()) },
+                    Err(e) => CatalogEntry {
+                        name,
+                        manual: false,
+                        api: false,
+                        error: Some(e.to_string()),
+                    },
                 },
                 Err(_) => CatalogEntry {
                     name,
@@ -963,14 +979,20 @@ async fn pipeline_interface(
     Path((org, repo, name)): Path<(String, String, String)>,
     Query(q): Query<PipelineRefQuery>,
 ) -> Result<Json<PipelineInterfaceResponse>, ApiError> {
-    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
+    let scope = scarab_identity::Scope::Project {
+        org: org.clone(),
+        name: repo.clone(),
+    };
     authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
     let forge = st
         .forge
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
     let forge = forge.as_ref();
-    let repo = scarab_forge::RepoRef { owner: org, name: repo };
+    let repo = scarab_forge::RepoRef {
+        owner: org,
+        name: repo,
+    };
 
     // Resolve the ref → SHA (echoed back), read the named pipeline there, and
     // fully compile — mapping each failure to a structured 4xx via DispatchError
@@ -1035,7 +1057,9 @@ async fn list_runs(
             std::collections::HashMap::new();
         let mut visible = Vec::with_capacity(runs.len());
         for r in runs {
-            let Some(tenant) = r.tenant.clone() else { continue };
+            let Some(tenant) = r.tenant.clone() else {
+                continue;
+            };
             let ok = match allowed.get(&tenant) {
                 Some(ok) => *ok,
                 None => {
@@ -1288,7 +1312,11 @@ async fn get_step_logs(
     let mut replay: Vec<Result<Event, Infallible>> = Vec::new();
     let mut seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for aid in &selected {
-        let (body, next) = st.logs.read_from(&run, &step, aid, 0).await.unwrap_or_default();
+        let (body, next) = st
+            .logs
+            .read_from(&run, &step, aid, 0)
+            .await
+            .unwrap_or_default();
         if !body.is_empty() {
             replay.push(Ok(Event::default().data(String::from_utf8_lossy(&body))));
         }
@@ -1596,7 +1624,11 @@ async fn list_artifacts(
     Ok(Json(
         artifacts
             .into_iter()
-            .map(|a| ArtifactDto { name: a.name, size: a.size, content_type: a.content_type })
+            .map(|a| ArtifactDto {
+                name: a.name,
+                size: a.size,
+                content_type: a.content_type,
+            })
             .collect(),
     ))
 }
@@ -1635,7 +1667,8 @@ async fn download_artifact(
         .map_err(|_| ApiError::NotFound)?;
     let mut resp = bytes.into_response();
     if let Ok(v) = axum::http::HeaderValue::from_str(&artifact.content_type) {
-        resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, v);
+        resp.headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, v);
     }
     Ok(resp)
 }
@@ -1759,7 +1792,10 @@ async fn workspace_walk(
             // A path component descends into a file — no such directory.
             TreeTarget::Blob(_) => return Err(ApiError::NotFound),
         };
-        let entries = cas.tree_entries(&tree).await.map_err(|_| ApiError::NotFound)?;
+        let entries = cas
+            .tree_entries(&tree)
+            .await
+            .map_err(|_| ApiError::NotFound)?;
         cursor = entries
             .into_iter()
             .find(|e| &e.name == seg)
@@ -1844,9 +1880,7 @@ async fn list_workspace(
         })
         .collect();
     // Directories first, then lexicographic — a conventional file listing.
-    entries.sort_by(|a, b| {
-        (a.kind != "dir", &a.name).cmp(&(b.kind != "dir", &b.name))
-    });
+    entries.sort_by(|a, b| (a.kind != "dir", &a.name).cmp(&(b.kind != "dir", &b.name)));
     Ok(Json(WorkspaceListing {
         path,
         available: true,
@@ -1960,7 +1994,11 @@ async fn attach_step(
 async fn bridge_attach(socket: WebSocket, io: scarab_executor_k8s::AttachIo) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let scarab_executor_k8s::AttachIo { mut output, mut input, _process } = io;
+    let scarab_executor_k8s::AttachIo {
+        mut output,
+        mut input,
+        _process,
+    } = io;
     let mut buf = [0u8; 8192];
     loop {
         tokio::select! {
@@ -2017,7 +2055,11 @@ async fn debug_pod_step(
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     authorize_scoped(&st, &headers, Action::Administer, scope.as_ref()).await?;
-    let launcher = st.debug_launcher.as_ref().ok_or(ApiError::NotFound)?.clone();
+    let launcher = st
+        .debug_launcher
+        .as_ref()
+        .ok_or(ApiError::NotFound)?
+        .clone();
     let step_id = StepId(step);
     let sr = st
         .db
@@ -2027,11 +2069,10 @@ async fn debug_pod_step(
         .find(|s| s.step == step_id)
         .ok_or(ApiError::NotFound)?;
     // Its image is the durable step spec; its workspace is the output snapshot.
-    let spec = st
-        .db
-        .step_spec(&run, &step_id)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest("no step spec — cannot reproduce this step".into()))?;
+    let spec =
+        st.db.step_spec(&run, &step_id).await?.ok_or_else(|| {
+            ApiError::BadRequest("no step spec — cannot reproduce this step".into())
+        })?;
     let snapshot = st.db.step_output(&run, &step_id).await?;
     Ok(ws.on_upgrade(move |mut socket| async move {
         let _ = socket
@@ -2039,7 +2080,10 @@ async fn debug_pod_step(
                 "provisioning debug pod (re-materializing workspace)…\r\n".into(),
             ))
             .await;
-        match launcher.launch_debug(&sr, &spec.image, snapshot.as_deref(), 3600).await {
+        match launcher
+            .launch_debug(&sr, &spec.image, snapshot.as_deref(), 3600)
+            .await
+        {
             Ok(dp) => {
                 match launcher.attach_debug(&dp.name).await {
                     Ok(io) => {
@@ -2149,7 +2193,10 @@ pub async fn trigger_run_from_event(
         Err(scarab_forge::ForgeError::Api(_)) => return Ok(Vec::new()),
         Err(e) => return Err(TriggerError::Forge(e)),
     };
-    let mut paths: Vec<String> = entries.into_iter().filter(|p| is_pipeline_file(p)).collect();
+    let mut paths: Vec<String> = entries
+        .into_iter()
+        .filter(|p| is_pipeline_file(p))
+        .collect();
     paths.sort();
 
     let ctx = event.context();
@@ -2285,7 +2332,13 @@ impl RunGovernance {
     /// Whether a fork PR is locked out of the target environment's secrets and,
     /// by extension, its governed privilege grants (ADR-0039).
     fn locked_out(&self) -> bool {
-        matches!(self, RunGovernance::Governed { locked_out: true, .. })
+        matches!(
+            self,
+            RunGovernance::Governed {
+                locked_out: true,
+                ..
+            }
+        )
     }
 }
 
@@ -2410,8 +2463,18 @@ impl DispatchKind {
         sha: String,
     ) -> scarab_forge::Event {
         match self {
-            DispatchKind::Manual => scarab_forge::Event::Manual { actor, repo, r#ref, sha },
-            DispatchKind::Api => scarab_forge::Event::Api { actor, repo, r#ref, sha },
+            DispatchKind::Manual => scarab_forge::Event::Manual {
+                actor,
+                repo,
+                r#ref,
+                sha,
+            },
+            DispatchKind::Api => scarab_forge::Event::Api {
+                actor,
+                repo,
+                r#ref,
+                sha,
+            },
         }
     }
 }
@@ -2434,7 +2497,10 @@ pub enum DispatchError {
     /// The pipeline does not opt into this dispatch trigger — no matching
     /// `on: manual` / `on: api` (ADR-0043 §4). Not dispatchable, fail-closed.
     #[error("pipeline `{pipeline}` is not dispatchable: it declares no matching `on: {kind}`")]
-    NotDispatchable { pipeline: String, kind: &'static str },
+    NotDispatchable {
+        pipeline: String,
+        kind: &'static str,
+    },
     /// A supplied launch parameter failed coercion/validation (ADR-0043 §6). The
     /// inner error carries the per-parameter detail the form renders.
     #[error("invalid launch parameters: {0}")]
@@ -2717,15 +2783,19 @@ async fn persist_run_from_ir(
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     let locked_out = gov.locked_out();
-    db.create_run(run, ir.ir_version, EVENT_VERSION, now).await?;
+    db.create_run(run, ir.ir_version, EVENT_VERSION, now)
+        .await?;
     // Tenancy (ADR-0049): stamp the owning (org, project) from the trigger's
     // repo, so run reads/lists can be scoped by the caller's bindings.
     // Untenanted runs (no repo — inline dev submissions) stay global-only.
     if let Some(repo) = event.repo() {
         db.set_run_tenant(run, &repo.owner, &repo.name).await?;
     }
-    db.store_run_ir(run, &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null))
-        .await?;
+    db.store_run_ir(
+        run,
+        &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null),
+    )
+    .await?;
     // ADR-0037: record the deploy context (repo + environment + git ref) so
     // gate-approval-time admission can look up the environment's protection
     // rules directly, without parsing the stored IR blob. Deploy runs only.
@@ -2742,9 +2812,7 @@ async fn persist_run_from_ir(
                 // A SHA here would silently break the second allowed_refs check
                 // (the gate would never release under a non-empty allowed_refs).
                 // Refless deploy events fall back to the read ref.
-                git_ref: event
-                    .protection_ref()
-                    .unwrap_or_else(|| config_ref(event)),
+                git_ref: event.protection_ref().unwrap_or_else(|| config_ref(event)),
                 // A fork PR is locked out of this environment's secrets (ADR-0015)
                 // and — by extension — its governed privilege grants (ADR-0039).
                 locked_out,
@@ -2845,21 +2913,29 @@ async fn persist_run_from_ir(
             // ADR-0039: admit the step's privilege request against the target
             // Environment's whitelist, fail-closed. A rejected request aborts the
             // whole run creation with a diagnostic — never a silent downgrade.
-            let admitted =
-                admit_step_grants(gov.protection(), step.security.as_ref(), &step.image, locked_out)
-                    .map_err(|v| {
-                        TriggerError::Pipeline(format!(
-                            "step `{}`: privilege request rejected: {}",
-                            step.id,
-                            v.join("; ")
-                        ))
-                    })?;
+            let admitted = admit_step_grants(
+                gov.protection(),
+                step.security.as_ref(),
+                &step.image,
+                locked_out,
+            )
+            .map_err(|v| {
+                TriggerError::Pipeline(format!(
+                    "step `{}`: privilege request rejected: {}",
+                    step.id,
+                    v.join("; ")
+                ))
+            })?;
             // A `kind: build` step (ADR-0018): the engine runs rootless
             // BuildKit with this context — never the author's image. The
             // registry credential resolves at LAUNCH (scoped REGISTRY_AUTH
             // secret, else the forge-derived credential).
             let build = step.build.as_ref().map(|b| scarab_engine::BuildConfig {
-                context: if b.context.is_empty() { ".".into() } else { b.context.clone() },
+                context: if b.context.is_empty() {
+                    ".".into()
+                } else {
+                    b.context.clone()
+                },
                 dockerfile: if b.dockerfile.is_empty() {
                     "Dockerfile".into()
                 } else {
@@ -3302,7 +3378,10 @@ async fn login(
         .map_err(|_| ApiError::Unauthorized)?;
     let now = st.clock.now().await.0;
     let session = mint_session(principal.clone(), now);
-    sessions.put(&session).await.map_err(|_| ApiError::Unauthorized)?;
+    sessions
+        .put(&session)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
 
     let mut resp = (
         StatusCode::OK,
@@ -3337,10 +3416,7 @@ fn set_session_cookies(headers: &mut HeaderMap, session: &Session) {
             "scarab_session={}; HttpOnly; Secure; Path=/; SameSite=Lax",
             session.id
         ),
-        format!(
-            "scarab_csrf={}; Secure; Path=/; SameSite=Lax",
-            session.csrf
-        ),
+        format!("scarab_csrf={}; Secure; Path=/; SameSite=Lax", session.csrf),
     ] {
         if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
             headers.append(axum::http::header::SET_COOKIE, v);
@@ -3363,9 +3439,8 @@ async fn oauth_login_redirect(State(st): State<AppState>) -> Result<Response, Ap
     if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
         resp.headers_mut().insert(axum::http::header::LOCATION, v);
     }
-    let cookie = format!(
-        "scarab_oauth_state={state}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=600"
-    );
+    let cookie =
+        format!("scarab_oauth_state={state}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=600");
     if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
@@ -3397,11 +3472,16 @@ async fn oauth_callback(
         .map_err(|_| ApiError::Unauthorized)?;
     let now = st.clock.now().await.0;
     let session = mint_session(principal, now);
-    sessions.put(&session).await.map_err(|_| ApiError::Unauthorized)?;
+    sessions
+        .put(&session)
+        .await
+        .map_err(|_| ApiError::Unauthorized)?;
 
     let mut resp = (StatusCode::FOUND, ()).into_response();
-    resp.headers_mut()
-        .insert(axum::http::header::LOCATION, axum::http::HeaderValue::from_static("/"));
+    resp.headers_mut().insert(
+        axum::http::header::LOCATION,
+        axum::http::HeaderValue::from_static("/"),
+    );
     set_session_cookies(resp.headers_mut(), &session);
     // The one-shot state cookie is spent.
     if let Ok(v) = axum::http::HeaderValue::from_str(
@@ -3421,7 +3501,10 @@ async fn logout(State(st): State<AppState>, headers: HeaderMap) -> Result<Respon
         return Err(ApiError::NotFound);
     };
     if let Some((sid, _)) = session_id(&headers) {
-        sessions.delete(&sid).await.map_err(|_| ApiError::Unauthorized)?;
+        sessions
+            .delete(&sid)
+            .await
+            .map_err(|_| ApiError::Unauthorized)?;
     }
     let mut resp = StatusCode::NO_CONTENT.into_response();
     for cookie in [
@@ -3505,7 +3588,10 @@ async fn list_bindings(
     let scope = scarab_identity::Scope::Org(org.clone());
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
-    let bindings = rbac.bindings(&org).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let bindings = rbac
+        .bindings(&org)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(
         bindings
             .into_iter()
@@ -3584,14 +3670,20 @@ async fn import_bindings(
     Path((org, repo)): Path<(String, String)>,
     Json(req): Json<ImportBindingsRequest>,
 ) -> Result<Json<Vec<BindingDto>>, ApiError> {
-    let scope = scarab_identity::Scope::Project { org: org.clone(), name: repo.clone() };
+    let scope = scarab_identity::Scope::Project {
+        org: org.clone(),
+        name: repo.clone(),
+    };
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let rbac = st.rbac.as_ref().ok_or(ApiError::NotFound)?;
     let forge = st
         .forge
         .as_ref()
         .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
-    let repo_ref = scarab_forge::RepoRef { owner: org.clone(), name: repo.clone() };
+    let repo_ref = scarab_forge::RepoRef {
+        owner: org.clone(),
+        name: repo.clone(),
+    };
 
     let mut imported = Vec::new();
     for subject in &req.subjects {
@@ -3813,7 +3905,11 @@ async fn approve_gate(
         .iter()
         .any(|s| s.step == step && s.status == StepStatus::Succeeded);
     if released_already {
-        return Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "released": true }))).into_response());
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "released": true })),
+        )
+            .into_response());
     }
 
     // 2. Gather the accumulated approvers and the governing environment's rules.
@@ -3986,7 +4082,9 @@ async fn ingest_step_results(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("0");
     let message = results_token_message(&run.0, &step.0, attempt);
-    let token = headers.get(RESULTS_TOKEN_HEADER).and_then(|v| v.to_str().ok());
+    let token = headers
+        .get(RESULTS_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok());
     scarab_forge_github::verify_signature(secret, message.as_bytes(), token)
         .map_err(|_| ApiError::Unauthorized)?;
 
@@ -4021,7 +4119,10 @@ async fn ingest_step_results(
 /// deploy authorization is the protection rules (ADR-0037).
 fn rbac_scope(org: &str, repo: Option<&str>) -> scarab_identity::Scope {
     match repo {
-        Some(name) => scarab_identity::Scope::Project { org: org.to_string(), name: name.to_string() },
+        Some(name) => scarab_identity::Scope::Project {
+            org: org.to_string(),
+            name: name.to_string(),
+        },
         None => scarab_identity::Scope::Org(org.to_string()),
     }
 }
@@ -4293,8 +4394,12 @@ async fn secret_matrix(
             repo: repo.clone(),
             environment: name.clone(),
         };
-        let keys: std::collections::BTreeSet<String> =
-            secrets.list_scoped(&scope).await.map_err(secret_err)?.into_iter().collect();
+        let keys: std::collections::BTreeSet<String> = secrets
+            .list_scoped(&scope)
+            .await
+            .map_err(secret_err)?
+            .into_iter()
+            .collect();
         all_keys.extend(keys.iter().cloned());
         env_keys.insert(name.clone(), keys);
     }
@@ -4423,20 +4528,27 @@ pub fn fork_policy(event: &scarab_forge::Event, target_env: &str) -> ForkPolicy 
 #[utoipa::path(get, path = "/metrics", summary = "Prometheus gauges (ADR-0053)", responses((status = 200, description = "Prometheus text exposition")))]
 async fn metrics(State(st): State<AppState>) -> Result<Response, ApiError> {
     let mut out = String::new();
-    out.push_str("# HELP scarab_runs Current run count by status.
+    out.push_str(
+        "# HELP scarab_runs Current run count by status.
 # TYPE scarab_runs gauge
-");
+",
+    );
     for (status, n) in st.db.run_status_counts().await? {
-        out.push_str(&format!("scarab_runs{{status=\"{status}\"}} {n}
-"));
+        out.push_str(&format!(
+            "scarab_runs{{status=\"{status}\"}} {n}
+"
+        ));
     }
     out.push_str(
         "# HELP scarab_outbox_depth Undispatched outbox messages.
 # TYPE scarab_outbox_depth gauge
 ",
     );
-    out.push_str(&format!("scarab_outbox_depth {}
-", st.db.outbox_depth().await?));
+    out.push_str(&format!(
+        "scarab_outbox_depth {}
+",
+        st.db.outbox_depth().await?
+    ));
     let mut resp = out.into_response();
     resp.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
@@ -4455,9 +4567,7 @@ async fn readyz(State(st): State<AppState>) -> Response {
     }
     if let Some(store) = &st.artifact_store {
         // NotFound = reachable; only a backend error is unready.
-        if let Err(scarab_storage::StorageError::Backend(e)) =
-            store.get("readyz/probe").await
-        {
+        if let Err(scarab_storage::StorageError::Backend(e)) = store.get("readyz/probe").await {
             return (StatusCode::SERVICE_UNAVAILABLE, format!("store: {e}")).into_response();
         }
     }
@@ -4597,7 +4707,10 @@ fn router_inner(state: AppState) -> Router {
         .route("/metrics", get(metrics))
         .route("/openapi.json", get(openapi))
         .route("/.well-known/jwks.json", get(jwks))
-        .route("/.well-known/openid-configuration", get(openid_configuration))
+        .route(
+            "/.well-known/openid-configuration",
+            get(openid_configuration),
+        )
         .route("/v1/auth/login", post(login).get(oauth_login_redirect))
         .route("/v1/auth/callback", get(oauth_callback))
         .route("/v1/auth/logout", post(logout))
@@ -4606,7 +4719,10 @@ fn router_inner(state: AppState) -> Router {
             "/v1/orgs/{org}/bindings",
             get(list_bindings).put(put_binding).delete(delete_binding),
         )
-        .route("/v1/repos/{org}/{repo}/bindings/import", post(import_bindings))
+        .route(
+            "/v1/repos/{org}/{repo}/bindings/import",
+            post(import_bindings),
+        )
         .route("/v1/repos", get(list_projects))
         .route("/v1/repos/{org}/{repo}/runs", get(list_repo_runs))
         .route("/v1/runs", post(create_run).get(list_runs))
@@ -4626,7 +4742,10 @@ fn router_inner(state: AppState) -> Router {
             get(get_workspace_file),
         )
         .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
-        .route("/v1/runs/{id}/gates/{step}/release", post(release_gate_external))
+        .route(
+            "/v1/runs/{id}/gates/{step}/release",
+            post(release_gate_external),
+        )
         .route(
             "/v1/runs/{id}/steps/{step}/results",
             get(get_step_results).post(ingest_step_results),
@@ -4684,10 +4803,18 @@ async fn serve_ui(State(st): State<AppState>, uri: axum::http::Uri) -> Response 
         }
         path.push(seg);
     }
-    let file = if path.is_file() { path } else { dir.join("index.html") };
+    let file = if path.is_file() {
+        path
+    } else {
+        dir.join("index.html")
+    };
     match tokio::fs::read(&file).await {
         Ok(bytes) => {
-            let mime = match file.extension().and_then(|e| e.to_str()).unwrap_or_default() {
+            let mime = match file
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default()
+            {
                 "html" => "text/html; charset=utf-8",
                 "js" => "application/javascript",
                 "css" => "text/css",
@@ -4768,7 +4895,9 @@ mod grant_admission_tests {
     fn k8s_overlay_rejected_without_environment() {
         let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
         let err = admit_k8s_overlay(None, Some(&overlay)).unwrap_err();
-        assert!(err.join("; ").contains("requires a target Environment that permits"));
+        assert!(err
+            .join("; ")
+            .contains("requires a target Environment that permits"));
     }
 
     #[test]
@@ -4783,7 +4912,10 @@ mod grant_admission_tests {
         let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
         let mut p = rules(vec![]);
         p.permit_k8s_overlay = true;
-        assert_eq!(admit_k8s_overlay(Some(&p), Some(&overlay)).unwrap(), Some(overlay));
+        assert_eq!(
+            admit_k8s_overlay(Some(&p), Some(&overlay)).unwrap(),
+            Some(overlay)
+        );
     }
 
     #[test]
@@ -4794,21 +4926,32 @@ mod grant_admission_tests {
 
     #[test]
     fn run_as_root_is_self_service_without_environment() {
-        let sec = StepSecurity { run_as_root: true, ..Default::default() };
+        let sec = StepSecurity {
+            run_as_root: true,
+            ..Default::default()
+        };
         let g = admit_step_grants(None, Some(&sec), IMG, false).unwrap();
         assert!(g.run_as_root);
     }
 
     #[test]
     fn governed_grant_without_environment_is_rejected() {
-        let sec = StepSecurity { privileged: true, ..Default::default() };
+        let sec = StepSecurity {
+            privileged: true,
+            ..Default::default()
+        };
         let err = admit_step_grants(None, Some(&sec), IMG, false).unwrap_err();
-        assert!(err.iter().any(|v| v.contains("require a target Environment")));
+        assert!(err
+            .iter()
+            .any(|v| v.contains("require a target Environment")));
     }
 
     #[test]
     fn governed_grant_admitted_for_whitelisted_digest() {
-        let sec = StepSecurity { privileged: true, ..Default::default() };
+        let sec = StepSecurity {
+            privileged: true,
+            ..Default::default()
+        };
         let p = rules(vec![ImageGrant {
             image_digest: "sha256:aaaa".into(),
             privileged: true,

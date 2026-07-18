@@ -57,14 +57,21 @@ fn spec_with_secret() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 fn logs(db: Arc<dyn Db>) -> Arc<LogService> {
     Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db))
 }
 async fn launched_env(exec: &CapturingExec) -> Vec<(String, String)> {
-    exec.last_env.lock().unwrap().clone().expect("inner executor was launched")
+    exec.last_env
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("inner executor was launched")
 }
 
 #[tokio::test]
@@ -85,7 +92,10 @@ async fn injects_env_scoped_secret_with_repo_inheritance() {
     .unwrap();
     // TOKEN defined at the *repo* scope — the env-scoped run inherits it.
     let secrets: Arc<dyn SecretProvider> = Arc::new(FakeSecrets::new().with_secret(
-        &SecretScope::Repo { org: "acme".into(), repo: "web".into() },
+        &SecretScope::Repo {
+            org: "acme".into(),
+            repo: "web".into(),
+        },
         "TOKEN",
         b"s3cr3t",
     ));
@@ -100,7 +110,10 @@ async fn injects_env_scoped_secret_with_repo_inheritance() {
     exec.launch(&step("r1"), &spec_with_secret()).await.unwrap();
 
     let env = launched_env(&inner).await;
-    assert!(env.contains(&("PLAIN".into(), "1".into())), "plain env preserved");
+    assert!(
+        env.contains(&("PLAIN".into(), "1".into())),
+        "plain env preserved"
+    );
     assert!(
         env.contains(&("TOKEN".into(), "s3cr3t".into())),
         "inherited repo secret injected: {env:?}"
@@ -132,12 +145,20 @@ async fn fork_pr_lockout_injects_no_secrets() {
         b"s3cr3t",
     ));
     let inner = Arc::new(CapturingExec::default());
-    let exec = SecretInjectingExecutor::new(inner.clone(), db.clone() as Arc<dyn Db>, secrets, logs(db.clone()));
+    let exec = SecretInjectingExecutor::new(
+        inner.clone(),
+        db.clone() as Arc<dyn Db>,
+        secrets,
+        logs(db.clone()),
+    );
 
     exec.launch(&step("r1"), &spec_with_secret()).await.unwrap();
 
     let env = launched_env(&inner).await;
-    assert!(!env.iter().any(|(k, _)| k == "TOKEN"), "locked-out run gets no secrets: {env:?}");
+    assert!(
+        !env.iter().any(|(k, _)| k == "TOKEN"),
+        "locked-out run gets no secrets: {env:?}"
+    );
 }
 
 #[tokio::test]
@@ -153,12 +174,20 @@ async fn non_deploy_run_injects_no_secrets() {
         b"s3cr3t",
     ));
     let inner = Arc::new(CapturingExec::default());
-    let exec = SecretInjectingExecutor::new(inner.clone(), db.clone() as Arc<dyn Db>, secrets, logs(db.clone()));
+    let exec = SecretInjectingExecutor::new(
+        inner.clone(),
+        db.clone() as Arc<dyn Db>,
+        secrets,
+        logs(db.clone()),
+    );
 
     exec.launch(&step("r1"), &spec_with_secret()).await.unwrap();
 
     let env = launched_env(&inner).await;
-    assert!(!env.iter().any(|(k, _)| k == "TOKEN"), "no scope → no secret: {env:?}");
+    assert!(
+        !env.iter().any(|(k, _)| k == "TOKEN"),
+        "no scope → no secret: {env:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +229,10 @@ fn plain_spec() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
@@ -267,7 +299,14 @@ async fn fork_pr_token_subject_is_downgraded_to_env_none() {
     .with_oidc(issuer.clone(), "https://scarab.example", "sts.example.com");
 
     exec.launch(&step("r-fork"), &plain_spec()).await.unwrap();
-    let token = inner.last.lock().unwrap().clone().unwrap().oidc_token.unwrap();
+    let token = inner
+        .last
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap()
+        .oidc_token
+        .unwrap();
     let jwks = issuer.jwks();
     let claims = verify(
         &token,

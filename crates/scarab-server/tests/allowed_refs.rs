@@ -14,15 +14,16 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_engine::Db;
 use scarab_forge::{Event, RepoRef};
-use scarab_project::{
-    Deployment, Environment, EnvironmentStore, ProjectError, ProtectionRules,
-};
+use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError, ProtectionRules};
 use scarab_secrets::SecretScope;
 use scarab_server::trigger_run_from_event;
 use scarab_testkit::{FakeClock, FakeForge, InMemoryDb};
 
 fn repo() -> RepoRef {
-    RepoRef { owner: "acme".into(), name: "web".into() }
+    RepoRef {
+        owner: "acme".into(),
+        name: "web".into(),
+    }
 }
 
 // A deploy pipeline (targets an Environment) that runs on push OR pull_request.
@@ -59,24 +60,51 @@ struct FakeEnvironments {
 
 #[async_trait]
 impl EnvironmentStore for FakeEnvironments {
-    async fn put_environment(&self, _org: &str, _repo: &str, env: &Environment) -> Result<(), ProjectError> {
-        self.envs.lock().unwrap().insert(env.name.clone(), env.clone());
+    async fn put_environment(
+        &self,
+        _org: &str,
+        _repo: &str,
+        env: &Environment,
+    ) -> Result<(), ProjectError> {
+        self.envs
+            .lock()
+            .unwrap()
+            .insert(env.name.clone(), env.clone());
         Ok(())
     }
-    async fn get_environment(&self, _org: &str, _repo: &str, name: &str) -> Result<Option<Environment>, ProjectError> {
+    async fn get_environment(
+        &self,
+        _org: &str,
+        _repo: &str,
+        name: &str,
+    ) -> Result<Option<Environment>, ProjectError> {
         Ok(self.envs.lock().unwrap().get(name).cloned())
     }
-    async fn list_environments(&self, _org: &str, _repo: &str) -> Result<Vec<Environment>, ProjectError> {
+    async fn list_environments(
+        &self,
+        _org: &str,
+        _repo: &str,
+    ) -> Result<Vec<Environment>, ProjectError> {
         Ok(self.envs.lock().unwrap().values().cloned().collect())
     }
-    async fn delete_environment(&self, _org: &str, _repo: &str, name: &str) -> Result<(), ProjectError> {
+    async fn delete_environment(
+        &self,
+        _org: &str,
+        _repo: &str,
+        name: &str,
+    ) -> Result<(), ProjectError> {
         self.envs.lock().unwrap().remove(name);
         Ok(())
     }
     async fn record_deployment(&self, _deployment: &Deployment) -> Result<(), ProjectError> {
         Ok(())
     }
-    async fn deployments(&self, _org: &str, _repo: &str, _environment: &str) -> Result<Vec<Deployment>, ProjectError> {
+    async fn deployments(
+        &self,
+        _org: &str,
+        _repo: &str,
+        _environment: &str,
+    ) -> Result<Vec<Deployment>, ProjectError> {
         Ok(Vec::new())
     }
 }
@@ -86,7 +114,10 @@ async fn env_store(allowed_refs: &[&str]) -> FakeEnvironments {
     envs.put_environment(
         "acme",
         "web",
-        &Environment { name: "prod".into(), protection: prod_rules(allowed_refs) },
+        &Environment {
+            name: "prod".into(),
+            protection: prod_rules(allowed_refs),
+        },
     )
     .await
     .unwrap();
@@ -121,14 +152,25 @@ async fn push_on_allowed_branch_is_admitted_matching_the_branch_not_the_sha() {
     let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &push("main"))
         .await
         .expect("trigger");
-    assert_eq!(runs.len(), 1, "a push on refs/heads/main deploys to a main-scoped env");
+    assert_eq!(
+        runs.len(),
+        1,
+        "a push on refs/heads/main deploys to a main-scoped env"
+    );
 
     // The run pins to the resolved commit (config read at the SHA), while the
     // recorded deploy context carries the symbolic ref for the gate-approval
     // re-check.
     let run = &runs[0];
-    let ctx = db.run_deploy_context(run).await.unwrap().expect("deploy context");
-    assert_eq!(ctx.git_ref, "refs/heads/main", "protection ref recorded symbolically");
+    let ctx = db
+        .run_deploy_context(run)
+        .await
+        .unwrap()
+        .expect("deploy context");
+    assert_eq!(
+        ctx.git_ref, "refs/heads/main",
+        "protection ref recorded symbolically"
+    );
 }
 
 // Core regression: a push on a DIFFERENT branch is denied by a branch-scoped env.
@@ -140,7 +182,10 @@ async fn push_on_disallowed_branch_is_denied() {
     let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &push("feature"))
         .await
         .expect("trigger");
-    assert!(runs.is_empty(), "a push on refs/heads/feature is denied a main-scoped env");
+    assert!(
+        runs.is_empty(),
+        "a push on refs/heads/feature is denied a main-scoped env"
+    );
 }
 
 // An empty allowed_refs admits any ref (the rule is unrestricted).
@@ -172,7 +217,10 @@ async fn pull_request_is_denied_a_branch_scoped_environment() {
     let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &pr)
         .await
         .expect("trigger");
-    assert!(runs.is_empty(), "a PR's refs/pull/7/head doesn't match refs/heads/main");
+    assert!(
+        runs.is_empty(),
+        "a PR's refs/pull/7/head doesn't match refs/heads/main"
+    );
 }
 
 // A PR IS admitted when the env explicitly opts PRs in via refs/pull/*.

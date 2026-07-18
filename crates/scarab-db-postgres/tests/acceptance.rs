@@ -20,9 +20,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::ExecState;
-use scarab_engine::{
-    restart_step, Db, RunId, RunStatus, Scheduler, StepId, StepStatus, Timestamp,
-};
+use scarab_engine::{restart_step, Db, RunId, RunStatus, Scheduler, StepId, StepStatus, Timestamp};
 use scarab_storage::Cas;
 use scarab_storage_s3::S3Storage;
 use scarab_testkit::{FakeClock, FakeExecutor};
@@ -49,8 +47,12 @@ async fn compile_and_create(db: &PostgresDb, run: &RunId) -> Vec<scarab_pipeline
     let ir = scarab_pipeline::compile_yaml(DIAMOND).expect("diamond compiles");
     assert_eq!(ir.steps.len(), 4);
 
-    db.create_run(run, ir.ir_version, 1, Timestamp(0)).await.unwrap();
-    db.store_run_ir(run, &serde_json::to_value(&ir).unwrap()).await.unwrap();
+    db.create_run(run, ir.ir_version, 1, Timestamp(0))
+        .await
+        .unwrap();
+    db.store_run_ir(run, &serde_json::to_value(&ir).unwrap())
+        .await
+        .unwrap();
     for step in &ir.steps {
         let spec = scarab_engine::StepSpec {
             image: step.image.clone(),
@@ -60,17 +62,26 @@ async fn compile_and_create(db: &PostgresDb, run: &RunId) -> Vec<scarab_pipeline
             run_as_root: false,
             add_capabilities: vec![],
             privileged: false,
-        timeout_seconds: None,
-        workspace_inputs: vec![],
-        clone: None,
-        build: None,
-        artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+            timeout_seconds: None,
+            workspace_inputs: vec![],
+            clone: None,
+            build: None,
+            artifacts: vec![],
+            placement_profiles: vec![],
+            resources: Default::default(),
+            k8s_overlay: None,
+            oidc_token: None,
         };
         let needs: Vec<StepId> = step.needs.0.iter().map(|n| StepId(n.clone())).collect();
-        db.create_step_run(run, &StepId(step.id.clone()), Some(&spec), &needs, Timestamp(0))
-            .await
-            .unwrap();
+        db.create_step_run(
+            run,
+            &StepId(step.id.clone()),
+            Some(&spec),
+            &needs,
+            Timestamp(0),
+        )
+        .await
+        .unwrap();
     }
     ir.steps
 }
@@ -89,7 +100,12 @@ fn status_of(steps: &[scarab_engine::StepRun], id: &str) -> StepStatus {
     steps.iter().find(|s| s.step.0 == id).unwrap().status
 }
 fn attempts_of(steps: &[scarab_engine::StepRun], id: &str) -> usize {
-    steps.iter().find(|s| s.step.0 == id).unwrap().attempts.len()
+    steps
+        .iter()
+        .find(|s| s.step.0 == id)
+        .unwrap()
+        .attempts
+        .len()
 }
 
 /// Compile → admit-in-order (B and C concurrent, D last) → restart C cascades to
@@ -123,20 +139,37 @@ async fn diamond_compiles_admits_concurrently_and_restart_cascades() {
     // One admission now claims BOTH B and C — emergent parallelism.
     sched.admit(&run).await.expect("admit B+C");
     let steps = db.steps_of_run(&run).await.unwrap();
-    assert_eq!(status_of(&steps, "B"), StepStatus::Running, "B and C concurrent");
-    assert_eq!(status_of(&steps, "C"), StepStatus::Running, "B and C concurrent");
-    assert_eq!(status_of(&steps, "D"), StepStatus::Pending, "D waits for B and C");
+    assert_eq!(
+        status_of(&steps, "B"),
+        StepStatus::Running,
+        "B and C concurrent"
+    );
+    assert_eq!(
+        status_of(&steps, "C"),
+        StepStatus::Running,
+        "B and C concurrent"
+    );
+    assert_eq!(
+        status_of(&steps, "D"),
+        StepStatus::Pending,
+        "D waits for B and C"
+    );
 
     // Finish: D runs only after both B and C; the run succeeds.
     drive_to_terminal(&sched, &db, &run).await;
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let steps = db.steps_of_run(&run).await.unwrap();
     for id in ["A", "B", "C", "D"] {
         assert_eq!(attempts_of(&steps, id), 1, "{id} ran once");
     }
 
     // Restart C: C and its descendant D re-run; sibling B and ancestor A do not.
-    restart_step(&db, &clock, &run, &StepId("C".into())).await.expect("restart C");
+    restart_step(&db, &clock, &run, &StepId("C".into()))
+        .await
+        .expect("restart C");
     drive_to_terminal(&sched, &db, &run).await;
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(attempts_of(&steps, "A"), 1, "ancestor A not re-run");
@@ -184,8 +217,13 @@ async fn diamond_workspace_flows_to_d_which_sees_both() {
         // the step "runs": it writes its own output file.
         std::fs::write(work.join(format!("{id}.txt")), format!("out-{id}")).unwrap();
         // post-step: snapshot the output workspace and record it.
-        let snap = cas.ingest(work.to_str().unwrap()).await.expect("ingest output");
-        db.set_step_output(&run, &StepId(id.clone()), &snap.root.0).await.unwrap();
+        let snap = cas
+            .ingest(work.to_str().unwrap())
+            .await
+            .expect("ingest output");
+        db.set_step_output(&run, &StepId(id.clone()), &snap.root.0)
+            .await
+            .unwrap();
         output_of.insert(StepId(id.clone()), snap.root.0.clone());
         let _ = std::fs::remove_dir_all(&work);
     }
@@ -199,9 +237,21 @@ async fn diamond_workspace_flows_to_d_which_sees_both() {
             .await
             .unwrap();
     }
-    assert_eq!(std::fs::read(d_in.join("A.txt")).unwrap(), b"out-A", "A flowed through");
-    assert_eq!(std::fs::read(d_in.join("B.txt")).unwrap(), b"out-B", "D sees B");
-    assert_eq!(std::fs::read(d_in.join("C.txt")).unwrap(), b"out-C", "D sees C");
+    assert_eq!(
+        std::fs::read(d_in.join("A.txt")).unwrap(),
+        b"out-A",
+        "A flowed through"
+    );
+    assert_eq!(
+        std::fs::read(d_in.join("B.txt")).unwrap(),
+        b"out-B",
+        "D sees B"
+    );
+    assert_eq!(
+        std::fs::read(d_in.join("C.txt")).unwrap(),
+        b"out-C",
+        "D sees C"
+    );
 
     let _ = std::fs::remove_dir_all(&d_in);
     tdb.cleanup().await;

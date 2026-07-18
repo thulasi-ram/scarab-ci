@@ -25,8 +25,10 @@ async fn stub_provider() -> String {
             post(|body: String| async move {
                 assert!(body.contains("grant_type=authorization_code"), "{body}");
                 if body.contains("code=good-code") {
-                    axum::Json(serde_json::json!({ "access_token": "at-1", "token_type": "bearer" }))
-                        .into_response()
+                    axum::Json(
+                        serde_json::json!({ "access_token": "at-1", "token_type": "bearer" }),
+                    )
+                    .into_response()
                 } else {
                     (StatusCode::BAD_REQUEST, "bad code").into_response()
                 }
@@ -90,12 +92,20 @@ async fn full_browser_login_flow_lands_a_session_with_csrf() {
     // 1. GET /v1/auth/login → 302 to the provider with state + redirect_uri.
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/v1/auth/login").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FOUND);
     let location = resp.headers()["location"].to_str().unwrap().to_string();
-    assert!(location.starts_with(&format!("{provider}/authorize?")), "{location}");
+    assert!(
+        location.starts_with(&format!("{provider}/authorize?")),
+        "{location}"
+    );
     assert!(location.contains("client_id=cid"), "{location}");
     assert!(
         location.contains("redirect_uri=https%3A%2F%2Fscarab.example.com%2Fv1%2Fauth%2Fcallback"),
@@ -135,7 +145,9 @@ async fn full_browser_login_flow_lands_a_session_with_csrf() {
                 .header("content-type", "application/json")
                 .header("cookie", format!("scarab_session={session}"))
                 .header("x-csrf-token", &csrf)
-                .body(Body::from(serde_json::json!({ "value": "s3cret" }).to_string()))
+                .body(Body::from(
+                    serde_json::json!({ "value": "s3cret" }).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -172,7 +184,12 @@ async fn non_owner_logs_in_as_viewer() {
 
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/v1/auth/login").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let state = cookie_from(&resp, "scarab_oauth_state").unwrap();

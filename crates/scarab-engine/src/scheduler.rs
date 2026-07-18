@@ -311,7 +311,10 @@ pub async fn cancel_run_request(
             Err(e) => return Err(e.into()),
         }
     }
-    match db.record_transition(run, current, RunStatus::Cancelled).await {
+    match db
+        .record_transition(run, current, RunStatus::Cancelled)
+        .await
+    {
         Ok(()) => {
             db.append_event(&EventKind {
                 version: EVENT_VERSION,
@@ -739,8 +742,10 @@ impl<'a> Scheduler<'a> {
         for msg in msgs {
             for step in self.db.steps_of_run(&msg.run).await? {
                 if let Some(attempt) = step.attempts.last() {
-                    if let Some(h) =
-                        self.db.attempt_handle(&msg.run, &step.step, &attempt.id).await?
+                    if let Some(h) = self
+                        .db
+                        .attempt_handle(&msg.run, &step.step, &attempt.id)
+                        .await?
                     {
                         let _ = self.executor.cancel(&ExecHandle(h)).await;
                     }
@@ -801,8 +806,7 @@ impl<'a> Scheduler<'a> {
                                     output_of.insert(s.step.clone(), o);
                                 }
                             }
-                            spec.workspace_inputs =
-                                crate::workspace_inputs(&consumed, &output_of);
+                            spec.workspace_inputs = crate::workspace_inputs(&consumed, &output_of);
                         }
                     }
 
@@ -883,7 +887,8 @@ impl<'a> Scheduler<'a> {
                         FailureClass::Step => FailureKind::Step,
                         FailureClass::Timeout => FailureKind::Timeout,
                     };
-                    self.settle_failed_attempt(&run, &step, &attempt, kind).await?;
+                    self.settle_failed_attempt(&run, &step, &attempt, kind)
+                        .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
                 // The backend lost a launched execution (ADR-0047): vanished
@@ -992,7 +997,8 @@ impl<'a> Scheduler<'a> {
         let inputs = serde_json::Value::Object(params.into_iter().collect());
         let ctx = serde_json::json!({ "outputs": outputs, "inputs": inputs });
 
-        let interp = |s: &str| scarab_pipeline::cel::interpolate(s, &ctx).map_err(|e| e.to_string());
+        let interp =
+            |s: &str| scarab_pipeline::cel::interpolate(s, &ctx).map_err(|e| e.to_string());
         let mut out = spec;
         match (|| {
             out.image = interp(&out.image)?;
@@ -1036,11 +1042,12 @@ impl<'a> Scheduler<'a> {
             .filter(|s| s.status == StepStatus::Failed)
             .filter_map(|s| {
                 let failure = s.attempts.last()?.failure?;
-                matches!(
-                    failure,
-                    FailureKind::Infra { .. } | FailureKind::Lost
-                )
-                .then(|| format!("step `{}`: {failure:?} — retries exhausted without a verdict", s.step.0))
+                matches!(failure, FailureKind::Infra { .. } | FailureKind::Lost).then(|| {
+                    format!(
+                        "step `{}`: {failure:?} — retries exhausted without a verdict",
+                        s.step.0
+                    )
+                })
             })
             .collect();
         let outcome = if !dead.is_empty() {
@@ -1095,7 +1102,8 @@ impl<'a> Scheduler<'a> {
         }
         if let Some(current) = self.db.run_status(run).await? {
             if !current.is_terminal() {
-                self.transition_run(run, current, RunStatus::Cancelled).await?;
+                self.transition_run(run, current, RunStatus::Cancelled)
+                    .await?;
             }
         }
         if let Some((group, _)) = self.db.run_concurrency(run).await? {
@@ -1181,8 +1189,14 @@ impl<'a> Scheduler<'a> {
         {
             Ok(()) => {
                 let now = self.clock.now().await;
-                self.append(run, EventPayload::GateExpired { step: gate.step.clone() }, now)
-                    .await?;
+                self.append(
+                    run,
+                    EventPayload::GateExpired {
+                        step: gate.step.clone(),
+                    },
+                    now,
+                )
+                .await?;
                 self.append(
                     run,
                     EventPayload::StepTransitioned {
@@ -1199,9 +1213,15 @@ impl<'a> Scheduler<'a> {
             Err(e) => return Err(e.into()),
         }
         // Resume so the next admission skips dependents and settles the run.
-        reopen(self.db, self.clock, run, RunStatus::Suspended, RunStatus::Running)
-            .await
-            .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
+        reopen(
+            self.db,
+            self.clock,
+            run,
+            RunStatus::Suspended,
+            RunStatus::Running,
+        )
+        .await
+        .map_err(|e| SchedulerError::Db(DbError::Other(e.to_string())))?;
         Ok(())
     }
 
@@ -1226,10 +1246,16 @@ impl<'a> Scheduler<'a> {
         let mut open: Option<i64> = None;
         for e in &events {
             match &e.kind {
-                EventPayload::RunTransitioned { to: RunStatus::Suspended, .. } => {
+                EventPayload::RunTransitioned {
+                    to: RunStatus::Suspended,
+                    ..
+                } => {
                     open = Some(e.at.0);
                 }
-                EventPayload::RunTransitioned { from: RunStatus::Suspended, .. } => {
+                EventPayload::RunTransitioned {
+                    from: RunStatus::Suspended,
+                    ..
+                } => {
                     if let Some(started) = open.take() {
                         suspended_ms += e.at.0 - started;
                     }
@@ -1259,9 +1285,17 @@ impl<'a> Scheduler<'a> {
             self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
                 .await?;
         }
-        self.append(run, EventPayload::RunBudgetExhausted { active_ms, budget_ms }, now)
+        self.append(
+            run,
+            EventPayload::RunBudgetExhausted {
+                active_ms,
+                budget_ms,
+            },
+            now,
+        )
+        .await?;
+        self.transition_run(run, RunStatus::Running, RunStatus::Failed)
             .await?;
-        self.transition_run(run, RunStatus::Running, RunStatus::Failed).await?;
         if let Some((group, _)) = self.db.run_concurrency(run).await? {
             self.db.release_slot(&group, run).await?;
         }
@@ -1279,7 +1313,10 @@ impl<'a> Scheduler<'a> {
             .filter(|e| {
                 matches!(
                     &e.kind,
-                    EventPayload::RunTransitioned { to: RunStatus::Suspended, .. }
+                    EventPayload::RunTransitioned {
+                        to: RunStatus::Suspended,
+                        ..
+                    }
                 )
             })
             .map(|e| e.at.0)
@@ -1376,7 +1413,9 @@ impl<'a> Scheduler<'a> {
         kind: FailureKind,
     ) -> Result<(), SchedulerError> {
         // Record the classified failure on the attempt row (idempotent).
-        self.db.set_attempt_failure(run, step, attempt, kind).await?;
+        self.db
+            .set_attempt_failure(run, step, attempt, kind)
+            .await?;
 
         // Stale-delivery guard: only the step's LATEST attempt may settle it.
         // A redelivered intent for an older attempt (whose successor is already
@@ -1389,9 +1428,9 @@ impl<'a> Scheduler<'a> {
 
         let configured = self.step_retry(run, step).await?.map(|r| 1 + r.max);
         let allowed = match kind {
-            FailureKind::Infra { never_started: true } => {
-                configured.unwrap_or(0).max(NEVER_STARTED_AUTO_ATTEMPTS)
-            }
+            FailureKind::Infra {
+                never_started: true,
+            } => configured.unwrap_or(0).max(NEVER_STARTED_AUTO_ATTEMPTS),
             _ => configured.unwrap_or(1),
         };
 
@@ -1420,8 +1459,10 @@ impl<'a> Scheduler<'a> {
             }
         }
         let now = self.clock.now().await;
-        self.append(run, EventPayload::RunDeadLettered { reason }, now).await?;
-        self.transition_run(run, current, RunStatus::DeadLettered).await?;
+        self.append(run, EventPayload::RunDeadLettered { reason }, now)
+            .await?;
+        self.transition_run(run, current, RunStatus::DeadLettered)
+            .await?;
         if let Some((group, _)) = self.db.run_concurrency(run).await? {
             self.db.release_slot(&group, run).await?;
         }

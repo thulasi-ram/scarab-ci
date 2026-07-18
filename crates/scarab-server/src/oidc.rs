@@ -12,9 +12,7 @@
 
 use async_trait::async_trait;
 use base64::Engine;
-use jsonwebtoken::{
-    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
-};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rsa::pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
@@ -158,8 +156,8 @@ pub fn verify(
     e: &str,
     audience: &str,
 ) -> Result<serde_json::Value, IdentityError> {
-    let key =
-        DecodingKey::from_rsa_components(n, e).map_err(|e| IdentityError::Issuance(e.to_string()))?;
+    let key = DecodingKey::from_rsa_components(n, e)
+        .map_err(|e| IdentityError::Issuance(e.to_string()))?;
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_audience(&[audience]);
     let data = decode::<serde_json::Value>(token, &key, &validation)

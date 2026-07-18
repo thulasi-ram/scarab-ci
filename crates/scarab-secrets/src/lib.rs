@@ -26,9 +26,18 @@ impl std::fmt::Debug for Secret {
 /// The scope at which a secret is defined; more specific scopes win.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SecretScope {
-    Org { org: String },
-    Repo { org: String, repo: String },
-    Environment { org: String, repo: String, environment: String },
+    Org {
+        org: String,
+    },
+    Repo {
+        org: String,
+        repo: String,
+    },
+    Environment {
+        org: String,
+        repo: String,
+        environment: String,
+    },
 }
 
 impl SecretScope {
@@ -175,12 +184,10 @@ mod tests {
     #[tokio::test]
     async fn resolve_prefers_environment_over_repo_over_org() {
         // Value at both env and repo → env wins (most specific).
-        let p = Fake::default()
-            .with(&env("prod"))
-            .with(&SecretScope::Repo {
-                org: "acme".into(),
-                repo: "web".into(),
-            });
+        let p = Fake::default().with(&env("prod")).with(&SecretScope::Repo {
+            org: "acme".into(),
+            repo: "web".into(),
+        });
         let got = p.resolve(&env("prod"), "K").await.unwrap();
         assert_eq!(got.value, b"env:acme/web/prod");
     }

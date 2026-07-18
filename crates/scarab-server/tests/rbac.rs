@@ -20,7 +20,11 @@ use scarab_testkit::{
 
 /// A principal with NO global roles — only scoped bindings decide.
 fn scoped_principal(subject: &str) -> Principal {
-    Principal { subject: subject.into(), display_name: None, roles: vec![] }
+    Principal {
+        subject: subject.into(),
+        display_name: None,
+        roles: vec![],
+    }
 }
 
 struct Harness {
@@ -36,11 +40,14 @@ fn harness() -> Harness {
     let logs = Arc::new(LogService::new(store, db.clone()));
     let auth = Arc::new(
         FakeAuthenticator::new()
-            .with_credential("root-code", Principal {
-                subject: "root".into(),
-                display_name: None,
-                roles: vec![Role::Owner], // global bootstrap owner
-            })
+            .with_credential(
+                "root-code",
+                Principal {
+                    subject: "root".into(),
+                    display_name: None,
+                    roles: vec![Role::Owner], // global bootstrap owner
+                },
+            )
             .with_credential("amy-code", scoped_principal("amy"))
             .with_credential("eve-code", scoped_principal("eve")),
     );
@@ -55,7 +62,9 @@ fn harness() -> Harness {
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -75,7 +84,10 @@ async fn login(app: &axum::Router, credential: &str) -> String {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    body_json(resp).await["session"].as_str().unwrap().to_string()
+    body_json(resp).await["session"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 /// Create a run as the global owner, then stamp its tenant.
@@ -104,7 +116,9 @@ async fn seed_run(h: &Harness, root: &str, org: &str, project: &str) -> String {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let id = body_json(resp).await["id"].as_str().unwrap().to_string();
-    h.db.set_run_tenant(&RunId(id.clone()), org, project).await.unwrap();
+    h.db.set_run_tenant(&RunId(id.clone()), org, project)
+        .await
+        .unwrap();
     id
 }
 
@@ -148,18 +162,33 @@ async fn run_reads_are_tenant_scoped_and_cross_tenant_is_denied() {
     }
 
     // CROSS-TENANT DENIAL: the other org's run is forbidden for amy.
-    let resp = h.app.clone().oneshot(get(&format!("/v1/runs/{evil_run}"), &amy)).await.unwrap();
+    let resp = h
+        .app
+        .clone()
+        .oneshot(get(&format!("/v1/runs/{evil_run}"), &amy))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // eve (no bindings at all) is denied both.
     let eve = login(&h.app, "eve-code").await;
     for run in [&acme_run, &evil_run] {
-        let resp = h.app.clone().oneshot(get(&format!("/v1/runs/{run}"), &eve)).await.unwrap();
+        let resp = h
+            .app
+            .clone()
+            .oneshot(get(&format!("/v1/runs/{run}"), &eve))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     // The global owner still sees everything.
-    let resp = h.app.clone().oneshot(get(&format!("/v1/runs/{evil_run}"), &root)).await.unwrap();
+    let resp = h
+        .app
+        .clone()
+        .oneshot(get(&format!("/v1/runs/{evil_run}"), &root))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
@@ -174,7 +203,10 @@ async fn list_runs_filters_to_the_callers_tenants() {
         .grant(
             &Binding {
                 subject: "amy".into(),
-                scope: Scope::Project { org: "acme".into(), name: "app".into() },
+                scope: Scope::Project {
+                    org: "acme".into(),
+                    name: "app".into(),
+                },
                 role: Role::Viewer,
             },
             BindingOrigin::Native,
@@ -190,8 +222,14 @@ async fn list_runs_filters_to_the_callers_tenants() {
         .iter()
         .map(|r| r["id"].as_str().unwrap().to_string())
         .collect();
-    assert!(ids.contains(&acme_run), "amy sees her tenant's run: {ids:?}");
-    assert!(!ids.contains(&evil_run), "the other tenant's run is filtered out: {ids:?}");
+    assert!(
+        ids.contains(&acme_run),
+        "amy sees her tenant's run: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&evil_run),
+        "the other tenant's run is filtered out: {ids:?}"
+    );
 
     // The global owner sees both.
     let v = body_json(h.app.clone().oneshot(get("/v1/runs", &root)).await.unwrap()).await;
@@ -234,10 +272,20 @@ async fn scoped_writes_respect_role_and_tenant() {
             .unwrap()
     };
     // Write inside her tenant is allowed…
-    let resp = h.app.clone().oneshot(restart(&acme_run, &amy)).await.unwrap();
+    let resp = h
+        .app
+        .clone()
+        .oneshot(restart(&acme_run, &amy))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     // …a cross-tenant write is forbidden.
-    let resp = h.app.clone().oneshot(restart(&evil_run, &amy)).await.unwrap();
+    let resp = h
+        .app
+        .clone()
+        .oneshot(restart(&evil_run, &amy))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 
@@ -274,7 +322,9 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
             .uri("/v1/repos/acme/app/bindings/import")
             .header("content-type", "application/json")
             .header("authorization", format!("Bearer {root}"))
-            .body(Body::from(serde_json::json!({ "subjects": ["carol"] }).to_string()))
+            .body(Body::from(
+                serde_json::json!({ "subjects": ["carol"] }).to_string(),
+            ))
             .unwrap()
     };
     let resp = h.app.clone().oneshot(import()).await.unwrap();
@@ -282,8 +332,14 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
     let imported = body_json(resp).await;
     assert_eq!(imported[0]["subject"], "carol");
     assert_eq!(imported[0]["role"], "admin");
-    let app_scope = Scope::Project { org: "acme".into(), name: "app".into() };
-    assert_eq!(h.rbac.role_of("carol", &app_scope).await.unwrap(), Some(Role::Admin));
+    let app_scope = Scope::Project {
+        org: "acme".into(),
+        name: "app".into(),
+    };
+    assert_eq!(
+        h.rbac.role_of("carol", &app_scope).await.unwrap(),
+        Some(Role::Admin)
+    );
 
     // Native revoke via the API…
     let resp = h
@@ -315,12 +371,25 @@ async fn bindings_api_grants_lists_revokes_and_imports() {
             .unwrap(),
     )
     .await;
-    let subjects: Vec<&str> = v.as_array().unwrap().iter().map(|b| b["subject"].as_str().unwrap()).collect();
+    let subjects: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["subject"].as_str().unwrap())
+        .collect();
     assert!(subjects.contains(&"amy"));
-    assert!(!subjects.contains(&"carol"), "tombstoned carol is not listed");
+    assert!(
+        !subjects.contains(&"carol"),
+        "tombstoned carol is not listed"
+    );
 
     // A non-admin cannot manage bindings.
     let amy = login(&h.app, "amy-code").await;
-    let resp = h.app.clone().oneshot(get("/v1/orgs/acme/bindings", &amy)).await.unwrap();
+    let resp = h
+        .app
+        .clone()
+        .oneshot(get("/v1/orgs/acme/bindings", &amy))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

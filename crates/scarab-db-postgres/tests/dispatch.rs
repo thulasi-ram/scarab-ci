@@ -152,12 +152,11 @@ async fn outbox_delivers_exactly_once() {
     assert_eq!(all.len(), M, "every message dispatched exactly once");
 
     // No pending rows remain.
-    let pending: i64 =
-        sqlx::query("SELECT count(*) AS c FROM outbox WHERE dispatched_at IS NULL")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .get("c");
+    let pending: i64 = sqlx::query("SELECT count(*) AS c FROM outbox WHERE dispatched_at IS NULL")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get("c");
     assert_eq!(pending, 0);
 
     tdb.cleanup().await;

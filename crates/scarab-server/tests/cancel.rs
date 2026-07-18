@@ -14,19 +14,28 @@ use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb, InMemoryObjectStore};
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
 fn post(uri: &str) -> Request<Body> {
-    Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap()
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
 }
 
 #[tokio::test]
 async fn cancel_settles_the_run_and_tears_down_its_pod() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
     let app = router(AppState::new(db.clone(), clock.clone(), logs));
     let exec = Arc::new(FakeExecutor::new());
 
@@ -59,24 +68,48 @@ async fn cancel_settles_the_run_and_tears_down_its_pod() {
     scheduler.tick_all().await.unwrap();
 
     // Cancel via the API: accepted, durably Cancelled.
-    let resp = app.clone().oneshot(post(&format!("/v1/runs/{id}/cancel"))).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post(&format!("/v1/runs/{id}/cancel")))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let status = db.run_status(&RunId(id.clone())).await.unwrap().unwrap();
     assert_eq!(status, scarab_engine::RunStatus::Cancelled);
     for s in db.steps_of_run(&RunId(id.clone())).await.unwrap() {
-        assert_eq!(s.status, scarab_engine::StepStatus::Cancelled, "{:?}", s.step);
+        assert_eq!(
+            s.status,
+            scarab_engine::StepStatus::Cancelled,
+            "{:?}",
+            s.step
+        );
     }
 
     // The NEXT tick processes the teardown intent: executor.cancel invoked
     // with the recorded handle.
-    assert!(exec.cancelled_handles().is_empty(), "teardown is async, not inline");
+    assert!(
+        exec.cancelled_handles().is_empty(),
+        "teardown is async, not inline"
+    );
     scheduler.tick_all().await.unwrap();
     let cancelled = exec.cancelled_handles();
-    assert_eq!(cancelled.len(), 1, "the in-flight execution was torn down: {cancelled:?}");
+    assert_eq!(
+        cancelled.len(),
+        1,
+        "the in-flight execution was torn down: {cancelled:?}"
+    );
 
     // Cancelling again: 409 (already terminal). Unknown run: 404.
-    let resp = app.clone().oneshot(post(&format!("/v1/runs/{id}/cancel"))).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post(&format!("/v1/runs/{id}/cancel")))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
-    let resp = app.clone().oneshot(post("/v1/runs/nope/cancel")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(post("/v1/runs/nope/cancel"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

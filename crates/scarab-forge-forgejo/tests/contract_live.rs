@@ -30,7 +30,10 @@ async fn forgejo_adapter_passes_the_port_contract() {
     let token = env("SCARAB_TEST_FORGEJO_TOKEN").expect("SCARAB_TEST_FORGEJO_TOKEN");
     let full = env("SCARAB_TEST_FORGEJO_REPO").expect("SCARAB_TEST_FORGEJO_REPO");
     let (owner, name) = full.split_once('/').expect("owner/name");
-    let repo = RepoRef { owner: owner.into(), name: name.into() };
+    let repo = RepoRef {
+        owner: owner.into(),
+        name: name.into(),
+    };
 
     // The ADMIN-REGISTERED ForgeConnection flow (ADR-0046): the connection is
     // configured with a base URL + a credential handle; the adapter is
@@ -45,7 +48,10 @@ async fn forgejo_adapter_passes_the_port_contract() {
     let forge = ForgejoForge::new(&conn.base_url, &token);
 
     // Resolve the fixture facts from the instance itself.
-    let commit = forge.latest_commit(&repo, "main").await.expect("main resolves");
+    let commit = forge
+        .latest_commit(&repo, "main")
+        .await
+        .expect("main resolves");
     let content = forge
         .read_file_at_ref(&repo, "main", "README.md")
         .await
@@ -79,6 +85,9 @@ async fn forgejo_adapter_passes_the_port_contract() {
         .await
         .expect("re-register is a no-op");
 
-    let ev = forge.normalize_event(fx.push_delivery.clone()).await.unwrap();
+    let ev = forge
+        .normalize_event(fx.push_delivery.clone())
+        .await
+        .unwrap();
     assert!(matches!(ev, Event::Push { .. }));
 }

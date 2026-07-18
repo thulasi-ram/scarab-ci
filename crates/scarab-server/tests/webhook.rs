@@ -28,7 +28,8 @@ fn app(db: Arc<InMemoryDb>) -> axum::Router {
     let clock = Arc::new(FakeClock::new(1_000));
     let store = Arc::new(InMemoryObjectStore::new());
     let logs = Arc::new(LogService::new(store, db.clone()));
-    let forge: Arc<dyn ForgePort> = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let forge: Arc<dyn ForgePort> =
+        Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
     router(
         AppState::new(db, clock, logs)
             .with_github_webhook_secret(SECRET.to_vec())
@@ -70,14 +71,20 @@ async fn signed_push_creates_a_run() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let run_id = v["run_ids"][0].as_str().unwrap().to_string();
     assert_eq!(v["run_ids"].as_array().unwrap().len(), 1);
     assert_eq!(v["trigger"], "push");
 
     // The run is durable, and its normalized trigger is on the event log.
-    assert!(db.run_status(&RunId(run_id.clone())).await.unwrap().is_some());
+    assert!(db
+        .run_status(&RunId(run_id.clone()))
+        .await
+        .unwrap()
+        .is_some());
     let events = db.events(&RunId(run_id)).await.unwrap();
     let trigger = events.iter().find_map(|e| match &e.kind {
         scarab_engine::EventPayload::Raw(v) => v.get("trigger").cloned(),
@@ -97,7 +104,10 @@ async fn bad_signature_is_rejected_and_creates_no_run() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    assert!(db.active_runs().await.unwrap().is_empty(), "no run on bad signature");
+    assert!(
+        db.active_runs().await.unwrap().is_empty(),
+        "no run on bad signature"
+    );
 }
 
 #[tokio::test]
@@ -107,9 +117,15 @@ async fn unsupported_event_is_acknowledged_and_ignored() {
 
     let body = serde_json::to_vec(&serde_json::json!({ "zen": "keep it simple" })).unwrap();
     let sig = scarab_forge_github::sign_hex(SECRET, &body);
-    let resp = app.oneshot(webhook_request("ping", &body, &sig)).await.unwrap();
+    let resp = app
+        .oneshot(webhook_request("ping", &body, &sig))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(db.active_runs().await.unwrap().is_empty(), "ping creates no run");
+    assert!(
+        db.active_runs().await.unwrap().is_empty(),
+        "ping creates no run"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -121,7 +137,8 @@ fn multi_forge_app(db: Arc<InMemoryDb>) -> axum::Router {
     let clock = Arc::new(FakeClock::new(1_000));
     let store = Arc::new(InMemoryObjectStore::new());
     let logs = Arc::new(LogService::new(store, db.clone()));
-    let forge: Arc<dyn ForgePort> = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
+    let forge: Arc<dyn ForgePort> =
+        Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
     router(
         AppState::new(db.clone(), clock, logs)
             .with_github_webhook_secret(SECRET.to_vec())
@@ -251,7 +268,10 @@ async fn installation_webhook_auto_registers_the_connection_and_repos() {
         .expect("auto-registered connection");
     assert_eq!(conn.kind, scarab_forge::ForgeKind::GitHub);
     let hit = db
-        .resolve(&scarab_forge::RepoRef { owner: "acme".into(), name: "web".into() })
+        .resolve(&scarab_forge::RepoRef {
+            owner: "acme".into(),
+            name: "web".into(),
+        })
         .await
         .unwrap()
         .expect("repo bound");

@@ -13,7 +13,9 @@
 //! existing Pod rather than creating a new one.
 
 use scarab_engine::ports::{ExecHandle, ExecState};
-use scarab_engine::{Attempt, AttemptId, Executor, RunId, StepId, StepRun, StepStatus, StepSpec, Timestamp};
+use scarab_engine::{
+    Attempt, AttemptId, Executor, RunId, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+};
 use scarab_executor_k8s::{pod_name, K8sExecutor};
 
 /// Fully drain a [`scarab_engine::LogChunks`] into one `Vec<u8>`.
@@ -81,12 +83,18 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
 
     // launch, then launch again — the second call must re-attach, not relaunch.
     let h1 = exec.launch(&step, &spec).await.expect("launch");
-    let h2 = exec.launch(&step, &spec).await.expect("relaunch re-attaches");
+    let h2 = exec
+        .launch(&step, &spec)
+        .await
+        .expect("relaunch re-attaches");
     assert_eq!(h1, h2);
     assert_eq!(h1, ExecHandle(pod_name(&step)));
 
@@ -144,7 +152,10 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -198,7 +209,10 @@ async fn log_stream_tails_pod_stdout() {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -257,9 +271,8 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
     let cas_dir = std::env::var("SCARAB_TEST_CAS_DIR")
         .unwrap_or_else(|_| tmp.path().to_string_lossy().into_owned());
     std::fs::create_dir_all(&cas_dir).expect("cas dir");
-    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
-        scarab_storage_s3::S3Storage::local(&cas_dir).expect("local cas"),
-    );
+    let cas: std::sync::Arc<dyn Cas> =
+        std::sync::Arc::new(scarab_storage_s3::S3Storage::local(&cas_dir).expect("local cas"));
     let exec = K8sExecutor::with_client(ns, client).with_workspace_cas(cas);
 
     let step_run = |id: &str, attempt: &str| StepRun {
@@ -287,7 +300,10 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
     async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
         for _ in 0..90 {
@@ -304,7 +320,10 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
     // --- Step A: produce a file in /workspace. ---
     let a = step_run("a", "a1");
     let ha = exec
-        .launch(&a, &spec("echo scarab-was-here > /workspace/out.txt", vec![]))
+        .launch(
+            &a,
+            &spec("echo scarab-was-here > /workspace/out.txt", vec![]),
+        )
         .await
         .expect("launch A");
     assert_eq!(settle(&exec, &ha).await, ExecState::Succeeded, "A succeeds");
@@ -335,12 +354,18 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
     // --- Restart determinism: a NEW attempt of A yields the SAME root. ---
     let a2 = step_run("a", "a2");
     let ha2 = exec
-        .launch(&a2, &spec("echo scarab-was-here > /workspace/out.txt", vec![]))
+        .launch(
+            &a2,
+            &spec("echo scarab-was-here > /workspace/out.txt", vec![]),
+        )
         .await
         .expect("relaunch A");
     assert_eq!(settle(&exec, &ha2).await, ExecState::Succeeded);
     let root_a2 = exec.output(&ha2).await.expect("output").expect("snapshot");
-    assert_eq!(root_a, root_a2, "same content => same CAS root (deterministic)");
+    assert_eq!(
+        root_a, root_a2,
+        "same content => same CAS root (deterministic)"
+    );
 
     for h in [ha, hb, ha2] {
         exec.cancel(&h).await.expect("cleanup");
@@ -368,9 +393,8 @@ async fn clone_step_produces_a_source_workspace() {
     let client = kube::Client::try_default().await.expect("kube client");
     let tmp = tempfile::tempdir().expect("cas dir");
     let cas_dir = tmp.path().to_string_lossy().into_owned();
-    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
-        scarab_storage_s3::S3Storage::local(&cas_dir).expect("local cas"),
-    );
+    let cas: std::sync::Arc<dyn Cas> =
+        std::sync::Arc::new(scarab_storage_s3::S3Storage::local(&cas_dir).expect("local cas"));
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(cas.clone())
         .with_clone_image(&clone_image);
@@ -406,7 +430,10 @@ async fn clone_step_produces_a_source_workspace() {
         }),
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch clone");
@@ -423,7 +450,11 @@ async fn clone_step_produces_a_source_workspace() {
     assert_eq!(terminal, Some(ExecState::Succeeded), "clone step succeeds");
 
     // The workspace snapshot is the run's source tree — WITH .git (ADR-0045).
-    let root = exec.output(&h).await.expect("output").expect("workspace snapshot");
+    let root = exec
+        .output(&h)
+        .await
+        .expect("output")
+        .expect("workspace snapshot");
     let out = tempfile::tempdir().expect("materialize dir");
     cas.materialize(
         &scarab_storage::TreeHash(root.clone()),
@@ -432,14 +463,20 @@ async fn clone_step_produces_a_source_workspace() {
     .await
     .expect("materialize the cloned workspace");
     assert!(out.path().join("Cargo.toml").exists(), "source is present");
-    assert!(out.path().join(".git").is_dir(), ".git retained in the snapshot");
+    assert!(
+        out.path().join(".git").is_dir(),
+        ".git retained in the snapshot"
+    );
     // .git/config is credential-free (S2 guard held).
     let config = std::fs::read_to_string(out.path().join(".git/config")).expect("git config");
     assert!(
         !config.contains('@') || config.contains("github.com/thulasi-ram"),
         "no credential-bearing URL: {config}"
     );
-    assert!(config.contains("https://github.com/thulasi-ram/scarab-ci.git"), "{config}");
+    assert!(
+        config.contains("https://github.com/thulasi-ram/scarab-ci.git"),
+        "{config}"
+    );
 
     // A downstream `needs: [checkout]` step consumes the snapshot: the source
     // AND its .git materialize into /workspace (clone → CAS → materialize),
@@ -483,9 +520,15 @@ async fn clone_step_produces_a_source_workspace() {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
-    let bh = exec.launch(&build, &build_spec).await.expect("launch downstream");
+    let bh = exec
+        .launch(&build, &build_spec)
+        .await
+        .expect("launch downstream");
     let mut terminal = None;
     for _ in 0..120 {
         match exec.poll(&bh).await.expect("poll") {
@@ -562,7 +605,10 @@ async fn clone_depth_full_exposes_history() {
         }),
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch full clone");
     let mut terminal = None;
@@ -576,7 +622,11 @@ async fn clone_depth_full_exposes_history() {
         }
     }
     assert_eq!(terminal, Some(ExecState::Succeeded), "full clone succeeds");
-    let root = exec.output(&h).await.expect("output").expect("workspace snapshot");
+    let root = exec
+        .output(&h)
+        .await
+        .expect("output")
+        .expect("workspace snapshot");
 
     let count = StepRun {
         run: RunId(run_id.clone()),
@@ -610,9 +660,15 @@ async fn clone_depth_full_exposes_history() {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
-    let ch = exec.launch(&count, &count_spec).await.expect("launch history check");
+    let ch = exec
+        .launch(&count, &count_spec)
+        .await
+        .expect("launch history check");
     let mut terminal = None;
     for _ in 0..120 {
         match exec.poll(&ch).await.expect("poll") {
@@ -688,11 +744,17 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         }),
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
 
     let started = std::time::Instant::now();
-    let h = exec.launch(&step, &spec).await.expect("launch doomed clone");
+    let h = exec
+        .launch(&step, &spec)
+        .await
+        .expect("launch doomed clone");
     let mut terminal = None;
     for _ in 0..120 {
         match exec.poll(&h).await.expect("poll") {
@@ -791,7 +853,10 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
             ..Default::default()
         }),
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch build");
     let mut terminal = None;
@@ -841,9 +906,15 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
-    let vh = exec.launch(&verify, &verify_spec).await.expect("launch verify");
+    let vh = exec
+        .launch(&verify, &verify_spec)
+        .await
+        .expect("launch verify");
     let mut terminal = None;
     for _ in 0..120 {
         match exec.poll(&vh).await.expect("poll") {
@@ -952,7 +1023,10 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     let mut terminal = None;
@@ -980,10 +1054,12 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
     let (fence, token, body) = got.expect("the sidecar posted the results");
     assert_eq!(fence, format!("{run_id}/emit"));
     // The fence token is the real HMAC the executor minted.
-    let expected =
-        scarab_forge_github::sign_hex(&secret, format!("{run_id}:emit:a1").as_bytes());
+    let expected = scarab_forge_github::sign_hex(&secret, format!("{run_id}:emit:a1").as_bytes());
     assert_eq!(token, expected, "fence-scoped token authenticated");
-    assert_eq!(body["compute"]["answer"], 42, "named result captured: {body}");
+    assert_eq!(
+        body["compute"]["answer"], 42,
+        "named result captured: {body}"
+    );
 
     exec.cancel(&h).await.expect("cleanup");
 }
@@ -1023,7 +1099,10 @@ async fn cancel_tears_down_a_running_pod() {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     // Wait until it is actually Running (the interesting teardown case).
@@ -1033,7 +1112,11 @@ async fn cancel_tears_down_a_running_pod() {
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    assert_eq!(exec.poll(&h).await.unwrap(), ExecState::Running, "step reached Running");
+    assert_eq!(
+        exec.poll(&h).await.unwrap(),
+        ExecState::Running,
+        "step reached Running"
+    );
 
     exec.cancel(&h).await.expect("cancel");
 
@@ -1103,7 +1186,10 @@ async fn artifacts_are_harvested_post_step() {
         clone: None,
         build: None,
         artifacts: vec!["dist/*".into()], // the .tmp is NOT published
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     let mut terminal = None;

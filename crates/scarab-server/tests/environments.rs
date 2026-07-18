@@ -53,7 +53,10 @@ fn app(pg: Arc<PostgresDb>) -> axum::Router {
     let db: Arc<dyn Db> = pg.clone();
     let envs: Arc<dyn EnvironmentStore> = pg.clone();
     let clock = Arc::new(FakeClock::new(1_000));
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), pg.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        pg.clone(),
+    ));
     router(AppState::new(db, clock, logs).with_environments(envs))
 }
 
@@ -66,7 +69,11 @@ fn json_req(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 fn get_req(uri: &str) -> Request<Body> {
-    Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
 }
 
 #[tokio::test]
@@ -89,19 +96,35 @@ async fn environment_management_crud_over_repo_scoped_routes() {
             &format!("/v1/repos/acme/web/environments/{name}"),
             serde_json::to_value(&r).unwrap(),
         );
-        assert_eq!(app.clone().oneshot(put).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            app.clone().oneshot(put).await.unwrap().status(),
+            StatusCode::OK
+        );
     }
 
     // GET one.
-    let resp = app.clone().oneshot(get_req("/v1/repos/acme/web/environments/prod")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get_req("/v1/repos/acme/web/environments/prod"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     // LIST returns both, alphabetical.
-    let resp = app.clone().oneshot(get_req("/v1/repos/acme/web/environments")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get_req("/v1/repos/acme/web/environments"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let envs: Vec<scarab_project::Environment> = serde_json::from_slice(&body).unwrap();
-    assert_eq!(envs.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), vec!["prod", "staging"]);
+    assert_eq!(
+        envs.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
+        vec!["prod", "staging"]
+    );
 
     // Deployment history starts empty.
     let resp = app
@@ -117,8 +140,15 @@ async fn environment_management_crud_over_repo_scoped_routes() {
         .uri("/v1/repos/acme/web/environments/staging")
         .body(Body::empty())
         .unwrap();
-    assert_eq!(app.clone().oneshot(del).await.unwrap().status(), StatusCode::NO_CONTENT);
-    assert!(pg.get_environment("acme", "web", "staging").await.unwrap().is_none());
+    assert_eq!(
+        app.clone().oneshot(del).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(pg
+        .get_environment("acme", "web", "staging")
+        .await
+        .unwrap()
+        .is_none());
 
     tdb.cleanup().await;
 }
@@ -127,13 +157,40 @@ async fn environment_management_crud_over_repo_scoped_routes() {
 /// releases (and a deployment is recorded) only when the environment's rules
 /// admit the accumulated approver; otherwise the run stays suspended.
 async fn drive_to_gate(pg: &Arc<PostgresDb>, run: &RunId) {
-    let (a, g, b) = (StepId("a".into()), StepId("gate".into()), StepId("b".into()));
-    let spec = StepSpec { image: "busybox".into(), command: vec!["true".into()], env: vec![], secrets: vec![], run_as_root: false, add_capabilities: vec![], privileged: false, timeout_seconds: None, workspace_inputs: vec![], clone: None, build: None, artifacts: vec![], placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None };
+    let (a, g, b) = (
+        StepId("a".into()),
+        StepId("gate".into()),
+        StepId("b".into()),
+    );
+    let spec = StepSpec {
+        image: "busybox".into(),
+        command: vec!["true".into()],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: false,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: None,
+        workspace_inputs: vec![],
+        clone: None,
+        build: None,
+        artifacts: vec![],
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
+    };
     pg.create_run(run, 1, 1, Timestamp(0)).await.unwrap();
-    pg.create_step_run(run, &a, Some(&spec), &[], Timestamp(0)).await.unwrap();
-    pg.create_step_run(run, &g, None, std::slice::from_ref(&a), Timestamp(0)).await.unwrap();
+    pg.create_step_run(run, &a, Some(&spec), &[], Timestamp(0))
+        .await
+        .unwrap();
+    pg.create_step_run(run, &g, None, std::slice::from_ref(&a), Timestamp(0))
+        .await
+        .unwrap();
     pg.set_step_gate(run, &g, "manual", None).await.unwrap();
-    pg.create_step_run(run, &b, Some(&spec), std::slice::from_ref(&g), Timestamp(0)).await.unwrap();
+    pg.create_step_run(run, &b, Some(&spec), std::slice::from_ref(&g), Timestamp(0))
+        .await
+        .unwrap();
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
@@ -141,7 +198,10 @@ async fn drive_to_gate(pg: &Arc<PostgresDb>, run: &RunId) {
     let sched = Scheduler::new(pg.as_ref(), &clock, &exec, "sched");
     sched.tick(run).await.unwrap(); // run A
     sched.tick(run).await.unwrap(); // reach gate, suspend
-    assert_eq!(pg.run_status(run).await.unwrap(), Some(RunStatus::Suspended));
+    assert_eq!(
+        pg.run_status(run).await.unwrap(),
+        Some(RunStatus::Suspended)
+    );
 }
 
 #[tokio::test]
@@ -170,30 +230,46 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
     };
 
     // --- Case 1: approver requirement NOT met by the anonymous approver ---
-    pg.put_environment("acme", "web", &scarab_project::Environment {
-        name: "prod".into(),
-        protection: rules(&["alice"], &["refs/heads/main"]), // requires alice, not anonymous
-    })
+    pg.put_environment(
+        "acme",
+        "web",
+        &scarab_project::Environment {
+            name: "prod".into(),
+            protection: rules(&["alice"], &["refs/heads/main"]), // requires alice, not anonymous
+        },
+    )
     .await
     .unwrap();
     let run1 = RunId("deploy-blocked".into());
     drive_to_gate(&pg, &run1).await;
     pg.set_run_deploy_context(&run1, &ctx).await.unwrap();
 
-    let resp = app.clone().oneshot(approve("deploy-blocked")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(approve("deploy-blocked"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     assert_eq!(
         pg.run_status(&run1).await.unwrap(),
         Some(RunStatus::Suspended),
         "unmet approver → gate stays closed"
     );
-    assert!(pg.deployments("acme", "web", "prod").await.unwrap().is_empty());
+    assert!(pg
+        .deployments("acme", "web", "prod")
+        .await
+        .unwrap()
+        .is_empty());
 
     // --- Case 2: approver requirement satisfied by the anonymous approver ---
-    pg.put_environment("acme", "web", &scarab_project::Environment {
-        name: "prod".into(),
-        protection: rules(&["anonymous"], &["refs/heads/main"]),
-    })
+    pg.put_environment(
+        "acme",
+        "web",
+        &scarab_project::Environment {
+            name: "prod".into(),
+            protection: rules(&["anonymous"], &["refs/heads/main"]),
+        },
+    )
     .await
     .unwrap();
     let run2 = RunId("deploy-ok".into());
@@ -208,7 +284,13 @@ async fn deploy_gate_releases_and_records_history_only_when_admitted() {
         "admitted → gate released, run resumes"
     );
     assert_eq!(
-        pg.steps_of_run(&run2).await.unwrap().iter().find(|s| s.step.0 == "gate").unwrap().status,
+        pg.steps_of_run(&run2)
+            .await
+            .unwrap()
+            .iter()
+            .find(|s| s.step.0 == "gate")
+            .unwrap()
+            .status,
         StepStatus::Succeeded
     );
     let history = pg.deployments("acme", "web", "prod").await.unwrap();
@@ -234,14 +316,24 @@ async fn secret_matrix_reports_effective_status() {
         pg.put_environment(
             "acme",
             "web",
-            &scarab_project::Environment { name: name.into(), protection: rules(&[], &[]) },
+            &scarab_project::Environment {
+                name: name.into(),
+                protection: rules(&[], &[]),
+            },
         )
         .await
         .unwrap();
     }
     // SHARED lives once at repo scope; PROD_ONLY only at prod's env scope.
     let secrets = FakeSecrets::new()
-        .with_secret(&SecretScope::Repo { org: "acme".into(), repo: "web".into() }, "SHARED", b"x")
+        .with_secret(
+            &SecretScope::Repo {
+                org: "acme".into(),
+                repo: "web".into(),
+            },
+            "SHARED",
+            b"x",
+        )
         .with_secret(
             &SecretScope::Environment {
                 org: "acme".into(),
@@ -254,22 +346,38 @@ async fn secret_matrix_reports_effective_status() {
     let db: Arc<dyn Db> = pg.clone();
     let envs: Arc<dyn EnvironmentStore> = pg.clone();
     let clock = Arc::new(FakeClock::new(1_000));
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), pg.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        pg.clone(),
+    ));
     let secrets: Arc<dyn SecretProvider> = Arc::new(secrets);
     let app = router(
-        AppState::new(db, clock, logs).with_environments(envs).with_secrets(secrets),
+        AppState::new(db, clock, logs)
+            .with_environments(envs)
+            .with_secrets(secrets),
     );
 
-    let resp = app.oneshot(get_req("/v1/repos/acme/web/secrets/matrix")).await.unwrap();
+    let resp = app
+        .oneshot(get_req("/v1/repos/acme/web/secrets/matrix"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let m: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(m["environments"], serde_json::json!(["prod", "staging"]));
     let rows = m["keys"].as_array().unwrap();
     let row = |k: &str| rows.iter().find(|r| r["key"] == k).unwrap()["status"].clone();
-    assert_eq!(row("SHARED"), serde_json::json!({ "prod": "inherited", "staging": "inherited" }));
-    assert_eq!(row("PROD_ONLY"), serde_json::json!({ "prod": "set", "staging": "unset" }));
+    assert_eq!(
+        row("SHARED"),
+        serde_json::json!({ "prod": "inherited", "staging": "inherited" })
+    );
+    assert_eq!(
+        row("PROD_ONLY"),
+        serde_json::json!({ "prod": "set", "staging": "unset" })
+    );
 
     tdb.cleanup().await;
 }

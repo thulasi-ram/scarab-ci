@@ -54,7 +54,10 @@ fn handle(n: u32) -> ExecHandle {
 }
 
 fn failed(class: FailureClass) -> ExecState {
-    ExecState::Failed { exit_code: None, class }
+    ExecState::Failed {
+        exit_code: None,
+        class,
+    }
 }
 
 /// Seed a one-step run with the given per-step IR json (retry/timeout config).
@@ -64,9 +67,12 @@ async fn seed(db: &PostgresDb, step_ir: serde_json::Value) {
     db.create_step_run(&run_id(), &step_id(), Some(&spec()), &[], at)
         .await
         .unwrap();
-    db.store_run_ir(&run_id(), &serde_json::json!({ "ir_version": 1, "steps": [step_ir] }))
-        .await
-        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 1, "steps": [step_ir] }),
+    )
+    .await
+    .unwrap();
 }
 
 /// One scheduler cycle on a FRESH instance — every call models a process that
@@ -99,13 +105,19 @@ async fn crash_between_never_started_failure_and_retry_resumes_on_a_new_fence() 
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
-    exec.script_outcome(failed(FailureClass::Infra { never_started: true }));
+    exec.script_outcome(failed(FailureClass::Infra {
+        never_started: true,
+    }));
 
     // Instance A launches a1, observes the failure, re-arms the step
     // (Running → Ready durably), then CRASHES.
     boot_and_tick(&db, &clock, &exec).await;
     let steps = db.steps_of_run(&run_id()).await.unwrap();
-    assert_eq!(steps[0].status, StepStatus::Ready, "re-armed durably before the crash");
+    assert_eq!(
+        steps[0].status,
+        StepStatus::Ready,
+        "re-armed durably before the crash"
+    );
 
     // Instance B resumes from Postgres: claims the re-armed step as a NEW
     // attempt (new fence) and drives it to success.
@@ -114,15 +126,27 @@ async fn crash_between_never_started_failure_and_retry_resumes_on_a_new_fence() 
         boot_and_tick(&db, &clock, &exec).await;
     }
 
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let a = attempts(&db).await;
     assert_eq!(
         a.iter().map(|x| x.id.0.as_str()).collect::<Vec<_>>(),
         ["a1", "a2"],
         "auto-retry minted a new fence across the crash"
     );
-    assert_eq!(a[0].failure, Some(FailureKind::Infra { never_started: true }));
-    assert_eq!(exec.launch_count(&handle(1)), 1, "old fence never relaunched");
+    assert_eq!(
+        a[0].failure,
+        Some(FailureKind::Infra {
+            never_started: true
+        })
+    );
+    assert_eq!(
+        exec.launch_count(&handle(1)),
+        1,
+        "old fence never relaunched"
+    );
     assert_eq!(exec.launch_count(&handle(2)), 1);
     tdb.cleanup().await;
 }
@@ -155,7 +179,11 @@ async fn readoption_after_crash_then_assertion_gated_retry() {
     // no new attempt is minted (no budget consumed by the crash).
     boot_and_tick(&db, &clock, &exec).await;
     assert_eq!(exec.launch_count(&handle(1)), 1, "adopted, not relaunched");
-    assert_eq!(attempts(&db).await.len(), 1, "re-adoption consumed no budget");
+    assert_eq!(
+        attempts(&db).await.len(),
+        1,
+        "re-adoption consumed no budget"
+    );
 
     // a1 now fails with a code verdict; the author's retry: re-runs on a2.
     exec.script_outcome(failed(FailureClass::Step));
@@ -164,7 +192,10 @@ async fn readoption_after_crash_then_assertion_gated_retry() {
         boot_and_tick(&db, &clock, &exec).await;
     }
 
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let a = attempts(&db).await;
     assert_eq!(a.len(), 2, "the code-verdict retry consumed budget");
     assert_eq!(a[0].failure, Some(FailureKind::Step));
@@ -206,7 +237,11 @@ async fn pod_lost_during_outage_dead_letters_without_the_assertion() {
     let a = attempts(&db).await;
     assert_eq!(a.len(), 1, "Lost counted against the budget");
     assert_eq!(a[0].failure, Some(FailureKind::Lost));
-    assert_eq!(exec.launch_count(&handle(1)), 1, "the lost fence was never relaunched");
+    assert_eq!(
+        exec.launch_count(&handle(1)),
+        1,
+        "the lost fence was never relaunched"
+    );
     tdb.cleanup().await;
 }
 
@@ -236,7 +271,10 @@ async fn pod_lost_during_outage_retries_on_a_new_fence_with_the_assertion() {
         boot_and_tick(&db, &clock, &exec).await;
     }
 
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let a = attempts(&db).await;
     assert_eq!(a.len(), 2, "Lost consumed one budget slot");
     assert_eq!(a[0].failure, Some(FailureKind::Lost));
@@ -261,13 +299,22 @@ async fn infra_exhaustion_dead_letters_but_code_verdict_fails() {
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
     for _ in 0..3 {
-        exec.script_outcome(failed(FailureClass::Infra { never_started: true }));
+        exec.script_outcome(failed(FailureClass::Infra {
+            never_started: true,
+        }));
     }
     for _ in 0..4 {
         boot_and_tick(&db, &clock, &exec).await;
     }
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::DeadLettered));
-    assert_eq!(attempts(&db).await.len(), 3, "bounded — never an infinite loop");
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::DeadLettered)
+    );
+    assert_eq!(
+        attempts(&db).await.len(),
+        3,
+        "bounded — never an infinite loop"
+    );
     assert!(
         db.events(&run_id()).await.unwrap().iter().any(|e| matches!(
             &e.kind,
@@ -295,10 +342,11 @@ async fn infra_exhaustion_dead_letters_but_code_verdict_fails() {
     }
     assert_eq!(db.run_status(&run2).await.unwrap(), Some(RunStatus::Failed));
     assert!(
-        !db.events(&run2).await.unwrap().iter().any(|e| matches!(
-            e.kind,
-            EventPayload::RunDeadLettered { .. }
-        )),
+        !db.events(&run2)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, EventPayload::RunDeadLettered { .. })),
         "a code verdict is the developer signal — no dead-letter"
     );
     tdb.cleanup().await;

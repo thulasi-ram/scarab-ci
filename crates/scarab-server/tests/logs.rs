@@ -26,7 +26,9 @@ async fn full_replay_after_completion_keeps_bodies_out_of_postgres() {
     let (run, step, attempt) = stream();
 
     logs.append(&run, &step, &attempt, b"hello ").await.unwrap();
-    logs.append(&run, &step, &attempt, b"world\n").await.unwrap();
+    logs.append(&run, &step, &attempt, b"world\n")
+        .await
+        .unwrap();
 
     // Full replay reconstructs the exact byte stream.
     let all = logs.read_all(&run, &step, &attempt).await.unwrap();
@@ -53,8 +55,12 @@ async fn live_tail_receives_chunks_as_they_arrive() {
     let (run, step, attempt) = stream();
 
     let mut rx = logs.subscribe(&run, &step, &attempt);
-    logs.append(&run, &step, &attempt, b"line1\n").await.unwrap();
-    logs.append(&run, &step, &attempt, b"line2\n").await.unwrap();
+    logs.append(&run, &step, &attempt, b"line1\n")
+        .await
+        .unwrap();
+    logs.append(&run, &step, &attempt, b"line2\n")
+        .await
+        .unwrap();
 
     assert_eq!(rx.recv().await.unwrap(), b"line1\n");
     assert_eq!(rx.recv().await.unwrap(), b"line2\n");

@@ -12,7 +12,10 @@ use scarab_testkit::{FakeClock, FakeSecrets, InMemoryDb, InMemoryObjectStore};
 
 fn state(secrets: Option<Arc<FakeSecrets>>) -> AppState {
     let db = Arc::new(InMemoryDb::new());
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
     let mut st = AppState::new(db, Arc::new(FakeClock::new(0)), logs);
     if let Some(s) = secrets {
         st = st.with_secrets(s);
@@ -21,7 +24,9 @@ fn state(secrets: Option<Arc<FakeSecrets>>) -> AppState {
 }
 
 async fn body_string(resp: axum::response::Response) -> String {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
 }
 
@@ -63,7 +68,10 @@ async fn create_list_delete_never_exposes_the_value() {
     assert_eq!(resp.status(), StatusCode::OK);
     let listed = body_string(resp).await;
     assert!(listed.contains("NPM_TOKEN"), "name is listed: {listed}");
-    assert!(!listed.contains("s3cr3t-value"), "value MUST NOT be exposed: {listed}");
+    assert!(
+        !listed.contains("s3cr3t-value"),
+        "value MUST NOT be exposed: {listed}"
+    );
 
     // Delete it (idempotent) → gone from the list.
     let resp = app

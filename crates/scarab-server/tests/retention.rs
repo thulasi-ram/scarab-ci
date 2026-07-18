@@ -42,7 +42,12 @@ async fn seed_run_with_log(
         &run,
         &StepId("s1".into()),
         &scarab_engine::AttemptId("a1".into()),
-        &LogChunkMeta { seq: 0, byte_offset: 0, len: 9, object_key: key },
+        &LogChunkMeta {
+            seq: 0,
+            byte_offset: 0,
+            len: 9,
+            object_key: key,
+        },
     )
     .await
     .unwrap();
@@ -65,7 +70,10 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         &db,
         &store,
         "r-old-done",
-        &[(RunStatus::Pending, RunStatus::Running), (RunStatus::Running, RunStatus::Succeeded)],
+        &[
+            (RunStatus::Pending, RunStatus::Running),
+            (RunStatus::Running, RunStatus::Succeeded),
+        ],
         old,
     )
     .await;
@@ -74,7 +82,10 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         &db,
         &store,
         "r-old-suspended",
-        &[(RunStatus::Pending, RunStatus::Running), (RunStatus::Running, RunStatus::Suspended)],
+        &[
+            (RunStatus::Pending, RunStatus::Running),
+            (RunStatus::Running, RunStatus::Suspended),
+        ],
         old,
     )
     .await;
@@ -95,7 +106,10 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         &db,
         &store,
         "r-fresh-done",
-        &[(RunStatus::Pending, RunStatus::Running), (RunStatus::Running, RunStatus::Failed)],
+        &[
+            (RunStatus::Pending, RunStatus::Running),
+            (RunStatus::Running, RunStatus::Failed),
+        ],
         old,
     )
     .await;
@@ -130,33 +144,67 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         &store_dyn,
         &clock,
         "sweeper-1",
-        RetentionConfig { log_ttl_ms: 30 * DAY_MS, artifact_ttl_ms: 20 * DAY_MS },
+        RetentionConfig {
+            log_ttl_ms: 30 * DAY_MS,
+            artifact_ttl_ms: 20 * DAY_MS,
+        },
     )
     .await
     .unwrap();
-    assert_eq!(pruned, 2, "the old terminal run's logs AND artifacts classes");
+    assert_eq!(
+        pruned, 2,
+        "the old terminal run's logs AND artifacts classes"
+    );
     // The artifact class: old-done pruned (blob + rows), suspended kept.
     assert!(store.get("artifacts/r-old-done/report.txt").await.is_err());
-    assert!(db.artifacts_of_run(&RunId("r-old-done".into())).await.unwrap().is_empty());
-    assert!(store.get("artifacts/r-old-suspended/report.txt").await.is_ok());
+    assert!(db
+        .artifacts_of_run(&RunId("r-old-done".into()))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .get("artifacts/r-old-suspended/report.txt")
+        .await
+        .is_ok());
 
     // The pruned run: blobs gone, index gone — metadata retained.
     let gone = RunId("r-old-done".into());
-    assert!(store.get("logs/r-old-done/s1/a1/0").await.is_err(), "blob deleted");
-    assert!(db.log_object_keys_of_run(&gone).await.unwrap().is_empty(), "index dropped");
+    assert!(
+        store.get("logs/r-old-done/s1/a1/0").await.is_err(),
+        "blob deleted"
+    );
+    assert!(
+        db.log_object_keys_of_run(&gone).await.unwrap().is_empty(),
+        "index dropped"
+    );
     assert_eq!(
         db.run_status(&gone).await.unwrap(),
         Some(RunStatus::Succeeded),
         "run metadata survives its blobs (ADR-0050)"
     );
-    assert!(!db.events(&gone).await.unwrap().is_empty(), "event log retained");
+    assert!(
+        !db.events(&gone).await.unwrap().is_empty(),
+        "event log retained"
+    );
 
     // The suspended run — same age — is untouched (lifecycle-keyed).
     assert!(store.get("logs/r-old-suspended/s1/a1/0").await.is_ok());
-    assert_eq!(db.log_object_keys_of_run(&RunId("r-old-suspended".into())).await.unwrap().len(), 1);
+    assert_eq!(
+        db.log_object_keys_of_run(&RunId("r-old-suspended".into()))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 
     // The fresh terminal run is untouched (within TTL).
-    assert_eq!(db.log_object_keys_of_run(&RunId("r-fresh-done".into())).await.unwrap().len(), 1);
+    assert_eq!(
+        db.log_object_keys_of_run(&RunId("r-fresh-done".into()))
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 
     // Idempotent: a second sweep finds nothing.
     let pruned = sweep_retention(
@@ -164,7 +212,10 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         &store_dyn,
         &clock,
         "sweeper-1",
-        RetentionConfig { log_ttl_ms: 30 * DAY_MS, artifact_ttl_ms: 20 * DAY_MS },
+        RetentionConfig {
+            log_ttl_ms: 30 * DAY_MS,
+            artifact_ttl_ms: 20 * DAY_MS,
+        },
     )
     .await
     .unwrap();
@@ -176,7 +227,10 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
         &store_dyn,
         &clock,
         "sweeper-2",
-        RetentionConfig { log_ttl_ms: 30 * DAY_MS, artifact_ttl_ms: 20 * DAY_MS },
+        RetentionConfig {
+            log_ttl_ms: 30 * DAY_MS,
+            artifact_ttl_ms: 20 * DAY_MS,
+        },
     )
     .await
     .unwrap();
@@ -212,13 +266,22 @@ async fn seed_run_with_workspace(
     for (from, to) in path {
         db.record_transition(&run, *from, *to).await.unwrap();
     }
-    db.create_step_run(&run, &StepId("s1".into()), None, &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &StepId("s1".into()), None, &[], Timestamp(0))
+        .await
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
     for (name, content) in files {
         std::fs::write(dir.path().join(name), content).unwrap();
     }
-    let root = cas.ingest(dir.path().to_str().unwrap()).await.unwrap().root.0;
-    db.set_step_output(&run, &StepId("s1".into()), &root).await.unwrap();
+    let root = cas
+        .ingest(dir.path().to_str().unwrap())
+        .await
+        .unwrap()
+        .root
+        .0;
+    db.set_step_output(&run, &StepId("s1".into()), &root)
+        .await
+        .unwrap();
     root
 }
 
@@ -232,21 +295,30 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
     pg.migrate().await.unwrap();
 
     let cas_dir = tempfile::tempdir().unwrap();
-    let storage = Arc::new(
-        scarab_storage_s3::S3Storage::local(cas_dir.path().to_str().unwrap()).unwrap(),
-    );
+    let storage =
+        Arc::new(scarab_storage_s3::S3Storage::local(cas_dir.path().to_str().unwrap()).unwrap());
     let cas: Arc<dyn Cas> = storage.clone();
     let store: Arc<dyn ObjectStore> = storage.clone();
 
     // Old TERMINAL run: its workspace becomes unreachable. One file is SHARED
     // with the suspended run — the dedup case the mark walk must protect.
-    let old_root =
-        seed_run_with_workspace(&pg, &cas, "gc-old-done", true, &[("only-old.txt", "old"), ("shared.txt", "same-bytes")])
-            .await;
+    let old_root = seed_run_with_workspace(
+        &pg,
+        &cas,
+        "gc-old-done",
+        true,
+        &[("only-old.txt", "old"), ("shared.txt", "same-bytes")],
+    )
+    .await;
     // Old SUSPENDED run: reachable forever, regardless of age.
-    let suspended_root =
-        seed_run_with_workspace(&pg, &cas, "gc-old-suspended", false, &[("keep.txt", "keep"), ("shared.txt", "same-bytes")])
-            .await;
+    let suspended_root = seed_run_with_workspace(
+        &pg,
+        &cas,
+        "gc-old-suspended",
+        false,
+        &[("keep.txt", "keep"), ("shared.txt", "same-bytes")],
+    )
+    .await;
     // Age both runs' rows well past the TTL.
     for id in ["gc-old-done", "gc-old-suspended"] {
         sqlx::query("UPDATE runs SET updated_at = 0 WHERE id = $1")
@@ -277,7 +349,10 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
         &store,
         &clock,
         "gc-1",
-        GcConfig { workspace_ttl_ms: 30 * DAY_MS, grace_ms: i64::MAX },
+        GcConfig {
+            workspace_ttl_ms: 30 * DAY_MS,
+            grace_ms: i64::MAX,
+        },
     )
     .await
     .unwrap();
@@ -290,7 +365,10 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
         &store,
         &clock,
         "gc-1",
-        GcConfig { workspace_ttl_ms: 30 * DAY_MS, grace_ms: 0 },
+        GcConfig {
+            workspace_ttl_ms: 30 * DAY_MS,
+            grace_ms: 0,
+        },
     )
     .await
     .unwrap();
@@ -299,25 +377,37 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
     // The suspended (never-collectable) and fresh workspaces materialize fine.
     for (root, file) in [(&suspended_root, "keep.txt"), (&fresh_root, "fresh.txt")] {
         let out = tempfile::tempdir().unwrap();
-        cas.materialize(&scarab_storage::TreeHash(root.clone()), out.path().to_str().unwrap())
-            .await
-            .expect("reachable workspace survives GC");
+        cas.materialize(
+            &scarab_storage::TreeHash(root.clone()),
+            out.path().to_str().unwrap(),
+        )
+        .await
+        .expect("reachable workspace survives GC");
         assert!(out.path().join(file).exists());
     }
     // The SHARED blob survived (marked via the suspended run) even though the
     // old run that also referenced it was collected.
     let out = tempfile::tempdir().unwrap();
-    cas.materialize(&scarab_storage::TreeHash(suspended_root.clone()), out.path().to_str().unwrap())
-        .await
-        .unwrap();
-    assert_eq!(std::fs::read_to_string(out.path().join("shared.txt")).unwrap(), "same-bytes");
+    cas.materialize(
+        &scarab_storage::TreeHash(suspended_root.clone()),
+        out.path().to_str().unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(out.path().join("shared.txt")).unwrap(),
+        "same-bytes"
+    );
 
     // The old root's tree object is gone: materializing it now fails.
     let out = tempfile::tempdir().unwrap();
     assert!(
-        cas.materialize(&scarab_storage::TreeHash(old_root), out.path().to_str().unwrap())
-            .await
-            .is_err(),
+        cas.materialize(
+            &scarab_storage::TreeHash(old_root),
+            out.path().to_str().unwrap()
+        )
+        .await
+        .is_err(),
         "the unreachable root was actually swept"
     );
 

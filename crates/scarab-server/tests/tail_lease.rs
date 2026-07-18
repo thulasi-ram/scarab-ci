@@ -14,7 +14,7 @@ use scarab_engine::{
     Timestamp,
 };
 use scarab_server::log_tail::LogTailer;
-use scarab_server::{LogService};
+use scarab_server::LogService;
 use scarab_testkit::{InMemoryDb, InMemoryObjectStore};
 
 /// An executor whose log stream yields two fixed chunks, counting how many
@@ -37,7 +37,11 @@ impl LogChunks for TwoChunks {
 
 #[async_trait]
 impl Executor for TwoChunkExec {
-    async fn launch(&self, _s: &StepRun, _spec: &scarab_engine::StepSpec) -> Result<ExecHandle, ExecError> {
+    async fn launch(
+        &self,
+        _s: &StepRun,
+        _spec: &scarab_engine::StepSpec,
+    ) -> Result<ExecHandle, ExecError> {
         Ok(ExecHandle("h".into()))
     }
     async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
@@ -91,9 +95,17 @@ async fn two_replicas_tail_a_step_exactly_once() {
 
     // Exactly one stream was opened, and the durable index holds the two
     // chunks exactly once — no duplicate ingestion.
-    assert_eq!(exec.opened.load(Ordering::SeqCst), 1, "one tailer won the lease");
+    assert_eq!(
+        exec.opened.load(Ordering::SeqCst),
+        1,
+        "one tailer won the lease"
+    );
     let chunks = db
-        .log_chunks(&RunId("r1".into()), &StepId("s1".into()), &AttemptId("a1".into()))
+        .log_chunks(
+            &RunId("r1".into()),
+            &StepId("s1".into()),
+            &AttemptId("a1".into()),
+        )
         .await
         .unwrap();
     assert_eq!(chunks.len(), 2, "two chunks, ingested once: {chunks:?}");
@@ -122,7 +134,12 @@ async fn sse_live_tail_is_replica_agnostic() {
 
     // Replica A commits a chunk BEFORE the SSE request (the replay part)…
     logs_a
-        .append(&run, &StepId("s1".into()), &AttemptId("a1".into()), b"early\n")
+        .append(
+            &run,
+            &StepId("s1".into()),
+            &AttemptId("a1".into()),
+            b"early\n",
+        )
         .await
         .unwrap();
 
@@ -132,7 +149,12 @@ async fn sse_live_tail_is_replica_agnostic() {
         logs_b, // replica B's OWN LogService — it never saw A's broadcast
     ));
     let resp = app
-        .oneshot(Request::builder().uri("/v1/runs/r-sse/logs").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs/r-sse/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
@@ -141,7 +163,12 @@ async fn sse_live_tail_is_replica_agnostic() {
 
     // …and another chunk AFTER the stream is up (the live part).
     logs_a
-        .append(&run, &StepId("s1".into()), &AttemptId("a1".into()), b"late\n")
+        .append(
+            &run,
+            &StepId("s1".into()),
+            &AttemptId("a1".into()),
+            b"late\n",
+        )
         .await
         .unwrap();
 

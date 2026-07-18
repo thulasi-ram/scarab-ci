@@ -9,9 +9,7 @@ mod common;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::{ExecHandle, ExecState};
-use scarab_engine::{
-    Db, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
-};
+use scarab_engine::{Db, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp};
 use scarab_testkit::{FakeClock, FakeExecutor};
 
 fn spec() -> StepSpec {
@@ -28,7 +26,10 @@ fn spec() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
@@ -61,7 +62,10 @@ async fn one_step_run_reaches_succeeded() {
     let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
     sched.tick(&run).await.expect("tick");
 
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0].status, StepStatus::Succeeded);
@@ -112,7 +116,10 @@ async fn scheduler_restart_redrives_without_duplication() {
         sched2.tick(&run).await.expect("tick after restart");
     }
 
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(steps[0].status, StepStatus::Succeeded);
     assert_eq!(
@@ -165,7 +172,10 @@ async fn named_result_flows_into_a_downstream_interpolation() {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
     db.create_step_run(
         &run,
@@ -192,10 +202,16 @@ async fn named_result_flows_into_a_downstream_interpolation() {
         sched.tick(&run).await.expect("tick");
     }
 
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     // The producer's result was captured under the fence.
     let captured = db.step_results(&run, &producer).await.unwrap();
-    assert_eq!(captured.get("url").unwrap(), &serde_json::json!("https://svc.example"));
+    assert_eq!(
+        captured.get("url").unwrap(),
+        &serde_json::json!("https://svc.example")
+    );
     // The consumer launched with the *interpolated* command — the value flowed.
     let handle = ExecHandle("fake://run-1/consumer/a1".into());
     let launched = exec.launched_spec(&handle).expect("consumer launched");

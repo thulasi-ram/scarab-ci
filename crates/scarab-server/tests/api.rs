@@ -105,7 +105,10 @@ async fn happy_path_post_run_then_scheduler_reaches_succeeded() {
         "text/event-stream"
     );
     let sse = body_string(resp).await;
-    assert!(sse.contains("RunCreated"), "SSE should carry the event log: {sse}");
+    assert!(
+        sse.contains("RunCreated"),
+        "SSE should carry the event log: {sse}"
+    );
     assert!(sse.contains("RunTransitioned"));
 }
 
@@ -116,16 +119,31 @@ async fn list_runs_returns_recent_runs_newest_first() {
     let app = router(app_state(db.clone(), clock.clone()));
 
     // Create two runs with distinct creation times (advance the clock between).
-    db.create_run(&RunId("older".into()), 1, 1, scarab_engine::Timestamp(1_000))
-        .await
-        .unwrap();
-    db.create_run(&RunId("newer".into()), 1, 1, scarab_engine::Timestamp(2_000))
-        .await
-        .unwrap();
+    db.create_run(
+        &RunId("older".into()),
+        1,
+        1,
+        scarab_engine::Timestamp(1_000),
+    )
+    .await
+    .unwrap();
+    db.create_run(
+        &RunId("newer".into()),
+        1,
+        1,
+        scarab_engine::Timestamp(2_000),
+    )
+    .await
+    .unwrap();
 
     let resp = app
         .clone()
-        .oneshot(Request::builder().uri("/v1/runs").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -161,7 +179,12 @@ async fn openapi_is_served_and_describes_the_ir_subset() {
     let app = router(app_state(db, clock));
 
     let resp = app
-        .oneshot(Request::builder().uri("/openapi.json").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -240,9 +263,17 @@ async fn get_run_exposes_step_needs_for_the_dag() {
         .iter()
         .find(|s| s["id"] == "test")
         .expect("test step present");
-    assert_eq!(test["needs"], serde_json::json!(["build"]), "DAG in-edges surfaced");
+    assert_eq!(
+        test["needs"],
+        serde_json::json!(["build"]),
+        "DAG in-edges surfaced"
+    );
     let build = steps.iter().find(|s| s["id"] == "build").unwrap();
-    assert_eq!(build["needs"], serde_json::json!([]), "root step has no needs");
+    assert_eq!(
+        build["needs"],
+        serde_json::json!([]),
+        "root step has no needs"
+    );
 }
 
 /// Full-route OpenAPI coverage (ADR-0054): every route registered on the
@@ -267,9 +298,15 @@ fn every_registered_route_is_in_the_openapi_spec() {
         spec["paths"].as_object().unwrap().keys().cloned().collect();
 
     let missing: Vec<&String> = routes.iter().filter(|r| !have.contains(*r)).collect();
-    assert!(missing.is_empty(), "routes missing from the OpenAPI spec: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "routes missing from the OpenAPI spec: {missing:?}"
+    );
     let extra: Vec<&String> = have.iter().filter(|p| !routes.contains(p)).collect();
-    assert!(extra.is_empty(), "spec paths with no registered route: {extra:?}");
+    assert!(
+        extra.is_empty(),
+        "spec paths with no registered route: {extra:?}"
+    );
 }
 
 /// The embedded web UI (ADR-0054): `/` serves index.html, real assets serve
@@ -295,10 +332,16 @@ async fn embedded_ui_serves_index_assets_and_spa_fallback() {
     );
 
     let get = |uri: &str| {
-        axum::http::Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap()
+        axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap()
     };
     let body = |resp: axum::response::Response| async {
-        axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
     };
 
     // Index at /.
@@ -309,24 +352,36 @@ async fn embedded_ui_serves_index_assets_and_spa_fallback() {
     // A real asset with its content type.
     let resp = app.clone().oneshot(get("/assets/app.js")).await.unwrap();
     assert_eq!(
-        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
         Some("application/javascript")
     );
 
     // An SPA client route falls back to index (client routing takes over).
-    let resp = app.clone().oneshot(get("/acme/web/runs/r-123")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get("/acme/web/runs/r-123"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
     assert!(String::from_utf8_lossy(&body(resp).await).contains("scarab-ui"));
 
     // The API still wins under /v1 (JSON, not HTML).
     let resp = app.clone().oneshot(get("/v1/runs")).await.unwrap();
     assert_eq!(
-        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
         Some("application/json")
     );
 
     // Traversal cannot escape dist: `..` segments are dropped, so this is
     // the SPA fallback, never /etc/passwd.
-    let resp = app.clone().oneshot(get("/../../../../etc/passwd")).await.unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get("/../../../../etc/passwd"))
+        .await
+        .unwrap();
     assert!(String::from_utf8_lossy(&body(resp).await).contains("scarab-ui"));
 }

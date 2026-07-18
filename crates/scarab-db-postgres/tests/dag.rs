@@ -27,7 +27,10 @@ fn spec() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
@@ -99,7 +102,10 @@ async fn linear_dag_admits_in_dependency_order() {
     sched.tick(&run).await.expect("tick 3");
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(status_of(&steps, "C"), StepStatus::Succeeded);
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
 
     tdb.cleanup().await;
 }
@@ -156,7 +162,10 @@ async fn fan_out_admits_independent_steps_concurrently() {
     // Finish the tick: both complete and the run settles.
     sched.reconcile().await.expect("reconcile");
     sched.advance(&run).await.expect("advance");
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
 
     tdb.cleanup().await;
 }

@@ -175,7 +175,11 @@ impl LogTailer {
                                     (TAIL_LEASE_TTL_MS / 3) as u64,
                                 ))
                                 .await;
-                                if db.lease(&resource, &owner, TAIL_LEASE_TTL_MS).await.is_err() {
+                                if db
+                                    .lease(&resource, &owner, TAIL_LEASE_TTL_MS)
+                                    .await
+                                    .is_err()
+                                {
                                     break;
                                 }
                             }
@@ -271,14 +275,20 @@ mod tests {
             "executor error: exec error: ApiError: container \"step\" in pod \
              \"scarab-check-a1-7893ca80\" is waiting to start: PodInitializing: BadRequest"
         ));
-        assert!(is_pod_not_ready("container \"step\" is waiting to start: ContainerCreating"));
+        assert!(is_pod_not_ready(
+            "container \"step\" is waiting to start: ContainerCreating"
+        ));
     }
 
     #[test]
     fn genuine_errors_still_warn() {
-        assert!(!is_pod_not_ready("ApiError: pods \"x\" is forbidden: cannot get pods/log"));
+        assert!(!is_pod_not_ready(
+            "ApiError: pods \"x\" is forbidden: cannot get pods/log"
+        ));
         assert!(!is_pod_not_ready("connection refused"));
         // A failing image pull is a real problem, not a pre-start state.
-        assert!(!is_pod_not_ready("container \"step\" is waiting to start: ImagePullBackOff"));
+        assert!(!is_pod_not_ready(
+            "container \"step\" is waiting to start: ImagePullBackOff"
+        ));
     }
 }

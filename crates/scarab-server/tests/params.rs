@@ -21,9 +21,7 @@ use serde_json::json;
 use tower::ServiceExt;
 
 use scarab_engine::ports::{ExecHandle, ExecState, Executor};
-use scarab_engine::{
-    Clock, Db, RunId, Scheduler, StepId, StepRun, StepSpec, Timestamp,
-};
+use scarab_engine::{Clock, Db, RunId, Scheduler, StepId, StepRun, StepSpec, Timestamp};
 use scarab_server::{router, AppState, LogService};
 use scarab_testkit::{FakeClock, InMemoryDb, InMemoryObjectStore};
 
@@ -75,12 +73,17 @@ fn interp_spec() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -126,12 +129,28 @@ async fn params_interpolate_inputs_and_restart_re_derives_identically() {
 
     // `${{ inputs.region }}` interpolated; the numeric guard resolved numerically.
     let (cmd, env) = &launches[0];
-    assert_eq!(cmd, &vec!["deploy".to_string(), "us-east-1".to_string(), "big=true".to_string()]);
+    assert_eq!(
+        cmd,
+        &vec![
+            "deploy".to_string(),
+            "us-east-1".to_string(),
+            "big=true".to_string()
+        ]
+    );
 
     // Every param — including the unreferenced `zone` — reaches the step as env.
-    assert!(env.contains(&("SCARAB_PARAM_REGION".into(), "us-east-1".into())), "{env:?}");
-    assert!(env.contains(&("SCARAB_PARAM_N".into(), "90".into())), "{env:?}");
-    assert!(env.contains(&("SCARAB_PARAM_ZONE".into(), "a".into())), "{env:?}");
+    assert!(
+        env.contains(&("SCARAB_PARAM_REGION".into(), "us-east-1".into())),
+        "{env:?}"
+    );
+    assert!(
+        env.contains(&("SCARAB_PARAM_N".into(), "90".into())),
+        "{env:?}"
+    );
+    assert!(
+        env.contains(&("SCARAB_PARAM_ZONE".into(), "a".into())),
+        "{env:?}"
+    );
 
     // Restart determinism (ADR-0027): the re-launched attempt re-derives the
     // exact same interpolation + env from the frozen params.
@@ -141,7 +160,10 @@ async fn params_interpolate_inputs_and_restart_re_derives_identically() {
 // --- supply path (POST /v1/runs) ---------------------------------------------
 
 fn app(db: Arc<InMemoryDb>, clock: Arc<FakeClock>) -> axum::Router {
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
     router(AppState::new(db, clock, logs))
 }
 

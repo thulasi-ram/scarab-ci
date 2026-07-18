@@ -49,13 +49,19 @@ fn clone_spec(read_only: bool) -> StepSpec {
         }),
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
 #[test]
 fn clone_urls_are_credential_free_per_forge() {
-    let repo = RepoRef { owner: "acme".into(), name: "web".into() };
+    let repo = RepoRef {
+        owner: "acme".into(),
+        name: "web".into(),
+    };
     assert_eq!(
         clone_url(ForgeKind::GitHub, "https://api.github.com", &repo),
         "https://github.com/acme/web.git"
@@ -83,7 +89,15 @@ async fn launch_enriches_url_and_mints_a_credential_honoring_read_only() {
         .await
         .unwrap();
     registry
-        .bind_repo("fj-1", &RepoRef { owner: "acme".into(), name: "web".into() }, "acme", "web")
+        .bind_repo(
+            "fj-1",
+            &RepoRef {
+                owner: "acme".into(),
+                name: "web".into(),
+            },
+            "acme",
+            "web",
+        )
         .await
         .unwrap();
 
@@ -93,7 +107,11 @@ async fn launch_enriches_url_and_mints_a_credential_honoring_read_only() {
     // A fork-PR clone: read_only fixed at creation, honored at mint time.
     let step = step_run("checkout");
     let handle = exec.launch(&step, &clone_spec(true)).await.unwrap();
-    let enriched = inner.launched_spec(&handle).expect("captured").clone.unwrap();
+    let enriched = inner
+        .launched_spec(&handle)
+        .expect("captured")
+        .clone
+        .unwrap();
     assert_eq!(enriched.url, "https://git.example.com/acme/web.git");
     let cred = enriched.credential.expect("credential minted");
     assert!(!cred.token.is_empty());
@@ -109,8 +127,15 @@ async fn unregistered_repo_falls_back_to_public_github_url() {
         Arc::new(InMemoryDb::new()), // empty registry
         Arc::new(FakeForge::new()),
     );
-    let handle = exec.launch(&step_run("checkout"), &clone_spec(false)).await.unwrap();
-    let enriched = inner.launched_spec(&handle).expect("captured").clone.unwrap();
+    let handle = exec
+        .launch(&step_run("checkout"), &clone_spec(false))
+        .await
+        .unwrap();
+    let enriched = inner
+        .launched_spec(&handle)
+        .expect("captured")
+        .clone
+        .unwrap();
     assert_eq!(enriched.url, "https://github.com/acme/web.git");
 }
 
@@ -159,7 +184,10 @@ fn build_spec(image: &str) -> StepSpec {
             ..Default::default()
         }),
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
@@ -167,7 +195,10 @@ fn build_spec(image: &str) -> StepSpec {
 async fn scoped_registry_auth_secret_takes_precedence_over_forge_derived() {
     let inner = Arc::new(FakeExecutor::new());
     let secrets = Arc::new(FakeSecrets::new().with_secret(
-        &SecretScope::Repo { org: "acme".into(), repo: "web".into() },
+        &SecretScope::Repo {
+            org: "acme".into(),
+            repo: "web".into(),
+        },
         "REGISTRY_AUTH",
         br#"{"auths":{"registry.corp":{"auth":"eDp5"}}}"#,
     ));
@@ -220,7 +251,10 @@ async fn forge_derived_credential_is_the_fallback_and_only_for_its_own_registry(
     // Pushing elsewhere: the forge credential must NOT leak to a foreign
     // registry — anonymous build instead.
     let handle = exec
-        .launch(&step_run("image2"), &build_spec("registry.elsewhere/acme/web:1"))
+        .launch(
+            &step_run("image2"),
+            &build_spec("registry.elsewhere/acme/web:1"),
+        )
         .await
         .unwrap();
     let enriched = inner.launched_spec(&handle).unwrap().build.unwrap();

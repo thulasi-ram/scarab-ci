@@ -22,15 +22,16 @@ use scarab_engine::{
     Clock, Db, EventPayload, ExecError, RunId, RunStatus, Scheduler, StepRun, StepSpec,
 };
 use scarab_forge::RepoRef;
-use scarab_project::{
-    Deployment, Environment, EnvironmentStore, ProjectError, ProtectionRules,
-};
+use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError, ProtectionRules};
 use scarab_secrets::SecretScope;
 use scarab_server::{dispatch_run, router, AppState, DispatchError, DispatchKind, LogService};
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb, InMemoryObjectStore};
 
 fn repo() -> RepoRef {
-    RepoRef { owner: "acme".into(), name: "web".into() }
+    RepoRef {
+        owner: "acme".into(),
+        name: "web".into(),
+    }
 }
 
 // A single-step pipeline that opts into manual dispatch and interpolates a param.
@@ -57,17 +58,36 @@ struct FakeEnvironments {
 
 #[async_trait]
 impl EnvironmentStore for FakeEnvironments {
-    async fn put_environment(&self, org: &str, repo: &str, env: &Environment) -> Result<(), ProjectError> {
+    async fn put_environment(
+        &self,
+        org: &str,
+        repo: &str,
+        env: &Environment,
+    ) -> Result<(), ProjectError> {
         self.envs
             .lock()
             .unwrap()
             .insert((org.into(), repo.into(), env.name.clone()), env.clone());
         Ok(())
     }
-    async fn get_environment(&self, org: &str, repo: &str, name: &str) -> Result<Option<Environment>, ProjectError> {
-        Ok(self.envs.lock().unwrap().get(&(org.into(), repo.into(), name.into())).cloned())
+    async fn get_environment(
+        &self,
+        org: &str,
+        repo: &str,
+        name: &str,
+    ) -> Result<Option<Environment>, ProjectError> {
+        Ok(self
+            .envs
+            .lock()
+            .unwrap()
+            .get(&(org.into(), repo.into(), name.into()))
+            .cloned())
     }
-    async fn list_environments(&self, org: &str, repo: &str) -> Result<Vec<Environment>, ProjectError> {
+    async fn list_environments(
+        &self,
+        org: &str,
+        repo: &str,
+    ) -> Result<Vec<Environment>, ProjectError> {
         Ok(self
             .envs
             .lock()
@@ -77,15 +97,28 @@ impl EnvironmentStore for FakeEnvironments {
             .map(|(_, e)| e.clone())
             .collect())
     }
-    async fn delete_environment(&self, org: &str, repo: &str, name: &str) -> Result<(), ProjectError> {
-        self.envs.lock().unwrap().remove(&(org.into(), repo.into(), name.into()));
+    async fn delete_environment(
+        &self,
+        org: &str,
+        repo: &str,
+        name: &str,
+    ) -> Result<(), ProjectError> {
+        self.envs
+            .lock()
+            .unwrap()
+            .remove(&(org.into(), repo.into(), name.into()));
         Ok(())
     }
     async fn record_deployment(&self, deployment: &Deployment) -> Result<(), ProjectError> {
         self.deployments.lock().unwrap().push(deployment.clone());
         Ok(())
     }
-    async fn deployments(&self, org: &str, repo: &str, environment: &str) -> Result<Vec<Deployment>, ProjectError> {
+    async fn deployments(
+        &self,
+        org: &str,
+        repo: &str,
+        environment: &str,
+    ) -> Result<Vec<Deployment>, ProjectError> {
         Ok(self
             .deployments
             .lock()
@@ -127,7 +160,10 @@ struct RecordingExec {
 #[async_trait]
 impl Executor for RecordingExec {
     async fn launch(&self, _step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
-        self.launches.lock().unwrap().push((spec.command.clone(), spec.env.clone()));
+        self.launches
+            .lock()
+            .unwrap()
+            .push((spec.command.clone(), spec.env.clone()));
         Ok(ExecHandle("h".into()))
     }
     async fn poll(&self, _h: &ExecHandle) -> Result<ExecState, ExecError> {
@@ -185,8 +221,14 @@ async fn dispatch_manual_pins_resolved_sha_and_freezes_and_interpolates_params()
         })
         .expect("a trigger event was recorded");
     assert_eq!(trigger["event"]["kind"], "manual");
-    assert_eq!(trigger["event"]["sha"], "sha-deadbeef", "pinned to the resolved sha");
-    assert_eq!(trigger["event"]["ref"], "refs/heads/main", "symbolic dispatch ref");
+    assert_eq!(
+        trigger["event"]["sha"], "sha-deadbeef",
+        "pinned to the resolved sha"
+    );
+    assert_eq!(
+        trigger["event"]["ref"], "refs/heads/main",
+        "symbolic dispatch ref"
+    );
     assert_eq!(trigger["event"]["branch"], "main");
     assert_eq!(trigger["event"]["actor"], "alice");
 
@@ -197,8 +239,18 @@ async fn dispatch_manual_pins_resolved_sha_and_freezes_and_interpolates_params()
     let launches = exec.launches.lock().unwrap().clone();
     assert_eq!(launches.len(), 1);
     let (cmd, env) = &launches[0];
-    assert_eq!(cmd, &vec!["deploy".to_string(), "us-east-1".to_string(), "n=5".to_string()]);
-    assert!(env.contains(&("SCARAB_PARAM_REGION".into(), "us-east-1".into())), "{env:?}");
+    assert_eq!(
+        cmd,
+        &vec![
+            "deploy".to_string(),
+            "us-east-1".to_string(),
+            "n=5".to_string()
+        ]
+    );
+    assert!(
+        env.contains(&("SCARAB_PARAM_REGION".into(), "us-east-1".into())),
+        "{env:?}"
+    );
 }
 
 // --- opt-in gate --------------------------------------------------------------
@@ -227,8 +279,14 @@ async fn dispatch_rejects_a_pipeline_that_does_not_opt_into_manual() {
     )
     .await
     .expect_err("must reject a non-dispatchable pipeline");
-    assert!(matches!(err, DispatchError::NotDispatchable { .. }), "{err:?}");
-    assert!(db.list_runs(100).await.unwrap().is_empty(), "no run created");
+    assert!(
+        matches!(err, DispatchError::NotDispatchable { .. }),
+        "{err:?}"
+    );
+    assert!(
+        db.list_runs(100).await.unwrap().is_empty(),
+        "no run created"
+    );
 }
 
 // --- params fail-closed -------------------------------------------------------
@@ -256,11 +314,17 @@ async fn dispatch_rejects_missing_required_param_and_creates_no_run() {
     .expect_err("missing required param must reject");
     match err {
         DispatchError::Params(e) => {
-            assert!(e.to_string().contains("required parameter not supplied"), "{e}");
+            assert!(
+                e.to_string().contains("required parameter not supplied"),
+                "{e}"
+            );
         }
         other => panic!("expected a structured Params error, got {other:?}"),
     }
-    assert!(db.list_runs(100).await.unwrap().is_empty(), "no run created");
+    assert!(
+        db.list_runs(100).await.unwrap().is_empty(),
+        "no run created"
+    );
 }
 
 // --- governance ---------------------------------------------------------------
@@ -286,7 +350,10 @@ async fn dispatched_deploy_suspends_on_the_approval_gate() {
     envs.put_environment(
         "acme",
         "web",
-        &Environment { name: "prod".into(), protection: prod_rules(&["alice"], &["refs/heads/main"]) },
+        &Environment {
+            name: "prod".into(),
+            protection: prod_rules(&["alice"], &["refs/heads/main"]),
+        },
     )
     .await
     .unwrap();
@@ -309,7 +376,11 @@ async fn dispatched_deploy_suspends_on_the_approval_gate() {
     // The deploy context was recorded so gate-approval-time admission can find the
     // Environment's rules and re-check allowed_refs. `git_ref` is the *symbolic*
     // ref (ADR-0037), so the gate-approval `admits()` matches the branch pattern.
-    let ctx = db.run_deploy_context(&run).await.unwrap().expect("deploy context");
+    let ctx = db
+        .run_deploy_context(&run)
+        .await
+        .unwrap()
+        .expect("deploy context");
     assert_eq!(ctx.environment, "prod");
     assert_eq!(ctx.git_ref, "refs/heads/main");
 
@@ -328,7 +399,10 @@ async fn dispatched_deploy_suspends_on_the_approval_gate() {
             break;
         }
     }
-    assert!(suspended, "a dispatched deploy suspends on its approval gate");
+    assert!(
+        suspended,
+        "a dispatched deploy suspends on its approval gate"
+    );
 }
 
 #[tokio::test]
@@ -341,7 +415,10 @@ async fn dispatch_ref_disallowed_by_environment_is_rejected_fail_closed() {
     envs.put_environment(
         "acme",
         "web",
-        &Environment { name: "prod".into(), protection: prod_rules(&[], &["refs/heads/main"]) },
+        &Environment {
+            name: "prod".into(),
+            protection: prod_rules(&[], &["refs/heads/main"]),
+        },
     )
     .await
     .unwrap();
@@ -361,7 +438,10 @@ async fn dispatch_ref_disallowed_by_environment_is_rejected_fail_closed() {
     .await
     .expect_err("a disallowed ref must be rejected");
     assert!(matches!(err, DispatchError::RefNotAllowed(_)), "{err:?}");
-    assert!(db.list_runs(100).await.unwrap().is_empty(), "no run created for a disallowed ref");
+    assert!(
+        db.list_runs(100).await.unwrap().is_empty(),
+        "no run created for a disallowed ref"
+    );
 }
 
 // ADR-0037 core regression: allowed_refs is matched against the *symbolic* ref,
@@ -383,7 +463,10 @@ async fn dispatch_to_branch_scoped_env_admits_and_pins_the_resolved_sha() {
     envs.put_environment(
         "acme",
         "web",
-        &Environment { name: "prod".into(), protection: prod_rules(&[], &["refs/heads/main"]) },
+        &Environment {
+            name: "prod".into(),
+            protection: prod_rules(&[], &["refs/heads/main"]),
+        },
     )
     .await
     .unwrap();
@@ -405,8 +488,15 @@ async fn dispatch_to_branch_scoped_env_admits_and_pins_the_resolved_sha() {
     .expect("a branch-scoped env admits its allowed branch even when the commit is a real SHA");
 
     // The run is pinned to the RESOLVED commit, not the branch ref.
-    let ctx = db.run_deploy_context(&run).await.unwrap().expect("deploy context");
-    assert_eq!(ctx.git_ref, "refs/heads/main", "protection ref recorded symbolically");
+    let ctx = db
+        .run_deploy_context(&run)
+        .await
+        .unwrap()
+        .expect("deploy context");
+    assert_eq!(
+        ctx.git_ref, "refs/heads/main",
+        "protection ref recorded symbolically"
+    );
     let events = db.events(&run).await.unwrap();
     let trigger = events
         .iter()
@@ -437,7 +527,10 @@ async fn dispatch_to_branch_scoped_env_admits_and_pins_the_resolved_sha() {
     .expect_err("a branch outside allowed_refs is rejected");
     match err {
         DispatchError::RefNotAllowed(r) => {
-            assert_eq!(r, "refs/heads/feature", "error reports the symbolic ref, not a SHA");
+            assert_eq!(
+                r, "refs/heads/feature",
+                "error reports the symbolic ref, not a SHA"
+            );
         }
         other => panic!("expected RefNotAllowed, got {other:?}"),
     }
@@ -451,7 +544,10 @@ async fn dispatch_endpoint_creates_a_run_and_returns_its_id() {
         Arc::new(scarab_testkit::FakeForge::new().with_file(".scarab/ship.yaml", MANUAL_YAML));
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     let clock = Arc::new(FakeClock::new(1_000));
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
     let app = router(AppState::new(db.clone(), clock, logs).with_forge(forge));
 
     let resp = app
@@ -474,7 +570,9 @@ async fn dispatch_endpoint_creates_a_run_and_returns_its_id() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let id = body["id"].as_str().expect("run id in response");
     let stored = db.run_params(&RunId(id.into())).await.unwrap();

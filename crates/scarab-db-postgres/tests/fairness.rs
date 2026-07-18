@@ -15,7 +15,9 @@ use scarab_testkit::{FakeClock, FakeExecutor};
 async fn seed_run(db: &PostgresDb, id: &str, project: &str, priority: i32, created: i64) -> RunId {
     let run = RunId(id.into());
     db.create_run(&run, 1, 1, Timestamp(created)).await.unwrap();
-    db.set_run_scheduling(&run, project, priority).await.unwrap();
+    db.set_run_scheduling(&run, project, priority)
+        .await
+        .unwrap();
     run
 }
 
@@ -53,7 +55,11 @@ async fn per_project_cap_holds() {
     // Two admitted, the third held back by the project cap.
     assert_eq!(status(&db, "a").await, RunStatus::Running);
     assert_eq!(status(&db, "b").await, RunStatus::Running);
-    assert_eq!(status(&db, "c").await, RunStatus::Pending, "third exceeds the project cap");
+    assert_eq!(
+        status(&db, "c").await,
+        RunStatus::Pending,
+        "third exceeds the project cap"
+    );
     assert_eq!(db.count_in_flight_runs(Some("proj")).await.unwrap(), 2);
 
     tdb.cleanup().await;
@@ -78,7 +84,11 @@ async fn global_cap_holds() {
     let sched = Scheduler::new(&db, &clock, &exec, "sched-1").with_global_run_cap(2);
     admit_pass(&sched, &db).await;
 
-    assert_eq!(db.count_in_flight_runs(None).await.unwrap(), 2, "global cap holds");
+    assert_eq!(
+        db.count_in_flight_runs(None).await.unwrap(),
+        2,
+        "global cap holds"
+    );
     // The two oldest admit; the newest waits.
     assert_eq!(status(&db, "c").await, RunStatus::Pending);
 
@@ -104,7 +114,11 @@ async fn higher_priority_admits_first() {
     let sched = Scheduler::new(&db, &clock, &exec, "sched-1").with_project_run_cap(1);
     admit_pass(&sched, &db).await;
 
-    assert_eq!(status(&db, "high").await, RunStatus::Running, "priority wins the single slot");
+    assert_eq!(
+        status(&db, "high").await,
+        RunStatus::Running,
+        "priority wins the single slot"
+    );
     assert_eq!(status(&db, "low").await, RunStatus::Pending);
 
     tdb.cleanup().await;

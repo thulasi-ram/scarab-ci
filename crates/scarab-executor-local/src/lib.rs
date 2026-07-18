@@ -70,7 +70,10 @@ impl LocalExecutor {
             .current_attempt()
             .map(|a| a.id.0.as_str())
             .unwrap_or("0");
-        ExecHandle(format!("local://{}/{}/{}", step.run.0, step.step.0, attempt))
+        ExecHandle(format!(
+            "local://{}/{}/{}",
+            step.run.0, step.step.0, attempt
+        ))
     }
 
     /// The per-step working directory for a handle — a pure function of the fence
@@ -183,7 +186,9 @@ impl Executor for LocalExecutor {
             .env("SCARAB_STEP", &step.step.0)
             .env(
                 "SCARAB_ATTEMPT",
-                step.current_attempt().map(|a| a.id.0.as_str()).unwrap_or("0"),
+                step.current_attempt()
+                    .map(|a| a.id.0.as_str())
+                    .unwrap_or("0"),
             )
             .env("SCARAB_RESULTS", &results_dir);
 
@@ -195,7 +200,8 @@ impl Executor for LocalExecutor {
         // configured global default.
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(
-                spec.timeout_seconds.unwrap_or(self.default_step_timeout_secs) as u64,
+                spec.timeout_seconds
+                    .unwrap_or(self.default_step_timeout_secs) as u64,
             );
         self.procs
             .lock()
@@ -298,6 +304,12 @@ impl Executor for LocalExecutor {
 /// Sanitize a fence component into a filesystem-safe path segment.
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }

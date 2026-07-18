@@ -27,7 +27,10 @@ fn spec() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
@@ -47,7 +50,12 @@ async fn drive_to_terminal(sched: &Scheduler<'_>, db: &PostgresDb, run: &RunId) 
 }
 
 fn attempts_of(steps: &[scarab_engine::StepRun], id: &str) -> usize {
-    steps.iter().find(|s| s.step.0 == id).unwrap().attempts.len()
+    steps
+        .iter()
+        .find(|s| s.step.0 == id)
+        .unwrap()
+        .attempts
+        .len()
 }
 
 /// Diamond A -> {B, C} -> D. Run it, then restart B: B and D (its descendant)
@@ -72,9 +80,15 @@ async fn restarting_a_middle_step_reruns_only_it_and_descendants() {
     db.create_step_run(&run, &dep("C"), Some(&spec()), &[dep("A")], Timestamp(0))
         .await
         .unwrap();
-    db.create_step_run(&run, &dep("D"), Some(&spec()), &[dep("B"), dep("C")], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &dep("D"),
+        Some(&spec()),
+        &[dep("B"), dep("C")],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
@@ -85,20 +99,28 @@ async fn restarting_a_middle_step_reruns_only_it_and_descendants() {
 
     // Initial run: all four steps run once, run succeeds.
     drive_to_terminal(&sched, &db, &run).await;
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let steps = db.steps_of_run(&run).await.unwrap();
     for id in ["A", "B", "C", "D"] {
         assert_eq!(attempts_of(&steps, id), 1, "{id} ran once initially");
     }
 
     // Restart B: re-arms B and its transitive descendant D.
-    restart_step(&db, &clock, &run, &dep("B")).await.expect("restart");
+    restart_step(&db, &clock, &run, &dep("B"))
+        .await
+        .expect("restart");
     // The run reopened; B and D are Pending again, A and C still Succeeded.
     assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Running));
 
     // Drive again: B then D re-run (D waits for B), run settles.
     drive_to_terminal(&sched, &db, &run).await;
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(attempts_of(&steps, "A"), 1, "ancestor A not re-run");
     assert_eq!(attempts_of(&steps, "C"), 1, "sibling C not re-run");
@@ -123,12 +145,24 @@ async fn restart_skips_unchanged_descendant_then_cascades_when_output_changes() 
 
     let run = RunId("run-skip".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &dep("A"), Some(&spec()), &[], Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &dep("B"), Some(&spec()), &[dep("A")], Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &dep("C"), Some(&spec()), &[dep("A")], Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &dep("D"), Some(&spec()), &[dep("B"), dep("C")], Timestamp(0))
+    db.create_step_run(&run, &dep("A"), Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
+    db.create_step_run(&run, &dep("B"), Some(&spec()), &[dep("A")], Timestamp(0))
+        .await
+        .unwrap();
+    db.create_step_run(&run, &dep("C"), Some(&spec()), &[dep("A")], Timestamp(0))
+        .await
+        .unwrap();
+    db.create_step_run(
+        &run,
+        &dep("D"),
+        Some(&spec()),
+        &[dep("B"), dep("C")],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
@@ -142,16 +176,24 @@ async fn restart_skips_unchanged_descendant_then_cascades_when_output_changes() 
     let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
 
     drive_to_terminal(&sched, &db, &run).await;
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let steps = db.steps_of_run(&run).await.unwrap();
     for id in ["A", "B", "C", "D"] {
         assert_eq!(attempts_of(&steps, id), 1, "{id} ran once initially");
     }
 
     // Restart B — its output is unchanged, so D must be skipped, not re-run.
-    restart_step(&db, &clock, &run, &dep("B")).await.expect("restart");
+    restart_step(&db, &clock, &run, &dep("B"))
+        .await
+        .expect("restart");
     drive_to_terminal(&sched, &db, &run).await;
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(attempts_of(&steps, "B"), 2, "target B re-ran");
     assert_eq!(attempts_of(&steps, "D"), 1, "D skipped — inputs unchanged");
@@ -172,11 +214,17 @@ async fn restart_skips_unchanged_descendant_then_cascades_when_output_changes() 
 
     // Now B produces a *different* output; restarting B must cascade to D.
     exec.set_output("B", "ob2");
-    restart_step(&db, &clock, &run, &dep("B")).await.expect("restart 2");
+    restart_step(&db, &clock, &run, &dep("B"))
+        .await
+        .expect("restart 2");
     drive_to_terminal(&sched, &db, &run).await;
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(attempts_of(&steps, "B"), 3, "target B re-ran again");
-    assert_eq!(attempts_of(&steps, "D"), 2, "D cascaded — B's output changed");
+    assert_eq!(
+        attempts_of(&steps, "D"),
+        2,
+        "D cascaded — B's output changed"
+    );
 
     tdb.cleanup().await;
 }
@@ -196,16 +244,34 @@ async fn explicit_inputs_scope_restart_invalidation() {
 
     let run = RunId("run-inputs".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &dep("B"), Some(&spec()), &[], Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &dep("C"), Some(&spec()), &[], Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &dep("D"), Some(&spec()), &[dep("B"), dep("C")], Timestamp(0))
+    db.create_step_run(&run, &dep("B"), Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
-    db.create_step_run(&run, &dep("E"), Some(&spec()), &[dep("B"), dep("C")], Timestamp(0))
+    db.create_step_run(&run, &dep("C"), Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
+    db.create_step_run(
+        &run,
+        &dep("D"),
+        Some(&spec()),
+        &[dep("B"), dep("C")],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
+    db.create_step_run(
+        &run,
+        &dep("E"),
+        Some(&spec()),
+        &[dep("B"), dep("C")],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     // D consumes only B's workspace; E inherits both (implicit default).
-    db.set_step_inputs(&run, &dep("D"), &[dep("B")]).await.unwrap();
+    db.set_step_inputs(&run, &dep("D"), &[dep("B")])
+        .await
+        .unwrap();
 
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
@@ -218,17 +284,26 @@ async fn explicit_inputs_scope_restart_invalidation() {
     let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
 
     drive_to_terminal(&sched, &db, &run).await;
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
 
     // C now produces a *different* output; restart it.
     exec.set_output("C", "oc2");
-    restart_step(&db, &clock, &run, &dep("C")).await.expect("restart");
+    restart_step(&db, &clock, &run, &dep("C"))
+        .await
+        .expect("restart");
     drive_to_terminal(&sched, &db, &run).await;
 
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(attempts_of(&steps, "C"), 2, "target C re-ran");
     assert_eq!(attempts_of(&steps, "E"), 2, "E cascaded — it consumes C");
-    assert_eq!(attempts_of(&steps, "D"), 1, "D skipped — consumes only B (unchanged)");
+    assert_eq!(
+        attempts_of(&steps, "D"),
+        1,
+        "D skipped — consumes only B (unchanged)"
+    );
 
     tdb.cleanup().await;
 }
@@ -250,7 +325,9 @@ async fn restarting_unknown_step_errors() {
         .unwrap();
 
     let clock = FakeClock::new(1_000);
-    assert!(restart_step(&db, &clock, &run, &dep("ghost")).await.is_err());
+    assert!(restart_step(&db, &clock, &run, &dep("ghost"))
+        .await
+        .is_err());
 
     tdb.cleanup().await;
 }

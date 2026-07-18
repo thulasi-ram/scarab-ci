@@ -73,7 +73,9 @@ pub async fn sweep_retention(
                 return Err(format!("delete {}: {e}", a.object_key));
             }
         }
-        db.delete_artifacts_of_run(&run).await.map_err(|e| e.to_string())?;
+        db.delete_artifacts_of_run(&run)
+            .await
+            .map_err(|e| e.to_string())?;
         tracing::info!(run = %run.0, artifacts = artifacts.len(), "retention: pruned run artifacts");
         pruned += 1;
     }
@@ -88,14 +90,19 @@ async fn prune_run_logs(
     store: &Arc<dyn ObjectStore>,
     run: &RunId,
 ) -> Result<(), String> {
-    let keys = db.log_object_keys_of_run(run).await.map_err(|e| e.to_string())?;
+    let keys = db
+        .log_object_keys_of_run(run)
+        .await
+        .map_err(|e| e.to_string())?;
     for key in &keys {
         if let Err(e) = store.delete(key).await {
             tracing::warn!(run = %run.0, key = %key, error = %e, "retention: blob delete failed (will re-sweep)");
             return Err(format!("delete {key}: {e}"));
         }
     }
-    db.delete_log_index_of_run(run).await.map_err(|e| e.to_string())?;
+    db.delete_log_index_of_run(run)
+        .await
+        .map_err(|e| e.to_string())?;
     tracing::info!(run = %run.0, blobs = keys.len(), "retention: pruned run logs (metadata retained)");
     Ok(())
 }
@@ -129,7 +136,10 @@ pub async fn sweep_cas(
     owner: &str,
     cfg: GcConfig,
 ) -> Result<u32, String> {
-    let lease = db.lease(GC_LEASE, owner, GC_LEASE_TTL_MS).await.map_err(|e| e.to_string())?;
+    let lease = db
+        .lease(GC_LEASE, owner, GC_LEASE_TTL_MS)
+        .await
+        .map_err(|e| e.to_string())?;
     if lease.owner != owner {
         return Ok(0);
     }
@@ -163,7 +173,10 @@ pub async fn sweep_cas(
     // --- Sweep. --------------------------------------------------------
     let mut swept = 0u32;
     for prefix in ["trees/", "blobs/"] {
-        let objects = store.list_objects(prefix).await.map_err(|e| e.to_string())?;
+        let objects = store
+            .list_objects(prefix)
+            .await
+            .map_err(|e| e.to_string())?;
         for obj in objects {
             if marked.contains(&obj.key) {
                 continue;

@@ -35,7 +35,10 @@ async fn fake_forge_passes_the_port_contract() {
         r#ref: "refs/heads/main".into(),
         commit_sha: "cafe1234".into(),
         dir: ".scarab".into(),
-        known_file: (".scarab/ci.yaml".into(), b"on: {push: {}}\nsteps: []".to_vec()),
+        known_file: (
+            ".scarab/ci.yaml".into(),
+            b"on: {push: {}}\nsteps: []".to_vec(),
+        ),
         push_delivery,
     };
     assert_contract(&forge, &fx).await;

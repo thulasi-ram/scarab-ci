@@ -10,7 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Executor, LogChunks};
 use scarab_engine::{
-    AttemptId, Attempt, ExecError, RunId, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, ExecError, RunId, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 use scarab_server::{pump_log_stream, LogService, LogTailer};
 use scarab_testkit::{InMemoryDb, InMemoryObjectStore};
@@ -23,7 +23,11 @@ fn logs() -> Arc<LogService> {
 }
 
 fn stream() -> (RunId, StepId, AttemptId) {
-    (RunId("r".into()), StepId("build".into()), AttemptId("a1".into()))
+    (
+        RunId("r".into()),
+        StepId("build".into()),
+        AttemptId("a1".into()),
+    )
 }
 
 /// A mock log source: hands out queued chunks, then end-of-stream.
@@ -66,7 +70,7 @@ async fn pump_redacts_registered_secrets() {
     logs.register_secret(b"s3cr3t");
 
     let source = Box::new(MockChunks(VecDeque::from(vec![
-        b"token=s3cr3t done\n".to_vec(),
+        b"token=s3cr3t done\n".to_vec()
     ])));
     pump_log_stream(source, &logs, &run, &step, &attempt)
         .await
@@ -181,7 +185,11 @@ async fn tailer_dedups_per_fence() {
     // Second ensure, fence still claimed → deduped (no new log_stream open).
     tailer.ensure(&step);
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(exec.calls(), 1, "a fence already being tailed is not re-opened");
+    assert_eq!(
+        exec.calls(),
+        1,
+        "a fence already being tailed is not re-opened"
+    );
 
     // Release the parked tail; it drains its chunk into the pipeline.
     exec.open.notify_waiters();

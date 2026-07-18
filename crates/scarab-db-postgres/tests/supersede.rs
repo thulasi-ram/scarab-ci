@@ -24,7 +24,10 @@ fn spec() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
@@ -35,9 +38,15 @@ async fn seed_run(db: &PostgresDb, id: &str, created: i64, key: Option<&str>) ->
     if let Some(k) = key {
         db.set_supersede_key(&run, k).await.unwrap();
     }
-    db.create_step_run(&run, &StepId("build".into()), Some(&spec()), &[], Timestamp(created))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("build".into()),
+        Some(&spec()),
+        &[],
+        Timestamp(created),
+    )
+    .await
+    .unwrap();
     run
 }
 
@@ -62,12 +71,23 @@ async fn newer_run_supersedes_older_on_same_ref() {
 
     // Older starts first (nothing older to supersede).
     sched.admit(&older).await.unwrap();
-    assert_eq!(db.run_status(&older).await.unwrap(), Some(RunStatus::Running));
+    assert_eq!(
+        db.run_status(&older).await.unwrap(),
+        Some(RunStatus::Running)
+    );
 
     // Admitting the newer auto-cancels the older; only the newer is active.
     sched.admit(&newer).await.unwrap();
-    assert_eq!(db.run_status(&older).await.unwrap(), Some(RunStatus::Cancelled), "older superseded");
-    assert_eq!(db.run_status(&newer).await.unwrap(), Some(RunStatus::Running), "newer wins");
+    assert_eq!(
+        db.run_status(&older).await.unwrap(),
+        Some(RunStatus::Cancelled),
+        "older superseded"
+    );
+    assert_eq!(
+        db.run_status(&newer).await.unwrap(),
+        Some(RunStatus::Running),
+        "newer wins"
+    );
 
     tdb.cleanup().await;
 }
@@ -91,8 +111,15 @@ async fn different_refs_do_not_supersede() {
 
     sched.admit(&main).await.unwrap();
     sched.admit(&feat).await.unwrap();
-    assert_eq!(db.run_status(&main).await.unwrap(), Some(RunStatus::Running), "different ref untouched");
-    assert_eq!(db.run_status(&feat).await.unwrap(), Some(RunStatus::Running));
+    assert_eq!(
+        db.run_status(&main).await.unwrap(),
+        Some(RunStatus::Running),
+        "different ref untouched"
+    );
+    assert_eq!(
+        db.run_status(&feat).await.unwrap(),
+        Some(RunStatus::Running)
+    );
 
     tdb.cleanup().await;
 }
@@ -118,8 +145,15 @@ async fn deploy_pipelines_opt_out_of_auto_cancel() {
 
     sched.admit(&first).await.unwrap();
     sched.admit(&second).await.unwrap();
-    assert_eq!(db.run_status(&first).await.unwrap(), Some(RunStatus::Running), "deploy not superseded");
-    assert_eq!(db.run_status(&second).await.unwrap(), Some(RunStatus::Running));
+    assert_eq!(
+        db.run_status(&first).await.unwrap(),
+        Some(RunStatus::Running),
+        "deploy not superseded"
+    );
+    assert_eq!(
+        db.run_status(&second).await.unwrap(),
+        Some(RunStatus::Running)
+    );
 
     tdb.cleanup().await;
 }

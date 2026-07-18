@@ -20,7 +20,9 @@ use scarab_engine::{Clock, Db, Executor};
 use scarab_executor_k8s::{K8sExecutor, PlacementConfig, ResultsEgress};
 use scarab_executor_local::LocalExecutor;
 use scarab_server::config::{Cli, Config, ExecutorKind, StoreConfig};
-use scarab_server::{converged, router, AppState, LogService, SecretInjectingExecutor, SystemClock};
+use scarab_server::{
+    converged, router, AppState, LogService, SecretInjectingExecutor, SystemClock,
+};
 use scarab_storage::ObjectStore;
 use scarab_storage_s3::S3Storage;
 
@@ -35,7 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if std::env::var("SCARAB_LOG_FORMAT").as_deref() == Ok("text") {
             tracing_subscriber::fmt().with_env_filter(filter).init();
         } else {
-            tracing_subscriber::fmt().with_env_filter(filter).json().init();
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .json()
+                .init();
         }
     }
 
@@ -125,9 +130,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         key
     });
     let secrets: Arc<dyn scarab_secrets::SecretProvider> = {
-        let s =
-            scarab_secrets_postgres::PostgresSecrets::connect(&config.database_url, master_key)
-                .await?;
+        let s = scarab_secrets_postgres::PostgresSecrets::connect(&config.database_url, master_key)
+            .await?;
         s.migrate().await?;
         Arc::new(s)
     };
@@ -173,11 +177,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     oidc.signing_key_file
                 )
             })?;
-            let issuer =
-                scarab_server::oidc::Rs256Issuer::from_pem(oidc.issuer_url.clone(), &pem)
-                    .map_err(|e| {
-                        format!("invalid OIDC signing key {}: {e}", oidc.signing_key_file)
-                    })?;
+            let issuer = scarab_server::oidc::Rs256Issuer::from_pem(oidc.issuer_url.clone(), &pem)
+                .map_err(|e| format!("invalid OIDC signing key {}: {e}", oidc.signing_key_file))?;
             Some(Arc::new(issuer))
         }
         None => None,
@@ -187,14 +188,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `_forge` credential so a fresh DB (or a GitOps deploy) needs no reseed PUT.
     // Inline `SCARAB_GITHUB_APP_PEM` wins; a bad `..._FILE` path is a boot
     // failure (ADR-0048), mirroring the OIDC signing key above.
-    let github_app_pem: Option<String> =
-        match (&config.github_app_pem, &config.github_app_pem_file) {
-            (Some(pem), _) => Some(pem.clone()),
-            (None, Some(path)) => Some(std::fs::read_to_string(path).map_err(|e| {
-                format!("cannot read SCARAB_GITHUB_APP_PEM_FILE {path}: {e}")
-            })?),
-            (None, None) => None,
-        };
+    let github_app_pem: Option<String> = match (&config.github_app_pem, &config.github_app_pem_file)
+    {
+        (Some(pem), _) => Some(pem.clone()),
+        (None, Some(path)) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read SCARAB_GITHUB_APP_PEM_FILE {path}: {e}"))?,
+        ),
+        (None, None) => None,
+    };
 
     // Operator placement config (ADR-0055): the cluster baseline + named
     // PlacementProfile registry, one gitops-managed file. A bad path/parse is a
@@ -213,14 +215,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // resolves its repo through the ForgeConnection registry, constructs the
     // vendor adapter (GitHub App/token, Forgejo token) with credentials
     // fetched from SecretProvider at use-time, and caches it per connection.
-    let forge: Arc<dyn scarab_forge::ForgePort> = Arc::new(
-        scarab_server::forge_router::RegistryForge::new(
+    let forge: Arc<dyn scarab_forge::ForgePort> =
+        Arc::new(scarab_server::forge_router::RegistryForge::new(
             pg.clone(),
             secrets.clone(),
             config.github_app_id.clone(),
             github_app_pem.clone(),
-        ),
-    );
+        ));
     // Startup validation (ADR-0046): every registered connection's credential
     // handle must resolve. Missing material is a loud DEGRADED warning — the
     // connection cannot serve until the secret is registered. When a boot-time
@@ -228,8 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // connections, so an absent `_forge` secret there is expected — skip it.
     {
         use scarab_forge::ForgeConnectionStore;
-        let app_pem_overrides_github =
-            github_app_pem.is_some() && config.github_app_id.is_some();
+        let app_pem_overrides_github = github_app_pem.is_some() && config.github_app_id.is_some();
         match pg.list_connections().await {
             Ok(conns) => {
                 for conn in conns {
@@ -302,12 +302,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(executor) = executor {
             // Inject env-scoped secrets into deploy-run pods at launch
             // (ADR-0037).
-            let mut secret_exec = SecretInjectingExecutor::new(
-                executor,
-                db.clone(),
-                secrets.clone(),
-                logs.clone(),
-            );
+            let mut secret_exec =
+                SecretInjectingExecutor::new(executor, db.clone(), secrets.clone(), logs.clone());
             // Per-attempt OIDC federation tokens (ADR-0015), tmpfs-delivered.
             if let (Some(issuer), Some(oidc_cfg)) = (oidc_issuer.clone(), &config.oidc) {
                 secret_exec = secret_exec.with_oidc(
@@ -389,9 +385,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     exec.with_workspace_cas(workspace_cas.clone())
                         .with_placement(placement.clone()),
                 );
-                state = state
-                    .with_attacher(exec.clone())
-                    .with_debug_launcher(exec);
+                state = state.with_attacher(exec.clone()).with_debug_launcher(exec);
                 tracing::info!("debug shell: step-attach + debug-pod enabled (k8s exec)");
             }
             Err(e) => {
@@ -437,8 +431,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The embedded web UI (ADR-0054): served when the baked dist exists
     // (the production image sets SCARAB_UI_DIR); dev stays API-only.
-    let ui_dir = std::env::var("SCARAB_UI_DIR")
-        .unwrap_or_else(|_| "/usr/share/scarab/ui".into());
+    let ui_dir = std::env::var("SCARAB_UI_DIR").unwrap_or_else(|_| "/usr/share/scarab/ui".into());
     if std::path::Path::new(&ui_dir).join("index.html").is_file() {
         state = state.with_ui_dir(&ui_dir);
         tracing::info!(dir = %ui_dir, "web UI embedded (same-origin, ADR-0054)");
@@ -470,9 +463,8 @@ async fn shutdown_signal() {
     };
     #[cfg(unix)]
     let term = async {
-        let mut sig =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
+        let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
         sig.recv().await;
     };
     #[cfg(not(unix))]

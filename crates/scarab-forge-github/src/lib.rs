@@ -19,14 +19,19 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Verify a GitHub `X-Hub-Signature-256` header (`sha256=<hex>`) against the raw
 /// request `body` and the configured webhook `secret` (ADR-0032). Constant-time.
-pub fn verify_signature(secret: &[u8], body: &[u8], header: Option<&str>) -> Result<(), ForgeError> {
+pub fn verify_signature(
+    secret: &[u8],
+    body: &[u8],
+    header: Option<&str>,
+) -> Result<(), ForgeError> {
     let hex = header
         .and_then(|h| h.strip_prefix("sha256="))
         .ok_or(ForgeError::BadSignature)?;
     let provided = decode_hex(hex).ok_or(ForgeError::BadSignature)?;
     let mut mac = HmacSha256::new_from_slice(secret).map_err(|_| ForgeError::BadSignature)?;
     mac.update(body);
-    mac.verify_slice(&provided).map_err(|_| ForgeError::BadSignature)
+    mac.verify_slice(&provided)
+        .map_err(|_| ForgeError::BadSignature)
 }
 
 /// Compute the `sha256=<hex>` signature GitHub would send for `body` under
@@ -243,7 +248,9 @@ pub async fn apply_installation_sync(
     sync: &InstallationSync,
 ) -> Result<(), scarab_forge::RegistryError> {
     for repo in &sync.added {
-        store.bind_repo(connection_id, repo, org, &repo.name).await?;
+        store
+            .bind_repo(connection_id, repo, org, &repo.name)
+            .await?;
     }
     for repo in &sync.removed {
         store.unbind_repo(connection_id, repo).await?;
@@ -421,7 +428,9 @@ impl GithubForge {
     /// and mints/caches an installation access token.
     async fn auth_token_for(&self, repo: &RepoRef) -> Result<String, ForgeError> {
         let Auth::App { app, cache } = &self.auth else {
-            let Auth::Token(t) = &self.auth else { unreachable!() };
+            let Auth::Token(t) = &self.auth else {
+                unreachable!()
+            };
             return Ok(t.clone());
         };
 
@@ -460,7 +469,9 @@ impl GithubForge {
         };
 
         // Exchange the JWT for an installation access token (~1h).
-        let url = self.url(&format!("/app/installations/{installation_id}/access_tokens"));
+        let url = self.url(&format!(
+            "/app/installations/{installation_id}/access_tokens"
+        ));
         let resp = self.send(|| self.client.post(&url), &jwt).await?;
         let body: Value = ok_json(resp).await?;
         let token = body
@@ -509,15 +520,22 @@ fn next_link(headers: &reqwest::header::HeaderMap) -> Option<String> {
     let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
     link.split(',').find_map(|part| {
         let (url, rel) = part.split_once(';')?;
-        rel.contains("rel=\"next\"")
-            .then(|| url.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+        rel.contains("rel=\"next\"").then(|| {
+            url.trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string()
+        })
     })
 }
 
 /// Fail non-2xx with the response body in the error; parse JSON otherwise.
 async fn ok_json(resp: reqwest::Response) -> Result<Value, ForgeError> {
     let status = resp.status();
-    let text = resp.text().await.map_err(|e| ForgeError::Api(e.to_string()))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| ForgeError::Api(e.to_string()))?;
     if !status.is_success() {
         return Err(ForgeError::Api(format!("{status}: {text}")));
     }
@@ -527,10 +545,26 @@ async fn ok_json(resp: reqwest::Response) -> Result<Value, ForgeError> {
 /// Map GitHub's collaborator permission token to the agnostic flags.
 fn permissions_from_str(p: &str) -> Permissions {
     match p {
-        "admin" => Permissions { read: true, write: true, admin: true },
-        "write" | "maintain" => Permissions { read: true, write: true, admin: false },
-        "read" | "triage" => Permissions { read: true, write: false, admin: false },
-        _ => Permissions { read: false, write: false, admin: false },
+        "admin" => Permissions {
+            read: true,
+            write: true,
+            admin: true,
+        },
+        "write" | "maintain" => Permissions {
+            read: true,
+            write: true,
+            admin: false,
+        },
+        "read" | "triage" => Permissions {
+            read: true,
+            write: false,
+            admin: false,
+        },
+        _ => Permissions {
+            read: false,
+            write: false,
+            admin: false,
+        },
     }
 }
 
@@ -538,7 +572,10 @@ fn permissions_from_str(p: &str) -> Permissions {
 impl ForgePort for GithubForge {
     async fn latest_commit(&self, repo: &RepoRef, r#ref: &str) -> Result<Commit, ForgeError> {
         let token = self.auth_token_for(repo).await?;
-        let url = self.url(&format!("/repos/{}/{}/commits/{}", repo.owner, repo.name, r#ref));
+        let url = self.url(&format!(
+            "/repos/{}/{}/commits/{}",
+            repo.owner, repo.name, r#ref
+        ));
         let resp = self.send(|| self.client.get(&url), &token).await?;
         let body = ok_json(resp).await?;
         Ok(Commit {
@@ -571,12 +608,19 @@ impl ForgePort for GithubForge {
         // The raw media type returns file bytes directly (no base64 dance).
         let resp = self
             .send(
-                || self.client.get(&url).header("accept", "application/vnd.github.raw+json"),
+                || {
+                    self.client
+                        .get(&url)
+                        .header("accept", "application/vnd.github.raw+json")
+                },
                 &token,
             )
             .await?;
         let status = resp.status();
-        let bytes = resp.bytes().await.map_err(|e| ForgeError::Api(e.to_string()))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ForgeError::Api(e.to_string()))?;
         if !status.is_success() {
             return Err(ForgeError::Api(format!(
                 "{status}: {}",
@@ -615,7 +659,11 @@ impl ForgePort for GithubForge {
     /// installation event through its single App webhook — installing the App
     /// *is* webhook registration. Kept in the port because Forgejo needs it
     /// for real.
-    async fn register_webhook(&self, _repo: &RepoRef, _callback_url: &str) -> Result<(), ForgeError> {
+    async fn register_webhook(
+        &self,
+        _repo: &RepoRef,
+        _callback_url: &str,
+    ) -> Result<(), ForgeError> {
         Ok(())
     }
 
@@ -630,13 +678,18 @@ impl ForgePort for GithubForge {
         status: Status,
     ) -> Result<(), ForgeError> {
         let token = self.auth_token_for(repo).await?;
-        let url = self.url(&format!("/repos/{}/{}/statuses/{}", repo.owner, repo.name, commit.sha));
+        let url = self.url(&format!(
+            "/repos/{}/{}/statuses/{}",
+            repo.owner, repo.name, commit.sha
+        ));
         let body = serde_json::json!({
             "state": status.state.as_wire(),
             "context": status.context,
             "target_url": status.target_url,
         });
-        let resp = self.send(|| self.client.post(&url).json(&body), &token).await?;
+        let resp = self
+            .send(|| self.client.post(&url).json(&body), &token)
+            .await?;
         ok_json(resp).await.map(|_| ())
     }
 
@@ -659,7 +712,9 @@ impl ForgePort for GithubForge {
             "auto_merge": false,
             "required_contexts": [],
         });
-        let resp = self.send(|| self.client.post(&url).json(&body), &token).await?;
+        let resp = self
+            .send(|| self.client.post(&url).json(&body), &token)
+            .await?;
         ok_json(resp).await.map(|_| ())
     }
 
@@ -670,7 +725,9 @@ impl ForgePort for GithubForge {
             repo.owner, repo.name
         ));
         let payload = serde_json::json!({ "body": body });
-        let resp = self.send(|| self.client.post(&url).json(&payload), &token).await?;
+        let resp = self
+            .send(|| self.client.post(&url).json(&payload), &token)
+            .await?;
         ok_json(resp).await.map(|_| ())
     }
 
@@ -683,7 +740,9 @@ impl ForgePort for GithubForge {
         let resp = self.send(|| self.client.get(&url), &token).await?;
         let body = ok_json(resp).await?;
         Ok(permissions_from_str(
-            body.get("permission").and_then(Value::as_str).unwrap_or("none"),
+            body.get("permission")
+                .and_then(Value::as_str)
+                .unwrap_or("none"),
         ))
     }
 
@@ -715,10 +774,8 @@ impl ForgePort for GithubForge {
                     match cached {
                         Some(id) => id,
                         None => {
-                            let url = self.url(&format!(
-                                "/repos/{}/{}/installation",
-                                repo.owner, repo.name
-                            ));
+                            let url = self
+                                .url(&format!("/repos/{}/{}/installation", repo.owner, repo.name));
                             let resp = self.send(|| self.client.get(&url), &jwt).await?;
                             let body = ok_json(resp).await?;
                             body.get("id")
@@ -727,14 +784,17 @@ impl ForgePort for GithubForge {
                         }
                     }
                 };
-                let url =
-                    self.url(&format!("/app/installations/{installation_id}/access_tokens"));
+                let url = self.url(&format!(
+                    "/app/installations/{installation_id}/access_tokens"
+                ));
                 let body = serde_json::json!({
                     "repositories": [repo.name],
                     // A checkout only reads — never request write (see doc above).
                     "permissions": { "contents": "read" },
                 });
-                let resp = self.send(|| self.client.post(&url).json(&body), &jwt).await?;
+                let resp = self
+                    .send(|| self.client.post(&url).json(&body), &jwt)
+                    .await?;
                 ok_json(resp)
                     .await?
                     .get("token")
@@ -781,14 +841,14 @@ impl ForgePort for GithubForge {
                     match cached {
                         Some(id) => id,
                         None => {
-                            let url = self.url(&format!(
-                                "/repos/{}/{}/installation",
-                                repo.owner, repo.name
-                            ));
+                            let url = self
+                                .url(&format!("/repos/{}/{}/installation", repo.owner, repo.name));
                             let Ok(resp) = self.send(|| self.client.get(&url), &jwt).await else {
                                 return Ok(None);
                             };
-                            let Ok(body) = ok_json(resp).await else { return Ok(None) };
+                            let Ok(body) = ok_json(resp).await else {
+                                return Ok(None);
+                            };
                             match body.get("id").and_then(Value::as_u64) {
                                 Some(id) => id,
                                 None => return Ok(None),
@@ -796,17 +856,19 @@ impl ForgePort for GithubForge {
                         }
                     }
                 };
-                let url =
-                    self.url(&format!("/app/installations/{installation_id}/access_tokens"));
+                let url = self.url(&format!(
+                    "/app/installations/{installation_id}/access_tokens"
+                ));
                 let body = serde_json::json!({
                     "repositories": [repo.name],
                     "permissions": { "packages": "write" },
                 });
-                let Ok(resp) = self.send(|| self.client.post(&url).json(&body), &jwt).await
-                else {
+                let Ok(resp) = self.send(|| self.client.post(&url).json(&body), &jwt).await else {
                     return Ok(None);
                 };
-                let Ok(json) = ok_json(resp).await else { return Ok(None) };
+                let Ok(json) = ok_json(resp).await else {
+                    return Ok(None);
+                };
                 match json.get("token").and_then(Value::as_str) {
                     Some(t) => t.to_string(),
                     None => return Ok(None),
@@ -862,7 +924,10 @@ mod tests {
         assert_eq!(
             normalize(&delivery("push", base("refs/heads/main"))).unwrap(),
             Event::Push {
-                repo: RepoRef { owner: "acme".into(), name: "app".into() },
+                repo: RepoRef {
+                    owner: "acme".into(),
+                    name: "app".into()
+                },
                 r#ref: "refs/heads/main".into(),
                 after: "abc123".into(),
             }
@@ -871,7 +936,10 @@ mod tests {
         assert_eq!(
             normalize(&delivery("push", base("refs/tags/v1.2.3"))).unwrap(),
             Event::Tag {
-                repo: RepoRef { owner: "acme".into(), name: "app".into() },
+                repo: RepoRef {
+                    owner: "acme".into(),
+                    name: "app".into()
+                },
                 tag: "v1.2.3".into(),
             }
         );
@@ -890,7 +958,10 @@ mod tests {
         assert_eq!(
             normalize(&delivery("pull_request", internal)).unwrap(),
             Event::PullRequest {
-                repo: RepoRef { owner: "acme".into(), name: "app".into() },
+                repo: RepoRef {
+                    owner: "acme".into(),
+                    name: "app".into()
+                },
                 number: 42,
                 head: "feedface".into(),
                 fork: false,
@@ -967,8 +1038,14 @@ mod tests {
                 installation_id: 77,
                 account: "acme".into(),
                 added: vec![
-                    RepoRef { owner: "acme".into(), name: "web".into() },
-                    RepoRef { owner: "acme".into(), name: "api".into() },
+                    RepoRef {
+                        owner: "acme".into(),
+                        name: "web".into()
+                    },
+                    RepoRef {
+                        owner: "acme".into(),
+                        name: "api".into()
+                    },
                 ],
                 removed: vec![],
             }
@@ -985,8 +1062,20 @@ mod tests {
             }),
         );
         let sync = installation_sync(&delta).unwrap();
-        assert_eq!(sync.added, vec![RepoRef { owner: "acme".into(), name: "new".into() }]);
-        assert_eq!(sync.removed, vec![RepoRef { owner: "acme".into(), name: "api".into() }]);
+        assert_eq!(
+            sync.added,
+            vec![RepoRef {
+                owner: "acme".into(),
+                name: "new".into()
+            }]
+        );
+        assert_eq!(
+            sync.removed,
+            vec![RepoRef {
+                owner: "acme".into(),
+                name: "api".into()
+            }]
+        );
 
         // Uninstall removes its repos.
         let deleted = delivery(
@@ -1033,7 +1122,9 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             reqwest::header::LINK,
-            "<https://api.github.com/x?page=1>; rel=\"prev\"".parse().unwrap(),
+            "<https://api.github.com/x?page=1>; rel=\"prev\""
+                .parse()
+                .unwrap(),
         );
         assert_eq!(next_link(&headers), None);
         assert_eq!(next_link(&reqwest::header::HeaderMap::new()), None);
@@ -1047,7 +1138,10 @@ mod tests {
         ));
         // A push missing its repository is malformed, not a panic.
         assert!(matches!(
-            normalize(&delivery("push", json!({ "ref": "refs/heads/main", "after": "x" }))),
+            normalize(&delivery(
+                "push",
+                json!({ "ref": "refs/heads/main", "after": "x" })
+            )),
             Err(ForgeError::Malformed(_))
         ));
     }

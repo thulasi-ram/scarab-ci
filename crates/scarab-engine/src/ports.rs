@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Attempt, AttemptId, ConcurrencyPolicy, DbError, EventKind, ExecError, FailureKind,
-    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun,
-    StepSpec, StepStatus, Timestamp,
+    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec,
+    StepStatus, Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -245,12 +245,7 @@ pub trait Db: Send + Sync {
     /// Stamp the run's owning tenant `(org, project)` (ADR-0049): resolved
     /// from the trigger's repo at creation; untenanted runs (inline dev
     /// submissions) never call this and stay visible to global roles only.
-    async fn set_run_tenant(
-        &self,
-        run: &RunId,
-        org: &str,
-        project: &str,
-    ) -> Result<(), DbError>;
+    async fn set_run_tenant(&self, run: &RunId, org: &str, project: &str) -> Result<(), DbError>;
 
     /// The run's owning tenant, if stamped.
     async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError>;
@@ -274,8 +269,7 @@ pub trait Db: Send + Sync {
 
     /// The wait (seconds) of a `timer` gate, or `None` if the step is not a timer
     /// gate (or is unknown). Read at admission to decide auto-release.
-    async fn gate_timer_seconds(&self, run: &RunId, step: &StepId)
-        -> Result<Option<i64>, DbError>;
+    async fn gate_timer_seconds(&self, run: &RunId, step: &StepId) -> Result<Option<i64>, DbError>;
 
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;
@@ -354,11 +348,7 @@ pub trait Db: Send + Sync {
 
     /// All attempts of a step, in start order — the retry loop's budget source
     /// (ADR-0047: every retry consumes the attempt budget).
-    async fn attempts_of_step(
-        &self,
-        run: &RunId,
-        step: &StepId,
-    ) -> Result<Vec<Attempt>, DbError>;
+    async fn attempts_of_step(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError>;
 
     /// Record the executor handle an attempt was launched with — the durable
     /// "launch happened" marker (ADR-0047). Its presence turns a later missing
@@ -432,11 +422,8 @@ pub trait Db: Send + Sync {
     /// `cutoff` — the retention sweeper's work list (ADR-0050). Lifecycle-keyed
     /// by contract: a non-terminal run (including one suspended on a gate for
     /// weeks) is NEVER returned, regardless of age.
-    async fn prunable_log_runs(
-        &self,
-        cutoff: Timestamp,
-        limit: u32,
-    ) -> Result<Vec<RunId>, DbError>;
+    async fn prunable_log_runs(&self, cutoff: Timestamp, limit: u32)
+        -> Result<Vec<RunId>, DbError>;
 
     /// Every log-chunk object key a run holds (across steps/attempts) — what
     /// the sweeper deletes from the object store before dropping the index.
@@ -481,20 +468,12 @@ pub trait Db: Send + Sync {
     /// of every step of every non-terminal run, plus terminal runs that
     /// settled at/after `terminal_cutoff`. A gate-suspended run is
     /// non-terminal, so its roots are ALWAYS marked, regardless of age.
-    async fn gc_workspace_roots(
-        &self,
-        terminal_cutoff: Timestamp,
-    ) -> Result<Vec<String>, DbError>;
+    async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError>;
 
     /// Acquire (or renew) a time-bounded lease over a named `resource` (a step
     /// id, `"scheduler"` leadership, …) for `owner`. Only an expired lease is
     /// taken over; the returned [`Lease`] names the current holder.
-    async fn lease(
-        &self,
-        resource: &str,
-        owner: &str,
-        ttl_ms: i64,
-    ) -> Result<Lease, DbError>;
+    async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError>;
 }
 
 /// A best-effort **live tail** of a running unit's combined stdout/stderr, pulled
@@ -557,10 +536,7 @@ pub trait Executor: Send + Sync {
     /// The **artifacts** a finished execution published to `/scarab/artifacts/`
     /// (ADR-0052): collected post-step by the backend, blobs already in the
     /// object store; the orchestrator persists the metadata. Default empty.
-    async fn artifacts(
-        &self,
-        _handle: &ExecHandle,
-    ) -> Result<Vec<crate::ArtifactMeta>, ExecError> {
+    async fn artifacts(&self, _handle: &ExecHandle) -> Result<Vec<crate::ArtifactMeta>, ExecError> {
         Ok(Vec::new())
     }
 

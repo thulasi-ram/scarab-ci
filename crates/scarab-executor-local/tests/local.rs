@@ -25,7 +25,10 @@ fn spec(cmd: &[&str]) -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
@@ -46,7 +49,10 @@ async fn drive(exec: &LocalExecutor, handle: &scarab_engine::ports::ExecHandle) 
 async fn zero_exit_command_succeeds() {
     let exec = LocalExecutor::new();
     let s = step("r1", "ok");
-    let handle = exec.launch(&s, &spec(&["sh", "-c", "exit 0"])).await.unwrap();
+    let handle = exec
+        .launch(&s, &spec(&["sh", "-c", "exit 0"]))
+        .await
+        .unwrap();
     assert_eq!(drive(&exec, &handle).await, ExecState::Succeeded);
 }
 
@@ -54,7 +60,10 @@ async fn zero_exit_command_succeeds() {
 async fn nonzero_exit_command_fails_with_its_code() {
     let exec = LocalExecutor::new();
     let s = step("r1", "boom");
-    let handle = exec.launch(&s, &spec(&["sh", "-c", "exit 3"])).await.unwrap();
+    let handle = exec
+        .launch(&s, &spec(&["sh", "-c", "exit 3"]))
+        .await
+        .unwrap();
     // A non-zero exit is the step's own verdict: class Step (ADR-0047).
     assert_eq!(
         drive(&exec, &handle).await,
@@ -79,7 +88,9 @@ async fn signal_kill_is_post_start_infra() {
         drive(&exec, &handle).await,
         ExecState::Failed {
             exit_code: None,
-            class: FailureClass::Infra { never_started: false },
+            class: FailureClass::Infra {
+                never_started: false
+            },
         }
     );
 }
@@ -88,10 +99,16 @@ async fn signal_kill_is_post_start_infra() {
 async fn relaunching_the_same_fence_reattaches() {
     let exec = LocalExecutor::new();
     let s = step("r1", "once");
-    let h1 = exec.launch(&s, &spec(&["sh", "-c", "exit 0"])).await.unwrap();
+    let h1 = exec
+        .launch(&s, &spec(&["sh", "-c", "exit 0"]))
+        .await
+        .unwrap();
     // A second launch of the same fence returns the same handle and does not
     // start a second process (idempotent re-attach).
-    let h2 = exec.launch(&s, &spec(&["sh", "-c", "exit 0"])).await.unwrap();
+    let h2 = exec
+        .launch(&s, &spec(&["sh", "-c", "exit 0"]))
+        .await
+        .unwrap();
     assert_eq!(h1, h2);
     assert_eq!(drive(&exec, &h1).await, ExecState::Succeeded);
 }
@@ -100,7 +117,10 @@ async fn relaunching_the_same_fence_reattaches() {
 async fn a_command_is_required() {
     let exec = LocalExecutor::new();
     let s = step("r1", "nocmd");
-    assert!(exec.launch(&s, &spec(&[])).await.is_err(), "no command → launch error");
+    assert!(
+        exec.launch(&s, &spec(&[])).await.is_err(),
+        "no command → launch error"
+    );
 }
 
 #[tokio::test]
@@ -134,12 +154,18 @@ async fn kill_timer_times_out_a_hung_step() {
 async fn cancel_kills_a_running_child() {
     let exec = LocalExecutor::new();
     let s = step("r1", "sleeper");
-    let handle = exec.launch(&s, &spec(&["sh", "-c", "sleep 30"])).await.unwrap();
+    let handle = exec
+        .launch(&s, &spec(&["sh", "-c", "sleep 30"]))
+        .await
+        .unwrap();
     // It's running...
     assert_eq!(exec.poll(&handle).await.unwrap(), ExecState::Running);
     exec.cancel(&handle).await.unwrap();
     // ...and after cancel it is terminal (not Running).
-    assert!(matches!(exec.poll(&handle).await.unwrap(), ExecState::Failed { .. }));
+    assert!(matches!(
+        exec.poll(&handle).await.unwrap(),
+        ExecState::Failed { .. }
+    ));
 }
 
 /// ADR-0041: a step writes `$SCARAB_RESULTS/<name>.json`, and the executor reads
@@ -163,8 +189,15 @@ async fn named_results_are_read_back_from_the_results_dir() {
     assert_eq!(drive(&exec, &handle).await, ExecState::Succeeded);
 
     let results = exec.results(&handle).await.unwrap();
-    assert_eq!(results.get("url").unwrap(), &serde_json::json!("https://svc"));
-    assert_eq!(results.get("replicas").unwrap(), &serde_json::json!(3), "int type preserved");
+    assert_eq!(
+        results.get("url").unwrap(),
+        &serde_json::json!("https://svc")
+    );
+    assert_eq!(
+        results.get("replicas").unwrap(),
+        &serde_json::json!(3),
+        "int type preserved"
+    );
 }
 
 /// A step that emits nothing yields an empty result map (not an error).
@@ -172,7 +205,10 @@ async fn named_results_are_read_back_from_the_results_dir() {
 async fn no_results_emitted_is_an_empty_map() {
     let exec = LocalExecutor::new();
     let s = step("r1", "silent");
-    let handle = exec.launch(&s, &spec(&["sh", "-c", "exit 0"])).await.unwrap();
+    let handle = exec
+        .launch(&s, &spec(&["sh", "-c", "exit 0"]))
+        .await
+        .unwrap();
     assert_eq!(drive(&exec, &handle).await, ExecState::Succeeded);
     assert!(exec.results(&handle).await.unwrap().is_empty());
 }

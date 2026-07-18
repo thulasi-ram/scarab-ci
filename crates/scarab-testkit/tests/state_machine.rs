@@ -28,14 +28,18 @@ async fn run_happy_path_records_each_transition_once() {
     db.append_event(&created).await.unwrap();
 
     clock.advance(10);
-    let ev = run.transition(RunStatus::Running, clock.now().await).unwrap();
+    let ev = run
+        .transition(RunStatus::Running, clock.now().await)
+        .unwrap();
     db.record_transition(&run.id, RunStatus::Pending, RunStatus::Running)
         .await
         .unwrap();
     db.append_event(&ev).await.unwrap();
 
     clock.advance(10);
-    let ev = run.transition(RunStatus::Succeeded, clock.now().await).unwrap();
+    let ev = run
+        .transition(RunStatus::Succeeded, clock.now().await)
+        .unwrap();
     db.record_transition(&run.id, RunStatus::Running, RunStatus::Succeeded)
         .await
         .unwrap();
@@ -83,7 +87,10 @@ fn step_happy_path_single_attempt() {
         .unwrap();
     assert_eq!(step.status, StepStatus::Running);
     assert_eq!(step.attempt_count(), 1);
-    assert!(matches!(started[1].kind, EventPayload::AttemptStarted { .. }));
+    assert!(matches!(
+        started[1].kind,
+        EventPayload::AttemptStarted { .. }
+    ));
 
     let finished = step.finish_attempt(None, 3, at).unwrap();
     assert_eq!(step.status, StepStatus::Succeeded);
@@ -150,8 +157,14 @@ fn forward_progress_poison_step_is_bounded() {
     for i in 1..=MAX {
         step.start_attempt(scarab_engine::AttemptId(format!("a{i}")), at)
             .unwrap();
-        step.finish_attempt(Some(FailureKind::Infra { never_started: true }), MAX, at)
-            .unwrap();
+        step.finish_attempt(
+            Some(FailureKind::Infra {
+                never_started: true,
+            }),
+            MAX,
+            at,
+        )
+        .unwrap();
         if i < MAX {
             // Attempts remain: re-armed for another try.
             assert_eq!(step.status, StepStatus::Ready);
@@ -185,7 +198,9 @@ fn step_failure_is_not_retried() {
 fn timeout_and_post_start_infra_are_not_auto_retried() {
     for failure in [
         FailureKind::Timeout,
-        FailureKind::Infra { never_started: false },
+        FailureKind::Infra {
+            never_started: false,
+        },
     ] {
         let mut step = StepRun::new(run_id(), StepId("effectful".into()));
         let at = scarab_engine::Timestamp(0);

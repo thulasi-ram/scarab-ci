@@ -56,13 +56,23 @@ async fn run_start_and_success_post_pending_then_success() {
     let exec = FakeExecutor::new();
     exec.script_outcome(ExecState::Succeeded);
     drive(&db, &clock, &exec, &run).await;
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
 
     // Drain status notifications to the forge: Running -> pending, then
     // Succeeded -> success, in order.
-    let posted = drain_forge_statuses(forge.as_ref(), &db, "drainer", 32, 30_000, "http://scarab.test")
-        .await
-        .unwrap();
+    let posted = drain_forge_statuses(
+        forge.as_ref(),
+        &db,
+        "drainer",
+        32,
+        30_000,
+        "http://scarab.test",
+    )
+    .await
+    .unwrap();
     assert_eq!(posted, 2);
     let states: Vec<StatusState> = forge.statuses().iter().map(|s| s.state).collect();
     assert_eq!(states, vec![StatusState::Pending, StatusState::Success]);
@@ -78,9 +88,16 @@ async fn run_start_and_success_post_pending_then_success() {
     );
 
     // Redraining is a no-op — dispatched messages are not re-posted (idempotent).
-    let again = drain_forge_statuses(forge.as_ref(), &db, "drainer", 32, 30_000, "http://scarab.test")
-        .await
-        .unwrap();
+    let again = drain_forge_statuses(
+        forge.as_ref(),
+        &db,
+        "drainer",
+        32,
+        30_000,
+        "http://scarab.test",
+    )
+    .await
+    .unwrap();
     assert_eq!(again, 0);
     assert_eq!(forge.statuses().len(), 2, "no duplicate posts");
 }
@@ -107,9 +124,16 @@ async fn run_failure_posts_failure_status() {
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(steps[0].status, StepStatus::Failed);
 
-    drain_forge_statuses(forge.as_ref(), &db, "drainer", 32, 30_000, "http://scarab.test")
-        .await
-        .unwrap();
+    drain_forge_statuses(
+        forge.as_ref(),
+        &db,
+        "drainer",
+        32,
+        30_000,
+        "http://scarab.test",
+    )
+    .await
+    .unwrap();
     let states: Vec<StatusState> = forge.statuses().iter().map(|s| s.state).collect();
     assert_eq!(states, vec![StatusState::Pending, StatusState::Failure]);
 }
@@ -137,7 +161,10 @@ async fn rejected_status_posts_are_retried_then_dead_lettered_not_silently_dropp
     let exec = FakeExecutor::new();
     exec.script_outcome(ExecState::Succeeded);
     drive(&db, &clock, &exec, &run).await;
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
 
     // visibility_ms = 0 makes each claimed-but-unposted message immediately
     // reclaimable, so repeated drains accumulate failures on the same messages.
@@ -148,7 +175,10 @@ async fn rejected_status_posts_are_retried_then_dead_lettered_not_silently_dropp
                 .unwrap();
         assert_eq!(posted, 0, "a rejected post is never counted as posted");
     }
-    assert!(forge.statuses().is_empty(), "no status ever landed on the forge");
+    assert!(
+        forge.statuses().is_empty(),
+        "no status ever landed on the forge"
+    );
 
     // After MAX_DELIVERY_ATTEMPTS failed deliveries the status messages are
     // dead-lettered (poison), so they drop out of the outbox and a further drain

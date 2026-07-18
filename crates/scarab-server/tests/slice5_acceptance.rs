@@ -12,7 +12,9 @@ use std::sync::Arc;
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Db, RunId, StepId, StepRun};
-use scarab_executor_k8s::{build_pod, image_artifact, DEFAULT_CLONE_IMAGE, DEFAULT_STEP_TIMEOUT_SECS};
+use scarab_executor_k8s::{
+    build_pod, image_artifact, DEFAULT_CLONE_IMAGE, DEFAULT_STEP_TIMEOUT_SECS,
+};
 use scarab_identity::{Claims, OidcIssuer};
 use scarab_secrets::{Secret, SecretProvider, SecretScope};
 use scarab_secrets_postgres::PostgresSecrets;
@@ -57,22 +59,39 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
     let db: Arc<dyn Db> = pg.clone();
     let logs = LogService::new(Arc::new(InMemoryObjectStore::new()), db);
 
-    let env = resolve_step_secrets(&secrets, &logs, &scope(), &["DEPLOY_TOKEN".to_string()], false)
-        .await
-        .unwrap();
-    assert_eq!(env, vec![("DEPLOY_TOKEN".to_string(), "prod-token-xyz".to_string())]);
+    let env = resolve_step_secrets(
+        &secrets,
+        &logs,
+        &scope(),
+        &["DEPLOY_TOKEN".to_string()],
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        env,
+        vec![("DEPLOY_TOKEN".to_string(), "prod-token-xyz".to_string())]
+    );
 
     let (run, step, attempt) = (
         RunId("run-1".into()),
         StepId("deploy".into()),
         scarab_engine::AttemptId("a1".into()),
     );
-    logs.append(&run, &step, &attempt, b"deploying with DEPLOY_TOKEN=prod-token-xyz\n")
-        .await
-        .unwrap();
+    logs.append(
+        &run,
+        &step,
+        &attempt,
+        b"deploying with DEPLOY_TOKEN=prod-token-xyz\n",
+    )
+    .await
+    .unwrap();
     let stored = logs.read_all(&run, &step, &attempt).await.unwrap();
     let stored = String::from_utf8_lossy(&stored);
-    assert!(!stored.contains("prod-token-xyz"), "secret leaked into logs: {stored}");
+    assert!(
+        !stored.contains("prod-token-xyz"),
+        "secret leaked into logs: {stored}"
+    );
     assert!(stored.contains("DEPLOY_TOKEN=***"));
 
     // --- 2. A run-scoped OIDC token verifies against the JWKS. ---
@@ -95,7 +114,10 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         jwks["keys"][0]["e"].as_str().unwrap(),
     );
     let verified = verify(&token.0, n, e, AUD).expect("run token verifies against JWKS");
-    assert_eq!(verified["sub"], "scarab:org/acme/repo/app/env/prod/ref/refs/heads/main");
+    assert_eq!(
+        verified["sub"],
+        "scarab:org/acme/repo/app/env/prod/ref/refs/heads/main"
+    );
     assert_eq!(verified["run_id"], "run-1");
 
     // --- 3. A build step compiles to a rootless-BuildKit Pod + records a digest. ---
@@ -120,7 +142,10 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         clone: None,
         build: Some(build.clone()),
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     };
     let pod = build_pod(
         "scarab-image",
@@ -134,7 +159,10 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
     );
     let container = &pod.spec.as_ref().unwrap().containers[0];
     assert_eq!(container.image.as_deref(), Some("moby/buildkit:rootless"));
-    assert_eq!(container.security_context.as_ref().unwrap().privileged, Some(false));
+    assert_eq!(
+        container.security_context.as_ref().unwrap().privileged,
+        Some(false)
+    );
 
     let artifact = image_artifact(&build, "sha256:deadbeef");
     assert_eq!(artifact.image, "registry.example/app:1.0");

@@ -94,7 +94,11 @@ pub struct WebhookDelivery {
 /// admission, UI — speaks only this vocabulary, never a vendor's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
-    Push { repo: RepoRef, r#ref: String, after: String },
+    Push {
+        repo: RepoRef,
+        r#ref: String,
+        after: String,
+    },
     PullRequest {
         repo: RepoRef,
         number: u64,
@@ -104,10 +108,22 @@ pub enum Event {
         /// downgraded OIDC subject.
         fork: bool,
     },
-    Tag { repo: RepoRef, tag: String },
-    Release { repo: RepoRef, tag: String },
-    Comment { repo: RepoRef, issue: u64, body: String },
-    Cron { schedule: String },
+    Tag {
+        repo: RepoRef,
+        tag: String,
+    },
+    Release {
+        repo: RepoRef,
+        tag: String,
+    },
+    Comment {
+        repo: RepoRef,
+        issue: u64,
+        body: String,
+    },
+    Cron {
+        schedule: String,
+    },
     /// A human dispatch of a named pipeline at a repo + ref (ADR-0043 "World B").
     /// Unlike a webhook event, the target is chosen by the launcher, so the event
     /// carries the `repo`, the dispatch `ref`, and the resolved commit explicitly —
@@ -116,12 +132,25 @@ pub enum Event {
     /// **symbolic** dispatch ref (e.g. `refs/heads/main`), used for Environment
     /// `allowed_refs` matching (ADR-0037); `sha` is the **resolved commit** the
     /// config is read/pinned at (ADR-0032).
-    Manual { actor: String, repo: RepoRef, r#ref: String, sha: String },
+    Manual {
+        actor: String,
+        repo: RepoRef,
+        r#ref: String,
+        sha: String,
+    },
     /// Started programmatically via the REST API (CLI / third party), as opposed
     /// to a human [`Manual`](Event::Manual) trigger. Repo + ref-aware for the same
     /// reason (ADR-0043); `ref` is symbolic, `sha` is the resolved commit.
-    Api { actor: String, repo: RepoRef, r#ref: String, sha: String },
-    Upstream { repo: RepoRef, run: String },
+    Api {
+        actor: String,
+        repo: RepoRef,
+        r#ref: String,
+        sha: String,
+    },
+    Upstream {
+        repo: RepoRef,
+        run: String,
+    },
 }
 
 /// The canonical trigger vocabulary (`on:` in a pipeline). A pipeline's triggers
@@ -189,9 +218,7 @@ impl Event {
     pub fn protection_ref(&self) -> Option<String> {
         match self {
             Event::Push { r#ref, .. } => Some(r#ref.clone()),
-            Event::Tag { tag, .. } | Event::Release { tag, .. } => {
-                Some(format!("refs/tags/{tag}"))
-            }
+            Event::Tag { tag, .. } | Event::Release { tag, .. } => Some(format!("refs/tags/{tag}")),
             // A PR's protection ref is its head ref — deliberately NOT a branch
             // ref, so a PR is denied a branch-scoped Environment unless the env
             // explicitly opts PRs in via `refs/pull/*` (the intended fail-safe).
@@ -242,7 +269,9 @@ impl Event {
                 e.insert("tag".into(), json!(tag));
                 e.insert("ref".into(), json!(format!("refs/tags/{tag}")));
             }
-            Event::PullRequest { number, head, fork, .. } => {
+            Event::PullRequest {
+                number, head, fork, ..
+            } => {
                 e.insert("number".into(), json!(number));
                 e.insert("sha".into(), json!(head));
                 e.insert("fork".into(), json!(fork));
@@ -257,8 +286,12 @@ impl Event {
             Event::Cron { schedule } => {
                 e.insert("schedule".into(), json!(schedule));
             }
-            Event::Manual { actor, r#ref, sha, .. }
-            | Event::Api { actor, r#ref, sha, .. } => {
+            Event::Manual {
+                actor, r#ref, sha, ..
+            }
+            | Event::Api {
+                actor, r#ref, sha, ..
+            } => {
                 e.insert("actor".into(), json!(actor));
                 // Exposed like push's (ADR-0043): `ref` is the symbolic dispatch
                 // ref, `branch` its short form, and `sha` the resolved commit the
@@ -365,7 +398,12 @@ pub trait ForgePort: Send + Sync {
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError>;
 
-    async fn set_status(&self, repo: &RepoRef, commit: &Commit, status: Status) -> Result<(), ForgeError>;
+    async fn set_status(
+        &self,
+        repo: &RepoRef,
+        commit: &Commit,
+        status: Status,
+    ) -> Result<(), ForgeError>;
 
     async fn create_deployment(&self, repo: &RepoRef, environment: &str) -> Result<(), ForgeError>;
 
@@ -496,8 +534,7 @@ pub trait ForgeConnectionStore: Send + Sync {
     ) -> Result<(), RegistryError>;
 
     /// Remove a repo binding. Idempotent.
-    async fn unbind_repo(&self, connection_id: &str, repo: &RepoRef)
-        -> Result<(), RegistryError>;
+    async fn unbind_repo(&self, connection_id: &str, repo: &RepoRef) -> Result<(), RegistryError>;
 
     /// The repos a connection owns.
     async fn repos_of(&self, connection_id: &str) -> Result<Vec<RepoRef>, RegistryError>;
@@ -551,7 +588,10 @@ pub mod contract {
             .latest_commit(&fx.repo, &fx.r#ref)
             .await
             .expect("latest_commit resolves the ref");
-        assert_eq!(commit.sha, fx.commit_sha, "ref resolves to the expected commit");
+        assert_eq!(
+            commit.sha, fx.commit_sha,
+            "ref resolves to the expected commit"
+        );
 
         // Capability: read a file at a ref.
         let bytes = port
@@ -576,7 +616,11 @@ pub mod contract {
             .normalize_event(fx.push_delivery.clone())
             .await
             .expect("normalize_event handles a push delivery");
-        assert_eq!(event.trigger_kind(), TriggerKind::Push, "normalizes to push");
+        assert_eq!(
+            event.trigger_kind(),
+            TriggerKind::Push,
+            "normalizes to push"
+        );
         assert_eq!(event.repo(), Some(&fx.repo), "event carries the RepoRef");
 
         // Capability: post a status — the run deep-link is REQUIRED.
@@ -605,8 +649,14 @@ pub mod contract {
             .expect("mint_checkout_credential");
         assert!(!cred.token.is_empty(), "credential carries a secret");
         assert!(!cred.username.is_empty(), "credential carries a username");
-        assert!(cred.read_only, "read_only: true must be honored, never widened");
-        assert!(cred.expires_at > 0, "credential carries an expiry (short TTL)");
+        assert!(
+            cred.read_only,
+            "read_only: true must be honored, never widened"
+        );
+        assert!(
+            cred.expires_at > 0,
+            "credential carries an expiry (short TTL)"
+        );
     }
 }
 
@@ -807,33 +857,59 @@ mod tests {
         );
         // Tag/Release synthesize a `refs/tags/*` ref.
         assert_eq!(
-            Event::Tag { repo: repo(), tag: "v1".into() }
-                .protection_ref()
-                .as_deref(),
+            Event::Tag {
+                repo: repo(),
+                tag: "v1".into()
+            }
+            .protection_ref()
+            .as_deref(),
             Some("refs/tags/v1"),
         );
         assert_eq!(
-            Event::Release { repo: repo(), tag: "v2".into() }
-                .protection_ref()
-                .as_deref(),
+            Event::Release {
+                repo: repo(),
+                tag: "v2".into()
+            }
+            .protection_ref()
+            .as_deref(),
             Some("refs/tags/v2"),
         );
         // A PR's protection ref is its pull ref — never a branch ref, so a PR is
         // fenced out of a branch-scoped Environment (the fail-safe).
         assert_eq!(
-            Event::PullRequest { repo: repo(), number: 7, head: "cafe".into(), fork: false }
-                .protection_ref()
-                .as_deref(),
+            Event::PullRequest {
+                repo: repo(),
+                number: 7,
+                head: "cafe".into(),
+                fork: false
+            }
+            .protection_ref()
+            .as_deref(),
             Some("refs/pull/7/head"),
         );
         // Refless events → None (fail-closed: only an empty allowed_refs admits).
-        assert_eq!(Event::Cron { schedule: "@daily".into() }.protection_ref(), None);
         assert_eq!(
-            Event::Comment { repo: repo(), issue: 1, body: "/deploy".into() }.protection_ref(),
+            Event::Cron {
+                schedule: "@daily".into()
+            }
+            .protection_ref(),
+            None
+        );
+        assert_eq!(
+            Event::Comment {
+                repo: repo(),
+                issue: 1,
+                body: "/deploy".into()
+            }
+            .protection_ref(),
             None,
         );
         assert_eq!(
-            Event::Upstream { repo: repo(), run: "r1".into() }.protection_ref(),
+            Event::Upstream {
+                repo: repo(),
+                run: "r1".into()
+            }
+            .protection_ref(),
             None,
         );
     }

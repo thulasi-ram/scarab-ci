@@ -51,7 +51,9 @@ async fn store_fetch_ciphertext_at_rest_and_scoping() {
     let ciphertext: Vec<u8> = row.get("ciphertext");
     assert_ne!(ciphertext, plaintext);
     assert!(
-        !ciphertext.windows(plaintext.len()).any(|w| w == &plaintext[..]),
+        !ciphertext
+            .windows(plaintext.len())
+            .any(|w| w == &plaintext[..]),
         "plaintext must not appear at rest"
     );
 
@@ -66,7 +68,11 @@ async fn store_fetch_ciphertext_at_rest_and_scoping() {
         secrets.list_scoped(&repo_scope("app")).await.unwrap(),
         vec!["TOKEN".to_string()]
     );
-    assert!(secrets.list_scoped(&repo_scope("other")).await.unwrap().is_empty());
+    assert!(secrets
+        .list_scoped(&repo_scope("other"))
+        .await
+        .unwrap()
+        .is_empty());
 
     tdb.cleanup().await;
 }

@@ -27,7 +27,9 @@ async fn poison_outbox_message_stops_after_max_and_dead_letters_the_run() {
     let run = RunId("run-poison".into());
     let step = StepId("s".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &step, None, &[], Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &step, None, &[], Timestamp(0))
+        .await
+        .unwrap();
 
     // A launch intent whose payload can never deserialize — permanently failing.
     db.enqueue_outbox(&OutboxMessage {
@@ -52,7 +54,10 @@ async fn poison_outbox_message_stops_after_max_and_dead_letters_the_run() {
     }
 
     // The run was dead-lettered with diagnostics (the operator signal).
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::DeadLettered));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::DeadLettered)
+    );
     let events = db.events(&run).await.unwrap();
     let reason = events
         .iter()

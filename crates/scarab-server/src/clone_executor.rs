@@ -24,7 +24,10 @@ pub fn clone_url(kind: ForgeKind, base_url: &str, repo: &RepoRef) -> String {
             if base_url.trim_end_matches('/') == "https://api.github.com" {
                 "https://github.com".to_string()
             } else {
-                base_url.trim_end_matches('/').trim_end_matches("/api/v3").to_string()
+                base_url
+                    .trim_end_matches('/')
+                    .trim_end_matches("/api/v3")
+                    .to_string()
             }
         }
         ForgeKind::Forgejo => base_url.trim_end_matches('/').to_string(),
@@ -49,7 +52,12 @@ impl CloneEnrichingExecutor {
         connections: Arc<dyn ForgeConnectionStore>,
         forge: Arc<dyn ForgePort>,
     ) -> Self {
-        Self { inner, connections, forge, secrets: None }
+        Self {
+            inner,
+            connections,
+            forge,
+            secrets: None,
+        }
     }
 
     /// Enable scoped `REGISTRY_AUTH` resolution for build steps (ADR-0018).
@@ -77,7 +85,9 @@ impl CloneEnrichingExecutor {
                     org: build.repo_owner.clone(),
                     repo: build.repo_name.clone(),
                 },
-                scarab_secrets::SecretScope::Org { org: build.repo_owner.clone() },
+                scarab_secrets::SecretScope::Org {
+                    org: build.repo_owner.clone(),
+                },
             ] {
                 if let Ok(secret) = secrets.get(&scope, "REGISTRY_AUTH").await {
                     if let Ok(json) = String::from_utf8(secret.value) {
@@ -144,7 +154,11 @@ impl Executor for CloneEnrichingExecutor {
         // Minting failure (no connection / no credential material) degrades to
         // an anonymous clone: public repos keep working, private ones fail at
         // git with an explicit auth error rather than a facade.
-        let credential = match self.forge.mint_checkout_credential(&repo, clone.read_only).await {
+        let credential = match self
+            .forge
+            .mint_checkout_credential(&repo, clone.read_only)
+            .await
+        {
             Ok(cred) => Some(CloneCredential {
                 username: cred.username,
                 token: cred.token,

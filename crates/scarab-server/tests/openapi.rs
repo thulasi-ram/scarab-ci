@@ -46,7 +46,10 @@ fn cli_emits_openapi_json_file() {
     let content = std::fs::read_to_string(&path).expect("openapi.json written");
     let doc: serde_json::Value = serde_json::from_str(&content).expect("valid JSON");
     assert!(doc["paths"].get("/v1/runs").is_some());
-    assert_eq!(doc["openapi"].as_str().map(|s| s.starts_with("3.")), Some(true));
+    assert_eq!(
+        doc["openapi"].as_str().map(|s| s.starts_with("3.")),
+        Some(true)
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

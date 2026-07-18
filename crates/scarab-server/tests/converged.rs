@@ -36,7 +36,9 @@ async fn create_run(app: &axum::Router) -> String {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     v["id"].as_str().unwrap().to_string()
 }
@@ -69,7 +71,7 @@ async fn background_driver_runs_a_pipeline_end_to_end() {
         "conv-1".to_string(),
         Duration::from_millis(10),
         30_000,
-         3_600_000,
+        3_600_000,
         "http://scarab.test".to_string(),
     );
 
@@ -96,7 +98,9 @@ async fn background_driver_runs_a_pipeline_end_to_end() {
         )
         .await
         .unwrap();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(status["status"], "succeeded");
 }

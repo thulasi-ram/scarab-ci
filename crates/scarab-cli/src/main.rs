@@ -412,7 +412,10 @@ mod tests {
 
     #[test]
     fn parse_param_splits_on_first_equals() {
-        assert_eq!(parse_param("region=us-east-1").unwrap(), ("region".into(), "us-east-1".into()));
+        assert_eq!(
+            parse_param("region=us-east-1").unwrap(),
+            ("region".into(), "us-east-1".into())
+        );
     }
 
     #[test]
@@ -444,7 +447,10 @@ mod tests {
         let body = build_dispatch_body(
             "deploy",
             "refs/heads/main",
-            &[("region".into(), "eu-west-1".into()), ("replicas".into(), "5".into())],
+            &[
+                ("region".into(), "eu-west-1".into()),
+                ("replicas".into(), "5".into()),
+            ],
             false,
         );
         assert_eq!(body["ref"], "refs/heads/main");
@@ -453,7 +459,10 @@ mod tests {
         // Raw strings — no client-side coercion (the server types them).
         assert_eq!(body["params"]["region"], serde_json::json!("eu-west-1"));
         assert_eq!(body["params"]["replicas"], serde_json::json!("5"));
-        assert!(body["params"]["replicas"].is_string(), "params stay strings client-side");
+        assert!(
+            body["params"]["replicas"].is_string(),
+            "params stay strings client-side"
+        );
     }
 
     #[test]

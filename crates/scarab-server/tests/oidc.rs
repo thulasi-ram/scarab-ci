@@ -52,7 +52,10 @@ async fn token_verifies_against_jwks_with_run_subject() {
     let claims = verify(&token.0, &n, &e, AUD).expect("token verifies against the JWKS");
 
     assert_eq!(claims["iss"], ISSUER);
-    assert_eq!(claims["sub"], "scarab:org/acme/repo/app/env/prod/ref/refs/heads/main");
+    assert_eq!(
+        claims["sub"],
+        "scarab:org/acme/repo/app/env/prod/ref/refs/heads/main"
+    );
     assert_eq!(claims["aud"], AUD);
     assert_eq!(claims["run_id"], "run-1");
     assert_eq!(claims["attempt"], "a1");
@@ -76,9 +79,15 @@ async fn rotation_keeps_old_tokens_verifying() {
     // A token minted now is signed by the new key...
     let new_token = issuer.issue(run_claims()).await.unwrap();
     let (new_n, new_e) = jwk(&issuer, 1);
-    assert!(verify(&new_token.0, &new_n, &new_e, AUD).is_ok(), "new token verifies with new key");
+    assert!(
+        verify(&new_token.0, &new_n, &new_e, AUD).is_ok(),
+        "new token verifies with new key"
+    );
     // ...and the old token still verifies against its (still-published) old key.
-    assert!(verify(&old_token.0, &old_n, &old_e, AUD).is_ok(), "old token still verifies");
+    assert!(
+        verify(&old_token.0, &old_n, &old_e, AUD).is_ok(),
+        "old token still verifies"
+    );
     // Cross-key checks fail (different keypairs).
     assert!(verify(&new_token.0, &old_n, &old_e, AUD).is_err());
 }
@@ -87,7 +96,10 @@ async fn rotation_keeps_old_tokens_verifying() {
 async fn jwks_is_served_over_http() {
     let issuer = Arc::new(Rs256Issuer::generate(ISSUER).unwrap());
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
     let clock = Arc::new(FakeClock::new(1_000));
     let app = router(AppState::new(db, clock, logs).with_oidc(issuer));
 
@@ -101,7 +113,9 @@ async fn jwks_is_served_over_http() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(v["keys"][0]["alg"], "RS256");
     assert_eq!(v["keys"][0]["kty"], "RSA");

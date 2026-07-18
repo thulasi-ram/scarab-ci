@@ -23,7 +23,10 @@ fn spec(command: Vec<&str>) -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
     }
 }
 
@@ -32,9 +35,15 @@ async fn seed_two_step(db: &InMemoryDb, consumer_cmd: Vec<&str>) -> (RunId, Step
     let producer = StepId("producer".into());
     let consumer = StepId("consumer".into());
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &producer, Some(&spec(vec!["make-url"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &producer,
+        Some(&spec(vec!["make-url"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.create_step_run(
         &run,
         &consumer,
@@ -68,10 +77,17 @@ async fn a_named_result_flows_into_a_downstream_interpolation() {
         sched.tick(&run).await.expect("tick");
     }
 
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     // The producer's result was captured on success.
     assert_eq!(
-        db.step_results(&run, &producer).await.unwrap().get("url").unwrap(),
+        db.step_results(&run, &producer)
+            .await
+            .unwrap()
+            .get("url")
+            .unwrap(),
         &serde_json::json!("https://svc.example")
     );
     // The consumer launched with the resolved command — the value flowed.
@@ -110,9 +126,16 @@ async fn a_missing_result_fails_the_consumer_fast() {
         .into_iter()
         .find(|s| s.step == consumer)
         .map(|s| s.status);
-    assert_eq!(consumer_status, Some(StepStatus::Failed), "unbound reference fails the step");
+    assert_eq!(
+        consumer_status,
+        Some(StepStatus::Failed),
+        "unbound reference fails the step"
+    );
     assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
     // It never launched with an empty render.
     let handle = ExecHandle("fake://run-1/consumer/a1".into());
-    assert!(exec.launched_spec(&handle).is_none(), "consumer must not launch");
+    assert!(
+        exec.launched_spec(&handle).is_none(),
+        "consumer must not launch"
+    );
 }

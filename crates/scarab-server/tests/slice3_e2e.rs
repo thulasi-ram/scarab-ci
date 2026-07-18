@@ -53,7 +53,9 @@ fn signed_push_request() -> Request<Body> {
 }
 
 async fn json(resp: axum::response::Response) -> serde_json::Value {
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     serde_json::from_slice(&bytes).unwrap()
 }
 
@@ -68,16 +70,19 @@ async fn push_webhook_runs_pipeline_posts_checks_and_login_authorizes() {
 
     // Wiring: real Postgres; forge + auth mocked at the port boundary.
     let clock = Arc::new(FakeClock::new(1_000));
-    let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), pg.clone()));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        pg.clone(),
+    ));
     let forge = Arc::new(FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML));
-    let auth = Arc::new(
-        FakeAuthenticator::new()
-            .with_credential("alice-code", Principal {
-                subject: "alice".into(),
-                display_name: None,
-                roles: vec![Role::Member],
-            }),
-    );
+    let auth = Arc::new(FakeAuthenticator::new().with_credential(
+        "alice-code",
+        Principal {
+            subject: "alice".into(),
+            display_name: None,
+            roles: vec![Role::Member],
+        },
+    ));
     let sessions = Arc::new(InMemorySessions::new());
 
     let db_dyn: Arc<dyn Db> = pg.clone();
@@ -106,14 +111,27 @@ async fn push_webhook_runs_pipeline_posts_checks_and_login_authorizes() {
     }
     let exec_dyn: Arc<dyn Executor> = exec.clone();
     for _ in 0..10 {
-        converged::tick_once(&db_dyn, &clock_dyn, &exec_dyn, Some(&forge_dyn), None, "e2e", 30_000, 3_600_000, "http://scarab.test")
-            .await
-            .unwrap();
+        converged::tick_once(
+            &db_dyn,
+            &clock_dyn,
+            &exec_dyn,
+            Some(&forge_dyn),
+            None,
+            "e2e",
+            30_000,
+            3_600_000,
+            "http://scarab.test",
+        )
+        .await
+        .unwrap();
         if pg.run_status(&run).await.unwrap().unwrap().is_terminal() {
             break;
         }
     }
-    assert_eq!(pg.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        pg.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
 
     // 3. Checks posted back to the forge: pending (start) then success.
     let states: Vec<StatusState> = forge.statuses().iter().map(|s| s.state).collect();

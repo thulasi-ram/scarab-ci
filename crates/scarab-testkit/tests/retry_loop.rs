@@ -45,9 +45,12 @@ async fn seed(db: &InMemoryDb, retry_max: Option<u32>) {
             "retry": { "on": "failure", "max": max } }),
         None => serde_json::json!({ "id": STEP, "image": "img" }),
     };
-    db.store_run_ir(&run_id(), &serde_json::json!({ "ir_version": 1, "steps": [step_ir] }))
-        .await
-        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 1, "steps": [step_ir] }),
+    )
+    .await
+    .unwrap();
 }
 
 /// One scheduler cycle with instantly-reclaimable outbox leases, so each tick
@@ -71,7 +74,10 @@ fn handle(n: u32) -> ExecHandle {
 }
 
 fn failed(class: FailureClass) -> ExecState {
-    ExecState::Failed { exit_code: None, class }
+    ExecState::Failed {
+        exit_code: None,
+        class,
+    }
 }
 
 async fn attempts(db: &InMemoryDb) -> Vec<scarab_engine::Attempt> {
@@ -80,17 +86,28 @@ async fn attempts(db: &InMemoryDb) -> Vec<scarab_engine::Attempt> {
 
 #[tokio::test]
 async fn never_started_infra_auto_retries_to_success_without_config() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     seed(&db, None).await;
-    exec.script_outcome(failed(FailureClass::Infra { never_started: true }));
-    exec.script_outcome(failed(FailureClass::Infra { never_started: true }));
+    exec.script_outcome(failed(FailureClass::Infra {
+        never_started: true,
+    }));
+    exec.script_outcome(failed(FailureClass::Infra {
+        never_started: true,
+    }));
     exec.script_outcome(ExecState::Succeeded);
 
     for _ in 0..4 {
         tick(&db, &clock, &exec).await;
     }
 
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let a = attempts(&db).await;
     // Three attempts: two auto-retried never-started failures, then success —
     // each retry a NEW attempt id (and thus a new fence).
@@ -98,8 +115,18 @@ async fn never_started_infra_auto_retries_to_success_without_config() {
         a.iter().map(|x| x.id.0.as_str()).collect::<Vec<_>>(),
         ["a1", "a2", "a3"]
     );
-    assert_eq!(a[0].failure, Some(FailureKind::Infra { never_started: true }));
-    assert_eq!(a[1].failure, Some(FailureKind::Infra { never_started: true }));
+    assert_eq!(
+        a[0].failure,
+        Some(FailureKind::Infra {
+            never_started: true
+        })
+    );
+    assert_eq!(
+        a[1].failure,
+        Some(FailureKind::Infra {
+            never_started: true
+        })
+    );
     // Every fence launched exactly once — retries never reuse a fence.
     for n in 1..=3 {
         assert_eq!(exec.launch_count(&handle(n)), 1, "a{n}");
@@ -108,10 +135,16 @@ async fn never_started_infra_auto_retries_to_success_without_config() {
 
 #[tokio::test]
 async fn never_started_infra_exhausts_its_bounded_budget() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     seed(&db, None).await;
     for _ in 0..3 {
-        exec.script_outcome(failed(FailureClass::Infra { never_started: true }));
+        exec.script_outcome(failed(FailureClass::Infra {
+            never_started: true,
+        }));
     }
 
     for _ in 0..4 {
@@ -130,11 +163,17 @@ async fn never_started_infra_exhausts_its_bounded_budget() {
 #[tokio::test]
 async fn post_start_classes_fail_immediately_without_the_assertion() {
     for class in [
-        FailureClass::Infra { never_started: false },
+        FailureClass::Infra {
+            never_started: false,
+        },
         FailureClass::Step,
         FailureClass::Timeout,
     ] {
-        let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+        let (db, clock, exec) = (
+            InMemoryDb::new(),
+            FakeClock::new(1_000),
+            FakeExecutor::new(),
+        );
         seed(&db, None).await;
         exec.script_outcome(failed(class));
 
@@ -160,7 +199,11 @@ async fn post_start_classes_fail_immediately_without_the_assertion() {
 
 #[tokio::test]
 async fn configured_retry_covers_post_start_failures_and_consumes_budget() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     seed(&db, Some(2)).await; // 1 + max(2) = 3 attempts allowed
     exec.script_outcome(failed(FailureClass::Step));
     exec.script_outcome(failed(FailureClass::Timeout));
@@ -170,7 +213,10 @@ async fn configured_retry_covers_post_start_failures_and_consumes_budget() {
         tick(&db, &clock, &exec).await;
     }
 
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let a = attempts(&db).await;
     assert_eq!(a.len(), 3);
     assert_eq!(a[0].failure, Some(FailureKind::Step));
@@ -179,7 +225,11 @@ async fn configured_retry_covers_post_start_failures_and_consumes_budget() {
 
 #[tokio::test]
 async fn configured_retry_exhausts_and_fails() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     seed(&db, Some(1)).await; // 2 attempts allowed
     exec.script_outcome(failed(FailureClass::Step));
     exec.script_outcome(failed(FailureClass::Step));
@@ -188,13 +238,20 @@ async fn configured_retry_exhausts_and_fails() {
         tick(&db, &clock, &exec).await;
     }
 
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Failed));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed)
+    );
     assert_eq!(attempts(&db).await.len(), 2);
 }
 
 #[tokio::test]
 async fn lost_without_the_assertion_is_terminal_and_never_relaunched() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     seed(&db, None).await;
 
     // Tick 1: a1 launches and is Running (unscripted poll default).
@@ -218,12 +275,20 @@ async fn lost_without_the_assertion_is_terminal_and_never_relaunched() {
     let a = attempts(&db).await;
     assert_eq!(a.len(), 1, "Lost counted against the budget");
     assert_eq!(a[0].failure, Some(FailureKind::Lost));
-    assert_eq!(exec.launch_count(&handle(1)), 1, "the lost fence was never relaunched");
+    assert_eq!(
+        exec.launch_count(&handle(1)),
+        1,
+        "the lost fence was never relaunched"
+    );
 }
 
 #[tokio::test]
 async fn lost_with_the_assertion_retries_on_a_new_fence() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     seed(&db, Some(1)).await; // 2 attempts allowed
 
     tick(&db, &clock, &exec).await; // a1 Running
@@ -234,15 +299,26 @@ async fn lost_with_the_assertion_retries_on_a_new_fence() {
         tick(&db, &clock, &exec).await;
     }
 
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     let a = attempts(&db).await;
     assert_eq!(
         a.iter().map(|x| x.id.0.as_str()).collect::<Vec<_>>(),
         ["a1", "a2"],
         "the retry minted a NEW attempt (new monotonic fence)"
     );
-    assert_eq!(a[0].failure, Some(FailureKind::Lost), "Lost consumed budget");
-    assert_eq!(exec.launch_count(&handle(1)), 1, "the lost fence stayed fenced off");
+    assert_eq!(
+        a[0].failure,
+        Some(FailureKind::Lost),
+        "Lost consumed budget"
+    );
+    assert_eq!(
+        exec.launch_count(&handle(1)),
+        1,
+        "the lost fence stayed fenced off"
+    );
     assert_eq!(exec.launch_count(&handle(2)), 1);
 }
 
@@ -252,7 +328,11 @@ async fn lost_with_the_assertion_retries_on_a_new_fence() {
 /// (post-start) — terminal without the author's `retry:` assertion.
 #[tokio::test]
 async fn engine_backstop_times_out_a_hung_step() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     let at = Timestamp(1_000);
     db.create_run(&run_id(), 1, 1, at).await.unwrap();
     db.create_step_run(&run_id(), &step_id(), Some(&spec()), &[], at)
@@ -268,7 +348,10 @@ async fn engine_backstop_times_out_a_hung_step() {
     .unwrap();
 
     tick(&db, &clock, &exec).await; // a1 launches; poll defaults to Running
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Running));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Running)
+    );
 
     // Deadline (5s) + backstop grace (60s) elapse; the backend still says
     // nothing (a hung kubelet). The backstop cancels + settles Timeout.
@@ -277,7 +360,10 @@ async fn engine_backstop_times_out_a_hung_step() {
         tick(&db, &clock, &exec).await;
     }
 
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Failed));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed)
+    );
     let a = attempts(&db).await;
     assert_eq!(a.len(), 1);
     assert_eq!(a[0].failure, Some(FailureKind::Timeout));
@@ -285,7 +371,11 @@ async fn engine_backstop_times_out_a_hung_step() {
 
 #[tokio::test]
 async fn re_adoption_after_a_crash_reuses_the_fence_and_consumes_no_budget() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     seed(&db, None).await;
 
     // Tick 1: a1 launches and is Running.
@@ -296,14 +386,25 @@ async fn re_adoption_after_a_crash_reuses_the_fence_and_consumes_no_budget() {
     // durable state; the backend object (the "Pod") still exists.
     // Its reconcile polls via the stored handle — adoption, not relaunch.
     tick(&db, &clock, &exec).await; // still Running under the same fence
-    assert_eq!(exec.launch_count(&handle(1)), 1, "no relaunch on re-adoption");
+    assert_eq!(
+        exec.launch_count(&handle(1)),
+        1,
+        "no relaunch on re-adoption"
+    );
 
     exec.script_outcome(ExecState::Succeeded);
     for _ in 0..2 {
         tick(&db, &clock, &exec).await;
     }
 
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Succeeded));
-    assert_eq!(attempts(&db).await.len(), 1, "re-adoption consumed no budget");
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
+    assert_eq!(
+        attempts(&db).await.len(),
+        1,
+        "re-adoption consumed no budget"
+    );
     assert_eq!(exec.launch_count(&handle(1)), 1);
 }

@@ -44,7 +44,10 @@ async fn tick(db: &InMemoryDb, clock: &FakeClock, exec: &FakeExecutor) {
 }
 
 fn failed(class: FailureClass) -> ExecState {
-    ExecState::Failed { exit_code: None, class }
+    ExecState::Failed {
+        exit_code: None,
+        class,
+    }
 }
 
 async fn events(db: &InMemoryDb) -> Vec<EventPayload> {
@@ -63,17 +66,26 @@ async fn seed_one_step(db: &InMemoryDb, step_ir: serde_json::Value) {
     db.create_step_run(&run_id(), &StepId("s".into()), Some(&spec()), &[], at)
         .await
         .unwrap();
-    db.store_run_ir(&run_id(), &serde_json::json!({ "ir_version": 1, "steps": [step_ir] }))
-        .await
-        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 1, "steps": [step_ir] }),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn infra_exhaustion_dead_letters_the_run_with_diagnostics() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     seed_one_step(&db, serde_json::json!({ "id": "s", "image": "img" })).await;
     for _ in 0..3 {
-        exec.script_outcome(failed(FailureClass::Infra { never_started: true }));
+        exec.script_outcome(failed(FailureClass::Infra {
+            never_started: true,
+        }));
     }
 
     for _ in 0..4 {
@@ -95,15 +107,24 @@ async fn infra_exhaustion_dead_letters_the_run_with_diagnostics() {
         .expect("diagnostics on the event log");
     assert!(reason.contains("step `s`"), "{reason}");
     assert!(
-        evs.iter().any(|e| matches!(e,
-            EventPayload::RunTransitioned { to: RunStatus::DeadLettered, .. })),
+        evs.iter().any(|e| matches!(
+            e,
+            EventPayload::RunTransitioned {
+                to: RunStatus::DeadLettered,
+                ..
+            }
+        )),
         "transition_run(.., DeadLettered) actually produced"
     );
 }
 
 #[tokio::test]
 async fn lost_exhaustion_dead_letters_the_run() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     seed_one_step(
         &db,
         serde_json::json!({ "id": "s", "image": "img", "retry": { "max": 1 } }),
@@ -111,9 +132,13 @@ async fn lost_exhaustion_dead_letters_the_run() {
     .await;
 
     tick(&db, &clock, &exec).await; // a1 Running
-    exec.kill(scarab_engine::ports::ExecHandle(format!("fake://{RUN}/s/a1")));
+    exec.kill(scarab_engine::ports::ExecHandle(format!(
+        "fake://{RUN}/s/a1"
+    )));
     tick(&db, &clock, &exec).await; // Lost → retry (assertion present)
-    exec.kill(scarab_engine::ports::ExecHandle(format!("fake://{RUN}/s/a2")));
+    exec.kill(scarab_engine::ports::ExecHandle(format!(
+        "fake://{RUN}/s/a2"
+    )));
     for _ in 0..3 {
         tick(&db, &clock, &exec).await; // a2 launches, is lost, budget exhausted
     }
@@ -128,7 +153,11 @@ async fn lost_exhaustion_dead_letters_the_run() {
 #[tokio::test]
 async fn step_and_timeout_verdicts_fail_the_run_not_dead_letter() {
     for class in [FailureClass::Step, FailureClass::Timeout] {
-        let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+        let (db, clock, exec) = (
+            InMemoryDb::new(),
+            FakeClock::new(1_000),
+            FakeExecutor::new(),
+        );
         // Even with retries configured and exhausted: a verdict exists.
         seed_one_step(
             &db,
@@ -148,7 +177,10 @@ async fn step_and_timeout_verdicts_fail_the_run_not_dead_letter() {
             "{class:?} is the developer signal"
         );
         assert!(
-            !events(&db).await.iter().any(|e| matches!(e, EventPayload::RunDeadLettered { .. })),
+            !events(&db)
+                .await
+                .iter()
+                .any(|e| matches!(e, EventPayload::RunDeadLettered { .. })),
             "{class:?}: no dead-letter diagnostics"
         );
     }
@@ -156,7 +188,11 @@ async fn step_and_timeout_verdicts_fail_the_run_not_dead_letter() {
 
 #[tokio::test]
 async fn unapproved_gate_expires_at_its_deadline_and_fails_the_run() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     let at = Timestamp(1_000);
     let (build, gate) = (StepId("build".into()), StepId("approve".into()));
     db.create_run(&run_id(), 1, 1, at).await.unwrap();
@@ -166,7 +202,9 @@ async fn unapproved_gate_expires_at_its_deadline_and_fails_the_run() {
     db.create_step_run(&run_id(), &gate, None, &[build.clone()], at)
         .await
         .unwrap();
-    db.set_step_gate(&run_id(), &gate, "manual", None).await.unwrap();
+    db.set_step_gate(&run_id(), &gate, "manual", None)
+        .await
+        .unwrap();
     db.store_run_ir(
         &run_id(),
         &serde_json::json!({ "ir_version": 1, "steps": [
@@ -182,12 +220,18 @@ async fn unapproved_gate_expires_at_its_deadline_and_fails_the_run() {
     for _ in 0..3 {
         tick(&db, &clock, &exec).await; // build succeeds; gate suspends the run
     }
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Suspended));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Suspended)
+    );
 
     // Within the deadline: still waiting (default would be forever).
     clock.advance(299_000);
     tick(&db, &clock, &exec).await;
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Suspended));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Suspended)
+    );
 
     // Past the deadline: the gate fails, the run resumes and settles Failed —
     // a code verdict ("nobody approved in time"), not a dead-letter.
@@ -195,7 +239,10 @@ async fn unapproved_gate_expires_at_its_deadline_and_fails_the_run() {
     for _ in 0..3 {
         tick(&db, &clock, &exec).await;
     }
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Failed));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed)
+    );
     let steps = db.steps_of_run(&run_id()).await.unwrap();
     let gate_step = steps.iter().find(|s| s.step == gate).unwrap();
     assert_eq!(gate_step.status, StepStatus::Failed);
@@ -208,7 +255,11 @@ async fn unapproved_gate_expires_at_its_deadline_and_fails_the_run() {
 
 #[tokio::test]
 async fn run_budget_counts_active_time_only_and_fails_on_exhaustion() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     let at = Timestamp(1_000);
     let step = StepId("s".into());
     db.create_run(&run_id(), 1, 1, at).await.unwrap();
@@ -227,7 +278,10 @@ async fn run_budget_counts_active_time_only_and_fails_on_exhaustion() {
     tick(&db, &clock, &exec).await; // a1 Running (unscripted poll default)
     clock.advance(30_000);
     tick(&db, &clock, &exec).await; // 30s active — within budget
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Running));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Running)
+    );
 
     clock.advance(31_000); // 61s active — exhausted
     for _ in 0..2 {
@@ -239,10 +293,19 @@ async fn run_budget_counts_active_time_only_and_fails_on_exhaustion() {
         "budget exhaustion is a liveness verdict — Failed, not DeadLettered"
     );
     let steps = db.steps_of_run(&run_id()).await.unwrap();
-    assert_eq!(steps[0].status, StepStatus::Cancelled, "in-flight step cancelled");
+    assert_eq!(
+        steps[0].status,
+        StepStatus::Cancelled,
+        "in-flight step cancelled"
+    );
     assert!(
-        events(&db).await.iter().any(|e| matches!(e,
-            EventPayload::RunBudgetExhausted { budget_ms: 60_000, .. })),
+        events(&db).await.iter().any(|e| matches!(
+            e,
+            EventPayload::RunBudgetExhausted {
+                budget_ms: 60_000,
+                ..
+            }
+        )),
         "diagnostics on the event log"
     );
 }
@@ -253,7 +316,11 @@ async fn run_budget_counts_active_time_only_and_fails_on_exhaustion() {
 /// of the picture).
 #[tokio::test]
 async fn no_budget_means_no_run_ceiling() {
-    let (db, clock, exec) = (InMemoryDb::new(), FakeClock::new(1_000), FakeExecutor::new());
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
     seed_one_step(
         &db,
         serde_json::json!({ "id": "s", "image": "img", "timeout": 500 * 3_600 }),
@@ -263,5 +330,8 @@ async fn no_budget_means_no_run_ceiling() {
     tick(&db, &clock, &exec).await;
     clock.advance(100 * 3_600_000); // 100 hours — no budget, step deadline far off
     tick(&db, &clock, &exec).await;
-    assert_eq!(db.run_status(&run_id()).await.unwrap(), Some(RunStatus::Running));
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Running)
+    );
 }

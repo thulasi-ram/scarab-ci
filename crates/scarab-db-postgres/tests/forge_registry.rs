@@ -52,20 +52,35 @@ async fn registration_and_resolution_round_trip() {
         db.list_connections().await.unwrap(),
         vec![forgejo_conn(), github_conn()], // ordered by id
     );
-    assert_eq!(db.get_connection("gh-acme").await.unwrap(), Some(github_conn()));
+    assert_eq!(
+        db.get_connection("gh-acme").await.unwrap(),
+        Some(github_conn())
+    );
 
     // Upsert: rotating the credential handle replaces in place.
     let mut rotated = github_conn();
     rotated.credential_ref = "gh-acme-app-pem-v2".into();
     db.put_connection(&rotated).await.unwrap();
-    assert_eq!(db.get_connection("gh-acme").await.unwrap(), Some(rotated.clone()));
+    assert_eq!(
+        db.get_connection("gh-acme").await.unwrap(),
+        Some(rotated.clone())
+    );
 
     // Bind repos to their governed Projects.
-    db.bind_repo("gh-acme", &repo("acme", "web"), "acme", "web").await.unwrap();
-    db.bind_repo("gh-acme", &repo("acme", "api"), "acme", "api").await.unwrap();
-    db.bind_repo("codeberg-acme", &repo("acme-mirror", "web"), "acme", "web-mirror")
+    db.bind_repo("gh-acme", &repo("acme", "web"), "acme", "web")
         .await
         .unwrap();
+    db.bind_repo("gh-acme", &repo("acme", "api"), "acme", "api")
+        .await
+        .unwrap();
+    db.bind_repo(
+        "codeberg-acme",
+        &repo("acme-mirror", "web"),
+        "acme",
+        "web-mirror",
+    )
+    .await
+    .unwrap();
     assert_eq!(
         db.repos_of("gh-acme").await.unwrap(),
         vec![repo("acme", "api"), repo("acme", "web")],
@@ -73,16 +88,28 @@ async fn registration_and_resolution_round_trip() {
 
     // resolve: RepoRef → owning Project + serving connection (with the rotated
     // credential handle, never the secret bytes).
-    let hit = db.resolve(&repo("acme", "web")).await.unwrap().expect("registered");
+    let hit = db
+        .resolve(&repo("acme", "web"))
+        .await
+        .unwrap()
+        .expect("registered");
     assert_eq!(hit.org, "acme");
     assert_eq!(hit.project, "web");
     assert_eq!(hit.connection, rotated);
-    let hit = db.resolve(&repo("acme-mirror", "web")).await.unwrap().expect("registered");
+    let hit = db
+        .resolve(&repo("acme-mirror", "web"))
+        .await
+        .unwrap()
+        .expect("registered");
     assert_eq!(hit.connection.kind, ForgeKind::Forgejo);
     assert_eq!(hit.project, "web-mirror");
 
     // An unregistered repo resolves to None (its webhooks are dropped).
-    assert!(db.resolve(&repo("stranger", "danger")).await.unwrap().is_none());
+    assert!(db
+        .resolve(&repo("stranger", "danger"))
+        .await
+        .unwrap()
+        .is_none());
 
     // Re-binding re-homes the repo (upsert by coordinate).
     db.bind_repo("codeberg-acme", &repo("acme", "api"), "acme", "api-moved")
@@ -93,8 +120,12 @@ async fn registration_and_resolution_round_trip() {
     assert_eq!(moved.project, "api-moved");
 
     // Unbind is idempotent and removes resolution.
-    db.unbind_repo("codeberg-acme", &repo("acme", "api")).await.unwrap();
-    db.unbind_repo("codeberg-acme", &repo("acme", "api")).await.unwrap();
+    db.unbind_repo("codeberg-acme", &repo("acme", "api"))
+        .await
+        .unwrap();
+    db.unbind_repo("codeberg-acme", &repo("acme", "api"))
+        .await
+        .unwrap();
     assert!(db.resolve(&repo("acme", "api")).await.unwrap().is_none());
 
     // Deleting a connection cascades its bindings.

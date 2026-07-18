@@ -26,10 +26,7 @@ fn param_err(msg: impl Into<String>) -> PipelineError {
 /// (`"3"` → number `3`, `"true"`/`"yes"` → `true`). `choice` only requires a
 /// string here — membership in `options` is enforced by [`resolve_one`] /
 /// [`resolve_params`]. Anything that does not fit is an error.
-pub fn coerce(
-    raw: &serde_json::Value,
-    ty: ParamType,
-) -> Result<serde_json::Value, PipelineError> {
+pub fn coerce(raw: &serde_json::Value, ty: ParamType) -> Result<serde_json::Value, PipelineError> {
     use serde_json::Value;
     match ty {
         ParamType::String => match raw {
@@ -66,7 +63,9 @@ pub fn coerce(
         // the resolve layer (it needs the spec, not just the type).
         ParamType::Choice => match raw {
             Value::String(s) => Ok(Value::String(s.clone())),
-            other => Err(param_err(format!("a choice value must be a string, got {other}"))),
+            other => Err(param_err(format!(
+                "a choice value must be a string, got {other}"
+            ))),
         },
     }
 }
@@ -203,15 +202,14 @@ pub fn validate_param_specs(specs: &[ParamSpec], label: &str, diagnostics: &mut 
             ));
         }
         match p.r#type {
-            ParamType::Choice => {
-                match p.options.as_deref() {
-                    None | Some([]) => diagnostics.push(format!(
-                        "{label}: choice parameter `{}` must declare a non-empty `options` list",
-                        p.name
-                    )),
-                    Some(opts) => {
-                        if let Some(def) = &p.default {
-                            match def.as_str() {
+            ParamType::Choice => match p.options.as_deref() {
+                None | Some([]) => diagnostics.push(format!(
+                    "{label}: choice parameter `{}` must declare a non-empty `options` list",
+                    p.name
+                )),
+                Some(opts) => {
+                    if let Some(def) = &p.default {
+                        match def.as_str() {
                                 Some(s) if opts.iter().any(|o| o == s) => {}
                                 Some(s) => diagnostics.push(format!(
                                     "{label}: parameter `{}` default `{s}` is not one of its options [{}]",
@@ -223,10 +221,9 @@ pub fn validate_param_specs(specs: &[ParamSpec], label: &str, diagnostics: &mut 
                                     p.name
                                 )),
                             }
-                        }
                     }
                 }
-            }
+            },
             _ => {
                 if let Some(def) = &p.default {
                     if let Err(e) = coerce(def, p.r#type) {
@@ -264,7 +261,10 @@ mod tests {
 
     #[test]
     fn coerce_string_from_json_and_number() {
-        assert_eq!(coerce(&json!("hi"), ParamType::String).unwrap(), json!("hi"));
+        assert_eq!(
+            coerce(&json!("hi"), ParamType::String).unwrap(),
+            json!("hi")
+        );
         assert_eq!(coerce(&json!(3), ParamType::String).unwrap(), json!("3"));
         // A bool is not a string (fail-closed).
         assert!(coerce(&json!(true), ParamType::String).is_err());
@@ -274,17 +274,34 @@ mod tests {
     fn coerce_number_from_typed_and_string() {
         assert_eq!(coerce(&json!(3), ParamType::Number).unwrap(), json!(3));
         assert_eq!(coerce(&json!("3"), ParamType::Number).unwrap(), json!(3));
-        assert_eq!(coerce(&json!(" 42 "), ParamType::Number).unwrap(), json!(42));
-        assert!(coerce(&json!("3.5"), ParamType::Number).unwrap().is_number());
+        assert_eq!(
+            coerce(&json!(" 42 "), ParamType::Number).unwrap(),
+            json!(42)
+        );
+        assert!(coerce(&json!("3.5"), ParamType::Number)
+            .unwrap()
+            .is_number());
         assert!(coerce(&json!("three"), ParamType::Number).is_err());
     }
 
     #[test]
     fn coerce_boolean_from_typed_and_string_forms() {
-        assert_eq!(coerce(&json!(true), ParamType::Boolean).unwrap(), json!(true));
-        assert_eq!(coerce(&json!("true"), ParamType::Boolean).unwrap(), json!(true));
-        assert_eq!(coerce(&json!("YES"), ParamType::Boolean).unwrap(), json!(true));
-        assert_eq!(coerce(&json!("no"), ParamType::Boolean).unwrap(), json!(false));
+        assert_eq!(
+            coerce(&json!(true), ParamType::Boolean).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            coerce(&json!("true"), ParamType::Boolean).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            coerce(&json!("YES"), ParamType::Boolean).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            coerce(&json!("no"), ParamType::Boolean).unwrap(),
+            json!(false)
+        );
         assert!(coerce(&json!("maybe"), ParamType::Boolean).is_err());
         assert!(coerce(&json!(1), ParamType::Boolean).is_err());
     }
@@ -298,7 +315,10 @@ mod tests {
     // --- resolve_params -------------------------------------------------------
 
     fn iface(inputs: Vec<ParamSpec>) -> Interface {
-        Interface { inputs, outputs: vec![] }
+        Interface {
+            inputs,
+            outputs: vec![],
+        }
     }
 
     #[test]
@@ -318,7 +338,10 @@ mod tests {
     fn resolve_rejects_missing_required() {
         let i = iface(vec![spec("region", ParamType::String)]);
         let err = resolve_params(&i, &BTreeMap::new()).unwrap_err();
-        assert!(err.to_string().contains("required parameter not supplied"), "{err}");
+        assert!(
+            err.to_string().contains("required parameter not supplied"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -336,7 +359,10 @@ mod tests {
         let i = iface(vec![env]);
         let supplied = BTreeMap::from([("env".to_string(), json!("dev"))]);
         let err = resolve_params(&i, &supplied).unwrap_err();
-        assert!(err.to_string().contains("not one of the allowed choices"), "{err}");
+        assert!(
+            err.to_string().contains("not one of the allowed choices"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -345,7 +371,8 @@ mod tests {
         n.validate = Some("value > 0".into());
         let i = iface(vec![n]);
         assert!(resolve_params(&i, &BTreeMap::from([("n".to_string(), json!("5"))])).is_ok());
-        let err = resolve_params(&i, &BTreeMap::from([("n".to_string(), json!("-1"))])).unwrap_err();
+        let err =
+            resolve_params(&i, &BTreeMap::from([("n".to_string(), json!("-1"))])).unwrap_err();
         assert!(err.to_string().contains("failed validation"), "{err}");
     }
 
@@ -357,7 +384,10 @@ mod tests {
             ("bogus".to_string(), json!("y")),
         ]);
         let err = resolve_params(&i, &supplied).unwrap_err();
-        assert!(err.to_string().contains("`bogus`: unknown parameter"), "{err}");
+        assert!(
+            err.to_string().contains("`bogus`: unknown parameter"),
+            "{err}"
+        );
     }
 
     // --- validate_param_specs (§2) -------------------------------------------
@@ -372,14 +402,18 @@ mod tests {
     fn required_with_default_is_rejected() {
         let mut p = spec("x", ParamType::String);
         p.default = Some(json!("d"));
-        assert!(diags(&[p]).iter().any(|m| m.contains("also declares a `default`")));
+        assert!(diags(&[p])
+            .iter()
+            .any(|m| m.contains("also declares a `default`")));
     }
 
     #[test]
     fn optional_without_default_is_rejected() {
         let mut p = spec("x", ParamType::String);
         p.required = false;
-        assert!(diags(&[p]).iter().any(|m| m.contains("must declare a `default`")));
+        assert!(diags(&[p])
+            .iter()
+            .any(|m| m.contains("must declare a `default`")));
     }
 
     #[test]
@@ -394,7 +428,9 @@ mod tests {
         p.required = false;
         p.options = Some(vec!["a".into(), "b".into()]);
         p.default = Some(json!("c"));
-        assert!(diags(&[p]).iter().any(|m| m.contains("is not one of its options")));
+        assert!(diags(&[p])
+            .iter()
+            .any(|m| m.contains("is not one of its options")));
     }
 
     #[test]
@@ -402,7 +438,10 @@ mod tests {
         let d = diags(&[spec("ok", ParamType::String), spec("ok", ParamType::String)]);
         assert!(d.iter().any(|m| m.contains("duplicate parameter")), "{d:?}");
         let d = diags(&[spec("1bad", ParamType::String)]);
-        assert!(d.iter().any(|m| m.contains("not a valid identifier")), "{d:?}");
+        assert!(
+            d.iter().any(|m| m.contains("not a valid identifier")),
+            "{d:?}"
+        );
     }
 
     #[test]

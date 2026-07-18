@@ -55,7 +55,10 @@ impl PostgresDb {
 
     /// Apply all pending migrations (the production expand-contract path).
     pub async fn migrate(&self) -> Result<(), DbError> {
-        MIGRATOR.run(self.pool()).await.map_err(|e| DbError::Other(e.to_string()))
+        MIGRATOR
+            .run(self.pool())
+            .await
+            .map_err(|e| DbError::Other(e.to_string()))
     }
 
     fn pool(&self) -> &PgPool {
@@ -65,7 +68,11 @@ impl PostgresDb {
     // --- read helpers ------------------------------------------------------
 
     /// Current status of a step, if it exists.
-    pub async fn step_status(&self, run: &RunId, step: &StepId) -> Result<Option<StepStatus>, DbError> {
+    pub async fn step_status(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<StepStatus>, DbError> {
         let row = sqlx::query("SELECT status FROM step_runs WHERE run_id = $1 AND step_id = $2")
             .bind(&run.0)
             .bind(&step.0)
@@ -111,7 +118,10 @@ impl PostgresDb {
         .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows.into_iter().map(|r| r.get::<String, _>("kind")).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("kind"))
+            .collect())
     }
 }
 
@@ -506,7 +516,12 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| {
             let group: Option<String> = r.get("concurrency_group");
             let policy: Option<String> = r.get("concurrency_policy");
-            group.map(|g| (g, ConcurrencyPolicy::from_wire(policy.as_deref().unwrap_or("queue"))))
+            group.map(|g| {
+                (
+                    g,
+                    ConcurrencyPolicy::from_wire(policy.as_deref().unwrap_or("queue")),
+                )
+            })
         }))
     }
 
@@ -600,7 +615,10 @@ impl Db for PostgresDb {
         .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| RunId(r.get::<String, _>("id")))
+            .collect())
     }
 
     async fn set_run_scheduling(
@@ -632,12 +650,7 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("project")))
     }
 
-    async fn set_run_tenant(
-        &self,
-        run: &RunId,
-        org: &str,
-        project: &str,
-    ) -> Result<(), DbError> {
+    async fn set_run_tenant(&self, run: &RunId, org: &str, project: &str) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE runs SET tenant_org = $2, tenant_project = $3,
                  updated_at = (extract(epoch from now()) * 1000)::bigint
@@ -704,11 +717,7 @@ impl Db for PostgresDb {
         Ok(())
     }
 
-    async fn gate_timer_seconds(
-        &self,
-        run: &RunId,
-        step: &StepId,
-    ) -> Result<Option<i64>, DbError> {
+    async fn gate_timer_seconds(&self, run: &RunId, step: &StepId) -> Result<Option<i64>, DbError> {
         let row = sqlx::query(
             "SELECT gate_timer_seconds FROM step_runs WHERE run_id = $1 AND step_id = $2",
         )
@@ -740,7 +749,10 @@ impl Db for PostgresDb {
         .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| RunId(r.get::<String, _>("id")))
+            .collect())
     }
 
     async fn list_runs(&self, limit: u32) -> Result<Vec<RunSummary>, DbError> {
@@ -812,11 +824,12 @@ impl Db for PostgresDb {
     }
 
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
-        let rows = sqlx::query("SELECT version, at, payload FROM events WHERE run_id = $1 ORDER BY seq")
-            .bind(&run.0)
-            .fetch_all(self.pool())
-            .await
-            .map_err(db_err)?;
+        let rows =
+            sqlx::query("SELECT version, at, payload FROM events WHERE run_id = $1 ORDER BY seq")
+                .bind(&run.0)
+                .fetch_all(self.pool())
+                .await
+                .map_err(db_err)?;
         rows.into_iter()
             .map(|r| {
                 let payload: Value = r.get("payload");
@@ -1075,7 +1088,8 @@ impl Db for PostgresDb {
     }
 
     async fn append_event(&self, event: &EventKind) -> Result<(), DbError> {
-        let payload = serde_json::to_value(&event.kind).map_err(|e| DbError::Other(e.to_string()))?;
+        let payload =
+            serde_json::to_value(&event.kind).map_err(|e| DbError::Other(e.to_string()))?;
         sqlx::query("INSERT INTO events (run_id, version, at, payload) VALUES ($1, $2, $3, $4)")
             .bind(&event.run.0)
             .bind(event.version as i32)
@@ -1178,7 +1192,9 @@ impl Db for PostgresDb {
         .fetch_optional(self.pool())
         .await
         .map_err(db_err)?;
-        Ok(row.map(|r| r.get::<i64, _>("delivery_attempts") as u32).unwrap_or(0))
+        Ok(row
+            .map(|r| r.get::<i64, _>("delivery_attempts") as u32)
+            .unwrap_or(0))
     }
 
     async fn dead_letter_outbox(&self, id: OutboxId) -> Result<(), DbError> {
@@ -1243,7 +1259,10 @@ impl Db for PostgresDb {
         Ok(())
     }
 
-    async fn artifacts_of_run(&self, run: &RunId) -> Result<Vec<scarab_engine::ArtifactMeta>, DbError> {
+    async fn artifacts_of_run(
+        &self,
+        run: &RunId,
+    ) -> Result<Vec<scarab_engine::ArtifactMeta>, DbError> {
         let rows = sqlx::query(
             "SELECT name, size, content_type, object_key FROM artifacts
              WHERE run_id = $1 ORDER BY name",
@@ -1280,7 +1299,10 @@ impl Db for PostgresDb {
         .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| RunId(r.get::<String, _>("id")))
+            .collect())
     }
 
     async fn delete_artifacts_of_run(&self, run: &RunId) -> Result<(), DbError> {
@@ -1309,7 +1331,10 @@ impl Db for PostgresDb {
         .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows.into_iter().map(|r| RunId(r.get::<String, _>("id"))).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| RunId(r.get::<String, _>("id")))
+            .collect())
     }
 
     async fn log_object_keys_of_run(&self, run: &RunId) -> Result<Vec<String>, DbError> {
@@ -1318,7 +1343,10 @@ impl Db for PostgresDb {
             .fetch_all(self.pool())
             .await
             .map_err(db_err)?;
-        Ok(rows.into_iter().map(|r| r.get::<String, _>("object_key")).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("object_key"))
+            .collect())
     }
 
     async fn delete_log_index_of_run(&self, run: &RunId) -> Result<(), DbError> {
@@ -1330,10 +1358,7 @@ impl Db for PostgresDb {
         Ok(())
     }
 
-    async fn gc_workspace_roots(
-        &self,
-        terminal_cutoff: Timestamp,
-    ) -> Result<Vec<String>, DbError> {
+    async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError> {
         let rows = sqlx::query(
             "SELECT DISTINCT sr.output_snapshot FROM step_runs sr
              JOIN runs r ON r.id = sr.run_id
@@ -1469,11 +1494,7 @@ impl ForgeConnectionStore for PostgresDb {
         Ok(())
     }
 
-    async fn unbind_repo(
-        &self,
-        connection_id: &str,
-        repo: &RepoRef,
-    ) -> Result<(), RegistryError> {
+    async fn unbind_repo(&self, connection_id: &str, repo: &RepoRef) -> Result<(), RegistryError> {
         sqlx::query(
             "DELETE FROM forge_repos WHERE connection_id = $1 AND owner = $2 AND name = $3",
         )
@@ -1651,8 +1672,8 @@ impl EnvironmentStore for PostgresDb {
     }
 
     async fn record_deployment(&self, d: &Deployment) -> Result<(), ProjectError> {
-        let approved = serde_json::to_value(&d.approved_by)
-            .map_err(|e| ProjectError::Store(e.to_string()))?;
+        let approved =
+            serde_json::to_value(&d.approved_by).map_err(|e| ProjectError::Store(e.to_string()))?;
         sqlx::query(
             "INSERT INTO deployments (org, project, environment, git_ref, run_id, approved_by, at)
              VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -1743,8 +1764,7 @@ fn needs_to_value(needs: &[StepId]) -> Value {
 
 /// Parse the `step_runs.needs` JSONB array back into step ids.
 fn needs_from_value(v: Value) -> Result<Vec<StepId>, DbError> {
-    let ids: Vec<String> =
-        serde_json::from_value(v).map_err(|e| DbError::Other(e.to_string()))?;
+    let ids: Vec<String> = serde_json::from_value(v).map_err(|e| DbError::Other(e.to_string()))?;
     Ok(ids.into_iter().map(StepId).collect())
 }
 
@@ -1777,8 +1797,12 @@ fn failure_str(f: FailureKind) -> &'static str {
     match f {
         // "infra" keeps its pre-ADR-0047 spelling (post-start is the
         // conservative reading of historical rows).
-        FailureKind::Infra { never_started: false } => "infra",
-        FailureKind::Infra { never_started: true } => "infra-never-started",
+        FailureKind::Infra {
+            never_started: false,
+        } => "infra",
+        FailureKind::Infra {
+            never_started: true,
+        } => "infra-never-started",
         FailureKind::Step => "step",
         FailureKind::Timeout => "timeout",
         FailureKind::Lost => "lost",
@@ -1787,8 +1811,12 @@ fn failure_str(f: FailureKind) -> &'static str {
 
 fn failure_from_str(s: &str) -> Result<FailureKind, DbError> {
     match s {
-        "infra" => Ok(FailureKind::Infra { never_started: false }),
-        "infra-never-started" => Ok(FailureKind::Infra { never_started: true }),
+        "infra" => Ok(FailureKind::Infra {
+            never_started: false,
+        }),
+        "infra-never-started" => Ok(FailureKind::Infra {
+            never_started: true,
+        }),
         "step" => Ok(FailureKind::Step),
         "timeout" => Ok(FailureKind::Timeout),
         "lost" => Ok(FailureKind::Lost),
@@ -1809,7 +1837,10 @@ fn db_err(e: sqlx::Error) -> DbError {
 
 #[async_trait]
 impl scarab_identity::SessionStore for PostgresDb {
-    async fn put(&self, session: &scarab_identity::Session) -> Result<(), scarab_identity::IdentityError> {
+    async fn put(
+        &self,
+        session: &scarab_identity::Session,
+    ) -> Result<(), scarab_identity::IdentityError> {
         let principal = serde_json::to_value(&session.principal)
             .map_err(|e| scarab_identity::IdentityError::Issuance(e.to_string()))?;
         sqlx::query(
@@ -1830,7 +1861,10 @@ impl scarab_identity::SessionStore for PostgresDb {
         Ok(())
     }
 
-    async fn get(&self, id: &str) -> Result<Option<scarab_identity::Session>, scarab_identity::IdentityError> {
+    async fn get(
+        &self,
+        id: &str,
+    ) -> Result<Option<scarab_identity::Session>, scarab_identity::IdentityError> {
         let row = sqlx::query("SELECT principal, csrf, expires_at FROM sessions WHERE id = $1")
             .bind(id)
             .fetch_optional(self.pool())
@@ -2008,7 +2042,10 @@ impl scarab_identity::RbacStore for PostgresDb {
                 let scope = if project.is_empty() {
                     scarab_identity::Scope::Org(org.to_string())
                 } else {
-                    scarab_identity::Scope::Project { org: org.to_string(), name: project }
+                    scarab_identity::Scope::Project {
+                        org: org.to_string(),
+                        name: project,
+                    }
                 };
                 Some(scarab_identity::Binding {
                     subject: r.get::<String, _>("subject"),

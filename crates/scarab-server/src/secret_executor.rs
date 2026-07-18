@@ -91,13 +91,13 @@ impl SecretInjectingExecutor {
         };
         // The fork-PR downgrade (ADR-0015): a locked-out run's subject says
         // env `none` — no cloud trust policy for a real environment matches.
-        let env = if ctx.locked_out { "none" } else { &ctx.environment };
-        let subject = scarab_identity::Claims::run_subject(
-            &ctx.org,
-            &ctx.project,
-            env,
-            &ctx.git_ref,
-        );
+        let env = if ctx.locked_out {
+            "none"
+        } else {
+            &ctx.environment
+        };
+        let subject =
+            scarab_identity::Claims::run_subject(&ctx.org, &ctx.project, env, &ctx.git_ref);
         let attempt = step
             .current_attempt()
             .map(|a| a.id.0.clone())
