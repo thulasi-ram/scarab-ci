@@ -2,11 +2,11 @@
 # Deploy the Scarab dogfood stack (in-cluster Postgres + scarab-server via Helm)
 # onto the LOCAL colima cluster. Reproducible; run it as many times as needed.
 #
-# Config comes from deploy/local/.env (gitignored — see .env.example). A real
-# environment variable already set in your shell overrides the file. Pass an
-# image tag to override IMAGE_TAG (e.g. a GHA `sha-<gitsha>`):
+# Config comes from deploy/local-helm/.env (gitignored — see .env.example). A
+# real environment variable already set in your shell overrides the file. Pass
+# an image tag to override IMAGE_TAG (e.g. a GHA `sha-<gitsha>`):
 #
-#   deploy/local/deploy.sh [IMAGE_TAG]
+#   deploy/local-helm/deploy.sh [IMAGE_TAG]
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -28,7 +28,7 @@ if [ -f "$ENVFILE" ]; then
     export "${line%%=*}=${line#*=}"
   done < "$ENVFILE"
 else
-  echo "missing $ENVFILE (cp deploy/local/.env.example deploy/local/.env and fill it)" >&2
+  echo "missing $ENVFILE (cp deploy/local-helm/.env.example deploy/local-helm/.env and fill it)" >&2
   exit 1
 fi
 
@@ -74,7 +74,7 @@ echo "==> namespace"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
 echo "==> in-cluster Postgres"
-kubectl apply -n "$NS" -f "$ROOT/deploy/local/postgres.yaml"
+kubectl apply -n "$NS" -f "$ROOT/deploy/local-helm/postgres.yaml"
 kubectl rollout status -n "$NS" deploy/scarab-postgres --timeout=120s
 
 echo "==> scarab-server (image tag: $TAG)"
@@ -85,5 +85,5 @@ cat <<EOF
 
 Deployed. Next:
   kubectl port-forward -n $NS svc/scarab 8899:80   # leave running; cloudflared -> :8899
-  deploy/local/reseed.sh                           # fresh DB only: store PEM + register
+  deploy/local-helm/reseed.sh                      # fresh DB only: store PEM + register
 EOF

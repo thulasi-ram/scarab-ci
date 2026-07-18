@@ -198,11 +198,11 @@ just down    # tear it all down
 ```
 
 Requires `docker`, `kind`, `kubectl`, `cargo`, and `python3`. The kind cluster's
-kubeconfig is written to `dev/.kubeconfig` and used only via `KUBECONFIG`, so
-Scarab never touches an ambient (e.g. production) context. Postgres is published
-on **55432** to avoid clashing with a host Postgres on 5432. Config is entirely
-env-driven (`SCARAB_DATABASE_URL`, `SCARAB_S3_*`, `KUBECONFIG`,
-`SCARAB_NAMESPACE`) — see `Justfile` and `dev/`.
+kubeconfig is written to `deploy/local-proc/.kubeconfig` and used only via
+`KUBECONFIG`, so Scarab never touches an ambient (e.g. production) context.
+Postgres is published on **55432** to avoid clashing with a host Postgres on
+5432. Config is entirely env-driven (`SCARAB_DATABASE_URL`, `SCARAB_S3_*`,
+`KUBECONFIG`, `SCARAB_NAMESPACE`) — see `Justfile` and `deploy/local-proc/`.
 
 Without Docker/kind, the server still runs API-only against a local Postgres and
 a filesystem object store (`--object-dir`); the background driver is skipped

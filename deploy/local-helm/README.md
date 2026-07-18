@@ -6,11 +6,11 @@ watch this repo's own CI run on Scarab. Docs (`scarab-docs-ui`) are **not** depl
 here; they ship to GitHub Pages.
 
 ## Config — one file
-Everything (image, App knobs, secrets, reseed inputs) lives in `deploy/local/.env`
+Everything (image, App knobs, secrets, reseed inputs) lives in `deploy/local-helm/.env`
 (gitignored). Both scripts source it; a real environment variable already set in
 your shell overrides the file value.
 ```sh
-cp deploy/local/.env.example deploy/local/.env
+cp deploy/local-helm/.env.example deploy/local-helm/.env
 # fill in: SCARAB_MASTER_KEY (STABLE — reuse .env.local), SCARAB_GITHUB_WEBHOOK_SECRET,
 # SCARAB_RESULTS_TOKEN_SECRET, SCARAB_GITHUB_APP_ID, SCARAB_PUBLIC_URL (tunnel),
 # and the reseed inputs (SCARAB_APP_PEM / INSTALL_ID / ORG / REPO).
@@ -42,19 +42,19 @@ new access** — the change is not live until approved. Webhook URL is
 `<SCARAB_PUBLIC_URL>/webhooks/github`, secret is `SCARAB_GITHUB_WEBHOOK_SECRET`.
 
 ## Image
-- **Local (arm64, now):** `docker build -t scarab-server:dogfood-local .` plus the
-  clone/sidecar images (`docker build -t scarab-clone:dogfood deploy/clone`,
-  `... scarab-results-sidecar:dogfood deploy/sidecar`). Keep `IMAGE_TAG=dogfood-local`.
+- **Local (arm64, now):** `docker build -t scarab-server:dogfood-local -f docker/server/Dockerfile .`
+  plus the clone/sidecar images (`docker build -t scarab-clone:dogfood docker/clone`,
+  `... scarab-results-sidecar:dogfood docker/sidecar`). Keep `IMAGE_TAG=dogfood-local`.
 - **GHA artifact (the real loop):** once `image.yml` publishes a multi-arch tag,
   set `IMAGE_REPOSITORY=ghcr.io/thulasi-ram/scarab-server` in `.env` and deploy by
-  SHA — `deploy/local/deploy.sh sha-<gitsha>`. (Needs the ghcr package public, or an
+  SHA — `deploy/local-helm/deploy.sh sha-<gitsha>`. (Needs the ghcr package public, or an
   `imagePullSecrets` entry.)
 
 ## Deploy / expose / seed
 ```sh
-deploy/local/deploy.sh [image-tag]              # postgres + helm upgrade --install
+deploy/local-helm/deploy.sh [image-tag]         # postgres + helm upgrade --install
 kubectl port-forward -n scarab svc/scarab 8899:80   # leave running; cloudflared -> :8899
-deploy/local/reseed.sh                          # fresh DB only: store PEM + register
+deploy/local-helm/reseed.sh                     # fresh DB only: store PEM + register
 ```
 `deploy.sh` renders a transient Helm values file from `.env` (deleted on exit — no
 secrets on the CLI or on disk). `reseed.sh` reads the webhook secret from the
@@ -63,7 +63,7 @@ deployed Secret, so it isn't written down anywhere.
 ## Clean slate
 ```sh
 helm uninstall scarab -n scarab
-kubectl delete -n scarab -f deploy/local/postgres.yaml   # drops the PVC => wipes the DB
+kubectl delete -n scarab -f deploy/local-helm/postgres.yaml   # drops the PVC => wipes the DB
 # next deploy.sh + reseed.sh starts fresh
 ```
 Because the App PEM lives in Postgres (encrypted under `SCARAB_MASTER_KEY`), wiping the

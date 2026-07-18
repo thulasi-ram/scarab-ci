@@ -1,6 +1,6 @@
 # A single-node kind cluster for local step execution (ADR-0005 k8s-only,
-# ADR-0019 local execution). Its kubeconfig is written to dev/.kubeconfig and
-# used ONLY via KUBECONFIG=dev/.kubeconfig, so Scarab never touches an ambient
+# ADR-0019 local execution). Its kubeconfig is written to deploy/local-proc/.kubeconfig and
+# used ONLY via KUBECONFIG=deploy/local-proc/.kubeconfig, so Scarab never touches an ambient
 # (e.g. production) context.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4

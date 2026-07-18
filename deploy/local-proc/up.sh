@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Bring up the full Scarab dev stack and start scarab-server against it:
 #   - Postgres + MinIO via docker compose
-#   - a kind cluster (isolated kubeconfig at dev/.kubeconfig)
+#   - a kind cluster (isolated kubeconfig at deploy/local-proc/.kubeconfig)
 #   - scarab-server --role converged --serve in the background
 #
 # Idempotent: safe to re-run. Requires docker, kind, kubectl.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-root="$(cd "$here/.." && pwd)"
+root="$(cd "$here/../.." && pwd)"
 kubeconfig="$here/.kubeconfig"
 cluster="scarab-dev"
 
@@ -60,11 +60,11 @@ echo $! > "$here/server.pid"
 echo "==> waiting for the API (/healthz)"
 for _ in $(seq 1 30); do
   if curl -sf http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
-    echo "==> scarab-server is up on http://127.0.0.1:8080 (logs: dev/server.log)"
+    echo "==> scarab-server is up on http://127.0.0.1:8080 (logs: deploy/local-proc/server.log)"
     echo "    run 'just demo' to submit a pipeline and watch it complete."
     exit 0
   fi
   sleep 1
 done
-echo "error: scarab-server did not become healthy; see dev/server.log" >&2
+echo "error: scarab-server did not become healthy; see deploy/local-proc/server.log" >&2
 exit 1

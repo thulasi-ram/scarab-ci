@@ -4,7 +4,7 @@
 #   2. re-register the installation by POSTing a signed synthetic
 #      `installation:created` (same path a real GitHub delivery takes)
 #
-# Config comes from deploy/local/.env (gitignored — see .env.example); a real
+# Config comes from deploy/local-helm/.env (gitignored — see .env.example); a real
 # environment variable already set in your shell overrides the file. Nothing
 # sensitive is baked in — the webhook secret defaults to whatever the deployed
 # k8s Secret already holds.
@@ -26,10 +26,10 @@ fi
 
 BASE="${BASE:-http://localhost:8899}"
 NS="${NAMESPACE:-scarab}"
-: "${SCARAB_APP_PEM:?set SCARAB_APP_PEM in deploy/local/.env}"
-: "${SCARAB_INSTALL_ID:?set SCARAB_INSTALL_ID in deploy/local/.env}"
-: "${SCARAB_ORG:?set SCARAB_ORG in deploy/local/.env}"
-: "${SCARAB_REPO:?set SCARAB_REPO in deploy/local/.env}"
+: "${SCARAB_APP_PEM:?set SCARAB_APP_PEM in deploy/local-helm/.env}"
+: "${SCARAB_INSTALL_ID:?set SCARAB_INSTALL_ID in deploy/local-helm/.env}"
+: "${SCARAB_ORG:?set SCARAB_ORG in deploy/local-helm/.env}"
+: "${SCARAB_REPO:?set SCARAB_REPO in deploy/local-helm/.env}"
 [ -f "$SCARAB_APP_PEM" ] || { echo "PEM not found: $SCARAB_APP_PEM" >&2; exit 1; }
 
 # Default the webhook secret to whatever the running release already uses, so it

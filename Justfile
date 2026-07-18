@@ -27,19 +27,19 @@ docs:
 
 # Bring up the full dev stack and start scarab-server against it.
 up:
-    bash dev/up.sh
+    bash deploy/local-proc/up.sh
 
 # Submit a one-step pipeline to the running server and watch it complete.
 demo:
-    bash dev/demo.sh
+    bash deploy/local-proc/demo.sh
 
 # Tear down the whole stack.
 down:
-    bash dev/down.sh
+    bash deploy/local-proc/down.sh
 
 # Tail the background server log.
 logs:
-    tail -f dev/server.log
+    tail -f deploy/local-proc/server.log
 
 # Run scarab-server in the FOREGROUND against the dev stack (Ctrl-C to stop).
 # Useful when iterating; `just up` runs it in the background instead.
@@ -47,7 +47,7 @@ serve:
     SCARAB_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab \
     SCARAB_S3_BUCKET=scarab-logs SCARAB_S3_ENDPOINT=http://127.0.0.1:9000 \
     SCARAB_S3_ACCESS_KEY=scarab SCARAB_S3_SECRET_KEY=scarabsecret SCARAB_S3_REGION=us-east-1 \
-    KUBECONFIG=dev/.kubeconfig SCARAB_NAMESPACE=scarab \
+    KUBECONFIG=deploy/local-proc/.kubeconfig SCARAB_NAMESPACE=scarab \
     SCARAB_DEV_INSECURE=1 \
     cargo run -p scarab-server -- --role converged --serve --addr 127.0.0.1:8080
 

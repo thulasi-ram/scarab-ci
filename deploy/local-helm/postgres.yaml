@@ -1,7 +1,7 @@
 # Dev-only in-cluster Postgres for the local Helm dogfood (NOT for production —
 # use a managed Postgres there). One replica, a PVC via k3s local-path so the
 # durable state (incl. the stored GitHub App PEM) survives pod restarts. Wipe a
-# clean slate by deleting the PVC (see deploy/local/README.md).
+# clean slate by deleting the PVC (see deploy/local-helm/README.md).
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

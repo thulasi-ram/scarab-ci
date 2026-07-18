@@ -2,10 +2,10 @@
 **/*.rs.bk
 .DS_Store
 
-# dev harness runtime artifacts
-/dev/.kubeconfig
-/dev/server.pid
-/dev/server.log
+# dev harness runtime artifacts (local-proc mode)
+/deploy/local-proc/.kubeconfig
+/deploy/local-proc/server.pid
+/deploy/local-proc/server.log
 # local object-store backend (default dev fallback) and other runtime state
 # under .scarab/ — but keep committed pipeline configs (.scarab/*.yaml and the
 # .scarab/lib/ catalog) tracked; that is where a repo declares its own CI.
@@ -28,4 +28,4 @@
 .workspaces/
 
 # Local dogfood config (secrets) — never commit
-/deploy/local/.env
+/deploy/local-helm/.env

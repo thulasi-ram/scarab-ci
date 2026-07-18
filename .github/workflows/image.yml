@@ -1,5 +1,5 @@
 # Build (and publish) Scarab's first-party container images, multi-arch:
-#   - scarab-server           (the converged API/worker binary, ./Dockerfile)
+#   - scarab-server           (the converged API/worker binary, docker/server/Dockerfile)
 #   - scarab-clone            (the canonical clone step image, ADR-0045)
 #   - scarab-results-sidecar  (the trusted results-egress sidecar, ADR-0042)
 #
@@ -20,15 +20,15 @@ on:
     tags: ['v*']
   pull_request:
     paths:
-      - 'Dockerfile'
+      - 'docker/server/Dockerfile'
       - '.dockerignore'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
       - 'ui/**'
       - 'openapi.json'
-      - 'deploy/clone/**'
-      - 'deploy/sidecar/**'
+      - 'docker/clone/**'
+      - 'docker/sidecar/**'
       - '.github/workflows/image.yml'
   workflow_dispatch:
 
@@ -60,13 +60,13 @@ jobs:
             runner: ubuntu-24.04-arm
           - image: scarab-server
             context: .
-            dockerfile: Dockerfile
+            dockerfile: docker/server/Dockerfile
           - image: scarab-clone
-            context: deploy/clone
-            dockerfile: deploy/clone/Dockerfile
+            context: docker/clone
+            dockerfile: docker/clone/Dockerfile
           - image: scarab-results-sidecar
-            context: deploy/sidecar
-            dockerfile: deploy/sidecar/Dockerfile
+            context: docker/sidecar
+            dockerfile: docker/sidecar/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
