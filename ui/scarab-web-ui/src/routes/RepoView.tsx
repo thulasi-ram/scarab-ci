@@ -1,8 +1,10 @@
 // Repo dashboard (tier 2) — tabs over one repository: Runs (default),
-// Environments, Secrets, Settings. Branches and pull requests aren't their own
-// tabs anymore — they're just ways of slicing runs, so they live as a branch
-// filter and a trigger filter on the runs list. The header CTA is contextual to
-// the active tab (run a pipeline, add an environment, add a secret).
+// Environments, Secrets, Settings. The runs list carries only a status filter
+// today. Branch and trigger/PR filters used to live here (as dropdowns), but
+// were removed in the de-mock (ADR-0054) because the real RunSummary carries no
+// branch/trigger/PR provenance yet — restore them once RunSummaryDto exposes
+// those fields. The header CTA is contextual to the active tab (run a pipeline,
+// add an environment, add a secret).
 import { createResource, createSignal, createEffect, For, Show } from "solid-js";
 import { useParams, useNavigate } from "@solidjs/router";
 import { recordVisit } from "../visited";
@@ -14,6 +16,7 @@ import {
   fetchSecretMatrix,
   listEnvironments,
   listDeployments,
+  putEnvironment,
   type RunSummary,
   type RepoEnvironment,
   type SecretCellStatus,
@@ -49,6 +52,7 @@ export default function RepoView() {
   const [tab, setTab] = createSignal<Tab>("runs");
   const [statusFilter, setStatusFilter] = createSignal<"all" | "running" | "failed">("all");
   const [showEnvDialog, setShowEnvDialog] = createSignal(false);
+  const [envEpoch, setEnvEpoch] = createSignal(0); // bump to refetch the env list after a create
   const [secretFocus, setSecretFocus] = createSignal(0);
 
   const filtered = () => {
@@ -152,7 +156,7 @@ export default function RepoView() {
 
       {/* ---- Environments ---- */}
       <Show when={tab() === "environments"}>
-        <RepoEnvironments org={org()} repo={repo()} />
+        <RepoEnvironments org={org()} repo={repo()} epoch={envEpoch()} />
       </Show>
 
       {/* ---- Secrets ---- */}
@@ -175,7 +179,12 @@ export default function RepoView() {
       </Show>
 
       <Show when={showEnvDialog()}>
-        <EnvDialog repo={repo()} onClose={() => setShowEnvDialog(false)} />
+        <EnvDialog
+          org={org()}
+          repo={repo()}
+          onClose={() => setShowEnvDialog(false)}
+          onCreated={() => setEnvEpoch((n) => n + 1)}
+        />
       </Show>
     </section>
   );
@@ -183,8 +192,9 @@ export default function RepoView() {
 
 // ---- environments (real API: `GET …/environments` + per-env deployments) --
 
-function RepoEnvironments(props: { org: string; repo: string }) {
-  const key = () => ({ org: props.org, repo: props.repo });
+function RepoEnvironments(props: { org: string; repo: string; epoch: number }) {
+  // `epoch` is in the key so a create in EnvDialog re-fetches the list.
+  const key = () => ({ org: props.org, repo: props.repo, epoch: props.epoch });
   const [envs] = createResource(key, ({ org, repo }) => listEnvironments(org, repo));
 
   return (
@@ -243,11 +253,51 @@ function EnvPanel(props: { org: string; repo: string; env: RepoEnvironment }) {
   );
 }
 
-// ---- new-environment dialog (representative) ------------------------------
-// Mirrors the run dialog's honesty: the fields are real (name, gate policy,
-// allowed refs) but binding lands with the environments backend.
+// ---- new-environment dialog ----------------------------------------------
+// Wired to `PUT …/environments/{name}` (ADR-0037). Fields map 1:1 onto
+// ProtectionRules: comma lists → string[], numbers → wait_timer/concurrency.
 
-function EnvDialog(props: { repo: string; onClose: () => void }) {
+const splitList = (s: string): string[] =>
+  s.split(",").map((x) => x.trim()).filter((x) => x.length > 0);
+
+function EnvDialog(props: {
+  org: string;
+  repo: string;
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const [name, setName] = createSignal("");
+  const [approvers, setApprovers] = createSignal("");
+  const [waitTimer, setWaitTimer] = createSignal("0");
+  const [allowedRefs, setAllowedRefs] = createSignal("main");
+  const [concurrency, setConcurrency] = createSignal("1");
+  const [saving, setSaving] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+
+  const save = async () => {
+    const n = name().trim();
+    if (!n) {
+      setError("Name is required.");
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await putEnvironment(props.org, props.repo, n, {
+        approvers: splitList(approvers()),
+        wait_timer: Number(waitTimer()) || 0,
+        allowed_refs: splitList(allowedRefs()),
+        concurrency: Number(concurrency()) || 1,
+      });
+      props.onCreated();
+      props.onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not save environment.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div class="modal-scrim" onClick={props.onClose}>
       <div class="modal" onClick={(e) => e.stopPropagation()}>
@@ -255,25 +305,63 @@ function EnvDialog(props: { repo: string; onClose: () => void }) {
         <div class="modal-body">
           <div class="form-r">
             <label>name</label>
-            <input class="input" placeholder="e.g. production" />
+            <input
+              class="input"
+              placeholder="e.g. production"
+              value={name()}
+              onInput={(e) => setName(e.currentTarget.value)}
+            />
           </div>
           <div class="form-r">
-            <label>required approvers</label>
-            <div class="input select-like">1 <Icon icon="chevron-down" size={13} /></div>
+            <label>approvers</label>
+            <input
+              class="input"
+              placeholder="comma-separated users (blank = none)"
+              value={approvers()}
+              onInput={(e) => setApprovers(e.currentTarget.value)}
+            />
+          </div>
+          <div class="form-r">
+            <label>wait timer (s)</label>
+            <input
+              class="input"
+              type="number"
+              min="0"
+              value={waitTimer()}
+              onInput={(e) => setWaitTimer(e.currentTarget.value)}
+            />
           </div>
           <div class="form-r">
             <label>allowed refs</label>
-            <div class="input select-like">main only <Icon icon="chevron-down" size={13} /></div>
+            <input
+              class="input"
+              placeholder="comma-separated (blank = any ref)"
+              value={allowedRefs()}
+              onInput={(e) => setAllowedRefs(e.currentTarget.value)}
+            />
           </div>
+          <div class="form-r">
+            <label>concurrency</label>
+            <input
+              class="input"
+              type="number"
+              min="1"
+              value={concurrency()}
+              onInput={(e) => setConcurrency(e.currentTarget.value)}
+            />
+          </div>
+          <Show when={error()}>
+            <p class="error">{error()}</p>
+          </Show>
           <div class="modal-actions">
-            <button class="btn btn-primary" onClick={props.onClose}>
-              <Icon icon="plus" size={14} /> Create
+            <button class="btn btn-primary" disabled={saving()} onClick={save}>
+              <Icon icon="plus" size={14} /> {saving() ? "Creating…" : "Create"}
             </button>
             <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
           </div>
           <p class="subtle modal-note">
-            Defines a deploy gate (approvers, wait, allowed refs). Persists once the
-            environments backend lands (ADR-0037).
+            Defines a deploy gate (approvers, wait timer, allowed refs). Requires the
+            Administer capability on this repo (ADR-0037).
           </p>
         </div>
       </div>

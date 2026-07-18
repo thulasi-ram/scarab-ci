@@ -176,6 +176,25 @@ export async function listEnvironments(org: string, repo: string): Promise<RepoE
   return (await res.json()) as RepoEnvironment[];
 }
 
+/** Create or replace an environment's protection rules
+ *  (`PUT …/environments/{name}`, ADR-0037; requires Administer). */
+export async function putEnvironment(
+  org: string,
+  repo: string,
+  name: string,
+  protection: ProtectionRules,
+): Promise<void> {
+  const res = await fetch(
+    `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/environments/${encodeURIComponent(name)}`,
+    {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(protection),
+    },
+  );
+  if (!res.ok) throw new Error("failed to save environment");
+}
+
 /** A recorded deployment into an environment (`at` is epoch millis). */
 export type Deployment = {
   org: string;
