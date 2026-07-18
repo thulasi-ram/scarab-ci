@@ -48,6 +48,7 @@ fn prod_rules(allowed_refs: &[&str]) -> ProtectionRules {
         },
         oidc_subject: "scarab:acme/web/prod".into(),
         privileged_images: Vec::new(),
+        permit_k8s_overlay: false,
     }
 }
 

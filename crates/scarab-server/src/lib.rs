@@ -2615,23 +2615,25 @@ fn admit_step_grants(
 }
 
 /// Admit a step's raw `k8s_overlay` (ADR-0055) against the target Environment.
-/// A raw overlay carries no authority — mirroring a governed grant, it is honored
-/// only under an Environment that permits raw placement overlays, else the run is
-/// rejected **fail-closed**. Returns the overlay to persist (or `None`).
-///
-/// TODO(ADR-0055 governance slice): consult `ProtectionRules` for a
-/// `permit_k8s_overlay` grant. Until that field exists, every overlay is rejected
-/// fail-closed — the safe default the ADR specifies.
+/// A raw overlay carries no authority — mirroring a governed grant
+/// ([`admit_step_grants`]), it is honored only under an Environment whose
+/// `permit_k8s_overlay` is set, else the run is rejected **fail-closed**. An
+/// inline API run (no Environment) therefore never gets one. Returns the overlay
+/// to persist (or `None`).
 fn admit_k8s_overlay(
-    _protection: Option<&scarab_project::ProtectionRules>,
+    protection: Option<&scarab_project::ProtectionRules>,
     overlay: Option<&serde_json::Value>,
 ) -> Result<Option<serde_json::Value>, Vec<String>> {
     match overlay {
         None => Ok(None),
-        Some(_) => Err(vec![
-            "raw `k8s_overlay` requires a target Environment that permits raw overlays"
-                .to_string(),
-        ]),
+        Some(o) => match protection {
+            Some(p) if p.permit_k8s_overlay => Ok(Some(o.clone())),
+            _ => Err(vec![
+                "raw `k8s_overlay` requires a target Environment that permits raw overlays \
+                 (set `permit_k8s_overlay` on the environment)"
+                    .to_string(),
+            ]),
+        },
     }
 }
 
@@ -4689,7 +4691,7 @@ fn step_status_name(s: StepStatus) -> &'static str {
 
 #[cfg(test)]
 mod grant_admission_tests {
-    use super::admit_step_grants;
+    use super::{admit_k8s_overlay, admit_step_grants};
     use scarab_pipeline::StepSecurity;
     use scarab_project::{ImageGrant, ProtectionRules};
     use scarab_secrets::SecretScope;
@@ -4705,7 +4707,35 @@ mod grant_admission_tests {
             secret_scope: SecretScope::Org { org: "acme".into() },
             oidc_subject: String::new(),
             privileged_images: images,
+            permit_k8s_overlay: false,
         }
+    }
+
+    #[test]
+    fn k8s_overlay_none_is_always_admitted_as_none() {
+        assert_eq!(admit_k8s_overlay(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn k8s_overlay_rejected_without_environment() {
+        let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
+        let err = admit_k8s_overlay(None, Some(&overlay)).unwrap_err();
+        assert!(err.join("; ").contains("requires a target Environment that permits"));
+    }
+
+    #[test]
+    fn k8s_overlay_rejected_when_environment_does_not_permit() {
+        let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
+        let err = admit_k8s_overlay(Some(&rules(vec![])), Some(&overlay)).unwrap_err();
+        assert!(err.join("; ").contains("permit_k8s_overlay"));
+    }
+
+    #[test]
+    fn k8s_overlay_admitted_when_environment_permits() {
+        let overlay = serde_json::json!({"spec": {"schedulerName": "x"}});
+        let mut p = rules(vec![]);
+        p.permit_k8s_overlay = true;
+        assert_eq!(admit_k8s_overlay(Some(&p), Some(&overlay)).unwrap(), Some(overlay));
     }
 
     #[test]

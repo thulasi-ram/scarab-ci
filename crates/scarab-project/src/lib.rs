@@ -83,6 +83,12 @@ pub struct ProtectionRules {
     /// `run-as-root` is self-service and never appears here.
     #[serde(default)]
     pub privileged_images: Vec<ImageGrant>,
+    /// Whether steps targeting this environment may set a raw `k8s_overlay`
+    /// (ADR-0055): the governed placement escape hatch. **Off by default
+    /// (fail-closed)** — a raw overlay carries no authority and is admitted only
+    /// where an admin has opted in. Administer-only, like the privilege whitelist.
+    #[serde(default)]
+    pub permit_k8s_overlay: bool,
 }
 
 /// A per-image entry in an [`Environment`]'s privilege whitelist (ADR-0039): the
@@ -362,6 +368,7 @@ mod tests {
             secret_scope: SecretScope::Org { org: "acme".into() },
             oidc_subject: String::new(),
             privileged_images: Vec::new(),
+            permit_k8s_overlay: false,
         }
     }
 
