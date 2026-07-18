@@ -46,13 +46,45 @@ export async function listRuns(limit = 50): Promise<RunSummary[]> {
 }
 
 /** List the registered projects (`GET /v1/repos`, ADR-0046) — the dashboard's
- * repo cards. Scoped server-side to what the caller may Read. */
+ * repo cards, most-recently-active first. Scoped server-side to what the caller
+ * may Read. */
 export async function listProjects(): Promise<Project[]> {
   const { data, error } = await api.GET("/v1/repos");
   if (error || !data) {
     throw new Error("failed to list projects");
   }
   return data;
+}
+
+/** One repo's most recent runs (`GET /v1/repos/{org}/{repo}/runs`) — the source
+ * for a repo card's pass/fail chart. Newest first. */
+export async function listRepoRuns(
+  org: string,
+  repo: string,
+  limit = 20,
+): Promise<RunSummary[]> {
+  const { data, error } = await api.GET("/v1/repos/{org}/{repo}/runs", {
+    params: { path: { org, repo }, query: { limit } },
+  });
+  if (error || !data) {
+    throw new Error(`failed to list runs for ${org}/${repo}`);
+  }
+  return data.runs;
+}
+
+/** The authenticated principal (`GET /v1/me`, ADR-0049) — the identity menu. */
+export type Me = components["schemas"]["MeResponse"];
+export async function getMe(): Promise<Me> {
+  const { data, error } = await api.GET("/v1/me");
+  if (error || !data) {
+    throw new Error("failed to load identity");
+  }
+  return data;
+}
+
+/** End the session (`POST /v1/auth/logout`), then send the user to login. */
+export async function logout(): Promise<void> {
+  await api.POST("/v1/auth/logout");
 }
 
 /** List a run's artifacts of record (`GET /v1/runs/{id}/artifacts`, ADR-0052). */

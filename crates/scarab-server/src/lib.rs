@@ -444,6 +444,10 @@ pub struct RunSummaryDto {
     pub id: String,
     pub status: String,
     pub created_at: i64,
+    /// Run duration in millis: `updated_at - created_at`. For a terminal run
+    /// this is its total wall time; for an in-flight run, elapsed-to-last-update.
+    /// Drives the dashboard's per-run bar heights (ADR-0046).
+    pub duration_ms: i64,
     /// The owning org, if the run is tenanted (trigger-created).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub org: Option<String>,
@@ -956,6 +960,7 @@ async fn list_runs(
                 id: s.run.0,
                 status: run_status_name(s.status).to_string(),
                 created_at: s.created_at.0,
+                duration_ms: (s.updated_at.0 - s.created_at.0).max(0),
                 org: s.tenant.as_ref().map(|(o, _)| o.clone()),
                 project: s.tenant.as_ref().map(|(_, p)| p.clone()),
             })
@@ -1192,6 +1197,40 @@ pub struct ProjectDto {
     /// The forge coordinate backing it (1:1 in v1).
     pub owner: String,
     pub name: String,
+    /// Epoch millis of the project's most recent run, or `null` if it has never
+    /// run — the dashboard's recency signal (ADR-0046). The domain carries no
+    /// push/created_at yet, so never-run repos have no ordering key here.
+    pub last_run_at: Option<i64>,
+}
+
+/// The authenticated principal (ADR-0049) — powers the UI's identity menu.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeResponse {
+    /// Stable, forge-agnostic identity subject.
+    pub subject: String,
+    /// Human display name, when the identity provides one.
+    pub display_name: Option<String>,
+    /// The principal's Scarab-native roles (e.g. `["Owner"]`).
+    pub roles: Vec<String>,
+}
+
+/// Return the current authenticated principal. In dev (auth disabled) this is
+/// the synthetic Owner.
+#[utoipa::path(
+    get,
+    path = "/v1/me",
+    responses(
+        (status = 200, body = MeResponse),
+        (status = 401, description = "not authenticated")
+    )
+)]
+async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeResponse>, ApiError> {
+    let principal = authenticate(&st, &headers, Action::Read).await?;
+    Ok(Json(MeResponse {
+        subject: principal.subject,
+        display_name: principal.display_name,
+        roles: principal.roles.iter().map(|r| format!("{r:?}")).collect(),
+    }))
 }
 
 /// The authenticated principal (ADR-0049) — powers the UI's identity menu.
@@ -1276,16 +1315,70 @@ async fn list_projects(
                     continue;
                 }
             }
+            // Recency signal (ADR-0046): the tenant's most recent run, if any.
+            let last_run_at = st
+                .db
+                .list_runs_for_tenant(&resolved.org, &resolved.project, 1)
+                .await?
+                .first()
+                .map(|r| r.created_at.0);
             out.push(ProjectDto {
                 org: resolved.org,
                 project: resolved.project,
                 owner: repo.owner,
                 name: repo.name,
+                last_run_at,
             });
         }
     }
-    out.sort_by(|a, b| (&a.org, &a.project).cmp(&(&b.org, &b.project)));
+    // Most-recently-active first; never-run repos fall back to (org, project)
+    // alphabetical (no push/created_at exists in the domain yet).
+    out.sort_by(|a, b| {
+        b.last_run_at
+            .cmp(&a.last_run_at)
+            .then_with(|| (&a.org, &a.project).cmp(&(&b.org, &b.project)))
+    });
     Ok(Json(out))
+}
+
+/// A repo's most recent runs, newest first (ADR-0046) — the dashboard's per-repo
+/// history and pass/fail chart source. Scoped to the repo's tenant.
+#[utoipa::path(
+    get,
+    path = "/v1/repos/{org}/{repo}/runs",
+    params(
+        ("org" = String, Path, description = "org slug"),
+        ("repo" = String, Path, description = "project (repo) name"),
+        ("limit" = Option<u32>, Query, description = "max runs (default 50, capped 200)")
+    ),
+    responses((status = 200, body = RunListResponse))
+)]
+async fn list_repo_runs(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo)): Path<(String, String)>,
+    Query(q): Query<ListRunsQuery>,
+) -> Result<Json<RunListResponse>, ApiError> {
+    let scope = scarab_identity::Scope::Project {
+        org: org.clone(),
+        name: repo.clone(),
+    };
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
+    let runs = st.db.list_runs_for_tenant(&org, &repo, limit).await?;
+    Ok(Json(RunListResponse {
+        runs: runs
+            .into_iter()
+            .map(|s| RunSummaryDto {
+                id: s.run.0,
+                status: run_status_name(s.status).to_string(),
+                created_at: s.created_at.0,
+                duration_ms: (s.updated_at.0 - s.created_at.0).max(0),
+                org: s.tenant.as_ref().map(|(o, _)| o.clone()),
+                project: s.tenant.as_ref().map(|(_, p)| p.clone()),
+            })
+            .collect(),
+    }))
 }
 
 /// One artifact in a run's list (ADR-0052).
@@ -3746,6 +3839,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         pipeline_interface,
         list_runs,
         list_projects,
+        list_repo_runs,
         get_run,
         get_events,
         get_logs,
@@ -3812,6 +3906,7 @@ fn router_inner(state: AppState) -> Router {
         )
         .route("/v1/repos/{org}/{repo}/bindings/import", post(import_bindings))
         .route("/v1/repos", get(list_projects))
+        .route("/v1/repos/{org}/{repo}/runs", get(list_repo_runs))
         .route("/v1/runs", post(create_run).get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))

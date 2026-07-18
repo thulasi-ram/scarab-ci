@@ -5,6 +5,9 @@
 import type { ParentProps } from "solid-js";
 import { A } from "@solidjs/router";
 import Icon from "./components/Icon";
+import UserMenu from "./components/UserMenu";
+import CommandPalette from "./components/CommandPalette";
+import { setPaletteOpen } from "./palette";
 import { theme, toggleTheme } from "./theme";
 import emblemLight from "./assets/brand/scarab-emblem.svg";
 import emblemDark from "./assets/brand/scarab-emblem-dark.svg";
@@ -25,9 +28,10 @@ export default function Layout(props: ParentProps) {
           <span>Scarab</span>
         </A>
         <span class="topbar-spacer" />
-        <button class="search-chip" type="button">
+        <button class="search-chip" type="button" onClick={() => setPaletteOpen(true)}>
           <Icon icon="search" size={13} />
-          <span class="mono">⌘K</span>
+          <span class="search-chip-label">Search</span>
+          <span class="mono kbd">⌘K</span>
         </button>
         <button
           class="theme-toggle"
@@ -38,8 +42,9 @@ export default function Layout(props: ParentProps) {
         >
           <Icon icon={theme() === "dark" ? "sun" : "moon"} size={15} />
         </button>
-        <span class="avatar" title="t.ram" />
+        <UserMenu />
       </nav>
+      <CommandPalette />
       {props.children}
     </div>
   );

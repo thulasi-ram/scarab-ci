@@ -46,8 +46,9 @@ export default defineConfig({
         '@fontsource-variable/geist/index.css',
         '@fontsource/jetbrains-mono/400.css',
         '@fontsource/jetbrains-mono/500.css',
-        // Display voice: Major Mono Display (headings + wordmark).
-        '@fontsource/major-mono-display/index.css',
+        // Display voice: Space Grotesk (headings + wordmark).
+        '@fontsource/space-grotesk/500.css',
+        '@fontsource/space-grotesk/700.css',
         './src/styles/scarab.css',
       ],
       social: [
