@@ -384,10 +384,27 @@ pub struct StepSpec {
     pub matrix: Option<Matrix>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<When>,
-    #[serde(default)]
-    pub runs_on: RunsOn,
+    /// Placement targeting (ADR-0055): the names of the [`PlacementProfile`]s this
+    /// step runs on, whose admin-defined k8s overlays are merged (in listed order)
+    /// onto the step's Pod. Empty = the operator's `default` profile. The author
+    /// **names profiles**, never raw k8s — so a pipeline carries no cluster
+    /// topology (a bounded name-only reference) and no Kubernetes primitives.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placement_profiles: Vec<String>,
+    /// Requested compute resources (ADR-0055): exact `cpu`/`memory`, applied to the
+    /// step container's requests/limits. Deliberately **not** named `size` tiers —
+    /// state the specifics.
     #[serde(default)]
     pub resources: Resources,
+    /// Governed placement escape hatch (ADR-0055): a raw pod-spec fragment
+    /// strategic-merged **last** onto the generated Pod. Carries **no authority** —
+    /// like a governed [`StepSecurity`] grant, it is admitted only if the run's
+    /// target Environment permits raw overlays, else the run is rejected
+    /// fail-closed. The `k8s_` prefix marks the backend-coupling (a pipeline using
+    /// it will not run on the local/dev executor). For the rare *dynamic per-job*
+    /// k8s need; static placement belongs in a [`PlacementProfile`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k8s_overlay: Option<serde_json::Value>,
     /// The concrete matrix coordinate this instance was expanded from (empty for
     /// steps authored without a matrix). Consumed later by CEL interpolation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -599,13 +616,31 @@ pub struct Matrix {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct When(pub String);
 
-/// Runner selector (labels / class the step must be scheduled on).
+/// A **PlacementProfile** (ADR-0055): an operator-owned, cluster-scoped named
+/// bundle mapping a `name` → concrete Kubernetes placement (nodeSelector /
+/// tolerations / runtimeClass / annotations — an *opaque overlay*). It lives in
+/// Scarab operator config, **not** in a pipeline; a step references it *by name*
+/// via [`StepSpec::placement_profiles`]. Kept here as the authoring-side shape so
+/// the executor and config layers share one definition.
+///
+/// It is *where a step lands* — not an `Environment` (deploy governance) and not
+/// a `Run` (a pipeline instance). One profile in the registry may be `default`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunsOn {
-    pub labels: Vec<String>,
+pub struct PlacementProfile {
+    /// The name a step references in `placement_profiles`.
+    pub name: String,
+    /// Marks the profile applied when a step names none. At most one per registry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+    /// The concrete k8s placement this profile contributes — merged onto the Pod.
+    /// An opaque JSON pod-spec fragment, so an admin can bake any static placement
+    /// fact in without a Scarab schema change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k8s: Option<serde_json::Value>,
 }
 
-/// Requested compute resources for a step.
+/// Requested compute resources for a step (ADR-0055). Exact `cpu`/`memory`, not
+/// named `size` tiers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resources {
     pub cpu_millis: Option<u32>,
@@ -1446,6 +1481,23 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 step.id
             ));
         }
+        // Placement (ADR-0055): profile names must be non-empty, and a raw
+        // `k8s_overlay`, if present, must be a JSON object (a pod-spec fragment) —
+        // never a scalar/array — so it can strategic-merge onto the Pod.
+        if step.placement_profiles.iter().any(|p| p.trim().is_empty()) {
+            diagnostics.push(format!(
+                "step `{}`: `placement_profiles` contains an empty profile name",
+                step.id
+            ));
+        }
+        if let Some(overlay) = &step.k8s_overlay {
+            if !overlay.is_object() {
+                diagnostics.push(format!(
+                    "step `{}`: `k8s_overlay` must be a mapping (a pod-spec fragment)",
+                    step.id
+                ));
+            }
+        }
         // A build step runs the blessed rootless BuildKit image (ADR-0018):
         // the author names no image/command and needs no privilege (rootless
         // by construction).
@@ -1868,6 +1920,45 @@ mod tests {
         assert!(ir2.steps[0].security.is_none());
         let json = serde_json::to_string(&ir2).unwrap();
         assert!(!json.contains("security"));
+    }
+
+    #[test]
+    fn placement_fields_parse_and_round_trip() {
+        let ir = compile(
+            r#"
+            ir_version: 1
+            steps:
+              - id: heavy
+                image: busybox
+                placement_profiles: [arm64, critical]
+                resources: { cpu_millis: 8000, memory_mib: 16384 }
+                k8s_overlay:
+                  spec:
+                    schedulerName: my-scheduler
+            "#,
+        );
+        let s = &ir.steps[0];
+        assert_eq!(s.placement_profiles, vec!["arm64".to_string(), "critical".to_string()]);
+        assert_eq!(s.resources.cpu_millis, Some(8000));
+        assert_eq!(s.resources.memory_mib, Some(16384));
+        assert_eq!(s.k8s_overlay.as_ref().unwrap()["spec"]["schedulerName"], json!("my-scheduler"));
+        // A step with no placement omits the fields on serialize.
+        let bare = compile("steps: [{ id: a, image: busybox }]");
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(!json.contains("placement_profiles"));
+        assert!(!json.contains("k8s_overlay"));
+    }
+
+    #[test]
+    fn k8s_overlay_must_be_a_mapping() {
+        let errs = errors("steps: [{ id: a, image: busybox, k8s_overlay: [1, 2] }]");
+        assert!(errs.iter().any(|e| e.contains("`k8s_overlay` must be a mapping")));
+    }
+
+    #[test]
+    fn empty_placement_profile_name_is_rejected() {
+        let errs = errors(r#"steps: [{ id: a, image: busybox, placement_profiles: ["", "x"] }]"#);
+        assert!(errs.iter().any(|e| e.contains("empty profile name")));
     }
 
     #[test]

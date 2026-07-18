@@ -12,9 +12,10 @@ use async_trait::async_trait;
 use futures::io::AsyncBufRead;
 use futures::AsyncReadExt;
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EmptyDirVolumeSource, EnvVar, Pod, PodSpec, SeccompProfile,
-    SecurityContext, Volume, VolumeMount,
+    Capabilities, Container, EmptyDirVolumeSource, EnvVar, Pod, PodSpec, ResourceRequirements,
+    SeccompProfile, SecurityContext, Volume, VolumeMount,
 };
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, AttachParams, DeleteParams, LogParams, Patch, PatchParams, PostParams};
 use std::sync::Arc;
@@ -51,6 +52,35 @@ pub struct ResultsEgress {
     pub sidecar_image: String,
 }
 
+/// Operator-owned placement config (ADR-0055): the cluster **baseline** stamped
+/// onto every step Pod plus the named **PlacementProfile** registry a step selects
+/// from. Owned by the operator (server/executor config), never by a pipeline.
+/// Default (empty) = no placement mutation, preserving the pre-0055 behavior.
+/// Deserializable so an operator supplies it as one gitops-managed file
+/// (`SCARAB_PLACEMENT_CONFIG_FILE`), never in a pipeline.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PlacementConfig {
+    /// A raw pod-spec fragment merged onto **every** step Pod first — the
+    /// pain-killer for tainted clusters (default tolerations/nodeSelector). `None`
+    /// = no baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<serde_json::Value>,
+    /// Default container resources applied when a step requests none. A step's own
+    /// `resources` wins per-field.
+    #[serde(default)]
+    pub default_resources: scarab_pipeline::Resources,
+    /// The named profile registry. A step's `placement_profiles` are resolved
+    /// against this by name; an unknown name fails the launch (fail-closed).
+    #[serde(default)]
+    pub profiles: Vec<scarab_pipeline::PlacementProfile>,
+}
+
+impl PlacementConfig {
+    fn profile(&self, name: &str) -> Option<&scarab_pipeline::PlacementProfile> {
+        self.profiles.iter().find(|p| p.name == name)
+    }
+}
+
 /// A Kubernetes-backed executor. Holds an optional client so the composition
 /// root can construct it without contacting an API server.
 pub struct K8sExecutor {
@@ -75,6 +105,8 @@ pub struct K8sExecutor {
     /// is harvested post-step: matching files upload as object blobs and the
     /// metadata rides a Pod annotation the orchestrator persists.
     artifact_store: Option<Arc<dyn scarab_storage::ObjectStore>>,
+    /// Operator placement config (ADR-0055): baseline + PlacementProfile registry.
+    placement: PlacementConfig,
 }
 
 impl K8sExecutor {
@@ -87,6 +119,7 @@ impl K8sExecutor {
             workspace_cas: None,
             artifact_store: None,
             clone_image: DEFAULT_CLONE_IMAGE.to_string(),
+            placement: PlacementConfig::default(),
         }
     }
 
@@ -99,7 +132,15 @@ impl K8sExecutor {
             workspace_cas: None,
             artifact_store: None,
             clone_image: DEFAULT_CLONE_IMAGE.to_string(),
+            placement: PlacementConfig::default(),
         }
+    }
+
+    /// Set the operator placement config (ADR-0055): the baseline stamped on every
+    /// step Pod and the named PlacementProfile registry steps select from.
+    pub fn with_placement(mut self, placement: PlacementConfig) -> Self {
+        self.placement = placement;
+        self
     }
 
     /// Override the canonical scarab-clone image (ADR-0045).
@@ -696,6 +737,10 @@ impl Executor for K8sExecutor {
             self.workspace_cas.is_some(),
             &self.clone_image,
         );
+        // ADR-0055: stamp the baseline, merge the named PlacementProfiles + the
+        // governed k8s_overlay, and apply requested resources — fallible because a
+        // named profile might not exist in the registry (fail-closed).
+        let pod = apply_placement(pod, spec, &self.placement).map_err(ExecError::Launch)?;
         match pods.create(&PostParams::default(), &pod).await {
             Ok(created) => {
                 self.ensure_step_secrets(&name, &created, spec).await?;
@@ -1613,6 +1658,97 @@ pub fn build_pod(
     }
 }
 
+/// Apply the operator placement config + the step's requested placement to a
+/// freshly built Pod (ADR-0055). Overlay order (later wins): **baseline** → each
+/// named **PlacementProfile** (in listed order) → the governed **`k8s_overlay`**.
+/// Container resources are applied to the step container from the step's
+/// `resources`, falling back per-field to the baseline default. Overlays are
+/// RFC-7386 merge-patches (objects merge recursively; arrays/scalars replace).
+///
+/// Returns `Err` if a step names a PlacementProfile absent from the registry —
+/// fail-closed, never a silently mis-scheduled Pod. A no-op (returns the Pod
+/// unchanged) when there is no baseline, no profile, no overlay and no resources,
+/// preserving the pre-0055 behavior exactly.
+fn apply_placement(
+    mut pod: Pod,
+    spec: &StepSpec,
+    placement: &PlacementConfig,
+) -> Result<Pod, String> {
+    // 1. Container resources (typed) onto the step container, baseline-defaulted.
+    let cpu = spec.resources.cpu_millis.or(placement.default_resources.cpu_millis);
+    let mem = spec.resources.memory_mib.or(placement.default_resources.memory_mib);
+    if cpu.is_some() || mem.is_some() {
+        if let Some(pod_spec) = pod.spec.as_mut() {
+            if let Some(c) = pod_spec.containers.iter_mut().find(|c| c.name == STEP_CONTAINER) {
+                c.resources = Some(resource_requirements(cpu, mem));
+            }
+        }
+    }
+
+    // 2. Build the raw overlay: baseline → named profiles (in order) → k8s_overlay.
+    let mut overlay = serde_json::Value::Null;
+    if let Some(base) = &placement.baseline {
+        json_merge(&mut overlay, base);
+    }
+    for name in &spec.placement_profiles {
+        let profile = placement
+            .profile(name)
+            .ok_or_else(|| format!("unknown placement_profile `{name}` (not in the registry)"))?;
+        if let Some(k8s) = &profile.k8s {
+            json_merge(&mut overlay, k8s);
+        }
+    }
+    if let Some(o) = &spec.k8s_overlay {
+        json_merge(&mut overlay, o);
+    }
+
+    // 3. Merge the overlay onto the Pod (no-op when empty). k8s_openapi serializes
+    // with the k8s JSON field names (nodeSelector, tolerations…), which is exactly
+    // what an operator writes into a baseline/profile/overlay.
+    if !overlay.is_null() {
+        let mut pod_value = serde_json::to_value(&pod).map_err(|e| format!("pod encode: {e}"))?;
+        json_merge(&mut pod_value, &overlay);
+        pod = serde_json::from_value(pod_value)
+            .map_err(|e| format!("pod decode after overlay merge: {e}"))?;
+    }
+    Ok(pod)
+}
+
+/// RFC-7386 JSON merge-patch: objects merge recursively; a `null` in the patch
+/// deletes the key; every other value (scalar or array) replaces.
+fn json_merge(base: &mut serde_json::Value, patch: &serde_json::Value) {
+    use serde_json::Value;
+    match (base, patch) {
+        (Value::Object(b), Value::Object(p)) => {
+            for (k, v) in p {
+                if v.is_null() {
+                    b.remove(k);
+                } else {
+                    json_merge(b.entry(k.clone()).or_insert(Value::Null), v);
+                }
+            }
+        }
+        (b, p) => *b = p.clone(),
+    }
+}
+
+/// k8s `ResourceRequirements` with requests == limits (Guaranteed QoS) from
+/// optional millicpu / MiB. Absent axes are simply not set.
+fn resource_requirements(cpu_millis: Option<u32>, memory_mib: Option<u32>) -> ResourceRequirements {
+    let mut map = std::collections::BTreeMap::new();
+    if let Some(c) = cpu_millis {
+        map.insert("cpu".to_string(), Quantity(format!("{c}m")));
+    }
+    if let Some(m) = memory_mib {
+        map.insert("memory".to_string(), Quantity(format!("{m}Mi")));
+    }
+    ResourceRequirements {
+        requests: Some(map.clone()),
+        limits: Some(map),
+        ..Default::default()
+    }
+}
+
 /// The trusted results-egress sidecar (ADR-0042). A native sidecar sharing the
 /// results volume, carrying the fence-scoped token and the results API URL, that
 /// drains `/scarab/results` with a confirmed write after the step exits. The
@@ -2088,8 +2224,103 @@ mod tests {
         clone: None,
             build: None,
             artifacts: vec![],
-            oidc_token: None,
+            placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
         }
+    }
+
+    fn profile(name: &str, k8s: serde_json::Value) -> scarab_pipeline::PlacementProfile {
+        scarab_pipeline::PlacementProfile { name: name.into(), default: false, k8s: Some(k8s) }
+    }
+
+    fn pod_for(spec: &StepSpec) -> Pod {
+        let step = step_with_attempt("run-1", "s", "a1");
+        build_pod("scarab-x", "ns", &step, spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE)
+    }
+
+    #[test]
+    fn placement_baseline_is_stamped_on_every_pod() {
+        let spec = busybox(); // no placement fields at all
+        let placement = PlacementConfig {
+            baseline: Some(serde_json::json!({
+                "spec": { "tolerations": [
+                    {"key":"workload-type","operator":"Equal","value":"application-sub-critical","effect":"NoSchedule"}
+                ]}
+            })),
+            ..Default::default()
+        };
+        let ps = apply_placement(pod_for(&spec), &spec, &placement).unwrap().spec.unwrap();
+        let tol = &ps.tolerations.unwrap()[0];
+        assert_eq!(tol.key.as_deref(), Some("workload-type"));
+        assert_eq!(tol.value.as_deref(), Some("application-sub-critical"));
+    }
+
+    #[test]
+    fn placement_profiles_merge_in_listed_order() {
+        let mut spec = busybox();
+        spec.placement_profiles = vec!["arm64".into(), "critical".into()];
+        let placement = PlacementConfig {
+            profiles: vec![
+                profile("arm64", serde_json::json!({"spec":{"nodeSelector":{"kubernetes.io/arch":"arm64"}}})),
+                profile("critical", serde_json::json!({"spec":{"tolerations":[
+                    {"key":"workload-type","operator":"Equal","value":"application-critical","effect":"NoSchedule"}]}})),
+            ],
+            ..Default::default()
+        };
+        let ps = apply_placement(pod_for(&spec), &spec, &placement).unwrap().spec.unwrap();
+        assert_eq!(ps.node_selector.unwrap().get("kubernetes.io/arch").map(String::as_str), Some("arm64"));
+        assert_eq!(ps.tolerations.unwrap()[0].value.as_deref(), Some("application-critical"));
+    }
+
+    #[test]
+    fn placement_resources_go_on_step_container_as_guaranteed_qos() {
+        let mut spec = busybox();
+        spec.resources = scarab_pipeline::Resources { cpu_millis: Some(8000), memory_mib: Some(16384) };
+        let ps = apply_placement(pod_for(&spec), &spec, &PlacementConfig::default()).unwrap().spec.unwrap();
+        let c = ps.containers.into_iter().find(|c| c.name == STEP_CONTAINER).unwrap();
+        let r = c.resources.unwrap();
+        assert_eq!(r.requests.as_ref().unwrap()["cpu"].0, "8000m");
+        assert_eq!(r.limits.as_ref().unwrap()["memory"].0, "16384Mi");
+    }
+
+    #[test]
+    fn placement_default_resources_used_when_step_requests_none() {
+        let spec = busybox();
+        let placement = PlacementConfig {
+            default_resources: scarab_pipeline::Resources { cpu_millis: Some(1000), memory_mib: Some(2048) },
+            ..Default::default()
+        };
+        let ps = apply_placement(pod_for(&spec), &spec, &placement).unwrap().spec.unwrap();
+        let c = ps.containers.into_iter().find(|c| c.name == STEP_CONTAINER).unwrap();
+        assert_eq!(c.resources.unwrap().requests.unwrap()["cpu"].0, "1000m");
+    }
+
+    #[test]
+    fn unknown_placement_profile_is_fail_closed() {
+        let mut spec = busybox();
+        spec.placement_profiles = vec!["ghost".into()];
+        let err = apply_placement(pod_for(&spec), &spec, &PlacementConfig::default()).unwrap_err();
+        assert!(err.contains("unknown placement_profile `ghost`"), "got: {err}");
+    }
+
+    #[test]
+    fn k8s_overlay_wins_last() {
+        let mut spec = busybox();
+        spec.k8s_overlay = Some(serde_json::json!({"spec":{"schedulerName":"mine"}}));
+        let placement = PlacementConfig {
+            baseline: Some(serde_json::json!({"spec":{"schedulerName":"default-sched"}})),
+            ..Default::default()
+        };
+        let ps = apply_placement(pod_for(&spec), &spec, &placement).unwrap().spec.unwrap();
+        assert_eq!(ps.scheduler_name.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn empty_placement_is_a_noop() {
+        let spec = busybox();
+        let pod = pod_for(&spec);
+        let before = serde_json::to_value(&pod).unwrap();
+        let after = serde_json::to_value(apply_placement(pod, &spec, &PlacementConfig::default()).unwrap()).unwrap();
+        assert_eq!(before, after);
     }
 
     #[test]
@@ -2126,7 +2357,7 @@ mod tests {
         clone: None,
             build: None,
             artifacts: vec![],
-            oidc_token: None,
+            placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
         };
         let pod = build_pod("scarab-x", "scarab-run-1", &step, &spec, None, DEFAULT_STEP_TIMEOUT_SECS, false, DEFAULT_CLONE_IMAGE);
         let sc = pod.spec.unwrap().containers[0].security_context.clone().unwrap();

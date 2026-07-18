@@ -1884,11 +1884,26 @@
           "image": {
             "type": "string"
           },
+          "k8s_overlay": {
+            "type": "object",
+            "description": "Governed raw pod-spec overlay (ADR-0055). Carries no authority; an inline\nAPI run targets no Environment, so any overlay is rejected fail-closed."
+          },
           "needs": {
             "type": "array",
             "items": {
               "type": "string"
             }
+          },
+          "placement_profiles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "PlacementProfile names this step runs on (ADR-0055); their admin-defined\nk8s overlays merge onto the Pod in listed order. Empty = the default profile."
+          },
+          "resources": {
+            "type": "object",
+            "description": "Requested compute resources (ADR-0055): exact `cpu_millis`/`memory_mib`."
           },
           "retry": {
             "type": "object",

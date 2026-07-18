@@ -36,6 +36,7 @@
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
 //! | `SCARAB_CLONE_IMAGE` | env | the canonical scarab-clone image a `clone` step runs (ADR-0045); default `ghcr.io/thulasi-ram/scarab-clone:edge` — digest-pin in production |
+//! | `SCARAB_PLACEMENT_CONFIG_FILE` | env | path to the operator placement config (ADR-0055): cluster baseline + PlacementProfile registry (YAML/JSON, gitops-managed); a bad path/parse is a boot failure |
 //! | `SCARAB_GITHUB_APP_ID` | env | GitHub App id (ADR-0046): when set, GitHub connections authenticate in **App mode** (their credential secret is the App PEM); absent = token mode (dev) |
 //! | `SCARAB_OAUTH_CLIENT_ID` … `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | env | OAuth/OIDC login provider (ADR-0049): all five together enable real authn (GitHub, Forgejo, or any OIDC issuer); a partial set refuses boot |
 //! | `SCARAB_OAUTH_SCOPES` | env | space-separated scopes for the authorize redirect (optional; e.g. `read:user` for GitHub, `openid profile` for OIDC) |
@@ -228,6 +229,12 @@ pub struct Config {
     /// The canonical scarab-clone image (ADR-0045) — the image every `clone`
     /// step runs, digest-pinned in production.
     pub clone_image: String,
+    /// Path to the operator **placement config** file (ADR-0055): the cluster
+    /// baseline (tolerations/nodeSelector/default resources) + the named
+    /// PlacementProfile registry, YAML/JSON, gitops-managed. `None` = no baseline
+    /// and an empty registry (pre-0055 behavior). Read at boot; a bad path/parse
+    /// is a boot failure (ADR-0048), mirroring the OIDC signing key.
+    pub placement_config_file: Option<String>,
     /// OAuth/OIDC login (ADR-0049 C1). `Some` = real authn wired; `None` is
     /// only bootable under `SCARAB_DEV_INSECURE=1`.
     pub oauth: Option<OAuthConfig>,
@@ -492,6 +499,7 @@ impl Config {
             clone_image: env("SCARAB_CLONE_IMAGE")
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| "ghcr.io/thulasi-ram/scarab-clone:edge".into()),
+            placement_config_file: env("SCARAB_PLACEMENT_CONFIG_FILE").filter(|v| !v.is_empty()),
             oauth,
             retention_log_days: match env("SCARAB_RETENTION_LOG_DAYS").filter(|v| !v.is_empty()) {
                 Some(v) => v

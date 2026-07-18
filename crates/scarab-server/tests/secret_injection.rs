@@ -57,7 +57,7 @@ fn spec_with_secret() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        oidc_token: None,
+        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
     }
 }
 fn logs(db: Arc<dyn Db>) -> Arc<LogService> {
@@ -200,7 +200,7 @@ fn plain_spec() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        oidc_token: None,
+        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
     }
 }
 

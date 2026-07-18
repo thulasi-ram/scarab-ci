@@ -28,7 +28,7 @@ fn spec() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        oidc_token: None,
+        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
     }
 }
 
@@ -165,7 +165,7 @@ async fn named_result_flows_into_a_downstream_interpolation() {
         clone: None,
         build: None,
         artifacts: vec![],
-        oidc_token: None,
+        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
     };
     db.create_step_run(
         &run,

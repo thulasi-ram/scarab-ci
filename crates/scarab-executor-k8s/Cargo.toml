@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 scarab-engine = { workspace = true }
+scarab-pipeline = { workspace = true }
+serde = { workspace = true }
 async-trait = { workspace = true }
 kube = { workspace = true }
 tar = { workspace = true }

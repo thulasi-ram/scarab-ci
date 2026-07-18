@@ -42,7 +42,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0023](0023-dag-shape.md) | DAG shape: static matrix v1, dynamic reserved | Accepted |
 | [0024](0024-environments.md) | Environments: first-class with protection rules | Accepted |
 | [0025](0025-cross-pipeline-orchestration.md) | Cross-pipeline orchestration: nest vs trigger | Accepted (amended by 0038) |
-| [0026](0026-resource-and-placement.md) | Resource & placement model | Accepted |
+| [0026](0026-resource-and-placement.md) | Resource & placement model | Accepted (refined by 0055) |
 | [0027](0027-restart-semantics.md) | Restart semantics: content-addressed smart invalidation | Accepted |
 | [0028](0028-ui-stack.md) | UI stack: SolidJS + TS + generated client | Accepted |
 | [0029](0029-workspace-cas.md) | Workspace content-addressing: per-file merkle CAS | Accepted |
@@ -70,6 +70,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0052](0052-artifacts.md) | Artifacts: dedicated per-run store (not CAS), convention-emitted (`/scarab/artifacts/` + globs), presigned download, own TTL | Accepted |
 | [0053](0053-observability-and-lifecycle.md) | Observability & lifecycle: Prometheus `/metrics`, JSON logs + request-ids, `/readyz` vs `/healthz`, graceful shutdown (implements 0030) | Accepted |
 | [0054](0054-product-surface-serving.md) | Product surface: embed UI in the binary, run-cancel API, OpenAPI drift gate, CLI truthfulness (stubs exit non-zero) | Accepted |
+| [0055](0055-placement-profiles.md) | Placement profiles: named `placement_profiles` + control-plane baseline + governed `k8s_overlay` (refines 0026) | Accepted |
 
 > For *features* deliberately deferred until demand appears (as opposed to ADRs
 > to be written), see [`docs/followups.md`](../followups.md).

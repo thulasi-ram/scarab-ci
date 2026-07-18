@@ -120,7 +120,7 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         clone: None,
         build: Some(build.clone()),
         artifacts: vec![],
-        oidc_token: None,
+        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
     };
     let pod = build_pod(
         "scarab-image",

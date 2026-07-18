@@ -364,6 +364,19 @@ pub struct StepDto {
     /// default (1h). Exceeding it is a `Timeout` failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
+    /// PlacementProfile names this step runs on (ADR-0055); their admin-defined
+    /// k8s overlays merge onto the Pod in listed order. Empty = the default profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placement_profiles: Vec<String>,
+    /// Requested compute resources (ADR-0055): exact `cpu_millis`/`memory_mib`.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub resources: scarab_pipeline::Resources,
+    /// Governed raw pod-spec overlay (ADR-0055). Carries no authority; an inline
+    /// API run targets no Environment, so any overlay is rejected fail-closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Object)]
+    pub k8s_overlay: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -728,6 +741,12 @@ async fn create_run(
                     v.join("; ")
                 ))
             })?;
+        // ADR-0055: a raw k8s_overlay carries no authority. An inline API run
+        // targets no Environment, so any overlay is rejected fail-closed.
+        let k8s_overlay =
+            admit_k8s_overlay(None, step.k8s_overlay.as_ref()).map_err(|v| {
+                ApiError::BadRequest(format!("step `{}`: {}", step.id, v.join("; ")))
+            })?;
         let spec = StepSpec {
             image: step.image.clone(),
             command: step.command.clone(),
@@ -745,6 +764,9 @@ async fn create_run(
         clone: None,
             build: None,
             artifacts: vec![],
+            placement_profiles: step.placement_profiles.clone(),
+            resources: step.resources.clone(),
+            k8s_overlay,
             oidc_token: None,
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
@@ -2592,6 +2614,27 @@ fn admit_step_grants(
     }
 }
 
+/// Admit a step's raw `k8s_overlay` (ADR-0055) against the target Environment.
+/// A raw overlay carries no authority — mirroring a governed grant, it is honored
+/// only under an Environment that permits raw placement overlays, else the run is
+/// rejected **fail-closed**. Returns the overlay to persist (or `None`).
+///
+/// TODO(ADR-0055 governance slice): consult `ProtectionRules` for a
+/// `permit_k8s_overlay` grant. Until that field exists, every overlay is rejected
+/// fail-closed — the safe default the ADR specifies.
+fn admit_k8s_overlay(
+    _protection: Option<&scarab_project::ProtectionRules>,
+    overlay: Option<&serde_json::Value>,
+) -> Result<Option<serde_json::Value>, Vec<String>> {
+    match overlay {
+        None => Ok(None),
+        Some(_) => Err(vec![
+            "raw `k8s_overlay` requires a target Environment that permits raw overlays"
+                .to_string(),
+        ]),
+    }
+}
+
 /// Durably materialize a compiled pipeline IR into a Run: store the IR on the
 /// run (self-describing, ADR-0022), record RunCreated + the normalized trigger
 /// The (repo, pinned sha) a clone step fetches, from a sha-carrying trigger
@@ -2738,6 +2781,12 @@ async fn persist_run_from_ir(
                 }),
                 build: None,
                 artifacts: vec![],
+                placement_profiles: step.placement_profiles.clone(),
+                resources: step.resources.clone(),
+                k8s_overlay: admit_k8s_overlay(protection, step.k8s_overlay.as_ref())
+                    .map_err(|v| {
+                        TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
+                    })?,
                 oidc_token: None,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
@@ -2787,6 +2836,12 @@ async fn persist_run_from_ir(
                 clone: None,
                 build,
                 artifacts: step.artifacts.clone(),
+                placement_profiles: step.placement_profiles.clone(),
+                resources: step.resources.clone(),
+                k8s_overlay: admit_k8s_overlay(protection, step.k8s_overlay.as_ref())
+                    .map_err(|v| {
+                        TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
+                    })?,
                 oidc_token: None,
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)

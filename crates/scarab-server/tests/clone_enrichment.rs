@@ -49,7 +49,7 @@ fn clone_spec(read_only: bool) -> StepSpec {
         }),
         build: None,
         artifacts: vec![],
-        oidc_token: None,
+        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
     }
 }
 
@@ -159,7 +159,7 @@ fn build_spec(image: &str) -> StepSpec {
             ..Default::default()
         }),
         artifacts: vec![],
-        oidc_token: None,
+        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
     }
 }
 

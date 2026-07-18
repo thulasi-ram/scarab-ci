@@ -246,6 +246,21 @@ pub struct StepSpec {
     /// collects from `/scarab/artifacts/` post-step. Empty = everything.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
+    /// Placement profile names (ADR-0055) whose admin-defined k8s overlays the
+    /// executor merges onto the Pod, in listed order, atop the operator baseline.
+    /// Empty = the operator's `default` profile.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placement_profiles: Vec<String>,
+    /// Requested compute resources (ADR-0055), applied to the step container's
+    /// requests/limits. Default = the operator baseline's defaults.
+    #[serde(default)]
+    pub resources: scarab_pipeline::Resources,
+    /// The raw pod-spec overlay **admitted** for this step (ADR-0055) — already
+    /// authorized against the run's Environment at run creation (a request carries
+    /// no authority; fail-closed). The executor strategic-merges it onto the Pod
+    /// last. `None` for almost every step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub k8s_overlay: Option<serde_json::Value>,
     /// The per-attempt OIDC token for keyless cloud federation (ADR-0015),
     /// minted at LAUNCH — **never serialized** (in-memory enrichment only;
     /// delivery to the Pod is a tmpfs file, never env/argv). `None` when the

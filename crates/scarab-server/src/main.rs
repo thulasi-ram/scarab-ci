@@ -17,7 +17,7 @@ use clap::Parser;
 
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
-use scarab_executor_k8s::{K8sExecutor, ResultsEgress};
+use scarab_executor_k8s::{K8sExecutor, PlacementConfig, ResultsEgress};
 use scarab_executor_local::LocalExecutor;
 use scarab_server::config::{Cli, Config, ExecutorKind, StoreConfig};
 use scarab_server::{converged, router, AppState, LogService, SecretInjectingExecutor, SystemClock};
@@ -196,6 +196,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (None, None) => None,
         };
 
+    // Operator placement config (ADR-0055): the cluster baseline + named
+    // PlacementProfile registry, one gitops-managed file. A bad path/parse is a
+    // boot failure (ADR-0048), mirroring the files above. Empty when unset.
+    let placement: PlacementConfig = match &config.placement_config_file {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read SCARAB_PLACEMENT_CONFIG_FILE {path}: {e}"))?;
+            serde_yaml::from_str(&raw)
+                .map_err(|e| format!("invalid placement config {path}: {e}"))?
+        }
+        None => PlacementConfig::default(),
+    };
+
     // The production forge (ADR-0046): a registry-routed ForgePort — each call
     // resolves its repo through the ForgeConnection registry, constructs the
     // vendor adapter (GitHub App/token, Forgejo token) with credentials
@@ -271,7 +284,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .with_clone_image(config.clone_image.clone())
                         // Artifact harvest (ADR-0052): /scarab/artifacts →
                         // object blobs + Pod-annotation metadata.
-                        .with_artifact_store(store.clone());
+                        .with_artifact_store(store.clone())
+                        // Placement (ADR-0055): baseline + PlacementProfile registry.
+                        .with_placement(placement.clone());
                     if let Some(egress) = results_egress.clone() {
                         exec = exec.with_results_egress(egress);
                         tracing::info!("results egress sidecar enabled (ADR-0042)");
@@ -368,7 +383,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(exec) => {
                 // The workspace CAS lets the debug-pod re-materialize a finished
                 // step's snapshot. One instance serves both attach and debug-pod.
-                let exec = Arc::new(exec.with_workspace_cas(workspace_cas.clone()));
+                // Placement (ADR-0055) applies here too — a debug Pod must schedule
+                // on the same tainted nodes as the real step.
+                let exec = Arc::new(
+                    exec.with_workspace_cas(workspace_cas.clone())
+                        .with_placement(placement.clone()),
+                );
                 state = state
                     .with_attacher(exec.clone())
                     .with_debug_launcher(exec);

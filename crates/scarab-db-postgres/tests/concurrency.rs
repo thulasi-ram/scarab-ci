@@ -28,7 +28,7 @@ fn spec() -> StepSpec {
         clone: None,
         build: None,
         artifacts: vec![],
-        oidc_token: None,
+        placement_profiles: vec![], resources: Default::default(), k8s_overlay: None, oidc_token: None,
     }
 }
 

@@ -252,10 +252,9 @@ code,
 .ascii-scene .ascii-fe { color: var(--muted-sage); }
 
 /* Dashboard footer: the dung beetle walks its ball across the full viewport
-   on a copper ground line. `.rolling` runs the motion (frames + travel); it is
-   applied unconditionally so the beetle rolls continuously. Travel is CSS; the
-   frames only animate legs + ball spin. (The parked/frozen fallback below still
-   applies under prefers-reduced-motion.) */
+   on a copper ground line. `.rolling` = work in flight (frames + travel run);
+   otherwise it parks beside the ball, frozen — motion means "something is
+   working". Travel is CSS; the frames only animate legs + ball spin. */
 .dash-footer {
   position: relative;
   height: 172px;
