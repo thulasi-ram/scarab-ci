@@ -1886,3 +1886,9 @@ h1, .crumb-head, .run-title {
 .shell-h .shell-close:hover { color: var(--danger); }
 .shell-term { height: 60vh; padding: 8px 10px; background: var(--terminal); }
 .shell-term .xterm { height: 100%; }
+
+/* Cap the DAG/Logs panels so a long log scrolls INSIDE the panel instead of
+   stretching the grid row (which pushed the vertically-centered DAG out of
+   view). The DAG also top-aligns + scrolls rather than centering in a tall box. */
+.rd-grid > .panel { max-height: 74vh; }
+.dag-panel .dag { align-items: flex-start; overflow: auto; }

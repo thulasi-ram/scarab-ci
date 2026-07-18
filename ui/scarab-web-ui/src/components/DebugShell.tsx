@@ -11,6 +11,9 @@ import "@xterm/xterm/css/xterm.css";
 export default function DebugShell(props: {
   runId: string;
   step: string;
+  /** "attach" = shell into the live step Pod; "debug-pod" = reproduce a
+   * finished step in a fresh ephemeral Pod and shell into that. */
+  mode: "attach" | "debug-pod";
   onClose: () => void;
 }) {
   let host: HTMLDivElement | undefined;
@@ -31,12 +34,17 @@ export default function DebugShell(props: {
     term = t;
 
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${location.host}/v1/runs/${encodeURIComponent(props.runId)}/steps/${encodeURIComponent(props.step)}/attach`;
+    const path = props.mode === "debug-pod" ? "debug-pod" : "attach";
+    const url = `${proto}://${location.host}/v1/runs/${encodeURIComponent(props.runId)}/steps/${encodeURIComponent(props.step)}/${path}`;
     const sock = new WebSocket(url);
     sock.binaryType = "arraybuffer";
     ws = sock;
 
-    t.writeln(`\x1b[2m connecting to ${props.step}…\x1b[0m`);
+    t.writeln(
+      props.mode === "debug-pod"
+        ? `\x1b[2m reproducing ${props.step} in a fresh pod…\x1b[0m`
+        : `\x1b[2m connecting to ${props.step}…\x1b[0m`,
+    );
     sock.onopen = () => t.writeln("\x1b[2m attached — type below (Ctrl-D to end)\x1b[0m\r\n");
     sock.onmessage = (e) => {
       const data =
@@ -66,8 +74,12 @@ export default function DebugShell(props: {
     <div class="shell-overlay" onClick={props.onClose}>
       <div class="shell-modal" onClick={(e) => e.stopPropagation()}>
         <div class="shell-h">
-          <span class="mono">⌗ debug shell · {props.step}</span>
-          <span class="shell-sub mono">interactive · Administer-gated</span>
+          <span class="mono">
+            ⌗ {props.mode === "debug-pod" ? "debug pod" : "debug shell"} · {props.step}
+          </span>
+          <span class="shell-sub mono">
+            {props.mode === "debug-pod" ? "reproduction · " : ""}interactive · Administer-gated
+          </span>
           <button class="shell-close" onClick={props.onClose} title="close">
             ✕
           </button>

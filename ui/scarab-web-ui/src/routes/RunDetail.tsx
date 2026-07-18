@@ -46,8 +46,13 @@ export default function RunDetail() {
   const [shellOpen, setShellOpen] = createSignal(false);
 
   const stepList = (): StepStatus[] => run()?.steps ?? [];
-  const selectedRunning = () =>
-    !!sel() && stepList().find((s) => s.id === sel())?.status === "running";
+  const selectedStatus = () => stepList().find((s) => s.id === sel())?.status;
+  const selectedRunning = () => selectedStatus() === "running";
+  // A running step attaches to its live Pod; a finished one is reproduced in a
+  // fresh debug Pod. Pending/skipped steps have nothing to shell into.
+  const shellMode = (): "attach" | "debug-pod" => (selectedRunning() ? "attach" : "debug-pod");
+  const canShell = () =>
+    !!sel() && ["running", "succeeded", "failed"].includes(selectedStatus() ?? "");
   const runningCount = () => stepList().filter((s) => s.status === "running").length;
 
   // Per-step wall-clock from the event log: first AttemptStarted → last
@@ -205,14 +210,17 @@ export default function RunDetail() {
               <button
                 class="btn btn-ghost btn-sm"
                 onClick={() => setShellOpen(true)}
-                disabled={!selectedRunning()}
+                disabled={!canShell()}
                 title={
-                  selectedRunning()
-                    ? `open a debug shell into ${sel()}`
-                    : "select a running step to shell into"
+                  !canShell()
+                    ? "select a running or finished step"
+                    : selectedRunning()
+                      ? `shell into the running ${sel()} Pod`
+                      : `reproduce ${sel()} in a fresh debug Pod and shell in`
                 }
               >
-                <Icon icon="terminal" size={13} /> Debug shell
+                <Icon icon="terminal" size={13} />{" "}
+                {selectedRunning() ? "Debug shell" : "Debug pod"}
               </button>
             </div>
 
@@ -300,7 +308,12 @@ export default function RunDetail() {
               </div>
             </div>
             <Show when={shellOpen() && sel()}>
-              <DebugShell runId={id()} step={sel()!} onClose={() => setShellOpen(false)} />
+              <DebugShell
+                runId={id()}
+                step={sel()!}
+                mode={shellMode()}
+                onClose={() => setShellOpen(false)}
+              />
             </Show>
           </>
         )}
