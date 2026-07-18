@@ -73,8 +73,6 @@ export default function Repos() {
   const [query, setQuery] = createSignal("");
 
   const inbox = () => (runs() ?? []).filter((r) => r.status === "suspended");
-  const inFlight = () =>
-    (runs() ?? []).filter((r) => r.status === "running" || r.status === "pending").length;
 
   // Recently visited (browser-local); falls back to the most-active repos so a
   // fresh browser is never empty. Resolved against the project list for metadata.
@@ -99,7 +97,6 @@ export default function Repos() {
   });
 
   const loading = () => projects.loading || runs.loading;
-  const rolling = createMemo(() => inFlight() > 0);
 
   return (
     <>
@@ -216,9 +213,9 @@ export default function Repos() {
         </Show>
       </section>
 
-      <footer class="dash-footer" classList={{ rolling: rolling() }} aria-hidden="true">
+      <footer class="dash-footer rolling" aria-hidden="true">
         <div class="roller">
-          <AsciiScene scene={dungroller} fontSize={5} playing={rolling()} />
+          <AsciiScene scene={dungroller} fontSize={5} playing={true} />
         </div>
       </footer>
     </>
