@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 # infra
-axum = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
 tokio = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }

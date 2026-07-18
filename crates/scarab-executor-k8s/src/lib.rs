@@ -898,6 +898,61 @@ impl LogChunks for PodLogChunks {
 /// name across process restarts — which is what makes `launch` re-attach rather
 /// than relaunch. A short content hash keeps distinct fences from colliding
 /// after DNS-1123 sanitisation, and the whole thing stays within 63 chars.
+// ── Debug shell: interactive attach (the debug surface) ────────────────────
+
+/// A live interactive attach to a running step's container: an interactive
+/// `sh` with a TTY, for the operator to bridge to a client terminal. Only a
+/// *running* step has a live Pod to attach to — step Pods are
+/// `restartPolicy: Never` and gone once the step ends.
+pub struct AttachIo {
+    /// Combined program output (a TTY merges stdout + stderr).
+    pub output: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+    /// The shell's stdin — client keystrokes go here.
+    pub input: std::pin::Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
+    /// Keeps the underlying attached process (and its connection task) alive as
+    /// long as the caller holds the IO. Opaque so callers need no `kube` types.
+    pub _process: Box<dyn std::any::Any + Send>,
+}
+
+/// Opens an interactive shell into a *running* step's container — the debug
+/// surface. Backends that can't exec return [`ExecError::Unavailable`].
+#[async_trait]
+pub trait StepAttacher: Send + Sync {
+    async fn attach(&self, step: &StepRun) -> Result<AttachIo, ExecError>;
+}
+
+#[async_trait]
+impl StepAttacher for K8sExecutor {
+    async fn attach(&self, step: &StepRun) -> Result<AttachIo, ExecError> {
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let pods: Api<Pod> = Api::namespaced(client, &self.namespace);
+        let pod = pod_name(step);
+        // Interactive TTY shell in the step container; a TTY multiplexes stderr
+        // into stdout, so stderr must be off.
+        let params = AttachParams::default()
+            .container(STEP_CONTAINER)
+            .stdin(true)
+            .stdout(true)
+            .stderr(false)
+            .tty(true);
+        let mut proc = pods
+            .exec(&pod, ["sh"], &params)
+            .await
+            .map_err(|e| ExecError::Other(format!("attach to {pod}: {e}")))?;
+        let output = proc
+            .stdout()
+            .ok_or_else(|| ExecError::Other("attach: no stdout stream".into()))?;
+        let input = proc
+            .stdin()
+            .ok_or_else(|| ExecError::Other("attach: no stdin stream".into()))?;
+        Ok(AttachIo {
+            output: Box::pin(output),
+            input: Box::pin(input),
+            _process: Box::new(proc),
+        })
+    }
+}
+
 pub fn pod_name(step: &StepRun) -> String {
     let attempt = step
         .current_attempt()

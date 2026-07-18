@@ -360,6 +360,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Read-only workspace browser (ADR-0029): serves a step's output
         // snapshot tree + file bytes for the run detail Inspector.
         .with_workspace_cas(workspace_cas.clone());
+    // Debug shell (step-attach): only the k8s executor can exec into a running
+    // Pod. A dedicated kube client, independent of the runs driver, so a
+    // UI-only replica can still serve attach. Absent a cluster it stays off.
+    if matches!(config.executor, ExecutorKind::K8s) {
+        match K8sExecutor::connect(config.namespace.clone()).await {
+            Ok(attacher) => {
+                state = state.with_attacher(Arc::new(attacher));
+                tracing::info!("debug shell: step-attach enabled (k8s exec)");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "debug shell: attach disabled — no cluster reachable");
+            }
+        }
+    }
     if let Some(secret) = config.github_webhook_secret.clone() {
         state = state.with_github_webhook_secret(secret);
     }

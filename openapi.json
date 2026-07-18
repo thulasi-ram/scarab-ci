@@ -854,6 +854,44 @@
         }
       }
     },
+    "/v1/runs/{id}/steps/{step}/attach": {
+      "get": {
+        "tags": [],
+        "summary": "WebSocket: an interactive debug shell into a **running** step's Pod (the\ndebug surface). Gated behind `Administer` — exec is the most privileged\nsurface. Only a running step has a live Pod (they are `restartPolicy: Never`\nand gone once done), so a terminal/pending step is refused. Bridges the\nPod's TTY to the socket: client text/binary → shell stdin, shell output →\nclient. Disabled (404) unless an attacher is wired (k8s executor only).",
+        "operationId": "attach_step",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade — interactive TTY into the running step's Pod"
+          },
+          "400": {
+            "description": "step is not running (no live Pod)"
+          },
+          "404": {
+            "description": "no such run/step, or attach disabled"
+          }
+        }
+      }
+    },
     "/v1/runs/{id}/steps/{step}/logs": {
       "get": {
         "tags": [],

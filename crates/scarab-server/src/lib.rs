@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
@@ -23,6 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::{self, BoxStream, Stream, StreamExt};
+use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
@@ -112,6 +114,10 @@ pub struct AppState {
     /// workspace-browse endpoints (404) — e.g. the local executor doesn't
     /// snapshot workspaces.
     pub workspace_cas: Option<Arc<dyn scarab_storage::Cas>>,
+    /// The step attacher (debug shell): opens an interactive TTY into a running
+    /// step's Pod. `None` disables the attach endpoint (404) — only the k8s
+    /// executor can exec; the local executor runs no Pods.
+    pub attacher: Option<Arc<dyn scarab_executor_k8s::StepAttacher>>,
     /// The built SPA's dist directory (ADR-0054). `Some` serves the web UI at
     /// `/` with an SPA fallback — same-origin with the API, so no CORS layer
     /// exists or is needed. `None` (dev) leaves non-API paths 404.
@@ -147,6 +153,7 @@ impl AppState {
             results_token_secret: None,
             artifact_store: None,
             workspace_cas: None,
+            attacher: None,
             ui_dir: None,
             rbac: None,
             oauth_login: None,
@@ -241,6 +248,13 @@ impl AppState {
     /// (ADR-0029). Serves a step's output snapshot tree + file bytes.
     pub fn with_workspace_cas(mut self, cas: Arc<dyn scarab_storage::Cas>) -> Self {
         self.workspace_cas = Some(cas);
+        self
+    }
+
+    /// Enable the debug-shell attach endpoint, backed by an executor that can
+    /// exec into a running step's Pod (the k8s executor).
+    pub fn with_attacher(mut self, attacher: Arc<dyn scarab_executor_k8s::StepAttacher>) -> Self {
+        self.attacher = Some(attacher);
         self
     }
 
@@ -1852,6 +1866,91 @@ async fn get_workspace_file(
         axum::http::HeaderValue::from_static(content_type),
     );
     Ok(resp)
+}
+
+/// WebSocket: an interactive debug shell into a **running** step's Pod (the
+/// debug surface). Gated behind `Administer` — exec is the most privileged
+/// surface. Only a running step has a live Pod (they are `restartPolicy: Never`
+/// and gone once done), so a terminal/pending step is refused. Bridges the
+/// Pod's TTY to the socket: client text/binary → shell stdin, shell output →
+/// client. Disabled (404) unless an attacher is wired (k8s executor only).
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/steps/{step}/attach",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "step id")
+    ),
+    responses(
+        (status = 101, description = "WebSocket upgrade — interactive TTY into the running step's Pod"),
+        (status = 400, description = "step is not running (no live Pod)"),
+        (status = 404, description = "no such run/step, or attach disabled")
+    )
+)]
+async fn attach_step(
+    ws: WebSocketUpgrade,
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Administer, scope.as_ref()).await?;
+    let attacher = st.attacher.as_ref().ok_or(ApiError::NotFound)?.clone();
+    let step_id = StepId(step);
+    let sr = st
+        .db
+        .steps_of_run(&run)
+        .await?
+        .into_iter()
+        .find(|s| s.step == step_id)
+        .ok_or(ApiError::NotFound)?;
+    if sr.status != StepStatus::Running {
+        return Err(ApiError::BadRequest(
+            "step is not running — a debug shell needs a live Pod".into(),
+        ));
+    }
+    let io = attacher
+        .attach(&sr)
+        .await
+        .map_err(|e| ApiError::BadRequest(format!("attach failed: {e}")))?;
+    Ok(ws.on_upgrade(move |socket| bridge_attach(socket, io)))
+}
+
+/// Pump bytes both ways between a WebSocket and an attached step shell until
+/// either end closes. `_process` in the `AttachIo` keeps the Pod exec alive for
+/// the lifetime of this task.
+async fn bridge_attach(socket: WebSocket, io: scarab_executor_k8s::AttachIo) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let scarab_executor_k8s::AttachIo { mut output, mut input, _process } = io;
+    let mut buf = [0u8; 8192];
+    loop {
+        tokio::select! {
+            read = output.read(&mut buf) => match read {
+                Ok(0) | Err(_) => break, // shell exited or stream error
+                Ok(n) => {
+                    if ws_tx.send(Message::Binary(Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
+                        break;
+                    }
+                }
+            },
+            msg = ws_rx.next() => match msg {
+                Some(Ok(Message::Text(t))) => {
+                    if input.write_all(t.as_bytes()).await.is_err() { break; }
+                    let _ = input.flush().await;
+                }
+                Some(Ok(Message::Binary(b))) => {
+                    if input.write_all(&b).await.is_err() { break; }
+                    let _ = input.flush().await;
+                }
+                Some(Ok(Message::Close(_))) | None => break,
+                _ => {} // ping/pong handled by axum
+            },
+        }
+    }
+    // Hold the exec process until the pump ends.
+    drop(_process);
 }
 
 /// In-repo directory holding pipeline definitions (ADR-0010). Every
@@ -4243,6 +4342,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         get_events,
         get_logs,
         get_step_logs,
+        attach_step,
         restart_step,
         cancel_run,
         list_artifacts,
@@ -4323,6 +4423,7 @@ fn router_inner(state: AppState) -> Router {
         .route("/v1/runs/{id}/artifacts", get(list_artifacts))
         .route("/v1/runs/{id}/artifacts/{*name}", get(download_artifact))
         .route("/v1/runs/{id}/steps/{step}/logs", get(get_step_logs))
+        .route("/v1/runs/{id}/steps/{step}/attach", get(attach_step))
         .route("/v1/runs/{id}/steps/{step}/workspace", get(list_workspace))
         .route(
             "/v1/runs/{id}/steps/{step}/workspace/file",
