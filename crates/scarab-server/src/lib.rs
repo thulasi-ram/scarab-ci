@@ -107,6 +107,11 @@ pub struct AppState {
     /// The artifact blob store (ADR-0052): serves downloads. `None` disables
     /// the artifact endpoints (404).
     pub artifact_store: Option<Arc<dyn scarab_storage::ObjectStore>>,
+    /// The workspace content-addressed store (ADR-0029): reads a step's output
+    /// snapshot for the read-only workspace browser. `None` disables the
+    /// workspace-browse endpoints (404) — e.g. the local executor doesn't
+    /// snapshot workspaces.
+    pub workspace_cas: Option<Arc<dyn scarab_storage::Cas>>,
     /// The built SPA's dist directory (ADR-0054). `Some` serves the web UI at
     /// `/` with an SPA fallback — same-origin with the API, so no CORS layer
     /// exists or is needed. `None` (dev) leaves non-API paths 404.
@@ -141,6 +146,7 @@ impl AppState {
             secrets: None,
             results_token_secret: None,
             artifact_store: None,
+            workspace_cas: None,
             ui_dir: None,
             rbac: None,
             oauth_login: None,
@@ -228,6 +234,13 @@ impl AppState {
     /// Enable the artifact endpoints (ADR-0052), serving blobs from `store`.
     pub fn with_artifact_store(mut self, store: Arc<dyn scarab_storage::ObjectStore>) -> Self {
         self.artifact_store = Some(store);
+        self
+    }
+
+    /// Enable the read-only workspace browser, backed by the workspace CAS
+    /// (ADR-0029). Serves a step's output snapshot tree + file bytes.
+    pub fn with_workspace_cas(mut self, cas: Arc<dyn scarab_storage::Cas>) -> Self {
+        self.workspace_cas = Some(cas);
         self
     }
 
@@ -513,6 +526,12 @@ pub struct StepStatusDto {
     pub id: String,
     pub status: String,
     pub attempts: usize,
+    /// Per-attempt detail (ADR-0047) — the rerun/retry history in append order.
+    /// `attempts` is the count; this is the list, so the UI can show retries (a
+    /// failed attempt followed by a succeeding one — the durable-execution story)
+    /// and fold a step's logs per attempt. Empty until the step first launches.
+    #[serde(default)]
+    pub attempt_list: Vec<AttemptDto>,
     /// Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The
     /// UI folds these into the run's graph view.
     #[serde(default)]
@@ -521,6 +540,41 @@ pub struct StepStatusDto {
     /// Gates launch no pod and suspend the run until released.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
+}
+
+/// One attempt at executing a step (ADR-0047) — the rerun unit. A step with more
+/// than one attempt is one that failed-and-retried (or was restarted); the last
+/// attempt carries the current outcome.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AttemptDto {
+    pub id: String,
+    /// When this attempt started (unix-ms).
+    pub started_at: i64,
+    /// `true` if this attempt ended in failure. A later attempt may still have
+    /// succeeded — that divergence is exactly the retry story worth showing.
+    pub failed: bool,
+    /// Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+}
+
+/// Project a durable [`scarab_engine::Attempt`] to its wire DTO.
+fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
+    let failure = a.failure.as_ref().map(|f| {
+        match f {
+            scarab_engine::FailureKind::Infra { .. } => "infra",
+            scarab_engine::FailureKind::Step => "step",
+            scarab_engine::FailureKind::Timeout => "timeout",
+            scarab_engine::FailureKind::Lost => "lost",
+        }
+        .to_string()
+    });
+    AttemptDto {
+        id: a.id.0.clone(),
+        started_at: a.started_at.0,
+        failed: a.failure.is_some(),
+        failure,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -995,6 +1049,7 @@ async fn get_run(
                 id: s.step.0,
                 status: step_status_name(s.status).to_string(),
                 attempts: s.attempts.len(),
+                attempt_list: s.attempts.iter().map(attempt_dto).collect(),
                 needs: s.needs.into_iter().map(|n| n.0).collect(),
                 gate: s.gate_kind,
             })
@@ -1123,6 +1178,115 @@ async fn get_logs(
     }
 }
 
+/// The `?attempt=` scope for a per-step log stream. Absent = the whole step
+/// (all attempts, in order — the default the fold header shows).
+#[derive(Debug, Deserialize)]
+struct StepLogsQuery {
+    #[serde(default)]
+    attempt: Option<String>,
+}
+
+/// SSE of ONE step's log bodies (ADR-0013), the source for the run detail's
+/// per-step fold. Same machinery as the run-wide `/logs`, scoped to the step —
+/// and, with `?attempt=`, to a single attempt so a rerun's earlier (failed)
+/// output can be read in isolation. Replays committed chunks then live-tails
+/// only when the run is still going AND the latest attempt is in scope
+/// (historical attempts are immutable). Read at the run's tenant.
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/steps/{step}/logs",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "step id"),
+        ("attempt" = Option<String>, Query, description = "restrict to one attempt id (default = all)")
+    ),
+    responses((status = 200, description = "SSE stream of this step's log output"), (status = 404, description = "no such run or step"))
+)]
+async fn get_step_logs(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+    Query(q): Query<StepLogsQuery>,
+) -> Result<Sse<BoxStream<'static, Result<Event, Infallible>>>, ApiError> {
+    let run = RunId(id);
+    let step = StepId(step);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
+    let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
+    let sr = st
+        .db
+        .steps_of_run(&run)
+        .await?
+        .into_iter()
+        .find(|s| s.step == step)
+        .ok_or(ApiError::NotFound)?;
+
+    // The attempts to stream, in order: one requested, else all this step ran.
+    let selected: Vec<scarab_engine::AttemptId> = match &q.attempt {
+        Some(a) => {
+            let aid = scarab_engine::AttemptId(a.clone());
+            if !sr.attempts.iter().any(|x| x.id == aid) {
+                return Err(ApiError::NotFound);
+            }
+            vec![aid]
+        }
+        None => sr.attempts.iter().map(|a| a.id.clone()).collect(),
+    };
+
+    // Replay each selected attempt in order, remembering how far it was read.
+    let mut replay: Vec<Result<Event, Infallible>> = Vec::new();
+    let mut seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for aid in &selected {
+        let (body, next) = st.logs.read_from(&run, &step, aid, 0).await.unwrap_or_default();
+        if !body.is_empty() {
+            replay.push(Ok(Event::default().data(String::from_utf8_lossy(&body))));
+        }
+        seen.insert(aid.0.clone(), next);
+    }
+    let replay_stream = stream::iter(replay);
+
+    // Live-tail only if the run is going AND the latest attempt is in scope.
+    let latest_in_scope = sr
+        .attempts
+        .last()
+        .map(|a| a.id.clone())
+        .filter(|latest| selected.iter().any(|s| s == latest))
+        .is_some();
+    if status.is_terminal() || !latest_in_scope {
+        return Ok(Sse::new(replay_stream.boxed()));
+    }
+    let live = futures::stream::unfold(
+        (st.clone(), run.clone(), step.clone(), selected, seen, false),
+        |(st, run, step, attempts, mut seen, done)| async move {
+            if done {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let terminal = matches!(
+                st.db.run_status(&run).await,
+                Ok(Some(s)) if s.is_terminal()
+            );
+            let mut body = Vec::new();
+            for aid in &attempts {
+                let from = seen.get(&aid.0).copied().unwrap_or(0);
+                if let Ok((bytes, next)) = st.logs.read_from(&run, &step, aid, from).await {
+                    if !bytes.is_empty() {
+                        body.extend(bytes);
+                    }
+                    seen.insert(aid.0.clone(), next);
+                }
+            }
+            let event = if body.is_empty() {
+                Event::default().comment("keepalive")
+            } else {
+                Event::default().data(String::from_utf8_lossy(&body))
+            };
+            Some((Ok(event), (st, run, step, attempts, seen, terminal)))
+        },
+    );
+    Ok(Sse::new(replay_stream.chain(live).boxed()))
+}
+
 /// Restart a step and its transitive descendants (ADR-0027 smart invalidation):
 /// the target and every step depending on it are re-armed and re-run in
 /// dependency order; siblings and ancestors are left as-is.
@@ -1201,36 +1365,6 @@ pub struct ProjectDto {
     /// run — the dashboard's recency signal (ADR-0046). The domain carries no
     /// push/created_at yet, so never-run repos have no ordering key here.
     pub last_run_at: Option<i64>,
-}
-
-/// The authenticated principal (ADR-0049) — powers the UI's identity menu.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct MeResponse {
-    /// Stable, forge-agnostic identity subject.
-    pub subject: String,
-    /// Human display name, when the identity provides one.
-    pub display_name: Option<String>,
-    /// The principal's Scarab-native roles (e.g. `["Owner"]`).
-    pub roles: Vec<String>,
-}
-
-/// Return the current authenticated principal. In dev (auth disabled) this is
-/// the synthetic Owner.
-#[utoipa::path(
-    get,
-    path = "/v1/me",
-    responses(
-        (status = 200, body = MeResponse),
-        (status = 401, description = "not authenticated")
-    )
-)]
-async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeResponse>, ApiError> {
-    let principal = authenticate(&st, &headers, Action::Read).await?;
-    Ok(Json(MeResponse {
-        subject: principal.subject,
-        display_name: principal.display_name,
-        roles: principal.roles.iter().map(|r| format!("{r:?}")).collect(),
-    }))
 }
 
 /// The authenticated principal (ADR-0049) — powers the UI's identity menu.
@@ -1452,6 +1586,271 @@ async fn download_artifact(
     if let Ok(v) = axum::http::HeaderValue::from_str(&artifact.content_type) {
         resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, v);
     }
+    Ok(resp)
+}
+
+/// One named result a step published (ADR-0041) — the `${{ outputs.<step>.<name> }}`
+/// values, exposed read-only for the run detail Inspector. `type_name` is a
+/// coarse JSON kind (string/number/bool/object/array/null) so the UI can badge it
+/// without re-deriving.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StepResultDto {
+    pub name: String,
+    #[schema(value_type = Object)]
+    pub value: serde_json::Value,
+    pub type_name: String,
+}
+
+/// The coarse JSON kind of a result value, for the UI badge.
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// A step's named results (ADR-0041), read from `step_runs.results`. The read
+/// side of the results-ingest write path (`POST …/steps/{step}/results`): the
+/// Inspector's Results tab, and the source the Outputs view derives from. Read
+/// at the run's tenant.
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/steps/{step}/results",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "step id")
+    ),
+    responses((status = 200, body = [StepResultDto]), (status = 404, description = "no such run"))
+)]
+async fn get_step_results(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+) -> Result<Json<Vec<StepResultDto>>, ApiError> {
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
+    if st.db.run_status(&run).await?.is_none() {
+        return Err(ApiError::NotFound);
+    }
+    let results = st.db.step_results(&run, &StepId(step)).await?;
+    Ok(Json(
+        results
+            .into_iter()
+            .map(|(name, value)| StepResultDto {
+                type_name: json_type_name(&value).to_string(),
+                name,
+                value,
+            })
+            .collect(),
+    ))
+}
+
+/// One entry in a workspace directory listing — the merkle-tree children under a
+/// step's output snapshot (ADR-0029).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WorkspaceEntryDto {
+    pub name: String,
+    /// `"dir"` (a sub-tree) or `"file"` (a blob).
+    pub kind: String,
+}
+
+/// A directory listing within a step's output workspace snapshot.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WorkspaceListing {
+    /// The path listed (empty string = snapshot root).
+    pub path: String,
+    /// `false` when the step produced no snapshot (e.g. a still-running step, a
+    /// gate, or the local executor which doesn't snapshot). `entries` is empty.
+    pub available: bool,
+    pub entries: Vec<WorkspaceEntryDto>,
+}
+
+/// The `?path=` sub-path within a step's workspace snapshot (default = root).
+#[derive(Debug, Deserialize)]
+struct WorkspacePathQuery {
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Split a browse path into clean, non-empty segments — rejecting any `.`/`..`
+/// so a listing/fetch can never escape the snapshot root.
+fn workspace_segments(path: &str) -> Result<Vec<String>, ApiError> {
+    let mut segs = Vec::new();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            return Err(ApiError::NotFound);
+        }
+        segs.push(part.to_string());
+    }
+    Ok(segs)
+}
+
+/// Walk `segments` down from `root`, returning the [`scarab_storage::TreeTarget`]
+/// they name (a sub-tree or a blob), or `NotFound` if any segment is missing.
+async fn workspace_walk(
+    cas: &Arc<dyn scarab_storage::Cas>,
+    root: scarab_storage::TreeHash,
+    segments: &[String],
+) -> Result<scarab_storage::TreeTarget, ApiError> {
+    use scarab_storage::TreeTarget;
+    let mut cursor = TreeTarget::Tree(root);
+    for seg in segments {
+        let tree = match cursor {
+            TreeTarget::Tree(h) => h,
+            // A path component descends into a file — no such directory.
+            TreeTarget::Blob(_) => return Err(ApiError::NotFound),
+        };
+        let entries = cas.tree_entries(&tree).await.map_err(|_| ApiError::NotFound)?;
+        cursor = entries
+            .into_iter()
+            .find(|e| &e.name == seg)
+            .ok_or(ApiError::NotFound)?
+            .target;
+    }
+    Ok(cursor)
+}
+
+/// Read a step's output snapshot root hash, or `None` if it produced none.
+async fn step_snapshot_root(
+    st: &AppState,
+    run: &RunId,
+    step: &StepId,
+) -> Result<Option<scarab_storage::TreeHash>, ApiError> {
+    Ok(st
+        .db
+        .step_output(run, step)
+        .await?
+        .map(scarab_storage::TreeHash))
+}
+
+/// List a directory inside a step's output workspace snapshot (ADR-0029). The
+/// live Pod workspace is gone once the step ends (`restartPolicy: Never`); what
+/// survives is the content-addressed snapshot, walked read-only here. Read at
+/// the run's tenant.
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/steps/{step}/workspace",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "step id"),
+        ("path" = Option<String>, Query, description = "sub-path within the snapshot (default = root)")
+    ),
+    responses((status = 200, body = WorkspaceListing), (status = 404, description = "no such run/path or browse disabled"))
+)]
+async fn list_workspace(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+    Query(q): Query<WorkspacePathQuery>,
+) -> Result<Json<WorkspaceListing>, ApiError> {
+    use scarab_storage::TreeTarget;
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
+    let cas = st.workspace_cas.as_ref().ok_or(ApiError::NotFound)?;
+    if st.db.run_status(&run).await?.is_none() {
+        return Err(ApiError::NotFound);
+    }
+    let path = q.path.unwrap_or_default();
+    let segments = workspace_segments(&path)?;
+    let root = match step_snapshot_root(&st, &run, &StepId(step)).await? {
+        Some(r) => r,
+        // No snapshot yet — a running step, a gate, or a non-snapshotting
+        // backend. Report unavailable rather than 404 so the UI can explain.
+        None => {
+            return Ok(Json(WorkspaceListing {
+                path,
+                available: false,
+                entries: Vec::new(),
+            }))
+        }
+    };
+    let tree = match workspace_walk(cas, root, &segments).await? {
+        TreeTarget::Tree(h) => h,
+        // The path names a file, not a directory.
+        TreeTarget::Blob(_) => return Err(ApiError::NotFound),
+    };
+    let mut entries: Vec<WorkspaceEntryDto> = cas
+        .tree_entries(&tree)
+        .await
+        .map_err(|_| ApiError::NotFound)?
+        .into_iter()
+        .map(|e| WorkspaceEntryDto {
+            name: e.name,
+            kind: match e.target {
+                TreeTarget::Tree(_) => "dir",
+                TreeTarget::Blob(_) => "file",
+            }
+            .to_string(),
+        })
+        .collect();
+    // Directories first, then lexicographic — a conventional file listing.
+    entries.sort_by(|a, b| {
+        (a.kind != "dir", &a.name).cmp(&(b.kind != "dir", &b.name))
+    });
+    Ok(Json(WorkspaceListing {
+        path,
+        available: true,
+        entries,
+    }))
+}
+
+/// Stream one file's bytes from a step's output workspace snapshot (ADR-0029).
+/// Read at the run's tenant; immutable content.
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/steps/{step}/workspace/file",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "step id"),
+        ("path" = String, Query, description = "file path within the snapshot")
+    ),
+    responses((status = 200, description = "the file bytes"), (status = 404, description = "no such file or browse disabled"))
+)]
+async fn get_workspace_file(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+    Query(q): Query<WorkspacePathQuery>,
+) -> Result<Response, ApiError> {
+    use scarab_storage::TreeTarget;
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
+    let cas = st.workspace_cas.as_ref().ok_or(ApiError::NotFound)?;
+    let path = q.path.unwrap_or_default();
+    let segments = workspace_segments(&path)?;
+    if segments.is_empty() {
+        return Err(ApiError::NotFound);
+    }
+    let root = step_snapshot_root(&st, &run, &StepId(step))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let blob = match workspace_walk(cas, root, &segments).await? {
+        TreeTarget::Blob(h) => h,
+        TreeTarget::Tree(_) => return Err(ApiError::NotFound),
+    };
+    let bytes = cas.get_blob(&blob).await.map_err(|_| ApiError::NotFound)?;
+    // Serve text inline where it looks like UTF-8 (logs, source, configs); fall
+    // back to octet-stream so a binary triggers a download rather than mojibake.
+    let content_type = if std::str::from_utf8(&bytes).is_ok() {
+        "text/plain; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    };
+    let mut resp = bytes.into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(content_type),
+    );
     Ok(resp)
 }
 
@@ -3843,10 +4242,14 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         get_run,
         get_events,
         get_logs,
+        get_step_logs,
         restart_step,
         cancel_run,
         list_artifacts,
         download_artifact,
+        get_step_results,
+        list_workspace,
+        get_workspace_file,
         approve_gate,
         release_gate_external,
         put_secret,
@@ -3867,6 +4270,10 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         RunSummaryDto,
         RunStatusResponse,
         StepStatusDto,
+        AttemptDto,
+        StepResultDto,
+        WorkspaceEntryDto,
+        WorkspaceListing,
         PutSecretRequest,
         SecretListResponse,
         MeResponse
@@ -3915,9 +4322,18 @@ fn router_inner(state: AppState) -> Router {
         .route("/v1/runs/{id}/cancel", post(cancel_run))
         .route("/v1/runs/{id}/artifacts", get(list_artifacts))
         .route("/v1/runs/{id}/artifacts/{*name}", get(download_artifact))
+        .route("/v1/runs/{id}/steps/{step}/logs", get(get_step_logs))
+        .route("/v1/runs/{id}/steps/{step}/workspace", get(list_workspace))
+        .route(
+            "/v1/runs/{id}/steps/{step}/workspace/file",
+            get(get_workspace_file),
+        )
         .route("/v1/runs/{id}/gates/{step}/approve", post(approve_gate))
         .route("/v1/runs/{id}/gates/{step}/release", post(release_gate_external))
-        .route("/v1/runs/{id}/steps/{step}/results", post(ingest_step_results))
+        .route(
+            "/v1/runs/{id}/steps/{step}/results",
+            get(get_step_results).post(ingest_step_results),
+        )
         .route(
             "/v1/secrets",
             post(put_secret).get(list_secrets).delete(delete_secret),

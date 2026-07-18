@@ -356,7 +356,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // /v1/secrets management with the secrets store built above (ADR-0014).
         .with_secrets(secrets.clone())
         // Artifact list/download (ADR-0052), served from the object store.
-        .with_artifact_store(store.clone());
+        .with_artifact_store(store.clone())
+        // Read-only workspace browser (ADR-0029): serves a step's output
+        // snapshot tree + file bytes for the run detail Inspector.
+        .with_workspace_cas(workspace_cas.clone());
     if let Some(secret) = config.github_webhook_secret.clone() {
         state = state.with_github_webhook_secret(secret);
     }

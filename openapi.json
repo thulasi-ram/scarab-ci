@@ -854,6 +854,50 @@
         }
       }
     },
+    "/v1/runs/{id}/steps/{step}/logs": {
+      "get": {
+        "tags": [],
+        "summary": "SSE of ONE step's log bodies (ADR-0013), the source for the run detail's\nper-step fold. Same machinery as the run-wide `/logs`, scoped to the step —\nand, with `?attempt=`, to a single attempt so a rerun's earlier (failed)\noutput can be read in isolation. Replays committed chunks then live-tails\nonly when the run is still going AND the latest attempt is in scope\n(historical attempts are immutable). Read at the run's tenant.",
+        "operationId": "get_step_logs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attempt",
+            "in": "query",
+            "description": "restrict to one attempt id (default = all)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream of this step's log output"
+          },
+          "404": {
+            "description": "no such run or step"
+          }
+        }
+      }
+    },
     "/v1/runs/{id}/steps/{step}/restart": {
       "post": {
         "tags": [],
@@ -890,6 +934,49 @@
       }
     },
     "/v1/runs/{id}/steps/{step}/results": {
+      "get": {
+        "tags": [],
+        "summary": "A step's named results (ADR-0041), read from `step_runs.results`. The read\nside of the results-ingest write path (`POST …/steps/{step}/results`): the\nInspector's Results tab, and the source the Outputs view derives from. Read\nat the run's tenant.",
+        "operationId": "get_step_results",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/StepResultDto"
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such run"
+          }
+        }
+      },
       "post": {
         "tags": [],
         "summary": "Ingest a step's named results (ADR-0040/0042): the trusted per-Pod egress\nsidecar POSTs `{ name: value, … }` here, authenticated by a fence-scoped\ntoken, and the control plane persists them to `step_runs.results`. The\nuntrusted step never calls this — only the sidecar holds the token.",
@@ -924,6 +1011,101 @@
           },
           "404": {
             "description": "no such step, or results ingest disabled"
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/steps/{step}/workspace": {
+      "get": {
+        "tags": [],
+        "summary": "List a directory inside a step's output workspace snapshot (ADR-0029). The\nlive Pod workspace is gone once the step ends (`restartPolicy: Never`); what\nsurvives is the content-addressed snapshot, walked read-only here. Read at\nthe run's tenant.",
+        "operationId": "list_workspace",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "sub-path within the snapshot (default = root)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceListing"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such run/path or browse disabled"
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/steps/{step}/workspace/file": {
+      "get": {
+        "tags": [],
+        "summary": "Stream one file's bytes from a step's output workspace snapshot (ADR-0029).\nRead at the run's tenant; immutable content.",
+        "operationId": "get_workspace_file",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "query",
+            "description": "file path within the snapshot",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the file bytes"
+          },
+          "404": {
+            "description": "no such file or browse disabled"
           }
         }
       }
@@ -1105,6 +1287,36 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "AttemptDto": {
+        "type": "object",
+        "description": "One attempt at executing a step (ADR-0047) — the rerun unit. A step with more\nthan one attempt is one that failed-and-retried (or was restarted); the last\nattempt carries the current outcome.",
+        "required": [
+          "id",
+          "started_at",
+          "failed"
+        ],
+        "properties": {
+          "failed": {
+            "type": "boolean",
+            "description": "`true` if this attempt ended in failure. A later attempt may still have\nsucceeded — that divergence is exactly the retry story worth showing."
+          },
+          "failure": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`."
+          },
+          "id": {
+            "type": "string"
+          },
+          "started_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When this attempt started (unix-ms)."
           }
         }
       },
@@ -1631,6 +1843,26 @@
           }
         }
       },
+      "StepResultDto": {
+        "type": "object",
+        "description": "One named result a step published (ADR-0041) — the `${{ outputs.<step>.<name> }}`\nvalues, exposed read-only for the run detail Inspector. `type_name` is a\ncoarse JSON kind (string/number/bool/object/array/null) so the UI can badge it\nwithout re-deriving.",
+        "required": [
+          "name",
+          "value",
+          "type_name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type_name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "object"
+          }
+        }
+      },
       "StepStatusDto": {
         "type": "object",
         "required": [
@@ -1639,6 +1871,13 @@
           "attempts"
         ],
         "properties": {
+          "attempt_list": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttemptDto"
+            },
+            "description": "Per-attempt detail (ADR-0047) — the rerun/retry history in append order.\n`attempts` is the count; this is the list, so the UI can show retries (a\nfailed attempt followed by a succeeding one — the durable-execution story)\nand fold a step's logs per attempt. Empty until the step first launches."
+          },
           "attempts": {
             "type": "integer",
             "minimum": 0
@@ -1662,6 +1901,48 @@
           },
           "status": {
             "type": "string"
+          }
+        }
+      },
+      "WorkspaceEntryDto": {
+        "type": "object",
+        "description": "One entry in a workspace directory listing — the merkle-tree children under a\nstep's output snapshot (ADR-0029).",
+        "required": [
+          "name",
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`\"dir\"` (a sub-tree) or `\"file\"` (a blob)."
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "WorkspaceListing": {
+        "type": "object",
+        "description": "A directory listing within a step's output workspace snapshot.",
+        "required": [
+          "path",
+          "available",
+          "entries"
+        ],
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "description": "`false` when the step produced no snapshot (e.g. a still-running step, a\ngate, or the local executor which doesn't snapshot). `entries` is empty."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceEntryDto"
+            }
+          },
+          "path": {
+            "type": "string",
+            "description": "The path listed (empty string = snapshot root)."
           }
         }
       }
