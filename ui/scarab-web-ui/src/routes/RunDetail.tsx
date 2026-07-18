@@ -18,7 +18,7 @@ import {
   type RunEvent,
   type StepStatus,
 } from "../api/client";
-import { describeEvent, eventCategory, EVENT_GLYPH } from "../events";
+import { eventParts, eventCategory, EVENT_GLYPH } from "../events";
 import { relTime, absTime, duration } from "../fmt";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
@@ -46,18 +46,45 @@ export default function RunDetail() {
   const stepList = (): StepStatus[] => run()?.steps ?? [];
   const runningCount = () => stepList().filter((s) => s.status === "running").length;
 
+  // Per-step wall-clock from the event log: first AttemptStarted → last
+  // AttemptFinished. Gives finished DAG nodes a real duration (the run object
+  // carries no per-step timing).
+  const stepTiming = (): Record<string, { start?: number; end?: number }> => {
+    const m: Record<string, { start?: number; end?: number }> = {};
+    for (const e of events()) {
+      const k = e.kind;
+      if (typeof k === "string") continue;
+      const tag = Object.keys(k)[0];
+      const step = (k[tag]?.step as string | undefined) ?? undefined;
+      if (!step) continue;
+      const t = (m[step] ??= {});
+      if (tag === "AttemptStarted" && (t.start === undefined || e.at < t.start)) t.start = e.at;
+      if (tag === "AttemptFinished" && (t.end === undefined || e.at > t.end)) t.end = e.at;
+    }
+    return m;
+  };
+
   // DAG nodes: the graph shape + live status. A running step's `runningSince`
-  // (its latest attempt's start) drives the node's in-place elapsed counter.
-  const dagSteps = (): DagStep[] =>
-    stepList().map((s) => ({
-      id: s.id,
-      status: s.status,
-      attempts: s.attempts,
-      needs: s.needs ?? [],
-      gate: s.gate,
-      runningSince:
-        s.status === "running" ? s.attempt_list?.[s.attempt_list.length - 1]?.started_at ?? null : null,
-    }));
+  // (its latest attempt's start) drives the node's in-place elapsed counter; a
+  // finished step's `durationMs` comes from the event-log timing above.
+  const dagSteps = (): DagStep[] => {
+    const timing = stepTiming();
+    return stepList().map((s) => {
+      const t = timing[s.id];
+      return {
+        id: s.id,
+        status: s.status,
+        attempts: s.attempts,
+        needs: s.needs ?? [],
+        gate: s.gate,
+        runningSince:
+          s.status === "running"
+            ? s.attempt_list?.[s.attempt_list.length - 1]?.started_at ?? null
+            : null,
+        durationMs: t?.start != null && t?.end != null ? t.end - t.start : null,
+      };
+    });
+  };
 
   const [artifacts, { refetch: refetchArtifacts }] = createResource(id, (rid) =>
     listArtifacts(rid).catch(() => []),
@@ -235,6 +262,7 @@ export default function RunDetail() {
                 <For each={events()} fallback={<div class="tl-empty">no events yet</div>}>
                   {(e) => {
                     const cat = eventCategory(e);
+                    const parts = eventParts(e);
                     return (
                       <div class="tl-item">
                         <div class="tl-time" title={absTime(e.at)}>{relTime(e.at)}</div>
@@ -242,7 +270,12 @@ export default function RunDetail() {
                           <div class={`tl-glyph ${cat}`}>{EVENT_GLYPH[cat]}</div>
                         </div>
                         <div class="tl-body">
-                          <div class="tl-msg">{describeEvent(e)}</div>
+                          <div class="tl-msg">
+                            <Show when={parts.step}>
+                              <b class="tl-step mono">{parts.step}</b>
+                            </Show>
+                            {parts.text}
+                          </div>
                         </div>
                       </div>
                     );

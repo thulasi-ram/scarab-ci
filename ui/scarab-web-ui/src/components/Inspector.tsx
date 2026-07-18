@@ -35,6 +35,20 @@ export default function Inspector(props: {
 }) {
   const [tab, setTab] = createSignal<Tab>("results");
   const [wsPath, setWsPath] = createSignal("");
+  // A file open for inline preview (path within the snapshot), or null = listing.
+  const [openFile, setOpenFile] = createSignal<string | null>(null);
+
+  // Fetch an opened file's bytes; text renders inline, binary offers download.
+  const fileArg = () =>
+    props.selectedStep && openFile()
+      ? { run: props.runId, step: props.selectedStep, path: openFile()! }
+      : null;
+  const [fileBody] = createResource(fileArg, async (a) => {
+    const res = await fetch(workspaceFileUrl(a.run, a.step, a.path));
+    const ct = res.headers.get("content-type") ?? "";
+    if (!ct.startsWith("text/")) return { binary: true, text: "" };
+    return { binary: false, text: await res.text() };
+  });
 
   const stepArg = () => (props.selectedStep ? { run: props.runId, step: props.selectedStep } : null);
 
@@ -47,8 +61,13 @@ export default function Inspector(props: {
   const [ws] = createResource(wsArg, (a) => listWorkspace(a.run, a.step, a.path));
 
   const crumbs = () => wsPath().split("/").filter(Boolean);
-  const goto = (i: number) => setWsPath(crumbs().slice(0, i + 1).join("/"));
-  const enter = (name: string) => setWsPath([...crumbs(), name].join("/"));
+  // Navigating the tree closes any open file preview.
+  const navTo = (path: string) => {
+    setOpenFile(null);
+    setWsPath(path);
+  };
+  const goto = (i: number) => navTo(crumbs().slice(0, i + 1).join("/"));
+  const enter = (name: string) => navTo([...crumbs(), name].join("/"));
   const filePath = (name: string) => [...crumbs(), name].join("/");
 
   const TabBtn = (p: { id: Tab; label: string; count?: number }) => (
@@ -153,7 +172,7 @@ export default function Inspector(props: {
         <Show when={tab() === "workspace"}>
           <div class="tabpane">
             <div class="ws-crumbs mono">
-              <button class="crumb" onClick={() => setWsPath("")}>
+              <button class="crumb" onClick={() => navTo("")}>
                 {props.selectedStep}
               </button>
               <For each={crumbs()}>
@@ -166,43 +185,88 @@ export default function Inspector(props: {
                   </>
                 )}
               </For>
+              <Show when={openFile()}>
+                <span class="sep">/</span>
+                <span class="crumb file">{openFile()!.split("/").pop()}</span>
+              </Show>
             </div>
-            <Show
-              when={ws()?.available}
-              fallback={
-                <p class="empty">
-                  {ws.loading
-                    ? "loading…"
-                    : "no workspace snapshot for this step — a still-running step, a gate, or a backend that doesn't snapshot"}
-                </p>
-              }
-            >
-              <ul class="filelist">
-                <For each={ws()?.entries} fallback={<li class="filerow empty">empty directory</li>}>
-                  {(e) => (
-                    <li class="filerow">
-                      <Show
-                        when={e.kind === "dir"}
-                        fallback={
-                          <span class="fname">
-                            <Icon icon="file" size={14} class="fico-file" />
-                            <a href={workspaceFileUrl(props.runId, props.selectedStep!, filePath(e.name))} target="_blank">
+
+            {/* File preview */}
+            <Show when={openFile()}>
+              <div class="fileview">
+                <div class="fileview-h">
+                  <span class="mono">{openFile()!.split("/").pop()}</span>
+                  <a
+                    class="fv-dl mono"
+                    href={workspaceFileUrl(props.runId, props.selectedStep!, openFile()!)}
+                    download={openFile()!.split("/").pop()}
+                  >
+                    download ↓
+                  </a>
+                  <button class="fv-close" onClick={() => setOpenFile(null)} title="close">
+                    ✕
+                  </button>
+                </div>
+                <Show
+                  when={!fileBody.loading}
+                  fallback={<div class="fileview-body"><span class="lgln" />loading…</div>}
+                >
+                  <Show
+                    when={!fileBody()?.binary}
+                    fallback={<div class="fileview-body binary">binary file — use download</div>}
+                  >
+                    <div class="fileview-body mono">
+                      <For each={(fileBody()?.text ?? "").replace(/\n$/, "").split("\n")}>
+                        {(line, i) => (
+                          <div class="fvrow">
+                            <span class="lgln">{i() + 1}</span>
+                            <span class="lgtx">{line}</span>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                </Show>
+              </div>
+            </Show>
+
+            {/* Directory listing (hidden while a file is open) */}
+            <Show when={!openFile()}>
+              <Show
+                when={ws()?.available}
+                fallback={
+                  <p class="empty">
+                    {ws.loading
+                      ? "loading…"
+                      : "no workspace snapshot for this step — a still-running step, a gate, or a backend that doesn't snapshot"}
+                  </p>
+                }
+              >
+                <ul class="filelist">
+                  <For each={ws()?.entries} fallback={<li class="filerow empty">empty directory</li>}>
+                    {(e) => (
+                      <li class="filerow">
+                        <Show
+                          when={e.kind === "dir"}
+                          fallback={
+                            <button class="fname asdir" onClick={() => setOpenFile(filePath(e.name))}>
+                              <Icon icon="file" size={14} class="fico-file" />
                               {e.name}
-                            </a>
-                          </span>
-                        }
-                      >
-                        <button class="fname asdir" onClick={() => enter(e.name)}>
-                          <Icon icon="folder" size={14} class="fico-dir" />
-                          {e.name}
-                        </button>
-                      </Show>
-                      <span class="fsize mono">{e.kind}</span>
-                      <span class="fmeta" />
-                    </li>
-                  )}
-                </For>
-              </ul>
+                            </button>
+                          }
+                        >
+                          <button class="fname asdir" onClick={() => enter(e.name)}>
+                            <Icon icon="folder" size={14} class="fico-dir" />
+                            {e.name}
+                          </button>
+                        </Show>
+                        <span class="fsize mono">{e.kind}</span>
+                        <span class="fmeta" />
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </Show>
             </Show>
           </div>
         </Show>

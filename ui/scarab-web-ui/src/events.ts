@@ -30,6 +30,32 @@ export function describeEvent(e: RunEvent): string {
   }
 }
 
+/** Split an event into its optional step id and a human message with the step
+ * omitted — so the rail can render the step name as a styled mono chip. */
+export function eventParts(e: RunEvent): { step: string | null; text: string } {
+  const k = e.kind;
+  if (typeof k === "string") return { step: null, text: describeEvent(e) };
+  const tag = Object.keys(k)[0];
+  const v = k[tag] ?? {};
+  const step = (v.step as string | undefined) ?? null;
+  const s = (x: unknown) => String(x ?? "");
+  if (!step) return { step: null, text: describeEvent(e) };
+  switch (tag) {
+    case "StepTransitioned":
+      return { step, text: `${s(v.from)} → ${s(v.to)}` };
+    case "AttemptStarted":
+      return { step, text: "attempt started" };
+    case "AttemptFinished":
+      return { step, text: v.failure ? `attempt failed (${s(v.failure)})` : "attempt finished" };
+    case "GateReleased":
+      return { step, text: "gate released" };
+    case "StepSkipped":
+      return { step, text: `skipped (${s(v.reason)})` };
+    default:
+      return { step, text: describeEvent(e) };
+  }
+}
+
 /** The activity-rail category for an event — drives its glyph and colour. `err`
  * covers a failed attempt (the retry story) and a run/step that ended failed. */
 export type EventCat = "info" | "ok" | "run" | "err" | "gate";

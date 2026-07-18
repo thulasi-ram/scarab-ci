@@ -1837,3 +1837,30 @@ h1, .crumb-head, .run-title {
 .tl-glyph.info { border-color: var(--border-copper); color: var(--copper); }
 .tl-body { padding-top: 2px; }
 .tl-msg { font-size: 13px; color: var(--soft-white); }
+
+/* ── Run detail rough-edge polish ─────────────────────────────────────────── */
+/* Activity: step name as a mono chip before the message. */
+.tl-step { color: var(--emerald); font-weight: 500; margin-right: 7px; font-size: 12px; }
+
+/* Logs: the error count is a jump-to-first-error button. */
+.lgerr { background: transparent; cursor: pointer; }
+.lgerr:hover { color: var(--danger); border-color: var(--danger); }
+
+/* Workspace: inline file preview. */
+.ws-crumbs .crumb.file { color: var(--soft-white); }
+.fileview { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; margin-bottom: 8px; }
+.fileview-h {
+  display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+  background: var(--pine-deep); border-bottom: 1px solid var(--border);
+  font-size: 12px; color: var(--soft-white);
+}
+.fileview-h .fv-dl { margin-left: auto; color: var(--emerald); text-decoration: none; font-size: 11px; }
+.fileview-h .fv-dl:hover { text-decoration: underline; }
+.fileview-h .fv-close { background: none; border: none; color: var(--muted-sage); cursor: pointer; font-size: 13px; padding: 0 2px; }
+.fileview-h .fv-close:hover { color: var(--danger); }
+.fileview-body { background: var(--terminal); color: var(--terminal-ink); font-size: 12.5px; line-height: 1.6; max-height: 420px; overflow: auto; padding: 8px 0; }
+.fileview-body.binary { padding: 16px; color: var(--muted-sage); font-family: var(--font-mono); }
+.fvrow { display: grid; grid-template-columns: 46px 1fr; padding: 0 12px; }
+.fvrow:hover { background: color-mix(in srgb, var(--emerald-bright) 6%, transparent); }
+.fvrow .lgln { color: var(--terminal-line); text-align: right; padding-right: 14px; user-select: none; }
+.fvrow .lgtx { color: var(--terminal-ink); white-space: pre-wrap; word-break: break-word; }

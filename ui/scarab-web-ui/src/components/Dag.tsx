@@ -16,18 +16,28 @@ export type DagStep = {
   gate?: string | null;
   /** When the current (running) attempt started, epoch-ms — drives live elapsed. */
   runningSince?: number | null;
+  /** Wall-clock a finished step took (ms), derived from the event log. */
+  durationMs?: number | null;
 };
 
 type Edge = { x1: number; y1: number; x2: number; y2: number; hot: boolean };
 
 /** m:ss (or h:mm:ss) elapsed since `since`, ticking off the caller's `now`. */
 function elapsed(since: number, now: number): string {
-  const s = Math.max(0, Math.floor((now - since) / 1000));
-  const mm = Math.floor(s / 60);
-  const ss = s % 60;
-  if (mm < 60) return `${mm}:${String(ss).padStart(2, "0")}`;
+  return fmtDur(now - since);
+}
+
+/** A compact duration label (e.g. `4.2s`, `1m12s`, `1h03m`) from a ms delta. */
+function fmtDur(ms: number): string {
+  const s = Math.max(0, ms) / 1000;
+  if (s < 10) return `${s.toFixed(1)}s`;
+  const total = Math.round(s);
+  if (total < 60) return `${total}s`;
+  const mm = Math.floor(total / 60);
+  const ss = total % 60;
+  if (mm < 60) return `${mm}m${String(ss).padStart(2, "0")}s`;
   const hh = Math.floor(mm / 60);
-  return `${hh}:${String(mm % 60).padStart(2, "0")}:${String(ss).padStart(2, "0")}`;
+  return `${hh}h${String(mm % 60).padStart(2, "0")}m`;
 }
 
 export default function Dag(props: {
@@ -115,6 +125,11 @@ export default function Dag(props: {
     }
     if (s.gate && (s.status === "pending" || s.status === "waiting" || s.status === "ready")) {
       return `gate · ${s.gate}`;
+    }
+    // Finished steps show how long they took (from the event log).
+    if (s.durationMs != null && (s.status === "succeeded" || s.status === "failed")) {
+      const mark = s.status === "succeeded" ? "✓" : "✕";
+      return `${mark} ${fmtDur(s.durationMs)}`;
     }
     return s.status;
   };
