@@ -892,6 +892,41 @@
         }
       }
     },
+    "/v1/runs/{id}/steps/{step}/debug-pod": {
+      "get": {
+        "tags": [],
+        "summary": "WebSocket: reproduce a **finished** step in a fresh ephemeral Pod — its\nimage, its output workspace snapshot re-materialized at `/workspace` —\nrunning `sleep` so the operator can shell in and debug (ADR-0039 world). The\nlive-attach surface needs a still-running step; this one works after the fact.\nGated behind `Administer`; the debug Pod is TTL-bounded and torn down when\nthe socket closes. Disabled (404) unless a debug launcher is wired (k8s only).",
+        "operationId": "debug_pod_step",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket upgrade — interactive TTY into a fresh reproduction Pod"
+          },
+          "404": {
+            "description": "no such run/step, no step spec, or debug-pod disabled"
+          }
+        }
+      }
+    },
     "/v1/runs/{id}/steps/{step}/logs": {
       "get": {
         "tags": [],

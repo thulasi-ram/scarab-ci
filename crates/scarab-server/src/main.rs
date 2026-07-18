@@ -365,12 +365,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // UI-only replica can still serve attach. Absent a cluster it stays off.
     if matches!(config.executor, ExecutorKind::K8s) {
         match K8sExecutor::connect(config.namespace.clone()).await {
-            Ok(attacher) => {
-                state = state.with_attacher(Arc::new(attacher));
-                tracing::info!("debug shell: step-attach enabled (k8s exec)");
+            Ok(exec) => {
+                // The workspace CAS lets the debug-pod re-materialize a finished
+                // step's snapshot. One instance serves both attach and debug-pod.
+                let exec = Arc::new(exec.with_workspace_cas(workspace_cas.clone()));
+                state = state
+                    .with_attacher(exec.clone())
+                    .with_debug_launcher(exec);
+                tracing::info!("debug shell: step-attach + debug-pod enabled (k8s exec)");
             }
             Err(e) => {
-                tracing::warn!(error = %e, "debug shell: attach disabled — no cluster reachable");
+                tracing::warn!(error = %e, "debug shell: attach/debug-pod disabled — no cluster reachable");
             }
         }
     }

@@ -921,14 +921,13 @@ pub trait StepAttacher: Send + Sync {
     async fn attach(&self, step: &StepRun) -> Result<AttachIo, ExecError>;
 }
 
-#[async_trait]
-impl StepAttacher for K8sExecutor {
-    async fn attach(&self, step: &StepRun) -> Result<AttachIo, ExecError> {
+impl K8sExecutor {
+    /// Open an interactive `sh` (TTY) in `pod`'s step container — the shared
+    /// primitive behind both live-attach and debug-pod. A TTY multiplexes
+    /// stderr into stdout, so stderr must be off.
+    async fn attach_pod(&self, pod: &str) -> Result<AttachIo, ExecError> {
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         let pods: Api<Pod> = Api::namespaced(client, &self.namespace);
-        let pod = pod_name(step);
-        // Interactive TTY shell in the step container; a TTY multiplexes stderr
-        // into stdout, so stderr must be off.
         let params = AttachParams::default()
             .container(STEP_CONTAINER)
             .stdin(true)
@@ -936,7 +935,7 @@ impl StepAttacher for K8sExecutor {
             .stderr(false)
             .tty(true);
         let mut proc = pods
-            .exec(&pod, ["sh"], &params)
+            .exec(pod, ["sh"], &params)
             .await
             .map_err(|e| ExecError::Other(format!("attach to {pod}: {e}")))?;
         let output = proc
@@ -950,6 +949,212 @@ impl StepAttacher for K8sExecutor {
             input: Box::pin(input),
             _process: Box::new(proc),
         })
+    }
+
+    /// Poll until `container` (init or main) reaches a running state, or time out.
+    async fn wait_container(
+        &self,
+        pods: &Api<Pod>,
+        pod: &str,
+        container: &str,
+        is_init: bool,
+        timeout_secs: u64,
+    ) -> Result<(), ExecError> {
+        for _ in 0..(timeout_secs * 5) {
+            if let Ok(p) = pods.get(pod).await {
+                let running = if is_init {
+                    init_container_running(&p, container)
+                } else {
+                    p.status
+                        .as_ref()
+                        .and_then(|s| s.container_statuses.as_ref())
+                        .map(|cs| {
+                            cs.iter().any(|c| {
+                                c.name == container
+                                    && c.state.as_ref().and_then(|st| st.running.as_ref()).is_some()
+                            })
+                        })
+                        .unwrap_or(false)
+                };
+                if running {
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        Err(ExecError::Other(format!(
+            "timed out waiting for container {container} in {pod}"
+        )))
+    }
+
+    fn debug_pod_name(step: &StepRun) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let slug = truncate(&sanitize_dns(&step.step.0), 32);
+        let hash = fnv1a(&format!("{}/{}/{nanos}", step.run.0, step.step.0));
+        format!("scarab-debug-{slug}-{hash:08x}")
+    }
+}
+
+#[async_trait]
+impl StepAttacher for K8sExecutor {
+    async fn attach(&self, step: &StepRun) -> Result<AttachIo, ExecError> {
+        self.attach_pod(&pod_name(step)).await
+    }
+}
+
+/// A created debug pod — an ephemeral shell reproduction of a finished step.
+pub struct DebugPod {
+    pub name: String,
+}
+
+/// Reproduces a *finished* step in a fresh ephemeral Pod — its image, its output
+/// workspace snapshot re-materialized at `/workspace` — running `sleep` so an
+/// operator can shell in. The debug Pod carries no hardened baseline (it runs as
+/// the image's own user, so any image can boot) and is not governed; it's a
+/// throwaway. Backends that can't reproduce return [`ExecError::Unavailable`].
+#[async_trait]
+pub trait DebugLauncher: Send + Sync {
+    async fn launch_debug(
+        &self,
+        step: &StepRun,
+        image: &str,
+        snapshot_root: Option<&str>,
+        ttl_secs: u64,
+    ) -> Result<DebugPod, ExecError>;
+    async fn attach_debug(&self, pod: &str) -> Result<AttachIo, ExecError>;
+    async fn teardown_debug(&self, pod: &str) -> Result<(), ExecError>;
+}
+
+#[async_trait]
+impl DebugLauncher for K8sExecutor {
+    async fn launch_debug(
+        &self,
+        step: &StepRun,
+        image: &str,
+        snapshot_root: Option<&str>,
+        ttl_secs: u64,
+    ) -> Result<DebugPod, ExecError> {
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let pods: Api<Pod> = Api::namespaced(client, &self.namespace);
+        let name = Self::debug_pod_name(step);
+
+        let ws_mount = VolumeMount {
+            name: WORKSPACE_VOLUME.to_string(),
+            mount_path: WORKSPACE_MOUNT_PATH.to_string(),
+            ..Default::default()
+        };
+        let ctl_mount = VolumeMount {
+            name: CTL_VOLUME.to_string(),
+            mount_path: CTL_MOUNT_PATH.to_string(),
+            ..Default::default()
+        };
+        // With a snapshot, the init container waits for the control-plane feed;
+        // without one, it exits immediately and the shell starts empty.
+        let wait = if snapshot_root.is_some() {
+            format!("until [ -f {CTL_MOUNT_PATH}/init-done ]; do sleep 0.2; done")
+        } else {
+            "exit 0".to_string()
+        };
+        let init = Container {
+            name: WORKSPACE_INIT_CONTAINER.to_string(),
+            image: Some(WORKSPACE_HELPER_IMAGE.to_string()),
+            command: Some(vec!["sh".into(), "-c".into(), wait]),
+            volume_mounts: Some(vec![ws_mount.clone(), ctl_mount.clone()]),
+            ..Default::default()
+        };
+        let shell = Container {
+            name: STEP_CONTAINER.to_string(),
+            image: Some(image.to_string()),
+            // Keep the Pod alive so it can be shelled into; TTL-bounded.
+            command: Some(vec!["sleep".into(), ttl_secs.to_string()]),
+            working_dir: Some(WORKSPACE_MOUNT_PATH.to_string()),
+            volume_mounts: Some(vec![ws_mount, ctl_mount]),
+            ..Default::default()
+        };
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some(name.clone()),
+                namespace: Some(self.namespace.clone()),
+                labels: Some(std::collections::BTreeMap::from([
+                    ("app.kubernetes.io/managed-by".to_string(), "scarab".to_string()),
+                    ("scarab.io/debug".to_string(), "true".to_string()),
+                    ("scarab.io/run".to_string(), sanitize_label(&step.run.0)),
+                    ("scarab.io/step".to_string(), sanitize_label(&step.step.0)),
+                ])),
+                ..Default::default()
+            },
+            spec: Some(PodSpec {
+                restart_policy: Some("Never".to_string()),
+                init_containers: Some(vec![init]),
+                containers: vec![shell],
+                volumes: Some(vec![
+                    Volume {
+                        name: WORKSPACE_VOLUME.to_string(),
+                        empty_dir: Some(EmptyDirVolumeSource::default()),
+                        ..Default::default()
+                    },
+                    Volume {
+                        name: CTL_VOLUME.to_string(),
+                        empty_dir: Some(EmptyDirVolumeSource::default()),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        pods.create(&PostParams::default(), &pod)
+            .await
+            .map_err(|e| ExecError::Other(format!("create debug pod: {e}")))?;
+
+        // Re-materialize the step's output snapshot into /workspace (same feed
+        // path as a real step's inputs).
+        if let Some(root) = snapshot_root {
+            let cas = self.workspace_cas.clone().ok_or(ExecError::Unavailable)?;
+            self.wait_container(&pods, &name, WORKSPACE_INIT_CONTAINER, true, 90)
+                .await?;
+            let tmp = tempfile::tempdir().map_err(|e| ExecError::Other(e.to_string()))?;
+            cas.materialize(
+                &scarab_storage::TreeHash(root.to_string()),
+                tmp.path().to_str().ok_or_else(|| ExecError::Other("tmp path".into()))?,
+            )
+            .await
+            .map_err(|e| ExecError::Other(format!("materialize {root}: {e}")))?;
+            let tar = pack_dir(tmp.path()).map_err(ExecError::Other)?;
+            self.exec_with_stdin(
+                &pods,
+                &name,
+                WORKSPACE_INIT_CONTAINER,
+                &format!(
+                    "tar -xf - -C {WORKSPACE_MOUNT_PATH} \
+                     && chmod -R g+rwX {WORKSPACE_MOUNT_PATH} \
+                     && touch {CTL_MOUNT_PATH}/init-done"
+                ),
+                tar,
+            )
+            .await
+            .map_err(ExecError::Other)?;
+        }
+        // Wait for the shell container to be running before we let a client attach.
+        self.wait_container(&pods, &name, STEP_CONTAINER, false, 90)
+            .await?;
+        Ok(DebugPod { name })
+    }
+
+    async fn attach_debug(&self, pod: &str) -> Result<AttachIo, ExecError> {
+        self.attach_pod(pod).await
+    }
+
+    async fn teardown_debug(&self, pod: &str) -> Result<(), ExecError> {
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let pods: Api<Pod> = Api::namespaced(client, &self.namespace);
+        pods.delete(pod, &DeleteParams::default().grace_period(0))
+            .await
+            .map_err(|e| ExecError::Other(format!("delete debug pod {pod}: {e}")))?;
+        Ok(())
     }
 }
 

@@ -118,6 +118,10 @@ pub struct AppState {
     /// step's Pod. `None` disables the attach endpoint (404) — only the k8s
     /// executor can exec; the local executor runs no Pods.
     pub attacher: Option<Arc<dyn scarab_executor_k8s::StepAttacher>>,
+    /// The debug-pod launcher: reproduces a finished step in a fresh ephemeral
+    /// Pod (its image + re-materialized workspace snapshot) to shell into.
+    /// `None` disables the debug-pod endpoint (404) — k8s executor only.
+    pub debug_launcher: Option<Arc<dyn scarab_executor_k8s::DebugLauncher>>,
     /// The built SPA's dist directory (ADR-0054). `Some` serves the web UI at
     /// `/` with an SPA fallback — same-origin with the API, so no CORS layer
     /// exists or is needed. `None` (dev) leaves non-API paths 404.
@@ -154,6 +158,7 @@ impl AppState {
             artifact_store: None,
             workspace_cas: None,
             attacher: None,
+            debug_launcher: None,
             ui_dir: None,
             rbac: None,
             oauth_login: None,
@@ -255,6 +260,16 @@ impl AppState {
     /// exec into a running step's Pod (the k8s executor).
     pub fn with_attacher(mut self, attacher: Arc<dyn scarab_executor_k8s::StepAttacher>) -> Self {
         self.attacher = Some(attacher);
+        self
+    }
+
+    /// Enable the debug-pod endpoint, backed by an executor that can reproduce a
+    /// finished step in an ephemeral Pod (the k8s executor).
+    pub fn with_debug_launcher(
+        mut self,
+        launcher: Arc<dyn scarab_executor_k8s::DebugLauncher>,
+    ) -> Self {
+        self.debug_launcher = Some(launcher);
         self
     }
 
@@ -1951,6 +1966,80 @@ async fn bridge_attach(socket: WebSocket, io: scarab_executor_k8s::AttachIo) {
     }
     // Hold the exec process until the pump ends.
     drop(_process);
+}
+
+/// WebSocket: reproduce a **finished** step in a fresh ephemeral Pod — its
+/// image, its output workspace snapshot re-materialized at `/workspace` —
+/// running `sleep` so the operator can shell in and debug (ADR-0039 world). The
+/// live-attach surface needs a still-running step; this one works after the fact.
+/// Gated behind `Administer`; the debug Pod is TTL-bounded and torn down when
+/// the socket closes. Disabled (404) unless a debug launcher is wired (k8s only).
+#[utoipa::path(
+    get,
+    path = "/v1/runs/{id}/steps/{step}/debug-pod",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "step id")
+    ),
+    responses(
+        (status = 101, description = "WebSocket upgrade — interactive TTY into a fresh reproduction Pod"),
+        (status = 404, description = "no such run/step, no step spec, or debug-pod disabled")
+    )
+)]
+async fn debug_pod_step(
+    ws: WebSocketUpgrade,
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    authorize_scoped(&st, &headers, Action::Administer, scope.as_ref()).await?;
+    let launcher = st.debug_launcher.as_ref().ok_or(ApiError::NotFound)?.clone();
+    let step_id = StepId(step);
+    let sr = st
+        .db
+        .steps_of_run(&run)
+        .await?
+        .into_iter()
+        .find(|s| s.step == step_id)
+        .ok_or(ApiError::NotFound)?;
+    // Its image is the durable step spec; its workspace is the output snapshot.
+    let spec = st
+        .db
+        .step_spec(&run, &step_id)
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("no step spec — cannot reproduce this step".into()))?;
+    let snapshot = st.db.step_output(&run, &step_id).await?;
+    Ok(ws.on_upgrade(move |mut socket| async move {
+        let _ = socket
+            .send(Message::Text(
+                "provisioning debug pod (re-materializing workspace)…\r\n".into(),
+            ))
+            .await;
+        match launcher.launch_debug(&sr, &spec.image, snapshot.as_deref(), 3600).await {
+            Ok(dp) => {
+                match launcher.attach_debug(&dp.name).await {
+                    Ok(io) => {
+                        let _ = socket.send(Message::Text("\r\n".into())).await;
+                        bridge_attach(socket, io).await;
+                    }
+                    Err(e) => {
+                        let _ = socket
+                            .send(Message::Text(format!("attach failed: {e}\r\n").into()))
+                            .await;
+                    }
+                }
+                // Throwaway: tear the reproduction Pod down when the shell ends.
+                let _ = launcher.teardown_debug(&dp.name).await;
+            }
+            Err(e) => {
+                let _ = socket
+                    .send(Message::Text(format!("debug pod failed: {e}\r\n").into()))
+                    .await;
+            }
+        }
+    }))
 }
 
 /// In-repo directory holding pipeline definitions (ADR-0010). Every
@@ -4343,6 +4432,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         get_logs,
         get_step_logs,
         attach_step,
+        debug_pod_step,
         restart_step,
         cancel_run,
         list_artifacts,
@@ -4424,6 +4514,7 @@ fn router_inner(state: AppState) -> Router {
         .route("/v1/runs/{id}/artifacts/{*name}", get(download_artifact))
         .route("/v1/runs/{id}/steps/{step}/logs", get(get_step_logs))
         .route("/v1/runs/{id}/steps/{step}/attach", get(attach_step))
+        .route("/v1/runs/{id}/steps/{step}/debug-pod", get(debug_pod_step))
         .route("/v1/runs/{id}/steps/{step}/workspace", get(list_workspace))
         .route(
             "/v1/runs/{id}/steps/{step}/workspace/file",
