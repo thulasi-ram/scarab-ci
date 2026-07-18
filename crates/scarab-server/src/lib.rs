@@ -2244,6 +2244,80 @@ async fn prefetch_libs_and_compile(
     Ok(ir)
 }
 
+/// Governance resolved once for a run from its `environment:` reference
+/// (ADR-0037/0039), so `ir.environment` is unpacked a single time and every
+/// downstream admission/persistence site reads intent instead of re-deriving it.
+///
+/// The variant is the **deploy vs ordinary-CI** discriminator: targeting an
+/// Environment makes a run a deploy (opts out of newest-wins auto-cancel,
+/// ADR-0032, and records a deploy context). Whether that Environment is actually
+/// *defined* is the nested `protection` — an environment referenced but undefined
+/// (or with the store unwired) is still a deploy, just permissive on refs and
+/// fail-closed on grants. Keeping these two axes distinct preserves the existing
+/// behavior, where deploy-ness keys on the *reference* and ref/grant enforcement
+/// keys on the *resolved rules*.
+enum RunGovernance {
+    /// No `environment:` referenced: an ordinary CI run. Permissive on refs,
+    /// fail-closed on governed grants, eligible for auto-cancel.
+    Ungoverned,
+    /// The pipeline targets an Environment — a deploy. `protection` is `Some`
+    /// only when that Environment is defined and the store is wired.
+    Governed {
+        environment: String,
+        /// A fork PR locked out of this environment's secrets is also locked out
+        /// of its governed privilege grants (ADR-0039).
+        locked_out: bool,
+        protection: Option<scarab_project::ProtectionRules>,
+    },
+}
+
+impl RunGovernance {
+    /// The resolved protection rules, if the target Environment is defined. `None`
+    /// for an ordinary run *and* for a referenced-but-undefined environment —
+    /// both are permissive on refs and fail-closed on governed grants.
+    fn protection(&self) -> Option<&scarab_project::ProtectionRules> {
+        match self {
+            RunGovernance::Governed { protection, .. } => protection.as_ref(),
+            RunGovernance::Ungoverned => None,
+        }
+    }
+
+    /// Whether a fork PR is locked out of the target environment's secrets and,
+    /// by extension, its governed privilege grants (ADR-0039).
+    fn locked_out(&self) -> bool {
+        matches!(self, RunGovernance::Governed { locked_out: true, .. })
+    }
+}
+
+/// Resolve a run's [`RunGovernance`] from the pipeline's `environment:` reference.
+/// Fetches the target Environment's protection rules once (ADR-0037/0039); an
+/// environment referenced but undefined — or referenced with the store unwired —
+/// resolves to `Governed { protection: None }`: still a deploy, permissive on
+/// refs, fail-closed on grants.
+async fn resolve_governance(
+    environments: Option<&dyn scarab_project::EnvironmentStore>,
+    event: &scarab_forge::Event,
+    ir: &scarab_pipeline::PipelineIr,
+    repo: &scarab_forge::RepoRef,
+) -> Result<RunGovernance, TriggerError> {
+    let Some(env_name) = &ir.environment else {
+        return Ok(RunGovernance::Ungoverned);
+    };
+    let protection = match environments {
+        Some(store) => store
+            .get_environment(&repo.owner, &repo.name, env_name)
+            .await
+            .map_err(|e| TriggerError::Pipeline(e.to_string()))?
+            .map(|e| e.protection),
+        None => None,
+    };
+    Ok(RunGovernance::Governed {
+        environment: env_name.clone(),
+        locked_out: fork_policy(event, env_name).secrets_locked_out,
+        protection,
+    })
+}
+
 /// Fetch the target Environment's protection rules, enforce allowed-refs
 /// fail-closed, admit per-step privilege grants, and durably create the run for
 /// a single compiled pipeline — the admission primitive shared by the webhook
@@ -2272,21 +2346,12 @@ async fn admit_and_create_run(
         .repo()
         .ok_or_else(|| TriggerError::Pipeline("event carries no repository".into()))?;
 
-    // ADR-0037/0039: fetch the target Environment's protection rules once (a
-    // deploy pipeline only). Used both to reject a disallowed ref at creation
-    // (ADR-0037 — enforced even without an approver gate) and to admit per-step
-    // privilege grants (ADR-0039). An undefined environment is permissive for
-    // refs but forbids governed grants.
-    let protection = if let (Some(env_name), Some(store)) = (&ir.environment, environments) {
-        store
-            .get_environment(&repo.owner, &repo.name, env_name)
-            .await
-            .map_err(|e| TriggerError::Pipeline(e.to_string()))?
-            .map(|e| e.protection)
-    } else {
-        None
-    };
-    if let Some(p) = &protection {
+    // ADR-0037/0039: resolve the run's governance once (a deploy pipeline targets
+    // an Environment; an ordinary CI run does not). Used to reject a disallowed
+    // ref at creation (ADR-0037 — enforced even without an approver gate) and to
+    // admit per-step privilege grants (ADR-0039).
+    let gov = resolve_governance(environments, event, ir, repo).await?;
+    if let Some(p) = gov.protection() {
         // ADR-0037: match allowed_refs against the *symbolic* branch/tag ref
         // (`refs/heads/main`, `refs/tags/*`, …), NOT the immutable commit the
         // config is read at (`git_ref` above is a SHA for push/dispatch). An event
@@ -2300,27 +2365,10 @@ async fn admit_and_create_run(
             return Ok(None);
         }
     }
-    // A fork PR locked out of the environment's secrets is also locked out of its
-    // governed grants (ADR-0039).
-    let locked_out = ir
-        .environment
-        .as_ref()
-        .is_some_and(|e| fork_policy(event, e).secrets_locked_out);
 
     let now = clock.now().await;
     let run = RunId(Uuid::new_v4().to_string());
-    persist_run_from_ir(
-        db,
-        &run,
-        ir,
-        event,
-        path,
-        protection.as_ref(),
-        locked_out,
-        excluded,
-        now,
-    )
-    .await?;
+    persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, now).await?;
     // Freeze the resolved launch parameters on the run so every step's
     // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
     // deterministically (ADR-0043 §5).
@@ -2664,11 +2712,11 @@ async fn persist_run_from_ir(
     ir: &scarab_pipeline::PipelineIr,
     event: &scarab_forge::Event,
     pipeline: &str,
-    protection: Option<&scarab_project::ProtectionRules>,
-    locked_out: bool,
+    gov: &RunGovernance,
     excluded: &[String],
     now: Timestamp,
 ) -> Result<(), TriggerError> {
+    let locked_out = gov.locked_out();
     db.create_run(run, ir.ir_version, EVENT_VERSION, now).await?;
     // Tenancy (ADR-0049): stamp the owning (org, project) from the trigger's
     // repo, so run reads/lists can be scoped by the caller's bindings.
@@ -2681,13 +2729,13 @@ async fn persist_run_from_ir(
     // ADR-0037: record the deploy context (repo + environment + git ref) so
     // gate-approval-time admission can look up the environment's protection
     // rules directly, without parsing the stored IR blob. Deploy runs only.
-    if let (Some(env_name), Some(repo)) = (&ir.environment, event.repo()) {
+    if let (RunGovernance::Governed { environment, .. }, Some(repo)) = (gov, event.repo()) {
         db.set_run_deploy_context(
             run,
             &scarab_engine::DeployContext {
                 org: repo.owner.clone(),
                 project: repo.name.clone(),
-                environment: env_name.clone(),
+                environment: environment.clone(),
                 // ADR-0037: persist the *symbolic* ref, because gate-approval-time
                 // admission re-runs `ProtectionRules::admits` (allowed_refs +
                 // approvers) against this value and deployment history records it.
@@ -2717,7 +2765,7 @@ async fn persist_run_from_ir(
     // targets an Environment is a *deploy* and opts out — a superseded deploy
     // must not be silently cancelled; no key means `superseded_by` never returns
     // it.
-    if ir.environment.is_none() {
+    if matches!(gov, RunGovernance::Ungoverned) {
         if let Some(key) = supersede_key(event, pipeline) {
             db.set_supersede_key(run, &key).await?;
         }
@@ -2785,7 +2833,7 @@ async fn persist_run_from_ir(
                 artifacts: vec![],
                 placement_profiles: step.placement_profiles.clone(),
                 resources: step.resources.clone(),
-                k8s_overlay: admit_k8s_overlay(protection, step.k8s_overlay.as_ref())
+                k8s_overlay: admit_k8s_overlay(gov.protection(), step.k8s_overlay.as_ref())
                     .map_err(|v| {
                         TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
                     })?,
@@ -2798,7 +2846,7 @@ async fn persist_run_from_ir(
             // Environment's whitelist, fail-closed. A rejected request aborts the
             // whole run creation with a diagnostic — never a silent downgrade.
             let admitted =
-                admit_step_grants(protection, step.security.as_ref(), &step.image, locked_out)
+                admit_step_grants(gov.protection(), step.security.as_ref(), &step.image, locked_out)
                     .map_err(|v| {
                         TriggerError::Pipeline(format!(
                             "step `{}`: privilege request rejected: {}",
@@ -2840,7 +2888,7 @@ async fn persist_run_from_ir(
                 artifacts: step.artifacts.clone(),
                 placement_profiles: step.placement_profiles.clone(),
                 resources: step.resources.clone(),
-                k8s_overlay: admit_k8s_overlay(protection, step.k8s_overlay.as_ref())
+                k8s_overlay: admit_k8s_overlay(gov.protection(), step.k8s_overlay.as_ref())
                     .map_err(|v| {
                         TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
                     })?,
