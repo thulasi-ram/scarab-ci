@@ -568,54 +568,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/runs/{id}/steps/{step}/attach": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * WebSocket: an interactive debug shell into a **running** step's Pod (the
-         *     debug surface). Gated behind `Administer` — exec is the most privileged
-         *     surface. Only a running step has a live Pod (they are `restartPolicy: Never`
-         *     and gone once done), so a terminal/pending step is refused. Bridges the
-         *     Pod's TTY to the socket: client text/binary → shell stdin, shell output →
-         *     client. Disabled (404) unless an attacher is wired (k8s executor only).
-         */
-        get: operations["attach_step"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/runs/{id}/steps/{step}/debug-pod": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * WebSocket: reproduce a **finished** step in a fresh ephemeral Pod — its
-         *     image, its output workspace snapshot re-materialized at `/workspace` —
-         *     running `sleep` so the operator can shell in and debug (ADR-0039 world). The
-         *     live-attach surface needs a still-running step; this one works after the fact.
-         *     Gated behind `Administer`; the debug Pod is TTL-bounded and torn down when
-         *     the socket closes. Disabled (404) unless a debug launcher is wired (k8s only).
-         */
-        get: operations["debug_pod_step"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/runs/{id}/steps/{step}/logs": {
         parameters: {
             query?: never;
@@ -1033,8 +985,6 @@ export interface components {
          *     and — when the run was stamped at creation (ADR-0049) — its owning tenant.
          */
         RunSummaryDto: {
-            /** @description The **Actor** login — who caused the trigger (UI labels it "author"). */
-            actor?: string | null;
             /** Format: int64 */
             created_at: number;
             /**
@@ -1044,28 +994,12 @@ export interface components {
              *     Drives the dashboard's per-run bar heights (ADR-0046).
              */
             duration_ms: number;
-            /** @description The symbolic branch/tag ref the run ran on. */
-            git_ref?: string | null;
             id: string;
             /** @description The owning org, if the run is tenanted (trigger-created). */
             org?: string | null;
-            /**
-             * Format: int64
-             * @description The pull-request number, for `pull_request` runs.
-             */
-            pr_number?: number | null;
             /** @description The owning project (repo name), if tenanted. */
             project?: string | null;
-            /** @description The resolved commit the run pinned to. */
-            sha?: string | null;
             status: string;
-            /**
-             * @description The run's **origin** — the trigger facts it was born from, each stamped at
-             *     creation and independently nullable (sparse across trigger kinds; all
-             *     absent on runs created before origin-stamping). The trigger kind
-             *     (`push`/`pull_request`/`tag`/…).
-             */
-            trigger_kind?: string | null;
         };
         /**
          * @description `GET /v1/secrets` body: the secret **names** at a scope. Values are never
@@ -1099,19 +1033,7 @@ export interface components {
             };
             id: string;
             image: string;
-            /**
-             * @description Governed raw pod-spec overlay (ADR-0055). Carries no authority; an inline
-             *     API run targets no Environment, so any overlay is rejected fail-closed.
-             */
-            k8s_overlay?: Record<string, never>;
             needs?: string[];
-            /**
-             * @description PlacementProfile names this step runs on (ADR-0055); their admin-defined
-             *     k8s overlays merge onto the Pod in listed order. Empty = the default profile.
-             */
-            placement_profiles?: string[];
-            /** @description Requested compute resources (ADR-0055): exact `cpu_millis`/`memory_mib`. */
-            resources?: Record<string, never>;
             /**
              * @description Opt-in retry policy `{on, max}` (ADR-0047). ⚠ At-least-once: retry
              *     re-runs the whole step at-least-once; enable only if the step is
@@ -2050,73 +1972,6 @@ export interface operations {
         responses: {
             /** @description SSE stream of step log output */
             200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    attach_step: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description run id */
-                id: string;
-                /** @description step id */
-                step: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description WebSocket upgrade — interactive TTY into the running step's Pod */
-            101: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description step is not running (no live Pod) */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description no such run/step, or attach disabled */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    debug_pod_step: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description run id */
-                id: string;
-                /** @description step id */
-                step: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description WebSocket upgrade — interactive TTY into a fresh reproduction Pod */
-            101: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description no such run/step, no step spec, or debug-pod disabled */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };

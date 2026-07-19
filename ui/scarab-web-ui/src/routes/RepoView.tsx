@@ -1,11 +1,11 @@
 // Repo dashboard (tier 2) — tabs over one repository: Runs (default),
-// Environments, Secrets, Settings. Each run row shows its origin as a grid of
-// facts (author · ref · duration) under a header line (sha · status · trigger ·
-// when), fed by the origin fields RunSummaryDto now carries. Duration ticks live
-// for in-flight runs. The runs list carries a status filter; branch/trigger/PR
-// *filters* (removed in the ADR-0054 de-mock) can now be restored on top of
-// these fields. The header CTA is contextual to the active tab.
-import { createResource, createSignal, createEffect, onCleanup, For, Show } from "solid-js";
+// Environments, Secrets, Settings. The runs list carries only a status filter
+// today. Branch and trigger/PR filters used to live here (as dropdowns), but
+// were removed in the de-mock (ADR-0054) because the real RunSummary carries no
+// branch/trigger/PR provenance yet — restore them once RunSummaryDto exposes
+// those fields. The header CTA is contextual to the active tab (run a pipeline,
+// add an environment, add a secret).
+import { createResource, createSignal, createEffect, For, Show } from "solid-js";
 import { useParams, useNavigate } from "@solidjs/router";
 import { recordVisit } from "../visited";
 import {
@@ -21,7 +21,7 @@ import {
   type RepoEnvironment,
   type SecretCellStatus,
 } from "../api/client";
-import { relTime, absTime, duration } from "../fmt";
+import { relTime, absTime } from "../fmt";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
@@ -35,35 +35,6 @@ const TABS: [Tab, string][] = [
   ["secrets", "Secrets"],
   ["settings", "Settings"],
 ];
-
-// A run is "live" (still accruing wall time) until it reaches a terminal status.
-const TERMINAL = new Set(["succeeded", "failed", "cancelled", "dead_lettered"]);
-const isLive = (status: string) => !TERMINAL.has(status);
-
-// The human ref a run ran on: a PR number wins (it's the clearer identity), else
-// the branch/tag with its `refs/{heads,tags}/` prefix stripped. `null` when the
-// run carries no ref (e.g. a cron trigger).
-function refLabel(r: RunSummary): string | null {
-  if (r.pr_number != null) return `PR #${r.pr_number}`;
-  const ref = r.git_ref;
-  if (!ref) return null;
-  return ref.replace(/^refs\/heads\//, "").replace(/^refs\/tags\//, "");
-}
-
-// The trigger kind as a short display token (`pull_request` → `PR`); the raw
-// TriggerKind vocabulary otherwise.
-function triggerLabel(kind: string | null | undefined): string | null {
-  if (!kind) return null;
-  return kind === "pull_request" ? "PR" : kind;
-}
-
-// Duration to show: a terminal run's total wall time (frozen `duration_ms`), or
-// a live run's elapsed since creation against the ticking `now`.
-function durationLabel(r: RunSummary, now: number): string {
-  return isLive(r.status)
-    ? duration(r.created_at, now)
-    : duration(0, r.duration_ms);
-}
 
 export default function RepoView() {
   const params = useParams();
@@ -85,12 +56,6 @@ export default function RepoView() {
   const [showEnvDialog, setShowEnvDialog] = createSignal(false);
   const [envEpoch, setEnvEpoch] = createSignal(0); // bump to refetch the env list after a create
   const [secretFocus, setSecretFocus] = createSignal(0);
-
-  // A 1s heartbeat so in-flight runs show a live, ticking elapsed time. Terminal
-  // runs use their frozen `duration_ms` and ignore this.
-  const [now, setNow] = createSignal(Date.now());
-  const tick = setInterval(() => setNow(Date.now()), 1000);
-  onCleanup(() => clearInterval(tick));
 
   const filtered = () => {
     const all = rows() ?? [];
@@ -186,41 +151,19 @@ export default function RepoView() {
               }
             >
               <div class="runlist">
+                <div class="runrow head">
+                  <span></span><span>run</span><span>status</span><span></span><span>when</span>
+                </div>
                 <For each={filtered()}>
                   {(r) => (
                     <div class="runrow" onClick={() => nav(`/${org()}/${repo()}/runs/${r.id}`)}>
-                      <span class={`sdot ${r.status}`} title={r.status} />
-                      <div class="rr-body">
-                        <div class="rr-head">
-                          <span class="rr-sha mono">{(r.sha ?? r.id).slice(0, 7)}</span>
-                          <span class={`rr-status ${r.status}`}>{r.status}</span>
-                          <Show when={triggerLabel(r.trigger_kind)}>
-                            {(t) => <span class="rr-trigger">{t()}</span>}
-                          </Show>
-                          <span class="rr-when mono" title={absTime(r.created_at)}>
-                            {relTime(r.created_at)}
-                          </span>
-                        </div>
-                        <div class="rr-facts">
-                          <Show when={r.actor}>
-                            {(a) => (
-                              <span class="rr-fact" title="author">
-                                <Icon icon="user" size={12} /> {a()}
-                              </span>
-                            )}
-                          </Show>
-                          <Show when={refLabel(r)}>
-                            {(ref) => (
-                              <span class="rr-fact" title="ref">
-                                <Icon icon="git-branch" size={12} /> {ref()}
-                              </span>
-                            )}
-                          </Show>
-                          <span class="rr-fact" classList={{ live: isLive(r.status) }} title="duration">
-                            <Icon icon="timer" size={12} /> {durationLabel(r, now())}
-                          </span>
-                        </div>
-                      </div>
+                      <span class={`sdot ${r.status}`} />
+                      <span class="rr-commit">
+                        <span class="rr-sha mono">{r.id.slice(0, 8)}</span>
+                      </span>
+                      <span class="rr-trigger mono">{r.status}</span>
+                      <span class="rr-dur mono"></span>
+                      <span class="rr-when mono" title={absTime(r.created_at)}>{relTime(r.created_at)}</span>
                     </div>
                   )}
                 </For>

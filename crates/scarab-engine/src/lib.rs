@@ -88,27 +88,6 @@ pub struct RunSummary {
     /// at creation — the tenancy filter for the list view.
     #[serde(default)]
     pub tenant: Option<(String, String)>,
-    /// The run's **origin** — the trigger facts it was born from, stamped at
-    /// creation from the normalized `Event`. Discrete and independently
-    /// nullable (never a bundle): the facts are naturally sparse across trigger
-    /// kinds, and runs created before origin-stamping carry all `None`.
-    /// The trigger kind (`push`/`pull_request`/`tag`/…), always set for a
-    /// trigger-created run.
-    #[serde(default)]
-    pub trigger_kind: Option<String>,
-    /// The **Actor** login — who caused the trigger (`None` for cron/upstream
-    /// or a pre-origin run).
-    #[serde(default)]
-    pub actor: Option<String>,
-    /// The symbolic branch/tag ref the run ran on (`refs/heads/main`, a tag).
-    #[serde(default)]
-    pub git_ref: Option<String>,
-    /// The resolved commit the run pinned to.
-    #[serde(default)]
-    pub sha: Option<String>,
-    /// The pull-request number, for `pull_request` runs.
-    #[serde(default)]
-    pub pr_number: Option<i64>,
 }
 
 /// Lifecycle status of a single step.

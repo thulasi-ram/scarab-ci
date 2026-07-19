@@ -28,7 +28,6 @@ fn repo() -> RepoRef {
 
 fn push(branch: &str) -> Event {
     Event::Push {
-        actor: "octocat".into(),
         repo: repo(),
         r#ref: format!("refs/heads/{branch}"),
         after: "sha123".into(),

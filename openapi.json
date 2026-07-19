@@ -1764,13 +1764,6 @@
           "duration_ms"
         ],
         "properties": {
-          "actor": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The **Actor** login — who caused the trigger (UI labels it \"author\")."
-          },
           "created_at": {
             "type": "integer",
             "format": "int64"
@@ -1779,13 +1772,6 @@
             "type": "integer",
             "format": "int64",
             "description": "Run duration in millis: `updated_at - created_at`. For a terminal run\nthis is its total wall time; for an in-flight run, elapsed-to-last-update.\nDrives the dashboard's per-run bar heights (ADR-0046)."
-          },
-          "git_ref": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The symbolic branch/tag ref the run ran on."
           },
           "id": {
             "type": "string"
@@ -1797,14 +1783,6 @@
             ],
             "description": "The owning org, if the run is tenanted (trigger-created)."
           },
-          "pr_number": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "The pull-request number, for `pull_request` runs."
-          },
           "project": {
             "type": [
               "string",
@@ -1812,22 +1790,8 @@
             ],
             "description": "The owning project (repo name), if tenanted."
           },
-          "sha": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The resolved commit the run pinned to."
-          },
           "status": {
             "type": "string"
-          },
-          "trigger_kind": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The run's **origin** — the trigger facts it was born from, each stamped at\ncreation and independently nullable (sparse across trigger kinds; all\nabsent on runs created before origin-stamping). The trigger kind\n(`push`/`pull_request`/`tag`/…)."
           }
         }
       },

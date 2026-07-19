@@ -509,45 +509,6 @@ pub struct RunSummaryDto {
     /// The owning project (repo name), if tenanted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-    /// The run's **origin** — the trigger facts it was born from, each stamped at
-    /// creation and independently nullable (sparse across trigger kinds; all
-    /// absent on runs created before origin-stamping). The trigger kind
-    /// (`push`/`pull_request`/`tag`/…).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub trigger_kind: Option<String>,
-    /// The **Actor** login — who caused the trigger (UI labels it "author").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub actor: Option<String>,
-    /// The symbolic branch/tag ref the run ran on.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub git_ref: Option<String>,
-    /// The resolved commit the run pinned to.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sha: Option<String>,
-    /// The pull-request number, for `pull_request` runs.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pr_number: Option<i64>,
-}
-
-impl From<scarab_engine::RunSummary> for RunSummaryDto {
-    fn from(s: scarab_engine::RunSummary) -> Self {
-        RunSummaryDto {
-            id: s.run.0,
-            status: run_status_name(s.status).to_string(),
-            created_at: s.created_at.0,
-            // Total wall time for a terminal run; for an in-flight run this is
-            // elapsed-to-last-transition (the UI shows a live ticking elapsed
-            // for running runs instead of trusting this frozen value).
-            duration_ms: (s.updated_at.0 - s.created_at.0).max(0),
-            org: s.tenant.as_ref().map(|(o, _)| o.clone()),
-            project: s.tenant.as_ref().map(|(_, p)| p.clone()),
-            trigger_kind: s.trigger_kind,
-            actor: s.actor,
-            git_ref: s.git_ref,
-            sha: s.sha,
-            pr_number: s.pr_number,
-        }
-    }
 }
 
 /// `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
@@ -1124,7 +1085,14 @@ async fn list_runs(
     Ok(Json(RunListResponse {
         runs: runs
             .into_iter()
-            .map(RunSummaryDto::from)
+            .map(|s| RunSummaryDto {
+                id: s.run.0,
+                status: run_status_name(s.status).to_string(),
+                created_at: s.created_at.0,
+                duration_ms: (s.updated_at.0 - s.created_at.0).max(0),
+                org: s.tenant.as_ref().map(|(o, _)| o.clone()),
+                project: s.tenant.as_ref().map(|(_, p)| p.clone()),
+            })
             .collect(),
     }))
 }
@@ -1614,7 +1582,14 @@ async fn list_repo_runs(
     Ok(Json(RunListResponse {
         runs: runs
             .into_iter()
-            .map(RunSummaryDto::from)
+            .map(|s| RunSummaryDto {
+                id: s.run.0,
+                status: run_status_name(s.status).to_string(),
+                created_at: s.created_at.0,
+                duration_ms: (s.updated_at.0 - s.created_at.0).max(0),
+                org: s.tenant.as_ref().map(|(o, _)| o.clone()),
+                project: s.tenant.as_ref().map(|(_, p)| p.clone()),
+            })
             .collect(),
     }))
 }
@@ -2186,28 +2161,6 @@ fn config_ref(event: &scarab_forge::Event) -> String {
         // only for allowed_refs matching (see `Event::protection_ref`).
         Event::Manual { sha, .. } | Event::Api { sha, .. } => sha.clone(),
         _ => "HEAD".to_string(),
-    }
-}
-
-/// The resolved commit an event pinned to, for the run's `origin_sha` — only
-/// the events that carry a concrete commit. A `Tag`/`Release` normalizes to a
-/// tag name (no SHA in the payload) and repo-less events have none, so both are
-/// `None`; the symbolic ref still lands in `origin_ref` via [`Event::protection_ref`].
-fn origin_sha(event: &scarab_forge::Event) -> Option<String> {
-    use scarab_forge::Event;
-    match event {
-        Event::Push { after, .. } => Some(after.clone()),
-        Event::PullRequest { head, .. } => Some(head.clone()),
-        Event::Manual { sha, .. } | Event::Api { sha, .. } => Some(sha.clone()),
-        _ => None,
-    }
-}
-
-/// The pull-request number for a `pull_request` event, for `origin_pr_number`.
-fn origin_pr_number(event: &scarab_forge::Event) -> Option<i64> {
-    match event {
-        scarab_forge::Event::PullRequest { number, .. } => Some(*number as i64),
-        _ => None,
     }
 }
 
@@ -2838,20 +2791,6 @@ async fn persist_run_from_ir(
     if let Some(repo) = event.repo() {
         db.set_run_tenant(run, &repo.owner, &repo.name).await?;
     }
-    // Origin (the runs-list surface): stamp the trigger facts this run was born
-    // from — trigger kind (always), Actor, symbolic ref, resolved commit, and PR
-    // number — as discrete columns beside tenancy. Sparse by nature (a cron run
-    // has no actor/ref/sha; only a PR has a number); carries no scheduling
-    // authority, purely for display/audit.
-    db.set_run_origin(
-        run,
-        event.trigger_kind().as_str(),
-        event.actor(),
-        event.protection_ref().as_deref(),
-        origin_sha(event).as_deref(),
-        origin_pr_number(event),
-    )
-    .await?;
     db.store_run_ir(
         run,
         &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null),
@@ -4324,11 +4263,21 @@ async fn put_environment(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((org, repo, name)): Path<(String, String, String)>,
-    Json(protection): Json<scarab_project::ProtectionRules>,
+    Json(mut protection): Json<scarab_project::ProtectionRules>,
 ) -> Result<StatusCode, ApiError> {
     let scope = rbac_scope(&org, Some(&repo));
     authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
     let store = st.environments.as_ref().ok_or(ApiError::NotFound)?;
+    // `secret_scope` and `oidc_subject` are canonical — fully determined by the
+    // environment's `(org, repo, name)` coordinate — and are re-derived at run
+    // time (secret resolution + OIDC minting). Stamp them server-side so the
+    // stored rules are authoritative and callers cannot inject a bogus scope.
+    protection.secret_scope = scarab_secrets::SecretScope::Environment {
+        org: org.clone(),
+        repo: repo.clone(),
+        environment: name.clone(),
+    };
+    protection.oidc_subject = format!("scarab:org/{org}/repo/{repo}/env/{name}");
     let env = scarab_project::Environment {
         name: name.clone(),
         protection,

@@ -95,27 +95,6 @@ struct StepRec {
     explicit_inputs: Option<Vec<StepId>>,
 }
 
-/// Build a [`RunSummary`] from the in-memory state, projecting the stored
-/// origin facts — the fake's counterpart to the postgres `run_summary_from_row`.
-/// The fake has no clock at transition time, so duration is reported as zero
-/// (`updated_at == created_at`).
-fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSummary {
-    let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
-    let origin = st.run_origin.get(run);
-    RunSummary {
-        run: run.clone(),
-        status,
-        created_at: created,
-        updated_at: created,
-        tenant: st.run_tenant.get(run).cloned(),
-        trigger_kind: origin.map(|o| o.0.clone()),
-        actor: origin.and_then(|o| o.1.clone()),
-        git_ref: origin.and_then(|o| o.2.clone()),
-        sha: origin.and_then(|o| o.3.clone()),
-        pr_number: origin.and_then(|o| o.4),
-    }
-}
-
 #[derive(Default)]
 struct InMemoryState {
     /// The append-only event log.
@@ -149,9 +128,6 @@ struct InMemoryState {
     run_project: HashMap<RunId, String>,
     run_priority: HashMap<RunId, i32>,
     run_tenant: HashMap<RunId, (String, String)>,
-    /// Per-run origin `(trigger_kind, actor, git_ref, sha, pr_number)` — the
-    /// trigger facts stamped at creation (mirrors the `origin_*` run columns).
-    run_origin: HashMap<RunId, (String, Option<String>, Option<String>, Option<String>, Option<i64>)>,
     /// ForgeConnection registry rows (ADR-0046).
     forge_connections: HashMap<String, scarab_forge::ForgeConnection>,
     /// Repo bindings: (owner, name) → (connection id, org, project).
@@ -519,28 +495,6 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().run_tenant.get(run).cloned())
     }
 
-    async fn set_run_origin(
-        &self,
-        run: &RunId,
-        trigger_kind: &str,
-        actor: Option<&str>,
-        git_ref: Option<&str>,
-        sha: Option<&str>,
-        pr_number: Option<i64>,
-    ) -> Result<(), DbError> {
-        self.state.lock().unwrap().run_origin.insert(
-            run.clone(),
-            (
-                trigger_kind.to_string(),
-                actor.map(str::to_string),
-                git_ref.map(str::to_string),
-                sha.map(str::to_string),
-                pr_number,
-            ),
-        );
-        Ok(())
-    }
-
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
         let st = self.state.lock().unwrap();
         let n = st
@@ -668,7 +622,17 @@ impl Db for InMemoryDb {
         let mut out: Vec<RunSummary> = st
             .runs
             .iter()
-            .map(|(run, status)| fake_run_summary(&st, run, *status))
+            .map(|(run, status)| {
+                let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
+                RunSummary {
+                    run: run.clone(),
+                    status: *status,
+                    created_at: created,
+                    // The fake has no clock at transition time; report zero duration.
+                    updated_at: created,
+                    tenant: st.run_tenant.get(run).cloned(),
+                }
+            })
             .collect();
         // Newest first, then id — matches the adapter's ORDER BY.
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.run.0.cmp(&a.run.0)));
@@ -688,7 +652,17 @@ impl Db for InMemoryDb {
             .runs
             .iter()
             .filter(|(run, _)| st.run_tenant.get(*run) == Some(&want))
-            .map(|(run, status)| fake_run_summary(&st, run, *status))
+            .map(|(run, status)| {
+                let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
+                RunSummary {
+                    run: run.clone(),
+                    status: *status,
+                    created_at: created,
+                    // The fake has no clock at transition time; report zero duration.
+                    updated_at: created,
+                    tenant: st.run_tenant.get(run).cloned(),
+                }
+            })
             .collect();
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.run.0.cmp(&a.run.0)));
         out.truncate(limit as usize);

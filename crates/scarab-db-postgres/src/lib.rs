@@ -682,33 +682,6 @@ impl Db for PostgresDb {
         }))
     }
 
-    async fn set_run_origin(
-        &self,
-        run: &RunId,
-        trigger_kind: &str,
-        actor: Option<&str>,
-        git_ref: Option<&str>,
-        sha: Option<&str>,
-        pr_number: Option<i64>,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "UPDATE runs SET origin_trigger_kind = $2, origin_actor = $3,
-                 origin_ref = $4, origin_sha = $5, origin_pr_number = $6,
-                 updated_at = (extract(epoch from now()) * 1000)::bigint
-             WHERE id = $1",
-        )
-        .bind(&run.0)
-        .bind(trigger_kind)
-        .bind(actor)
-        .bind(git_ref)
-        .bind(sha)
-        .bind(pr_number)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
         let row = sqlx::query(
             "SELECT count(*) AS n FROM runs
@@ -784,9 +757,7 @@ impl Db for PostgresDb {
 
     async fn list_runs(&self, limit: u32) -> Result<Vec<RunSummary>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project,
-                    origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number
-             FROM runs
+            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project FROM runs
              ORDER BY created_at DESC, id DESC
              LIMIT $1",
         )
@@ -794,7 +765,24 @@ impl Db for PostgresDb {
         .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
-        rows.into_iter().map(run_summary_from_row).collect()
+        rows.into_iter()
+            .map(|r| {
+                let tenant = match (
+                    r.get::<Option<String>, _>("tenant_org"),
+                    r.get::<Option<String>, _>("tenant_project"),
+                ) {
+                    (Some(o), Some(p)) => Some((o, p)),
+                    _ => None,
+                };
+                Ok(RunSummary {
+                    run: RunId(r.get::<String, _>("id")),
+                    status: run_status_from_str(r.get::<String, _>("status"))?,
+                    created_at: Timestamp(r.get::<i64, _>("created_at")),
+                    updated_at: Timestamp(r.get::<i64, _>("updated_at")),
+                    tenant,
+                })
+            })
+            .collect()
     }
 
     async fn list_runs_for_tenant(
@@ -804,9 +792,7 @@ impl Db for PostgresDb {
         limit: u32,
     ) -> Result<Vec<RunSummary>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project,
-                    origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number
-             FROM runs
+            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project FROM runs
              WHERE tenant_org = $1 AND tenant_project = $2
              ORDER BY created_at DESC, id DESC
              LIMIT $3",
@@ -817,7 +803,24 @@ impl Db for PostgresDb {
         .fetch_all(self.pool())
         .await
         .map_err(db_err)?;
-        rows.into_iter().map(run_summary_from_row).collect()
+        rows.into_iter()
+            .map(|r| {
+                let tenant = match (
+                    r.get::<Option<String>, _>("tenant_org"),
+                    r.get::<Option<String>, _>("tenant_project"),
+                ) {
+                    (Some(o), Some(p)) => Some((o, p)),
+                    _ => None,
+                };
+                Ok(RunSummary {
+                    run: RunId(r.get::<String, _>("id")),
+                    status: run_status_from_str(r.get::<String, _>("status"))?,
+                    created_at: Timestamp(r.get::<i64, _>("created_at")),
+                    updated_at: Timestamp(r.get::<i64, _>("updated_at")),
+                    tenant,
+                })
+            })
+            .collect()
     }
 
     async fn events(&self, run: &RunId) -> Result<Vec<EventKind>, DbError> {
@@ -1738,31 +1741,6 @@ fn run_status_str(s: RunStatus) -> &'static str {
         RunStatus::Cancelled => "cancelled",
         RunStatus::DeadLettered => "dead_lettered",
     }
-}
-
-/// Map a `runs` row (as selected by the two `list_runs*` queries) into a
-/// [`RunSummary`], including the tenancy and origin projections. Shared so the
-/// column set stays in lock-step between the global and per-tenant lists.
-fn run_summary_from_row(r: sqlx::postgres::PgRow) -> Result<RunSummary, DbError> {
-    let tenant = match (
-        r.get::<Option<String>, _>("tenant_org"),
-        r.get::<Option<String>, _>("tenant_project"),
-    ) {
-        (Some(o), Some(p)) => Some((o, p)),
-        _ => None,
-    };
-    Ok(RunSummary {
-        run: RunId(r.get::<String, _>("id")),
-        status: run_status_from_str(r.get::<String, _>("status"))?,
-        created_at: Timestamp(r.get::<i64, _>("created_at")),
-        updated_at: Timestamp(r.get::<i64, _>("updated_at")),
-        tenant,
-        trigger_kind: r.get::<Option<String>, _>("origin_trigger_kind"),
-        actor: r.get::<Option<String>, _>("origin_actor"),
-        git_ref: r.get::<Option<String>, _>("origin_ref"),
-        sha: r.get::<Option<String>, _>("origin_sha"),
-        pr_number: r.get::<Option<i64>, _>("origin_pr_number"),
-    })
 }
 
 fn run_status_from_str(s: String) -> Result<RunStatus, DbError> {

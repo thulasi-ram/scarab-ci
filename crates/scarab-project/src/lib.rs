@@ -73,9 +73,15 @@ pub struct ProtectionRules {
     pub allowed_refs: Vec<String>,
     /// Max concurrent deployments into this environment.
     pub concurrency: u32,
-    /// The secret scope exposed to runs targeting this environment.
+    /// The secret scope exposed to runs targeting this environment. This is
+    /// canonical — fully determined by the environment's `(org, repo, name)`
+    /// coordinate — so the server stamps it on write; callers need not (and
+    /// cannot meaningfully) supply it. Defaulted here so an API body may omit it.
+    #[serde(default = "canonical_scope_placeholder")]
     pub secret_scope: SecretScope,
-    /// The OIDC subject claim minted for runs into this environment.
+    /// The OIDC subject claim minted for runs into this environment. Likewise
+    /// canonical and server-stamped on write; defaulted so a body may omit it.
+    #[serde(default)]
     pub oidc_subject: String,
     /// The privilege whitelist (ADR-0039): which image **digests** may use which
     /// *governed* grants (`add-capabilities`, `privileged`) in this environment.
@@ -89,6 +95,15 @@ pub struct ProtectionRules {
     /// where an admin has opted in. Administer-only, like the privilege whitelist.
     #[serde(default)]
     pub permit_k8s_overlay: bool,
+}
+
+/// A stand-in [`SecretScope`] used only as the serde default for
+/// [`ProtectionRules::secret_scope`] when a request body omits it. The value is
+/// always overwritten with the canonical env-scoped scope on write, so it never
+/// escapes as-is — it exists purely so `SecretScope` (which has no `Default`)
+/// can be defaulted at the field level.
+fn canonical_scope_placeholder() -> SecretScope {
+    SecretScope::Org { org: String::new() }
 }
 
 /// A per-image entry in an [`Environment`]'s privilege whitelist (ADR-0039): the

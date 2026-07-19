@@ -250,22 +250,6 @@ pub trait Db: Send + Sync {
     /// The run's owning tenant, if stamped.
     async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError>;
 
-    /// Stamp the run's **origin** — the trigger facts it was born from, resolved
-    /// from the normalized `Event` at creation (beside the tenant stamp). Passed
-    /// as discrete, independently-nullable values (never a bundle): `trigger_kind`
-    /// is always known; `actor`/`git_ref`/`sha`/`pr_number` are `None` for the
-    /// trigger kinds that lack them (a cron run has no actor/ref/sha; only a PR
-    /// has a number). Surfaced by the runs list; carries no scheduling authority.
-    async fn set_run_origin(
-        &self,
-        run: &RunId,
-        trigger_kind: &str,
-        actor: Option<&str>,
-        git_ref: Option<&str>,
-        sha: Option<&str>,
-        pr_number: Option<i64>,
-    ) -> Result<(), DbError>;
-
     /// How many runs are in-flight (started, not terminal). With `project`,
     /// scoped to that project (fairness cap); without, the global count
     /// (backpressure).

@@ -153,6 +153,58 @@ async fn environment_management_crud_over_repo_scoped_routes() {
     tdb.cleanup().await;
 }
 
+/// A PUT body may omit `secret_scope` and `oidc_subject` — they're canonical,
+/// fully determined by the `(org, repo, name)` coordinate — and the server
+/// stamps them. Regression for the UI's "New environment" form, which sends
+/// only approvers/wait_timer/allowed_refs/concurrency (missing-field 400).
+#[tokio::test]
+async fn put_environment_stamps_canonical_scope_and_subject_when_body_omits_them() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let app = app(pg.clone());
+
+    // Exactly the body the UI's env form sends — no secret_scope / oidc_subject.
+    let put = json_req(
+        "PUT",
+        "/v1/repos/acme/web/environments/prod",
+        serde_json::json!({
+            "approvers": ["anonymous"],
+            "wait_timer": 0,
+            "allowed_refs": ["refs/heads/main"],
+            "concurrency": 1,
+        }),
+    );
+    assert_eq!(
+        app.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    // Read back: the server derived both fields from the path.
+    let stored = pg
+        .get_environment("acme", "web", "prod")
+        .await
+        .unwrap()
+        .expect("environment stored");
+    assert_eq!(
+        stored.protection.secret_scope,
+        SecretScope::Environment {
+            org: "acme".into(),
+            repo: "web".into(),
+            environment: "prod".into(),
+        }
+    );
+    assert_eq!(
+        stored.protection.oidc_subject,
+        "scarab:org/acme/repo/web/env/prod"
+    );
+
+    tdb.cleanup().await;
+}
+
 /// Drive a deploy run to its manual gate, then approve it via HTTP. The gate
 /// releases (and a deployment is recorded) only when the environment's rules
 /// admit the accumulated approver; otherwise the run stays suspended.
