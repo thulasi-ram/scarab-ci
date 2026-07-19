@@ -21,10 +21,7 @@ const { icon, size = 200, rotate = 0, opacity = 0.08, top, right, bottom, left, 
 const svgs = import.meta.glob('../../../brand/ascii/generated/doodles/*.svg', { query: '?raw', import: 'default', eager: true }) as Record<string, string>;
 const entry = Object.entries(svgs).find(([p]) => p.endsWith(`/${icon}.svg`));
 const raw = entry?.[1];
-// A doodle is decorative background — a missing/not-yet-baked motif must never
-// crash the page. Warn for the dev signal; the `{raw && …}` guard below renders
-// nothing when absent.
-if (!raw) console.warn(`Doodle: unknown motif "${icon}" (run npm run bake in ui/brand/ascii)`);
+if (!raw) throw new Error(`Doodle: unknown motif "${icon}" (run npm run bake in ui/brand/ascii)`);
 ---
 {raw && (
   <span

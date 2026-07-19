@@ -161,9 +161,8 @@ export default function RunPipeline() {
           </button>
           <Show when={catalog()}>
             {(c) => (
-              <span class="mono rp-sha" title={`resolved to ${c().sha}`}>
-                <Icon icon="git-commit-horizontal" size={13} />
-                {c().sha.slice(0, 7)}
+              <span class="subtle mono rp-sha" title={c().sha}>
+                resolved <b>{c().sha.slice(0, 10)}</b>
               </span>
             )}
           </Show>
@@ -224,12 +223,7 @@ export default function RunPipeline() {
                 }
               >
                 {(() => {
-                  // `!loading && !error` does NOT imply the interface has
-                  // resolved — there's a window (just-selected pipeline, or the
-                  // catalog re-resolving) where iface() is still undefined.
-                  // Guard it so the form never reads `.inputs` on undefined.
-                  const i = iface();
-                  if (!i) return <p class="empty">compiling interface…</p>;
+                  const i = iface()!;
                   return (
                     <>
                       <Show when={dropped().length > 0}>

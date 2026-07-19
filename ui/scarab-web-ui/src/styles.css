@@ -1428,8 +1428,8 @@ h2 {
   padding: 16px 18px;
 }
 .rp-ref-field { flex: 1; min-width: 220px; }
-.rp-sha { align-self: center; display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--copper); }
-.rp-sha svg { color: var(--muted-sage); }
+.rp-sha { align-self: center; }
+.rp-sha b { color: var(--copper); font-weight: 600; }
 
 .rp-catalog { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
 .rp-pipe {

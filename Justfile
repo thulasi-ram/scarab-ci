@@ -10,15 +10,14 @@
 default:
     @just --list
 
+# Run scarab-server for local dev. Config comes from the environment — `cd` into
+# the repo with direnv set up (see .env.local.example) and this needs no flags.
+server:
+    cargo run -p scarab-server
+
 # Run the web UI dev server (Vite on http://localhost:5173, proxies /v1 → server).
-# Env (incl. SCARAB_API_URL, which vite refuses to guess) comes from the one dev
-# env file — not wired inline here. Point elsewhere by editing that file.
 ui:
-    #!/usr/bin/env bash
-    set -euo pipefail
     npm --prefix ui/scarab-web-ui install
-    [ -f deploy/local-proc/.env ] || { echo "==> creating deploy/local-proc/.env from .env.example"; cp deploy/local-proc/.env.example deploy/local-proc/.env; }
-    set -a && source deploy/local-proc/.env && set +a
     npm --prefix ui/scarab-web-ui run dev
 
 # Run the docs site dev server (Astro Starlight; ADR-0040).
@@ -70,30 +69,15 @@ local-helm ref="edge":
         bash deploy/local-helm/deploy.sh {{ref}}
     fi
 
-# Persistent port-forward to the in-cluster server (UI + API) on colima. A plain
-# `kubectl port-forward` binds to ONE Pod and dies when it rolls — and every
-# `just local-helm` now rolls the server Pod — so this loops against the Service
-# and auto-reconnects. Leave it running; Ctrl-C to stop. Usage: `just local-helm-ui [port]`.
-local-helm-ui port="8080":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    [ "$(kubectl config current-context)" = "colima" ] || { echo "refusing: context is not 'colima'." >&2; exit 1; }
-    echo "==> http://127.0.0.1:{{port}}  (auto-reconnects across deploys; Ctrl-C to stop)"
-    until kubectl port-forward -n scarab svc/scarab {{port}}:80; do
-      echo "   port-forward dropped (Pod roll?) — reconnecting…" >&2
-      sleep 1
-    done
-
 # Run scarab-server in the FOREGROUND against the dev stack (Ctrl-C to stop).
-# Useful when iterating; `just up` runs it in the background instead. Needs the
-# stack up first (`just up`). Env comes from the one dev env file, not inline.
+# Useful when iterating; `just up` runs it in the background instead.
 serve:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    [ -f deploy/local-proc/.env ] || { echo "==> creating deploy/local-proc/.env from .env.example"; cp deploy/local-proc/.env.example deploy/local-proc/.env; }
-    set -a && source deploy/local-proc/.env && set +a
-    export KUBECONFIG=deploy/local-proc/.kubeconfig
-    cargo run -p scarab-server -- --role converged --serve
+    SCARAB_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab \
+    SCARAB_S3_BUCKET=scarab-logs SCARAB_S3_ENDPOINT=http://127.0.0.1:9000 \
+    SCARAB_S3_ACCESS_KEY=scarab SCARAB_S3_SECRET_KEY=scarabsecret SCARAB_S3_REGION=us-east-1 \
+    KUBECONFIG=deploy/local-proc/.kubeconfig SCARAB_NAMESPACE=scarab \
+    SCARAB_DEV_INSECURE=1 \
+    cargo run -p scarab-server -- --role converged --serve --addr 127.0.0.1:8080
 
 # Build + test the workspace. Set SCARAB_TEST_DATABASE_URL to run PG-backed tests.
 test:

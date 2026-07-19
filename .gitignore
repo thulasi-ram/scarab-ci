@@ -14,6 +14,9 @@
 !/.scarab/*.yml
 !/.scarab/lib/
 
+# machine-specific dev env (direnv loads it; see .env.local.example)
+/.env.local
+/.direnv
 
 # Front-end projects (TS, not cargo members): scarab-web-ui, scarab-docs-ui
 /ui/**/node_modules
@@ -24,9 +27,5 @@
 # Git worktrees for parallel agents (local, not shared)
 .workspaces/
 
-# Env files may hold secrets now or later — never commit them; commit the
-# `.env.example` templates instead. Matches `.env`, `.env.local`, etc. in any
-# directory, while keeping the `.env.example` templates tracked.
-.env
-.env.*
-!.env.example
+# Local dogfood config (secrets) — never commit
+/deploy/local-helm/.env

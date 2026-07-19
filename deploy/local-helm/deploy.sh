@@ -52,29 +52,8 @@ ctx="$(kubectl config current-context)"
 NS="${NAMESPACE:-scarab}"
 TAG="${1:-${IMAGE_TAG:-dogfood-local}}"
 
-# Force a fresh Pod on every deploy. The image tags we use are MUTABLE — `edge`
-# (ghcr) and `dogfood-local` (local build) never change string-wise — so a
-# re-run of `helm upgrade` renders a byte-identical Deployment, K8s sees no diff,
-# and the old Pod keeps running the stale image (pullPolicy: Always only re-pulls
-# when a container is actually (re)created). A per-deploy annotation changes the
-# Pod template each run, so Helm rolls a new Pod that pulls `edge` fresh / adopts
-# the just-rebuilt `dogfood-local` — and `helm ... && kubectl rollout status`
-# below waits on that roll.
-DEPLOY_NONCE="$(date +%s)"
-
 : "${SCARAB_MASTER_KEY:?set SCARAB_MASTER_KEY in .env}"
 : "${SCARAB_DATABASE_URL:?set SCARAB_DATABASE_URL in .env}"
-
-# Object store: default to the in-cluster MinIO (minio.yaml). Backing the CAS
-# with durable storage is REQUIRED — the local-dir fallback lives on the server
-# Pod's `scratch` emptyDir, so a restart (every deploy now rolls the Pod) wipes
-# all workspace snapshots and any rerun of a prior run hangs restoring them.
-# Overridable via .env to point at real S3. Creds default to minio.yaml's.
-S3_BUCKET="${SCARAB_S3_BUCKET:-scarab-logs}"
-S3_ENDPOINT="${SCARAB_S3_ENDPOINT:-http://scarab-minio:9000}"
-S3_REGION="${SCARAB_S3_REGION:-us-east-1}"
-S3_ACCESS_KEY="${SCARAB_S3_ACCESS_KEY:-scarab}"
-S3_SECRET_KEY="${SCARAB_S3_SECRET_KEY:-scarabsecret}"
 
 # Render a transient values file from .env (deleted on exit — no secrets on the
 # CLI, none left on disk).
@@ -85,18 +64,10 @@ image:
   repository: ${IMAGE_REPOSITORY:-scarab-server}
   tag: ${TAG}
   pullPolicy: ${IMAGE_PULL_POLICY:-IfNotPresent}
-# Changes every deploy => Pod template differs => Helm rolls a fresh Pod that
-# re-pulls the mutable tag (see DEPLOY_NONCE note above).
-podAnnotations:
-  scarab.dev/deployed-at: "${DEPLOY_NONCE}"
 scarab:
   role: converged
   executor: k8s
   namespace: ${NS}
-  s3:
-    bucket: "${S3_BUCKET}"
-    endpoint: "${S3_ENDPOINT}"
-    region: "${S3_REGION}"
   devInsecure: ${DEV_INSECURE:-true}
   githubAppId: "${SCARAB_GITHUB_APP_ID:-}"
   publicUrl: "${SCARAB_PUBLIC_URL:-}"
@@ -110,8 +81,6 @@ secrets:
   masterKey: "${SCARAB_MASTER_KEY}"
   githubWebhookSecret: "${SCARAB_GITHUB_WEBHOOK_SECRET:-}"
   resultsTokenSecret: "${SCARAB_RESULTS_TOKEN_SECRET:-}"
-  s3AccessKey: "${S3_ACCESS_KEY}"
-  s3SecretKey: "${S3_SECRET_KEY}"
 YAML
 
 echo "==> namespace"
@@ -120,15 +89,6 @@ kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 echo "==> in-cluster Postgres"
 kubectl apply -n "$NS" -f "$ROOT/deploy/local-helm/postgres.yaml"
 kubectl rollout status -n "$NS" deploy/scarab-postgres --timeout=120s
-
-# In-cluster MinIO only when the server points at the in-cluster service. A
-# real-S3 override (SCARAB_S3_ENDPOINT set to something else in .env) skips it.
-if [ "$S3_ENDPOINT" = "http://scarab-minio:9000" ]; then
-  echo "==> in-cluster MinIO"
-  kubectl apply -n "$NS" -f "$ROOT/deploy/local-helm/minio.yaml"
-  kubectl rollout status -n "$NS" deploy/scarab-minio --timeout=120s
-  kubectl wait -n "$NS" --for=condition=complete job/scarab-minio-mkbucket --timeout=90s
-fi
 
 echo "==> scarab-server (image tag: $TAG)"
 helm upgrade --install scarab "$ROOT/deploy/helm/scarab" -n "$NS" -f "$VALUES"

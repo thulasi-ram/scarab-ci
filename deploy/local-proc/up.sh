@@ -41,15 +41,19 @@ echo "==> building scarab-server"
 ( cd "$root" && cargo build -p scarab-server )
 
 echo "==> starting scarab-server (converged) in the background"
-# Env (DB/S3/namespace/addr) comes from the one dev env file — single source of
-# truth, shared with `just serve`/`just ui`. Gitignored; seed it from the
-# committed template on first run.
-[ -f "$here/.env" ] || cp "$here/.env.example" "$here/.env"
-set -a; . "$here/.env"; set +a
-# KUBECONFIG is dynamic (this run's kind cluster), so it's set here, not in .env.
+export SCARAB_DATABASE_URL="postgres://scarab:scarab@127.0.0.1:55432/scarab"
+# Dev-only escape hatch (ADR-0048): boots without an authenticator/KEK, with
+# loud warnings. Production must never set this.
+export SCARAB_DEV_INSECURE=1
+export SCARAB_S3_BUCKET="scarab-logs"
+export SCARAB_S3_ENDPOINT="http://127.0.0.1:9000"
+export SCARAB_S3_ACCESS_KEY="scarab"
+export SCARAB_S3_SECRET_KEY="scarabsecret"
+export SCARAB_S3_REGION="us-east-1"
 export KUBECONFIG="$kubeconfig"
+export SCARAB_NAMESPACE="scarab"
 
-nohup "$root/target/debug/scarab-server" --role converged --serve \
+nohup "$root/target/debug/scarab-server" --role converged --serve --addr 127.0.0.1:8080 \
   > "$here/server.log" 2>&1 &
 echo $! > "$here/server.pid"
 

@@ -125,10 +125,8 @@ const GC_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
 ///
 /// - **Mark**: walk every root the Db reports reachable (all non-terminal
 ///   runs + terminal runs within TTL), collecting `trees/<h>` + `blobs/<h>`.
-///   A transient walk error aborts the pass — robust over precise: a missed
-///   mark must never become a deleted live object. A MISSING root (dangling
-///   reference to a wiped tree) is skipped instead, so one lost object can't
-///   wedge GC forever.
+///   A walk error aborts the pass — robust over precise: a missed mark must
+///   never become a deleted live object.
 /// - **Sweep**: delete unmarked objects older than the grace window.
 pub async fn sweep_cas(
     db: &Arc<dyn Db>,
@@ -158,23 +156,10 @@ pub async fn sweep_cas(
         if !marked.insert(format!("trees/{hash}")) {
             continue; // shared subtree already walked (the dedup win)
         }
-        let entries = match cas.tree_entries(&scarab_storage::TreeHash(hash.clone())).await {
-            Ok(entries) => entries,
-            // A MISSING tree is a dangling reference (e.g. a run recorded before
-            // the object store was switched, whose blobs were wiped): the
-            // subtree doesn't exist, so there is nothing under it to mark and
-            // skipping it cannot endanger the sweep — anything it would have
-            // referenced is itself absent (and thus already garbage). Log and
-            // continue, so one lost object can't wedge GC forever. ANY OTHER
-            // error may be transient over a tree that DOES exist, where an
-            // unmarked-but-live blob could then be swept — stay conservative
-            // and abort the pass (a missed mark must never delete a live object).
-            Err(scarab_storage::StorageError::NotFound) => {
-                tracing::warn!(tree = %hash, "cas gc: root tree missing (dangling reference) — skipping");
-                continue;
-            }
-            Err(e) => return Err(format!("mark walk of tree {hash}: {e} — aborting pass")),
-        };
+        let entries = cas
+            .tree_entries(&scarab_storage::TreeHash(hash.clone()))
+            .await
+            .map_err(|e| format!("mark walk of tree {hash}: {e} — aborting pass"))?;
         for entry in entries {
             match entry.target {
                 scarab_storage::TreeTarget::Blob(b) => {
