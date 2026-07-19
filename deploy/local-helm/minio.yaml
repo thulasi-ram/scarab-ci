@@ -1,0 +1,91 @@
+# Dev-only in-cluster MinIO for the local Helm dogfood (NOT for production — use
+# a managed S3 there). It backs the object store (CAS: logs, artifacts, and the
+# per-step workspace snapshots reruns restore). One replica, a PVC via k3s
+# local-path so the durable state survives pod restarts — WITHOUT this the CAS
+# would live on the server's `scratch` emptyDir and every server restart would
+# wipe all workspaces, hanging any rerun of a prior run. Wipe a clean slate by
+# deleting the PVC (see deploy/local-helm/README.md).
+#
+# Official `minio/minio` + `minio/mc` images (multi-arch, run on arm64) — we
+# deliberately avoid the Bitnami images, matching the Postgres setup.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scarab-minio
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 4Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scarab-minio
+  labels: { app: scarab-minio }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }        # single RWO volume — never two pods at once
+  selector:
+    matchLabels: { app: scarab-minio }
+  template:
+    metadata:
+      labels: { app: scarab-minio }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest   # official image is multi-arch (runs on arm64)
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - { name: MINIO_ROOT_USER, value: scarab }
+            - { name: MINIO_ROOT_PASSWORD, value: scarabsecret }
+          ports:
+            - { name: s3, containerPort: 9000 }
+            - { name: console, containerPort: 9001 }
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: scarab-minio
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scarab-minio
+  labels: { app: scarab-minio }
+spec:
+  selector: { app: scarab-minio }
+  ports:
+    - { name: s3, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }
+---
+# One-shot: create the logs/artifacts bucket, then exit (mirrors the proc-mode
+# compose `createbuckets`). Self-waits for MinIO via the `mc alias set` retry
+# loop, so apply order doesn't matter. Idempotent (`--ignore-existing`); the
+# bucket persists in the PVC, so a completed Job need not re-run.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: scarab-minio-mkbucket
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels: { app: scarab-minio }
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until mc alias set local http://scarab-minio:9000 scarab scarabsecret; do sleep 1; done
+              mc mb --ignore-existing local/scarab-logs
+              echo 'bucket scarab-logs ready'

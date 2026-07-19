@@ -1,9 +1,17 @@
 # Local dogfood: Scarab-on-Scarab via Helm (colima)
 
-Runs the full stack **in-cluster** on colima — in-cluster Postgres + `scarab-server`
-(which serves the web UI at `/`) — so we can repeatedly deploy a pinned image and
-watch this repo's own CI run on Scarab. Docs (`scarab-docs-ui`) are **not** deployed
-here; they ship to GitHub Pages.
+Runs the full stack **in-cluster** on colima — in-cluster Postgres + MinIO +
+`scarab-server` (which serves the web UI at `/`) — so we can repeatedly deploy a
+pinned image and watch this repo's own CI run on Scarab. Docs (`scarab-docs-ui`)
+are **not** deployed here; they ship to GitHub Pages.
+
+**Object store (why MinIO):** the server's CAS holds logs, artifacts, and the
+per-step **workspace snapshots** that reruns restore. `deploy.sh` points it at the
+in-cluster MinIO (`minio.yaml`, official `minio/minio` image — no Bitnami, like
+Postgres) on a PVC. This is load-bearing: the local-dir fallback lives on the
+server Pod's `scratch` emptyDir, so — since every deploy now rolls the Pod — it
+would wipe all workspaces and any rerun of a prior run would hang restoring its
+input. Override `SCARAB_S3_*` in `.env` to use real S3 (then MinIO is skipped).
 
 ## Config — one file
 Everything (image, App knobs, secrets, reseed inputs) lives in `deploy/local-helm/.env`
@@ -11,7 +19,8 @@ Everything (image, App knobs, secrets, reseed inputs) lives in `deploy/local-hel
 your shell overrides the file value.
 ```sh
 cp deploy/local-helm/.env.example deploy/local-helm/.env
-# fill in: SCARAB_MASTER_KEY (STABLE — reuse .env.local), SCARAB_GITHUB_WEBHOOK_SECRET,
+# fill in: SCARAB_MASTER_KEY (keep it STABLE across deploys, or stored secrets
+#   become undecryptable), SCARAB_GITHUB_WEBHOOK_SECRET,
 # SCARAB_RESULTS_TOKEN_SECRET, SCARAB_GITHUB_APP_ID, SCARAB_PUBLIC_URL (tunnel),
 # and the reseed inputs (SCARAB_APP_PEM / INSTALL_ID / ORG / REPO).
 ```
@@ -60,9 +69,16 @@ just local-helm local       # build server+clone+sidecar from the tree, then dep
 Or drive the script directly (image source then comes from `.env`):
 ```sh
 deploy/local-helm/deploy.sh [image-tag]         # postgres + helm upgrade --install
-kubectl port-forward -n scarab svc/scarab 8899:80   # leave running; cloudflared -> :8899
+just local-helm-ui 8899                             # persistent forward (reconnects across deploys); cloudflared -> :8899
 deploy/local-helm/reseed.sh                     # fresh DB only: store PEM + register
 ```
+> **Every deploy rolls a fresh Pod.** Our tags are mutable — `edge` and
+> `dogfood-local` never change string-wise — so a plain `helm upgrade` would
+> render an identical Deployment and K8s would keep the *old* Pod running the
+> stale image (`pullPolicy` only fires on container (re)creation). `deploy.sh`
+> stamps a per-deploy `scarab.dev/deployed-at` Pod annotation, so Helm always
+> rolls: the pull paths re-pull `edge`/`sha-*` fresh, and `local` adopts the
+> just-rebuilt `dogfood-local`.
 > **`just local-helm local` caveat:** it builds into the local **Docker** store
 > and deploys with `pullPolicy: IfNotPresent`, so the images must be visible to
 > the colima **Kubernetes** node. If a Pod reports `ErrImageNeverPull` /
@@ -78,8 +94,10 @@ deployed Secret, so it isn't written down anywhere.
 ```sh
 helm uninstall scarab -n scarab
 kubectl delete -n scarab -f deploy/local-helm/postgres.yaml   # drops the PVC => wipes the DB
-# next deploy.sh + reseed.sh starts fresh
+kubectl delete -n scarab -f deploy/local-helm/minio.yaml      # drops the PVC => wipes the CAS
+# next deploy.sh + reseed.sh starts fresh (deploy.sh recreates the bucket)
 ```
 Because the App PEM lives in Postgres (encrypted under `SCARAB_MASTER_KEY`), wiping the
 PVC means re-running `reseed.sh`. Keep `SCARAB_MASTER_KEY` stable or previously-stored
-secrets become undecryptable.
+secrets become undecryptable. Wiping the MinIO PVC drops all logs/artifacts/workspace
+snapshots — old runs stay in the DB but their content (and rerun inputs) is gone.

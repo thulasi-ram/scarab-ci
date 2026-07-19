@@ -413,3 +413,82 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
 
     tdb.cleanup().await;
 }
+
+#[tokio::test]
+async fn cas_gc_skips_a_dangling_root_instead_of_aborting() {
+    // A run whose recorded workspace root is MISSING from the CAS (e.g. the
+    // object store was switched and the old blobs were wiped) must not wedge GC
+    // forever: the mark walk skips the dangling root and the pass still
+    // completes, sweeping / keeping everything else correctly.
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = PostgresDb::with_pool(tdb.pool.clone());
+    pg.migrate().await.unwrap();
+
+    let cas_dir = tempfile::tempdir().unwrap();
+    let storage =
+        Arc::new(scarab_storage_s3::S3Storage::local(cas_dir.path().to_str().unwrap()).unwrap());
+    let cas: Arc<dyn Cas> = storage.clone();
+    let store: Arc<dyn ObjectStore> = storage.clone();
+
+    // A reachable (suspended → never-collectable) run with a real workspace.
+    let live_root =
+        seed_run_with_workspace(&pg, &cas, "gc-live", false, &[("keep.txt", "keep")]).await;
+
+    // A reachable run whose recorded root points at a tree that does NOT exist
+    // in the CAS — the dangling reference. `gc_workspace_roots` will return it,
+    // so the mark walk hits a missing tree.
+    let dangling = RunId("gc-dangling".into());
+    pg.create_run(&dangling, 1, 1, Timestamp(0)).await.unwrap();
+    for (from, to) in [
+        (RunStatus::Pending, RunStatus::Running),
+        (RunStatus::Running, RunStatus::Suspended),
+    ] {
+        pg.record_transition(&dangling, from, to).await.unwrap();
+    }
+    pg.create_step_run(&dangling, &StepId("s1".into()), None, &[], Timestamp(0))
+        .await
+        .unwrap();
+    // A well-formed hash the store was never asked to hold → NotFound on walk.
+    let missing = "0".repeat(64);
+    pg.set_step_output(&dangling, &StepId("s1".into()), &missing)
+        .await
+        .unwrap();
+
+    let db: Arc<dyn Db> = Arc::new(pg);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(now_ms));
+
+    // The pass must SUCCEED despite the dangling root (before the fix it errored
+    // "aborting pass"), and the live workspace must survive.
+    sweep_cas(
+        &db,
+        &cas,
+        &store,
+        &clock,
+        "gc-dangle",
+        GcConfig {
+            workspace_ttl_ms: 30 * DAY_MS,
+            grace_ms: 0,
+        },
+    )
+    .await
+    .expect("a dangling root is skipped, not fatal to the pass");
+
+    let out = tempfile::tempdir().unwrap();
+    cas.materialize(
+        &scarab_storage::TreeHash(live_root),
+        out.path().to_str().unwrap(),
+    )
+    .await
+    .expect("the reachable workspace survives the pass");
+    assert!(out.path().join("keep.txt").exists());
+
+    tdb.cleanup().await;
+}
