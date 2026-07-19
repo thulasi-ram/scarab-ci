@@ -48,6 +48,11 @@ and **parked** as overkill for v1; the design + a build recipe are preserved in
 `BACKDROPS.md`. The beetle fixes from that exploration (square cells, 96 grid,
 thin legs, arms off the ball) did ship.
 
+**Scene repertoire** — the direction is to replace the four ponderer pose
+variations with a set of quiet, Hollow-Knight-*in-spirit* beetle vignettes
+(Stargazer, Tactician, Cleansing Drop, …), mapped to state moments. Full spec
+in `SCENES.md`; to be prototyped as samples before baking.
+
 ## Format
 
 `{ cols, rows, fps, frames: [[em, au, fe], …] }` — each frame is three
