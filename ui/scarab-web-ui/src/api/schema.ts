@@ -425,7 +425,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List a run's artifacts of record (ADR-0052). Read at the run's tenant. */
+        /** List a run's artifact versions (ADR-0052/0056). Read at the run's tenant. */
         get: operations["list_artifacts"];
         put?: never;
         post?: never;
@@ -445,7 +445,9 @@ export interface paths {
         /**
          * Download one artifact's bytes (ADR-0052). Streams through the server (a
          *     presigned-URL fast path can replace this when the store backend supports
-         *     signing). Read at the run's tenant; immutable content.
+         *     signing). Read at the run's tenant; immutable content. The bare name
+         *     resolves to the latest SUCCESSFUL version (ADR-0056); `?step=&attempt=`
+         *     pins an exact version.
          */
         get: operations["download_artifact"];
         put?: never;
@@ -568,6 +570,76 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/runs/{id}/steps/{step}/attach": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * WebSocket: an interactive debug shell into a **running** step's Pod (the
+         *     debug surface). Gated behind `Administer` — exec is the most privileged
+         *     surface. Only a running step has a live Pod (they are `restartPolicy: Never`
+         *     and gone once done), so a terminal/pending step is refused. Bridges the
+         *     Pod's TTY to the socket: client text/binary → shell stdin, shell output →
+         *     client. Disabled (404) unless an attacher is wired (k8s executor only).
+         */
+        get: operations["attach_step"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{id}/steps/{step}/consumed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * An attempt's consumption map (ADR-0056). Bare = the attempt behind the
+         *     step's current evidence; `?attempt=` = that attempt. Read at the run's
+         *     tenant. Fetched lazily by the step pane's Outputs tab — deliberately NOT
+         *     part of the polled run-status DTO.
+         */
+        get: operations["get_attempt_consumed"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{id}/steps/{step}/debug-pod": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * WebSocket: reproduce a **finished** step in a fresh ephemeral Pod — its
+         *     image, its output workspace snapshot re-materialized at `/workspace` —
+         *     running `sleep` so the operator can shell in and debug (ADR-0039 world). The
+         *     live-attach surface needs a still-running step; this one works after the fact.
+         *     Gated behind `Administer`; the debug Pod is TTL-bounded and torn down when
+         *     the socket closes. Disabled (404) unless a debug launcher is wired (k8s only).
+         */
+        get: operations["debug_pod_step"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/runs/{id}/steps/{step}/logs": {
         parameters: {
             query?: never;
@@ -621,10 +693,11 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * A step's named results (ADR-0041), read from `step_runs.results`. The read
-         *     side of the results-ingest write path (`POST …/steps/{step}/results`): the
-         *     Inspector's Results tab, and the source the Outputs view derives from. Read
-         *     at the run's tenant.
+         * A step's named results (ADR-0041). The read side of the results-ingest
+         *     write path (`POST …/steps/{step}/results`): the Inspector's Results tab,
+         *     and the source the Outputs view derives from. Bare = latest evidence;
+         *     `?attempt=` = that attempt's immutable copy (ADR-0056). Read at the run's
+         *     tenant.
          */
         get: operations["get_step_results"];
         put?: never;
@@ -747,12 +820,22 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /** @description One artifact in a run's list (ADR-0052). */
+        /**
+         * @description One artifact **version** in a run's list (ADR-0052, immutable per attempt
+         *     by ADR-0056). `step`/`attempt` are the publishing provenance (empty
+         *     strings on pre-ADR-0056 rows); `succeeded` is that attempt's verdict;
+         *     `of_record` marks the version the bare name-addressed download resolves
+         *     to — the latest successful version of that name.
+         */
         ArtifactDto: {
+            attempt: string;
             content_type: string;
             name: string;
+            of_record: boolean;
             /** Format: int64 */
             size: number;
+            step: string;
+            succeeded: boolean;
         };
         /**
          * @description One attempt at executing a step (ADR-0047) — the rerun unit. A step with more
@@ -799,6 +882,20 @@ export interface components {
              *     passes as `pipeline`.
              */
             name: string;
+        };
+        /**
+         * @description What an attempt consumed (ADR-0056): the map `upstream step id → attempt
+         *     id` stamped at its launch — the durable answer to "which generation of
+         *     `build` did `test` actually build on?" after a mid-run restart leaves the
+         *     run a patchwork of attempt generations. `attempt` names the attempt the
+         *     map belongs to; empty map = nothing recorded (no upstream evidence, or a
+         *     pre-ADR-0056 attempt).
+         */
+        ConsumedDto: {
+            attempt: string;
+            consumed: {
+                [key: string]: string;
+            };
         };
         /**
          * @description `POST /v1/runs` body: an inline pipeline to run immediately, plus any launch
@@ -1033,7 +1130,19 @@ export interface components {
             };
             id: string;
             image: string;
+            /**
+             * @description Governed raw pod-spec overlay (ADR-0055). Carries no authority; an inline
+             *     API run targets no Environment, so any overlay is rejected fail-closed.
+             */
+            k8s_overlay?: Record<string, never>;
             needs?: string[];
+            /**
+             * @description PlacementProfile names this step runs on (ADR-0055); their admin-defined
+             *     k8s overlays merge onto the Pod in listed order. Empty = the default profile.
+             */
+            placement_profiles?: string[];
+            /** @description Requested compute resources (ADR-0055): exact `cpu_millis`/`memory_mib`. */
+            resources?: Record<string, never>;
             /**
              * @description Opt-in retry policy `{on, max}` (ADR-0047). ⚠ At-least-once: retry
              *     re-runs the whole step at-least-once; enable only if the step is
@@ -1807,7 +1916,10 @@ export interface operations {
     };
     download_artifact: {
         parameters: {
-            query?: never;
+            query?: {
+                step?: string;
+                attempt?: string;
+            };
             header?: never;
             path: {
                 /** @description run id */
@@ -1979,6 +2091,106 @@ export interface operations {
             };
         };
     };
+    attach_step: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description WebSocket upgrade — interactive TTY into the running step's Pod */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description step is not running (no live Pod) */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such run/step, or attach disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_attempt_consumed: {
+        parameters: {
+            query?: {
+                attempt?: string;
+            };
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConsumedDto"];
+                };
+            };
+            /** @description no such run or no attempt */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    debug_pod_step: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description WebSocket upgrade — interactive TTY into a fresh reproduction Pod */
+            101: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such run/step, no step spec, or debug-pod disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     get_step_logs: {
         parameters: {
             query?: {
@@ -2044,7 +2256,9 @@ export interface operations {
     };
     get_step_results: {
         parameters: {
-            query?: never;
+            query?: {
+                attempt?: string;
+            };
             header?: never;
             path: {
                 /** @description run id */
@@ -2115,6 +2329,8 @@ export interface operations {
             query?: {
                 /** @description sub-path within the snapshot (default = root) */
                 path?: string;
+                /** @description attempt id — that attempt's immutable snapshot instead of the latest (ADR-0056) */
+                attempt?: string;
             };
             header?: never;
             path: {
@@ -2149,6 +2365,8 @@ export interface operations {
             query: {
                 /** @description file path within the snapshot */
                 path: string;
+                /** @description attempt id — that attempt's immutable snapshot instead of the latest (ADR-0056) */
+                attempt?: string;
             };
             header?: never;
             path: {

@@ -1678,6 +1678,7 @@ async fn list_artifacts(
 /// of-record resolution (latest successful version); `step`+`attempt` → that
 /// exact version (how a Take view reads a shadowed or failed-attempt file).
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ArtifactVersionQuery {
     pub step: Option<String>,
     pub attempt: Option<String>,
@@ -1759,6 +1760,7 @@ fn json_type_name(v: &serde_json::Value) -> &'static str {
 /// (ADR-0056): omitted → the step's latest evidence; present → that attempt's
 /// immutable copy.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct AttemptQuery {
     pub attempt: Option<String>,
 }

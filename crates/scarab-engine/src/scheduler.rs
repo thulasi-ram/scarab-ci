@@ -414,6 +414,33 @@ struct Config {
     default_step_timeout_ms: i64,
 }
 
+/// One control-plane instance's supervision memory (ADR-0056): the attempts
+/// (keyed `{run}:{step}:{attempt}`) this PROCESS has launched or polled.
+/// Deliberately in-memory — a stored launch handle first polled by an
+/// instance that isn't tracking it means a control plane died and this one
+/// adopted the attempt, which emits `AttemptReadopted`. Routine lease-expiry
+/// re-polls by the same instance stay silent; N crashes emit N events, each a
+/// real recovery.
+///
+/// The [`Scheduler`] borrows ports per cycle and is often constructed fresh
+/// each tick, so a long-lived driver MUST create one `Supervision` at boot
+/// and thread it into every cycle via
+/// [`with_supervision`](Scheduler::with_supervision) — a per-cycle set would
+/// make every routine re-poll look like an adoption.
+#[derive(Clone, Default)]
+pub struct Supervision(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>);
+
+impl Supervision {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Track `key`; returns `true` if this instance had never seen it.
+    fn first_contact(&self, key: String) -> bool {
+        self.0.lock().expect("supervision set poisoned").insert(key)
+    }
+}
+
 /// The durable scheduler. Borrows the ports for the duration of a cycle.
 pub struct Scheduler<'a> {
     db: &'a dyn Db,
@@ -421,14 +448,10 @@ pub struct Scheduler<'a> {
     executor: &'a dyn Executor,
     owner: String,
     cfg: Config,
-    /// Handles this scheduler instance has supervised (launched or polled),
-    /// keyed `{run}:{step}:{attempt}`. Deliberately in-memory (ADR-0056): a
-    /// stored handle first polled by an instance that ISN'T tracking it means
-    /// a control plane died and this one adopted the attempt — that first
-    /// poll emits `AttemptReadopted`. Routine lease-expiry re-polls by the
-    /// same instance are already tracked and stay silent; N crashes emit N
-    /// events, each a real recovery.
-    supervised: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// See [`Supervision`]. Defaults to a fresh set (fine when the Scheduler
+    /// value itself lives as long as the process, as in tests); a per-cycle
+    /// caller must inject the process-lifetime one.
+    supervised: Supervision,
 }
 
 impl<'a> Scheduler<'a> {
@@ -443,7 +466,7 @@ impl<'a> Scheduler<'a> {
             clock,
             executor,
             owner: owner.into(),
-            supervised: std::sync::Mutex::new(std::collections::HashSet::new()),
+            supervised: Supervision::new(),
             cfg: Config {
                 lease_ttl_ms: 30_000,
                 outbox_batch: 16,
@@ -458,6 +481,14 @@ impl<'a> Scheduler<'a> {
     /// Override the global default step deadline (ADR-0047).
     pub fn with_default_step_timeout_ms(mut self, ms: i64) -> Self {
         self.cfg.default_step_timeout_ms = ms;
+        self
+    }
+
+    /// Inject the process-lifetime [`Supervision`] memory (ADR-0056). Required
+    /// when the Scheduler is constructed per cycle, or adoption detection
+    /// degrades into per-cycle noise.
+    pub fn with_supervision(mut self, supervision: Supervision) -> Self {
+        self.supervised = supervision;
         self
     }
 
@@ -814,11 +845,7 @@ impl<'a> Scheduler<'a> {
                     // durability story, and today it is invisible. Routine
                     // re-polls by the same instance are in `supervised` and
                     // stay silent.
-                    let first_contact = self
-                        .supervised
-                        .lock()
-                        .expect("supervised set poisoned")
-                        .insert(supervision_key.clone());
+                    let first_contact = self.supervised.first_contact(supervision_key.clone());
                     if first_contact {
                         let now = self.clock.now().await;
                         self.append(
@@ -934,10 +961,7 @@ impl<'a> Scheduler<'a> {
                         .await?;
                     // We launched it — later re-polls by this instance are
                     // routine supervision, not adoption (ADR-0056).
-                    self.supervised
-                        .lock()
-                        .expect("supervised set poisoned")
-                        .insert(supervision_key);
+                    self.supervised.first_contact(supervision_key);
                     handle
                 }
             };
