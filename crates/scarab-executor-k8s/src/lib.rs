@@ -388,7 +388,7 @@ impl K8sExecutor {
         pods: &Api<Pod>,
         pod: &Pod,
         cas: &dyn Cas,
-    ) -> Result<(), String> {
+    ) -> Result<(), DriveErr> {
         let name = pod.metadata.name.clone().ok_or("pod has no name")?;
         let annotations = pod.metadata.annotations.clone().unwrap_or_default();
         // Not a workspace Pod (built before the CAS was wired) — nothing to do.
@@ -406,7 +406,18 @@ impl K8sExecutor {
                     tmp.path().to_str().ok_or("tmp path")?,
                 )
                 .await
-                .map_err(|e| format!("materialize {root}: {e}"))?;
+                .map_err(|e| match e {
+                    // Permanent: the input workspace blob is gone from the object
+                    // store (evicted, or — the classic dev footgun — the store
+                    // lived on an emptyDir that a restart wiped). The step can
+                    // never be provisioned, so fail the attempt fast rather than
+                    // leave the `scarab-workspace-init` barrier waiting forever.
+                    scarab_storage::StorageError::NotFound => DriveErr::InputMissing(format!(
+                        "workspace input {root} is missing from the object store — cannot \
+                         provision this step (blob evicted or the store was wiped)"
+                    )),
+                    other => DriveErr::Transient(format!("materialize {root}: {other}")),
+                })?;
             }
             let tar_bytes = pack_dir(tmp.path())?;
             // The CAS tarball carries the server's uid/gid/mode (65532, 0755) on
@@ -687,6 +698,39 @@ fn clone_secret_name(pod_name: &str) -> String {
 }
 
 /// Is the named (init) container currently in a `running` state?
+/// Why a `drive_workspace` call failed. `InputMissing` is a **permanent**
+/// provisioning failure — a CAS input the step needs is gone, so it can never
+/// start and the attempt must fail fast (`poll` deletes the barrier-stuck Pod
+/// and reports `Infra { never_started }`). `Transient` is anything else (a
+/// store blip, an exec hiccup): `poll` surfaces it as an error and re-drives.
+/// `From<String>`/`From<&str>` keep every `?` inside `drive_workspace` — which
+/// all yield string errors — compiling unchanged; only the CAS `materialize`
+/// call is special-cased to distinguish the two.
+enum DriveErr {
+    InputMissing(String),
+    Transient(String),
+}
+
+impl std::fmt::Display for DriveErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriveErr::InputMissing(s) | DriveErr::Transient(s) => f.write_str(s),
+        }
+    }
+}
+
+impl From<String> for DriveErr {
+    fn from(s: String) -> Self {
+        DriveErr::Transient(s)
+    }
+}
+
+impl From<&str> for DriveErr {
+    fn from(s: &str) -> Self {
+        DriveErr::Transient(s.to_string())
+    }
+}
+
 fn init_container_running(pod: &Pod, name: &str) -> bool {
     pod.status
         .as_ref()
@@ -797,8 +841,28 @@ impl Executor for K8sExecutor {
                 // idempotent and derive ALL state from the Pod itself, so an
                 // adopted Pod after a control-plane restart resumes cleanly.
                 if let Some(cas) = &self.workspace_cas {
-                    if let Err(e) = self.drive_workspace(&pods, &pod, cas.as_ref()).await {
-                        return Err(ExecError::Other(format!("workspace: {e}")));
+                    match self.drive_workspace(&pods, &pod, cas.as_ref()).await {
+                        Ok(()) => {}
+                        // Permanent: an input workspace is gone from the object
+                        // store, so this step can never be provisioned. Delete
+                        // the Pod stuck on the workspace-init barrier and fail
+                        // the attempt fast — `Infra { never_started: true }`
+                        // (the main process never ran ⇒ no side effect) — with a
+                        // clear reason, instead of the init container waiting
+                        // forever. Bounded retries then dead-letter deterministically.
+                        Err(DriveErr::InputMissing(msg)) => {
+                            eprintln!("scarab-executor: {msg} (pod {})", handle.0);
+                            let _ = pods.delete(&handle.0, &DeleteParams::default()).await;
+                            return Ok(ExecState::Failed {
+                                exit_code: None,
+                                class: FailureClass::Infra {
+                                    never_started: true,
+                                },
+                            });
+                        }
+                        Err(DriveErr::Transient(e)) => {
+                            return Err(ExecError::Other(format!("workspace: {e}")));
+                        }
                     }
                     // The settle (workspace snapshot + artifact harvest) runs in
                     // the egress NATIVE sidecar and patches the durable Pod

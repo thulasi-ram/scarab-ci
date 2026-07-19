@@ -13,7 +13,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   Bug, GitBranch, GitCommitHorizontal, Container, Boxes, Workflow,
-  Waypoints, Package, Terminal, KeyRound, ShieldCheck, Timer, Network,
+  Waypoints, Package, Terminal, KeyRound, ShieldCheck, Timer, Network, Rocket,
 } from "lucide";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -25,7 +25,7 @@ const MOTIFS = {
   bug: Bug, "git-branch": GitBranch, "git-commit": GitCommitHorizontal,
   container: Container, boxes: Boxes, workflow: Workflow, waypoints: Waypoints,
   package: Package, terminal: Terminal, "key-round": KeyRound,
-  "shield-check": ShieldCheck, timer: Timer, network: Network,
+  "shield-check": ShieldCheck, timer: Timer, network: Network, rocket: Rocket,
 };
 
 // Icon space is 24×24 with stroke-width 2 → on a 40-cell grid every stroke

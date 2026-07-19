@@ -243,13 +243,17 @@ code,
   margin: 0;
   font-family: var(--font-mono);
   font-size: var(--ascii-fs, 8px);
-  /* cell = 0.602em x 1.0em -> the 0.6 ratio the bake squashes for */
-  line-height: var(--ascii-fs, 8px);
+  /* square cell = 0.6em advance x 0.6em line-height (no squash; bake aspect 1.0) */
+  line-height: calc(var(--ascii-fs, 8px) * 0.6);
   user-select: none;
 }
 .ascii-scene .ascii-em { color: var(--emerald); }
 .ascii-scene .ascii-au { color: var(--copper); }
 .ascii-scene .ascii-fe { color: var(--muted-sage); }
+/* Runtime speech bubble (ponder-* stages): crisp foreground text over the
+   dotted art, deliberately off-language from the dot-matrix — reads as a
+   terminal caption. */
+.ascii-scene .ascii-bubble { color: var(--soft-white); }
 
 /* Dashboard footer: the dung beetle walks its ball across the full viewport
    on a copper ground line. `.rolling` runs the motion (frames + travel); it is
@@ -299,7 +303,7 @@ code,
   margin: 0;
   font-family: var(--font-mono);
   font-size: 7px;
-  line-height: 7px;
+  line-height: calc(7px * 0.6); /* square cells: emblem-mark is baked unsquashed */
   color: var(--copper);
   opacity: 0.3;
   transform: rotate(-6deg);
@@ -1403,6 +1407,13 @@ h2 {
   background: var(--emerald-surface);
 }
 .allclear .ac-ico { color: var(--emerald); flex: none; }
+
+/* State-moment beetle: an idle/failed pose stands in for an empty list. */
+.empty-scene {
+  display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 28px 0 8px; text-align: center;
+}
+.empty-scene .ascii-scene { margin: 0 auto; }
 .allclear .ac-title { font-family: "Space Grotesk", var(--font-ui); font-size: 15px; font-weight: 600; color: var(--soft-white); }
 .allclear .ac-sub { font-size: 13px; color: var(--muted-sage); margin-top: 2px; }
 
@@ -1417,8 +1428,8 @@ h2 {
   padding: 16px 18px;
 }
 .rp-ref-field { flex: 1; min-width: 220px; }
-.rp-sha { align-self: center; }
-.rp-sha b { color: var(--copper); font-weight: 600; }
+.rp-sha { align-self: center; display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--copper); }
+.rp-sha svg { color: var(--muted-sage); }
 
 .rp-catalog { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
 .rp-pipe {

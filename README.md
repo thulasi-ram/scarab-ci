@@ -166,24 +166,22 @@ cargo check --workspace
 cargo run -p scarab-server -- --help
 ```
 
-## Local dev (cluster-free)
+## Local dev
 
-For laptop iteration you need only a local Postgres. Config is env-driven, so
-set it once via direnv and run each process with no flags:
+Config for the local stack lives in `deploy/local-proc/.env` — gitignored (env
+files may hold secrets), seeded from the committed `deploy/local-proc/.env.example`
+the first time you run a recipe. Edit your copy to customise. There is no direnv
+or per-machine `.env.local` to set up; real secrets for the in-cluster dogfood
+live in its own gitignored `deploy/local-helm/.env`.
 
 ```sh
-cp .env.local.example .env.local   # edit DB url etc.
-direnv allow                       # exports .env.local on cd (see .envrc)
-
-just server   # cargo run -p scarab-server   (binds SCARAB_ADDR, host executor)
 just ui       # Vite dev server on http://localhost:5173, proxies /v1 → server
+just serve    # scarab-server in the foreground against the dev stack (needs `just up`)
 ```
 
-`just server` is just `cargo run -p scarab-server` — every knob
-(`SCARAB_ADDR`, `SCARAB_DATABASE_URL`, `SCARAB_EXECUTOR`, `SCARAB_MASTER_KEY`, …)
-comes from the environment. Serving is the default; pass `--dry-run` to report
-the resolved role and exit without binding. Auth is disabled in dev, so every
-request is an Owner.
+Every knob (`SCARAB_ADDR`, `SCARAB_DATABASE_URL`, `SCARAB_S3_*`, `SCARAB_API_URL`,
+…) comes from that file — point elsewhere by editing it. Auth is disabled in dev
+(`SCARAB_DEV_INSECURE=1`), so every request is an Owner.
 
 ## Full dev stack (k8s)
 

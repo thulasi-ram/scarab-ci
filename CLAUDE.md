@@ -16,7 +16,7 @@ colima safety guards; a bare command skips those and drifts from what CI does.
 | Task | Recipe | What it is |
 |------|--------|-----------|
 | Compile / test the workspace | `just check`, `just test` | `cargo check`/`test --workspace` |
-| Server + UI from source | `just server`, `just ui` | cluster-free laptop loop (host executor) |
+| UI / server from source | `just ui`, `just serve` | dev loop against the proc stack; env from `deploy/local-proc/.env` |
 | **Full local stack** (proc mode) | `just up` → `just demo` → `just down` | Postgres+MinIO (compose) + kind + `scarab-server` as a host process; `just logs` tails it |
 | **Helm dogfood** (helm mode) | `just local-helm` | in-cluster on colima via the real chart + published image; `just local-helm local` builds from the tree, `just local-helm sha-<sha>` pins a build |
 
