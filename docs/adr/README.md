@@ -71,6 +71,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0053](0053-observability-and-lifecycle.md) | Observability & lifecycle: Prometheus `/metrics`, JSON logs + request-ids, `/readyz` vs `/healthz`, graceful shutdown (implements 0030) | Accepted |
 | [0054](0054-product-surface-serving.md) | Product surface: embed UI in the binary, run-cancel API, OpenAPI drift gate, CLI truthfulness (stubs exit non-zero) | Accepted |
 | [0055](0055-placement-profiles.md) | Placement profiles: named `placement_profiles` + control-plane baseline + governed `k8s_overlay` (refines 0026) | Accepted |
+| [0056](0056-run-takes-and-attempt-grain-evidence.md) | Run Takes (derived, human-boundary version lens) + attempt-grain evidence (results/workspace/artifacts/consumption keyed by attempt; restart & re-adoption events) | Accepted |
 
 > For *features* deliberately deferred until demand appears (as opposed to ADRs
 > to be written), see [`docs/followups.md`](../followups.md).
