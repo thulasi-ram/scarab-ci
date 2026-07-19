@@ -14,10 +14,26 @@ npm install && npm run bake     # deterministic; reruns don't churn
 
 | Asset | What | Used by |
 |---|---|---|
-| `dungroller.json` | dung beetle + ball, treadmill (ground scrolls), 88×32 | docs landing accent |
-| `dungroller-bare.json` | same loop without ground, cropped at the feet, 88×26 | web-ui dashboard footer (CSS walks it across the viewport) |
-| `emblem-mark.txt` | the **traced** emblem, static, 64×34 | faint background marks |
+| `dungroller.json` | dung beetle + ball, treadmill (ground scrolls), 88×54 | docs landing accent |
+| `dungroller-bare.json` | same loop without ground, cropped at the feet, 88×44 | web-ui dashboard footer (CSS walks it across the viewport) |
+| `ponder-{ponder,nap,kingofhill,faceplant}.json` | **bubble stages**: roll in → hold a pose → roll on, 96×43 | web-ui state moments (idle / queued / all-clear / failed) |
+| `emblem-mark.txt` | the **traced** emblem, static, 64×57 | faint background marks |
 | `doodles/*.svg` | Lucide icons rasterized to a 24×24 **dot matrix** (dot-icons.mjs) | docs + web-ui background doodles |
+
+### Bubble stages (`ponder-*`) — text is a prop, not pixels
+
+The Ponderer is one stage reused for four moods (the held pose differs); each
+loop rolls in, **stops** for the middle, then rolls on. The speech-bubble text
+is **never baked** — the JSON carries only a `bubble` block:
+
+```
+bubble: { from, to, col, row, place }   // frame window [from,to), tail anchor cell, "above" | "right"
+```
+
+The players (`AsciiScene`) take a `line` prop and composite a box around it in a
+fourth `<pre>` layer, shown only on frames `[from, to)`. Change the wit, ship no
+re-bake. `\n` (or real newlines) split bubble lines. Add a pose by extending
+`ponderPose`/`ponderAnchor` in `scenes.mjs` and `PONDER_POSES` in `bake.mjs`.
 
 Scenes render with a **dots-only ramp** (`" .·•●"`): luminance maps to dot
 size, so the ASCII art, the dot-matrix doodles, and the page dot-grid speak
@@ -26,6 +42,11 @@ one language.
 The wing-spread scene (`drawScarab`) stays in `scenes.mjs` but is currently
 unbaked — the docs hero uses the square emblem SVG. Re-add its `bakeScene`
 line if a state moment wants it.
+
+**Scene backdrops** (scenery behind the beetle — sun/moon/clouds) were explored
+and **parked** as overkill for v1; the design + a build recipe are preserved in
+`BACKDROPS.md`. The beetle fixes from that exploration (square cells, 96 grid,
+thin legs, arms off the ball) did ship.
 
 ## Format
 
@@ -42,8 +63,9 @@ winding-linked compound path — its background whites are *hole contours* — s
 it cannot be dismembered for wing articulation. `scenes.mjs` rebuilds the
 scarab parametrically at the emblem's measured proportions (ring r≈894 at
 (1089,950), wing pivots (882,1030)/(1314,1030)); the traced original renders
-verbatim only as the static mark. Cell glyphs are ~1:1.67, so scenes squash y
-by 0.6 to keep the nimbus round.
+verbatim only as the static mark. Cells render **square** — the players set
+line-height to the 0.6em glyph advance — so scenes are baked unsquashed
+(`CELL_ASPECT = 1.0`) and the dot matrix is evenly spaced on both axes.
 
 ## Placement rules (extends DESIGN.md §5)
 

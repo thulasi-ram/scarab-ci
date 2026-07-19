@@ -24,6 +24,8 @@ import {
 import { relTime, absTime } from "../fmt";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
+import AsciiScene from "../components/AsciiScene";
+import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
 
 type Tab = "runs" | "environments" | "secrets" | "settings";
 
@@ -130,7 +132,24 @@ export default function RepoView() {
 
         <Show when={!rows.loading} fallback={<p class="empty">loading…</p>}>
           <Show when={!rows.error} fallback={<p class="error">Could not load runs.</p>}>
-            <Show when={filtered().length > 0} fallback={<p class="empty">No runs match these filters.</p>}>
+            <Show
+              when={filtered().length > 0}
+              fallback={
+                (rows() ?? []).length === 0 ? (
+                  <div class="empty-scene">
+                    <AsciiScene
+                      scene={ponderIdle}
+                      fontSize={5}
+                      label="Beetle pausing beside its ball"
+                      line={"no runs yet.\npush something\nto get rolling."}
+                    />
+                    <p class="empty">This repo hasn't run yet.</p>
+                  </div>
+                ) : (
+                  <p class="empty">No runs match these filters.</p>
+                )
+              }
+            >
               <div class="runlist">
                 <div class="runrow head">
                   <span></span><span>run</span><span>status</span><span></span><span>when</span>

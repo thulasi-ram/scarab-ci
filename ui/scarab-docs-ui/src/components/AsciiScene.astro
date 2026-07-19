@@ -16,17 +16,20 @@ interface Props {
   slotSelector?: string;
   label?: string;         // accessible name; omit → decorative (aria-hidden)
   class?: string;
+  line?: string;          // speech-bubble text for a bubble stage (ponder-*)
 }
-const { name, fontSize = 8, slotSelector, label, class: cls } = Astro.props;
+const { name, fontSize = 8, slotSelector, label, class: cls, line } = Astro.props;
 
+type Bubble = { from: number; to: number; col: number; row: number; place: "above" | "right" };
 const scenes = import.meta.glob("../../../brand/ascii/generated/*.json", {
   import: "default",
   eager: true,
-}) as Record<string, { cols: number; rows: number; fps: number; frames: [string, string, string][] }>;
+}) as Record<string, { cols: number; rows: number; fps: number; frames: [string, string, string][]; bubble?: Bubble }>;
 const entry = Object.entries(scenes).find(([p]) => p.endsWith(`/${name}.json`));
 if (!entry) throw new Error(`AsciiScene: unknown scene "${name}" (run npm run bake in ui/brand/ascii)`);
 const scene = entry[1];
 const [em0, au0, fe0] = scene.frames[0];
+const hasBubble = !!(scene.bubble && line);
 const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
 ---
 
@@ -35,13 +38,15 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
   id={id}
   data-ascii={name}
   data-fps={scene.fps}
+  data-line={hasBubble ? line : undefined}
   style={
     // Explicit box: layers are absolutely positioned, and trimmed text lines
     // must not size the scene (a layer can be much narrower than the grid).
-    // JetBrains Mono's advance is exactly 0.6em.
+    // JetBrains Mono's advance is exactly 0.6em and line-height is set to 0.6em
+    // too, so cells are SQUARE — width AND height use the same 0.6 factor.
     `--ascii-fs:${fontSize}px;` +
     `width:${scene.cols * fontSize * 0.6}px;` +
-    `height:${scene.rows * fontSize}px`
+    `height:${scene.rows * fontSize * 0.6}px`
   }
   role={label ? "img" : undefined}
   aria-label={label}
@@ -50,6 +55,7 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
   <pre class="ascii-em" data-layer="0">{em0}</pre>
   <pre class="ascii-au" data-layer="1">{au0}</pre>
   <pre class="ascii-fe" data-layer="2">{fe0}</pre>
+  {hasBubble && <pre class="ascii-bubble" data-layer="3"></pre>}
 </div>
 
 {slotSelector && (
@@ -65,27 +71,61 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
 <script>
   // One player for every scene on the page. Baked frames only — the dynamic
   // import pulls just the scenes this page actually uses.
+  type Bubble = { from: number; to: number; col: number; row: number; place: "above" | "right" };
+
+  // Compose a speech-bubble text layer sized to `line`, tail at the baked anchor.
+  function composeBubble(line: string, b: Bubble, cols: number, rows: number): string {
+    const lines = line.split("\n");
+    const maxw = Math.max(...lines.map((l) => l.length));
+    const bw = maxw + 4;
+    const bh = lines.length + 2;
+    const grid: string[][] = Array.from({ length: rows }, () => Array(cols).fill(" "));
+    let top: number, left: number;
+    if (b.place === "right") {
+      left = Math.min(cols - bw, Math.max(0, b.col + 2));
+      top = Math.max(0, Math.min(rows - bh, b.row - (bh >> 1)));
+    } else {
+      left = Math.max(0, Math.min(cols - bw, b.col - 2));
+      top = Math.max(0, Math.min(rows - bh, b.row - bh - 1));
+    }
+    const put = (r: number, c: number, ch: string) => {
+      if (r >= 0 && r < rows && c >= 0 && c < cols) grid[r][c] = ch;
+    };
+    put(top, left, "╭"); put(top, left + bw - 1, "╮");
+    put(top + bh - 1, left, "╰"); put(top + bh - 1, left + bw - 1, "╯");
+    for (let c = left + 1; c < left + bw - 1; c++) { put(top, c, "─"); put(top + bh - 1, c, "─"); }
+    for (let r = top + 1; r < top + bh - 1; r++) { put(r, left, "│"); put(r, left + bw - 1, "│"); }
+    lines.forEach((ln, i) => { for (let k = 0; k < ln.length; k++) put(top + 1 + i, left + 2 + k, ln[k]); });
+    if (b.place === "right") put(Math.max(top + 1, Math.min(top + bh - 2, b.row)), left - 1, "╴");
+    else put(top + bh, Math.max(left + 1, Math.min(left + bw - 2, b.col)), "╲");
+    return grid.map((r) => r.join("").replace(/\s+$/, "")).join("\n");
+  }
+
   const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   const nodes = document.querySelectorAll<HTMLElement>("[data-ascii]");
 
   for (const node of nodes) {
     const name = node.dataset.ascii!;
-    if (reduce) {
-      // Hold a fully-open frame instead of animating (frame 0 is closed).
-      import(`../../../brand/ascii/generated/${name}.json`).then((m) => {
-        const mid = m.default.frames[Math.floor(m.default.frames.length / 2)];
-        node.querySelectorAll("pre").forEach((p, i) => (p.textContent = mid[i]));
-      });
-      continue;
-    }
+    const line = node.dataset.line;
     import(`../../../brand/ascii/generated/${name}.json`).then((m) => {
-      const { fps, frames } = m.default as { fps: number; frames: [string, string, string][] };
+      const { fps, frames, cols, rows, bubble } = m.default as {
+        fps: number; frames: [string, string, string][]; cols: number; rows: number; bubble?: Bubble;
+      };
       const pres = node.querySelectorAll("pre");
+      const bubbleAt = (f: number) =>
+        bubble && line && f >= bubble.from && f < bubble.to ? composeBubble(line, bubble, cols, rows) : "";
+      if (reduce) {
+        // Hold a fully-open frame instead of animating (frame 0 is closed).
+        const m2 = Math.floor(frames.length / 2);
+        pres.forEach((p, i) => (p.textContent = i < 3 ? frames[m2][i] : bubbleAt(m2)));
+        return;
+      }
       let f = 0;
       setInterval(() => {
         if (document.hidden) return;
         f = (f + 1) % frames.length;
         for (let i = 0; i < 3; i++) pres[i].textContent = frames[f][i];
+        if (pres[3]) pres[3].textContent = bubbleAt(f);
       }, 1000 / fps);
     });
   }
@@ -109,8 +149,8 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
        Mono's exact 0.6em advance; a narrower mono would squash the scenes. */
     font-family: 'JetBrains Mono', ui-monospace, monospace;
     font-size: var(--ascii-fs, 8px);
-    /* cell = 0.602em x 1.0em -> the 0.6 ratio the bake squashes for */
-    line-height: var(--ascii-fs, 8px);
+    /* square cell = 0.6em advance x 0.6em line-height (no squash; bake aspect 1.0) */
+    line-height: calc(var(--ascii-fs, 8px) * 0.6);
     user-select: none;
     overflow: hidden;
   }
@@ -118,4 +158,7 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
   .ascii-scene .ascii-em { color: var(--ascii-emerald); }
   .ascii-scene .ascii-au { color: var(--ascii-gold); }
   .ascii-scene .ascii-fe { color: var(--ascii-gray); }
+  /* Runtime speech bubble (ponder-* stages): crisp foreground text, off-language
+     from the dot-matrix on purpose — reads as a terminal caption. */
+  .ascii-scene .ascii-bubble { color: var(--sl-color-white, var(--ascii-gray)); }
 </style>

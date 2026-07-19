@@ -19,7 +19,8 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  drawScarab, drawBeetle, VB_W, VB_H, BEETLE_VB_H, BEETLE_VB_H_BARE, CELL_ASPECT,
+  drawScarab, drawBeetle, drawPonderer, ponderAnchor, PONDER, PONDER_POSES,
+  VB_W, VB_H, BEETLE_VB_H, BEETLE_VB_H_BARE, CELL_ASPECT,
 } from "./scenes.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -62,7 +63,7 @@ function toLayers(ctx, cols, rows) {
   return layers.map((rowsArr) => rowsArr.join("\n"));
 }
 
-function bakeScene(name, { cols, rows, frames, draw }) {
+function bakeScene(name, { cols, rows, frames, draw, bubble }) {
   const canvas = createCanvas(cols, rows);
   const ctx = canvas.getContext("2d");
   const out = [];
@@ -70,9 +71,9 @@ function bakeScene(name, { cols, rows, frames, draw }) {
     draw(ctx, f / frames, cols, rows);
     out.push(toLayers(ctx, cols, rows));
   }
-  const json = JSON.stringify({ cols, rows, fps: FPS, frames: out });
+  const json = JSON.stringify({ cols, rows, fps: FPS, frames: out, ...(bubble ? { bubble } : {}) });
   writeFileSync(join(outDir, `${name}.json`), json, "utf8");
-  console.log(`bake: ${name}.json — ${cols}×${rows}, ${frames} frames, ${(json.length / 1024).toFixed(0)} KB`);
+  console.log(`bake: ${name}.json — ${cols}×${rows}, ${frames} frames, ${(json.length / 1024).toFixed(0)} KB${bubble ? " +bubble" : ""}`);
 }
 
 // Scarab rows: cols * (VB_H/VB_W) * CELL_ASPECT keeps the nimbus round.
@@ -90,6 +91,32 @@ bakeScene("dungroller-bare", {
   frames: 72,
   draw: (x, u, c, r) => drawBeetle(x, u, c, r, { ground: false }),
 });
+
+// ---- The Ponderer: one bubble-stage baked per pose -------------------------
+// Art (beetle + ball) is baked; the speech-bubble TEXT is not — each JSON only
+// records where/when a bubble shows, and the players draw a box around a `line`
+// prop at those frames. Swap the line, no re-bake.
+{
+  const cols = 96;   // 96 grid: finer, smaller round dots than the old 64
+  const rows = Math.round(cols * (PONDER.VBh / PONDER.W) * CELL_ASPECT);
+  const frames = 72;
+  const s = cols / PONDER.W;
+  // bubble frame window: pops just after the stop, clears before rolling on
+  const from = Math.round(frames * (PONDER.R0 + 0.06));
+  const to = Math.round(frames * (PONDER.R1 - 0.04));
+  for (const pose of PONDER_POSES) {
+    const anc = ponderAnchor(pose);
+    const bubble = {
+      from, to, place: anc.place,
+      col: Math.round(anc.x * s),
+      row: Math.round((anc.y - PONDER.VBy0) * s * CELL_ASPECT),
+    };
+    bakeScene(`ponder-${pose}`, {
+      cols, rows, frames, bubble,
+      draw: (x, u, c, r) => drawPonderer(x, u, c, r, { pose }),
+    });
+  }
+}
 
 // ---- static mark: the traced emblem, verbatim ------------------------------
 // The dark layer is ONE compound path (holes by winding); it renders correctly

@@ -17,9 +17,10 @@
 
 export const VB_W = 2196;
 export const VB_H = 1952;
-// Character cells are 1:0.6 (e.g. 6×10 px), so scene y is squashed to keep
-// circles round: rows = cols * (design height / design width) * 0.6.
-export const CELL_ASPECT = 0.6;
+// Cells render SQUARE — the players set line-height to the 0.6em glyph advance,
+// so scene y is NOT squashed and the dot matrix is evenly spaced on both axes
+// (one language with the dot-matrix doodles). rows = cols * (VBh / VBw).
+export const CELL_ASPECT = 1.0;
 
 const RING = { cx: 1089, cy: 950, r: 894, w: 42 };
 const PIVOT_L = { x: 882, y: 1030 };
@@ -135,7 +136,7 @@ export function drawScarab(x, u, cols, rows) {
   x.restore();
 }
 
-// Dung-roller design space: 96 virtual units wide, squashed by CELL_ASPECT.
+// Dung-roller design space: 96 virtual units wide (CELL_ASPECT is 1.0: square).
 // The viewport starts at VB_Y0 (crops the empty sky above the ball).
 const BEETLE_VB_W = 96;
 const BEETLE_VB_Y0 = 26;
@@ -208,5 +209,146 @@ export function drawBeetle(x, u, cols, rows, opts = {}) {
   x.beginPath(); x.moveTo(32, 68 + bob); x.quadraticCurveTo(32.5, 70.5, 32 + ph1 * 1.8, GY); x.stroke();
   x.beginPath(); x.moveTo(37, 57 + bob); x.quadraticCurveTo(43, 52.5, 46.5, 48 + ph2 * 1.2); x.stroke();
   x.beginPath(); x.moveTo(38.5, 61 + bob); x.quadraticCurveTo(44.5, 58.5, 48.5, 56 + ph1 * 1.2); x.stroke();
+  x.restore();
+}
+
+// ── The Ponderer: a reusable "bubble stage" ─────────────────────────────────
+// A treadmill beetle that rolls in, HOLDS a pose for the middle of the loop,
+// then rolls on. The held pose is swappable (ponder / nap / kingofhill /
+// faceplant); each exposes an anchor where a runtime speech bubble points.
+// The bubble TEXT is never baked — bake.mjs records only {from,to,col,row,place}
+// and the players composite a box around a `line` prop at those frames. Same
+// three role layers as every scene; the bubble is a fourth, runtime-only layer.
+export const PONDER = {
+  W: 74, VBy0: 10, VBh: 33, gy: 40, r: 12, ballX: 48, bx: 28,
+  R0: 0.30, R1: 0.78, // roll-in ends at R0; hold ends (roll-out begins) at R1
+};
+export const PONDER_POSES = ["ponder", "nap", "kingofhill", "faceplant"];
+
+// Trapezoid settle: ease into the pose, hold it, ease back out over the hold.
+function envelope(p) {
+  const up = Math.min(1, p / 0.18);
+  const dn = Math.min(1, (1 - p) / 0.18);
+  const e = Math.min(up, dn);
+  return e < 1 ? easeInOut(e) : 1;
+}
+
+// Pose deltas at hold-amount a ∈ [0,1] (a=0 is the push pose, a=1 fully posed).
+function ponderPose(pose, a) {
+  const bx0 = PONDER.bx, by0 = PONDER.gy - 4; // push pose baseline
+  switch (pose) {
+    case "nap":        // slumps back against the ball, eyes shut
+      return { bx: bx0 + 5 * a, by: by0 + 0.5 * a, tilt: -0.5 + 0.35 * a, grip: 1 - a, ballDX: 0, onBall: false, eyes: "shut" };
+    case "kingofhill": // climbs onto the ball and sits, surveying
+      return { bx: bx0 + 20 * a, by: by0 - 22 * a, tilt: -0.5 + 0.5 * a, grip: 1 - a, ballDX: 0, onBall: a > 0.5, eyes: "open" };
+    case "faceplant":  // over-commits and tips onto its face; ball creeps on
+      return { bx: bx0 + 6 * a, by: by0 + 2.5 * a, tilt: -0.5 - 1.1 * a, grip: 1 - a, ballDX: 3 * a, onBall: false, eyes: "dazed" };
+    case "ponder":
+    default:           // leans back on its haunches, looks up
+      return { bx: bx0, by: by0 - 1.2 * a, tilt: -0.5 + 0.9 * a, grip: 1 - 0.9 * a, ballDX: 0, onBall: false, eyes: "open" };
+  }
+}
+
+/** World-space point the bubble tail points at, + placement side. */
+export function ponderAnchor(pose) {
+  const q = ponderPose(pose, 1);
+  if (pose === "kingofhill") return { x: q.bx + 10, y: q.by + 1, place: "right" };
+  return { x: q.bx - 7, y: q.by - 4, place: "above" };
+}
+
+function ponderBall(x, cx, cy, r, roll) {
+  const rimPeriod = (TAU * r) / 21;
+  x.strokeStyle = "#d9b45e"; x.lineWidth = 1.6;
+  x.setLineDash([rimPeriod * 0.62, rimPeriod * 0.38]);
+  x.lineDashOffset = -roll * r;
+  x.beginPath(); x.arc(cx, cy, r, 0, 7); x.stroke();
+  x.setLineDash([]);
+  x.fillStyle = "#b3924a";
+  for (let i = 0; i < 16; i++) {
+    const a = roll + i * 2.39996;
+    const rr = r * (0.15 + 0.75 * ((i * 0.61) % 1));
+    const fs = r * (0.07 + ((i * 7) % 3) * 0.035);
+    x.beginPath(); x.arc(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr, fs, 0, 7); x.fill();
+  }
+}
+
+function ponderGround(x, gy, travel, r) {
+  const DOTS = 22;
+  const spacing = (TAU * r) / DOTS;
+  x.fillStyle = "#57685e";
+  for (let i = 0; i < DOTS + 8; i++) {
+    const gx = ((i * spacing - travel) % (DOTS * spacing) + DOTS * spacing) % (DOTS * spacing) - spacing * 4;
+    x.fillRect(gx, gy + 1.4, 1.3, 1.3);
+  }
+}
+
+function ponderBeetle(x, bx, by, gy, tilt, grip, legPh, ballCx, ballTop, ballR, s, onBall) {
+  const R = 6.6;
+  // Leg/arm stroke ~1.1 cells at ANY bake grid (s = cells per design unit), so
+  // finer bakes don't render legs as chunky multi-cell dot-clusters on the ball.
+  x.strokeStyle = "#6e7f76"; x.lineWidth = 1.1 / s;
+  const ph1 = Math.sin(legPh), ph2 = Math.sin(legPh + Math.PI);
+  if (onBall) {
+    // legs tucked onto the ball crown instead of the ground
+    for (const dx of [-4, 0, 4]) {
+      x.beginPath(); x.moveTo(bx + dx * 0.6, by + 2); x.quadraticCurveTo(bx + dx, by + 5, bx + dx, ballTop + 2); x.stroke();
+    }
+  } else {
+    x.beginPath(); x.moveTo(bx - 5, by + 2); x.quadraticCurveTo(bx - 7, by + 5, bx - 8 + ph1 * 2.2, gy); x.stroke();
+    x.beginPath(); x.moveTo(bx - 1, by + 3); x.quadraticCurveTo(bx - 1, by + 5.5, bx - 1 + ph2 * 2.2, gy); x.stroke();
+    x.beginPath(); x.moveTo(bx + 3, by + 3); x.quadraticCurveTo(bx + 3.5, by + 5.5, bx + 3 + ph1 * 1.7, gy); x.stroke();
+    // arms — reach to the ball's near SURFACE when gripping (never onto/over the
+    // gold ball), else fold to the chest. Target sits just outside the rim on
+    // the upper-left arc, so the hands touch the ball without overlapping it.
+    const ax = bx + 5.5, ay = by - 1;
+    const ballCy = ballTop + ballR, ca = Math.PI * 1.11; // ~200°, upper-left rim
+    const tx = ballCx + ballR * 1.04 * Math.cos(ca), ty = ballCy + ballR * 1.04 * Math.sin(ca);
+    const gx1 = ax + (tx - ax) * grip - (1 - grip) * 1.5;
+    const gy1 = ay + (ty - ay) * grip + (1 - grip) * 3;
+    x.beginPath(); x.moveTo(ax, ay); x.quadraticCurveTo(ax + 1.5, ay - 2, gx1, gy1); x.stroke();
+    x.beginPath(); x.moveTo(bx + 4, by + 1); x.quadraticCurveTo(ax + 1, ay + 1, gx1 - 0.3, gy1 + 2.2); x.stroke();
+  }
+  // body + head, rotated about (bx,by)
+  x.save(); x.translate(bx, by); x.rotate(tilt);
+  x.fillStyle = "#27b584";
+  x.beginPath(); x.ellipse(0, 0, R, 4.3, 0, 0, 7); x.fill();
+  x.strokeStyle = "#1c8a64"; x.lineWidth = 0.8;
+  x.beginPath(); x.moveTo(-R * 0.4, -2.2); x.lineTo(R * 0.6, 0.4); x.stroke();
+  x.fillStyle = "#1c8a64";
+  x.beginPath(); x.ellipse(-R - 0.6, 1.3, 2.4, 2, 0, 0, 7); x.fill();
+  x.strokeStyle = "#6e7f76"; x.lineWidth = 0.8;
+  x.beginPath(); x.moveTo(-R - 1.4, 0.2); x.quadraticCurveTo(-R - 3.5, -1.6, -R - 4, -3.2); x.stroke();
+  x.restore();
+}
+
+/** Ponderer stage at phase u. opts.pose ∈ PONDER_POSES. */
+export function drawPonderer(x, u, cols, rows, opts = {}) {
+  const pose = opts.pose || "ponder";
+  const P = PONDER;
+  const s = cols / P.W;
+  x.clearRect(0, 0, cols, rows);
+  x.save();
+  x.setTransform(s, 0, 0, s * CELL_ASPECT, 0, -P.VBy0 * s * CELL_ASPECT);
+  x.lineCap = "round"; x.lineJoin = "round";
+
+  const { R0, R1, r, gy, ballX } = P;
+  // ground travel is flat during the hold, so total over the loop = one wrap
+  const rollFrac = R0 + (1 - R1);
+  const spd = (TAU * r) / rollFrac;
+  let travel;
+  if (u < R0) travel = spd * u;
+  else if (u < R1) travel = spd * R0;
+  else travel = spd * (R0 + (u - R1));
+  const roll = travel / r;
+  ponderGround(x, gy, travel, r);
+
+  const a = (u >= R0 && u <= R1) ? envelope((u - R0) / (R1 - R0)) : 0;
+  const q = ponderPose(pose, a);
+  const ballCx = ballX + q.ballDX;
+  const ballCy = gy - r;
+  ponderBall(x, ballCx, ballCy, r, roll);
+
+  const legPh = (u < R0 ? u : u < R1 ? R0 : u) * TAU * 13;
+  ponderBeetle(x, q.bx, q.by, gy, q.tilt, q.grip, legPh, ballCx, ballCy - r, r, s, q.onBall);
   x.restore();
 }
