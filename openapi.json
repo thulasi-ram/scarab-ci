@@ -638,7 +638,7 @@
     "/v1/runs/{id}/artifacts": {
       "get": {
         "tags": [],
-        "summary": "List a run's artifacts of record (ADR-0052). Read at the run's tenant.",
+        "summary": "List a run's artifact versions (ADR-0052/0056). Read at the run's tenant.",
         "operationId": "list_artifacts",
         "parameters": [
           {
@@ -674,7 +674,7 @@
     "/v1/runs/{id}/artifacts/{name}": {
       "get": {
         "tags": [],
-        "summary": "Download one artifact's bytes (ADR-0052). Streams through the server (a\npresigned-URL fast path can replace this when the store backend supports\nsigning). Read at the run's tenant; immutable content.",
+        "summary": "Download one artifact's bytes (ADR-0052). Streams through the server (a\npresigned-URL fast path can replace this when the store backend supports\nsigning). Read at the run's tenant; immutable content. The bare name\nresolves to the latest SUCCESSFUL version (ADR-0056); `?step=&attempt=`\npins an exact version.",
         "operationId": "download_artifact",
         "parameters": [
           {
@@ -693,6 +693,28 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "attempt",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -892,6 +914,59 @@
         }
       }
     },
+    "/v1/runs/{id}/steps/{step}/consumed": {
+      "get": {
+        "tags": [],
+        "summary": "An attempt's consumption map (ADR-0056). Bare = the attempt behind the\nstep's current evidence; `?attempt=` = that attempt. Read at the run's\ntenant. Fetched lazily by the step pane's Outputs tab — deliberately NOT\npart of the polled run-status DTO.",
+        "operationId": "get_attempt_consumed",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attempt",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConsumedDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such run or no attempt"
+          }
+        }
+      }
+    },
     "/v1/runs/{id}/steps/{step}/debug-pod": {
       "get": {
         "tags": [],
@@ -1009,7 +1084,7 @@
     "/v1/runs/{id}/steps/{step}/results": {
       "get": {
         "tags": [],
-        "summary": "A step's named results (ADR-0041), read from `step_runs.results`. The read\nside of the results-ingest write path (`POST …/steps/{step}/results`): the\nInspector's Results tab, and the source the Outputs view derives from. Read\nat the run's tenant.",
+        "summary": "A step's named results (ADR-0041). The read side of the results-ingest\nwrite path (`POST …/steps/{step}/results`): the Inspector's Results tab,\nand the source the Outputs view derives from. Bare = latest evidence;\n`?attempt=` = that attempt's immutable copy (ADR-0056). Read at the run's\ntenant.",
         "operationId": "get_step_results",
         "parameters": [
           {
@@ -1028,6 +1103,17 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "attempt",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -1120,6 +1206,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "attempt",
+            "in": "query",
+            "description": "attempt id — that attempt's immutable snapshot instead of the latest (ADR-0056)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1168,6 +1263,15 @@
             "in": "query",
             "description": "file path within the snapshot",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "attempt",
+            "in": "query",
+            "description": "attempt id — that attempt's immutable snapshot instead of the latest (ADR-0056)",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1343,23 +1447,39 @@
     "schemas": {
       "ArtifactDto": {
         "type": "object",
-        "description": "One artifact in a run's list (ADR-0052).",
+        "description": "One artifact **version** in a run's list (ADR-0052, immutable per attempt\nby ADR-0056). `step`/`attempt` are the publishing provenance (empty\nstrings on pre-ADR-0056 rows); `succeeded` is that attempt's verdict;\n`of_record` marks the version the bare name-addressed download resolves\nto — the latest successful version of that name.",
         "required": [
           "name",
           "size",
-          "content_type"
+          "content_type",
+          "step",
+          "attempt",
+          "succeeded",
+          "of_record"
         ],
         "properties": {
+          "attempt": {
+            "type": "string"
+          },
           "content_type": {
             "type": "string"
           },
           "name": {
             "type": "string"
           },
+          "of_record": {
+            "type": "boolean"
+          },
           "size": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "step": {
+            "type": "string"
+          },
+          "succeeded": {
+            "type": "boolean"
           }
         }
       },
@@ -1440,6 +1560,28 @@
           "name": {
             "type": "string",
             "description": "The bare selection name (e.g. `deploy`) — what a describe/dispatch call\npasses as `pipeline`."
+          }
+        }
+      },
+      "ConsumedDto": {
+        "type": "object",
+        "description": "What an attempt consumed (ADR-0056): the map `upstream step id → attempt\nid` stamped at its launch — the durable answer to \"which generation of\n`build` did `test` actually build on?\" after a mid-run restart leaves the\nrun a patchwork of attempt generations. `attempt` names the attempt the\nmap belongs to; empty map = nothing recorded (no upstream evidence, or a\npre-ADR-0056 attempt).",
+        "required": [
+          "attempt",
+          "consumed"
+        ],
+        "properties": {
+          "attempt": {
+            "type": "string"
+          },
+          "consumed": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           }
         }
       },

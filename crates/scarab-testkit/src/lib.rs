@@ -93,6 +93,19 @@ struct StepRec {
     gate_timer_seconds: Option<i64>,
     /// Explicit input workspaces (subset of `needs`), or `None` = all needs.
     explicit_inputs: Option<Vec<StepId>>,
+    /// Which attempt produced the denormalized `output`/`results` above —
+    /// the consumption-provenance stamp (ADR-0056).
+    evidence_attempt: Option<AttemptId>,
+}
+
+/// One attempt's immutable evidence (ADR-0056): its own output snapshot,
+/// results, and the upstream attempts it consumed — never overwritten by a
+/// later attempt.
+#[derive(Default)]
+struct AttemptEvidenceRec {
+    output: Option<String>,
+    results: std::collections::BTreeMap<String, serde_json::Value>,
+    consumed: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -136,8 +149,11 @@ struct InMemoryState {
     webhook_deliveries: std::collections::HashSet<(String, String)>,
     /// Lease table: resource → (owner, expiry instant).
     leases: HashMap<String, (String, std::time::Instant)>,
-    /// Artifact metadata (ADR-0052), keyed (run, name).
-    artifacts: HashMap<(RunId, String), scarab_engine::ArtifactMeta>,
+    /// Artifact versions (ADR-0052, immutable per attempt by ADR-0056),
+    /// keyed (run, name, step, attempt).
+    artifacts: HashMap<(RunId, String, StepId, AttemptId), scarab_engine::ArtifactRecord>,
+    /// Per-attempt immutable evidence (ADR-0056).
+    attempt_evidence: HashMap<(RunId, StepId, AttemptId), AttemptEvidenceRec>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -182,6 +198,7 @@ impl InMemoryDb {
                 gate_kind: None,
                 gate_timer_seconds: None,
                 explicit_inputs: None,
+                evidence_attempt: None,
             },
         );
     }
@@ -203,6 +220,7 @@ impl InMemoryDb {
                     gate_kind: None,
                     gate_timer_seconds: None,
                     explicit_inputs: None,
+                    evidence_attempt: None,
                 },
             );
         }
@@ -279,6 +297,7 @@ impl Db for InMemoryDb {
                 gate_kind: None,
                 gate_timer_seconds: None,
                 explicit_inputs: None,
+                evidence_attempt: None,
             },
         );
         Ok(())
@@ -288,6 +307,7 @@ impl Db for InMemoryDb {
         &self,
         run: &RunId,
         step: &StepId,
+        attempt: &AttemptId,
         snapshot: &str,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
@@ -296,7 +316,27 @@ impl Db for InMemoryDb {
             .get_mut(&(run.clone(), step.clone()))
             .ok_or(DbError::Conflict)?;
         rec.output = Some(snapshot.to_string());
+        rec.evidence_attempt = Some(attempt.clone());
+        st.attempt_evidence
+            .entry((run.clone(), step.clone(), attempt.clone()))
+            .or_default()
+            .output = Some(snapshot.to_string());
         Ok(())
+    }
+
+    async fn attempt_output(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .attempt_evidence
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .and_then(|e| e.output.clone()))
     }
 
     async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
@@ -313,6 +353,7 @@ impl Db for InMemoryDb {
         &self,
         run: &RunId,
         step: &StepId,
+        attempt: &AttemptId,
         results: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
@@ -321,7 +362,75 @@ impl Db for InMemoryDb {
             .get_mut(&(run.clone(), step.clone()))
             .ok_or(DbError::Conflict)?;
         rec.results = results.clone();
+        rec.evidence_attempt = Some(attempt.clone());
+        st.attempt_evidence
+            .entry((run.clone(), step.clone(), attempt.clone()))
+            .or_default()
+            .results = results.clone();
         Ok(())
+    }
+
+    async fn attempt_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .attempt_evidence
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .map(|e| e.results.clone())
+            .unwrap_or_default())
+    }
+
+    async fn step_evidence_attempt(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<AttemptId>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.evidence_attempt.clone()))
+    }
+
+    async fn set_attempt_consumed(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        consumed: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .attempt_evidence
+            .entry((run.clone(), step.clone(), attempt.clone()))
+            .or_default()
+            .consumed = consumed.clone();
+        Ok(())
+    }
+
+    async fn attempt_consumed(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<std::collections::BTreeMap<String, String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .attempt_evidence
+            .get(&(run.clone(), step.clone(), attempt.clone()))
+            .map(|e| e.consumed.clone())
+            .unwrap_or_default())
     }
 
     async fn step_results(
@@ -968,13 +1077,24 @@ impl Db for InMemoryDb {
     async fn put_artifacts(
         &self,
         run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        succeeded: bool,
         artifacts: &[scarab_engine::ArtifactMeta],
-        _at: Timestamp,
+        at: Timestamp,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
         for a in artifacts {
-            st.artifacts
-                .insert((run.clone(), a.name.clone()), a.clone());
+            st.artifacts.insert(
+                (run.clone(), a.name.clone(), step.clone(), attempt.clone()),
+                scarab_engine::ArtifactRecord {
+                    meta: a.clone(),
+                    step: step.clone(),
+                    attempt: attempt.clone(),
+                    succeeded,
+                    created_at: at,
+                },
+            );
         }
         Ok(())
     }
@@ -982,15 +1102,18 @@ impl Db for InMemoryDb {
     async fn artifacts_of_run(
         &self,
         run: &RunId,
-    ) -> Result<Vec<scarab_engine::ArtifactMeta>, DbError> {
+    ) -> Result<Vec<scarab_engine::ArtifactRecord>, DbError> {
         let st = self.state.lock().unwrap();
         let mut out: Vec<_> = st
             .artifacts
             .iter()
-            .filter(|((r, _), _)| r == run)
+            .filter(|((r, _, _, _), _)| r == run)
             .map(|(_, a)| a.clone())
             .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.sort_by(|a, b| {
+            (&a.meta.name, a.created_at.0, &a.attempt.0)
+                .cmp(&(&b.meta.name, b.created_at.0, &b.attempt.0))
+        });
         Ok(out)
     }
 
@@ -1006,7 +1129,7 @@ impl Db for InMemoryDb {
             .filter(|(run, status)| {
                 status.is_terminal()
                     && st.run_created.get(*run).copied().unwrap_or(Timestamp(0)).0 < cutoff.0
-                    && st.artifacts.keys().any(|(r, _)| r == *run)
+                    && st.artifacts.keys().any(|(r, _, _, _)| r == *run)
             })
             .map(|(run, _)| run.clone())
             .collect();
@@ -1020,7 +1143,7 @@ impl Db for InMemoryDb {
             .lock()
             .unwrap()
             .artifacts
-            .retain(|(r, _), _| r != run);
+            .retain(|(r, _, _, _), _| r != run);
         Ok(())
     }
 
@@ -1066,19 +1189,30 @@ impl Db for InMemoryDb {
 
     async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError> {
         let st = self.state.lock().unwrap();
-        Ok(st
+        let run_live = |run: &RunId| {
+            st.runs.get(run).is_some_and(|status| {
+                !status.is_terminal()
+                    || st.run_created.get(run).copied().unwrap_or(Timestamp(0)).0
+                        >= terminal_cutoff.0
+            })
+        };
+        // Latest denorm roots + EVERY attempt's root (ADR-0056): an old
+        // Take's workspace must never race the sweeper.
+        let mut roots: Vec<String> = st
             .steps
             .iter()
-            .filter(|((run, _), rec)| {
-                rec.output.is_some()
-                    && st.runs.get(run).is_some_and(|status| {
-                        !status.is_terminal()
-                            || st.run_created.get(run).copied().unwrap_or(Timestamp(0)).0
-                                >= terminal_cutoff.0
-                    })
-            })
+            .filter(|((run, _), rec)| rec.output.is_some() && run_live(run))
             .filter_map(|(_, rec)| rec.output.clone())
-            .collect())
+            .chain(
+                st.attempt_evidence
+                    .iter()
+                    .filter(|((run, _, _), e)| e.output.is_some() && run_live(run))
+                    .filter_map(|(_, e)| e.output.clone()),
+            )
+            .collect();
+        roots.sort();
+        roots.dedup();
+        Ok(roots)
     }
 
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
@@ -2009,7 +2143,9 @@ mod tests {
         let mut results = std::collections::BTreeMap::new();
         results.insert("url".to_string(), serde_json::json!("https://svc"));
         results.insert("replicas".to_string(), serde_json::json!(3));
-        db.set_step_results(&run, &step, &results).await.unwrap();
+        db.set_step_results(&run, &step, &AttemptId("a1".into()), &results)
+            .await
+            .unwrap();
 
         let got = db.step_results(&run, &step).await.unwrap();
         assert_eq!(got.get("url").unwrap(), &serde_json::json!("https://svc"));

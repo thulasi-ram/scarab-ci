@@ -377,6 +377,24 @@ pub struct ArtifactMeta {
     pub object_key: String,
 }
 
+/// A persisted artifact version (ADR-0056): [`ArtifactMeta`] plus the
+/// provenance that makes it immutable per attempt. A retry never overwrites a
+/// prior attempt's version; the name-addressed "of record" download resolves
+/// to the latest version whose attempt **succeeded** (a consumer must never
+/// silently receive a failed attempt's partial file), while failed-attempt
+/// versions are retained as evidence and swept with the run's TTL class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactRecord {
+    pub meta: ArtifactMeta,
+    /// The step that published this version.
+    pub step: StepId,
+    /// The attempt that published this version — the evidence key.
+    pub attempt: AttemptId,
+    /// Whether that attempt's verdict was success (of-record candidates only).
+    pub succeeded: bool,
+    pub created_at: Timestamp,
+}
+
 /// A manual/approval gate that suspends a run until released.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gate {
@@ -522,6 +540,25 @@ pub enum EventPayload {
     /// failed the run (ADR-0047).
     GateExpired {
         step: StepId,
+    },
+    /// A human requested a step restart (ADR-0056) — the **Take boundary**.
+    /// Emitted before any re-arming, so a Take view is a pure replay up to
+    /// this event. `invalidated` is the resolved invalidation set (target +
+    /// transitive descendants) recorded at press time — deterministic record,
+    /// not re-derivation; `by` is the acting principal's subject (the
+    /// who-restarted-this audit fact, `None` only when auth is off).
+    RunRestartRequested {
+        target: StepId,
+        invalidated: Vec<StepId>,
+        by: Option<String>,
+    },
+    /// A control plane that did not launch this attempt resumed supervising
+    /// it (ADR-0047 re-adoption, surfaced by ADR-0056). Same attempt, same
+    /// fence, no re-execution, no budget consumed — this is the durability
+    /// wedge made visible, and it must never render as a new execution.
+    AttemptReadopted {
+        step: StepId,
+        attempt: AttemptId,
     },
     /// The run's opt-in active-time `budget:` was exhausted (ADR-0047);
     /// in-flight steps were cancelled and the run fails.

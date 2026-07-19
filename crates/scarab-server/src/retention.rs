@@ -69,8 +69,8 @@ pub async fn sweep_retention(
     for run in runs {
         let artifacts = db.artifacts_of_run(&run).await.map_err(|e| e.to_string())?;
         for a in &artifacts {
-            if let Err(e) = store.delete(&a.object_key).await {
-                return Err(format!("delete {}: {e}", a.object_key));
+            if let Err(e) = store.delete(&a.meta.object_key).await {
+                return Err(format!("delete {}: {e}", a.meta.object_key));
             }
         }
         db.delete_artifacts_of_run(&run)

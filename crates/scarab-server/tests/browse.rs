@@ -110,7 +110,9 @@ async fn step_results_read_back_typed() {
         serde_json::json!("ghcr.io/x@sha256:9f"),
     );
     results.insert("tests_passed".to_string(), serde_json::json!(214));
-    db.set_step_results(&run, &step, &results).await.unwrap();
+    db.set_step_results(&run, &step, &AttemptId("a1".into()), &results)
+        .await
+        .unwrap();
 
     let app = router(state(db, None));
     let resp = app
@@ -170,7 +172,9 @@ async fn seed_workspace(
         ])
         .await
         .unwrap();
-    db.set_step_output(run, step, &root.0).await.unwrap();
+    db.set_step_output(run, step, &AttemptId("a1".into()), &root.0)
+        .await
+        .unwrap();
     root
 }
 
