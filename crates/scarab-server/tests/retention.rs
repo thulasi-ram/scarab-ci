@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
-use scarab_engine::{AttemptId, Clock, Db, LogChunkMeta, RunId, RunStatus, StepId, Timestamp};
+use scarab_engine::{Clock, Db, LogChunkMeta, RunId, RunStatus, StepId, Timestamp};
 use scarab_server::retention::{sweep_retention, RetentionConfig};
 use scarab_storage::ObjectStore;
 use scarab_testkit::{FakeClock, InMemoryObjectStore};
@@ -123,9 +123,6 @@ async fn sweeps_only_terminal_runs_past_ttl_and_keeps_metadata() {
             .unwrap();
         db.put_artifacts(
             &RunId(id.into()),
-            &StepId("s1".into()),
-            &AttemptId("a1".into()),
-            true,
             &[scarab_engine::ArtifactMeta {
                 name: "report.txt".into(),
                 size: 1,
@@ -282,7 +279,7 @@ async fn seed_run_with_workspace(
         .unwrap()
         .root
         .0;
-    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root)
+    db.set_step_output(&run, &StepId("s1".into()), &root)
         .await
         .unwrap();
     root
@@ -456,14 +453,9 @@ async fn cas_gc_skips_a_dangling_root_instead_of_aborting() {
         .unwrap();
     // A well-formed hash the store was never asked to hold → NotFound on walk.
     let missing = "0".repeat(64);
-    pg.set_step_output(
-        &dangling,
-        &StepId("s1".into()),
-        &AttemptId("a1".into()),
-        &missing,
-    )
-    .await
-    .unwrap();
+    pg.set_step_output(&dangling, &StepId("s1".into()), &missing)
+        .await
+        .unwrap();
 
     let db: Arc<dyn Db> = Arc::new(pg);
     let now_ms = std::time::SystemTime::now()

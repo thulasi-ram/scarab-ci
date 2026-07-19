@@ -25,10 +25,6 @@ export function describeEvent(e: RunEvent): string {
       return `${s(v.step)} — gate released`;
     case "StepSkipped":
       return `${s(v.step)} — skipped (${s(v.reason)})`;
-    case "RunRestartRequested":
-      return `${s(v.target)} restarted${v.by ? ` by ${s(v.by)}` : ""} — new take`;
-    case "AttemptReadopted":
-      return `${s(v.step)} — re-adopted after control-plane restart`;
     default:
       return tag;
   }
@@ -55,18 +51,14 @@ export function eventParts(e: RunEvent): { step: string | null; text: string } {
       return { step, text: "gate released" };
     case "StepSkipped":
       return { step, text: `skipped (${s(v.reason)})` };
-    case "AttemptReadopted":
-      return { step, text: "re-adopted after control-plane restart" };
     default:
       return { step, text: describeEvent(e) };
   }
 }
 
 /** The activity-rail category for an event — drives its glyph and colour. `err`
- * covers a failed attempt (the retry story) and a run/step that ended failed.
- * `take` is a human restart — the Take boundary (ADR-0056); `recover` is a
- * control-plane crash re-adoption — durability made visible. */
-export type EventCat = "info" | "ok" | "run" | "err" | "gate" | "take" | "recover";
+ * covers a failed attempt (the retry story) and a run/step that ended failed. */
+export type EventCat = "info" | "ok" | "run" | "err" | "gate";
 
 export function eventCategory(e: RunEvent): EventCat {
   const k = e.kind;
@@ -90,10 +82,6 @@ export function eventCategory(e: RunEvent): EventCat {
       return v.failure ? "err" : "ok";
     case "GateReleased":
       return "gate";
-    case "RunRestartRequested":
-      return "take";
-    case "AttemptReadopted":
-      return "recover";
     default:
       return "info";
   }
@@ -106,6 +94,4 @@ export const EVENT_GLYPH: Record<EventCat, string> = {
   run: "●",
   err: "↻",
   gate: "◷",
-  take: "◈",
-  recover: "⟲",
 };

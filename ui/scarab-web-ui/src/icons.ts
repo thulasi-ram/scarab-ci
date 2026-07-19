@@ -29,13 +29,12 @@ import {
   ArrowUp,
   ArrowLeft,
   RotateCw,
-  RotateCcw,
-  History,
   AlertTriangle,
   File,
   Folder,
   Sun,
   Moon,
+  User,
 } from "lucide";
 
 // IconNode = Array<[tagName, attributes]>.
@@ -67,13 +66,12 @@ const ICONS: Record<string, IconNode> = {
   "arrow-up": ArrowUp as IconNode,
   "arrow-left": ArrowLeft as IconNode,
   "rotate-cw": RotateCw as IconNode,
-  "rotate-ccw": RotateCcw as IconNode,
-  history: History as IconNode,
   "alert-triangle": AlertTriangle as IconNode,
   file: File as IconNode,
   folder: Folder as IconNode,
   sun: Sun as IconNode,
   moon: Moon as IconNode,
+  user: User as IconNode,
 };
 
 export function iconNode(name: string): IconNode | undefined {

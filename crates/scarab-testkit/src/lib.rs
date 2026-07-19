@@ -93,19 +93,27 @@ struct StepRec {
     gate_timer_seconds: Option<i64>,
     /// Explicit input workspaces (subset of `needs`), or `None` = all needs.
     explicit_inputs: Option<Vec<StepId>>,
-    /// Which attempt produced the denormalized `output`/`results` above —
-    /// the consumption-provenance stamp (ADR-0056).
-    evidence_attempt: Option<AttemptId>,
 }
 
-/// One attempt's immutable evidence (ADR-0056): its own output snapshot,
-/// results, and the upstream attempts it consumed — never overwritten by a
-/// later attempt.
-#[derive(Default)]
-struct AttemptEvidenceRec {
-    output: Option<String>,
-    results: std::collections::BTreeMap<String, serde_json::Value>,
-    consumed: std::collections::BTreeMap<String, String>,
+/// Build a [`RunSummary`] from the in-memory state, projecting the stored
+/// origin facts — the fake's counterpart to the postgres `run_summary_from_row`.
+/// The fake has no clock at transition time, so duration is reported as zero
+/// (`updated_at == created_at`).
+fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSummary {
+    let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
+    let origin = st.run_origin.get(run);
+    RunSummary {
+        run: run.clone(),
+        status,
+        created_at: created,
+        updated_at: created,
+        tenant: st.run_tenant.get(run).cloned(),
+        trigger_kind: origin.map(|o| o.0.clone()),
+        actor: origin.and_then(|o| o.1.clone()),
+        git_ref: origin.and_then(|o| o.2.clone()),
+        sha: origin.and_then(|o| o.3.clone()),
+        pr_number: origin.and_then(|o| o.4),
+    }
 }
 
 #[derive(Default)]
@@ -141,6 +149,9 @@ struct InMemoryState {
     run_project: HashMap<RunId, String>,
     run_priority: HashMap<RunId, i32>,
     run_tenant: HashMap<RunId, (String, String)>,
+    /// Per-run origin `(trigger_kind, actor, git_ref, sha, pr_number)` — the
+    /// trigger facts stamped at creation (mirrors the `origin_*` run columns).
+    run_origin: HashMap<RunId, (String, Option<String>, Option<String>, Option<String>, Option<i64>)>,
     /// ForgeConnection registry rows (ADR-0046).
     forge_connections: HashMap<String, scarab_forge::ForgeConnection>,
     /// Repo bindings: (owner, name) → (connection id, org, project).
@@ -149,11 +160,8 @@ struct InMemoryState {
     webhook_deliveries: std::collections::HashSet<(String, String)>,
     /// Lease table: resource → (owner, expiry instant).
     leases: HashMap<String, (String, std::time::Instant)>,
-    /// Artifact versions (ADR-0052, immutable per attempt by ADR-0056),
-    /// keyed (run, name, step, attempt).
-    artifacts: HashMap<(RunId, String, StepId, AttemptId), scarab_engine::ArtifactRecord>,
-    /// Per-attempt immutable evidence (ADR-0056).
-    attempt_evidence: HashMap<(RunId, StepId, AttemptId), AttemptEvidenceRec>,
+    /// Artifact metadata (ADR-0052), keyed (run, name).
+    artifacts: HashMap<(RunId, String), scarab_engine::ArtifactMeta>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -198,7 +206,6 @@ impl InMemoryDb {
                 gate_kind: None,
                 gate_timer_seconds: None,
                 explicit_inputs: None,
-                evidence_attempt: None,
             },
         );
     }
@@ -220,7 +227,6 @@ impl InMemoryDb {
                     gate_kind: None,
                     gate_timer_seconds: None,
                     explicit_inputs: None,
-                    evidence_attempt: None,
                 },
             );
         }
@@ -297,7 +303,6 @@ impl Db for InMemoryDb {
                 gate_kind: None,
                 gate_timer_seconds: None,
                 explicit_inputs: None,
-                evidence_attempt: None,
             },
         );
         Ok(())
@@ -307,7 +312,6 @@ impl Db for InMemoryDb {
         &self,
         run: &RunId,
         step: &StepId,
-        attempt: &AttemptId,
         snapshot: &str,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
@@ -316,27 +320,7 @@ impl Db for InMemoryDb {
             .get_mut(&(run.clone(), step.clone()))
             .ok_or(DbError::Conflict)?;
         rec.output = Some(snapshot.to_string());
-        rec.evidence_attempt = Some(attempt.clone());
-        st.attempt_evidence
-            .entry((run.clone(), step.clone(), attempt.clone()))
-            .or_default()
-            .output = Some(snapshot.to_string());
         Ok(())
-    }
-
-    async fn attempt_output(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<Option<String>, DbError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .attempt_evidence
-            .get(&(run.clone(), step.clone(), attempt.clone()))
-            .and_then(|e| e.output.clone()))
     }
 
     async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
@@ -353,7 +337,6 @@ impl Db for InMemoryDb {
         &self,
         run: &RunId,
         step: &StepId,
-        attempt: &AttemptId,
         results: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
@@ -362,75 +345,7 @@ impl Db for InMemoryDb {
             .get_mut(&(run.clone(), step.clone()))
             .ok_or(DbError::Conflict)?;
         rec.results = results.clone();
-        rec.evidence_attempt = Some(attempt.clone());
-        st.attempt_evidence
-            .entry((run.clone(), step.clone(), attempt.clone()))
-            .or_default()
-            .results = results.clone();
         Ok(())
-    }
-
-    async fn attempt_results(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .attempt_evidence
-            .get(&(run.clone(), step.clone(), attempt.clone()))
-            .map(|e| e.results.clone())
-            .unwrap_or_default())
-    }
-
-    async fn step_evidence_attempt(
-        &self,
-        run: &RunId,
-        step: &StepId,
-    ) -> Result<Option<AttemptId>, DbError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .steps
-            .get(&(run.clone(), step.clone()))
-            .and_then(|r| r.evidence_attempt.clone()))
-    }
-
-    async fn set_attempt_consumed(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        consumed: &std::collections::BTreeMap<String, String>,
-    ) -> Result<(), DbError> {
-        self.state
-            .lock()
-            .unwrap()
-            .attempt_evidence
-            .entry((run.clone(), step.clone(), attempt.clone()))
-            .or_default()
-            .consumed = consumed.clone();
-        Ok(())
-    }
-
-    async fn attempt_consumed(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<std::collections::BTreeMap<String, String>, DbError> {
-        Ok(self
-            .state
-            .lock()
-            .unwrap()
-            .attempt_evidence
-            .get(&(run.clone(), step.clone(), attempt.clone()))
-            .map(|e| e.consumed.clone())
-            .unwrap_or_default())
     }
 
     async fn step_results(
@@ -604,6 +519,28 @@ impl Db for InMemoryDb {
         Ok(self.state.lock().unwrap().run_tenant.get(run).cloned())
     }
 
+    async fn set_run_origin(
+        &self,
+        run: &RunId,
+        trigger_kind: &str,
+        actor: Option<&str>,
+        git_ref: Option<&str>,
+        sha: Option<&str>,
+        pr_number: Option<i64>,
+    ) -> Result<(), DbError> {
+        self.state.lock().unwrap().run_origin.insert(
+            run.clone(),
+            (
+                trigger_kind.to_string(),
+                actor.map(str::to_string),
+                git_ref.map(str::to_string),
+                sha.map(str::to_string),
+                pr_number,
+            ),
+        );
+        Ok(())
+    }
+
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
         let st = self.state.lock().unwrap();
         let n = st
@@ -731,17 +668,7 @@ impl Db for InMemoryDb {
         let mut out: Vec<RunSummary> = st
             .runs
             .iter()
-            .map(|(run, status)| {
-                let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
-                RunSummary {
-                    run: run.clone(),
-                    status: *status,
-                    created_at: created,
-                    // The fake has no clock at transition time; report zero duration.
-                    updated_at: created,
-                    tenant: st.run_tenant.get(run).cloned(),
-                }
-            })
+            .map(|(run, status)| fake_run_summary(&st, run, *status))
             .collect();
         // Newest first, then id — matches the adapter's ORDER BY.
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.run.0.cmp(&a.run.0)));
@@ -761,17 +688,7 @@ impl Db for InMemoryDb {
             .runs
             .iter()
             .filter(|(run, _)| st.run_tenant.get(*run) == Some(&want))
-            .map(|(run, status)| {
-                let created = st.run_created.get(run).copied().unwrap_or(Timestamp(0));
-                RunSummary {
-                    run: run.clone(),
-                    status: *status,
-                    created_at: created,
-                    // The fake has no clock at transition time; report zero duration.
-                    updated_at: created,
-                    tenant: st.run_tenant.get(run).cloned(),
-                }
-            })
+            .map(|(run, status)| fake_run_summary(&st, run, *status))
             .collect();
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.run.0.cmp(&a.run.0)));
         out.truncate(limit as usize);
@@ -1077,24 +994,13 @@ impl Db for InMemoryDb {
     async fn put_artifacts(
         &self,
         run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        succeeded: bool,
         artifacts: &[scarab_engine::ArtifactMeta],
-        at: Timestamp,
+        _at: Timestamp,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
         for a in artifacts {
-            st.artifacts.insert(
-                (run.clone(), a.name.clone(), step.clone(), attempt.clone()),
-                scarab_engine::ArtifactRecord {
-                    meta: a.clone(),
-                    step: step.clone(),
-                    attempt: attempt.clone(),
-                    succeeded,
-                    created_at: at,
-                },
-            );
+            st.artifacts
+                .insert((run.clone(), a.name.clone()), a.clone());
         }
         Ok(())
     }
@@ -1102,18 +1008,15 @@ impl Db for InMemoryDb {
     async fn artifacts_of_run(
         &self,
         run: &RunId,
-    ) -> Result<Vec<scarab_engine::ArtifactRecord>, DbError> {
+    ) -> Result<Vec<scarab_engine::ArtifactMeta>, DbError> {
         let st = self.state.lock().unwrap();
         let mut out: Vec<_> = st
             .artifacts
             .iter()
-            .filter(|((r, _, _, _), _)| r == run)
+            .filter(|((r, _), _)| r == run)
             .map(|(_, a)| a.clone())
             .collect();
-        out.sort_by(|a, b| {
-            (&a.meta.name, a.created_at.0, &a.attempt.0)
-                .cmp(&(&b.meta.name, b.created_at.0, &b.attempt.0))
-        });
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
 
@@ -1129,7 +1032,7 @@ impl Db for InMemoryDb {
             .filter(|(run, status)| {
                 status.is_terminal()
                     && st.run_created.get(*run).copied().unwrap_or(Timestamp(0)).0 < cutoff.0
-                    && st.artifacts.keys().any(|(r, _, _, _)| r == *run)
+                    && st.artifacts.keys().any(|(r, _)| r == *run)
             })
             .map(|(run, _)| run.clone())
             .collect();
@@ -1143,7 +1046,7 @@ impl Db for InMemoryDb {
             .lock()
             .unwrap()
             .artifacts
-            .retain(|(r, _, _, _), _| r != run);
+            .retain(|(r, _), _| r != run);
         Ok(())
     }
 
@@ -1189,30 +1092,19 @@ impl Db for InMemoryDb {
 
     async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError> {
         let st = self.state.lock().unwrap();
-        let run_live = |run: &RunId| {
-            st.runs.get(run).is_some_and(|status| {
-                !status.is_terminal()
-                    || st.run_created.get(run).copied().unwrap_or(Timestamp(0)).0
-                        >= terminal_cutoff.0
-            })
-        };
-        // Latest denorm roots + EVERY attempt's root (ADR-0056): an old
-        // Take's workspace must never race the sweeper.
-        let mut roots: Vec<String> = st
+        Ok(st
             .steps
             .iter()
-            .filter(|((run, _), rec)| rec.output.is_some() && run_live(run))
+            .filter(|((run, _), rec)| {
+                rec.output.is_some()
+                    && st.runs.get(run).is_some_and(|status| {
+                        !status.is_terminal()
+                            || st.run_created.get(run).copied().unwrap_or(Timestamp(0)).0
+                                >= terminal_cutoff.0
+                    })
+            })
             .filter_map(|(_, rec)| rec.output.clone())
-            .chain(
-                st.attempt_evidence
-                    .iter()
-                    .filter(|((run, _, _), e)| e.output.is_some() && run_live(run))
-                    .filter_map(|(_, e)| e.output.clone()),
-            )
-            .collect();
-        roots.sort();
-        roots.dedup();
-        Ok(roots)
+            .collect())
     }
 
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
@@ -2143,9 +2035,7 @@ mod tests {
         let mut results = std::collections::BTreeMap::new();
         results.insert("url".to_string(), serde_json::json!("https://svc"));
         results.insert("replicas".to_string(), serde_json::json!(3));
-        db.set_step_results(&run, &step, &AttemptId("a1".into()), &results)
-            .await
-            .unwrap();
+        db.set_step_results(&run, &step, &results).await.unwrap();
 
         let got = db.step_results(&run, &step).await.unwrap();
         assert_eq!(got.get("url").unwrap(), &serde_json::json!("https://svc"));

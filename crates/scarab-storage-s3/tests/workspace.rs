@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use scarab_engine::{workspace_inputs, AttemptId, Db, RunId, StepId, Timestamp};
+use scarab_engine::{workspace_inputs, Db, RunId, StepId, Timestamp};
 use scarab_storage::{Cas, TreeHash};
 use scarab_storage_s3::S3Storage;
 use scarab_testkit::InMemoryDb;
@@ -51,7 +51,7 @@ async fn output_workspace_flows_to_dependent_input() {
         .ingest(a_work.to_str().unwrap())
         .await
         .expect("ingest A");
-    db.set_step_output(&run, &a, &AttemptId("a1".into()), &snapshot.root.0)
+    db.set_step_output(&run, &a, &snapshot.root.0)
         .await
         .unwrap();
 

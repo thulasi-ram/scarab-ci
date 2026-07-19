@@ -425,7 +425,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** List a run's artifact versions (ADR-0052/0056). Read at the run's tenant. */
+        /** List a run's artifacts of record (ADR-0052). Read at the run's tenant. */
         get: operations["list_artifacts"];
         put?: never;
         post?: never;
@@ -445,9 +445,7 @@ export interface paths {
         /**
          * Download one artifact's bytes (ADR-0052). Streams through the server (a
          *     presigned-URL fast path can replace this when the store backend supports
-         *     signing). Read at the run's tenant; immutable content. The bare name
-         *     resolves to the latest SUCCESSFUL version (ADR-0056); `?step=&attempt=`
-         *     pins an exact version.
+         *     signing). Read at the run's tenant; immutable content.
          */
         get: operations["download_artifact"];
         put?: never;
@@ -594,28 +592,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/runs/{id}/steps/{step}/consumed": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * An attempt's consumption map (ADR-0056). Bare = the attempt behind the
-         *     step's current evidence; `?attempt=` = that attempt. Read at the run's
-         *     tenant. Fetched lazily by the step pane's Outputs tab — deliberately NOT
-         *     part of the polled run-status DTO.
-         */
-        get: operations["get_attempt_consumed"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/runs/{id}/steps/{step}/debug-pod": {
         parameters: {
             query?: never;
@@ -693,11 +669,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * A step's named results (ADR-0041). The read side of the results-ingest
-         *     write path (`POST …/steps/{step}/results`): the Inspector's Results tab,
-         *     and the source the Outputs view derives from. Bare = latest evidence;
-         *     `?attempt=` = that attempt's immutable copy (ADR-0056). Read at the run's
-         *     tenant.
+         * A step's named results (ADR-0041), read from `step_runs.results`. The read
+         *     side of the results-ingest write path (`POST …/steps/{step}/results`): the
+         *     Inspector's Results tab, and the source the Outputs view derives from. Read
+         *     at the run's tenant.
          */
         get: operations["get_step_results"];
         put?: never;
@@ -820,22 +795,12 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /**
-         * @description One artifact **version** in a run's list (ADR-0052, immutable per attempt
-         *     by ADR-0056). `step`/`attempt` are the publishing provenance (empty
-         *     strings on pre-ADR-0056 rows); `succeeded` is that attempt's verdict;
-         *     `of_record` marks the version the bare name-addressed download resolves
-         *     to — the latest successful version of that name.
-         */
+        /** @description One artifact in a run's list (ADR-0052). */
         ArtifactDto: {
-            attempt: string;
             content_type: string;
             name: string;
-            of_record: boolean;
             /** Format: int64 */
             size: number;
-            step: string;
-            succeeded: boolean;
         };
         /**
          * @description One attempt at executing a step (ADR-0047) — the rerun unit. A step with more
@@ -882,20 +847,6 @@ export interface components {
              *     passes as `pipeline`.
              */
             name: string;
-        };
-        /**
-         * @description What an attempt consumed (ADR-0056): the map `upstream step id → attempt
-         *     id` stamped at its launch — the durable answer to "which generation of
-         *     `build` did `test` actually build on?" after a mid-run restart leaves the
-         *     run a patchwork of attempt generations. `attempt` names the attempt the
-         *     map belongs to; empty map = nothing recorded (no upstream evidence, or a
-         *     pre-ADR-0056 attempt).
-         */
-        ConsumedDto: {
-            attempt: string;
-            consumed: {
-                [key: string]: string;
-            };
         };
         /**
          * @description `POST /v1/runs` body: an inline pipeline to run immediately, plus any launch
@@ -1082,6 +1033,8 @@ export interface components {
          *     and — when the run was stamped at creation (ADR-0049) — its owning tenant.
          */
         RunSummaryDto: {
+            /** @description The **Actor** login — who caused the trigger (UI labels it "author"). */
+            actor?: string | null;
             /** Format: int64 */
             created_at: number;
             /**
@@ -1091,12 +1044,28 @@ export interface components {
              *     Drives the dashboard's per-run bar heights (ADR-0046).
              */
             duration_ms: number;
+            /** @description The symbolic branch/tag ref the run ran on. */
+            git_ref?: string | null;
             id: string;
             /** @description The owning org, if the run is tenanted (trigger-created). */
             org?: string | null;
+            /**
+             * Format: int64
+             * @description The pull-request number, for `pull_request` runs.
+             */
+            pr_number?: number | null;
             /** @description The owning project (repo name), if tenanted. */
             project?: string | null;
+            /** @description The resolved commit the run pinned to. */
+            sha?: string | null;
             status: string;
+            /**
+             * @description The run's **origin** — the trigger facts it was born from, each stamped at
+             *     creation and independently nullable (sparse across trigger kinds; all
+             *     absent on runs created before origin-stamping). The trigger kind
+             *     (`push`/`pull_request`/`tag`/…).
+             */
+            trigger_kind?: string | null;
         };
         /**
          * @description `GET /v1/secrets` body: the secret **names** at a scope. Values are never
@@ -1916,10 +1885,7 @@ export interface operations {
     };
     download_artifact: {
         parameters: {
-            query?: {
-                step?: string;
-                attempt?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 /** @description run id */
@@ -2128,39 +2094,6 @@ export interface operations {
             };
         };
     };
-    get_attempt_consumed: {
-        parameters: {
-            query?: {
-                attempt?: string;
-            };
-            header?: never;
-            path: {
-                /** @description run id */
-                id: string;
-                /** @description step id */
-                step: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ConsumedDto"];
-                };
-            };
-            /** @description no such run or no attempt */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
     debug_pod_step: {
         parameters: {
             query?: never;
@@ -2256,9 +2189,7 @@ export interface operations {
     };
     get_step_results: {
         parameters: {
-            query?: {
-                attempt?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 /** @description run id */
@@ -2329,8 +2260,6 @@ export interface operations {
             query?: {
                 /** @description sub-path within the snapshot (default = root) */
                 path?: string;
-                /** @description attempt id — that attempt's immutable snapshot instead of the latest (ADR-0056) */
-                attempt?: string;
             };
             header?: never;
             path: {
@@ -2365,8 +2294,6 @@ export interface operations {
             query: {
                 /** @description file path within the snapshot */
                 path: string;
-                /** @description attempt id — that attempt's immutable snapshot instead of the latest (ADR-0056) */
-                attempt?: string;
             };
             header?: never;
             path: {

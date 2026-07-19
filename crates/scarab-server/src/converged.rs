@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use scarab_engine::{Clock, Db, Executor, Scheduler, SchedulerError, StepStatus, Supervision};
+use scarab_engine::{Clock, Db, Executor, Scheduler, SchedulerError, StepStatus};
 use scarab_forge::ForgePort;
 
 use crate::LogTailer;
@@ -31,15 +31,10 @@ pub async fn tick_once(
     visibility_ms: i64,
     step_timeout_ms: i64,
     public_url: &str,
-    supervision: &Supervision,
 ) -> Result<(), SchedulerError> {
-    // The Scheduler is per-cycle; the Supervision memory is per-PROCESS
-    // (ADR-0056) — that is what lets a resumed control plane recognise the
-    // attempts it did NOT launch and emit `AttemptReadopted` exactly once.
     Scheduler::new(&**db, &**clock, &**executor, owner)
         .with_outbox_visibility_ms(visibility_ms)
         .with_default_step_timeout_ms(step_timeout_ms)
-        .with_supervision(supervision.clone())
         .tick_all()
         .await?;
     // Log tail (ADR-0013): pull each running step's stdout/stderr into the log
@@ -102,8 +97,6 @@ pub fn spawn_driver(
     // lease holder tails a step — deduping ingestion and spreading log I/O.
     let tailer = logs
         .map(|logs| LogTailer::new(executor.clone(), logs).with_lease(db.clone(), owner.clone()));
-    // One Supervision per driver process (ADR-0056) — see `tick_once`.
-    let supervision = Supervision::new();
     tokio::spawn(async move {
         loop {
             if let Err(e) = tick_once(
@@ -116,7 +109,6 @@ pub fn spawn_driver(
                 visibility_ms,
                 step_timeout_ms,
                 &public_url,
-                &supervision,
             )
             .await
             {

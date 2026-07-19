@@ -132,95 +132,37 @@ pub trait Db: Send + Sync {
 
     /// Record the output workspace snapshot (CAS merkle-root hash) a step
     /// produced, so a dependent can materialize it as input (workspace flows
-    /// along `needs` edges — ADR-0029). Attempt-grain evidence (ADR-0056):
-    /// writes the attempt's own immutable copy AND the step's latest-evidence
-    /// denormalization (what dependents consume) atomically, stamping which
-    /// attempt the denormalized row came from.
+    /// along `needs` edges — ADR-0029).
     async fn set_step_output(
         &self,
         run: &RunId,
         step: &StepId,
-        attempt: &AttemptId,
         snapshot: &str,
     ) -> Result<(), DbError>;
 
     /// The output workspace snapshot a step produced, or `None` if it has not
-    /// produced one (or the step is unknown). This is the hot-path
-    /// latest-evidence read (workspace inheritance); per-attempt history is
-    /// [`attempt_output`](Db::attempt_output).
+    /// produced one (or the step is unknown).
     async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
 
-    /// A single attempt's output workspace snapshot (ADR-0056) — the evidence
-    /// a Take view reads; never overwritten by a later attempt.
-    async fn attempt_output(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<Option<String>, DbError>;
-
     /// Record a step's **named results** (ADR-0041) — the typed `name → value`
-    /// map it emitted via the results channel (ADR-0008), captured under the
-    /// fence. Attempt-grain evidence (ADR-0056): writes the attempt's own
-    /// immutable copy AND the step's latest-evidence denormalization (what
-    /// `${{ outputs.<step>.<name> }}` reads) atomically, stamping which
-    /// attempt the denormalized row came from.
+    /// map it emitted via the results channel (ADR-0008), captured on successful
+    /// completion under the fence. Distinct from the workspace snapshot: these
+    /// are small consumable values a dependent reads through
+    /// `${{ outputs.<step>.<name> }}`. Overwrites any prior value (a re-run of the
+    /// same fenced step re-emits deterministically).
     async fn set_step_results(
         &self,
         run: &RunId,
         step: &StepId,
-        attempt: &AttemptId,
         results: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<(), DbError>;
 
     /// A step's named results, or an empty map if it emitted none (or is unknown).
-    /// Latest-evidence read; per-attempt history is [`attempt_results`](Db::attempt_results).
     async fn step_results(
         &self,
         run: &RunId,
         step: &StepId,
     ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError>;
-
-    /// A single attempt's named results (ADR-0056) — empty if that attempt
-    /// emitted none. Never overwritten by a later attempt.
-    async fn attempt_results(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError>;
-
-    /// Which attempt produced the step's current latest-evidence row (the
-    /// stamp written by `set_step_output`/`set_step_results`), or `None` if
-    /// the step has produced no evidence yet. The consumption-provenance
-    /// source (ADR-0056): read at a dependent's launch instant.
-    async fn step_evidence_attempt(
-        &self,
-        run: &RunId,
-        step: &StepId,
-    ) -> Result<Option<AttemptId>, DbError>;
-
-    /// Record which upstream attempts this attempt consumed at launch
-    /// (ADR-0056): a map `upstream step id → attempt id`, stamped once when
-    /// the launch spec is resolved. Recorded, not inferred — after a mid-run
-    /// restart the run is a patchwork of attempt generations, and this is the
-    /// durable fact of which generation each step actually built on.
-    async fn set_attempt_consumed(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        consumed: &std::collections::BTreeMap<String, String>,
-    ) -> Result<(), DbError>;
-
-    /// The consumption map recorded at an attempt's launch, or empty if none
-    /// was recorded (no upstream evidence existed, or a pre-ADR-0056 row).
-    async fn attempt_consumed(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-    ) -> Result<std::collections::BTreeMap<String, String>, DbError>;
 
     /// Record (or clear, with `None`) the **input signature** a step consumed on
     /// the attempt that is about to run — a deterministic digest of its `needs`'
@@ -307,6 +249,22 @@ pub trait Db: Send + Sync {
 
     /// The run's owning tenant, if stamped.
     async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError>;
+
+    /// Stamp the run's **origin** — the trigger facts it was born from, resolved
+    /// from the normalized `Event` at creation (beside the tenant stamp). Passed
+    /// as discrete, independently-nullable values (never a bundle): `trigger_kind`
+    /// is always known; `actor`/`git_ref`/`sha`/`pr_number` are `None` for the
+    /// trigger kinds that lack them (a cron run has no actor/ref/sha; only a PR
+    /// has a number). Surfaced by the runs list; carries no scheduling authority.
+    async fn set_run_origin(
+        &self,
+        run: &RunId,
+        trigger_kind: &str,
+        actor: Option<&str>,
+        git_ref: Option<&str>,
+        sha: Option<&str>,
+        pr_number: Option<i64>,
+    ) -> Result<(), DbError>;
 
     /// How many runs are in-flight (started, not terminal). With `project`,
     /// scoped to that project (fairness cap); without, the global count
@@ -499,26 +457,17 @@ pub trait Db: Send + Sync {
     /// backlog a stalled driver shows up as).
     async fn outbox_depth(&self) -> Result<u64, DbError>;
 
-    /// Persist a step's published artifacts (ADR-0052, keyed per attempt by
-    /// ADR-0056): immutable per `(name, step, attempt)` — a re-drive of the
-    /// SAME attempt overwrites deterministically (same fence, same bytes),
-    /// but a new attempt writes a NEW version and never destroys a prior
-    /// attempt's evidence. `succeeded` records the attempt's verdict so the
-    /// of-record resolution can prefer successful versions.
+    /// Persist a step's published artifacts (ADR-0052): name-addressed per
+    /// run — a re-drive overwrites deterministically (same fence, same bytes).
     async fn put_artifacts(
         &self,
         run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        succeeded: bool,
         artifacts: &[crate::ArtifactMeta],
         at: Timestamp,
     ) -> Result<(), DbError>;
 
-    /// Every persisted artifact version of a run with its provenance,
-    /// name-then-attempt ordered. The name-addressed of-record resolution
-    /// (latest successful version per name) is the caller's projection.
-    async fn artifacts_of_run(&self, run: &RunId) -> Result<Vec<crate::ArtifactRecord>, DbError>;
+    /// A run's artifacts, name-ordered.
+    async fn artifacts_of_run(&self, run: &RunId) -> Result<Vec<crate::ArtifactMeta>, DbError>;
 
     /// Runs that still hold artifacts, are TERMINAL, and settled before
     /// `cutoff` — the artifact class's sweep list (ADR-0050/0052).
@@ -535,8 +484,6 @@ pub trait Db: Send + Sync {
     /// of every step of every non-terminal run, plus terminal runs that
     /// settled at/after `terminal_cutoff`. A gate-suspended run is
     /// non-terminal, so its roots are ALWAYS marked, regardless of age.
-    /// Covers EVERY attempt's snapshot, not just each step's latest
-    /// (ADR-0056): an old Take's workspace view must never race the GC.
     async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError>;
 
     /// Acquire (or renew) a time-bounded lease over a named `resource` (a step

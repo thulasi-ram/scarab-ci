@@ -23,8 +23,7 @@ pub mod scheduler;
 pub use ports::{Clock, Db, Executor, LogChunks};
 pub use scheduler::{
     cancel_run_request, record_gate_approval, release_gate, restart_step, RestartError, Scheduler,
-    SchedulerError, Supervision, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
-    RUN_STATUS_CHANGED,
+    SchedulerError, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
 };
 
 use serde::{Deserialize, Serialize};
@@ -89,6 +88,27 @@ pub struct RunSummary {
     /// at creation — the tenancy filter for the list view.
     #[serde(default)]
     pub tenant: Option<(String, String)>,
+    /// The run's **origin** — the trigger facts it was born from, stamped at
+    /// creation from the normalized `Event`. Discrete and independently
+    /// nullable (never a bundle): the facts are naturally sparse across trigger
+    /// kinds, and runs created before origin-stamping carry all `None`.
+    /// The trigger kind (`push`/`pull_request`/`tag`/…), always set for a
+    /// trigger-created run.
+    #[serde(default)]
+    pub trigger_kind: Option<String>,
+    /// The **Actor** login — who caused the trigger (`None` for cron/upstream
+    /// or a pre-origin run).
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// The symbolic branch/tag ref the run ran on (`refs/heads/main`, a tag).
+    #[serde(default)]
+    pub git_ref: Option<String>,
+    /// The resolved commit the run pinned to.
+    #[serde(default)]
+    pub sha: Option<String>,
+    /// The pull-request number, for `pull_request` runs.
+    #[serde(default)]
+    pub pr_number: Option<i64>,
 }
 
 /// Lifecycle status of a single step.
@@ -378,24 +398,6 @@ pub struct ArtifactMeta {
     pub object_key: String,
 }
 
-/// A persisted artifact version (ADR-0056): [`ArtifactMeta`] plus the
-/// provenance that makes it immutable per attempt. A retry never overwrites a
-/// prior attempt's version; the name-addressed "of record" download resolves
-/// to the latest version whose attempt **succeeded** (a consumer must never
-/// silently receive a failed attempt's partial file), while failed-attempt
-/// versions are retained as evidence and swept with the run's TTL class.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ArtifactRecord {
-    pub meta: ArtifactMeta,
-    /// The step that published this version.
-    pub step: StepId,
-    /// The attempt that published this version — the evidence key.
-    pub attempt: AttemptId,
-    /// Whether that attempt's verdict was success (of-record candidates only).
-    pub succeeded: bool,
-    pub created_at: Timestamp,
-}
-
 /// A manual/approval gate that suspends a run until released.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gate {
@@ -541,25 +543,6 @@ pub enum EventPayload {
     /// failed the run (ADR-0047).
     GateExpired {
         step: StepId,
-    },
-    /// A human requested a step restart (ADR-0056) — the **Take boundary**.
-    /// Emitted before any re-arming, so a Take view is a pure replay up to
-    /// this event. `invalidated` is the resolved invalidation set (target +
-    /// transitive descendants) recorded at press time — deterministic record,
-    /// not re-derivation; `by` is the acting principal's subject (the
-    /// who-restarted-this audit fact, `None` only when auth is off).
-    RunRestartRequested {
-        target: StepId,
-        invalidated: Vec<StepId>,
-        by: Option<String>,
-    },
-    /// A control plane that did not launch this attempt resumed supervising
-    /// it (ADR-0047 re-adoption, surfaced by ADR-0056). Same attempt, same
-    /// fence, no re-execution, no budget consumed — this is the durability
-    /// wedge made visible, and it must never render as a new execution.
-    AttemptReadopted {
-        step: StepId,
-        attempt: AttemptId,
     },
     /// The run's opt-in active-time `budget:` was exhausted (ADR-0047);
     /// in-flight steps were cancelled and the run fails.

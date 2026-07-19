@@ -30,9 +30,9 @@ use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
 use scarab_engine::{
-    AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RestartError,
-    RunId, RunStatus, StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION,
-    MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
+    Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RestartError, RunId, RunStatus,
+    StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION, MAX_DELIVERY_ATTEMPTS,
+    RUN_STATUS_CHANGED,
 };
 use scarab_identity::{Action, Principal, Session};
 
@@ -509,6 +509,45 @@ pub struct RunSummaryDto {
     /// The owning project (repo name), if tenanted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// The run's **origin** — the trigger facts it was born from, each stamped at
+    /// creation and independently nullable (sparse across trigger kinds; all
+    /// absent on runs created before origin-stamping). The trigger kind
+    /// (`push`/`pull_request`/`tag`/…).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_kind: Option<String>,
+    /// The **Actor** login — who caused the trigger (UI labels it "author").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// The symbolic branch/tag ref the run ran on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// The resolved commit the run pinned to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    /// The pull-request number, for `pull_request` runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr_number: Option<i64>,
+}
+
+impl From<scarab_engine::RunSummary> for RunSummaryDto {
+    fn from(s: scarab_engine::RunSummary) -> Self {
+        RunSummaryDto {
+            id: s.run.0,
+            status: run_status_name(s.status).to_string(),
+            created_at: s.created_at.0,
+            // Total wall time for a terminal run; for an in-flight run this is
+            // elapsed-to-last-transition (the UI shows a live ticking elapsed
+            // for running runs instead of trusting this frozen value).
+            duration_ms: (s.updated_at.0 - s.created_at.0).max(0),
+            org: s.tenant.as_ref().map(|(o, _)| o.clone()),
+            project: s.tenant.as_ref().map(|(_, p)| p.clone()),
+            trigger_kind: s.trigger_kind,
+            actor: s.actor,
+            git_ref: s.git_ref,
+            sha: s.sha,
+            pr_number: s.pr_number,
+        }
+    }
 }
 
 /// `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
@@ -1085,14 +1124,7 @@ async fn list_runs(
     Ok(Json(RunListResponse {
         runs: runs
             .into_iter()
-            .map(|s| RunSummaryDto {
-                id: s.run.0,
-                status: run_status_name(s.status).to_string(),
-                created_at: s.created_at.0,
-                duration_ms: (s.updated_at.0 - s.created_at.0).max(0),
-                org: s.tenant.as_ref().map(|(o, _)| o.clone()),
-                project: s.tenant.as_ref().map(|(_, p)| p.clone()),
-            })
+            .map(RunSummaryDto::from)
             .collect(),
     }))
 }
@@ -1388,19 +1420,8 @@ async fn restart_step(
 ) -> Result<StatusCode, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    // Bind the principal (ADR-0056): a restart is a Take boundary and the
-    // event it emits carries WHO pressed it — the same attribution pattern as
-    // gate approval.
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    match scarab_engine::restart_step(
-        &*st.db,
-        &*st.clock,
-        &run,
-        &StepId(step),
-        Some(principal.subject),
-    )
-    .await
-    {
+    authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    match scarab_engine::restart_step(&*st.db, &*st.clock, &run, &StepId(step)).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
         Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
         Err(RestartError::Db(e)) => Err(ApiError::Db(e)),
@@ -1593,51 +1614,20 @@ async fn list_repo_runs(
     Ok(Json(RunListResponse {
         runs: runs
             .into_iter()
-            .map(|s| RunSummaryDto {
-                id: s.run.0,
-                status: run_status_name(s.status).to_string(),
-                created_at: s.created_at.0,
-                duration_ms: (s.updated_at.0 - s.created_at.0).max(0),
-                org: s.tenant.as_ref().map(|(o, _)| o.clone()),
-                project: s.tenant.as_ref().map(|(_, p)| p.clone()),
-            })
+            .map(RunSummaryDto::from)
             .collect(),
     }))
 }
 
-/// One artifact **version** in a run's list (ADR-0052, immutable per attempt
-/// by ADR-0056). `step`/`attempt` are the publishing provenance (empty
-/// strings on pre-ADR-0056 rows); `succeeded` is that attempt's verdict;
-/// `of_record` marks the version the bare name-addressed download resolves
-/// to — the latest successful version of that name.
+/// One artifact in a run's list (ADR-0052).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ArtifactDto {
     pub name: String,
     pub size: u64,
     pub content_type: String,
-    pub step: String,
-    pub attempt: String,
-    pub succeeded: bool,
-    pub of_record: bool,
 }
 
-/// The of-record version per name (ADR-0056): the latest **successful**
-/// version — a consumer fetching by bare name must never silently receive a
-/// failed attempt's partial file. `artifacts_of_run` returns rows
-/// name-then-created_at ordered, so the last successful row per name wins.
-fn of_record_index(
-    artifacts: &[scarab_engine::ArtifactRecord],
-) -> std::collections::HashMap<String, usize> {
-    let mut idx = std::collections::HashMap::new();
-    for (i, a) in artifacts.iter().enumerate() {
-        if a.succeeded {
-            idx.insert(a.meta.name.clone(), i);
-        }
-    }
-    idx
-}
-
-/// List a run's artifact versions (ADR-0052/0056). Read at the run's tenant.
+/// List a run's artifacts of record (ADR-0052). Read at the run's tenant.
 #[utoipa::path(
     get,
     path = "/v1/runs/{id}/artifacts",
@@ -1656,46 +1646,27 @@ async fn list_artifacts(
         return Err(ApiError::NotFound);
     }
     let artifacts = st.db.artifacts_of_run(&run).await?;
-    let of_record = of_record_index(&artifacts);
     Ok(Json(
         artifacts
-            .iter()
-            .enumerate()
-            .map(|(i, a)| ArtifactDto {
-                name: a.meta.name.clone(),
-                size: a.meta.size,
-                content_type: a.meta.content_type.clone(),
-                step: a.step.0.clone(),
-                attempt: a.attempt.0.clone(),
-                succeeded: a.succeeded,
-                of_record: of_record.get(&a.meta.name) == Some(&i),
+            .into_iter()
+            .map(|a| ArtifactDto {
+                name: a.name,
+                size: a.size,
+                content_type: a.content_type,
             })
             .collect(),
     ))
 }
 
-/// Version selector for an artifact download (ADR-0056): omitted → the
-/// of-record resolution (latest successful version); `step`+`attempt` → that
-/// exact version (how a Take view reads a shadowed or failed-attempt file).
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct ArtifactVersionQuery {
-    pub step: Option<String>,
-    pub attempt: Option<String>,
-}
-
 /// Download one artifact's bytes (ADR-0052). Streams through the server (a
 /// presigned-URL fast path can replace this when the store backend supports
-/// signing). Read at the run's tenant; immutable content. The bare name
-/// resolves to the latest SUCCESSFUL version (ADR-0056); `?step=&attempt=`
-/// pins an exact version.
+/// signing). Read at the run's tenant; immutable content.
 #[utoipa::path(
     get,
     path = "/v1/runs/{id}/artifacts/{name}",
     params(
         ("id" = String, Path, description = "run id"),
-        ("name" = String, Path, description = "artifact name (may contain slashes)"),
-        ArtifactVersionQuery
+        ("name" = String, Path, description = "artifact name (may contain slashes)")
     ),
     responses((status = 200, description = "the artifact bytes"), (status = 404, description = "no such artifact"))
 )]
@@ -1703,29 +1674,24 @@ async fn download_artifact(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((id, name)): Path<(String, String)>,
-    Query(version): Query<ArtifactVersionQuery>,
 ) -> Result<Response, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
     let store = st.artifact_store.as_ref().ok_or(ApiError::NotFound)?;
-    let artifacts = st.db.artifacts_of_run(&run).await?;
-    let artifact = match (&version.step, &version.attempt) {
-        (Some(step), Some(attempt)) => artifacts
-            .iter()
-            .find(|a| a.meta.name == name && a.step.0 == *step && a.attempt.0 == *attempt),
-        _ => of_record_index(&artifacts)
-            .get(&name)
-            .map(|&i| &artifacts[i]),
-    }
-    .ok_or(ApiError::NotFound)?;
+    let artifact = st
+        .db
+        .artifacts_of_run(&run)
+        .await?
+        .into_iter()
+        .find(|a| a.name == name)
+        .ok_or(ApiError::NotFound)?;
     let bytes = store
-        .get(&artifact.meta.object_key)
+        .get(&artifact.object_key)
         .await
         .map_err(|_| ApiError::NotFound)?;
-    let content_type = artifact.meta.content_type.clone();
     let mut resp = bytes.into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(&content_type) {
+    if let Ok(v) = axum::http::HeaderValue::from_str(&artifact.content_type) {
         resp.headers_mut()
             .insert(axum::http::header::CONTENT_TYPE, v);
     }
@@ -1756,27 +1722,16 @@ fn json_type_name(v: &serde_json::Value) -> &'static str {
     }
 }
 
-/// The `?attempt=` selector shared by the attempt-scoped evidence reads
-/// (ADR-0056): omitted → the step's latest evidence; present → that attempt's
-/// immutable copy.
-#[derive(Debug, Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct AttemptQuery {
-    pub attempt: Option<String>,
-}
-
-/// A step's named results (ADR-0041). The read side of the results-ingest
-/// write path (`POST …/steps/{step}/results`): the Inspector's Results tab,
-/// and the source the Outputs view derives from. Bare = latest evidence;
-/// `?attempt=` = that attempt's immutable copy (ADR-0056). Read at the run's
-/// tenant.
+/// A step's named results (ADR-0041), read from `step_runs.results`. The read
+/// side of the results-ingest write path (`POST …/steps/{step}/results`): the
+/// Inspector's Results tab, and the source the Outputs view derives from. Read
+/// at the run's tenant.
 #[utoipa::path(
     get,
     path = "/v1/runs/{id}/steps/{step}/results",
     params(
         ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id"),
-        AttemptQuery
+        ("step" = String, Path, description = "step id")
     ),
     responses((status = 200, body = [StepResultDto]), (status = 404, description = "no such run"))
 )]
@@ -1784,7 +1739,6 @@ async fn get_step_results(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
-    Query(q): Query<AttemptQuery>,
 ) -> Result<Json<Vec<StepResultDto>>, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
@@ -1792,13 +1746,7 @@ async fn get_step_results(
     if st.db.run_status(&run).await?.is_none() {
         return Err(ApiError::NotFound);
     }
-    let step = StepId(step);
-    // `?attempt=` scopes to one attempt's immutable evidence (ADR-0056) — how
-    // a Take view reads a superseded attempt; bare reads the latest evidence.
-    let results = match q.attempt {
-        Some(a) => st.db.attempt_results(&run, &step, &AttemptId(a)).await?,
-        None => st.db.step_results(&run, &step).await?,
-    };
+    let results = st.db.step_results(&run, &StepId(step)).await?;
     Ok(Json(
         results
             .into_iter()
@@ -1809,60 +1757,6 @@ async fn get_step_results(
             })
             .collect(),
     ))
-}
-
-/// What an attempt consumed (ADR-0056): the map `upstream step id → attempt
-/// id` stamped at its launch — the durable answer to "which generation of
-/// `build` did `test` actually build on?" after a mid-run restart leaves the
-/// run a patchwork of attempt generations. `attempt` names the attempt the
-/// map belongs to; empty map = nothing recorded (no upstream evidence, or a
-/// pre-ADR-0056 attempt).
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ConsumedDto {
-    pub attempt: String,
-    pub consumed: std::collections::BTreeMap<String, String>,
-}
-
-/// An attempt's consumption map (ADR-0056). Bare = the attempt behind the
-/// step's current evidence; `?attempt=` = that attempt. Read at the run's
-/// tenant. Fetched lazily by the step pane's Outputs tab — deliberately NOT
-/// part of the polled run-status DTO.
-#[utoipa::path(
-    get,
-    path = "/v1/runs/{id}/steps/{step}/consumed",
-    params(
-        ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id"),
-        AttemptQuery
-    ),
-    responses((status = 200, body = ConsumedDto), (status = 404, description = "no such run or no attempt"))
-)]
-async fn get_attempt_consumed(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
-    Query(q): Query<AttemptQuery>,
-) -> Result<Json<ConsumedDto>, ApiError> {
-    let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
-    if st.db.run_status(&run).await?.is_none() {
-        return Err(ApiError::NotFound);
-    }
-    let step = StepId(step);
-    let attempt = match q.attempt {
-        Some(a) => AttemptId(a),
-        None => st
-            .db
-            .step_evidence_attempt(&run, &step)
-            .await?
-            .ok_or(ApiError::NotFound)?,
-    };
-    let consumed = st.db.attempt_consumed(&run, &step, &attempt).await?;
-    Ok(Json(ConsumedDto {
-        attempt: attempt.0,
-        consumed,
-    }))
 }
 
 /// One entry in a workspace directory listing — the merkle-tree children under a
@@ -1885,14 +1779,11 @@ pub struct WorkspaceListing {
     pub entries: Vec<WorkspaceEntryDto>,
 }
 
-/// The `?path=` sub-path within a step's workspace snapshot (default = root),
-/// plus the `?attempt=` evidence selector (ADR-0056).
+/// The `?path=` sub-path within a step's workspace snapshot (default = root).
 #[derive(Debug, Deserialize)]
 struct WorkspacePathQuery {
     #[serde(default)]
     path: Option<String>,
-    #[serde(default)]
-    attempt: Option<String>,
 }
 
 /// Split a browse path into clean, non-empty segments — rejecting any `.`/`..`
@@ -1940,23 +1831,16 @@ async fn workspace_walk(
 }
 
 /// Read a step's output snapshot root hash, or `None` if it produced none.
-/// With `attempt`, reads that attempt's immutable root (ADR-0056) instead of
-/// the latest evidence.
 async fn step_snapshot_root(
     st: &AppState,
     run: &RunId,
     step: &StepId,
-    attempt: Option<&str>,
 ) -> Result<Option<scarab_storage::TreeHash>, ApiError> {
-    let root = match attempt {
-        Some(a) => {
-            st.db
-                .attempt_output(run, step, &AttemptId(a.to_string()))
-                .await?
-        }
-        None => st.db.step_output(run, step).await?,
-    };
-    Ok(root.map(scarab_storage::TreeHash))
+    Ok(st
+        .db
+        .step_output(run, step)
+        .await?
+        .map(scarab_storage::TreeHash))
 }
 
 /// List a directory inside a step's output workspace snapshot (ADR-0029). The
@@ -1969,8 +1853,7 @@ async fn step_snapshot_root(
     params(
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "step id"),
-        ("path" = Option<String>, Query, description = "sub-path within the snapshot (default = root)"),
-        ("attempt" = Option<String>, Query, description = "attempt id — that attempt's immutable snapshot instead of the latest (ADR-0056)")
+        ("path" = Option<String>, Query, description = "sub-path within the snapshot (default = root)")
     ),
     responses((status = 200, body = WorkspaceListing), (status = 404, description = "no such run/path or browse disabled"))
 )]
@@ -1990,7 +1873,7 @@ async fn list_workspace(
     }
     let path = q.path.unwrap_or_default();
     let segments = workspace_segments(&path)?;
-    let root = match step_snapshot_root(&st, &run, &StepId(step), q.attempt.as_deref()).await? {
+    let root = match step_snapshot_root(&st, &run, &StepId(step)).await? {
         Some(r) => r,
         // No snapshot yet — a running step, a gate, or a non-snapshotting
         // backend. Report unavailable rather than 404 so the UI can explain.
@@ -2038,8 +1921,7 @@ async fn list_workspace(
     params(
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "step id"),
-        ("path" = String, Query, description = "file path within the snapshot"),
-        ("attempt" = Option<String>, Query, description = "attempt id — that attempt's immutable snapshot instead of the latest (ADR-0056)")
+        ("path" = String, Query, description = "file path within the snapshot")
     ),
     responses((status = 200, description = "the file bytes"), (status = 404, description = "no such file or browse disabled"))
 )]
@@ -2059,7 +1941,7 @@ async fn get_workspace_file(
     if segments.is_empty() {
         return Err(ApiError::NotFound);
     }
-    let root = step_snapshot_root(&st, &run, &StepId(step), q.attempt.as_deref())
+    let root = step_snapshot_root(&st, &run, &StepId(step))
         .await?
         .ok_or(ApiError::NotFound)?;
     let blob = match workspace_walk(cas, root, &segments).await? {
@@ -2304,6 +2186,28 @@ fn config_ref(event: &scarab_forge::Event) -> String {
         // only for allowed_refs matching (see `Event::protection_ref`).
         Event::Manual { sha, .. } | Event::Api { sha, .. } => sha.clone(),
         _ => "HEAD".to_string(),
+    }
+}
+
+/// The resolved commit an event pinned to, for the run's `origin_sha` — only
+/// the events that carry a concrete commit. A `Tag`/`Release` normalizes to a
+/// tag name (no SHA in the payload) and repo-less events have none, so both are
+/// `None`; the symbolic ref still lands in `origin_ref` via [`Event::protection_ref`].
+fn origin_sha(event: &scarab_forge::Event) -> Option<String> {
+    use scarab_forge::Event;
+    match event {
+        Event::Push { after, .. } => Some(after.clone()),
+        Event::PullRequest { head, .. } => Some(head.clone()),
+        Event::Manual { sha, .. } | Event::Api { sha, .. } => Some(sha.clone()),
+        _ => None,
+    }
+}
+
+/// The pull-request number for a `pull_request` event, for `origin_pr_number`.
+fn origin_pr_number(event: &scarab_forge::Event) -> Option<i64> {
+    match event {
+        scarab_forge::Event::PullRequest { number, .. } => Some(*number as i64),
+        _ => None,
     }
 }
 
@@ -2934,6 +2838,20 @@ async fn persist_run_from_ir(
     if let Some(repo) = event.repo() {
         db.set_run_tenant(run, &repo.owner, &repo.name).await?;
     }
+    // Origin (the runs-list surface): stamp the trigger facts this run was born
+    // from — trigger kind (always), Actor, symbolic ref, resolved commit, and PR
+    // number — as discrete columns beside tenancy. Sparse by nature (a cron run
+    // has no actor/ref/sha; only a PR has a number); carries no scheduling
+    // authority, purely for display/audit.
+    db.set_run_origin(
+        run,
+        event.trigger_kind().as_str(),
+        event.actor(),
+        event.protection_ref().as_deref(),
+        origin_sha(event).as_deref(),
+        origin_pr_number(event),
+    )
+    .await?;
     db.store_run_ir(
         run,
         &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null),
@@ -4251,12 +4169,7 @@ async fn ingest_step_results(
         return Err(ApiError::NotFound);
     }
 
-    // The fence the token authenticated names the attempt — the ingested
-    // results land on that attempt's immutable evidence row as well as the
-    // step's latest-evidence denormalization (ADR-0056).
-    st.db
-        .set_step_results(&run, &step, &AttemptId(attempt.to_string()), &results)
-        .await?;
+    st.db.set_step_results(&run, &step, &results).await?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -4801,7 +4714,6 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         list_artifacts,
         download_artifact,
         get_step_results,
-        get_attempt_consumed,
         list_workspace,
         get_workspace_file,
         approve_gate,
@@ -4826,8 +4738,6 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         StepStatusDto,
         AttemptDto,
         StepResultDto,
-        ConsumedDto,
-        ArtifactDto,
         WorkspaceEntryDto,
         WorkspaceListing,
         PutSecretRequest,
@@ -4900,10 +4810,6 @@ fn router_inner(state: AppState) -> Router {
         .route(
             "/v1/runs/{id}/steps/{step}/results",
             get(get_step_results).post(ingest_step_results),
-        )
-        .route(
-            "/v1/runs/{id}/steps/{step}/consumed",
-            get(get_attempt_consumed),
         )
         .route(
             "/v1/secrets",

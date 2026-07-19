@@ -57,6 +57,7 @@ pub fn sign_hex(secret: &[u8], body: &[u8]) -> String {
 /// top level too.
 pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
     let p = &delivery.payload;
+    let actor = actor_of(p);
     match delivery.event.as_str() {
         "push" => {
             let repo = repo_of(p)?;
@@ -64,11 +65,17 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
             let after = string_at(p, "after")?;
             if let Some(tag) = r#ref.strip_prefix("refs/tags/") {
                 Ok(Event::Tag {
+                    actor,
                     repo,
                     tag: tag.to_string(),
                 })
             } else {
-                Ok(Event::Push { repo, r#ref, after })
+                Ok(Event::Push {
+                    actor,
+                    repo,
+                    r#ref,
+                    after,
+                })
             }
         }
         "pull_request" => {
@@ -92,6 +99,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 _ => head_repo.is_none(),
             };
             Ok(Event::PullRequest {
+                actor,
                 repo,
                 number,
                 head,
@@ -105,7 +113,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| ForgeError::Malformed("release.tag_name".into()))?
                 .to_string();
-            Ok(Event::Release { repo, tag })
+            Ok(Event::Release { actor, repo, tag })
         }
         "issue_comment" => {
             let repo = repo_of(p)?;
@@ -118,10 +126,29 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            Ok(Event::Comment { repo, issue, body })
+            Ok(Event::Comment {
+                actor,
+                repo,
+                issue,
+                body,
+            })
         }
         other => Err(ForgeError::UnsupportedEvent(other.to_string())),
     }
+}
+
+/// Extract the **Actor** — the event's `sender` login. Forgejo, like its repo
+/// owner, uses `login` on most payloads and `username` on some — accept either.
+/// A display/audit fact, not authorization input, so a missing sender degrades
+/// to an empty login (read back as `Event::actor() == None`) rather than failing
+/// normalization.
+fn actor_of(payload: &Value) -> String {
+    payload
+        .pointer("/sender/login")
+        .or_else(|| payload.pointer("/sender/username"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Extract the repository coordinate. Forgejo sends `owner.login` on most
@@ -494,15 +521,18 @@ mod tests {
 
     #[test]
     fn normalizes_push_tag_and_owner_username_variant() {
-        // Forgejo may send owner.username instead of owner.login.
+        // Forgejo may send owner.username instead of owner.login — and the same
+        // for the sender, which we normalize to the Actor.
         let payload = json!({
             "ref": "refs/heads/main",
             "after": "abc123",
-            "repository": { "name": "app", "owner": { "username": "acme" } }
+            "repository": { "name": "app", "owner": { "username": "acme" } },
+            "sender": { "username": "pusher" }
         });
         assert_eq!(
             normalize(&delivery("push", payload)).unwrap(),
             Event::Push {
+                actor: "pusher".into(),
                 repo: RepoRef {
                     owner: "acme".into(),
                     name: "app".into()

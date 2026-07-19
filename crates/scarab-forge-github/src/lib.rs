@@ -48,6 +48,7 @@ pub fn sign_hex(secret: &[u8], body: &[u8]) -> String {
 /// caller to acknowledge-and-ignore.
 pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
     let p = &delivery.payload;
+    let actor = actor_of(p);
     match delivery.event.as_str() {
         "push" => {
             let repo = repo_of(p)?;
@@ -55,11 +56,17 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
             let after = string_at(p, "after")?;
             if let Some(tag) = r#ref.strip_prefix("refs/tags/") {
                 Ok(Event::Tag {
+                    actor,
                     repo,
                     tag: tag.to_string(),
                 })
             } else {
-                Ok(Event::Push { repo, r#ref, after })
+                Ok(Event::Push {
+                    actor,
+                    repo,
+                    r#ref,
+                    after,
+                })
             }
         }
         "pull_request" => {
@@ -84,6 +91,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 _ => head_repo.is_none(),
             };
             Ok(Event::PullRequest {
+                actor,
                 repo,
                 number,
                 head,
@@ -97,7 +105,7 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| ForgeError::Malformed("release.tag_name".into()))?
                 .to_string();
-            Ok(Event::Release { repo, tag })
+            Ok(Event::Release { actor, repo, tag })
         }
         "issue_comment" => {
             let repo = repo_of(p)?;
@@ -110,10 +118,27 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            Ok(Event::Comment { repo, issue, body })
+            Ok(Event::Comment {
+                actor,
+                repo,
+                issue,
+                body,
+            })
         }
         other => Err(ForgeError::UnsupportedEvent(other.to_string())),
     }
+}
+
+/// Extract the **Actor** — the event's `sender.login` (the account that caused
+/// the delivery). A display/audit fact, not authorization input, so a missing
+/// sender degrades to an empty login (read back as `Event::actor() == None`)
+/// rather than failing the whole normalization.
+fn actor_of(payload: &Value) -> String {
+    payload
+        .pointer("/sender/login")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Extract the `repository` coordinate (`owner.login` / `name`) from a payload.
@@ -918,12 +943,14 @@ mod tests {
             json!({
                 "ref": r#ref,
                 "after": "abc123",
-                "repository": { "name": "app", "owner": { "login": "acme" } }
+                "repository": { "name": "app", "owner": { "login": "acme" } },
+                "sender": { "login": "octocat" }
             })
         };
         assert_eq!(
             normalize(&delivery("push", base("refs/heads/main"))).unwrap(),
             Event::Push {
+                actor: "octocat".into(),
                 repo: RepoRef {
                     owner: "acme".into(),
                     name: "app".into()
@@ -936,6 +963,7 @@ mod tests {
         assert_eq!(
             normalize(&delivery("push", base("refs/tags/v1.2.3"))).unwrap(),
             Event::Tag {
+                actor: "octocat".into(),
                 repo: RepoRef {
                     owner: "acme".into(),
                     name: "app".into()
@@ -953,11 +981,13 @@ mod tests {
                 "number": 42,
                 "head": { "sha": "feedface", "repo": { "full_name": "acme/app" } }
             },
-            "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" }
+            "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" },
+            "sender": { "login": "octocat" }
         });
         assert_eq!(
             normalize(&delivery("pull_request", internal)).unwrap(),
             Event::PullRequest {
+                actor: "octocat".into(),
                 repo: RepoRef {
                     owner: "acme".into(),
                     name: "app".into()

@@ -20,9 +20,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::ExecState;
-use scarab_engine::{
-    restart_step, AttemptId, Db, RunId, RunStatus, Scheduler, StepId, StepStatus, Timestamp,
-};
+use scarab_engine::{restart_step, Db, RunId, RunStatus, Scheduler, StepId, StepStatus, Timestamp};
 use scarab_storage::Cas;
 use scarab_storage_s3::S3Storage;
 use scarab_testkit::{FakeClock, FakeExecutor};
@@ -169,7 +167,7 @@ async fn diamond_compiles_admits_concurrently_and_restart_cascades() {
     }
 
     // Restart C: C and its descendant D re-run; sibling B and ancestor A do not.
-    restart_step(&db, &clock, &run, &StepId("C".into()), None)
+    restart_step(&db, &clock, &run, &StepId("C".into()))
         .await
         .expect("restart C");
     drive_to_terminal(&sched, &db, &run).await;
@@ -223,14 +221,9 @@ async fn diamond_workspace_flows_to_d_which_sees_both() {
             .ingest(work.to_str().unwrap())
             .await
             .expect("ingest output");
-        db.set_step_output(
-            &run,
-            &StepId(id.clone()),
-            &AttemptId("a1".into()),
-            &snap.root.0,
-        )
-        .await
-        .unwrap();
+        db.set_step_output(&run, &StepId(id.clone()), &snap.root.0)
+            .await
+            .unwrap();
         output_of.insert(StepId(id.clone()), snap.root.0.clone());
         let _ = std::fs::remove_dir_all(&work);
     }

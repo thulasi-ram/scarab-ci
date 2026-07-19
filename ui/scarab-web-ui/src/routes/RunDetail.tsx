@@ -1,11 +1,9 @@
 // Run detail — the operator view. A provenance header answers "what is this
-// run"; the Take dropdown (ADR-0056) is the run's version history — one Take
-// per human restart, derived purely from the event log, each closed Take a
-// read-only snapshot-at-boundary replay. The DAG (blueprint spine) shows the
-// step graph with live status; the merged step pane scopes Logs/Results/
-// Outputs/Workspace to the selected (step, attempt); artifacts are run-level,
-// immutable per attempt; and the Activity rail is the durable event log made
-// legible — restarts, retries, and crash re-adoptions you can read at a glance.
+// run", the DAG (blueprint spine) shows the real step graph with live status,
+// retries, and elapsed (ADR-0006/0047); logs fold per step → attempt and stream
+// lazily (ADR-0013); the Inspector browses each step's results/outputs/artifacts/
+// workspace (ADR-0041/0029/0052); and the Activity rail is the durable event log
+// made legible — retries and recovery you can read at a glance.
 import { createSignal, createEffect, createResource, onMount, onCleanup, For, Show } from "solid-js";
 import { A, useParams, useNavigate } from "@solidjs/router";
 import {
@@ -16,33 +14,21 @@ import {
   isTerminal,
   runParams,
   listArtifacts,
-  artifactUrl,
   type RunStatus,
   type RunEvent,
   type StepStatus,
-  type Artifact,
 } from "../api/client";
 import { eventParts, eventCategory, EVENT_GLYPH } from "../events";
-import { deriveTakes, replayTake, type Take, type TakeView } from "../takes";
 import { relTime, absTime, duration } from "../fmt";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 import Dag, { type DagStep } from "../components/Dag";
-import StepPane from "../components/StepPane";
+import StepLogs from "../components/StepLogs";
+import Inspector from "../components/Inspector";
 import DebugShell from "../components/DebugShell";
 
 const POLL_MS = 1200;
-
-/** Human byte size. */
-function fmtSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-/** Numeric part of an attempt id (`a3` → 3) for as-of-boundary comparisons. */
-const attemptN = (id: string) => parseInt(id.replace(/^a/, ""), 10) || 0;
 
 export default function RunDetail() {
   const params = useParams();
@@ -55,60 +41,26 @@ export default function RunDetail() {
   const [events, setEvents] = createSignal<RunEvent[]>([]);
   const [live, setLive] = createSignal(true);
   const [sel, setSel] = createSignal<string | null>(null);
-  const [selAttempt, setSelAttempt] = createSignal<string | null>(null);
   const [restarting, setRestarting] = createSignal<string | null>(null);
   const [cancelling, setCancelling] = createSignal(false);
   const [shellOpen, setShellOpen] = createSignal(false);
-  // The viewed Take (1-based), or null = latest. Only a CLOSED take is a
-  // time-travel view; selecting the latest take clears back to live.
-  const [viewTake, setViewTake] = createSignal<number | null>(null);
 
   const stepList = (): StepStatus[] => run()?.steps ?? [];
-
-  // --- Takes (ADR-0056): derived from the event log, stored nowhere. ---
-  const takes = (): Take[] => deriveTakes(events());
-  const latestTakeN = () => takes().length;
-  const viewing = (): Take | null => {
-    const n = viewTake();
-    if (n === null || n >= latestTakeN()) return null;
-    return takes().find((t) => t.n === n) ?? null;
-  };
-  const timeTraveling = () => viewing() !== null;
-  // Snapshot-at-boundary: a closed Take's view is a pure replay of the log up
-  // to the restart press that closed it.
-  const takeView = (): TakeView | null => {
-    const t = viewing();
-    return t ? replayTake(events(), takes(), t) : null;
-  };
-  // Events visible in the Activity rail: truncated at the boundary while
-  // time-traveling — the rail shows what had happened AS OF that instant.
-  const visibleEvents = () => {
-    const t = viewing();
-    return t ? events().slice(0, t.endIdx) : events();
-  };
-
-  const selectedStep = () => stepList().find((s) => s.id === sel()) ?? null;
-  const selectedStatus = () => {
-    const tv = takeView();
-    const s = sel();
-    if (tv && s) return tv.status[s];
-    return selectedStep()?.status;
-  };
-  const selectedRunning = () => selectedStatus() === "running" && !timeTraveling();
+  const selectedStatus = () => stepList().find((s) => s.id === sel())?.status;
+  const selectedRunning = () => selectedStatus() === "running";
   // A running step attaches to its live Pod; a finished one is reproduced in a
-  // fresh debug Pod. Debug-pod is the ONE action allowed while viewing a
-  // closed Take (it reproduces immutable evidence and mutates nothing durable).
+  // fresh debug Pod. Pending/skipped steps have nothing to shell into.
   const shellMode = (): "attach" | "debug-pod" => (selectedRunning() ? "attach" : "debug-pod");
   const canShell = () =>
-    !!sel() && ["running", "succeeded", "failed"].includes(String(selectedStatus() ?? ""));
+    !!sel() && ["running", "succeeded", "failed"].includes(selectedStatus() ?? "");
   const runningCount = () => stepList().filter((s) => s.status === "running").length;
 
   // Per-step wall-clock from the event log: first AttemptStarted → last
-  // AttemptFinished. While time-traveling, computed over the truncated log so
-  // a closed Take never shows timing from its future.
+  // AttemptFinished. Gives finished DAG nodes a real duration (the run object
+  // carries no per-step timing).
   const stepTiming = (): Record<string, { start?: number; end?: number }> => {
     const m: Record<string, { start?: number; end?: number }> = {};
-    for (const e of visibleEvents()) {
+    for (const e of events()) {
       const k = e.kind;
       if (typeof k === "string") continue;
       const tag = Object.keys(k)[0];
@@ -121,21 +73,21 @@ export default function RunDetail() {
     return m;
   };
 
-  // DAG nodes: the graph shape + status. Live: the run object. Time-traveling:
-  // the replayed statuses/attempt-counts as of the boundary.
+  // DAG nodes: the graph shape + live status. A running step's `runningSince`
+  // (its latest attempt's start) drives the node's in-place elapsed counter; a
+  // finished step's `durationMs` comes from the event-log timing above.
   const dagSteps = (): DagStep[] => {
     const timing = stepTiming();
-    const tv = takeView();
     return stepList().map((s) => {
       const t = timing[s.id];
       return {
         id: s.id,
-        status: tv ? (tv.status[s.id] ?? "pending") : s.status,
-        attempts: tv ? (tv.attempts[s.id] ?? 0) : s.attempts,
+        status: s.status,
+        attempts: s.attempts,
         needs: s.needs ?? [],
         gate: s.gate,
         runningSince:
-          !tv && s.status === "running"
+          s.status === "running"
             ? s.attempt_list?.[s.attempt_list.length - 1]?.started_at ?? null
             : null,
         durationMs: t?.start != null && t?.end != null ? t.end - t.start : null,
@@ -144,41 +96,17 @@ export default function RunDetail() {
   };
 
   const [artifacts, { refetch: refetchArtifacts }] = createResource(id, (rid) =>
-    listArtifacts(rid).catch(() => [] as Artifact[]),
+    listArtifacts(rid).catch(() => []),
   );
-
-  // Artifact versions visible in the current view: while time-traveling, only
-  // versions from attempts that existed as of the boundary — and of-record is
-  // recomputed within that horizon (the server's flag is latest-global).
-  const visibleArtifacts = (): Artifact[] => {
-    const all = artifacts() ?? [];
-    const tv = takeView();
-    if (!tv) return all;
-    const rows = all.filter((a) => {
-      if (!a.step) return true; // pre-ADR-0056 row: no provenance to judge
-      const frontier = tv.frontier[a.step];
-      return frontier !== undefined && attemptN(a.attempt) <= attemptN(frontier);
-    });
-    const ofRecord = new Map<string, number>();
-    rows.forEach((a, i) => {
-      if (a.succeeded) ofRecord.set(a.name, i);
-    });
-    return rows.map((a, i) => ({ ...a, of_record: ofRecord.get(a.name) === i }));
-  };
 
   let poll: ReturnType<typeof setInterval> | undefined;
 
-  // Timing from the event log: first event = created; the view's end is the
-  // boundary instant while time-traveling, else the latest transition.
-  const startedAt = () =>
-    visibleEvents().length ? Math.min(...visibleEvents().map((e) => e.at)) : null;
-  const finishedAt = () => {
-    const t = viewing();
-    if (t) return t.closedAt;
-    return run() && isTerminal(run()!.status) && events().length
+  // Timing from the event log: first event = created, last = latest transition.
+  const startedAt = () => (events().length ? Math.min(...events().map((e) => e.at)) : null);
+  const finishedAt = () =>
+    run() && isTerminal(run()!.status) && events().length
       ? Math.max(...events().map((e) => e.at))
       : null;
-  };
 
   async function refresh() {
     const [status, evs] = await Promise.all([
@@ -209,14 +137,6 @@ export default function RunDetail() {
     if (poll) clearInterval(poll);
   });
 
-  // Selecting a step or switching Takes resets the attempt scope to the new
-  // default (latest attempt, or the Take frontier while time-traveling).
-  createEffect(() => {
-    void sel();
-    void viewTake();
-    setSelAttempt(null);
-  });
-
   async function onRestart(step: string) {
     setRestarting(step);
     try {
@@ -239,19 +159,6 @@ export default function RunDetail() {
     }
   }
 
-  const takeLabel = (t: Take) =>
-    t.n === latestTakeN()
-      ? `Take ${t.n} of ${latestTakeN()} (latest)`
-      : `Take ${t.n} of ${latestTakeN()} — closed by restart of ${t.closedByTarget ?? "?"}`;
-
-  // Straddling steps in the viewed Take: mid-flight at the boundary, finished
-  // in a later Take (or never) — the "finished in Take N →" affordance.
-  const straddlers = () => {
-    const tv = takeView();
-    if (!tv) return [] as { step: string; take: number }[];
-    return Object.entries(tv.finishedInTake).map(([step, take]) => ({ step, take }));
-  };
-
   return (
     <section class="page">
       <Doodle icon="container" size={230} rotate={14} opacity={0.16} top="52px" right="48px" />
@@ -267,103 +174,36 @@ export default function RunDetail() {
                 <span class="crumb-head-title mono" title={id()}>run {id().slice(0, 8)}</span>
               </h1>
               <StatusBadge status={r().status} />
-              <Show when={live() && !timeTraveling()}>
+              <Show when={live()}>
                 <span class="live-dot" title="live">
                   <span class="dot" /> live
                 </span>
               </Show>
-              {/* The Take dropdown (ADR-0056): appears once history exists. */}
-              <Show when={latestTakeN() > 1}>
-                <label class="take-select" title="run history — one take per restart">
-                  <Icon icon="history" size={13} />
-                  <select
-                    value={String(viewTake() ?? latestTakeN())}
-                    onChange={(e) => {
-                      const n = Number(e.currentTarget.value);
-                      setViewTake(n >= latestTakeN() ? null : n);
-                    }}
-                  >
-                    <For each={takes()}>
-                      {(t) => <option value={String(t.n)}>{takeLabel(t)}</option>}
-                    </For>
-                  </select>
-                </label>
-              </Show>
             </div>
 
-            <Show when={viewing()}>
-              {(t) => (
-                <div class="take-banner">
-                  <Icon icon="history" size={14} />
-                  <span>
-                    viewing <b>Take {t().n}</b> — a read-only snapshot of the run the instant{" "}
-                    <b class="mono">{t().closedByTarget}</b> was restarted
-                    {t().closedBy ? ` by ${t().closedBy}` : ""}
-                    {t().closedAt ? ` ${relTime(t().closedAt!)}` : ""}
-                  </span>
-                  <For each={straddlers()}>
-                    {(x) => (
-                      <span class="take-straddle">
-                        <b class="mono">{x.step}</b> was still running —{" "}
-                        <Show when={x.take > 0} fallback={<>never finished</>}>
-                          <button
-                            class="linklike"
-                            onClick={() =>
-                              setViewTake(x.take >= latestTakeN() ? null : x.take)
-                            }
-                          >
-                            finished in Take {x.take} →
-                          </button>
-                        </Show>
-                      </span>
-                    )}
-                  </For>
-                  <span class="grow1" />
-                  <button class="btn btn-ghost btn-sm" onClick={() => setViewTake(null)}>
-                    jump to latest
-                  </button>
-                </div>
-              )}
-            </Show>
-
             <div class="run-toolbar">
-              {/* Restart mutates THIS run — it closes the current Take and
-                  opens the next; Re-run mints a whole NEW run. Distinct verbs,
-                  distinct icons (ADR-0056). While time-traveling, everything
-                  that would mutate this run is disabled; "New run" stays (it
-                  touches nothing here) and debug-pod stays (evidence-only). */}
               <button
                 class="btn btn-ghost btn-sm"
                 onClick={() => sel() && onRestart(sel()!)}
-                disabled={restarting() !== null || !sel() || timeTraveling()}
-                title={
-                  timeTraveling()
-                    ? "read-only take view — jump to latest to restart"
-                    : sel()
-                      ? `restart ${sel()} and its descendants — opens a new take`
-                      : "select a step"
-                }
+                disabled={restarting() !== null || !sel()}
+                title={sel() ? `restart ${sel()} and its descendants` : "select a step"}
               >
-                <Icon icon="rotate-ccw" size={13} /> {restarting() ? "restarting…" : "Restart step"}
+                <Icon icon="rotate-cw" size={13} /> {restarting() ? "restarting…" : "Restart"}
               </button>
               <button
                 class="btn btn-ghost btn-sm"
                 onClick={() =>
                   nav(`/${org()}/${repo()}/run`, { state: { prefillParams: runParams(r()) } })
                 }
-                title="launch a NEW run of this pipeline, pre-filled with these parameters"
+                title="re-run this pipeline, pre-filled with these parameters"
               >
-                <Icon icon="play" size={13} /> New run
+                <Icon icon="rotate-cw" size={13} /> Re-run
               </button>
               <button
                 class="btn btn-ghost btn-sm"
                 onClick={() => void onCancel()}
-                disabled={
-                  cancelling() || timeTraveling() || (run() ? isTerminal(run()!.status) : true)
-                }
-                title={
-                  timeTraveling() ? "read-only take view" : "cancel this run and tear down its steps"
-                }
+                disabled={cancelling() || (run() ? isTerminal(run()!.status) : true)}
+                title="cancel this run and tear down its steps"
               >
                 {cancelling() ? "cancelling…" : "Cancel"}
               </button>
@@ -420,90 +260,30 @@ export default function RunDetail() {
                 <div class="panel-h">
                   <span>DAG</span>
                   <span class="subtle">
-                    {r().steps.length} steps
-                    {!timeTraveling() && runningCount() ? ` · ${runningCount()} running` : ""}
-                    {timeTraveling() ? ` · as of take ${viewing()!.n}` : ""}
+                    {r().steps.length} steps{runningCount() ? ` · ${runningCount()} running` : ""}
                   </span>
                 </div>
                 <Dag steps={dagSteps()} selected={sel()} onSelect={setSel} />
               </div>
 
-              <StepPane
-                runId={id()}
-                step={selectedStep()}
-                events={visibleEvents()}
-                attempt={selAttempt()}
-                onAttemptSelect={setSelAttempt}
-                frontierAttempt={sel() ? takeView()?.frontier[sel()!] ?? null : null}
-                deadLettered={r().status === "dead_lettered"}
-              />
+              <div class="panel logs-panel">
+                <div class="panel-h">
+                  <span>Logs</span>
+                  <span class="subtle">fold by step · retries fold by attempt</span>
+                </div>
+                <StepLogs runId={id()} steps={stepList()} selected={sel()} onSelect={setSel} />
+              </div>
             </div>
 
-            {/* Artifacts — run-level files of record, immutable per attempt
-                (ADR-0056): every version listed with its provenance; the bare
-                download is the of-record resolution, shadowed/failed versions
-                download by pinned version. */}
-            <div class="panel artifacts-panel">
-              <div class="panel-h">
-                <span>Artifacts</span>
-                <span class="subtle">{visibleArtifacts().length} versions</span>
-              </div>
-              <Show
-                when={visibleArtifacts().length > 0}
-                fallback={<p class="empty">no artifacts published by this run</p>}
-              >
-                <ul class="filelist">
-                  <For each={visibleArtifacts()}>
-                    {(a) => (
-                      <li class="filerow" classList={{ shadowed: !a.of_record }}>
-                        <span class="fname">
-                          <Icon icon="package" size={14} />
-                          <a
-                            href={
-                              a.of_record || !a.step
-                                ? artifactUrl(id(), a.name)
-                                : artifactUrl(id(), a.name, { step: a.step, attempt: a.attempt })
-                            }
-                            download={a.name}
-                          >
-                            {a.name}
-                          </a>
-                        </span>
-                        <Show when={a.step}>
-                          <span class="aprov mono" classList={{ failed: !a.succeeded }}>
-                            {a.step}@{a.attempt}
-                            {a.succeeded ? "" : " ✗"}
-                          </span>
-                        </Show>
-                        <Show when={a.of_record}>
-                          <span
-                            class="aofrecord"
-                            title="what the bare name-addressed download serves"
-                          >
-                            of record
-                          </span>
-                        </Show>
-                        <span class="fsize mono">{fmtSize(a.size)}</span>
-                        <span class="fmeta mono">{a.content_type}</span>
-                      </li>
-                    )}
-                  </For>
-                </ul>
-              </Show>
-            </div>
+            <Inspector runId={id()} selectedStep={sel()} artifacts={artifacts() ?? []} />
 
             <div class="panel activity-panel">
               <div class="panel-h">
                 <span>Activity</span>
-                <span class="subtle">
-                  {visibleEvents().length} events
-                  {timeTraveling()
-                    ? ` · ${events().length - visibleEvents().length} later hidden by take view`
-                    : ""}
-                </span>
+                <span class="subtle">{events().length} events</span>
               </div>
               <div class="tl">
-                <For each={visibleEvents()} fallback={<div class="tl-empty">no events yet</div>}>
+                <For each={events()} fallback={<div class="tl-empty">no events yet</div>}>
                   {(e) => {
                     const cat = eventCategory(e);
                     const parts = eventParts(e);
