@@ -10,3 +10,6 @@ scarab-secrets = { workspace = true }
 scarab-forge = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

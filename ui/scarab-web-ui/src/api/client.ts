@@ -211,6 +211,10 @@ export type ProtectionRules = {
   wait_timer: number;
   allowed_refs: string[];
   concurrency: number;
+  /** Require a reason for human dispatches (manual/api) into this environment
+   *  (ADR-0057 §3). Optional/omittable — the server defaults it off (fail-open).
+   *  Administer-only to set, like the rest of the rules. */
+  require_reason?: boolean;
 };
 export type RepoEnvironment = { name: string; protection: ProtectionRules };
 

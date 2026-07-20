@@ -144,6 +144,7 @@ fn prod_rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
         oidc_subject: "scarab:acme/web/prod".into(),
         privileged_images: Vec::new(),
         permit_k8s_overlay: false,
+        require_reason: false,
     }
 }
 
@@ -454,6 +455,126 @@ async fn dispatch_ref_disallowed_by_environment_is_rejected_fail_closed() {
     assert!(
         db.list_runs(100).await.unwrap().is_empty(),
         "no run created for a disallowed ref"
+    );
+}
+
+// --- ADR-0057 §3: require_reason admission guardrail --------------------------
+
+// An Environment whose `require_reason` is set, admitting any ref (so the reason
+// check is what is exercised, not allowed_refs).
+async fn require_reason_env() -> Arc<FakeEnvironments> {
+    let envs = Arc::new(FakeEnvironments::default());
+    let mut protection = prod_rules(&[], &[]);
+    protection.require_reason = true;
+    envs.put_environment(
+        "acme",
+        "web",
+        &Environment {
+            name: "prod".into(),
+            protection,
+        },
+    )
+    .await
+    .unwrap();
+    envs
+}
+
+/// A `require_reason` environment blocks a reasonless human dispatch at the
+/// admission gate — fail-closed, no run created — surfaced with a clear
+/// diagnostic exactly like a disallowed ref / missing approval.
+#[tokio::test]
+async fn require_reason_blocks_a_reasonless_manual_dispatch() {
+    let forge = scarab_testkit::FakeForge::new().with_file(".scarab/deploy.yaml", DEPLOY_YAML);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let envs = require_reason_env().await;
+
+    let err = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        Some(envs.as_ref()),
+        "bob".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "deploy".into(),
+        std::collections::BTreeMap::new(),
+        DispatchKind::Manual,
+        None, // no reason
+    )
+    .await
+    .expect_err("a reasonless dispatch into a require_reason env must be rejected");
+    match err {
+        DispatchError::ReasonRequired(m) => assert!(m.contains("reason is required"), "{m}"),
+        other => panic!("expected ReasonRequired, got {other:?}"),
+    }
+    assert!(
+        db.list_runs(100).await.unwrap().is_empty(),
+        "no run created when the required reason is missing"
+    );
+}
+
+/// A blank (whitespace-only) reason is treated as empty (slice C's
+/// `trigger_title()==None` signal), so it is blocked just like `None`.
+#[tokio::test]
+async fn require_reason_blocks_a_blank_reason_dispatch() {
+    let forge = scarab_testkit::FakeForge::new().with_file(".scarab/deploy.yaml", DEPLOY_YAML);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let envs = require_reason_env().await;
+
+    let err = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        Some(envs.as_ref()),
+        "bob".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "deploy".into(),
+        std::collections::BTreeMap::new(),
+        DispatchKind::Manual,
+        Some("   ".into()), // blank → no effective reason
+    )
+    .await
+    .expect_err("a blank reason is no reason");
+    assert!(matches!(err, DispatchError::ReasonRequired(_)), "{err:?}");
+    assert!(db.list_runs(100).await.unwrap().is_empty());
+}
+
+/// With a reason, the same dispatch into the same `require_reason` environment
+/// proceeds and stamps the reason as the run Headline.
+#[tokio::test]
+async fn require_reason_admits_a_dispatch_that_carries_a_reason() {
+    let forge = scarab_testkit::FakeForge::new().with_file(".scarab/deploy.yaml", DEPLOY_YAML);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let envs = require_reason_env().await;
+
+    let run = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        Some(envs.as_ref()),
+        "bob".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "deploy".into(),
+        std::collections::BTreeMap::new(),
+        DispatchKind::Manual,
+        Some("ship the prod hotfix".into()),
+    )
+    .await
+    .expect("a dispatch carrying a reason is admitted");
+    assert_eq!(
+        db.list_runs(100).await.unwrap().len(),
+        1,
+        "the run is created once a reason is supplied"
+    );
+    assert_eq!(
+        db.run_trigger_title(&run).await.unwrap().as_deref(),
+        Some("ship the prod hotfix"),
+        "the supplied reason is stamped as the run Headline"
     );
 }
 

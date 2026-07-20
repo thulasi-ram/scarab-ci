@@ -95,6 +95,15 @@ pub struct ProtectionRules {
     /// where an admin has opted in. Administer-only, like the privilege whitelist.
     #[serde(default)]
     pub permit_k8s_overlay: bool,
+    /// Whether a **human dispatch** (`manual`/`api`) into this environment must
+    /// carry a reason (ADR-0057 §3). **Off by default (`#[serde(default)]` =
+    /// fail-open)** so existing environments are unaffected; Administer-only to
+    /// set, like the privilege whitelist (separation of duties). Enforced at the
+    /// admission gate ([`admits_reason`](ProtectionRules::admits_reason)), not the
+    /// dispatch endpoint. Push/PR/tag/release/cron/upstream are exempt — they carry
+    /// their own intrinsic headline or are machine-initiated.
+    #[serde(default)]
+    pub require_reason: bool,
 }
 
 /// A stand-in [`SecretScope`] used only as the serde default for
@@ -182,6 +191,35 @@ impl ProtectionRules {
     /// `allowed_refs` permits any ref.
     pub fn ref_allowed(&self, git_ref: &str) -> bool {
         self.allowed_refs.is_empty() || self.allowed_refs.iter().any(|p| glob_match(p, git_ref))
+    }
+
+    /// The `require_reason` guardrail (ADR-0057 §3), enforced at the admission gate
+    /// beside [`admits`](Self::admits) — a third guardrail like `approvers` /
+    /// `allowed_refs`. Returns every violation (empty = admitted), so a blocked run
+    /// surfaces exactly like a missing approval.
+    ///
+    /// A run is blocked **iff** `require_reason` is set, the trigger is a
+    /// human-initiated dispatch (`is_human_dispatch` — `manual`/`api`), and it
+    /// carries no reason (`has_reason == false`). Push / pull_request / tag /
+    /// release / cron / upstream are exempt (`is_human_dispatch == false`): they
+    /// carry their own intrinsic headline or are machine-initiated, so there is no
+    /// operator to prompt. An environment without `require_reason` never blocks
+    /// (fail-open — existing environments are unaffected).
+    ///
+    /// `has_reason` is the caller's "reason is present and non-blank" signal
+    /// (`Event::trigger_title().is_some()` on the manual/api arm, per slice C).
+    pub fn admits_reason(
+        &self,
+        is_human_dispatch: bool,
+        has_reason: bool,
+    ) -> Result<(), Vec<String>> {
+        if self.require_reason && is_human_dispatch && !has_reason {
+            Err(vec![
+                "a reason is required to dispatch a run into this environment".to_string(),
+            ])
+        } else {
+            Ok(())
+        }
     }
 
     /// Compute the privilege grant-set admitted for a step running `image` in this
@@ -383,6 +421,7 @@ mod tests {
             oidc_subject: String::new(),
             privileged_images: Vec::new(),
             permit_k8s_overlay: false,
+            require_reason: false,
         }
     }
 
@@ -435,6 +474,65 @@ mod tests {
     fn empty_allowed_refs_permits_any_ref() {
         let r = rules(&[], &[]);
         assert!(r.admits("refs/heads/whatever", &[]).is_ok());
+    }
+
+    // --- ADR-0057 require_reason ------------------------------------------
+
+    #[test]
+    fn require_reason_blocks_an_empty_reason_human_dispatch() {
+        let mut r = rules(&[], &[]);
+        r.require_reason = true;
+        // manual/api with no reason → blocked, violation reads like a gate miss.
+        let err = r.admits_reason(true, false).unwrap_err();
+        assert!(err.iter().any(|v| v.contains("reason is required")));
+    }
+
+    #[test]
+    fn require_reason_admits_a_human_dispatch_that_carries_a_reason() {
+        let mut r = rules(&[], &[]);
+        r.require_reason = true;
+        assert!(r.admits_reason(true, true).is_ok());
+    }
+
+    #[test]
+    fn require_reason_exempts_non_human_triggers_regardless() {
+        let mut r = rules(&[], &[]);
+        r.require_reason = true;
+        // A push (is_human_dispatch == false) is never blocked, reason or not.
+        assert!(r.admits_reason(false, false).is_ok());
+        assert!(r.admits_reason(false, true).is_ok());
+    }
+
+    #[test]
+    fn require_reason_off_never_blocks() {
+        // Fail-open: existing environments (require_reason unset) are unaffected.
+        let r = rules(&[], &[]);
+        assert!(!r.require_reason);
+        assert!(r.admits_reason(true, false).is_ok());
+    }
+
+    #[test]
+    fn require_reason_defaults_off_and_round_trips() {
+        // The jsonb-backed protection blob (scarab-db-postgres) relies on
+        // `#[serde(default)]`: a pre-ADR-0057 environment omits the key and must
+        // deserialize with `require_reason == false` (fail-open, no migration).
+        let legacy = serde_json::json!({
+            "approvers": [],
+            "wait_timer": 0,
+            "allowed_refs": [],
+            "concurrency": 1,
+            "secret_scope": { "Org": { "org": "acme" } },
+            "oidc_subject": ""
+        });
+        let p: ProtectionRules = serde_json::from_value(legacy).unwrap();
+        assert!(!p.require_reason);
+
+        // And an explicit `true` round-trips through serde (the storage path).
+        let mut set = rules(&[], &[]);
+        set.require_reason = true;
+        let back: ProtectionRules =
+            serde_json::from_value(serde_json::to_value(&set).unwrap()).unwrap();
+        assert!(back.require_reason);
     }
 
     // --- ADR-0039 grants ---------------------------------------------------

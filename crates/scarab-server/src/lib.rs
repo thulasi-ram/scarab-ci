@@ -2486,6 +2486,11 @@ pub enum TriggerError {
     Pipeline(String),
     #[error("config is not valid UTF-8")]
     NotUtf8,
+    /// A target Environment's `require_reason` guardrail (ADR-0057 §3) blocked a
+    /// reasonless human dispatch at the admission gate — fail-closed, no run
+    /// created. Carries the joined violation(s), surfaced like a missing approval.
+    #[error("{0}")]
+    ReasonRequired(String),
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -2808,6 +2813,23 @@ async fn admit_and_create_run(
         if !admitted {
             return Ok(None);
         }
+
+        // ADR-0057 §3: a `require_reason` environment blocks a reasonless human
+        // dispatch (manual/api) at the admission gate — a third guardrail beside
+        // allowed_refs/approvers. `trigger_title()` is `None` exactly when a
+        // manual/api dispatch carried no non-blank reason (slice C's canonical
+        // empty-reason signal); push/PR/tag/release/cron/upstream are exempt via
+        // `is_human_dispatch == false`. Unlike a disallowed ref (a silent `None`
+        // skip for the webhook path), a missing reason is an answerable request —
+        // surface it fail-closed with a clear diagnostic (like a missing approval).
+        let is_human_dispatch = matches!(
+            event.trigger_kind(),
+            scarab_forge::TriggerKind::Manual | scarab_forge::TriggerKind::Api
+        );
+        if let Err(violations) = p.admits_reason(is_human_dispatch, event.trigger_title().is_some())
+        {
+            return Err(TriggerError::ReasonRequired(violations.join("; ")));
+        }
     }
 
     let now = clock.now().await;
@@ -2903,6 +2925,11 @@ pub enum DispatchError {
     /// (ADR-0043 §6) — the same guardrail a webhook deploy hits, fail-closed.
     #[error("ref `{0}` is not allowed to deploy to this environment")]
     RefNotAllowed(String),
+    /// A target Environment requires a reason for human dispatches (ADR-0057 §3)
+    /// and none was supplied — the same admission guardrail a `require_reason`
+    /// environment applies, fail-closed. Surfaces the violation to the dispatcher.
+    #[error("{0}")]
+    ReasonRequired(String),
     #[error(transparent)]
     Db(DbError),
 }
@@ -2913,6 +2940,7 @@ impl From<TriggerError> for DispatchError {
             TriggerError::Forge(f) => DispatchError::Forge(f),
             TriggerError::Pipeline(m) => DispatchError::Pipeline(m),
             TriggerError::NotUtf8 => DispatchError::NotUtf8,
+            TriggerError::ReasonRequired(m) => DispatchError::ReasonRequired(m),
             TriggerError::Db(d) => DispatchError::Db(d),
         }
     }
@@ -5339,6 +5367,7 @@ mod grant_admission_tests {
             oidc_subject: String::new(),
             privileged_images: images,
             permit_k8s_overlay: false,
+            require_reason: false,
         }
     }
 

@@ -46,6 +46,7 @@ fn rules(approvers: &[&str], allowed_refs: &[&str]) -> ProtectionRules {
         oidc_subject: "scarab:acme/web/prod".into(),
         privileged_images: Vec::new(),
         permit_k8s_overlay: false,
+        require_reason: false,
     }
 }
 
@@ -200,6 +201,79 @@ async fn put_environment_stamps_canonical_scope_and_subject_when_body_omits_them
     assert_eq!(
         stored.protection.oidc_subject,
         "scarab:org/acme/repo/web/env/prod"
+    );
+
+    tdb.cleanup().await;
+}
+
+/// ADR-0057 §3: `require_reason` persists and round-trips through the Environment
+/// API, and defaults **off** (fail-open) when a body omits it — so existing
+/// environments (stored before this field existed) are unaffected. Setting it
+/// rides the same Administer-gated `put_environment` as the rest of the rules.
+#[tokio::test]
+async fn require_reason_persists_and_defaults_off_through_the_api() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = Arc::new(PostgresDb::with_pool(tdb.pool.clone()));
+    pg.migrate().await.unwrap();
+    let app = app(pg.clone());
+
+    // A body that OMITS require_reason (a pre-ADR-0057 env form) → stored off.
+    let put = json_req(
+        "PUT",
+        "/v1/repos/acme/web/environments/legacy",
+        serde_json::json!({
+            "approvers": [],
+            "wait_timer": 0,
+            "allowed_refs": [],
+            "concurrency": 1,
+        }),
+    );
+    assert_eq!(
+        app.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let stored = pg
+        .get_environment("acme", "web", "legacy")
+        .await
+        .unwrap()
+        .expect("environment stored");
+    assert!(
+        !stored.protection.require_reason,
+        "an omitted require_reason defaults off (fail-open)"
+    );
+
+    // A body that SETS require_reason → persists and reads back true.
+    let put = json_req(
+        "PUT",
+        "/v1/repos/acme/web/environments/prod",
+        serde_json::json!({
+            "approvers": [],
+            "wait_timer": 0,
+            "allowed_refs": [],
+            "concurrency": 1,
+            "require_reason": true,
+        }),
+    );
+    assert_eq!(
+        app.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let resp = app
+        .clone()
+        .oneshot(get_req("/v1/repos/acme/web/environments/prod"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let env: scarab_project::Environment = serde_json::from_slice(&body).unwrap();
+    assert!(
+        env.protection.require_reason,
+        "require_reason round-trips through the API"
     );
 
     tdb.cleanup().await;

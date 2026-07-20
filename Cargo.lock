@@ -2752,6 +2752,7 @@ dependencies = [
  "scarab-forge",
  "scarab-secrets",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

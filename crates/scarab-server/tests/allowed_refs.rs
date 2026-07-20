@@ -50,6 +50,7 @@ fn prod_rules(allowed_refs: &[&str]) -> ProtectionRules {
         oidc_subject: "scarab:acme/web/prod".into(),
         privileged_images: Vec::new(),
         permit_k8s_overlay: false,
+        require_reason: false,
     }
 }
 
@@ -247,4 +248,34 @@ async fn pull_request_admitted_when_env_opts_in_via_pull_glob() {
         .await
         .expect("trigger");
     assert_eq!(runs.len(), 1, "refs/pull/* opts PRs into the env");
+}
+
+// ADR-0057 §3: `require_reason` is scoped to human dispatches (manual/api). A
+// push carries its own intrinsic headline (the commit subject) and is EXEMPT — a
+// require_reason environment must never block it.
+#[tokio::test]
+async fn push_into_a_require_reason_env_is_exempt() {
+    let (forge, db, clock) = setup();
+    let envs = FakeEnvironments::default();
+    let mut protection = prod_rules(&[]); // unrestricted refs
+    protection.require_reason = true;
+    envs.put_environment(
+        "acme",
+        "web",
+        &Environment {
+            name: "prod".into(),
+            protection,
+        },
+    )
+    .await
+    .unwrap();
+
+    let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &push("main"))
+        .await
+        .expect("trigger");
+    assert_eq!(
+        runs.len(),
+        1,
+        "a push is exempt from require_reason (it carries an intrinsic headline)"
+    );
 }

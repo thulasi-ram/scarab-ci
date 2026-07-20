@@ -488,6 +488,9 @@ function EnvPanel(props: { org: string; repo: string; env: RepoEnvironment }) {
           {rules().approvers.length === 1 ? "" : "s"}
           <span class="dotsep">·</span> {rules().wait_timer}s wait
           <span class="dotsep">·</span> {allowed()}
+          <Show when={rules().require_reason}>
+            <span class="dotsep">·</span> reason required
+          </Show>
         </div>
         <div class="env-history">
           <For
@@ -527,6 +530,7 @@ function EnvDialog(props: {
   const [waitTimer, setWaitTimer] = createSignal("0");
   const [allowedRefs, setAllowedRefs] = createSignal("main");
   const [concurrency, setConcurrency] = createSignal("1");
+  const [requireReason, setRequireReason] = createSignal(false);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
@@ -544,6 +548,7 @@ function EnvDialog(props: {
         wait_timer: Number(waitTimer()) || 0,
         allowed_refs: splitList(allowedRefs()),
         concurrency: Number(concurrency()) || 1,
+        require_reason: requireReason(),
       });
       props.onCreated();
       props.onClose();
@@ -605,6 +610,17 @@ function EnvDialog(props: {
               value={concurrency()}
               onInput={(e) => setConcurrency(e.currentTarget.value)}
             />
+          </div>
+          <div class="form-r">
+            <label>require reason</label>
+            <label class="checkbox-inline">
+              <input
+                type="checkbox"
+                checked={requireReason()}
+                onInput={(e) => setRequireReason(e.currentTarget.checked)}
+              />
+              <span class="subtle">manual/api dispatches must supply a reason</span>
+            </label>
           </div>
           <Show when={error()}>
             <p class="error">{error()}</p>
