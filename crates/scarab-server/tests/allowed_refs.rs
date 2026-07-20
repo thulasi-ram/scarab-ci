@@ -215,6 +215,8 @@ async fn pull_request_is_denied_a_branch_scoped_environment() {
         repo: repo(),
         number: 7,
         head: "1234567890abcdef1234567890abcdef12345678".into(),
+        title: "add a widget".into(),
+        base: "main".into(),
         fork: false,
     };
     let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &pr)
@@ -237,6 +239,8 @@ async fn pull_request_admitted_when_env_opts_in_via_pull_glob() {
         repo: repo(),
         number: 7,
         head: "1234567890abcdef1234567890abcdef12345678".into(),
+        title: "add a widget".into(),
+        base: "main".into(),
         fork: false,
     };
     let runs = trigger_run_from_event(&forge, &db, &clock, Some(&envs), &pr)

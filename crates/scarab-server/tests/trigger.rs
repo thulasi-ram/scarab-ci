@@ -75,6 +75,53 @@ async fn push_matching_on_push_starts_a_run() {
     );
 }
 
+/// Runs one step on any pull_request (no predicate → always fires).
+const CI_YAML_PR: &str = r#"
+on:
+  pull_request: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#;
+
+fn pr() -> Event {
+    Event::PullRequest {
+        actor: "octocat".into(),
+        repo: repo(),
+        number: 42,
+        head: "prsha456".into(),
+        title: "feat: add the dashboard widget".into(),
+        base: "main".into(),
+        fork: false,
+    }
+}
+
+#[tokio::test]
+async fn pull_request_run_stamps_pr_title_headline_and_base() {
+    let forge = FakeForge::new().with_file(".scarab/ci.yaml", CI_YAML_PR);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let runs = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &pr())
+        .await
+        .expect("trigger");
+    assert_eq!(runs.len(), 1, "the pull_request trigger matched");
+    let run = runs.into_iter().next().unwrap();
+
+    // The Headline (ADR-0057): a PR run's trigger_title is the PR TITLE verbatim.
+    assert_eq!(
+        db.run_trigger_title(&run).await.unwrap().as_deref(),
+        Some("feat: add the dashboard widget"),
+        "a PR run stamps trigger_title = the PR title"
+    );
+    // The base branch is a discrete origin fact (origin_pr_base), rendered
+    // `base ← head` — NOT folded into the Headline.
+    assert_eq!(
+        db.run_pr_base(&run).await.unwrap().as_deref(),
+        Some("main"),
+        "a PR run stamps origin_pr_base = the base ref"
+    );
+}
+
 /// A committed `.scarab` authoring slice-4 engine features: a concurrency group
 /// and an image-less gate between two executed steps.
 const CI_YAML_CONCURRENCY_GATE: &str = r#"

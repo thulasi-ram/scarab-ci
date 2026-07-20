@@ -311,9 +311,10 @@ pub trait Db: Send + Sync {
     /// Stamp the run's **origin** — the trigger facts it was born from, resolved
     /// from the normalized `Event` at creation (beside the tenant stamp). Passed
     /// as discrete, independently-nullable values (never a bundle): `trigger_kind`
-    /// is always known; `actor`/`git_ref`/`sha`/`pr_number` are `None` for the
-    /// trigger kinds that lack them (a cron run has no actor/ref/sha; only a PR
-    /// has a number). Surfaced by the runs list; carries no scheduling authority.
+    /// is always known; `actor`/`git_ref`/`sha`/`pr_number`/`pr_base` are `None`
+    /// for the trigger kinds that lack them (a cron run has no actor/ref/sha; only
+    /// a PR has a number and a base branch). Surfaced by the runs list; carries no
+    /// scheduling authority.
     async fn set_run_origin(
         &self,
         run: &RunId,
@@ -322,7 +323,13 @@ pub trait Db: Send + Sync {
         git_ref: Option<&str>,
         sha: Option<&str>,
         pr_number: Option<i64>,
+        pr_base: Option<&str>,
     ) -> Result<(), DbError>;
+
+    /// The run's PR **base** branch (`origin_pr_base`, ADR-0057), if stamped. A
+    /// discrete origin fact for the run-detail `base ← head` display; the runs
+    /// list reads it off the summary row instead.
+    async fn run_pr_base(&self, run: &RunId) -> Result<Option<String>, DbError>;
 
     /// Stamp the bare name of the pipeline this run executed (the `.scarab`
     /// selection), for display on the runs list + run detail. Set at creation

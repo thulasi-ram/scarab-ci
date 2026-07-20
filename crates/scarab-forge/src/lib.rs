@@ -167,6 +167,17 @@ pub enum Event {
         repo: RepoRef,
         number: u64,
         head: String,
+        /// The PR **title** (`pull_request.title`). Source of the run **Headline**
+        /// for `pull_request` runs via [`Event::trigger_title`] (ADR-0057).
+        /// Display/audit only — **deliberately excluded from [`Event::context()`]**
+        /// (see that method's security note; a fork PR's title is
+        /// attacker-controlled). Empty when the payload carried no title.
+        title: String,
+        /// The PR **base** branch (`pull_request.base.ref`) — a discrete origin
+        /// fact (`origin_pr_base`), NOT folded into `trigger_title`. Fills the
+        /// `base ← head` display (ADR-0057 §4). Also excluded from
+        /// [`Event::context()`]. Empty when the payload carried no base ref.
+        base: String,
         /// True when the PR's head repo differs from its base repo — an
         /// untrusted fork PR (ADR-0015): such runs get no secrets and a
         /// downgraded OIDC subject.
@@ -322,17 +333,21 @@ impl Event {
     /// The run **Headline** (CONTEXT §4.5, ADR-0057) — the one normalized human
     /// line that says *what a run is about*, its meaning fixed by the trigger
     /// kind. For `push` it is the head commit **subject** (the first line of
-    /// `message`), truncated to [`TRIGGER_TITLE_MAX`] chars on a **char
-    /// boundary** (never mid-UTF-8-sequence) and returned **clean** — no
-    /// ellipsis; the UI owns the overflow signal. `None` when there is no
-    /// headline (an empty commit message, or a kind that carries none). The
-    /// other kinds return `None` for now — thread B/C fill PR title / dispatch
-    /// reason. Display/audit only; this value never enters [`Event::context()`].
+    /// `message`); for `pull_request` it is the PR **title**. Truncated to
+    /// [`TRIGGER_TITLE_MAX`] chars on a **char boundary** (never
+    /// mid-UTF-8-sequence) and returned **clean** — no ellipsis; the UI owns the
+    /// overflow signal. `None` when there is no headline (an empty commit
+    /// message / PR title, or a kind that carries none). The remaining kinds
+    /// return `None` for now — thread C fills the dispatch reason. Display/audit
+    /// only; this value never enters [`Event::context()`].
     pub fn trigger_title(&self) -> Option<String> {
         let raw = match self {
             // The commit subject = the first line of the message; the body is
             // dropped (ADR-0057 §1).
             Event::Push { message, .. } => message.lines().next().unwrap_or_default(),
+            // A PR's headline is its title verbatim (single line already); the
+            // base branch is a separate origin fact, not part of the headline.
+            Event::PullRequest { title, .. } => title,
             _ => "",
         };
         let trimmed = raw.trim();
@@ -364,8 +379,9 @@ impl Event {
     /// reads e.g. `event.branch == 'main'`.
     ///
     /// **Security boundary (ADR-0057 §2, Q6/Q7 — load-bearing, do not undo):**
-    /// the provenance/**Headline** fields (`Push::message`, and later PR
-    /// `title` / `base` / dispatch `reason`) are **deliberately excluded** from
+    /// the provenance/**Headline** fields (`Push::message`,
+    /// `PullRequest::title` / `PullRequest::base`, and later dispatch `reason`)
+    /// are **deliberately excluded** from
     /// this map. `${{ event.message }}` spliced into a `run:` script is the
     /// GitHub-Actions script-injection class, and shell has no context-free
     /// escape (the sink — quoted / unquoted / env / arg — is unknowable at
@@ -859,6 +875,8 @@ mod tests {
                     repo: repo(),
                     number: 7,
                     head: "cafe".into(),
+                    title: "add the widget".into(),
+                    base: "main".into(),
                     fork: false,
                 },
                 TriggerKind::PullRequest,
@@ -979,6 +997,8 @@ mod tests {
             repo: repo(),
             number: 1,
             head: "x".into(),
+            title: "fork PR".into(),
+            base: "main".into(),
             fork: true,
         };
         let internal = Event::PullRequest {
@@ -986,6 +1006,8 @@ mod tests {
             repo: repo(),
             number: 2,
             head: "y".into(),
+            title: "internal PR".into(),
+            base: "main".into(),
             fork: false,
         };
         assert!(fork.is_fork_pr());
@@ -1114,6 +1136,8 @@ mod tests {
                 repo: repo(),
                 number: 7,
                 head: "cafe".into(),
+                title: "add the widget".into(),
+                base: "main".into(),
                 fork: false
             }
             .protection_ref()
@@ -1199,6 +1223,70 @@ mod tests {
         assert!(
             !ctx.to_string().contains("rm -rf"),
             "no part of the message may leak into the flat context"
+        );
+    }
+
+    #[test]
+    fn pull_request_title_and_base_are_excluded_from_context_map() {
+        // Security boundary (ADR-0057 §2, Q6/Q7): a PR's title (fork-PR titles are
+        // attacker-controlled) and base branch are provenance fields — they MUST
+        // NOT enter the CEL/`${{ }}` context map. The matching context stays
+        // byte-for-byte as lean as before the enrichment.
+        let ctx = Event::PullRequest {
+            actor: "octocat".into(),
+            repo: repo(),
+            number: 7,
+            head: "cafe".into(),
+            title: "$(rm -rf /) evil title".into(),
+            base: "release/injected".into(),
+            fork: true,
+        }
+        .context();
+        assert!(
+            ctx["event"].get("title").is_none(),
+            "the PR title must never appear in the trigger-matching context"
+        );
+        assert!(
+            ctx["event"].get("base").is_none(),
+            "the PR base must never appear in the trigger-matching context"
+        );
+        // Belt-and-suspenders: neither value leaks anywhere into the flat map.
+        let flat = ctx.to_string();
+        assert!(!flat.contains("rm -rf"), "no part of the title may leak");
+        assert!(
+            !flat.contains("release/injected"),
+            "no part of the base may leak"
+        );
+    }
+
+    #[test]
+    fn trigger_title_of_a_pull_request_is_its_title() {
+        // A PR's headline is its title verbatim; the base branch is NOT part of it.
+        let title = Event::PullRequest {
+            actor: "octocat".into(),
+            repo: repo(),
+            number: 7,
+            head: "cafe".into(),
+            title: "feat: add the widget".into(),
+            base: "main".into(),
+            fork: false,
+        }
+        .trigger_title();
+        assert_eq!(title.as_deref(), Some("feat: add the widget"));
+
+        // An empty title yields no headline (graceful degrade).
+        assert_eq!(
+            Event::PullRequest {
+                actor: "octocat".into(),
+                repo: repo(),
+                number: 7,
+                head: "cafe".into(),
+                title: String::new(),
+                base: "main".into(),
+                fork: false,
+            }
+            .trigger_title(),
+            None
         );
     }
 

@@ -26,6 +26,8 @@ fn pr(fork: bool) -> Event {
         },
         number: 1,
         head: "abc".into(),
+        title: "add a widget".into(),
+        base: "main".into(),
         fork,
     }
 }

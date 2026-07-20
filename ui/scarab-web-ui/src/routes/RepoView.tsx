@@ -335,11 +335,28 @@ export default function RepoView() {
                               <Icon icon="git-commit-horizontal" size={13} />
                               <span class="mono sha">{(r.sha ?? r.id).slice(0, 7)}</span>
                             </a>
-                            <Show when={branchLabel(r) && branchLabel(r) !== r.sha}>
-                              {(b) => (
-                                <span class="pfact" title="branch / ref">
+                            {/* base ← head on PR runs (ADR-0057): the branch the
+                                PR targets, reading into its head commit. For
+                                non-PR runs, the plain branch/ref. */}
+                            <Show
+                              when={r.origin_pr_base}
+                              fallback={
+                                <Show when={branchLabel(r) && branchLabel(r) !== r.sha}>
+                                  {(b) => (
+                                    <span class="pfact" title="branch / ref">
+                                      <Icon icon="git-branch" size={13} />
+                                      <span class="mono">{b()}</span>
+                                    </span>
+                                  )}
+                                </Show>
+                              }
+                            >
+                              {(base) => (
+                                <span class="pfact" title="base ← head">
                                   <Icon icon="git-branch" size={13} />
-                                  <span class="mono">{b()}</span>
+                                  <span class="mono">{base()}</span>
+                                  <span class="pr-arrow">←</span>
+                                  <span class="mono sha">{(r.sha ?? "").slice(0, 7)}</span>
                                 </span>
                               )}
                             </Show>

@@ -848,6 +848,10 @@ h2 {
 .pfact.link:hover svg { color: var(--emerald); }
 .pfact.live, .pfact.live svg { color: var(--emerald); }
 
+/* The `base ← head` arrow (ADR-0057): the direction glyph between a PR's base
+   branch and its head commit, muted so the refs read as the content. */
+.pr-arrow { color: var(--muted-sage); margin: 0 3px; }
+
 /* Shared Trigger cell (ADR-0057): trigger kind on top, the run Headline
    (`trigger_title`) as the truncated secondary line beneath (full text on
    hover). One component, two hosts — `.tcell-cell` matches the run-detail

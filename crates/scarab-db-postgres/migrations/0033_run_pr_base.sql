@@ -1,0 +1,15 @@
+-- Run PR base branch (ADR-0057): the `pull_request.base.ref` a PR run targets,
+-- rendered `base ← head` in the ref cluster. A discrete origin fact — the
+-- sibling of origin_pr_number (0028) — NOT folded into trigger_title (the
+-- Headline), because base is structural (a branch), not a human line.
+--
+-- Stamped at creation beside the other origin_* columns, from the normalized
+-- Event's PullRequest.base. Naturally sparse: only pull_request runs carry it.
+-- Display/audit only — never load-bearing for scheduling, and (like the title
+-- that feeds trigger_title) deliberately NOT in Event::context() (no
+-- trigger-matching / `${{ }}` interpolation).
+--
+-- NULL on non-PR runs and on runs created before this migration (no backfill),
+-- exactly as origin_pr_number and trigger_title were — such runs simply show no
+-- base branch.
+ALTER TABLE runs ADD COLUMN origin_pr_base TEXT;

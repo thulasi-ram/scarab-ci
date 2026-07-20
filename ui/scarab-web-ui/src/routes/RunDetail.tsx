@@ -497,6 +497,21 @@ export default function RunDetail() {
                             </div>
                           </div>
                         </Show>
+                        {/* base ← head on PR runs (ADR-0057): the branch the PR
+                            targets, reading into its head commit. */}
+                        <Show when={r().origin_pr_base}>
+                          {(base) => (
+                            <div class="pcell">
+                              <div class="k">base ← head</div>
+                              <div class="v">
+                                <Icon icon="git-branch" size={14} />
+                                <span class="mono">{base()}</span>
+                                <span class="pr-arrow">←</span>
+                                <span class="mono sha">{(t().sha ?? "").slice(0, 8)}</span>
+                              </div>
+                            </div>
+                          )}
+                        </Show>
                       </>
                     );
                   }}

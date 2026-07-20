@@ -829,10 +829,12 @@ impl Db for PostgresDb {
         git_ref: Option<&str>,
         sha: Option<&str>,
         pr_number: Option<i64>,
+        pr_base: Option<&str>,
     ) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE runs SET origin_trigger_kind = $2, origin_actor = $3,
                  origin_ref = $4, origin_sha = $5, origin_pr_number = $6,
+                 origin_pr_base = $7,
                  updated_at = (extract(epoch from now()) * 1000)::bigint
              WHERE id = $1",
         )
@@ -842,10 +844,20 @@ impl Db for PostgresDb {
         .bind(git_ref)
         .bind(sha)
         .bind(pr_number)
+        .bind(pr_base)
         .execute(self.pool())
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    async fn run_pr_base(&self, run: &RunId) -> Result<Option<String>, DbError> {
+        let row = sqlx::query("SELECT origin_pr_base FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("origin_pr_base")))
     }
 
     async fn set_run_pipeline(&self, run: &RunId, pipeline: &str) -> Result<(), DbError> {
@@ -963,7 +975,7 @@ impl Db for PostgresDb {
         let rows = sqlx::query(
             "SELECT id, status, created_at, updated_at, tenant_org, tenant_project,
                     origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
-                    pipeline, trigger_title
+                    origin_pr_base, pipeline, trigger_title
              FROM runs
              ORDER BY created_at DESC, id DESC
              LIMIT $1",
@@ -984,7 +996,7 @@ impl Db for PostgresDb {
         let rows = sqlx::query(
             "SELECT id, status, created_at, updated_at, tenant_org, tenant_project,
                     origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
-                    pipeline, trigger_title
+                    origin_pr_base, pipeline, trigger_title
              FROM runs
              WHERE tenant_org = $1 AND tenant_project = $2
              ORDER BY created_at DESC, id DESC
@@ -1972,6 +1984,7 @@ fn run_summary_from_row(r: sqlx::postgres::PgRow) -> Result<RunSummary, DbError>
         git_ref: r.get::<Option<String>, _>("origin_ref"),
         sha: r.get::<Option<String>, _>("origin_sha"),
         pr_number: r.get::<Option<i64>, _>("origin_pr_number"),
+        pr_base: r.get::<Option<String>, _>("origin_pr_base"),
         pipeline: r.get::<Option<String>, _>("pipeline"),
         trigger_title: r.get::<Option<String>, _>("trigger_title"),
     })

@@ -1123,6 +1123,12 @@ export interface components {
         RunStatusResponse: {
             id: string;
             /**
+             * @description The PR **base** branch (ADR-0057) — the branch a `pull_request` run
+             *     targets, rendered `base ← head` in the ref cluster. A discrete origin
+             *     fact; absent for non-PR runs and runs created before base-stamping.
+             */
+            origin_pr_base?: string | null;
+            /**
              * @description The run's frozen launch parameters, `name → typed value` (ADR-0043 §5).
              *     A run-level constant resolved once at creation; non-secret by contract
              *     (§6), so safe to expose. Empty when the run took none. Lets the UI's
@@ -1165,6 +1171,12 @@ export interface components {
             id: string;
             /** @description The owning org, if the run is tenanted (trigger-created). */
             org?: string | null;
+            /**
+             * @description The PR **base** branch (ADR-0057) — the branch a `pull_request` run
+             *     targets, rendered `base ← head` in the ref cluster. A discrete origin
+             *     fact; absent for non-PR runs and runs created before base-stamping.
+             */
+            origin_pr_base?: string | null;
             /**
              * @description The pipeline this run executed (the bare `.scarab/<name>` selection).
              *     Absent for inline runs and runs created before pipeline-stamping.

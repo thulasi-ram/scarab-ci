@@ -107,11 +107,26 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 (Some(base), Some(head_repo)) => head_repo != base,
                 _ => head_repo.is_none(),
             };
+            // The PR title — source of the run Headline (ADR-0057) — and the base
+            // branch (`base ← head` display). Forgejo carries both like GitHub.
+            // Display/audit only; both stay out of Event::context(). Absent → empty.
+            let title = p
+                .pointer("/pull_request/title")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let base = p
+                .pointer("/pull_request/base/ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             Ok(Event::PullRequest {
                 actor,
                 repo,
                 number,
                 head,
+                title,
+                base,
                 fork,
             })
         }
@@ -614,13 +629,21 @@ mod tests {
         let fork = json!({
             "number": 9,
             "pull_request": {
+                "title": "fix: the login redirect",
+                "base": { "ref": "develop" },
                 "head": { "sha": "abc", "repo": { "full_name": "contributor/app" } }
             },
             "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" }
         });
         let event = normalize(&delivery("pull_request", fork)).unwrap();
         assert!(event.is_fork_pr());
-        assert!(matches!(event, Event::PullRequest { number: 9, .. }));
+        // Title + base are parsed onto the event (ADR-0057): the title feeds the
+        // Headline, the base the `base ← head` display.
+        assert!(matches!(
+            &event,
+            Event::PullRequest { number: 9, title, base, .. }
+                if title == "fix: the login redirect" && base == "develop"
+        ));
     }
 
     #[test]

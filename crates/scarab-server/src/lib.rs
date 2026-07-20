@@ -525,6 +525,11 @@ pub struct RunStatusResponse {
     /// trigger carried no headline and on runs created before headline-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_title: Option<String>,
+    /// The PR **base** branch (ADR-0057) — the branch a `pull_request` run
+    /// targets, rendered `base ← head` in the ref cluster. A discrete origin
+    /// fact; absent for non-PR runs and runs created before base-stamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_pr_base: Option<String>,
 }
 
 /// `GET /v1/runs` body: the most recent runs, newest first.
@@ -568,6 +573,11 @@ pub struct RunSummaryDto {
     /// The pull-request number, for `pull_request` runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<i64>,
+    /// The PR **base** branch (ADR-0057) — the branch a `pull_request` run
+    /// targets, rendered `base ← head` in the ref cluster. A discrete origin
+    /// fact; absent for non-PR runs and runs created before base-stamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_pr_base: Option<String>,
     /// The pipeline this run executed (the bare `.scarab/<name>` selection).
     /// Absent for inline runs and runs created before pipeline-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -597,6 +607,7 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             git_ref: s.git_ref,
             sha: s.sha,
             pr_number: s.pr_number,
+            origin_pr_base: s.pr_base,
             pipeline: s.pipeline,
             trigger_title: s.trigger_title,
         }
@@ -1264,6 +1275,7 @@ async fn get_run(
     let params = st.db.run_params(&run).await?;
     let pipeline = st.db.run_pipeline(&run).await?;
     let trigger_title = st.db.run_trigger_title(&run).await?;
+    let origin_pr_base = st.db.run_pr_base(&run).await?;
     Ok(Json(RunStatusResponse {
         id: run.0,
         status: run_status_name(status).to_string(),
@@ -1281,6 +1293,7 @@ async fn get_run(
         params,
         pipeline,
         trigger_title,
+        origin_pr_base,
     }))
 }
 
@@ -2510,6 +2523,16 @@ fn origin_pr_number(event: &scarab_forge::Event) -> Option<i64> {
     }
 }
 
+/// The PR **base** branch for a `pull_request` event, for `origin_pr_base`
+/// (ADR-0057, the `base ← head` display). `None` for every other kind, and when
+/// the payload carried no base ref.
+fn origin_pr_base(event: &scarab_forge::Event) -> Option<String> {
+    match event {
+        scarab_forge::Event::PullRequest { base, .. } if !base.is_empty() => Some(base.clone()),
+        _ => None,
+    }
+}
+
 /// "Commit a file, done" (ADR-0010): on a normalized `event`, discover every
 /// pipeline under `.scarab/` at the triggering ref, compile each, and durably
 /// create a Run for each whose `on:` matches this event. Returns the new run ids
@@ -3138,10 +3161,10 @@ async fn persist_run_from_ir(
         db.set_run_tenant(run, &repo.owner, &repo.name).await?;
     }
     // Origin (the runs-list surface): stamp the trigger facts this run was born
-    // from — trigger kind (always), Actor, symbolic ref, resolved commit, and PR
-    // number — as discrete columns beside tenancy. Sparse by nature (a cron run
-    // has no actor/ref/sha; only a PR has a number); carries no scheduling
-    // authority, purely for display/audit.
+    // from — trigger kind (always), Actor, symbolic ref, resolved commit, PR
+    // number, and PR base branch — as discrete columns beside tenancy. Sparse by
+    // nature (a cron run has no actor/ref/sha; only a PR has a number + base);
+    // carries no scheduling authority, purely for display/audit.
     db.set_run_origin(
         run,
         event.trigger_kind().as_str(),
@@ -3149,6 +3172,7 @@ async fn persist_run_from_ir(
         event.protection_ref().as_deref(),
         origin_sha(event).as_deref(),
         origin_pr_number(event),
+        origin_pr_base(event).as_deref(),
     )
     .await?;
     // The pipeline name (the runs-list/detail "which pipeline is this") — the

@@ -126,6 +126,7 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
         git_ref: origin.and_then(|o| o.2.clone()),
         sha: origin.and_then(|o| o.3.clone()),
         pr_number: origin.and_then(|o| o.4),
+        pr_base: origin.and_then(|o| o.5.clone()),
         pipeline: st.run_pipeline.get(run).cloned(),
         trigger_title: st.run_trigger_title.get(run).cloned(),
     }
@@ -164,9 +165,20 @@ struct InMemoryState {
     run_project: HashMap<RunId, String>,
     run_priority: HashMap<RunId, i32>,
     run_tenant: HashMap<RunId, (String, String)>,
-    /// Per-run origin `(trigger_kind, actor, git_ref, sha, pr_number)` — the
-    /// trigger facts stamped at creation (mirrors the `origin_*` run columns).
-    run_origin: HashMap<RunId, (String, Option<String>, Option<String>, Option<String>, Option<i64>)>,
+    /// Per-run origin `(trigger_kind, actor, git_ref, sha, pr_number, pr_base)` —
+    /// the trigger facts stamped at creation (mirrors the `origin_*` run columns).
+    #[allow(clippy::type_complexity)]
+    run_origin: HashMap<
+        RunId,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+        ),
+    >,
     /// Per-run pipeline name (mirrors the `pipeline` run column).
     run_pipeline: HashMap<RunId, String>,
     /// Per-run Headline / trigger title (mirrors the `trigger_title` column).
@@ -642,6 +654,7 @@ impl Db for InMemoryDb {
         git_ref: Option<&str>,
         sha: Option<&str>,
         pr_number: Option<i64>,
+        pr_base: Option<&str>,
     ) -> Result<(), DbError> {
         self.state.lock().unwrap().run_origin.insert(
             run.clone(),
@@ -651,9 +664,20 @@ impl Db for InMemoryDb {
                 git_ref.map(str::to_string),
                 sha.map(str::to_string),
                 pr_number,
+                pr_base.map(str::to_string),
             ),
         );
         Ok(())
+    }
+
+    async fn run_pr_base(&self, run: &RunId) -> Result<Option<String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .run_origin
+            .get(run)
+            .and_then(|o| o.5.clone()))
     }
 
     async fn set_run_pipeline(&self, run: &RunId, pipeline: &str) -> Result<(), DbError> {

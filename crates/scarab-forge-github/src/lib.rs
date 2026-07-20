@@ -99,11 +99,26 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                 // Absent head repo (deleted fork) → treat as a fork (untrusted).
                 _ => head_repo.is_none(),
             };
+            // The PR title — source of the run Headline (ADR-0057) — and the base
+            // branch (`base ← head` display). Display/audit only; both are
+            // deliberately kept out of Event::context(). Absent → empty.
+            let title = p
+                .pointer("/pull_request/title")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let base = p
+                .pointer("/pull_request/base/ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             Ok(Event::PullRequest {
                 actor,
                 repo,
                 number,
                 head,
+                title,
+                base,
                 fork,
             })
         }
@@ -1021,6 +1036,8 @@ mod tests {
         let internal = json!({
             "pull_request": {
                 "number": 42,
+                "title": "feat: add the widget",
+                "base": { "ref": "main" },
                 "head": { "sha": "feedface", "repo": { "full_name": "acme/app" } }
             },
             "repository": { "name": "app", "owner": { "login": "acme" }, "full_name": "acme/app" },
@@ -1036,6 +1053,10 @@ mod tests {
                 },
                 number: 42,
                 head: "feedface".into(),
+                // Parsed from pull_request.title / pull_request.base.ref (ADR-0057);
+                // the title feeds the Headline, the base the `base ← head` display.
+                title: "feat: add the widget".into(),
+                base: "main".into(),
                 fork: false,
             }
         );

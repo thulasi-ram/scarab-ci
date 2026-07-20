@@ -110,6 +110,11 @@ pub struct RunSummary {
     /// The pull-request number, for `pull_request` runs.
     #[serde(default)]
     pub pr_number: Option<i64>,
+    /// The PR **base** branch (`origin_pr_base`, ADR-0057) — the branch a
+    /// `pull_request` run targets, rendered `base ← head`. A discrete origin
+    /// fact, `None` for non-PR runs and pre-stamping runs.
+    #[serde(default)]
+    pub pr_base: Option<String>,
     /// The bare name of the pipeline this run executed (the `.scarab/<name>`
     /// selection), stamped at creation for trigger/dispatch runs. `None` for
     /// inline runs (no named pipeline) and pre-stamping runs.

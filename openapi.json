@@ -1961,6 +1961,13 @@
           "id": {
             "type": "string"
           },
+          "origin_pr_base": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The PR **base** branch (ADR-0057) — the branch a `pull_request` run\ntargets, rendered `base ← head` in the ref cluster. A discrete origin\nfact; absent for non-PR runs and runs created before base-stamping."
+          },
           "params": {
             "type": "object",
             "description": "The run's frozen launch parameters, `name → typed value` (ADR-0043 §5).\nA run-level constant resolved once at creation; non-secret by contract\n(§6), so safe to expose. Empty when the run took none. Lets the UI's\nre-run flow pre-fill the form from the prior run's params."
@@ -2032,6 +2039,13 @@
               "null"
             ],
             "description": "The owning org, if the run is tenanted (trigger-created)."
+          },
+          "origin_pr_base": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The PR **base** branch (ADR-0057) — the branch a `pull_request` run\ntargets, rendered `base ← head` in the ref cluster. A discrete origin\nfact; absent for non-PR runs and runs created before base-stamping."
           },
           "pipeline": {
             "type": [
