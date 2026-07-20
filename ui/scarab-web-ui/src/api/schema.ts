@@ -346,6 +346,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/repos/{org}/{repo}/refs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /v1/repos/{org}/{repo}/refs?q=` — the repo's branches and tags for a
+         *     searchable ref picker (ADR-0046), backed by the repo's `ForgeConnection`.
+         *     `q`, when set, is a case-insensitive substring the ref name must contain
+         *     (applied by the adapter, since neither forge's list API takes a search
+         *     param). Branches sort before tags, each group name-ascending, so the picker
+         *     order is stable regardless of forge return order. Scoped to branches + tags.
+         *     Read capability.
+         */
+        get: operations["list_refs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/repos/{org}/{repo}/runs": {
         parameters: {
             query?: never;
@@ -1060,6 +1085,29 @@ export interface components {
             repo?: string | null;
             /** @description Secret value — stored envelope-encrypted, never returned. */
             value: string;
+        };
+        /**
+         * @description One branch or tag: its kind, bare name, and the short SHA of the commit it
+         *     points at (a resolved-SHA hint for the picker row). The full SHA is
+         *     intentionally omitted — selecting a ref re-resolves it through the pipelines
+         *     endpoint, which is the authority on the pinned commit.
+         */
+        RefDto: {
+            /** @description `branch` or `tag`. */
+            kind: string;
+            /** @description The bare ref name (no `refs/{heads,tags}/` prefix), e.g. `main`, `v0.3.1`. */
+            name: string;
+            /** @description The 7-char short SHA of the commit the ref points at. */
+            short_sha: string;
+        };
+        /**
+         * @description `GET /v1/repos/{org}/{repo}/refs?q=` body: the repo's branches and tags for a
+         *     searchable ref picker (ADR-0046). Scoped to branches + tags — recent commits
+         *     and open-PR head-refs are a deliberate follow-up, not part of v1.
+         */
+        RefsResponse: {
+            /** @description Branches first, then tags; each group name-sorted. */
+            refs: components["schemas"]["RefDto"][];
         };
         /** @description `GET /v1/runs` body: the most recent runs, newest first. */
         RunListResponse: {
@@ -1779,6 +1827,34 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_refs: {
+        parameters: {
+            query?: {
+                /** @description case-insensitive substring the ref name must contain */
+                q?: string;
+            };
+            header?: never;
+            path: {
+                /** @description repo owner */
+                org: string;
+                /** @description repo name */
+                repo: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description the repo's branches and tags */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RefsResponse"];
+                };
             };
         };
     };

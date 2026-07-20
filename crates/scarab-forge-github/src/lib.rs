@@ -9,8 +9,8 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use scarab_forge::{
-    CheckoutCredential, Commit, Event, ForgeError, ForgePort, Permissions, RepoRef, Status,
-    WebhookDelivery,
+    filter_refs, CheckoutCredential, Commit, Event, ForgeError, ForgePort, ForgeRef, Permissions,
+    RefKind, RepoRef, Status, WebhookDelivery,
 };
 use serde_json::Value;
 use sha2::Sha256;
@@ -678,6 +678,35 @@ impl ForgePort for GithubForge {
             .iter()
             .filter_map(|e| e.get("path").and_then(Value::as_str).map(str::to_string))
             .collect())
+    }
+
+    async fn list_refs(
+        &self,
+        repo: &RepoRef,
+        query: Option<&str>,
+    ) -> Result<Vec<ForgeRef>, ForgeError> {
+        let token = self.auth_token_for(repo).await?;
+        // Branches and tags share a shape: `{ name, commit: { sha } }`. GitHub's
+        // list endpoints have no name-search param, so we page both fully and
+        // filter by `query` here.
+        let mut refs = Vec::new();
+        for (kind, coll) in [(RefKind::Branch, "branches"), (RefKind::Tag, "tags")] {
+            let path = format!("/repos/{}/{}/{coll}", repo.owner, repo.name);
+            for item in self.get_paginated(&path, &token).await? {
+                let (Some(name), Some(sha)) = (
+                    item.get("name").and_then(Value::as_str),
+                    item.pointer("/commit/sha").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                refs.push(ForgeRef {
+                    kind,
+                    name: name.to_string(),
+                    sha: sha.to_string(),
+                });
+            }
+        }
+        Ok(filter_refs(refs, query))
     }
 
     /// A no-op by design (ADR-0046): the GitHub App receives every

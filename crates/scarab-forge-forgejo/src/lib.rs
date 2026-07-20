@@ -20,8 +20,8 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use scarab_forge::{
-    CheckoutCredential, Commit, Event, ForgeError, ForgePort, Permissions, RepoRef, Status,
-    WebhookDelivery,
+    filter_refs, CheckoutCredential, Commit, Event, ForgeError, ForgePort, ForgeRef, Permissions,
+    RefKind, RepoRef, Status, WebhookDelivery,
 };
 use serde_json::Value;
 use sha2::Sha256;
@@ -359,6 +359,50 @@ impl ForgePort for ForgejoForge {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    async fn list_refs(
+        &self,
+        repo: &RepoRef,
+        query: Option<&str>,
+    ) -> Result<Vec<ForgeRef>, ForgeError> {
+        // Forgejo has no name-search param and paginates at `limit=50`; page each
+        // collection until a short page. Branch tips live at `commit.id`, tag
+        // tips at `commit.sha` — accept either. Filter by `query` after fetch.
+        const PAGE: usize = 50;
+        let mut refs = Vec::new();
+        for (kind, coll) in [(RefKind::Branch, "branches"), (RefKind::Tag, "tags")] {
+            let mut page = 1;
+            loop {
+                let url = self.url(&format!(
+                    "/repos/{}/{}/{coll}?page={page}&limit={PAGE}",
+                    repo.owner, repo.name
+                ));
+                let resp = self.send(|| self.client.get(&url)).await?;
+                let body = ok_json(resp).await?;
+                let items = body.as_array().cloned().unwrap_or_default();
+                let n = items.len();
+                for item in items {
+                    let name = item.get("name").and_then(Value::as_str);
+                    let sha = item
+                        .pointer("/commit/sha")
+                        .or_else(|| item.pointer("/commit/id"))
+                        .and_then(Value::as_str);
+                    if let (Some(name), Some(sha)) = (name, sha) {
+                        refs.push(ForgeRef {
+                            kind,
+                            name: name.to_string(),
+                            sha: sha.to_string(),
+                        });
+                    }
+                }
+                if n < PAGE {
+                    break;
+                }
+                page += 1;
+            }
+        }
+        Ok(filter_refs(refs, query))
     }
 
     /// REAL webhook registration (ADR-0046): Forgejo has no single-app

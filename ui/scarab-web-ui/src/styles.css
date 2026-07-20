@@ -1203,6 +1203,67 @@ h2 {
   padding-right: 2px;
 }
 
+/* ---- SearchSelect (reusable Select2-style searchable single-select) ---- */
+/* Trigger mirrors .fselect so it sits naturally in filter bars; the .ss-block
+   variant makes it a full-width form field like .input. The popover is portalled
+   + position:fixed, so it escapes any ancestor overflow clip. */
+.ss-trigger {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 8px 4px 10px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--emerald-surface); color: var(--sage);
+  font-family: var(--font-mono); font-size: 11.5px; cursor: pointer;
+}
+.ss-trigger:hover { border-color: var(--emerald); }
+.ss-trigger:disabled { opacity: 0.5; cursor: not-allowed; }
+.ss-trigger:disabled:hover { border-color: var(--border); }
+.ss-label { color: var(--sage); }
+.ss-placeholder { color: var(--muted-sage); }
+.ss-caret { color: var(--muted-sage); margin-left: 2px; }
+/* Full-width variant for form fields (matches .input metrics). */
+.ss-block {
+  width: 100%; justify-content: flex-start; gap: 8px;
+  padding: 8px 10px; font-size: 13px; border-radius: var(--radius-sm);
+}
+.ss-block .ss-label { color: var(--soft-white); }
+.ss-block .ss-caret { margin-left: auto; }
+
+.ss-pop {
+  position: fixed; z-index: 1000;
+  padding: 5px; min-width: 200px; max-width: 380px;
+  background: var(--emerald-elevated); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+}
+.ss-search {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 6px 7px; border-bottom: 1px solid var(--border-soft);
+}
+.ss-search svg { color: var(--muted-sage); flex: none; }
+.ss-search input {
+  width: 100%; border: none; background: none; outline: none;
+  font-family: var(--font-ui); font-size: 13px; color: var(--soft-white);
+}
+.ss-list { list-style: none; margin: 5px 0 0; padding: 0; max-height: 256px; overflow-y: auto; }
+.ss-opt {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 8px; border-radius: 4px; cursor: pointer;
+  font-size: 13px; color: var(--soft-white);
+}
+.ss-opt.on { background: color-mix(in srgb, var(--emerald) 15%, transparent); }
+.ss-opt.ss-clear { color: var(--muted-sage); }
+.ss-opt-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ss-tag {
+  flex: none; font-family: var(--font-mono); font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted-sage);
+}
+.ss-tag.tag { color: var(--copper); }
+.ss-hint { flex: none; color: var(--muted-sage); font-size: 11.5px; }
+.ss-dot {
+  flex: none; margin-left: auto; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--emerald);
+}
+.ss-empty { padding: 9px 8px; font-size: 12px; font-style: italic; color: var(--muted-sage); }
+
 /* ---- buttons additions ---- */
 .btn-copper {
   background: transparent; border-color: var(--copper); color: var(--copper);
@@ -1447,6 +1508,42 @@ h2 {
 .rp-ref-field { flex: 1; min-width: 220px; }
 .rp-sha { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--copper); }
 .rp-sha svg { color: var(--muted-sage); }
+
+/* ref combobox: a live-filtered branch/tag menu under the free-text ref input.
+   Absent refs (no forge / error) => no menu, and the input stays plain text. */
+/* The base `.panel` clips with overflow:hidden (rounded corners); this panel
+   must let the dropdown spill past its bottom edge, so re-round the filled
+   header itself since it can no longer rely on the panel's clip. */
+.panel-combo { overflow: visible; }
+.panel-combo .panel-h {
+  border-top-left-radius: var(--radius);
+  border-top-right-radius: var(--radius);
+}
+.rp-combo { position: relative; }
+.rp-combo-menu {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 20;
+  margin: 0; padding: 4px; list-style: none;
+  background: var(--emerald-elevated); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  max-height: 268px; overflow-y: auto;
+}
+.rp-combo-opt {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 9px; border-radius: 4px; cursor: pointer;
+  font-size: 13px; color: var(--soft-white);
+}
+.rp-combo-opt.on { background: color-mix(in srgb, var(--emerald) 15%, transparent); }
+.rp-ref-kind {
+  flex: none; width: 42px; font-family: var(--font-mono); font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted-sage);
+}
+.rp-ref-kind.tag { color: var(--copper); }
+.rp-ref-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rp-ref-osha { flex: none; color: var(--muted-sage); font-size: 11.5px; }
+.rp-combo-hint {
+  padding: 7px 9px; margin-top: 3px; border-top: 1px solid var(--border);
+  font-size: 11.5px; font-style: italic; color: var(--muted-sage);
+}
 
 .rp-catalog { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
 .rp-pipe {

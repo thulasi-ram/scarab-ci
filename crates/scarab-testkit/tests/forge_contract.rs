@@ -15,7 +15,10 @@ async fn fake_forge_passes_the_port_contract() {
     };
     let forge = FakeForge::new()
         .with_file(".scarab/ci.yaml", "on: {push: {}}\nsteps: []")
-        .with_commit("refs/heads/main", "cafe1234");
+        .with_commit("refs/heads/main", "cafe1234")
+        .with_branch("main", "cafe1234")
+        .with_branch("feat/widget", "beef5678")
+        .with_tag("v1.0.0", "cafe1234");
 
     // The fake's wire format is the canonical Event itself.
     let push_delivery = WebhookDelivery {
@@ -41,6 +44,7 @@ async fn fake_forge_passes_the_port_contract() {
             b"on: {push: {}}\nsteps: []".to_vec(),
         ),
         push_delivery,
+        known_branch: Some("main".into()),
     };
     assert_contract(&forge, &fx).await;
 }

@@ -453,6 +453,37 @@ pub struct CatalogEntry {
     pub error: Option<String>,
 }
 
+/// Query for the ref picker (ADR-0046): an optional case-insensitive substring
+/// the ref name must contain. Absent/blank returns every branch and tag.
+#[derive(Debug, Deserialize)]
+pub struct RefsQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
+/// `GET /v1/repos/{org}/{repo}/refs?q=` body: the repo's branches and tags for a
+/// searchable ref picker (ADR-0046). Scoped to branches + tags — recent commits
+/// and open-PR head-refs are a deliberate follow-up, not part of v1.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RefsResponse {
+    /// Branches first, then tags; each group name-sorted.
+    pub refs: Vec<RefDto>,
+}
+
+/// One branch or tag: its kind, bare name, and the short SHA of the commit it
+/// points at (a resolved-SHA hint for the picker row). The full SHA is
+/// intentionally omitted — selecting a ref re-resolves it through the pipelines
+/// endpoint, which is the authority on the pinned commit.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RefDto {
+    /// `branch` or `tag`.
+    pub kind: String,
+    /// The bare ref name (no `refs/{heads,tags}/` prefix), e.g. `main`, `v0.3.1`.
+    pub name: String,
+    /// The 7-char short SHA of the commit the ref points at.
+    pub short_sha: String,
+}
+
 /// `GET /v1/repos/{org}/{repo}/pipelines/{name}/interface?ref=` body: the
 /// compiled, typed launch-parameter schema for ONE selected pipeline (ADR-0043
 /// §4). A pure function of the compiled IR — the same compile path dispatch
@@ -986,6 +1017,68 @@ async fn list_pipelines(
     }
 
     Ok(Json(PipelineCatalogResponse { sha, pipelines }))
+}
+
+/// `GET /v1/repos/{org}/{repo}/refs?q=` — the repo's branches and tags for a
+/// searchable ref picker (ADR-0046), backed by the repo's `ForgeConnection`.
+/// `q`, when set, is a case-insensitive substring the ref name must contain
+/// (applied by the adapter, since neither forge's list API takes a search
+/// param). Branches sort before tags, each group name-ascending, so the picker
+/// order is stable regardless of forge return order. Scoped to branches + tags.
+/// Read capability.
+#[utoipa::path(
+    get,
+    path = "/v1/repos/{org}/{repo}/refs",
+    params(
+        ("org" = String, Path, description = "repo owner"),
+        ("repo" = String, Path, description = "repo name"),
+        ("q" = Option<String>, Query, description = "case-insensitive substring the ref name must contain")
+    ),
+    responses((status = 200, description = "the repo's branches and tags", body = RefsResponse))
+)]
+async fn list_refs(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo)): Path<(String, String)>,
+    Query(q): Query<RefsQuery>,
+) -> Result<Json<RefsResponse>, ApiError> {
+    let scope = scarab_identity::Scope::Project {
+        org: org.clone(),
+        name: repo.clone(),
+    };
+    authorize_scoped(&st, &headers, Action::Read, Some(&scope)).await?;
+    let forge = st
+        .forge
+        .as_ref()
+        .ok_or_else(|| ApiError::BadRequest("no forge configured".into()))?;
+    let repo = scarab_forge::RepoRef {
+        owner: org,
+        name: repo,
+    };
+
+    let mut refs = forge
+        .list_refs(&repo, q.q.as_deref())
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    // Branches before tags, each group name-sorted — a stable picker order.
+    let rank = |k: &scarab_forge::RefKind| matches!(k, scarab_forge::RefKind::Tag) as u8;
+    refs.sort_by(|a, b| rank(&a.kind).cmp(&rank(&b.kind)).then_with(|| a.name.cmp(&b.name)));
+
+    let refs = refs
+        .into_iter()
+        .map(|r| RefDto {
+            kind: match r.kind {
+                scarab_forge::RefKind::Branch => "branch",
+                scarab_forge::RefKind::Tag => "tag",
+            }
+            .to_string(),
+            name: r.name,
+            short_sha: r.sha.chars().take(7).collect(),
+        })
+        .collect();
+
+    Ok(Json(RefsResponse { refs }))
 }
 
 /// The compiled, typed launch-parameter schema for one selected pipeline
@@ -4856,6 +4949,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         ingest_step_results,
         create_run,
         dispatch,
+        list_refs,
         list_pipelines,
         pipeline_interface,
         list_runs,
@@ -4887,6 +4981,8 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         DispatchKind,
         PipelineCatalogResponse,
         CatalogEntry,
+        RefsResponse,
+        RefDto,
         PipelineInterfaceResponse,
         PipelineDto,
         StepDto,
@@ -4995,6 +5091,7 @@ fn router_inner(state: AppState) -> Router {
             get(list_deployments),
         )
         .route("/v1/repos/{org}/{repo}/secrets/matrix", get(secret_matrix))
+        .route("/v1/repos/{org}/{repo}/refs", get(list_refs))
         .route("/v1/repos/{org}/{repo}/pipelines", get(list_pipelines))
         .route(
             "/v1/repos/{org}/{repo}/pipelines/{name}/interface",

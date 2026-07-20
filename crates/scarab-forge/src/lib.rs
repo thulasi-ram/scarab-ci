@@ -26,6 +26,42 @@ pub struct Commit {
     pub message: String,
 }
 
+/// Whether a [`ForgeRef`] is a branch or a tag — the discoverable-ref kinds the
+/// port surfaces (ADR-0046). Recent-commits / open-PR head-refs are out of
+/// scope for v1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefKind {
+    Branch,
+    Tag,
+}
+
+/// A branch or tag on the forge with the commit it points at, for a ref picker
+/// (ADR-0046). `sha` is the **full** commit SHA — truncating to a short SHA is
+/// a presentation concern for the caller, kept consistent with [`Commit::sha`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeRef {
+    pub kind: RefKind,
+    pub name: String,
+    pub sha: String,
+}
+
+/// Apply [`ForgePort::list_refs`]'s optional `query` to an already-fetched ref
+/// list — the shared post-fetch filter for adapters whose forge API has no
+/// server-side name search. A case-insensitive substring match on the ref name;
+/// a blank/absent query passes everything through.
+pub fn filter_refs(refs: Vec<ForgeRef>, query: Option<&str>) -> Vec<ForgeRef> {
+    match query.map(str::trim).filter(|q| !q.is_empty()) {
+        None => refs,
+        Some(q) => {
+            let needle = q.to_lowercase();
+            refs.into_iter()
+                .filter(|r| r.name.to_lowercase().contains(&needle))
+                .collect()
+        }
+    }
+}
+
 /// A commit-status / check result to publish back to the forge. Pitched at
 /// commit-status level — the capability *both* forges guarantee (ADR-0046);
 /// an adapter may enrich internally (e.g. GitHub Checks) without the port
@@ -426,6 +462,17 @@ pub trait ForgePort: Send + Sync {
         dir: &str,
     ) -> Result<Vec<String>, ForgeError>;
 
+    /// List the repo's branches and tags, each with the commit it points at
+    /// (ADR-0046) — the source for a searchable ref picker. `query`, when set,
+    /// is a case-insensitive substring the ref name must contain; adapters
+    /// whose forge API has no server-side name search filter after fetching.
+    /// Ordering is unspecified — the caller sorts and labels.
+    async fn list_refs(
+        &self,
+        repo: &RepoRef,
+        query: Option<&str>,
+    ) -> Result<Vec<ForgeRef>, ForgeError>;
+
     async fn register_webhook(&self, repo: &RepoRef, callback_url: &str) -> Result<(), ForgeError>;
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError>;
@@ -610,6 +657,10 @@ pub mod contract {
         pub known_file: (String, Vec<u8>),
         /// A raw webhook delivery that normalizes to a `push` on `repo`.
         pub push_delivery: WebhookDelivery,
+        /// A branch name `list_refs` must surface, if the fixture can name one.
+        /// When set, the suite also asserts a substring `query` narrows to it;
+        /// `None` skips the ref assertions (only that `list_refs` doesn't error).
+        pub known_branch: Option<String>,
     }
 
     /// Assert the full port contract. Panics on violation — designed to be the
@@ -673,6 +724,35 @@ pub mod contract {
         port.register_webhook(&fx.repo, "https://scarab.example/webhooks/x")
             .await
             .expect("register_webhook accepted");
+
+        // Capability: list the repo's branches/tags for the ref picker.
+        let refs = port
+            .list_refs(&fx.repo, None)
+            .await
+            .expect("list_refs enumerates branches and tags");
+        if let Some(branch) = &fx.known_branch {
+            assert!(
+                refs.iter()
+                    .any(|r| r.kind == RefKind::Branch && &r.name == branch),
+                "list_refs surfaces the known branch {branch} (got {refs:?})"
+            );
+            // A substring `query` narrows by name (case-insensitive).
+            let needle = &branch[..branch.len().min(3)];
+            let narrowed = port
+                .list_refs(&fx.repo, Some(&needle.to_uppercase()))
+                .await
+                .expect("list_refs accepts a query");
+            assert!(
+                narrowed.iter().any(|r| &r.name == branch),
+                "a substring query still matches the known branch"
+            );
+            assert!(
+                narrowed
+                    .iter()
+                    .all(|r| r.name.to_lowercase().contains(&needle.to_lowercase())),
+                "every returned ref matches the query substring"
+            );
+        }
 
         // Capability: mint a scoped checkout credential; read-only honored.
         let cred = port

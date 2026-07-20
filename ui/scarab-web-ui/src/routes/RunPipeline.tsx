@@ -6,7 +6,7 @@
 // predicate runs server-side at dispatch and comes back as a per-field error.
 import { createResource, createSignal, createEffect, For, Show } from "solid-js";
 import { A, useParams, useNavigate, useLocation } from "@solidjs/router";
-import { listPipelines, pipelineInterface, dispatchRun } from "../api/client";
+import { listRefs, listPipelines, pipelineInterface, dispatchRun } from "../api/client";
 import {
   initialValues,
   reconcilePrefill,
@@ -17,6 +17,7 @@ import {
   type ParamSpec,
 } from "../params";
 import Icon from "../components/Icon";
+import SearchSelect from "../components/SearchSelect";
 import Doodle from "../components/Doodle";
 
 // Re-run hands the prior run's frozen params through router state (ADR-0043 §6).
@@ -94,6 +95,51 @@ export default function RunPipeline() {
     setLoadedRef(ref().trim() || "HEAD");
   };
 
+  // ---- ref combobox -------------------------------------------------------
+  // The repo's branches + tags, fetched once. Filtering is client-side over the
+  // typed text (the list is small and it keeps the dropdown instant); a repo
+  // with no forge / an error yields `[]`, so the field degrades to the plain
+  // free-text entry it was before — you can still type a branch or full SHA.
+  const [refs] = createResource(
+    () => ({ org: org(), repo: repo() }),
+    (k) => listRefs(k.org, k.repo),
+  );
+  const [refOpen, setRefOpen] = createSignal(false);
+  const [refHi, setRefHi] = createSignal(0);
+
+  const refMatches = () => {
+    const q = ref().trim().toLowerCase();
+    const all = refs() ?? [];
+    return q ? all.filter((r) => r.name.toLowerCase().includes(q)) : all;
+  };
+
+  // Commit a picked ref and load its catalog in one gesture.
+  const pickRef = (name: string) => {
+    setRef(name);
+    setRefOpen(false);
+    loadCatalog();
+  };
+
+  const onRefKey = (e: KeyboardEvent) => {
+    const ms = refMatches();
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setRefOpen(true);
+      setRefHi((h) => Math.min(h + 1, ms.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setRefHi((h) => Math.max(h - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      // A highlighted suggestion wins; otherwise commit whatever was typed
+      // (a branch name or a pasted full SHA) directly.
+      if (refOpen() && ms.length > 0) pickRef(ms[Math.min(refHi(), ms.length - 1)].name);
+      else loadCatalog();
+    } else if (e.key === "Escape") {
+      setRefOpen(false);
+    }
+  };
+
   async function submit() {
     const i = iface();
     const name = selected();
@@ -143,19 +189,52 @@ export default function RunPipeline() {
       </Show>
 
       {/* ---- ref picker ---- */}
-      <div class="panel">
+      {/* overflow-visible so the combobox dropdown can spill past the card edge
+          (the base `.panel` clips with overflow:hidden for its rounded corners). */}
+      <div class="panel panel-combo">
         <div class="panel-h"><span>Ref</span></div>
         <div class="rp-ref">
           <div class="rp-ref-row">
             <label class="field rp-ref-field">
               <span class="field-label">branch / tag / sha</span>
-              <input
-                class="input"
-                value={ref()}
-                onInput={(e) => setRef(e.currentTarget.value)}
-                onKeyDown={(e) => e.key === "Enter" && loadCatalog()}
-                placeholder="main"
-              />
+              <div class="rp-combo">
+                <input
+                  class="input"
+                  value={ref()}
+                  autocomplete="off"
+                  onInput={(e) => {
+                    setRef(e.currentTarget.value);
+                    setRefOpen(true);
+                    setRefHi(0);
+                  }}
+                  onFocus={() => setRefOpen(true)}
+                  // Delay the close so a mouse click on an option still lands.
+                  onBlur={() => setTimeout(() => setRefOpen(false), 120)}
+                  onKeyDown={onRefKey}
+                  placeholder="main"
+                />
+                <Show when={refOpen() && refMatches().length > 0}>
+                  <ul class="rp-combo-menu">
+                    <For each={refMatches()}>
+                      {(r, i) => (
+                        <li
+                          class={`rp-combo-opt ${i() === refHi() ? "on" : ""}`}
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            pickRef(r.name);
+                          }}
+                          onMouseEnter={() => setRefHi(i())}
+                        >
+                          <span class={`rp-ref-kind ${r.kind}`}>{r.kind}</span>
+                          <span class="rp-ref-name">{r.name}</span>
+                          <span class="mono rp-ref-osha">{r.short_sha}</span>
+                        </li>
+                      )}
+                    </For>
+                    <li class="rp-combo-hint">…or type a full SHA to pin directly</li>
+                  </ul>
+                </Show>
+              </div>
             </label>
             <button class="btn btn-primary" onClick={loadCatalog}>
               <Icon icon="search" size={14} /> Load pipelines
@@ -319,18 +398,14 @@ function Field(props: {
       </Show>
 
       <Show when={spec.type === "choice"}>
-        <select
-          class="input"
+        <SearchSelect
+          class="ss-block"
+          placeholder="select…"
+          searchPlaceholder="Search options…"
           value={strValue()}
-          onChange={(e) => props.onChange(e.currentTarget.value)}
-        >
-          <Show when={spec.required && strValue() === ""}>
-            <option value="" disabled>
-              select…
-            </option>
-          </Show>
-          <For each={spec.options ?? []}>{(o) => <option value={o}>{o}</option>}</For>
-        </select>
+          onChange={(v) => props.onChange(v)}
+          options={(spec.options ?? []).map((o) => ({ value: o, label: o }))}
+        />
       </Show>
 
       <Show when={spec.type === "number"}>

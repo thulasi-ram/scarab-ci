@@ -24,6 +24,7 @@ import {
 } from "../api/client";
 import { relTime, absTime, duration } from "../fmt";
 import Icon from "../components/Icon";
+import SearchSelect from "../components/SearchSelect";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
@@ -58,6 +59,26 @@ function triggerLabel(kind: string | null | undefined): string | null {
   return kind === "pull_request" ? "PR" : kind;
 }
 
+// The branch/tag a run ran on: `git_ref` with its `refs/{heads,tags}/` prefix
+// stripped. Unlike `refLabel`, this ignores `pr_number` — a PR run still ran on
+// a head branch, and the branch filter should match it. `null` when refless.
+function branchLabel(r: RunSummary): string | null {
+  const ref = r.git_ref;
+  if (!ref) return null;
+  return ref.replace(/^refs\/heads\//, "").replace(/^refs\/tags\//, "");
+}
+
+// Distinct, non-empty values a projection takes across the fetched rows — the
+// option set for a filter dropdown. Sorted by the caller.
+function distinct<T>(rows: RunSummary[], pick: (r: RunSummary) => T | null | undefined): T[] {
+  const seen = new Set<T>();
+  for (const r of rows) {
+    const v = pick(r);
+    if (v != null && v !== "") seen.add(v);
+  }
+  return [...seen];
+}
+
 // Duration to show: a terminal run's total wall time (frozen `duration_ms`), or
 // a live run's elapsed since creation against the ticking `now`.
 function durationLabel(r: RunSummary, now: number): string {
@@ -83,6 +104,11 @@ export default function RepoView() {
 
   const [tab, setTab] = createSignal<Tab>("runs");
   const [statusFilter, setStatusFilter] = createSignal<"all" | "running" | "failed">("all");
+  // Origin filters, client-side over the already-fetched rows. `""` = "any";
+  // `prFilter` holds the PR number stringified (`<select>` values are strings).
+  const [authorFilter, setAuthorFilter] = createSignal("");
+  const [branchFilter, setBranchFilter] = createSignal("");
+  const [prFilter, setPrFilter] = createSignal("");
   const [showEnvDialog, setShowEnvDialog] = createSignal(false);
   const [envEpoch, setEnvEpoch] = createSignal(0); // bump to refetch the env list after a create
   const [secretFocus, setSecretFocus] = createSignal(0);
@@ -93,10 +119,39 @@ export default function RepoView() {
   const tick = setInterval(() => setNow(Date.now()), 1000);
   onCleanup(() => clearInterval(tick));
 
+  // Option sets for the origin dropdowns, derived from whatever the fetched rows
+  // actually carry — so you only ever pick a value that exists. A dropdown with
+  // no values is hidden (see the JSX), not shown empty.
+  const authors = () => distinct(rows() ?? [], (r) => r.actor).sort();
+  const branches = () => distinct(rows() ?? [], branchLabel).sort();
+  const prNumbers = () => distinct(rows() ?? [], (r) => r.pr_number).sort((a, b) => b - a);
+
+  const anyFilterOn = () =>
+    statusFilter() !== "all" || !!authorFilter() || !!branchFilter() || !!prFilter();
+
+  const clearFilters = () => {
+    setStatusFilter("all");
+    setAuthorFilter("");
+    setBranchFilter("");
+    setPrFilter("");
+  };
+
+  // All predicates AND together. Each origin field is independently nullable, so
+  // an engaged filter simply excludes any row that can't match it (older runs
+  // predating origin-stamping fall out here) — but a disengaged filter (`""` /
+  // `"all"`) never hides a row for lacking that field.
   const filtered = () => {
-    const all = rows() ?? [];
     const s = statusFilter();
-    return s === "all" ? all : all.filter((r) => r.status === s);
+    const author = authorFilter();
+    const branch = branchFilter();
+    const pr = prFilter();
+    return (rows() ?? []).filter((r) => {
+      if (s !== "all" && r.status !== s) return false;
+      if (author && r.actor !== author) return false;
+      if (branch && branchLabel(r) !== branch) return false;
+      if (pr && String(r.pr_number ?? "") !== pr) return false;
+      return true;
+    });
   };
 
   // The header CTA follows the tab: what you'd create in this context.
@@ -161,6 +216,47 @@ export default function RepoView() {
               </button>
             )}
           </For>
+
+          <Show when={authors().length > 0}>
+            <SearchSelect
+              icon="user"
+              clearable
+              placeholder="any author"
+              searchPlaceholder="Search authors…"
+              value={authorFilter()}
+              onChange={setAuthorFilter}
+              options={authors().map((a) => ({ value: a, label: a }))}
+            />
+          </Show>
+
+          <Show when={branches().length > 0}>
+            <SearchSelect
+              icon="git-branch"
+              clearable
+              placeholder="any branch"
+              searchPlaceholder="Search branches…"
+              value={branchFilter()}
+              onChange={setBranchFilter}
+              options={branches().map((b) => ({ value: b, label: b }))}
+            />
+          </Show>
+
+          <Show when={prNumbers().length > 0}>
+            <SearchSelect
+              icon="git-pull-request"
+              clearable
+              placeholder="any PR"
+              searchPlaceholder="Search PRs…"
+              value={prFilter()}
+              onChange={setPrFilter}
+              options={prNumbers().map((p) => ({ value: String(p), label: `PR #${p}` }))}
+            />
+          </Show>
+
+          <Show when={anyFilterOn()}>
+            <button class="fpill" onClick={clearFilters}>clear</button>
+          </Show>
+
           <button class="btn btn-ghost btn-sm filters-refresh" onClick={() => refetch()}>
             <Icon icon="rotate-cw" size={13} /> Refresh
           </button>

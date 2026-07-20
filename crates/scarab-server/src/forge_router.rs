@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use scarab_forge::{
     CheckoutCredential, Commit, Event, ForgeConnection, ForgeConnectionStore, ForgeError,
-    ForgeKind, ForgePort, Permissions, RepoRef, Status, WebhookDelivery,
+    ForgeKind, ForgePort, ForgeRef, Permissions, RepoRef, Status, WebhookDelivery,
 };
 
 use crate::connection_credential;
@@ -165,6 +165,14 @@ impl ForgePort for RegistryForge {
             .await?
             .register_webhook(repo, callback_url)
             .await
+    }
+
+    async fn list_refs(
+        &self,
+        repo: &RepoRef,
+        query: Option<&str>,
+    ) -> Result<Vec<ForgeRef>, ForgeError> {
+        self.adapter_for(repo).await?.list_refs(repo, query).await
     }
 
     /// Not routable: normalization has no repo until AFTER it runs. The

@@ -1530,8 +1530,8 @@ impl ObjectStore for InMemoryObjectStore {
 // ---------------------------------------------------------------------------
 
 use scarab_forge::{
-    CheckoutCredential, Commit, Event, ForgeError, ForgePort, Permissions, RepoRef, Status,
-    WebhookDelivery,
+    filter_refs, CheckoutCredential, Commit, Event, ForgeError, ForgePort, ForgeRef, Permissions,
+    RefKind, RepoRef, Status, WebhookDelivery,
 };
 
 /// An in-memory [`ForgePort`]: serves seeded in-repo files (by path, e.g.
@@ -1552,6 +1552,9 @@ pub struct FakeForge {
     /// When set, [`set_status`](ForgePort::set_status) fails — models a forge
     /// rejecting the post (e.g. an App missing `statuses:write` → HTTP 403).
     fail_status: Mutex<bool>,
+    /// Seeded branches/tags for [`list_refs`](ForgePort::list_refs) — the ref
+    /// picker's source. Empty (default) models a repo with nothing to list.
+    refs: Mutex<Vec<ForgeRef>>,
 }
 
 impl FakeForge {
@@ -1589,6 +1592,26 @@ impl FakeForge {
     /// rejects the post (e.g. an App lacking `statuses:write`).
     pub fn failing_status(self) -> Self {
         *self.fail_status.lock().unwrap() = true;
+        self
+    }
+
+    /// Seed a branch [`list_refs`](ForgePort::list_refs) will return.
+    pub fn with_branch(self, name: impl Into<String>, sha: impl Into<String>) -> Self {
+        self.refs.lock().unwrap().push(ForgeRef {
+            kind: RefKind::Branch,
+            name: name.into(),
+            sha: sha.into(),
+        });
+        self
+    }
+
+    /// Seed a tag [`list_refs`](ForgePort::list_refs) will return.
+    pub fn with_tag(self, name: impl Into<String>, sha: impl Into<String>) -> Self {
+        self.refs.lock().unwrap().push(ForgeRef {
+            kind: RefKind::Tag,
+            name: name.into(),
+            sha: sha.into(),
+        });
         self
     }
 
@@ -1797,6 +1820,14 @@ impl ForgePort for FakeForge {
         _callback_url: &str,
     ) -> Result<(), ForgeError> {
         Ok(())
+    }
+
+    async fn list_refs(
+        &self,
+        _repo: &RepoRef,
+        query: Option<&str>,
+    ) -> Result<Vec<ForgeRef>, ForgeError> {
+        Ok(filter_refs(self.refs.lock().unwrap().clone(), query))
     }
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError> {

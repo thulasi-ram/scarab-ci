@@ -474,6 +474,54 @@
         }
       }
     },
+    "/v1/repos/{org}/{repo}/refs": {
+      "get": {
+        "tags": [],
+        "summary": "`GET /v1/repos/{org}/{repo}/refs?q=` — the repo's branches and tags for a\nsearchable ref picker (ADR-0046), backed by the repo's `ForgeConnection`.\n`q`, when set, is a case-insensitive substring the ref name must contain\n(applied by the adapter, since neither forge's list API takes a search\nparam). Branches sort before tags, each group name-ascending, so the picker\norder is stable regardless of forge return order. Scoped to branches + tags.\nRead capability.",
+        "operationId": "list_refs",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "repo owner",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "repo",
+            "in": "path",
+            "description": "repo name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "description": "case-insensitive substring the ref name must contain",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "the repo's branches and tags",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/repos/{org}/{repo}/runs": {
       "get": {
         "tags": [],
@@ -1840,6 +1888,45 @@
           "value": {
             "type": "string",
             "description": "Secret value — stored envelope-encrypted, never returned."
+          }
+        }
+      },
+      "RefDto": {
+        "type": "object",
+        "description": "One branch or tag: its kind, bare name, and the short SHA of the commit it\npoints at (a resolved-SHA hint for the picker row). The full SHA is\nintentionally omitted — selecting a ref re-resolves it through the pipelines\nendpoint, which is the authority on the pinned commit.",
+        "required": [
+          "kind",
+          "name",
+          "short_sha"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`branch` or `tag`."
+          },
+          "name": {
+            "type": "string",
+            "description": "The bare ref name (no `refs/{heads,tags}/` prefix), e.g. `main`, `v0.3.1`."
+          },
+          "short_sha": {
+            "type": "string",
+            "description": "The 7-char short SHA of the commit the ref points at."
+          }
+        }
+      },
+      "RefsResponse": {
+        "type": "object",
+        "description": "`GET /v1/repos/{org}/{repo}/refs?q=` body: the repo's branches and tags for a\nsearchable ref picker (ADR-0046). Scoped to branches + tags — recent commits\nand open-PR head-refs are a deliberate follow-up, not part of v1.",
+        "required": [
+          "refs"
+        ],
+        "properties": {
+          "refs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RefDto"
+            },
+            "description": "Branches first, then tags; each group name-sorted."
           }
         }
       },

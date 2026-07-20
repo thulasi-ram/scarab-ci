@@ -79,6 +79,9 @@ async fn github_adapter_passes_the_port_contract() {
                 "repository": { "name": repo.name, "owner": { "login": repo.owner } }
             }),
         },
+        // Set SCARAB_TEST_GITHUB_BRANCH to also assert list_refs against a known
+        // branch; unset skips the ref-name assertions.
+        known_branch: env("SCARAB_TEST_GITHUB_BRANCH"),
     };
     assert_contract(&forge, &fx).await;
 

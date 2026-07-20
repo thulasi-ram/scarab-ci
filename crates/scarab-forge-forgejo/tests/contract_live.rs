@@ -73,6 +73,8 @@ async fn forgejo_adapter_passes_the_port_contract() {
                 "repository": { "name": repo.name, "owner": { "username": repo.owner } }
             }),
         },
+        // The fixture reads at `main`, so that branch exists; override via env.
+        known_branch: Some(env("SCARAB_TEST_FORGEJO_BRANCH").unwrap_or_else(|| "main".into())),
     };
     // The same suite the GitHub adapter passes — including REAL webhook
     // registration (a per-repo hook is actually created here).
