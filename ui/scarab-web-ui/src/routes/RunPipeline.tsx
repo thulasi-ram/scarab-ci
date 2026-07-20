@@ -61,6 +61,10 @@ export default function RunPipeline() {
   const [formError, setFormError] = createSignal<string | null>(null);
   const [dropped, setDropped] = createSignal<string[]>([]);
   const [submitting, setSubmitting] = createSignal(false);
+  // Optional dispatch reason (ADR-0057 §3) — free text, stamped as the run
+  // Headline. Not a pipeline parameter (it rides the dispatch, not the IR), so
+  // it lives outside the typed param form and is never validated client-side.
+  const [reason, setReason] = createSignal("");
 
   // (Re)initialise the form whenever a fresh interface loads. A re-run reconciles
   // the prior params against the current specs (dropping since-removed ones) and
@@ -152,11 +156,16 @@ export default function RunPipeline() {
     setSubmitting(true);
     setFormError(null);
     try {
+      const trimmedReason = reason().trim();
       const res = await dispatchRun(org(), repo(), {
         ref: i.sha, // pin to the resolved commit the form was built against
         pipeline: name,
         params: toRequestParams(i.inputs, values()),
         kind: "manual",
+        // Optional (ADR-0057): omitted when blank; the endpoint stamps it as the
+        // run Headline and never requires it here (requiredness is an
+        // Environment ProtectionRule at admission).
+        ...(trimmedReason ? { reason: trimmedReason } : {}),
       });
       if (res.ok) {
         nav(`/${org()}/${repo()}/runs/${res.id}`);
@@ -320,6 +329,26 @@ export default function RunPipeline() {
                           <b>{dropped().join(", ")}</b>
                         </p>
                       </Show>
+                      {/* Optional dispatch reason (ADR-0057) — free text, stamped
+                          as the run Headline. Not a pipeline parameter, so it sits
+                          above the typed form and is never client-validated. */}
+                      <div class="field rp-field">
+                        <span class="field-label rp-field-label">
+                          <span class="mono">reason</span>
+                          <span class="rp-opt">optional</span>
+                        </span>
+                        <input
+                          class="input"
+                          type="text"
+                          value={reason()}
+                          onInput={(e) => setReason(e.currentTarget.value)}
+                          placeholder="why are you running this? (shown as the run headline)"
+                        />
+                        <span class="rp-help">
+                          Recorded as the run's headline for audit. Optional here.
+                        </span>
+                      </div>
+
                       <Show
                         when={i.inputs.length > 0}
                         fallback={<p class="subtle">This pipeline declares no launch parameters.</p>}

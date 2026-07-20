@@ -197,6 +197,7 @@ async fn dispatch_manual_pins_resolved_sha_and_freezes_and_interpolates_params()
             ("replicas".to_string(), json!("5")), // string coerces to number
         ]),
         DispatchKind::Manual,
+        None,
     )
     .await
     .expect("dispatch");
@@ -284,6 +285,7 @@ async fn dispatch_rejects_a_pipeline_that_does_not_opt_into_manual() {
         "ci".into(),
         std::collections::BTreeMap::new(),
         DispatchKind::Manual,
+        None,
     )
     .await
     .expect_err("must reject a non-dispatchable pipeline");
@@ -317,6 +319,7 @@ async fn dispatch_rejects_missing_required_param_and_creates_no_run() {
         "ship".into(),
         std::collections::BTreeMap::new(),
         DispatchKind::Manual,
+        None,
     )
     .await
     .expect_err("missing required param must reject");
@@ -377,6 +380,7 @@ async fn dispatched_deploy_suspends_on_the_approval_gate() {
         "deploy".into(),
         std::collections::BTreeMap::new(),
         DispatchKind::Manual,
+        None,
     )
     .await
     .expect("dispatch a deploy");
@@ -442,6 +446,7 @@ async fn dispatch_ref_disallowed_by_environment_is_rejected_fail_closed() {
         "deploy".into(),
         std::collections::BTreeMap::new(),
         DispatchKind::Manual,
+        None,
     )
     .await
     .expect_err("a disallowed ref must be rejected");
@@ -491,6 +496,7 @@ async fn dispatch_to_branch_scoped_env_admits_and_pins_the_resolved_sha() {
         "deploy".into(),
         std::collections::BTreeMap::new(),
         DispatchKind::Manual,
+        None,
     )
     .await
     .expect("a branch-scoped env admits its allowed branch even when the commit is a real SHA");
@@ -530,6 +536,7 @@ async fn dispatch_to_branch_scoped_env_admits_and_pins_the_resolved_sha() {
         "deploy".into(),
         std::collections::BTreeMap::new(),
         DispatchKind::Manual,
+        None,
     )
     .await
     .expect_err("a branch outside allowed_refs is rejected");
@@ -585,4 +592,120 @@ async fn dispatch_endpoint_creates_a_run_and_returns_its_id() {
     let id = body["id"].as_str().expect("run id in response");
     let stored = db.run_params(&RunId(id.into())).await.unwrap();
     assert_eq!(stored["region"], json!("eu-west-1"));
+}
+
+// --- ADR-0057: the dispatch reason becomes the run Headline -------------------
+
+#[tokio::test]
+async fn dispatch_with_a_reason_stamps_it_as_the_headline_and_without_leaves_it_null() {
+    let forge = scarab_testkit::FakeForge::new().with_file(".scarab/ship.yaml", MANUAL_YAML);
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    // WITH a reason: it is stamped verbatim as the run's trigger_title (Headline).
+    let run = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        None,
+        "alice".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "ship".into(),
+        std::collections::BTreeMap::from([("region".to_string(), json!("us-east-1"))]),
+        DispatchKind::Manual,
+        Some("rolling out the hotfix".into()),
+    )
+    .await
+    .expect("dispatch with a reason");
+    assert_eq!(
+        db.run_trigger_title(&run).await.unwrap().as_deref(),
+        Some("rolling out the hotfix"),
+        "a manual dispatch stamps trigger_title = the supplied reason (ADR-0057)"
+    );
+
+    // WITHOUT a reason: the dispatch still succeeds; the Headline is null. The
+    // endpoint performs no requiredness check (that is an Environment
+    // ProtectionRule at admission, thread D).
+    let run2 = dispatch_run(
+        &forge,
+        db.as_ref(),
+        clock.as_ref(),
+        None,
+        "alice".into(),
+        repo(),
+        "refs/heads/main".into(),
+        "ship".into(),
+        std::collections::BTreeMap::from([("region".to_string(), json!("us-east-1"))]),
+        DispatchKind::Manual,
+        None,
+    )
+    .await
+    .expect("dispatch without a reason");
+    assert_eq!(
+        db.run_trigger_title(&run2).await.unwrap(),
+        None,
+        "a reason-less dispatch succeeds with a null headline (optional at dispatch)"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_endpoint_accepts_a_reason_and_surfaces_it_on_the_read_dto() {
+    let forge: Arc<dyn scarab_forge::ForgePort> =
+        Arc::new(scarab_testkit::FakeForge::new().with_file(".scarab/ship.yaml", MANUAL_YAML));
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let app = router(AppState::new(db.clone(), clock, logs).with_forge(forge));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/repos/acme/web/dispatch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "ref": "refs/heads/main",
+                        "pipeline": "ship",
+                        "params": { "region": "eu-west-1" },
+                        "reason": "manual prod deploy"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let id = body["id"].as_str().expect("run id in response").to_string();
+
+    // The reason is surfaced as the run Headline (`trigger_title`) on the read DTO.
+    let got = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/v1/runs/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(got.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let run: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        run["trigger_title"], "manual prod deploy",
+        "the dispatch reason surfaces as the run Headline on GET /v1/runs/{{id}}"
+    );
 }

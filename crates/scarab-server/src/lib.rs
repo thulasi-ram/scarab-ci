@@ -311,6 +311,12 @@ pub struct CreateRunRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub params: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Optional caller-supplied **reason** for this inline run (ADR-0057 §3),
+    /// stamped as the run **Headline** (`trigger_title`) for this `api`-style
+    /// dispatch. Accepted and stamped verbatim, no requiredness check. Absent =
+    /// no headline.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// The inline pipeline (IR subset).
@@ -407,6 +413,13 @@ pub struct DispatchRequest {
     /// declare the matching `on:`.
     #[serde(default)]
     pub kind: DispatchKind,
+    /// Optional operator-supplied **reason** for this dispatch (ADR-0057 §3),
+    /// stamped as the run **Headline** (`trigger_title`). The endpoint accepts and
+    /// stamps it verbatim — it performs **no** requiredness check; requiredness is
+    /// an Environment `ProtectionRule` enforced at admission (thread D). Absent =
+    /// no headline.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Query for the manual-dispatch catalog + interface describe endpoints
@@ -821,6 +834,14 @@ async fn create_run(
     // Freeze the resolved params on the run so every step's interpolation
     // (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive deterministically.
     st.db.set_run_params(&run, &resolved).await?;
+    // The Headline (ADR-0057 §3): an optional dispatch reason for this inline
+    // `api`-style run. This path builds no forge `Event`, so the reason is capped
+    // + stamped directly (the same cap `Event::trigger_title` applies). Stamped
+    // only when supplied; no requiredness check here (thread D). Display/audit
+    // only — never in the CEL/interpolation context.
+    if let Some(title) = req.reason.as_deref().and_then(scarab_forge::cap_trigger_title) {
+        st.db.set_run_trigger_title(&run, &title).await?;
+    }
     st.db
         .append_event(&EventKind {
             version: EVENT_VERSION,
@@ -931,6 +952,7 @@ async fn dispatch(
         req.pipeline,
         req.params,
         req.kind,
+        req.reason,
     )
     .await
     .map_err(ApiError::from)?;
@@ -2830,6 +2852,7 @@ impl DispatchKind {
         repo: scarab_forge::RepoRef,
         r#ref: String,
         sha: String,
+        reason: Option<String>,
     ) -> scarab_forge::Event {
         match self {
             DispatchKind::Manual => scarab_forge::Event::Manual {
@@ -2837,12 +2860,14 @@ impl DispatchKind {
                 repo,
                 r#ref,
                 sha,
+                reason,
             },
             DispatchKind::Api => scarab_forge::Event::Api {
                 actor,
                 repo,
                 r#ref,
                 sha,
+                reason,
             },
         }
     }
@@ -2985,6 +3010,7 @@ pub async fn dispatch_run(
     pipeline: String,
     params: std::collections::BTreeMap<String, serde_json::Value>,
     kind: DispatchKind,
+    reason: Option<String>,
 ) -> Result<RunId, DispatchError> {
     // Resolve the dispatch ref to a concrete commit — the form and the run see
     // byte-identical config (no branch-moved skew), and the Run is reproducible
@@ -3008,7 +3034,11 @@ pub async fn dispatch_run(
     // raw SHA gets a SHA-shaped symbolic ref, which correctly won't match a
     // branch-scoped Environment.
     let sym = canonicalize_ref(&r#ref);
-    let event = kind.into_event(actor, repo, sym, sha);
+    // The optional dispatch reason (ADR-0057 §3) rides the Event as the run
+    // Headline. The endpoint stays dumb — accept + stamp, no requiredness check
+    // (that is an Environment ProtectionRule at admission, thread D). Excluded
+    // from `context()`, so it never reaches trigger-matching / interpolation.
+    let event = kind.into_event(actor, repo, sym, sha, reason);
     let ctx = event.context();
 
     // Opt-in (ADR-0043 §4): the pipeline is dispatchable only if it declares a

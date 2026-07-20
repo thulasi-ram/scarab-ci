@@ -139,6 +139,19 @@ fn truncate_on_char_boundary(s: &str, max: usize) -> String {
     }
 }
 
+/// Normalize a raw headline candidate into a stored [`Event::trigger_title`]
+/// (ADR-0057 §1): trim, drop when empty, and cap to [`TRIGGER_TITLE_MAX`] chars
+/// on a char boundary (stored clean, no ellipsis). Shared by
+/// [`Event::trigger_title`] and the inline `POST /v1/runs` dispatch path, which
+/// stamps a reason directly without a full [`Event`].
+pub fn cap_trigger_title(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_on_char_boundary(trimmed, TRIGGER_TITLE_MAX))
+}
+
 /// A forge event, normalized across providers into Scarab's own vocabulary.
 ///
 /// Adapters parse a vendor payload into exactly one of these (see
@@ -218,6 +231,13 @@ pub enum Event {
         repo: RepoRef,
         r#ref: String,
         sha: String,
+        /// The operator-supplied **reason** for this dispatch (optional). Source of
+        /// the run **Headline** for `manual` runs via [`Event::trigger_title`]
+        /// (ADR-0057 §3). Display/audit only — **deliberately excluded from
+        /// [`Event::context()`]** (see that method's security note). `None` when the
+        /// dispatcher gave none; requiredness is an Environment `ProtectionRule`
+        /// enforced at admission (thread D), never at the dispatch endpoint.
+        reason: Option<String>,
     },
     /// Started programmatically via the REST API (CLI / third party), as opposed
     /// to a human [`Manual`](Event::Manual) trigger. Repo + ref-aware for the same
@@ -227,6 +247,13 @@ pub enum Event {
         repo: RepoRef,
         r#ref: String,
         sha: String,
+        /// The caller-supplied **reason** for this dispatch (optional). Source of
+        /// the run **Headline** for `api` runs via [`Event::trigger_title`]
+        /// (ADR-0057 §3). Display/audit only — **deliberately excluded from
+        /// [`Event::context()`]** (see that method's security note). `None` when the
+        /// caller gave none; requiredness is an Environment `ProtectionRule` enforced
+        /// at admission (thread D), never at the dispatch endpoint.
+        reason: Option<String>,
     },
     Upstream {
         repo: RepoRef,
@@ -333,13 +360,14 @@ impl Event {
     /// The run **Headline** (CONTEXT §4.5, ADR-0057) — the one normalized human
     /// line that says *what a run is about*, its meaning fixed by the trigger
     /// kind. For `push` it is the head commit **subject** (the first line of
-    /// `message`); for `pull_request` it is the PR **title**. Truncated to
+    /// `message`); for `pull_request` it is the PR **title**; for `manual` / `api`
+    /// it is the operator-supplied dispatch **reason** (optional). Truncated to
     /// [`TRIGGER_TITLE_MAX`] chars on a **char boundary** (never
     /// mid-UTF-8-sequence) and returned **clean** — no ellipsis; the UI owns the
     /// overflow signal. `None` when there is no headline (an empty commit
-    /// message / PR title, or a kind that carries none). The remaining kinds
-    /// return `None` for now — thread C fills the dispatch reason. Display/audit
-    /// only; this value never enters [`Event::context()`].
+    /// message / PR title / reason, or a kind that carries none —
+    /// `tag`/`release`/`comment`/`cron`/`upstream`). Display/audit only; this
+    /// value never enters [`Event::context()`].
     pub fn trigger_title(&self) -> Option<String> {
         let raw = match self {
             // The commit subject = the first line of the message; the body is
@@ -348,13 +376,15 @@ impl Event {
             // A PR's headline is its title verbatim (single line already); the
             // base branch is a separate origin fact, not part of the headline.
             Event::PullRequest { title, .. } => title,
+            // A manual/api dispatch's headline is its (optional) reason (ADR-0057
+            // §3). `None` reason ⇒ no headline; the endpoint never requires one
+            // (requiredness is an Environment ProtectionRule at admission, thread D).
+            Event::Manual { reason, .. } | Event::Api { reason, .. } => {
+                reason.as_deref().unwrap_or_default()
+            }
             _ => "",
         };
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        Some(truncate_on_char_boundary(trimmed, TRIGGER_TITLE_MAX))
+        cap_trigger_title(raw)
     }
 
     /// The repository this event targets, if any. Only `cron` is truly repo-less;
@@ -380,8 +410,8 @@ impl Event {
     ///
     /// **Security boundary (ADR-0057 §2, Q6/Q7 — load-bearing, do not undo):**
     /// the provenance/**Headline** fields (`Push::message`,
-    /// `PullRequest::title` / `PullRequest::base`, and later dispatch `reason`)
-    /// are **deliberately excluded** from
+    /// `PullRequest::title` / `PullRequest::base`, and the manual/api dispatch
+    /// `reason`) are **deliberately excluded** from
     /// this map. `${{ event.message }}` spliced into a `run:` script is the
     /// GitHub-Actions script-injection class, and shell has no context-free
     /// escape (the sink — quoted / unquoted / env / arg — is unknowable at
@@ -918,6 +948,7 @@ mod tests {
                     repo: repo(),
                     r#ref: "refs/heads/main".into(),
                     sha: "deadbeef".into(),
+                    reason: None,
                 },
                 TriggerKind::Manual,
             ),
@@ -927,6 +958,7 @@ mod tests {
                     repo: repo(),
                     r#ref: "refs/heads/main".into(),
                     sha: "deadbeef".into(),
+                    reason: None,
                 },
                 TriggerKind::Api,
             ),
@@ -964,6 +996,7 @@ mod tests {
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 sha: "abc".into(),
+                reason: None,
             }
             .actor(),
             Some("alice")
@@ -1040,12 +1073,14 @@ mod tests {
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 sha: "cafef00d".into(),
+                reason: None,
             },
             Event::Api {
                 actor: "bot".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 sha: "cafef00d".into(),
+                reason: None,
             },
         ] {
             assert_eq!(event.repo(), Some(&repo()));
@@ -1091,6 +1126,7 @@ mod tests {
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 sha: "deadbeef".into(),
+                reason: None,
             }
             .protection_ref()
             .as_deref(),
@@ -1102,6 +1138,7 @@ mod tests {
                 repo: repo(),
                 r#ref: "refs/heads/release/1.2".into(),
                 sha: "deadbeef".into(),
+                reason: None,
             }
             .protection_ref()
             .as_deref(),
@@ -1291,6 +1328,85 @@ mod tests {
     }
 
     #[test]
+    fn manual_and_api_reason_is_excluded_from_context_map() {
+        // Security boundary (ADR-0057 §2, Q6/Q7): a dispatch reason is a
+        // provenance/Headline field — it MUST NOT enter the CEL/`${{ }}` context
+        // map (`${{ event.reason }}` spliced into a `run:` is a shell-injection
+        // sink). Assert absence on BOTH dispatch kinds; the matching context stays
+        // exactly as lean as a reason-less dispatch.
+        for event in [
+            Event::Manual {
+                actor: "alice".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                sha: "cafef00d".into(),
+                reason: Some("$(rm -rf /) ship it".into()),
+            },
+            Event::Api {
+                actor: "bot".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                sha: "cafef00d".into(),
+                reason: Some("$(rm -rf /) ship it".into()),
+            },
+        ] {
+            let ctx = event.context();
+            assert!(
+                ctx["event"].get("reason").is_none(),
+                "the dispatch reason must never appear in the trigger-matching context"
+            );
+            // Belt-and-suspenders: the injection string appears nowhere in the map.
+            assert!(
+                !ctx.to_string().contains("rm -rf"),
+                "no part of the reason may leak into the flat context"
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_title_of_a_dispatch_is_its_reason() {
+        // A manual/api dispatch's headline is its operator-supplied reason verbatim
+        // (ADR-0057 §3). Present on both kinds; a `None` reason yields no headline.
+        assert_eq!(
+            Event::Manual {
+                actor: "alice".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                sha: "abc".into(),
+                reason: Some("  hotfix the prod outage  ".into()),
+            }
+            .trigger_title()
+            .as_deref(),
+            // Trimmed like every other headline; body/whitespace normalized.
+            Some("hotfix the prod outage")
+        );
+        assert_eq!(
+            Event::Api {
+                actor: "bot".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                sha: "abc".into(),
+                reason: Some("nightly deploy".into()),
+            }
+            .trigger_title()
+            .as_deref(),
+            Some("nightly deploy")
+        );
+        // No reason ⇒ no headline (optional at dispatch; requiredness is thread D).
+        assert_eq!(
+            Event::Api {
+                actor: "bot".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                sha: "abc".into(),
+                reason: None,
+            }
+            .trigger_title(),
+            None
+        );
+    }
+
+    #[test]
     fn trigger_title_is_the_commit_subject_first_line_only() {
         // The subject is the first line; the body (blank line + prose) is dropped.
         let title = Event::Push {
@@ -1316,13 +1432,14 @@ mod tests {
             None
         );
 
-        // Non-push kinds carry no headline yet (thread B/C fill them).
+        // A manual dispatch with no reason carries no headline (graceful degrade).
         assert_eq!(
             Event::Manual {
                 actor: "u".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 sha: "abc".into(),
+                reason: None,
             }
             .trigger_title(),
             None

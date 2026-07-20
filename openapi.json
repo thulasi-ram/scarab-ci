@@ -1634,6 +1634,13 @@
           },
           "pipeline": {
             "$ref": "#/components/schemas/PipelineDto"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional caller-supplied **reason** for this inline run (ADR-0057 §3),\nstamped as the run **Headline** (`trigger_title`) for this `api`-style\ndispatch. Accepted and stamped verbatim, no requiredness check. Absent =\nno headline."
           }
         }
       },
@@ -1679,6 +1686,13 @@
           "pipeline": {
             "type": "string",
             "description": "The pipeline to run — a `.scarab` name (e.g. `deploy`) or a full\n`.scarab/*.yaml` path."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional operator-supplied **reason** for this dispatch (ADR-0057 §3),\nstamped as the run **Headline** (`trigger_title`). The endpoint accepts and\nstamps it verbatim — it performs **no** requiredness check; requiredness is\nan Environment `ProtectionRule` enforced at admission (thread D). Absent =\nno headline."
           },
           "ref": {
             "type": "string",

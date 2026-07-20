@@ -934,6 +934,13 @@ export interface components {
              */
             params?: Record<string, never>;
             pipeline: components["schemas"]["PipelineDto"];
+            /**
+             * @description Optional caller-supplied **reason** for this inline run (ADR-0057 §3),
+             *     stamped as the run **Headline** (`trigger_title`) for this `api`-style
+             *     dispatch. Accepted and stamped verbatim, no requiredness check. Absent =
+             *     no headline.
+             */
+            reason?: string | null;
         };
         CreateRunResponse: {
             id: string;
@@ -970,6 +977,14 @@ export interface components {
              *     `.scarab/*.yaml` path.
              */
             pipeline: string;
+            /**
+             * @description Optional operator-supplied **reason** for this dispatch (ADR-0057 §3),
+             *     stamped as the run **Headline** (`trigger_title`). The endpoint accepts and
+             *     stamps it verbatim — it performs **no** requiredness check; requiredness is
+             *     an Environment `ProtectionRule` enforced at admission (thread D). Absent =
+             *     no headline.
+             */
+            reason?: string | null;
             /**
              * @description The ref to dispatch at (branch/tag/sha). Resolved to a concrete commit;
              *     the run pins to that commit.

@@ -382,6 +382,8 @@ export async function dispatchRun(
     pipeline: string;
     params: Record<string, unknown>;
     kind?: DispatchKind;
+    /** Optional operator reason (ADR-0057) — stamped as the run Headline. */
+    reason?: string;
   },
 ): Promise<DispatchResult> {
   const { data, error, response } = await api.POST("/v1/repos/{org}/{repo}/dispatch", {
