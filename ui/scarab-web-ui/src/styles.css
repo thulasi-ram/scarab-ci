@@ -821,18 +821,19 @@ h2 {
 .pfact.idfact:hover, .pfact.idfact:hover .mono { color: var(--emerald); }
 .idcap { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted-sage); }
 
-/* The run-detail context bar runs ~20% larger than the runs-list row — same
-   markup, scaled up for the page's focal surface. Scoped under `.prov` so the
-   list stays compact. */
+/* The run-detail context bar reads ~10% larger than the runs-list row — same
+   markup, gently scaled type/icons for the page's focal surface. Scoped under
+   `.prov` so the list stays compact. Padding/gaps are held at the current values
+   so the scale-down doesn't change the bar's height. */
 .prov { padding: 17px 24px; gap: 14px 17px; }
 .prov-main { gap: 10px; }
-.prov .tcell-row .tcell-kind { font-size: 15px; }
-.prov .tcell-row .tcell-title { font-size: 16px; }
+.prov .tcell-row .tcell-kind { font-size: 14px; }
+.prov .tcell-row .tcell-title { font-size: 15px; }
 .prov .rr-facts { gap: 6px 17px; }
-.prov .rr-facts .pfact { font-size: 14.5px; }
-.prov .rr-facts .pfact .mono { font-size: 14px; }
-.prov .rr-head svg, .prov .rr-facts svg { width: 14px; height: 14px; }
-.prov .idcap { font-size: 12px; }
+.prov .rr-facts .pfact { font-size: 13px; }
+.prov .rr-facts .pfact .mono { font-size: 12.5px; }
+.prov .rr-head svg, .prov .rr-facts svg { width: 13px; height: 13px; }
+.prov .idcap { font-size: 11px; }
 .pcell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .pcell .k {
   font-family: var(--font-mono); font-size: 10px; font-weight: 600;
