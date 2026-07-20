@@ -1,5 +1,48 @@
 # Handoff — unify the STEPS component: deck-in-DAG attempts + Graph/Timeline
 
+**Status: deck + in-rail fan SHIPPED (Graph); prototype deleted. Timeline
+deferred (user: secondary — skipped for now).**
+
+## What shipped (2026-07-20, on `feat/adr-0056-rerun-retry-language`)
+
+Variant A folded into the real components, verified in-browser against run
+`8f2b256c…` (`check ×3`, `checkout ×2`) in both light and dark themes:
+
+- **`Dag.tsx`** — a step with `attempts > 1` renders as a **deck** (offset
+  shadow-cards + a copper `×N` badge). Selecting it **fans its tries** into a
+  compact, full-rail-width **vertical stack directly beneath the node** (not the
+  prototype's horizontal fan — that cramps the ~190px rail). Only the *selected*
+  node fans; others stay compact decks. Each try card carries cause + outcome +
+  shadowed/superseded/readopted state; picking one drives `onAttemptSelect`.
+  Edges re-measure when the fan changes the column height (the `.dag` box is
+  fixed with inner scroll, so a `createEffect` on `selected`/`tries` + a scroll
+  listener re-run `measure()`; coords now include `scrollLeft/Top`).
+- **`RunDetail.tsx`** — derives the selected step's tries (`dagTries()`) and the
+  active try (`dagActiveAttempt()`, mirroring StepPane's `scoped()`) from the
+  event log, honoring the Take frontier; passes them to `<Dag>`.
+- **`StepPane.tsx`** — the `.trydrop` attempt dropdown is **gone**; the graph
+  owns try selection. The step header now shows a **read-only** "which try
+  you're viewing" chip (`try N · cause · outcome`, tone-barred, + shadowed/⟲).
+- **CSS** — `.dcell/.ddeck/.ddeck-layer/.dnode-count/.dfan/.dfan-card` +
+  `.step-try`. **Gotcha baked in:** the DAG canvas uses the always-dark
+  *terminal* palette (`--terminal-ink/-elev/-line`), NOT the theme-flipping page
+  tokens (`--soft-white`, `--emerald-surface` go WHITE in light theme). The fan
+  must use terminal tokens or it renders white-on-white in light mode.
+- **Prototype deleted** — `StepsProto.tsx` + its `/proto` route in `App.tsx`.
+
+## Still open
+
+- **Graph / Timeline sub-tabs** under the "STEPS" header — NOT built (Timeline
+  deferred). When picking it up: the toggle + the waterfall (one bar per step,
+  tries as colored segments, shadowed dimmed). Real timing is already in
+  `RunDetail` (`stepTiming()` → first `AttemptStarted` … last `AttemptFinished`;
+  `dagSteps()` exposes `durationMs`). Don't add a lone toggle until Timeline
+  exists.
+
+---
+
+## (original design notes — kept for the Timeline pickup)
+
 **Status: design decided (prototype done), implementation NOT started.**
 
 Continues the ADR-0056 run-detail work (see [[docs/adr/0056-run-takes-and-attempt-grain-evidence.md]]
