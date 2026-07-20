@@ -7,7 +7,7 @@
 // superseded ⊘ / shadowed) from the event log (ADR-0056 amendment); a crash
 // re-adoption renders as a marker INSIDE its chip — same attempt, same fence,
 // never a new execution.
-import { createSignal, createEffect, createResource, For, Show, onCleanup } from "solid-js";
+import { createSignal, createEffect, createMemo, createResource, on, For, Show, onCleanup } from "solid-js";
 import {
   getStepResults,
   getConsumed,
@@ -98,14 +98,22 @@ export default function StepPane(props: {
   // arriving.
   const [switching, setSwitching] = createSignal(false);
   let switchTimer: ReturnType<typeof setTimeout> | undefined;
-  createEffect(() => {
-    void stepId();
-    void scoped()?.id;
-    void tab();
-    setSwitching(true);
-    clearTimeout(switchTimer);
-    switchTimer = setTimeout(() => setSwitching(false), 450);
-  });
+  // The selection identity — which step, which try, which tab — as a stable
+  // string. The memo only notifies when that string actually changes, so the
+  // 1.2s run-status poll (which hands us a fresh `props.step` object every tick
+  // while the run is live, but with the same ids) no longer re-fires the pulse.
+  // Tracking the reactive props objects directly made the log skeleton flicker
+  // on every poll while a step was running.
+  const selKey = createMemo(
+    () => `${stepId() ?? ""} ${scoped()?.id ?? ""} ${tab()}`,
+  );
+  createEffect(
+    on(selKey, () => {
+      setSwitching(true);
+      clearTimeout(switchTimer);
+      switchTimer = setTimeout(() => setSwitching(false), 450);
+    }),
+  );
   onCleanup(() => clearTimeout(switchTimer));
 
   // --- Logs: one buffered SSE stream per (step, attempt); the scoped attempt's
