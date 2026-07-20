@@ -2062,11 +2062,12 @@ h1, .crumb-head, .run-title {
    header carrying the always-present version dropdown. The inner DAG + StepPane
    read as one surface — their panel chrome is flattened, then the step evidence
    gets a light border back to separate it from the graph. */
-/* Transparent body: only the component's own header keeps the grey (it has its
-   own `.panel-h` background); the graph + evidence float on the page. */
+/* Transparent body inside the component's border: only the header keeps the
+   grey (its own `.panel-h` background); the graph + evidence sit on a
+   transparent body, but the bordered card frames the whole thing. */
 .pipeline-panel {
   display: flex; flex-direction: column;
-  background: transparent; border: none;
+  background: transparent;
 }
 .pipeline-panel > .panel-h .grow1 { flex: 1; }
 
