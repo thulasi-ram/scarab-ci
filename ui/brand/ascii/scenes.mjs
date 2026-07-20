@@ -257,17 +257,18 @@ export function ponderAnchor(pose) {
 }
 
 function ponderBall(x, cx, cy, r, roll) {
-  const rimPeriod = (TAU * r) / 21;
-  x.strokeStyle = "#d9b45e"; x.lineWidth = 1.6;
-  x.setLineDash([rimPeriod * 0.62, rimPeriod * 0.38]);
-  x.lineDashOffset = -roll * r;
+  // Solid rim. A dashed rim baked to these small dot grids reads as a *broken*
+  // ball; a clean continuous ring is what "beetle pausing beside its ball"
+  // wants. (The roll still reads through the ground scroll + rotating flecks.)
+  x.strokeStyle = "#d9b45e"; x.lineWidth = 2;
   x.beginPath(); x.arc(cx, cy, r, 0, 7); x.stroke();
-  x.setLineDash([]);
+  // Sparse, uniform flecks — dung texture that rotates with the roll, kept few
+  // and small so they read as texture rather than a swirl inside the ball.
   x.fillStyle = "#b3924a";
-  for (let i = 0; i < 16; i++) {
+  for (let i = 0; i < 9; i++) {
     const a = roll + i * 2.39996;
-    const rr = r * (0.15 + 0.75 * ((i * 0.61) % 1));
-    const fs = r * (0.07 + ((i * 7) % 3) * 0.035);
+    const rr = r * (0.22 + 0.48 * ((i * 0.61) % 1));
+    const fs = r * 0.085;
     x.beginPath(); x.arc(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr, fs, 0, 7); x.fill();
   }
 }
