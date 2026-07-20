@@ -2171,13 +2171,15 @@ h1, .crumb-head, .run-title {
 
 /* Inside the pane the tab row sits flush under the attempt strip — the
    page-level `.tabs` spacing doesn't apply. */
-.steppane .tabs { margin: 0; background: none; padding: 0 8px; border-bottom: 1px solid var(--border); }
+/* Tabs align their first label with the step header: the tab's own 14px left
+   padding lands "LOGS" under "STEP" (step-head shares the 14px inset). */
+.steppane .tabs { margin: 0; background: none; padding: 0; border-bottom: 1px solid var(--border); }
 
 /* Step header: a caps micro-label + the step id, then the "try" dropdown. Flat
    — no surface of its own; typography-led (matches the DAG's "Steps" header). */
 .steppane .step-head {
   display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
-  padding: 11px 12px 10px;
+  padding: 11px 14px 10px;
 }
 .steppane .step-head .hdr-label {
   font-family: var(--font-mono); font-size: 10px; font-weight: 600;
