@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1784533809,"nonce":"QkQ2bVlYXY7NSAUa2/yivvtpeZU=","message":"Merged to main via PR #43 (fast-forward, commit 0367a1c). Both halves shipped + verified live in-cluster. Closing.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1784533809,"nonce":"JsFDb/kzvGz4CjfSQxUzqO4FvjM=","status":2}]}
