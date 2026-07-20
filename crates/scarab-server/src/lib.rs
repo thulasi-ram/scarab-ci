@@ -515,6 +515,10 @@ pub struct RunStatusResponse {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     #[schema(value_type = Object)]
     pub params: std::collections::BTreeMap<String, serde_json::Value>,
+    /// The pipeline this run executed (the bare `.scarab/<name>` selection).
+    /// Absent for inline runs and runs created before pipeline-stamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
 }
 
 /// `GET /v1/runs` body: the most recent runs, newest first.
@@ -558,6 +562,10 @@ pub struct RunSummaryDto {
     /// The pull-request number, for `pull_request` runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<i64>,
+    /// The pipeline this run executed (the bare `.scarab/<name>` selection).
+    /// Absent for inline runs and runs created before pipeline-stamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
 }
 
 impl From<scarab_engine::RunSummary> for RunSummaryDto {
@@ -577,6 +585,7 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             git_ref: s.git_ref,
             sha: s.sha,
             pr_number: s.pr_number,
+            pipeline: s.pipeline,
         }
     }
 }
@@ -1240,6 +1249,7 @@ async fn get_run(
     let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
     let steps = st.db.steps_of_run(&run).await?;
     let params = st.db.run_params(&run).await?;
+    let pipeline = st.db.run_pipeline(&run).await?;
     Ok(Json(RunStatusResponse {
         id: run.0,
         status: run_status_name(status).to_string(),
@@ -1255,6 +1265,7 @@ async fn get_run(
             })
             .collect(),
         params,
+        pipeline,
     }))
 }
 
@@ -1576,6 +1587,11 @@ pub struct ProjectDto {
     /// The forge coordinate backing it (1:1 in v1).
     pub owner: String,
     pub name: String,
+    /// The forge WEB base for this repo (e.g. `https://github.com/owner/name`) —
+    /// what the UI appends `/commit/<sha>` or `/pull/<n>` to for deep links.
+    /// Derived from the connection's kind + base_url (the stored base is the API
+    /// host, which differs from the web host on GitHub).
+    pub repo_url: String,
     /// Epoch millis of the project's most recent run, or `null` if it has never
     /// run — the dashboard's recency signal (ADR-0046). The domain carries no
     /// push/created_at yet, so never-run repos have no ordering key here.
@@ -1610,6 +1626,31 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
         display_name: principal.display_name,
         roles: principal.roles.iter().map(|r| format!("{r:?}")).collect(),
     }))
+}
+
+/// The forge WEB (html) base for a repo — what the UI appends `/commit/<sha>`
+/// or `/pull/<n>` to. The connection's stored `base_url` is the API base, which
+/// on GitHub differs from the web host (`api.github.com` vs `github.com`; a GHES
+/// host carries an `/api/v3` suffix). Forgejo's `base_url` is already the web
+/// host (its API lives under `/api/v1`).
+fn web_repo_url(
+    kind: scarab_forge::ForgeKind,
+    base_url: &str,
+    owner: &str,
+    name: &str,
+) -> String {
+    let base = base_url.trim_end_matches('/');
+    let host = match kind {
+        scarab_forge::ForgeKind::GitHub => {
+            if base.contains("api.github.com") {
+                "https://github.com".to_string()
+            } else {
+                base.strip_suffix("/api/v3").unwrap_or(base).to_string()
+            }
+        }
+        scarab_forge::ForgeKind::Forgejo => base.to_string(),
+    };
+    format!("{host}/{owner}/{name}")
 }
 
 /// List the registered projects (ADR-0046 registry — what the dashboard's
@@ -1671,11 +1712,18 @@ async fn list_projects(
                 .await?
                 .first()
                 .map(|r| r.created_at.0);
+            let repo_url = web_repo_url(
+                resolved.connection.kind,
+                &resolved.connection.base_url,
+                &repo.owner,
+                &repo.name,
+            );
             out.push(ProjectDto {
                 org: resolved.org,
                 project: resolved.project,
                 owner: repo.owner,
                 name: repo.name,
+                repo_url,
                 last_run_at,
             });
         }
@@ -3088,6 +3136,14 @@ async fn persist_run_from_ir(
         origin_pr_number(event),
     )
     .await?;
+    // The pipeline name (the runs-list/detail "which pipeline is this") — the
+    // explicit `name:` from the IR when set, else the bare `.scarab/<name>`
+    // selection. Stamped beside origin.
+    let pipeline_name = ir
+        .name
+        .clone()
+        .unwrap_or_else(|| bare_pipeline_name(pipeline));
+    db.set_run_pipeline(run, &pipeline_name).await?;
     db.store_run_ir(
         run,
         &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null),

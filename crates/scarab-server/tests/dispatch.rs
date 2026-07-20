@@ -204,6 +204,14 @@ async fn dispatch_manual_pins_resolved_sha_and_freezes_and_interpolates_params()
     // The run was created and its IR stored (self-describing).
     assert!(db.run_ir(&run).await.unwrap().is_some());
 
+    // The pipeline name is stamped at creation (the bare `.scarab/<name>`
+    // selection) — surfaced on the runs list + run detail.
+    assert_eq!(
+        db.run_pipeline(&run).await.unwrap().as_deref(),
+        Some("ship"),
+        "the dispatched pipeline's bare name is stamped on the run"
+    );
+
     // Params are frozen on the run, coerced to their declared types.
     let stored = db.run_params(&run).await.unwrap();
     assert_eq!(stored["region"], json!("us-east-1"));

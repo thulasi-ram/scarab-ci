@@ -848,6 +848,25 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn set_run_pipeline(&self, run: &RunId, pipeline: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE runs SET pipeline = $2 WHERE id = $1")
+            .bind(&run.0)
+            .bind(pipeline)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn run_pipeline(&self, run: &RunId) -> Result<Option<String>, DbError> {
+        let row = sqlx::query("SELECT pipeline FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("pipeline")))
+    }
+
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {
         let row = sqlx::query(
             "SELECT count(*) AS n FROM runs
@@ -924,7 +943,8 @@ impl Db for PostgresDb {
     async fn list_runs(&self, limit: u32) -> Result<Vec<RunSummary>, DbError> {
         let rows = sqlx::query(
             "SELECT id, status, created_at, updated_at, tenant_org, tenant_project,
-                    origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number
+                    origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
+                    pipeline
              FROM runs
              ORDER BY created_at DESC, id DESC
              LIMIT $1",
@@ -944,7 +964,8 @@ impl Db for PostgresDb {
     ) -> Result<Vec<RunSummary>, DbError> {
         let rows = sqlx::query(
             "SELECT id, status, created_at, updated_at, tenant_org, tenant_project,
-                    origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number
+                    origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
+                    pipeline
              FROM runs
              WHERE tenant_org = $1 AND tenant_project = $2
              ORDER BY created_at DESC, id DESC
@@ -1932,6 +1953,7 @@ fn run_summary_from_row(r: sqlx::postgres::PgRow) -> Result<RunSummary, DbError>
         git_ref: r.get::<Option<String>, _>("origin_ref"),
         sha: r.get::<Option<String>, _>("origin_sha"),
         pr_number: r.get::<Option<i64>, _>("origin_pr_number"),
+        pipeline: r.get::<Option<String>, _>("pipeline"),
     })
 }
 

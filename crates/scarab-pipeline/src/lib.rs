@@ -51,6 +51,12 @@ pub struct PipelineIr {
     /// Schema version of the IR, for forward/backward compatibility.
     #[serde(default = "default_ir_version")]
     pub ir_version: u32,
+    /// Optional human display name (`name:`) — what the UI shows for the run's
+    /// pipeline. Absent means the caller falls back to the `.scarab/<file>` bare
+    /// name (so `ci.yaml` reads as `ci`). Overriding it lets a workflow present a
+    /// friendlier label without renaming the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The events that start this pipeline (`on:`), keyed by trigger kind. Empty
     /// means "no automatic triggers" (API/manual only). Matched against a
     /// normalized forge event via [`matches_trigger`] (ADR-0009, 0010).
@@ -755,6 +761,7 @@ pub fn compile_yaml_with_libs(
 
     let ir = PipelineIr {
         ir_version: authored.ir_version,
+        name: authored.name,
         triggers: authored.triggers,
         concurrency: authored.concurrency,
         environment: authored.environment,
@@ -1933,6 +1940,28 @@ mod tests {
             Err(PipelineError::Validation(d)) => d,
             other => panic!("expected validation error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn optional_name_parses_and_defaults_to_none() {
+        let named = compile(
+            r#"
+            name: Continuous Integration
+            steps:
+              - id: build
+                image: ghcr.io/acme/build@sha256:aaaa
+            "#,
+        );
+        assert_eq!(named.name.as_deref(), Some("Continuous Integration"));
+
+        let unnamed = compile(
+            r#"
+            steps:
+              - id: build
+                image: ghcr.io/acme/build@sha256:aaaa
+            "#,
+        );
+        assert_eq!(unnamed.name, None, "absent name → caller falls back to the file name");
     }
 
     #[test]

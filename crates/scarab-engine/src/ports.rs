@@ -324,6 +324,14 @@ pub trait Db: Send + Sync {
         pr_number: Option<i64>,
     ) -> Result<(), DbError>;
 
+    /// Stamp the bare name of the pipeline this run executed (the `.scarab`
+    /// selection), for display on the runs list + run detail. Set at creation
+    /// for trigger/dispatch runs; inline runs never call it.
+    async fn set_run_pipeline(&self, run: &RunId, pipeline: &str) -> Result<(), DbError>;
+
+    /// The run's pipeline name, if stamped.
+    async fn run_pipeline(&self, run: &RunId) -> Result<Option<String>, DbError>;
+
     /// How many runs are in-flight (started, not terminal). With `project`,
     /// scoped to that project (fairness cap); without, the global count
     /// (backpressure).

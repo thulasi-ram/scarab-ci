@@ -1828,7 +1828,8 @@
           "org",
           "project",
           "owner",
-          "name"
+          "name",
+          "repo_url"
         ],
         "properties": {
           "last_run_at": {
@@ -1851,6 +1852,10 @@
           },
           "project": {
             "type": "string"
+          },
+          "repo_url": {
+            "type": "string",
+            "description": "The forge WEB base for this repo (e.g. `https://github.com/owner/name`) —\nwhat the UI appends `/commit/<sha>` or `/pull/<n>` to for deep links.\nDerived from the connection's kind + base_url (the stored base is the API\nhost, which differs from the web host on GitHub)."
           }
         }
       },
@@ -1960,6 +1965,13 @@
             "type": "object",
             "description": "The run's frozen launch parameters, `name → typed value` (ADR-0043 §5).\nA run-level constant resolved once at creation; non-secret by contract\n(§6), so safe to expose. Empty when the run took none. Lets the UI's\nre-run flow pre-fill the form from the prior run's params."
           },
+          "pipeline": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pipeline this run executed (the bare `.scarab/<name>` selection).\nAbsent for inline runs and runs created before pipeline-stamping."
+          },
           "status": {
             "type": "string"
           },
@@ -2013,6 +2025,13 @@
               "null"
             ],
             "description": "The owning org, if the run is tenanted (trigger-created)."
+          },
+          "pipeline": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pipeline this run executed (the bare `.scarab/<name>` selection).\nAbsent for inline runs and runs created before pipeline-stamping."
           },
           "pr_number": {
             "type": [

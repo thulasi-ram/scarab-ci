@@ -110,6 +110,11 @@ pub struct RunSummary {
     /// The pull-request number, for `pull_request` runs.
     #[serde(default)]
     pub pr_number: Option<i64>,
+    /// The bare name of the pipeline this run executed (the `.scarab/<name>`
+    /// selection), stamped at creation for trigger/dispatch runs. `None` for
+    /// inline runs (no named pipeline) and pre-stamping runs.
+    #[serde(default)]
+    pub pipeline: Option<String>,
 }
 
 /// Lifecycle status of a single step.

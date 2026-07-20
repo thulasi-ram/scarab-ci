@@ -152,6 +152,9 @@ async fn projects_are_ordered_by_last_run_at() {
     // Most-recently-active first; never-run repo last.
     assert_eq!(projects[0]["project"], "api");
     assert_eq!(projects[0]["last_run_at"], 5_000);
+    // Forge web base for deep links: the API host (api.github.com) maps to the
+    // web host (github.com) + the repo coordinate (ADR-0056 provenance links).
+    assert_eq!(projects[0]["repo_url"], "https://github.com/acme/api");
     assert_eq!(projects[1]["project"], "web");
     assert_eq!(projects[1]["last_run_at"], 1_000);
     assert_eq!(projects[2]["project"], "mobile");
