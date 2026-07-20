@@ -1618,8 +1618,13 @@ h2 {
    Absent refs (no forge / error) => no menu, and the input stays plain text. */
 /* The base `.panel` clips with overflow:hidden (rounded corners); this panel
    must let the dropdown spill past its bottom edge, so re-round the filled
-   header itself since it can no longer rely on the panel's clip. */
-.panel-combo { overflow: visible; }
+   header itself since it can no longer rely on the panel's clip.
+   `.page > *` stamps every page child with `z-index: 1`, making each panel its
+   own stacking context — so the ref dropdown (z-index:20) was trapped inside
+   this panel and painted BEHIND the later, opaque pipelines panel (also z:1, so
+   it won on tree order). Lift the whole combo panel above its siblings so the
+   spilling dropdown floats on top. */
+.panel-combo { overflow: visible; z-index: 5; }
 .panel-combo .panel-h {
   border-top-left-radius: var(--radius);
   border-top-right-radius: var(--radius);
