@@ -19,7 +19,7 @@
 //! step reads durable state and every transition is guarded by optimistic
 //! concurrency, so a restart re-drives without duplicating work.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -118,12 +118,32 @@ pub async fn restart_step(
     clock: &dyn Clock,
     run: &RunId,
     target: &StepId,
+    by: Option<String>,
 ) -> Result<(), RestartError> {
     let steps = db.steps_of_run(run).await?;
     if !steps.iter().any(|s| &s.step == target) {
         return Err(RestartError::StepNotFound(target.clone()));
     }
     let invalid = crate::invalidation_set(target, &steps);
+
+    // The Take boundary (ADR-0056): record the human intervention FIRST, so a
+    // Take view — a pure event-log replay up to this event — sees the run
+    // exactly as it stood when the button was pressed. Carries the resolved
+    // invalidation set (deterministic record) and the acting principal.
+    let now = clock.now().await;
+    let mut invalidated: Vec<StepId> = invalid.iter().cloned().collect();
+    invalidated.sort_by(|a, b| a.0.cmp(&b.0));
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::RunRestartRequested {
+            target: target.clone(),
+            invalidated,
+            by,
+        },
+        at: now,
+    })
+    .await?;
 
     // Force the explicit target to re-run: clear its stored input signature so
     // admission never mistakes it for an unchanged descendant and skips it
@@ -394,6 +414,33 @@ struct Config {
     default_step_timeout_ms: i64,
 }
 
+/// One control-plane instance's supervision memory (ADR-0056): the attempts
+/// (keyed `{run}:{step}:{attempt}`) this PROCESS has launched or polled.
+/// Deliberately in-memory — a stored launch handle first polled by an
+/// instance that isn't tracking it means a control plane died and this one
+/// adopted the attempt, which emits `AttemptReadopted`. Routine lease-expiry
+/// re-polls by the same instance stay silent; N crashes emit N events, each a
+/// real recovery.
+///
+/// The [`Scheduler`] borrows ports per cycle and is often constructed fresh
+/// each tick, so a long-lived driver MUST create one `Supervision` at boot
+/// and thread it into every cycle via
+/// [`with_supervision`](Scheduler::with_supervision) — a per-cycle set would
+/// make every routine re-poll look like an adoption.
+#[derive(Clone, Default)]
+pub struct Supervision(std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>);
+
+impl Supervision {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Track `key`; returns `true` if this instance had never seen it.
+    fn first_contact(&self, key: String) -> bool {
+        self.0.lock().expect("supervision set poisoned").insert(key)
+    }
+}
+
 /// The durable scheduler. Borrows the ports for the duration of a cycle.
 pub struct Scheduler<'a> {
     db: &'a dyn Db,
@@ -401,6 +448,10 @@ pub struct Scheduler<'a> {
     executor: &'a dyn Executor,
     owner: String,
     cfg: Config,
+    /// See [`Supervision`]. Defaults to a fresh set (fine when the Scheduler
+    /// value itself lives as long as the process, as in tests); a per-cycle
+    /// caller must inject the process-lifetime one.
+    supervised: Supervision,
 }
 
 impl<'a> Scheduler<'a> {
@@ -415,6 +466,7 @@ impl<'a> Scheduler<'a> {
             clock,
             executor,
             owner: owner.into(),
+            supervised: Supervision::new(),
             cfg: Config {
                 lease_ttl_ms: 30_000,
                 outbox_batch: 16,
@@ -429,6 +481,14 @@ impl<'a> Scheduler<'a> {
     /// Override the global default step deadline (ADR-0047).
     pub fn with_default_step_timeout_ms(mut self, ms: i64) -> Self {
         self.cfg.default_step_timeout_ms = ms;
+        self
+    }
+
+    /// Inject the process-lifetime [`Supervision`] memory (ADR-0056). Required
+    /// when the Scheduler is constructed per cycle, or adoption detection
+    /// degrades into per-cycle noise.
+    pub fn with_supervision(mut self, supervision: Supervision) -> Self {
+        self.supervised = supervision;
         self
     }
 
@@ -776,8 +836,30 @@ impl<'a> Scheduler<'a> {
             // supervision resumes, NO budget consumed) or is gone, which
             // surfaces as `Lost` below — never a blind same-fence relaunch,
             // which would make a zombie and a retry indistinguishable.
+            let supervision_key = format!("{}:{}:{}", run.0, step.0, attempt.0);
             let handle = match self.db.attempt_handle(&run, &step, &attempt).await? {
-                Some(h) => ExecHandle(h),
+                Some(h) => {
+                    // First poll of a handle this instance never launched nor
+                    // polled ⇒ a control plane died and we adopted the attempt
+                    // (ADR-0047). Surface it (ADR-0056): the recovery is the
+                    // durability story, and today it is invisible. Routine
+                    // re-polls by the same instance are in `supervised` and
+                    // stay silent.
+                    let first_contact = self.supervised.first_contact(supervision_key.clone());
+                    if first_contact {
+                        let now = self.clock.now().await;
+                        self.append(
+                            &run,
+                            EventPayload::AttemptReadopted {
+                                step: step.clone(),
+                                attempt: attempt.clone(),
+                            },
+                            now,
+                        )
+                        .await?;
+                    }
+                    ExecHandle(h)
+                }
                 None => {
                     let spec = self
                         .db
@@ -807,6 +889,36 @@ impl<'a> Scheduler<'a> {
                                 }
                             }
                             spec.workspace_inputs = crate::workspace_inputs(&consumed, &output_of);
+
+                            // Consumption provenance (ADR-0056): stamp which
+                            // upstream ATTEMPT this attempt builds on — the
+                            // union of its workspace inputs and its `needs`
+                            // (the `${{ outputs.* }}` interpolation sources),
+                            // resolved at this launch instant. Recorded, not
+                            // inferred: after a mid-run restart the run is a
+                            // patchwork of attempt generations.
+                            let mut upstream: Vec<&StepId> =
+                                consumed.iter().chain(me.needs.iter()).collect();
+                            upstream.sort_by(|a, b| a.0.cmp(&b.0));
+                            upstream.dedup();
+                            let mut consumed_attempts = BTreeMap::new();
+                            for up in upstream {
+                                if let Some(a) =
+                                    self.db.step_evidence_attempt(&run, up).await?
+                                {
+                                    consumed_attempts.insert(up.0.clone(), a.0);
+                                }
+                            }
+                            if !consumed_attempts.is_empty() {
+                                self.db
+                                    .set_attempt_consumed(
+                                        &run,
+                                        &step,
+                                        &attempt,
+                                        &consumed_attempts,
+                                    )
+                                    .await?;
+                            }
                         }
                     }
 
@@ -847,6 +959,9 @@ impl<'a> Scheduler<'a> {
                     self.db
                         .set_attempt_handle(&run, &step, &attempt, &handle.0)
                         .await?;
+                    // We launched it — later re-polls by this instance are
+                    // routine supervision, not adoption (ADR-0056).
+                    self.supervised.first_contact(supervision_key);
                     handle
                 }
             };
@@ -856,28 +971,47 @@ impl<'a> Scheduler<'a> {
                     // Record the output workspace snapshot (if the backend
                     // produced one) so dependents can materialize it and restart
                     // can compare it for skip-if-unchanged (ADR-0027, 0029).
+                    // Attempt-grain (ADR-0056): the write lands on both the
+                    // attempt's immutable evidence row and the step's
+                    // latest-evidence denormalization.
                     if let Some(output) = self.executor.output(&handle).await? {
-                        self.db.set_step_output(&run, &step, &output).await?;
+                        self.db.set_step_output(&run, &step, &attempt, &output).await?;
                     }
                     // Capture the step's named results (ADR-0041) under the fence,
                     // so a dependent can read them via `${{ outputs.<step>.… }}`.
                     let results = self.executor.results(&handle).await?;
                     if !results.is_empty() {
-                        self.db.set_step_results(&run, &step, &results).await?;
+                        self.db
+                            .set_step_results(&run, &step, &attempt, &results)
+                            .await?;
                     }
                     // Persist the artifacts of record the step published
                     // (ADR-0052) — blobs are already in the object store;
-                    // this durably indexes them for list/download.
+                    // this durably indexes them for list/download, keyed by
+                    // this attempt (ADR-0056: immutable per attempt).
                     let artifacts = self.executor.artifacts(&handle).await?;
                     if !artifacts.is_empty() {
                         let now = self.clock.now().await;
-                        self.db.put_artifacts(&run, &artifacts, now).await?;
+                        self.db
+                            .put_artifacts(&run, &step, &attempt, true, &artifacts, now)
+                            .await?;
                     }
                     self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
                 ExecState::Failed { class, .. } => {
+                    // A failed attempt's artifacts are evidence — often THE
+                    // evidence (the test report of the failure a retry
+                    // recovered from). Harvest them too (ADR-0056), marked
+                    // unsuccessful so the of-record resolution skips them.
+                    let artifacts = self.executor.artifacts(&handle).await?;
+                    if !artifacts.is_empty() {
+                        let now = self.clock.now().await;
+                        self.db
+                            .put_artifacts(&run, &step, &attempt, false, &artifacts, now)
+                            .await?;
+                    }
                     // The adapter classified the failure (ADR-0047); the engine
                     // consumes the class verbatim and applies retry policy.
                     let kind = match class {
@@ -894,6 +1028,7 @@ impl<'a> Scheduler<'a> {
                 // The backend lost a launched execution (ADR-0047): vanished
                 // Pod / dead process. Conservatively post-start — settle it
                 // (assertion-gated retry on a NEW fence, budget consumed).
+                // No artifact harvest: the backend object is gone.
                 ExecState::Lost => {
                     self.settle_failed_attempt(&run, &step, &attempt, FailureKind::Lost)
                         .await?;

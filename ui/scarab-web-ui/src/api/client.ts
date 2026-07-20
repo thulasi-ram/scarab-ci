@@ -106,9 +106,19 @@ export async function listArtifacts(id: string): Promise<Artifact[]> {
 }
 
 /** Browser URL for one artifact's bytes (`GET /v1/runs/{id}/artifacts/{name}`,
- * streamed through the server — usable directly as an `<a href>` download). */
-export function artifactUrl(id: string, name: string): string {
-  return `/v1/runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(name)}`;
+ * streamed through the server — usable directly as an `<a href>` download).
+ * Bare name = the of-record resolution (latest SUCCESSFUL version, ADR-0056);
+ * `version` pins the exact `(step, attempt)` version — how a shadowed or
+ * failed-attempt file stays reachable. */
+export function artifactUrl(
+  id: string,
+  name: string,
+  version?: { step: string; attempt: string },
+): string {
+  const base = `/v1/runs/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(name)}`;
+  return version
+    ? `${base}?step=${encodeURIComponent(version.step)}&attempt=${encodeURIComponent(version.attempt)}`
+    : base;
 }
 
 // --- Run detail Inspector: a step's browseable outputs. Results are the typed
@@ -116,15 +126,37 @@ export function artifactUrl(id: string, name: string): string {
 // walked read-only from the content-addressed store (ADR-0029). ---
 
 /** A step's named results (`GET …/steps/{step}/results`). Empty if it emitted
- * none. The Results tab, and the source the Outputs view derives from. */
-export async function getStepResults(id: string, step: string): Promise<StepResult[]> {
+ * none. The Results tab, and the source the Outputs view derives from. With
+ * `attempt`, that attempt's immutable evidence instead of the latest (ADR-0056). */
+export async function getStepResults(
+  id: string,
+  step: string,
+  attempt?: string,
+): Promise<StepResult[]> {
   const { data, error } = await api.GET("/v1/runs/{id}/steps/{step}/results", {
-    params: { path: { id, step } },
+    params: { path: { id, step }, query: attempt ? { attempt } : {} },
   });
   if (error || !data) {
     throw new Error(`failed to load results for ${step}`);
   }
   return data;
+}
+
+/** What an attempt consumed (`GET …/steps/{step}/consumed`, ADR-0056): the map
+ * `upstream step → attempt id` stamped at its launch. Bare = the attempt behind
+ * the step's current evidence. Empty map when nothing was recorded. */
+export async function getConsumed(
+  id: string,
+  step: string,
+  attempt?: string,
+): Promise<{ attempt: string; consumed: Record<string, string> }> {
+  const { data, error } = await api.GET("/v1/runs/{id}/steps/{step}/consumed", {
+    params: { path: { id, step }, query: attempt ? { attempt } : {} },
+  });
+  if (error || !data) {
+    throw new Error(`failed to load consumption for ${step}`);
+  }
+  return data as { attempt: string; consumed: Record<string, string> };
 }
 
 /** List a directory in a step's output workspace snapshot
@@ -134,9 +166,10 @@ export async function listWorkspace(
   id: string,
   step: string,
   path = "",
+  attempt?: string,
 ): Promise<WorkspaceListing> {
   const { data, error } = await api.GET("/v1/runs/{id}/steps/{step}/workspace", {
-    params: { path: { id, step }, query: { path } },
+    params: { path: { id, step }, query: attempt ? { path, attempt } : { path } },
   });
   if (error || !data) {
     throw new Error(`failed to browse workspace for ${step}`);
@@ -145,12 +178,18 @@ export async function listWorkspace(
 }
 
 /** Browser URL for one workspace file's bytes (`GET …/steps/{step}/workspace/file?path=`,
- * streamed through the server — usable directly as an `<a href>`). */
-export function workspaceFileUrl(id: string, step: string, path: string): string {
-  return (
+ * streamed through the server — usable directly as an `<a href>`). With
+ * `attempt`, reads that attempt's immutable snapshot (ADR-0056). */
+export function workspaceFileUrl(
+  id: string,
+  step: string,
+  path: string,
+  attempt?: string,
+): string {
+  const base =
     `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}` +
-    `/workspace/file?path=${encodeURIComponent(path)}`
-  );
+    `/workspace/file?path=${encodeURIComponent(path)}`;
+  return attempt ? `${base}&attempt=${encodeURIComponent(attempt)}` : base;
 }
 
 // --- Environments (ADR-0024/0037). The generated schema types these responses

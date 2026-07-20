@@ -94,7 +94,7 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 | **Parameter** | launch-time input, supplied from *outside* the run | resolved once at launch, then persisted for the run's life | a typed value a launcher supplies to start a Pipeline. Declared in the Pipeline's `interface.inputs`; each is `required` (static bool) with an optional `default` and optional `validate:` CEL predicate. Supplied by a human/API on a `manual`/`api` launch **and** by an `invoke:` caller's `with:` — one declaration, one env rail (`SCARAB_PARAM_<NAME>`), one launch-time CEL binding `${{ inputs.<name> }}`. **Not** the per-Step workspace `inputs:` (ADR-0007), which is a different concept sharing the word. |
 | **Workspace** | intra-run, flows along DAG edges | ephemeral (per run) | the filesystem/checkout Steps build on. **Content-addressed** (per-file merkle CAS). Implicit-by-default (inherit `needs`), explicit-on-demand (`inputs:`/`outputs:`). |
 | **Result** | intra-run, flows along DAG edges | ephemeral | small typed values (a version, a bool) for params/conditionals. |
-| **Artifact** | output of record | retained (TTL), downloadable, UI-visible | binaries, reports, coverage, images. |
+| **Artifact** | output of record | retained (TTL), downloadable, UI-visible | binaries, reports, coverage, images. **Immutable per Attempt** — a retry never overwrites a prior Attempt's version; the name-addressed record resolves to the latest *successful* Attempt's version. |
 | **Cache** | cross-run | best-effort, evictable | `~/.cargo`, `node_modules` — keyed (e.g. lockfile hash). **Not** correctness-critical. |
 
 ### 4.3 Run-time / instance plane (what the durable engine tracks)
@@ -103,7 +103,8 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 |---|---|
 | **Run** | A durable *instance* of a Pipeline for a specific Event/commit. Stores the compiled IR + `{ir_version, event_schema_version}` (self-describing). |
 | **StepRun** | A durable instance of a Step within a Run. |
-| **Attempt** | A single execution of a StepRun. **Restart-step creates a new Attempt.** |
+| **Attempt** | A single execution of a StepRun. **Restart-step creates a new Attempt.** Each Attempt owns its evidence — logs, Results, Artifacts, workspace snapshot — keyed by `{run, step, attempt}`, and records which upstream Attempts it consumed. |
+| **Take** | The span of a Run between two **human interventions** (restart-step). A restart closes the current Take and opens the next; auto-retries, crash re-adoptions, and dead-letters happen *within* a Take. The run-level version unit ("Take 2 of 3") — a bookmark over a frontier of Attempts, not a copy of anything. |
 | **Event log** | Append-only, versioned, immutable record of state transitions. Drives SSE, timeline, audit, time-travel. State tables are the source of truth; the event log is derived-but-durable (via the outbox). |
 | **Admission** | *Scarab's* scheduling decision — which Runs/Steps are allowed to run (concurrency groups, fairness, priority, backpressure). Distinct from k8s **Placement** (node fit). |
 | **Fence** | A monotonic `{run, step, attempt}` token handed to each Attempt and to cooperating external systems (idempotency keys, digest/generation checks) to neutralize the double-effect hazard. |

@@ -9,7 +9,8 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    restart_step, Db, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, Timestamp,
+    restart_step, AttemptId, Db, EventPayload, RunId, RunStatus, Scheduler, StepId, StepSpec,
+    StepStatus, Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor};
 
@@ -109,11 +110,29 @@ async fn restarting_a_middle_step_reruns_only_it_and_descendants() {
     }
 
     // Restart B: re-arms B and its transitive descendant D.
-    restart_step(&db, &clock, &run, &dep("B"))
+    restart_step(&db, &clock, &run, &dep("B"), Some("thulasi".into()))
         .await
         .expect("restart");
     // The run reopened; B and D are Pending again, A and C still Succeeded.
     assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Running));
+
+    // The Take boundary (ADR-0056): the intervention itself is on the event
+    // log — target, the resolved invalidation set, and WHO pressed it.
+    let events = db.events(&run).await.unwrap();
+    let boundary = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventPayload::RunRestartRequested {
+                target,
+                invalidated,
+                by,
+            } => Some((target.clone(), invalidated.clone(), by.clone())),
+            _ => None,
+        })
+        .expect("a RunRestartRequested event");
+    assert_eq!(boundary.0, dep("B"));
+    assert_eq!(boundary.1, vec![dep("B"), dep("D")], "target + descendants");
+    assert_eq!(boundary.2.as_deref(), Some("thulasi"));
 
     // Drive again: B then D re-run (D waits for B), run settles.
     drive_to_terminal(&sched, &db, &run).await;
@@ -186,7 +205,7 @@ async fn restart_skips_unchanged_descendant_then_cascades_when_output_changes() 
     }
 
     // Restart B — its output is unchanged, so D must be skipped, not re-run.
-    restart_step(&db, &clock, &run, &dep("B"))
+    restart_step(&db, &clock, &run, &dep("B"), None)
         .await
         .expect("restart");
     drive_to_terminal(&sched, &db, &run).await;
@@ -214,7 +233,7 @@ async fn restart_skips_unchanged_descendant_then_cascades_when_output_changes() 
 
     // Now B produces a *different* output; restarting B must cascade to D.
     exec.set_output("B", "ob2");
-    restart_step(&db, &clock, &run, &dep("B"))
+    restart_step(&db, &clock, &run, &dep("B"), None)
         .await
         .expect("restart 2");
     drive_to_terminal(&sched, &db, &run).await;
@@ -225,6 +244,41 @@ async fn restart_skips_unchanged_descendant_then_cascades_when_output_changes() 
         2,
         "D cascaded — B's output changed"
     );
+
+    // Attempt-grain evidence (ADR-0056): B's latest evidence is the new
+    // output, but the earlier attempts' snapshots were NOT destroyed — a Take
+    // view can still read what attempt 1 produced.
+    assert_eq!(
+        db.step_output(&run, &dep("B")).await.unwrap().as_deref(),
+        Some("ob2"),
+        "latest evidence = the changed output"
+    );
+    assert_eq!(
+        db.attempt_output(&run, &dep("B"), &AttemptId("a1".into()))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("ob"),
+        "attempt 1's evidence survives the reruns"
+    );
+    assert_eq!(
+        db.attempt_output(&run, &dep("B"), &AttemptId("a3".into()))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("ob2"),
+        "attempt 3 owns its own copy"
+    );
+
+    // Consumption provenance (ADR-0056): D's cascaded attempt recorded WHICH
+    // generation of each upstream it built on — B's third attempt, A's and
+    // C's untouched firsts. Recorded at launch, not inferred later.
+    let consumed = db
+        .attempt_consumed(&run, &dep("D"), &AttemptId("a2".into()))
+        .await
+        .unwrap();
+    assert_eq!(consumed.get("B").map(String::as_str), Some("a3"));
+    assert_eq!(consumed.get("C").map(String::as_str), Some("a1"));
 
     tdb.cleanup().await;
 }
@@ -291,7 +345,7 @@ async fn explicit_inputs_scope_restart_invalidation() {
 
     // C now produces a *different* output; restart it.
     exec.set_output("C", "oc2");
-    restart_step(&db, &clock, &run, &dep("C"))
+    restart_step(&db, &clock, &run, &dep("C"), None)
         .await
         .expect("restart");
     drive_to_terminal(&sched, &db, &run).await;
@@ -325,7 +379,7 @@ async fn restarting_unknown_step_errors() {
         .unwrap();
 
     let clock = FakeClock::new(1_000);
-    assert!(restart_step(&db, &clock, &run, &dep("ghost"))
+    assert!(restart_step(&db, &clock, &run, &dep("ghost"), None)
         .await
         .is_err());
 

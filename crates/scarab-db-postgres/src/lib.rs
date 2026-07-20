@@ -341,20 +341,39 @@ impl Db for PostgresDb {
         &self,
         run: &RunId,
         step: &StepId,
+        attempt: &AttemptId,
         snapshot: &str,
     ) -> Result<(), DbError> {
+        // One transaction (ADR-0056): the attempt's immutable evidence copy
+        // and the step's latest-evidence denormalization (+ its provenance
+        // stamp) move together or not at all.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
         sqlx::query(
             "UPDATE step_runs
              SET output_snapshot = $3,
+                 evidence_attempt = $4,
                  updated_at = (extract(epoch from now()) * 1000)::bigint
              WHERE run_id = $1 AND step_id = $2",
         )
         .bind(&run.0)
         .bind(&step.0)
         .bind(snapshot)
-        .execute(self.pool())
+        .bind(&attempt.0)
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE attempts SET output_snapshot = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(snapshot)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -369,25 +388,61 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("output_snapshot")))
     }
 
+    async fn attempt_output(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<Option<String>, DbError> {
+        let row = sqlx::query(
+            "SELECT output_snapshot FROM attempts
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("output_snapshot")))
+    }
+
     async fn set_step_results(
         &self,
         run: &RunId,
         step: &StepId,
+        attempt: &AttemptId,
         results: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<(), DbError> {
         let json = serde_json::to_value(results).map_err(|e| DbError::Other(e.to_string()))?;
+        // One transaction (ADR-0056) — see `set_step_output`.
+        let mut tx = self.pool().begin().await.map_err(db_err)?;
         sqlx::query(
             "UPDATE step_runs
              SET results = $3,
+                 evidence_attempt = $4,
                  updated_at = (extract(epoch from now()) * 1000)::bigint
              WHERE run_id = $1 AND step_id = $2",
         )
         .bind(&run.0)
         .bind(&step.0)
-        .bind(json)
-        .execute(self.pool())
+        .bind(&json)
+        .bind(&attempt.0)
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        sqlx::query(
+            "UPDATE attempts SET results = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(&json)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
         Ok(())
     }
 
@@ -403,6 +458,90 @@ impl Db for PostgresDb {
             .await
             .map_err(db_err)?;
         match row.and_then(|r| r.get::<Option<Value>, _>("results")) {
+            Some(v) => serde_json::from_value(v).map_err(|e| DbError::Other(e.to_string())),
+            None => Ok(std::collections::BTreeMap::new()),
+        }
+    }
+
+    async fn attempt_results(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>, DbError> {
+        let row = sqlx::query(
+            "SELECT results FROM attempts
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        match row.and_then(|r| r.get::<Option<Value>, _>("results")) {
+            Some(v) => serde_json::from_value(v).map_err(|e| DbError::Other(e.to_string())),
+            None => Ok(std::collections::BTreeMap::new()),
+        }
+    }
+
+    async fn step_evidence_attempt(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<AttemptId>, DbError> {
+        let row = sqlx::query(
+            "SELECT evidence_attempt FROM step_runs WHERE run_id = $1 AND step_id = $2",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row
+            .and_then(|r| r.get::<Option<String>, _>("evidence_attempt"))
+            .map(AttemptId))
+    }
+
+    async fn set_attempt_consumed(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        consumed: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), DbError> {
+        let json = serde_json::to_value(consumed).map_err(|e| DbError::Other(e.to_string()))?;
+        sqlx::query(
+            "UPDATE attempts SET consumed = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(json)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn attempt_consumed(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+    ) -> Result<std::collections::BTreeMap<String, String>, DbError> {
+        let row = sqlx::query(
+            "SELECT consumed FROM attempts
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        match row.and_then(|r| r.get::<Option<Value>, _>("consumed")) {
             Some(v) => serde_json::from_value(v).map_err(|e| DbError::Other(e.to_string())),
             None => Ok(std::collections::BTreeMap::new()),
         }
@@ -1231,20 +1370,33 @@ impl Db for PostgresDb {
     async fn put_artifacts(
         &self,
         run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        succeeded: bool,
         artifacts: &[scarab_engine::ArtifactMeta],
         at: Timestamp,
     ) -> Result<(), DbError> {
         for a in artifacts {
+            // Immutable per attempt (ADR-0056): the conflict target includes
+            // the attempt, so only a re-drive of the SAME fenced attempt
+            // overwrites (deterministic — same bytes); a new attempt writes a
+            // new version and prior evidence survives.
             sqlx::query(
-                "INSERT INTO artifacts (run_id, name, size, content_type, object_key, created_at)
-                 VALUES ($1, $2, $3, $4, $5, $6)
-                 ON CONFLICT (run_id, name) DO UPDATE SET
+                "INSERT INTO artifacts
+                     (run_id, name, step_id, attempt_id, succeeded, size, content_type,
+                      object_key, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (run_id, name, step_id, attempt_id) DO UPDATE SET
+                     succeeded = EXCLUDED.succeeded,
                      size = EXCLUDED.size,
                      content_type = EXCLUDED.content_type,
                      object_key = EXCLUDED.object_key",
             )
             .bind(&run.0)
             .bind(&a.name)
+            .bind(&step.0)
+            .bind(&attempt.0)
+            .bind(succeeded)
             .bind(a.size as i64)
             .bind(&a.content_type)
             .bind(&a.object_key)
@@ -1259,10 +1411,12 @@ impl Db for PostgresDb {
     async fn artifacts_of_run(
         &self,
         run: &RunId,
-    ) -> Result<Vec<scarab_engine::ArtifactMeta>, DbError> {
+    ) -> Result<Vec<scarab_engine::ArtifactRecord>, DbError> {
         let rows = sqlx::query(
-            "SELECT name, size, content_type, object_key FROM artifacts
-             WHERE run_id = $1 ORDER BY name",
+            "SELECT name, step_id, attempt_id, succeeded, size, content_type, object_key,
+                    created_at
+             FROM artifacts
+             WHERE run_id = $1 ORDER BY name, created_at, attempt_id",
         )
         .bind(&run.0)
         .fetch_all(self.pool())
@@ -1270,11 +1424,17 @@ impl Db for PostgresDb {
         .map_err(db_err)?;
         Ok(rows
             .into_iter()
-            .map(|r| scarab_engine::ArtifactMeta {
-                name: r.get::<String, _>("name"),
-                size: r.get::<i64, _>("size") as u64,
-                content_type: r.get::<String, _>("content_type"),
-                object_key: r.get::<String, _>("object_key"),
+            .map(|r| scarab_engine::ArtifactRecord {
+                meta: scarab_engine::ArtifactMeta {
+                    name: r.get::<String, _>("name"),
+                    size: r.get::<i64, _>("size") as u64,
+                    content_type: r.get::<String, _>("content_type"),
+                    object_key: r.get::<String, _>("object_key"),
+                },
+                step: StepId(r.get::<String, _>("step_id")),
+                attempt: AttemptId(r.get::<String, _>("attempt_id")),
+                succeeded: r.get::<bool, _>("succeeded"),
+                created_at: Timestamp(r.get::<i64, _>("created_at")),
             })
             .collect())
     }
@@ -1356,10 +1516,20 @@ impl Db for PostgresDb {
     }
 
     async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError> {
+        // EVERY attempt's snapshot is live while its run is (ADR-0056), not
+        // just each step's latest — an old Take's workspace view must never
+        // race the sweeper. The step_runs arm is kept for pre-ADR-0056 rows
+        // whose attempts carry no snapshot copy.
         let rows = sqlx::query(
-            "SELECT DISTINCT sr.output_snapshot FROM step_runs sr
+            "SELECT DISTINCT sr.output_snapshot AS root FROM step_runs sr
              JOIN runs r ON r.id = sr.run_id
              WHERE sr.output_snapshot IS NOT NULL
+               AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
+                    OR r.updated_at >= $1)
+             UNION
+             SELECT DISTINCT a.output_snapshot AS root FROM attempts a
+             JOIN runs r ON r.id = a.run_id
+             WHERE a.output_snapshot IS NOT NULL
                AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
                     OR r.updated_at >= $1)",
         )
@@ -1369,7 +1539,7 @@ impl Db for PostgresDb {
         .map_err(db_err)?;
         Ok(rows
             .into_iter()
-            .map(|r| r.get::<String, _>("output_snapshot"))
+            .map(|r| r.get::<String, _>("root"))
             .collect())
     }
 

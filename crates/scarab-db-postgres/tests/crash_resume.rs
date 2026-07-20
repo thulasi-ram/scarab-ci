@@ -157,5 +157,15 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
     // external effect happened exactly once.
     assert_eq!(exec.launch_count(&handle), 1, "adopted — never relaunched");
 
+    // The recovery is VISIBLE (ADR-0056): instance B's first contact with a
+    // handle it never launched emits AttemptReadopted — exactly once, even
+    // though B re-polled across several ticks. Instance A (the launcher)
+    // emitted none.
+    assert_eq!(
+        count(&|k| matches!(k, EventPayload::AttemptReadopted { .. })),
+        1,
+        "one adoption event from the resumed instance"
+    );
+
     tdb.cleanup().await;
 }

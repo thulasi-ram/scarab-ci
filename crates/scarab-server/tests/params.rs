@@ -116,7 +116,7 @@ async fn params_interpolate_inputs_and_restart_re_derives_identically() {
     }
 
     // Restart the step (a new Attempt) and drive again.
-    scarab_engine::restart_step(&*db as &dyn Db, &*clock as &dyn Clock, &run, &step)
+    scarab_engine::restart_step(&*db as &dyn Db, &*clock as &dyn Clock, &run, &step, None)
         .await
         .unwrap();
     {
