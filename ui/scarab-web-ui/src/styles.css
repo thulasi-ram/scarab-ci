@@ -810,9 +810,16 @@ h2 {
   background: var(--emerald-surface);
   margin-bottom: 16px;
 }
-/* Two-level labeled cells (LABEL over value), grouped left; status floats right. */
-.prov-main { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 12px 28px; flex: 1; min-width: 0; }
+/* A·2: the same two-line body as the runs-list row — Headline on top, an
+   icon-chip fact strip beneath (no labels) — so the two surfaces are one
+   component. Status floats right. */
+.prov-main { display: flex; flex-direction: column; gap: 8px; flex: 1; min-width: 0; }
 .prov-right { display: inline-flex; align-items: center; gap: 10px; margin-left: auto; flex: none; }
+/* The opaque internal id, marked by a small inline `id` tag (no hash icon in
+   the set) so it doesn't read as another sha; click-to-copy. */
+.pfact.idfact { cursor: pointer; }
+.pfact.idfact:hover, .pfact.idfact:hover .mono { color: var(--emerald); }
+.idcap { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted-sage); }
 .pcell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .pcell .k {
   font-family: var(--font-mono); font-size: 10px; font-weight: 600;

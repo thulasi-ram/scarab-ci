@@ -436,142 +436,127 @@ export default function RunDetail() {
               </button>
             </div>
 
-            {/* Provenance bar: labeled two-level cells (LABEL over value),
-                grouped left (pipeline → code → who → when → id); status floated
-                right. Commit + PR deep-link to the forge via the repo's registry
-                web base (repoUrl). */}
+            {/* Provenance bar (ADR-0057 A·2): the SAME two-line body as a runs-
+                list row — the Headline on top, an icon-chip fact strip beneath
+                (no labels; the icon + hover title carry the meaning). The `#N`
+                handle lives in the breadcrumb; status floats right. Commit + PR
+                deep-link to the forge via the repo's registry web base. */}
             <div class="prov">
               <div class="prov-main">
-                <Show when={r().pipeline}>
-                  {(name) => (
-                    <div class="pcell">
-                      <div class="k">pipeline</div>
-                      <div class="v strong">
-                        <Icon icon="workflow" size={14} />
+                {/* Line 1: kind + Headline — the shared runs-list cell. */}
+                <div class="rr-head">
+                  <TriggerCell kind={triggerInfo()?.kind} title={r().trigger_title} variant="row" />
+                </div>
+                {/* Line 2: origin facts — pipeline · commit · base ← head · PR ·
+                    who · when · id. */}
+                <div class="rr-facts">
+                  <Show when={r().pipeline}>
+                    {(name) => (
+                      <span class="pfact strong" title="pipeline">
+                        <Icon icon="workflow" size={12} />
                         <span class="mono">{name()}</span>
-                      </div>
-                    </div>
-                  )}
-                </Show>
-
-                <Show when={triggerInfo()}>
-                  {(t) => {
-                    const commitUrl = () => forgeCommitUrl(repoUrl(), t().sha);
-                    const prUrl = () => forgePrUrl(repoUrl(), t().pr);
-                    return (
-                      <>
-                        <Show when={t().pr != null}>
-                          <div class="pcell">
-                            <div class="k">pull request</div>
+                      </span>
+                    )}
+                  </Show>
+                  <Show when={triggerInfo()}>
+                    {(t) => {
+                      const commitUrl = () => forgeCommitUrl(repoUrl(), t().sha);
+                      const prUrl = () => forgePrUrl(repoUrl(), t().pr);
+                      return (
+                        <>
+                          <Show when={t().sha}>
                             <a
-                              class="v"
-                              classList={{ link: !!prUrl() }}
-                              href={prUrl() ?? undefined}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              title="pull request on the forge"
-                            >
-                              <Icon icon="git-pull-request" size={14} />
-                              <span class="mono">#{t().pr}</span>
-                            </a>
-                          </div>
-                        </Show>
-                        <Show when={t().sha}>
-                          <div class="pcell">
-                            <div class="k">commit</div>
-                            <a
-                              class="v"
+                              class="pfact"
                               classList={{ link: !!commitUrl() }}
                               href={commitUrl() ?? undefined}
                               target="_blank"
                               rel="noopener noreferrer"
                               title="commit on the forge"
                             >
-                              <Icon icon="git-commit-horizontal" size={14} />
+                              <Icon icon="git-commit-horizontal" size={12} />
                               <span class="mono sha">{t().sha!.slice(0, 8)}</span>
                             </a>
-                          </div>
-                        </Show>
-                        <Show when={t().branch && t().branch !== t().sha}>
-                          <div class="pcell">
-                            <div class="k">branch</div>
-                            <div class="v">
-                              <Icon icon="git-branch" size={14} />
-                              <span class="mono">{t().branch}</span>
-                            </div>
-                          </div>
-                        </Show>
-                        {/* base ← head on PR runs (ADR-0057): the branch the PR
-                            targets, reading into its head commit. */}
-                        <Show when={r().origin_pr_base}>
-                          {(base) => (
-                            <div class="pcell">
-                              <div class="k">base ← head</div>
-                              <div class="v">
-                                <Icon icon="git-branch" size={14} />
+                          </Show>
+                          {/* base ← head on PR runs (ADR-0057); else branch/ref. */}
+                          <Show
+                            when={r().origin_pr_base}
+                            fallback={
+                              <Show when={t().branch && t().branch !== t().sha}>
+                                <span class="pfact" title="branch / ref">
+                                  <Icon icon="git-branch" size={12} />
+                                  <span class="mono">{t().branch}</span>
+                                </span>
+                              </Show>
+                            }
+                          >
+                            {(base) => (
+                              <span class="pfact" title="base ← head">
+                                <Icon icon="git-branch" size={12} />
                                 <span class="mono">{base()}</span>
                                 <span class="pr-arrow">←</span>
                                 <span class="mono sha">{(t().sha ?? "").slice(0, 8)}</span>
-                              </div>
-                            </div>
-                          )}
-                        </Show>
-                      </>
-                    );
-                  }}
-                </Show>
-
-                {/* Trigger cell (ADR-0057): kind + the run Headline beneath —
-                    the SAME shared component the runs list uses. */}
-                <TriggerCell kind={triggerInfo()?.kind} title={r().trigger_title} variant="cell" />
-                <Show when={triggerInfo()?.actor}>
-                  {(actor) => (
-                    <div class="pcell">
-                      <div class="k">triggered by</div>
-                      <div class="v">
-                        <Icon icon="user" size={13} />
-                        <span>{actor()}</span>
-                      </div>
-                    </div>
-                  )}
-                </Show>
-
-                <Show when={Object.keys(runParams(r())).length > 0}>
-                  <div class="pcell">
-                    <div class="k">params</div>
-                    <div class="v mono">
-                      {Object.entries(runParams(r()))
-                        .map(([k, v]) => `${k}=${String(v)}`)
-                        .join(" · ")}
-                    </div>
-                  </div>
-                </Show>
-
-                <Show when={startedAt()}>
-                  <div class="pcell">
-                    <div class="k">started</div>
-                    <div class="v" title={absTime(startedAt()!)}>{relTime(startedAt()!)}</div>
-                  </div>
-                </Show>
-
-                <div class="pcell">
-                  <div class="k">elapsed</div>
-                  <div class="v mono">
-                    {startedAt() ? duration(startedAt()!, finishedAt() ?? Date.now()) : "—"}
-                  </div>
-                </div>
-
-                {/* The opaque internal id (UUIDv7) — stable key/URL, distinct
-                    from the `#N` handle in the breadcrumb; click to copy full. */}
-                <div class="pcell">
-                  <div class="k">run id</div>
-                  <div
-                    class="v mono subtle link"
-                    title={`${id()} — click to copy`}
+                              </span>
+                            )}
+                          </Show>
+                          <Show when={t().pr != null}>
+                            <a
+                              class="pfact"
+                              classList={{ link: !!prUrl() }}
+                              href={prUrl() ?? undefined}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title="pull request on the forge"
+                            >
+                              <Icon icon="git-pull-request" size={12} />
+                              <span class="mono">#{t().pr}</span>
+                            </a>
+                          </Show>
+                          <Show when={t().actor}>
+                            {(actor) => (
+                              <span class="pfact" title="triggered by">
+                                <Icon icon="user" size={12} />
+                                <span>{actor()}</span>
+                              </span>
+                            )}
+                          </Show>
+                        </>
+                      );
+                    }}
+                  </Show>
+                  <Show when={startedAt()}>
+                    <span
+                      class="pfact"
+                      classList={{ live: live() && !timeTraveling() }}
+                      title={absTime(startedAt()!)}
+                    >
+                      <Icon icon="timer" size={12} />
+                      <span>
+                        {relTime(startedAt()!)} ·{" "}
+                        <span class="mono">
+                          {duration(startedAt()!, finishedAt() ?? Date.now())}
+                        </span>
+                      </span>
+                    </span>
+                  </Show>
+                  <Show when={Object.keys(runParams(r())).length > 0}>
+                    <span class="pfact" title="launch parameters">
+                      <span class="mono">
+                        {Object.entries(runParams(r()))
+                          .map(([k, v]) => `${k}=${String(v)}`)
+                          .join(" · ")}
+                      </span>
+                    </span>
+                  </Show>
+                  {/* Opaque internal id (UUIDv7) — copyable; a small inline `id`
+                      tag marks it apart from the shas. `#N` is in the breadcrumb. */}
+                  <span
+                    class="pfact idfact"
+                    title={`run id ${id()} — click to copy`}
                     onClick={() => navigator.clipboard?.writeText(id())}
                   >
-                    {id().slice(0, 8)}
-                  </div>
+                    <span class="idcap">id</span>
+                    <span class="mono subtle">{id().slice(0, 8)}</span>
+                  </span>
                 </div>
               </div>
 
