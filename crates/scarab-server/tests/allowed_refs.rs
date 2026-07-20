@@ -126,6 +126,7 @@ async fn env_store(allowed_refs: &[&str]) -> FakeEnvironments {
 
 fn push(branch: &str) -> Event {
     Event::Push {
+        actor: "octocat".into(),
         repo: repo(),
         r#ref: format!("refs/heads/{branch}"),
         // A REAL commit SHA — the value pre-fix wrongly matched against allowed_refs.
@@ -209,6 +210,7 @@ async fn pull_request_is_denied_a_branch_scoped_environment() {
     let envs = env_store(&["refs/heads/main"]).await;
 
     let pr = Event::PullRequest {
+        actor: "octocat".into(),
         repo: repo(),
         number: 7,
         head: "1234567890abcdef1234567890abcdef12345678".into(),
@@ -230,6 +232,7 @@ async fn pull_request_admitted_when_env_opts_in_via_pull_glob() {
     let envs = env_store(&["refs/pull/*"]).await;
 
     let pr = Event::PullRequest {
+        actor: "octocat".into(),
         repo: repo(),
         number: 7,
         head: "1234567890abcdef1234567890abcdef12345678".into(),

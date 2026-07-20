@@ -95,11 +95,17 @@ pub struct WebhookDelivery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     Push {
+        /// The forge principal who pushed (the webhook `sender`), normalized to a
+        /// login. Stamped onto the Run as its [`Actor`](Event::actor) and shown in
+        /// the UI. Empty only if the payload carried no sender (malformed).
+        actor: String,
         repo: RepoRef,
         r#ref: String,
         after: String,
     },
     PullRequest {
+        /// The forge principal who triggered the PR event (the webhook `sender`).
+        actor: String,
         repo: RepoRef,
         number: u64,
         head: String,
@@ -109,14 +115,20 @@ pub enum Event {
         fork: bool,
     },
     Tag {
+        /// The forge principal who cut the tag (the webhook `sender`).
+        actor: String,
         repo: RepoRef,
         tag: String,
     },
     Release {
+        /// The forge principal who published the release (the webhook `sender`).
+        actor: String,
         repo: RepoRef,
         tag: String,
     },
     Comment {
+        /// The forge principal who wrote the comment (the webhook `sender`).
+        actor: String,
         repo: RepoRef,
         issue: u64,
         body: String,
@@ -227,6 +239,26 @@ impl Event {
             Event::Manual { r#ref, .. } | Event::Api { r#ref, .. } => Some(r#ref.clone()),
             Event::Comment { .. } | Event::Cron { .. } | Event::Upstream { .. } => None,
         }
+    }
+
+    /// The **Actor** (CONTEXT.md §4.5) — the forge principal who caused this
+    /// event (pusher, PR opener, tagger, releaser, commenter, or `manual`/`api`
+    /// dispatcher), normalized to a login. `None` for the internally-originated
+    /// `cron` and `upstream` events, which have no forge principal. An empty
+    /// stored login (a payload with no `sender`) also reads as `None`, so callers
+    /// get either a real login or nothing.
+    pub fn actor(&self) -> Option<&str> {
+        let a = match self {
+            Event::Push { actor, .. }
+            | Event::PullRequest { actor, .. }
+            | Event::Tag { actor, .. }
+            | Event::Release { actor, .. }
+            | Event::Comment { actor, .. }
+            | Event::Manual { actor, .. }
+            | Event::Api { actor, .. } => actor.as_str(),
+            Event::Cron { .. } | Event::Upstream { .. } => "",
+        };
+        (!a.is_empty()).then_some(a)
     }
 
     /// The repository this event targets, if any. Only `cron` is truly repo-less;
@@ -676,6 +708,7 @@ mod tests {
         let cases = [
             (
                 Event::Push {
+                    actor: "octocat".into(),
                     repo: repo(),
                     r#ref: "refs/heads/main".into(),
                     after: "deadbeef".into(),
@@ -684,6 +717,7 @@ mod tests {
             ),
             (
                 Event::PullRequest {
+                    actor: "octocat".into(),
                     repo: repo(),
                     number: 7,
                     head: "cafe".into(),
@@ -693,6 +727,7 @@ mod tests {
             ),
             (
                 Event::Tag {
+                    actor: "octocat".into(),
                     repo: repo(),
                     tag: "v1".into(),
                 },
@@ -700,6 +735,7 @@ mod tests {
             ),
             (
                 Event::Release {
+                    actor: "octocat".into(),
                     repo: repo(),
                     tag: "v1".into(),
                 },
@@ -707,6 +743,7 @@ mod tests {
             ),
             (
                 Event::Comment {
+                    actor: "octocat".into(),
                     repo: repo(),
                     issue: 1,
                     body: "/deploy".into(),
@@ -751,14 +788,61 @@ mod tests {
     }
 
     #[test]
+    fn actor_is_exposed_for_principal_events_and_none_otherwise() {
+        // A webhook variant carries its normalized sender login.
+        assert_eq!(
+            Event::Push {
+                actor: "octocat".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                after: "abc".into(),
+            }
+            .actor(),
+            Some("octocat")
+        );
+        // A dispatch carries its actor too.
+        assert_eq!(
+            Event::Manual {
+                actor: "alice".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                sha: "abc".into(),
+            }
+            .actor(),
+            Some("alice")
+        );
+        // Internally-originated events have no forge principal.
+        assert_eq!(
+            Event::Cron {
+                schedule: "0 * * * *".into()
+            }
+            .actor(),
+            None
+        );
+        // An empty stored login (payload had no sender) reads as None, not "".
+        assert_eq!(
+            Event::Push {
+                actor: String::new(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                after: "abc".into(),
+            }
+            .actor(),
+            None
+        );
+    }
+
+    #[test]
     fn fork_pr_is_detected() {
         let fork = Event::PullRequest {
+            actor: "octocat".into(),
             repo: repo(),
             number: 1,
             head: "x".into(),
             fork: true,
         };
         let internal = Event::PullRequest {
+            actor: "octocat".into(),
             repo: repo(),
             number: 2,
             head: "y".into(),
@@ -769,6 +853,7 @@ mod tests {
         assert!(fork.context()["event"]["fork"].as_bool().unwrap());
         // Non-PR events are never fork PRs.
         assert!(!Event::Push {
+            actor: "octocat".into(),
             repo: repo(),
             r#ref: "main".into(),
             after: "z".into()
@@ -810,6 +895,7 @@ mod tests {
         }
         assert_eq!(
             Event::Push {
+                actor: "octocat".into(),
                 repo: repo(),
                 r#ref: "main".into(),
                 after: "x".into()
@@ -825,6 +911,7 @@ mod tests {
         // elsewhere (Push::after, Manual/Api::sha), never returned here.
         assert_eq!(
             Event::Push {
+                actor: "octocat".into(),
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 after: "deadbeef".into(),
@@ -858,6 +945,7 @@ mod tests {
         // Tag/Release synthesize a `refs/tags/*` ref.
         assert_eq!(
             Event::Tag {
+                actor: "octocat".into(),
                 repo: repo(),
                 tag: "v1".into()
             }
@@ -867,6 +955,7 @@ mod tests {
         );
         assert_eq!(
             Event::Release {
+                actor: "octocat".into(),
                 repo: repo(),
                 tag: "v2".into()
             }
@@ -878,6 +967,7 @@ mod tests {
         // fenced out of a branch-scoped Environment (the fail-safe).
         assert_eq!(
             Event::PullRequest {
+                actor: "octocat".into(),
                 repo: repo(),
                 number: 7,
                 head: "cafe".into(),
@@ -897,6 +987,7 @@ mod tests {
         );
         assert_eq!(
             Event::Comment {
+                actor: "octocat".into(),
                 repo: repo(),
                 issue: 1,
                 body: "/deploy".into()
@@ -930,6 +1021,7 @@ mod tests {
     #[test]
     fn push_context_exposes_branch_and_sha_for_cel() {
         let ctx = Event::Push {
+            actor: "octocat".into(),
             repo: repo(),
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),

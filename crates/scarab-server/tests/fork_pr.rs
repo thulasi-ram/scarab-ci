@@ -19,6 +19,7 @@ fn scope() -> SecretScope {
 
 fn pr(fork: bool) -> Event {
     Event::PullRequest {
+        actor: "octocat".into(),
         repo: RepoRef {
             owner: "acme".into(),
             name: "app".into(),
