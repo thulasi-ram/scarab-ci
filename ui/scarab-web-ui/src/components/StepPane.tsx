@@ -62,6 +62,7 @@ export default function StepPane(props: {
   canDebug?: boolean;
 }) {
   const [tab, setTab] = createSignal<Tab>("logs");
+  const [tryOpen, setTryOpen] = createSignal(false);
   const [wsPath, setWsPath] = createSignal("");
   const [openFile, setOpenFile] = createSignal<string | null>(null);
   const [wrap, setWrap] = createSignal(true);
@@ -114,15 +115,15 @@ export default function StepPane(props: {
     }
   };
 
-  // Outcome glyph: superseded (cut short) ranks before failed; both before ok.
-  const chipLabel = (a: Attempt, i: number) => {
-    const outcome = isSuperseded(a)
-      ? " ⊘ superseded"
-      : a.failed
-        ? ` ✗ ${a.failure ?? ""}`
-        : "";
-    return `try ${i + 1}${outcome}${causeSuffix(a)}`;
+  // Dropdown line items group two lines: the compact title (try N · cause) and
+  // the outcome beneath it — superseded (cut short) ranks before failed.
+  const tryTitle = (a: Attempt, i: number) => `try ${i + 1}${causeSuffix(a)}`;
+  const tryOutcome = (a: Attempt): string => {
+    if (isSuperseded(a)) return "⊘ superseded · cut short by a rerun";
+    if (a.failed) return `✗ failed${a.failure ? ` · ${a.failure}` : ""}`;
+    return "✓ succeeded";
   };
+  const scopedIndex = () => attemptsOf().findIndex((a) => a.id === scoped()?.id);
 
   // --- Logs: one buffered SSE stream per (step, attempt); the scoped attempt's
   // buffer renders. Historical attempts replay and close; the live one tails. ---
@@ -233,54 +234,69 @@ export default function StepPane(props: {
       >
         {(s) => (
           <>
-            {/* Attempt strip: every tab below is scoped to the lit chip. */}
-            <div class="astrip">
-              <span class="astrip-step mono">{s().id}</span>
-              <For each={attemptsOf()}>
-                {(a, i) => (
-                  <button
-                    class="achip"
-                    classList={{
-                      failed: a.failed && !isSuperseded(a),
-                      superseded: isSuperseded(a),
-                      shadowed: isShadowed(a),
-                      ok: !a.failed && !isSuperseded(a),
-                      sel: scoped()?.id === a.id,
-                    }}
-                    onClick={() => props.onAttemptSelect(a.id)}
-                    title={`try ${a.id}${
-                      isSuperseded(a)
-                        ? " — cut short by a rerun of an upstream step (superseded)"
-                        : isShadowed(a)
-                          ? " — succeeded, but a newer try replaced it as the of-record version (shadowed)"
-                          : ""
-                    }${
-                      causes()?.readopted.has(a.id)
-                        ? " — re-adopted after a control-plane restart (same attempt, same fence)"
-                        : ""
-                    }`}
-                  >
-                    {chipLabel(a, i())}
-                    <Show when={isShadowed(a)}>
-                      <span class="ashadow" title="no longer the of-record version">
-                        shadowed
-                      </span>
-                    </Show>
-                    <Show when={causes()?.readopted.has(a.id)}>
-                      <span class="areadopt" title="re-adopted after control-plane restart">
-                        ⟲
-                      </span>
-                    </Show>
-                  </button>
-                )}
-              </For>
+            {/* Step header: a caps micro-label + the step id, then a "try"
+                dropdown that scopes every tab below (mirrors the version
+                dropdown; ADR-0056 amendment — no side-border line items). */}
+            <div class="step-head">
+              <span class="hdr-label">Step</span>
+              <span class="step-head-id mono">{s().id}</span>
               <Show when={props.deadLettered && attemptsOf().some((a) => a.failed)}>
                 <span class="adeadletter" title="no verdict obtainable — the operator signal">
                   ⊘ dead-lettered
                 </span>
               </Show>
-              <Show when={attemptsOf().length === 0}>
-                <span class="subtle">not started</span>
+              <span class="grow1" />
+              <Show
+                when={attemptsOf().length > 0}
+                fallback={<span class="subtle">not started</span>}
+              >
+                <div class="verdrop trydrop" classList={{ open: tryOpen() }}>
+                  <button
+                    class="verdrop-btn"
+                    onClick={() => setTryOpen((v) => !v)}
+                    title="which try to inspect"
+                  >
+                    <span class="vd-label">
+                      {scoped() ? tryTitle(scoped()!, scopedIndex()) : "try"}
+                    </span>
+                    <Icon icon="chevron-down" size={12} class="vd-caret" />
+                  </button>
+                  <Show when={tryOpen()}>
+                    <div class="verdrop-backdrop" onClick={() => setTryOpen(false)} />
+                    <ul class="verdrop-list">
+                      <For each={attemptsOf()}>
+                        {(a, i) => (
+                          <li>
+                            <button
+                              class="verdrop-row"
+                              classList={{ sel: scoped()?.id === a.id }}
+                              onClick={() => {
+                                props.onAttemptSelect(a.id);
+                                setTryOpen(false);
+                              }}
+                            >
+                              <span class="vr-dot">{scoped()?.id === a.id ? "●" : "○"}</span>
+                              <span class="vr-main">
+                                <span class="vr-label">{tryTitle(a, i())}</span>
+                                <span class="vr-sub">{tryOutcome(a)}</span>
+                              </span>
+                              <Show when={isShadowed(a)}>
+                                <span class="vr-tag" title="no longer the of-record version">
+                                  shadowed
+                                </span>
+                              </Show>
+                              <Show when={causes()?.readopted.has(a.id)}>
+                                <span class="areadopt" title="re-adopted after control-plane restart">
+                                  ⟲
+                                </span>
+                              </Show>
+                            </button>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </Show>
+                </div>
               </Show>
             </div>
 

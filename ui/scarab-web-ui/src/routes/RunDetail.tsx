@@ -249,6 +249,27 @@ export default function RunDetail() {
   // Rerun, never surfacing "Take"/"attempt". Take 1 is the "original run"; every
   // later Take is named by the Rerun that OPENED it — the previous Take's closing
   // target (deriveTakes records it as `closedByTarget`) and time.
+  // Run provenance lives in the event log's trigger event (a `Raw` payload) —
+  // the thin GET /v1/runs/{id} DTO carries only id/status/steps — so the top bar
+  // reads trigger/actor/branch/commit from there.
+  const triggerInfo = (): {
+    kind?: string;
+    actor?: string;
+    branch?: string;
+    ref?: string;
+    sha?: string;
+  } | null => {
+    for (const e of events()) {
+      const k = e.kind as unknown;
+      if (k && typeof k === "object" && "Raw" in (k as Record<string, unknown>)) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const t = (k as any).Raw?.trigger?.event;
+        if (t) return t;
+      }
+    }
+    return null;
+  };
+
   const openedBy = (t: Take): string | null =>
     t.n <= 1 ? null : (takes()[t.n - 2]?.closedByTarget ?? null);
   const rowLabel = (t: Take): string => {
@@ -291,12 +312,6 @@ export default function RunDetail() {
                 <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
                 <span class="crumb-head-title mono" title={id()}>run {id().slice(0, 8)}</span>
               </h1>
-              <StatusBadge status={r().status} />
-              <Show when={live() && !timeTraveling()}>
-                <span class="live-dot" title="live">
-                  <span class="dot" /> live
-                </span>
-              </Show>
             </div>
 
             <div class="run-toolbar">
@@ -362,9 +377,47 @@ export default function RunDetail() {
 
             <div class="prov">
               <div class="cell">
+                <div class="k">status</div>
+                <div class="v prov-status">
+                  <StatusBadge status={r().status} />
+                  <Show when={live() && !timeTraveling()}>
+                    <span class="live-dot" title="live">
+                      <span class="dot" /> live
+                    </span>
+                  </Show>
+                </div>
+              </div>
+              <div class="cell">
                 <div class="k">run</div>
                 <div class="v mono"><span class="sha">{id()}</span></div>
               </div>
+              <Show when={triggerInfo()}>
+                {(t) => (
+                  <>
+                    <Show when={t().kind}>
+                      <div class="cell">
+                        <div class="k">trigger</div>
+                        <div class="v">
+                          {t().kind}
+                          <Show when={t().actor}> · by {t().actor}</Show>
+                        </div>
+                      </div>
+                    </Show>
+                    <Show when={t().branch && t().branch !== t().sha}>
+                      <div class="cell">
+                        <div class="k">branch</div>
+                        <div class="v mono">{t().branch}</div>
+                      </div>
+                    </Show>
+                    <Show when={t().sha}>
+                      <div class="cell">
+                        <div class="k">commit</div>
+                        <div class="v mono"><span class="sha">{t().sha!.slice(0, 8)}</span></div>
+                      </div>
+                    </Show>
+                  </>
+                )}
+              </Show>
               <Show when={Object.keys(runParams(r())).length > 0}>
                 <div class="cell">
                   <div class="k">params</div>

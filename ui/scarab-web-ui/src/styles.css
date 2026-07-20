@@ -2083,15 +2083,18 @@ h1, .crumb-head, .run-title {
 }
 /* DAG column: a transparent "Steps" header over the graph canvas, which scrolls. */
 .pipeline-panel .dag-wrap { display: flex; flex-direction: column; }
+/* Section headers over the two columns — caps, tracked, mono micro-labels
+   (a lighter echo of the .panel-h treatment, one level down). */
 .dag-head {
-  font-size: 13px; font-weight: 600; color: var(--soft-white);
-  letter-spacing: 0.01em; padding: 12px 4px 8px;
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1.4px; color: var(--sage);
+  padding: 11px 4px 10px;
 }
 .pipeline-panel .dag-wrap .dag { flex: 1; overflow: auto; border-radius: var(--radius); }
 /* Step evidence: no card of its own — a transparent header, content below. */
 .pipeline-panel .rd-grid > .steppane {
   display: flex; flex-direction: column; min-height: 0;
-  border: none; background: transparent; overflow: hidden;
+  border: none; background: transparent; overflow: visible;
 }
 /* The selected tab fills the leftover height and scrolls in place. */
 .pipeline-panel .steppane .tabpane { flex: 1; min-height: 0; overflow: auto; }
@@ -2122,21 +2125,31 @@ h1, .crumb-head, .run-title {
   background: var(--pine-deep); border: 1px solid var(--border);
   border-radius: var(--radius); box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28);
 }
+/* Line items (versions AND tries): grouped label + sub, no side border — the
+   dot + a soft fill carry selection. */
 .verdrop-row {
-  display: flex; align-items: center; gap: 9px; width: 100%; cursor: pointer;
+  display: flex; align-items: center; gap: 10px; width: 100%; cursor: pointer;
   font-family: var(--font-mono); font-size: 11.5px; color: var(--sage);
-  background: transparent; border: none; border-left: 2px solid transparent;
-  border-radius: var(--radius-sm); padding: 8px 10px; text-align: left;
+  background: transparent; border: none;
+  border-radius: var(--radius-sm); padding: 8px 11px; text-align: left;
 }
 .verdrop-row:hover { background: var(--emerald-surface); color: var(--soft-white); }
-.verdrop-row.sel {
-  color: var(--soft-white); background: var(--emerald-surface);
-  border-left-color: var(--emerald);
-}
-.verdrop-row .vr-dot { color: var(--emerald); font-size: 9px; }
-.verdrop-row .vr-main { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.verdrop-row.sel { color: var(--soft-white); background: var(--emerald-surface); }
+.verdrop-row .vr-dot { color: var(--emerald); font-size: 9px; line-height: 1; }
+.verdrop-row.sel .vr-dot { color: var(--emerald-bright); }
+.verdrop-row .vr-main { flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .verdrop-row .vr-sub { color: var(--muted-sage); font-size: 10px; }
 .verdrop-row .vr-live { color: var(--emerald); font-size: 10px; }
+.verdrop-row .vr-tag {
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted-sage);
+  border: 1px solid var(--border); border-radius: 20px; padding: 1px 6px;
+}
+.verdrop-row .areadopt { color: var(--copper); font-size: 12px; }
+/* The attempt ("try") dropdown reuses the version dropdown, one notch lighter. */
+.trydrop .verdrop-btn { height: 24px; font-size: 11px; }
+
+/* Status moved into the top metadata bar (was on the breadcrumb). */
+.prov-status { display: inline-flex; align-items: center; gap: 10px; }
 
 /* Artifacts footer of the Pipeline component — flat, typography-led (matches the
    flattened step-evidence headers, no surface of its own). */
@@ -2159,17 +2172,20 @@ h1, .crumb-head, .run-title {
    page-level `.tabs` spacing doesn't apply. */
 .steppane .tabs { margin: 0; background: none; padding: 0 8px; border-bottom: 1px solid var(--border); }
 
-/* The tries strip: every tab below is scoped to the lit chip. Flat — no surface
-   of its own (the Pipeline header carries the chrome); the step name leads by
-   typography, and the chips + tabs read as content, not a nested toolbar. */
-.steppane .astrip {
-  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
-  padding: 12px 14px 8px;
+/* Step header: a caps micro-label + the step id, then the "try" dropdown. Flat
+   — no surface of its own; typography-led (matches the DAG's "Steps" header). */
+.steppane .step-head {
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
+  padding: 11px 12px 10px;
 }
-.steppane .astrip-step {
-  font-size: 13px; font-weight: 600; color: var(--soft-white);
-  letter-spacing: 0.01em; margin-right: 6px;
+.steppane .step-head .hdr-label {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1.4px; color: var(--muted-sage);
 }
+.steppane .step-head-id {
+  font-size: 13px; font-weight: 500; color: var(--soft-white); letter-spacing: 0.01em;
+}
+.steppane .step-head .grow1 { flex: 1; }
 .achip {
   display: inline-flex; align-items: center; gap: 5px;
   font-family: var(--font-mono); font-size: 11px; cursor: pointer;
