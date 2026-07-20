@@ -29,6 +29,16 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use uuid::Uuid;
 
+/// Mint a fresh internal run id (ADR-0057 amendment). The single source of run
+/// ids: an opaque, unguessable **UUIDv7** whose hex string is lexicographically
+/// time-sortable, so the `runs` TEXT primary key keeps insert locality (v4 was
+/// fully random — index fragmentation). v7 embeds wall-clock time, so it lives
+/// here in the server (infra) rather than the engine, which sources time only
+/// via the `Clock` port. Session/CSRF/state ids stay v4 — they aren't keys.
+fn new_run_id() -> RunId {
+    RunId(Uuid::now_v7().to_string())
+}
+
 use scarab_engine::{
     AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RestartError,
     RunId, RunStatus, StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION,
@@ -520,6 +530,11 @@ pub struct PipelineInterfaceResponse {
 pub struct RunStatusResponse {
     pub id: String,
     pub status: String,
+    /// The **run number** (ADR-0057 amendment) — the per-repo sequential `#N`,
+    /// the human handle shown in the run-detail breadcrumb + gutter. Absent for
+    /// untenanted inline runs and pre-allocation runs. Distinct from `id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_number: Option<i64>,
     pub steps: Vec<StepStatusDto>,
     /// The run's frozen launch parameters, `name → typed value` (ADR-0043 §5).
     /// A run-level constant resolved once at creation; non-secret by contract
@@ -568,6 +583,12 @@ pub struct RunSummaryDto {
     /// The owning project (repo name), if tenanted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// The **run number** (ADR-0057 amendment) — the per-repo sequential `#N`,
+    /// the human handle shown in the run-list gutter. Absent for untenanted
+    /// inline runs and runs created before run-number allocation. Distinct from
+    /// the opaque, unguessable `id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_number: Option<i64>,
     /// The run's **origin** — the trigger facts it was born from, each stamped at
     /// creation and independently nullable (sparse across trigger kinds; all
     /// absent on runs created before origin-stamping). The trigger kind
@@ -615,6 +636,7 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             duration_ms: (s.updated_at.0 - s.created_at.0).max(0),
             org: s.tenant.as_ref().map(|(o, _)| o.clone()),
             project: s.tenant.as_ref().map(|(_, p)| p.clone()),
+            run_number: s.run_number,
             trigger_kind: s.trigger_kind,
             actor: s.actor,
             git_ref: s.git_ref,
@@ -822,7 +844,7 @@ async fn create_run(
     }
 
     let now = st.clock.now().await;
-    let run = RunId(Uuid::new_v4().to_string());
+    let run = new_run_id();
 
     st.db
         .create_run(&run, req.pipeline.ir_version, EVENT_VERSION, now)
@@ -1298,9 +1320,11 @@ async fn get_run(
     let pipeline = st.db.run_pipeline(&run).await?;
     let trigger_title = st.db.run_trigger_title(&run).await?;
     let origin_pr_base = st.db.run_pr_base(&run).await?;
+    let run_number = st.db.run_number(&run).await?;
     Ok(Json(RunStatusResponse {
         id: run.0,
         status: run_status_name(status).to_string(),
+        run_number,
         steps: steps
             .into_iter()
             .map(|s| StepStatusDto {
@@ -2833,7 +2857,7 @@ async fn admit_and_create_run(
     }
 
     let now = clock.now().await;
-    let run = RunId(Uuid::new_v4().to_string());
+    let run = new_run_id();
     persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, now).await?;
     // Freeze the resolved launch parameters on the run so every step's
     // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
@@ -3217,6 +3241,9 @@ async fn persist_run_from_ir(
     // Untenanted runs (no repo — inline dev submissions) stay global-only.
     if let Some(repo) = event.repo() {
         db.set_run_tenant(run, &repo.owner, &repo.name).await?;
+        // Allocate the per-repo run number (ADR-0057 amendment) once the tenant
+        // is known — the human `#N` handle. Untenanted inline runs skip this.
+        db.allocate_run_number(run, &repo.owner, &repo.name).await?;
     }
     // Origin (the runs-list surface): stamp the trigger facts this run was born
     // from — trigger kind (always), Actor, symbolic ref, resolved commit, PR

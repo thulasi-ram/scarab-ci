@@ -367,7 +367,11 @@ export default function RunDetail() {
               <h1 class="crumb-head">
                 <A href={`/${org()}/${repo()}`} class="crumb-head-link">{repo()}</A>
                 <Icon icon="chevron-right" size={20} class="crumb-head-sep" />
-                <span class="crumb-head-title mono" title={id()}>run {id().slice(0, 8)}</span>
+                {/* The per-repo run number `#N` is the human handle (ADR-0057);
+                    fall back to the short internal id for untenanted runs. */}
+                <span class="crumb-head-title mono" title={id()}>
+                  {r().run_number != null ? `#${r().run_number}` : `run ${id().slice(0, 8)}`}
+                </span>
               </h1>
             </div>
 
@@ -557,9 +561,17 @@ export default function RunDetail() {
                   </div>
                 </div>
 
+                {/* The opaque internal id (UUIDv7) — stable key/URL, distinct
+                    from the `#N` handle in the breadcrumb; click to copy full. */}
                 <div class="pcell">
-                  <div class="k">run</div>
-                  <div class="v mono subtle">{id().slice(0, 8)}</div>
+                  <div class="k">run id</div>
+                  <div
+                    class="v mono subtle link"
+                    title={`${id()} — click to copy`}
+                    onClick={() => navigator.clipboard?.writeText(id())}
+                  >
+                    {id().slice(0, 8)}
+                  </div>
                 </div>
               </div>
 

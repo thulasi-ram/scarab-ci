@@ -1993,6 +1993,14 @@
             ],
             "description": "The pipeline this run executed (the bare `.scarab/<name>` selection).\nAbsent for inline runs and runs created before pipeline-stamping."
           },
+          "run_number": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The **run number** (ADR-0057 amendment) — the per-repo sequential `#N`,\nthe human handle shown in the run-detail breadcrumb + gutter. Absent for\nuntenanted inline runs and pre-allocation runs. Distinct from `id`."
+          },
           "status": {
             "type": "string"
           },
@@ -2082,6 +2090,14 @@
               "null"
             ],
             "description": "The owning project (repo name), if tenanted."
+          },
+          "run_number": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The **run number** (ADR-0057 amendment) — the per-repo sequential `#N`,\nthe human handle shown in the run-list gutter. Absent for untenanted\ninline runs and runs created before run-number allocation. Distinct from\nthe opaque, unguessable `id`."
           },
           "sha": {
             "type": [

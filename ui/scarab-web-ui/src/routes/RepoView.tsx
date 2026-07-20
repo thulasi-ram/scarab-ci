@@ -26,6 +26,7 @@ import {
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import TriggerCell from "../components/TriggerCell";
+import RunNumber from "../components/RunNumber";
 import Icon from "../components/Icon";
 import SearchSelect from "../components/SearchSelect";
 import Doodle from "../components/Doodle";
@@ -298,14 +299,60 @@ export default function RepoView() {
                     const stop = (e: MouseEvent) => e.stopPropagation();
                     return (
                       <div class="runrow" onClick={() => nav(`/${org()}/${repo()}/runs/${r.id}`)}>
+                        {/* Run-number gutter (ADR-0057 A·2): the per-repo `#N`
+                            handle, sequential so it scans down the list. */}
+                        <div class="rr-gutter">
+                          <RunNumber n={r.run_number} id={r.id} />
+                        </div>
                         <div class="rr-body">
-                          {/* Primary line: which pipeline + what code. */}
+                          {/* Primary line: the run Headline (trigger kind + title),
+                              the SAME shared cell the run-detail bar uses (ADR-0057). */}
                           <div class="rr-head">
+                            <TriggerCell kind={r.trigger_kind} title={r.trigger_title} variant="row" />
+                          </div>
+                          {/* Secondary line: the origin facts — pipeline · commit ·
+                              base ← head · PR · who · when. */}
+                          <div class="rr-facts">
                             <Show when={r.pipeline}>
                               {(name) => (
                                 <span class="pfact strong" title="pipeline">
-                                  <Icon icon="workflow" size={13} />
+                                  <Icon icon="workflow" size={12} />
                                   <span class="mono">{name()}</span>
+                                </span>
+                              )}
+                            </Show>
+                            <a
+                              class="pfact"
+                              classList={{ link: !!commitUrl() }}
+                              href={commitUrl() ?? undefined}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={stop}
+                              title="commit on the forge"
+                            >
+                              <Icon icon="git-commit-horizontal" size={12} />
+                              <span class="mono sha">{(r.sha ?? r.id).slice(0, 7)}</span>
+                            </a>
+                            {/* base ← head on PR runs (ADR-0057); else the branch/ref. */}
+                            <Show
+                              when={r.origin_pr_base}
+                              fallback={
+                                <Show when={branchLabel(r) && branchLabel(r) !== r.sha}>
+                                  {(b) => (
+                                    <span class="pfact" title="branch / ref">
+                                      <Icon icon="git-branch" size={12} />
+                                      <span class="mono">{b()}</span>
+                                    </span>
+                                  )}
+                                </Show>
+                              }
+                            >
+                              {(base) => (
+                                <span class="pfact" title="base ← head">
+                                  <Icon icon="git-branch" size={12} />
+                                  <span class="mono">{base()}</span>
+                                  <span class="pr-arrow">←</span>
+                                  <span class="mono sha">{(r.sha ?? "").slice(0, 7)}</span>
                                 </span>
                               )}
                             </Show>
@@ -319,67 +366,16 @@ export default function RepoView() {
                                 onClick={stop}
                                 title="pull request on the forge"
                               >
-                                <Icon icon="git-pull-request" size={13} />
+                                <Icon icon="git-pull-request" size={12} />
                                 <span class="mono">#{r.pr_number}</span>
                               </a>
                             </Show>
-                            <a
-                              class="pfact"
-                              classList={{ link: !!commitUrl() }}
-                              href={commitUrl() ?? undefined}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              onClick={stop}
-                              title="commit on the forge"
-                            >
-                              <Icon icon="git-commit-horizontal" size={13} />
-                              <span class="mono sha">{(r.sha ?? r.id).slice(0, 7)}</span>
-                            </a>
-                            {/* base ← head on PR runs (ADR-0057): the branch the
-                                PR targets, reading into its head commit. For
-                                non-PR runs, the plain branch/ref. */}
-                            <Show
-                              when={r.origin_pr_base}
-                              fallback={
-                                <Show when={branchLabel(r) && branchLabel(r) !== r.sha}>
-                                  {(b) => (
-                                    <span class="pfact" title="branch / ref">
-                                      <Icon icon="git-branch" size={13} />
-                                      <span class="mono">{b()}</span>
-                                    </span>
-                                  )}
-                                </Show>
-                              }
-                            >
-                              {(base) => (
-                                <span class="pfact" title="base ← head">
-                                  <Icon icon="git-branch" size={13} />
-                                  <span class="mono">{base()}</span>
-                                  <span class="pr-arrow">←</span>
-                                  <span class="mono sha">{(r.sha ?? "").slice(0, 7)}</span>
-                                </span>
-                              )}
-                            </Show>
-                          </div>
-                          {/* Secondary line: trigger (+ headline) + who + when.
-                              The trigger cell is the SAME shared component the run
-                              detail bar uses (ADR-0057). */}
-                          <div class="rr-facts">
-                            <Show when={r.trigger_kind}>
-                              <>
-                                <TriggerCell kind={r.trigger_kind} title={r.trigger_title} variant="row" />
-                                <span class="rr-facts-sep">·</span>
-                              </>
-                            </Show>
                             <Show when={r.actor}>
                               {(actor) => (
-                                <>
-                                  <span class="pfact" title="triggered by">
-                                    <Icon icon="user" size={12} />
-                                    <span>{actor()}</span>
-                                  </span>
-                                  <span class="rr-facts-sep">·</span>
-                                </>
+                                <span class="pfact" title="triggered by">
+                                  <Icon icon="user" size={12} />
+                                  <span>{actor()}</span>
+                                </span>
                               )}
                             </Show>
                             <span

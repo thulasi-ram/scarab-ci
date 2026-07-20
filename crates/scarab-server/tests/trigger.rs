@@ -75,6 +75,63 @@ async fn push_matching_on_push_starts_a_run() {
     );
 }
 
+#[tokio::test]
+async fn run_number_is_per_repo_sequential() {
+    let (forge, db, clock) = setup().await;
+
+    // Two matching pushes to acme/app → #1 then #2 (per-repo, monotonic).
+    let r1 = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let r2 = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &push("main"))
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(db.run_number(&r1).await.unwrap(), Some(1));
+    assert_eq!(
+        db.run_number(&r2).await.unwrap(),
+        Some(2),
+        "the same repo numbers runs monotonically"
+    );
+
+    // A different repo starts its own sequence at #1 (numbers are per-repo, not
+    // global — no cross-tenant volume leak).
+    let other = Event::Push {
+        actor: "octocat".into(),
+        repo: RepoRef {
+            owner: "acme".into(),
+            name: "other".into(),
+        },
+        r#ref: "refs/heads/main".into(),
+        after: "sha999".into(),
+        message: "init".into(),
+    };
+    let r3 = trigger_run_from_event(&forge, db.as_ref(), clock.as_ref(), None, &other)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(
+        db.run_number(&r3).await.unwrap(),
+        Some(1),
+        "a different repo starts its own #1"
+    );
+
+    // The number rides the run summary (what the runs-list DTO is built from).
+    let summ = db.list_runs_for_tenant("acme", "app", 10).await.unwrap();
+    assert_eq!(
+        summ.iter().find(|s| s.run == r1).unwrap().run_number,
+        Some(1),
+        "run_number surfaces on the run summary"
+    );
+}
+
 /// Runs one step on any pull_request (no predicate → always fires).
 const CI_YAML_PR: &str = r#"
 on:

@@ -821,6 +821,49 @@ impl Db for PostgresDb {
         }))
     }
 
+    async fn allocate_run_number(
+        &self,
+        run: &RunId,
+        org: &str,
+        project: &str,
+    ) -> Result<i64, DbError> {
+        // One atomic upsert bumps the per-repo counter and hands back the number
+        // to assign; concurrent creations for the same repo serialize on this
+        // row rather than racing a MAX+1 scan.
+        let row = sqlx::query(
+            "INSERT INTO repo_run_counters (org, project, last_number) VALUES ($1, $2, 1)
+             ON CONFLICT (org, project)
+                 DO UPDATE SET last_number = repo_run_counters.last_number + 1
+             RETURNING last_number",
+        )
+        .bind(org)
+        .bind(project)
+        .fetch_one(self.pool())
+        .await
+        .map_err(db_err)?;
+        let n = row.get::<i64, _>("last_number");
+        sqlx::query(
+            "UPDATE runs SET run_number = $2,
+                 updated_at = (extract(epoch from now()) * 1000)::bigint
+             WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(n)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(n)
+    }
+
+    async fn run_number(&self, run: &RunId) -> Result<Option<i64>, DbError> {
+        let row = sqlx::query("SELECT run_number FROM runs WHERE id = $1")
+            .bind(&run.0)
+            .fetch_optional(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<i64>, _>("run_number")))
+    }
+
     async fn set_run_origin(
         &self,
         run: &RunId,
@@ -973,7 +1016,7 @@ impl Db for PostgresDb {
 
     async fn list_runs(&self, limit: u32) -> Result<Vec<RunSummary>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project,
+            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
                     origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
                     origin_pr_base, pipeline, trigger_title
              FROM runs
@@ -994,7 +1037,7 @@ impl Db for PostgresDb {
         limit: u32,
     ) -> Result<Vec<RunSummary>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project,
+            "SELECT id, status, created_at, updated_at, tenant_org, tenant_project, run_number,
                     origin_trigger_kind, origin_actor, origin_ref, origin_sha, origin_pr_number,
                     origin_pr_base, pipeline, trigger_title
              FROM runs
@@ -1979,6 +2022,7 @@ fn run_summary_from_row(r: sqlx::postgres::PgRow) -> Result<RunSummary, DbError>
         created_at: Timestamp(r.get::<i64, _>("created_at")),
         updated_at: Timestamp(r.get::<i64, _>("updated_at")),
         tenant,
+        run_number: r.get::<Option<i64>, _>("run_number"),
         trigger_kind: r.get::<Option<String>, _>("origin_trigger_kind"),
         actor: r.get::<Option<String>, _>("origin_actor"),
         git_ref: r.get::<Option<String>, _>("origin_ref"),

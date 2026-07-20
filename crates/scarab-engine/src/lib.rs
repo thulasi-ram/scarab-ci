@@ -89,6 +89,12 @@ pub struct RunSummary {
     /// at creation — the tenancy filter for the list view.
     #[serde(default)]
     pub tenant: Option<(String, String)>,
+    /// The **run number** (ADR-0057 amendment) — a per-repo sequential `#N`, the
+    /// human handle for the run. `None` for untenanted inline runs and runs
+    /// created before run-number allocation. Distinct from the opaque internal
+    /// [`RunId`]; display/reference only, never a key.
+    #[serde(default)]
+    pub run_number: Option<i64>,
     /// The run's **origin** — the trigger facts it was born from, stamped at
     /// creation from the normalized `Event`. Discrete and independently
     /// nullable (never a bundle): the facts are naturally sparse across trigger

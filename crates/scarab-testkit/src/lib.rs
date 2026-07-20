@@ -127,6 +127,7 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
         sha: origin.and_then(|o| o.3.clone()),
         pr_number: origin.and_then(|o| o.4),
         pr_base: origin.and_then(|o| o.5.clone()),
+        run_number: st.run_number.get(run).copied(),
         pipeline: st.run_pipeline.get(run).cloned(),
         trigger_title: st.run_trigger_title.get(run).cloned(),
     }
@@ -165,6 +166,10 @@ struct InMemoryState {
     run_project: HashMap<RunId, String>,
     run_priority: HashMap<RunId, i32>,
     run_tenant: HashMap<RunId, (String, String)>,
+    /// Per-run allocated run number, and the per-repo monotonic counter that
+    /// hands them out (mirrors `runs.run_number` + `repo_run_counters`).
+    run_number: HashMap<RunId, i64>,
+    repo_run_counters: HashMap<(String, String), i64>,
     /// Per-run origin `(trigger_kind, actor, git_ref, sha, pr_number, pr_base)` —
     /// the trigger facts stamped at creation (mirrors the `origin_*` run columns).
     #[allow(clippy::type_complexity)]
@@ -644,6 +649,24 @@ impl Db for InMemoryDb {
 
     async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError> {
         Ok(self.state.lock().unwrap().run_tenant.get(run).cloned())
+    }
+
+    async fn allocate_run_number(
+        &self,
+        run: &RunId,
+        org: &str,
+        project: &str,
+    ) -> Result<i64, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let key = (org.to_string(), project.to_string());
+        let n = st.repo_run_counters.get(&key).copied().unwrap_or(0) + 1;
+        st.repo_run_counters.insert(key, n);
+        st.run_number.insert(run.clone(), n);
+        Ok(n)
+    }
+
+    async fn run_number(&self, run: &RunId) -> Result<Option<i64>, DbError> {
+        Ok(self.state.lock().unwrap().run_number.get(run).copied())
     }
 
     async fn set_run_origin(

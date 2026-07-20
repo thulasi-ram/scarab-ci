@@ -308,6 +308,23 @@ pub trait Db: Send + Sync {
     /// The run's owning tenant, if stamped.
     async fn run_tenant(&self, run: &RunId) -> Result<Option<(String, String)>, DbError>;
 
+    /// Allocate and stamp this run's **per-repo run number** (ADR-0057
+    /// amendment), returning the assigned `#N`. Called once, right after the
+    /// tenant is known (that is where `(org, project)` first exist). Backed by a
+    /// per-repo counter bumped atomically, so concurrent creations for the same
+    /// repo get distinct, monotonic numbers. Untenanted inline runs never call
+    /// this and keep a `None` number.
+    async fn allocate_run_number(
+        &self,
+        run: &RunId,
+        org: &str,
+        project: &str,
+    ) -> Result<i64, DbError>;
+
+    /// The run's per-repo run number, if allocated. Read by the run-detail view;
+    /// the runs list reads it off the summary row instead.
+    async fn run_number(&self, run: &RunId) -> Result<Option<i64>, DbError>;
+
     /// Stamp the run's **origin** — the trigger facts it was born from, resolved
     /// from the normalized `Event` at creation (beside the tenant stamp). Passed
     /// as discrete, independently-nullable values (never a bundle): `trigger_kind`

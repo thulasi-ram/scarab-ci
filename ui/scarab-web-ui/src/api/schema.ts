@@ -1155,6 +1155,13 @@ export interface components {
              *     Absent for inline runs and runs created before pipeline-stamping.
              */
             pipeline?: string | null;
+            /**
+             * Format: int64
+             * @description The **run number** (ADR-0057 amendment) — the per-repo sequential `#N`,
+             *     the human handle shown in the run-detail breadcrumb + gutter. Absent for
+             *     untenanted inline runs and pre-allocation runs. Distinct from `id`.
+             */
+            run_number?: number | null;
             status: string;
             steps: components["schemas"]["StepStatusDto"][];
             /**
@@ -1204,6 +1211,14 @@ export interface components {
             pr_number?: number | null;
             /** @description The owning project (repo name), if tenanted. */
             project?: string | null;
+            /**
+             * Format: int64
+             * @description The **run number** (ADR-0057 amendment) — the per-repo sequential `#N`,
+             *     the human handle shown in the run-list gutter. Absent for untenanted
+             *     inline runs and runs created before run-number allocation. Distinct from
+             *     the opaque, unguessable `id`.
+             */
+            run_number?: number | null;
             /** @description The resolved commit the run pinned to. */
             sha?: string | null;
             status: string;
