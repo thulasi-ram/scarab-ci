@@ -146,19 +146,21 @@ export default function RunPipeline() {
       <div class="panel">
         <div class="panel-h"><span>Ref</span></div>
         <div class="rp-ref">
-          <label class="field rp-ref-field">
-            <span class="field-label">branch / tag / sha</span>
-            <input
-              class="input"
-              value={ref()}
-              onInput={(e) => setRef(e.currentTarget.value)}
-              onKeyDown={(e) => e.key === "Enter" && loadCatalog()}
-              placeholder="main"
-            />
-          </label>
-          <button class="btn btn-primary" onClick={loadCatalog}>
-            <Icon icon="search" size={14} /> Load pipelines
-          </button>
+          <div class="rp-ref-row">
+            <label class="field rp-ref-field">
+              <span class="field-label">branch / tag / sha</span>
+              <input
+                class="input"
+                value={ref()}
+                onInput={(e) => setRef(e.currentTarget.value)}
+                onKeyDown={(e) => e.key === "Enter" && loadCatalog()}
+                placeholder="main"
+              />
+            </label>
+            <button class="btn btn-primary" onClick={loadCatalog}>
+              <Icon icon="search" size={14} /> Load pipelines
+            </button>
+          </div>
           <Show when={catalog()}>
             {(c) => (
               <span class="mono rp-sha" title={`resolved to ${c().sha}`}>

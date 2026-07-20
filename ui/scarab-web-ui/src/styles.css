@@ -933,6 +933,9 @@ h2 {
   grid-template-columns: 1.1fr 1fr;
   gap: 16px;
   align-items: stretch;
+  /* Its panels zero their own margin (below), so carry the panel rhythm here —
+     otherwise the Artifacts panel sits flush against the grid with no gap. */
+  margin-bottom: 16px;
 }
 /* The panels stretch to the tallest (Logs); each lays out as a column so its
    body fills the leftover height below the header. */
@@ -1300,6 +1303,9 @@ h2 {
 .set-row { display: flex; justify-content: space-between; font-size: 13.5px; color: var(--sage); }
 .set-row .k { color: var(--muted-sage); }
 .secrets-add { margin-top: 4px; }
+.secrets-actions { margin-top: 4px; }
+.modal-body label.secret-overwrite { display: flex; align-items: center; gap: 8px; margin: 0; font-family: inherit; font-size: 12.5px; color: var(--copper); text-transform: none; letter-spacing: normal; }
+.secret-overwrite input { accent-color: var(--copper); flex: none; }
 
 /* ---- modal ---- */
 .modal-scrim {
@@ -1434,11 +1440,12 @@ h2 {
 .rp-rerun-note { display: flex; align-items: center; gap: 7px; margin: 0 0 14px; }
 
 .rp-ref {
-  display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap;
+  display: flex; flex-direction: column; gap: 8px;
   padding: 16px 18px;
 }
+.rp-ref-row { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
 .rp-ref-field { flex: 1; min-width: 220px; }
-.rp-sha { align-self: center; display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--copper); }
+.rp-sha { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--copper); }
 .rp-sha svg { color: var(--muted-sage); }
 
 .rp-catalog { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
@@ -1838,8 +1845,44 @@ h1, .crumb-head, .run-title {
 .ws-crumbs .crumb { background: none; border: none; cursor: pointer; font: inherit; color: var(--emerald); padding: 2px 4px; border-radius: var(--radius-sm); }
 .ws-crumbs .crumb:hover { background: color-mix(in srgb, var(--emerald) 8%, transparent); }
 .ws-crumbs .sep { color: var(--muted-sage); }
+.ws-fallback { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; }
+.ws-fallback .empty { padding: 0; }
+.ws-fallback .subtle { margin: 0; max-width: 46ch; }
+
+/* Artifacts: run-level, no card surface — lays on the page background like the
+   Activity rail below it (consistent run-level footer rhythm). Content aligns to
+   the page content margin (padding-left: 0), same as Activity. */
+.artifacts-panel {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  overflow: visible;
+}
+.artifacts-panel .panel-h {
+  background: transparent;
+  border-bottom: 1px solid var(--border-soft);
+  padding-left: 0;
+  padding-right: 0;
+}
+.artifacts-panel .empty { padding: 14px 0; }
+.artifacts-panel .filelist { padding: 2px 0; }
 
 /* ── Activity: connected rail ─────────────────────────────────────────────── */
+/* No card surface — the rail lays straight on the page background (it's a log,
+   not a block). Header keeps a hairline rule so the "Activity" label reads. */
+.activity-panel {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  overflow: visible;
+}
+.activity-panel .panel-h {
+  background: transparent;
+  border-bottom: 1px solid var(--border-soft);
+  padding-left: 0;
+  padding-right: 0;
+}
+.activity-panel .tl { padding-left: 0; padding-right: 0; }
 .tl { padding: 12px 16px; }
 .tl-empty { color: var(--muted-sage); font-size: 13px; padding: 6px 0; }
 .tl-item { position: relative; display: grid; grid-template-columns: 78px 26px 1fr; gap: 10px; align-items: start; padding: 6px 0; }

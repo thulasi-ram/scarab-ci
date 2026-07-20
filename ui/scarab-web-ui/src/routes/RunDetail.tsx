@@ -436,6 +436,8 @@ export default function RunDetail() {
                 onAttemptSelect={setSelAttempt}
                 frontierAttempt={sel() ? takeView()?.frontier[sel()!] ?? null : null}
                 deadLettered={r().status === "dead_lettered"}
+                canDebug={canShell()}
+                onDebugPod={() => setShellOpen(true)}
               />
             </div>
 

@@ -53,6 +53,12 @@ export default function StepPane(props: {
   frontierAttempt?: string | null;
   /** The run was dead-lettered — the step strip's terminal ⊘ marker. */
   deadLettered?: boolean;
+  /** Open a Debug pod for this step. The Workspace tab offers it as the fallback
+   * when no snapshot exists — a fresh reproduction is the robust way to explore
+   * a filesystem the CAS can't hand back (note: it re-runs, so it's NOT the
+   * attempt's immutable bytes). Absent/`canDebug:false` ⇒ the affordance hides. */
+  onDebugPod?: () => void;
+  canDebug?: boolean;
 }) {
   const [tab, setTab] = createSignal<Tab>("logs");
   const [wsPath, setWsPath] = createSignal("");
@@ -137,17 +143,31 @@ export default function StepPane(props: {
     const base = evidenceArg();
     return base ? { ...base, path: wsPath() } : null;
   };
-  const [ws] = createResource(wsArg, (a) => listWorkspace(a.run, a.step, a.path, a.attempt));
+  // Swallow browse failures into an unavailable listing — an uncaught reject
+  // here would re-throw while rendering and tear down the whole pane (tabs and
+  // all), stranding the user with no way back to Logs/Results.
+  const [ws] = createResource(wsArg, (a) =>
+    listWorkspace(a.run, a.step, a.path, a.attempt).catch(
+      () => ({ available: false, entries: [], path: a.path }),
+    ),
+  );
 
   const fileArg = () => {
     const base = evidenceArg();
     return base && openFile() ? { ...base, path: openFile()! } : null;
   };
   const [fileBody] = createResource(fileArg, async (a) => {
-    const res = await fetch(workspaceFileUrl(a.run, a.step, a.path, a.attempt));
-    const ct = res.headers.get("content-type") ?? "";
-    if (!ct.startsWith("text/")) return { binary: true, text: "" };
-    return { binary: false, text: await res.text() };
+    // Like the listing above, never let a failed read re-throw during render —
+    // a file the CAS can no longer hand back would otherwise tear down the pane.
+    try {
+      const res = await fetch(workspaceFileUrl(a.run, a.step, a.path, a.attempt));
+      if (!res.ok) return { binary: false, text: "", error: true };
+      const ct = res.headers.get("content-type") ?? "";
+      if (!ct.startsWith("text/")) return { binary: true, text: "", error: false };
+      return { binary: false, text: await res.text(), error: false };
+    } catch {
+      return { binary: false, text: "", error: true };
+    }
   });
 
   const crumbs = () => wsPath().split("/").filter(Boolean);
@@ -231,7 +251,15 @@ export default function StepPane(props: {
                   </button>
                 </div>
                 <div class="lgbody" classList={{ nowrap: !wrap() }}>
-                  <For each={logRows()} fallback={<div class="lgrow empty">no output</div>}>
+                  <For
+                    each={logRows()}
+                    fallback={
+                      <div class="lgrow empty">
+                        <span class="lgln" />
+                        <span class="lgtx">no output</span>
+                      </div>
+                    }
+                  >
                     {(r) => (
                       <div class={`lgrow ${r.lvl}`}>
                         <span class="lgln">{r.n}</span>
@@ -359,6 +387,14 @@ export default function StepPane(props: {
                       }
                     >
                       <Show
+                        when={!fileBody()?.error}
+                        fallback={
+                          <div class="fileview-body binary">
+                            could not read this file — it may no longer exist in the snapshot
+                          </div>
+                        }
+                      >
+                      <Show
                         when={!fileBody()?.binary}
                         fallback={
                           <div class="fileview-body binary">binary file — use download</div>
@@ -375,6 +411,7 @@ export default function StepPane(props: {
                           </For>
                         </div>
                       </Show>
+                      </Show>
                     </Show>
                   </div>
                 </Show>
@@ -383,11 +420,25 @@ export default function StepPane(props: {
                   <Show
                     when={ws()?.available}
                     fallback={
-                      <p class="empty">
-                        {ws.loading
-                          ? "loading…"
-                          : "no workspace snapshot for this attempt — still running, a gate, or a backend that doesn't snapshot"}
-                      </p>
+                      <Show when={!ws.loading} fallback={<p class="empty">loading…</p>}>
+                        <div class="ws-fallback">
+                          <p class="empty">
+                            No snapshot for this attempt — it's still running, a gate,
+                            a backend that doesn't snapshot, or the CAS was cleared.
+                          </p>
+                          <Show when={props.canDebug && props.onDebugPod}>
+                            <button class="btn btn-ghost btn-sm" onClick={() => props.onDebugPod!()}>
+                              <Icon icon="terminal" size={13} /> Explore in a Debug pod →
+                            </button>
+                            <p class="subtle">
+                              <small>
+                                A Debug pod reproduces the step in a fresh Pod — it re-runs,
+                                so it shows a reproduction, not this attempt's exact bytes.
+                              </small>
+                            </p>
+                          </Show>
+                        </div>
+                      </Show>
                     }
                   >
                     <ul class="filelist">
