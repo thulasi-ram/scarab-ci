@@ -462,6 +462,7 @@ export default function RunDetail() {
 
               <div class="rd-grid">
                 <div class="dag-wrap">
+                  <div class="dag-head">Steps</div>
                   <Dag steps={dagSteps()} selected={sel()} onSelect={setSel} />
                 </div>
 

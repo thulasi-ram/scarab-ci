@@ -2062,7 +2062,12 @@ h1, .crumb-head, .run-title {
    header carrying the always-present version dropdown. The inner DAG + StepPane
    read as one surface — their panel chrome is flattened, then the step evidence
    gets a light border back to separate it from the graph. */
-.pipeline-panel { display: flex; flex-direction: column; }
+/* Transparent body: only the component's own header keeps the grey (it has its
+   own `.panel-h` background); the graph + evidence float on the page. */
+.pipeline-panel {
+  display: flex; flex-direction: column;
+  background: transparent; border: none;
+}
 .pipeline-panel > .panel-h .grow1 { flex: 1; }
 
 /* Constant height: the graph + evidence area holds its size across step /
@@ -2076,11 +2081,17 @@ h1, .crumb-head, .run-title {
   border: none; background: transparent; box-shadow: none; padding: 0;
   max-height: none; min-height: 0;
 }
-.pipeline-panel .dag-wrap { display: flex; align-items: stretch; overflow: auto; }
-.pipeline-panel .dag-wrap .dag { flex: 1; border-radius: var(--radius); }
+/* DAG column: a transparent "Steps" header over the graph canvas, which scrolls. */
+.pipeline-panel .dag-wrap { display: flex; flex-direction: column; }
+.dag-head {
+  font-size: 13px; font-weight: 600; color: var(--soft-white);
+  letter-spacing: 0.01em; padding: 12px 4px 8px;
+}
+.pipeline-panel .dag-wrap .dag { flex: 1; overflow: auto; border-radius: var(--radius); }
+/* Step evidence: no card of its own — a transparent header, content below. */
 .pipeline-panel .rd-grid > .steppane {
   display: flex; flex-direction: column; min-height: 0;
-  border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+  border: none; background: transparent; overflow: hidden;
 }
 /* The selected tab fills the leftover height and scrolls in place. */
 .pipeline-panel .steppane .tabpane { flex: 1; min-height: 0; overflow: auto; }
