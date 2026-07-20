@@ -2,10 +2,11 @@
 // attempt strip on top that scopes EVERY tab — Logs, Results, Outputs,
 // Workspace — to the selected (step, attempt). This replaces the old stacked
 // Logs panel + Inspector, whose asymmetry (only logs knew about attempts) let
-// a restart silently shadow the evidence the other tabs showed. Chips carry
-// the attempt's cause (auto-retry vs manual restart) and failure class from
-// the event log; a crash re-adoption renders as a marker INSIDE its chip —
-// same attempt, same fence, never a new execution.
+// a rerun silently shadow the evidence the other tabs showed. Chips carry each
+// try's cause (auto-retry / you reran / ⟵ cascade) and outcome (failed ✗ /
+// superseded ⊘ / shadowed) from the event log (ADR-0056 amendment); a crash
+// re-adoption renders as a marker INSIDE its chip — same attempt, same fence,
+// never a new execution.
 import { createSignal, createEffect, createResource, For, Show, onCleanup } from "solid-js";
 import {
   getStepResults,
@@ -86,11 +87,33 @@ export default function StepPane(props: {
 
   const causes = () => (stepId() ? attemptCauses(props.events, stepId()!) : null);
 
-  const chipLabel = (a: Attempt, i: number) => {
+  const isSuperseded = (a: Attempt) => causes()?.superseded.has(a.id) ?? false;
+  const isShadowed = (a: Attempt) => causes()?.shadowed.has(a.id) ?? false;
+
+  // Plain-english cause suffix (ADR-0056 amendment): the machine's own retry vs
+  // the human reran-this-step vs a rerun of an ancestor that dragged this along.
+  const causeSuffix = (a: Attempt): string => {
     const cause = causes()?.causes[a.id];
-    const suffix =
-      cause === "restart" ? " · restart" : cause === "retry" ? " · retry" : "";
-    return `#${i + 1}${a.failed ? ` ✗ ${a.failure ?? ""}` : ""}${suffix}`;
+    switch (cause) {
+      case "rerun":
+        return " · you reran";
+      case "cascade":
+        return " · ⟵ rerun";
+      case "retry":
+        return " · auto-retry";
+      default:
+        return "";
+    }
+  };
+
+  // Outcome glyph: superseded (cut short) ranks before failed; both before ok.
+  const chipLabel = (a: Attempt, i: number) => {
+    const outcome = isSuperseded(a)
+      ? " ⊘ superseded"
+      : a.failed
+        ? ` ✗ ${a.failure ?? ""}`
+        : "";
+    return `try ${i + 1}${outcome}${causeSuffix(a)}`;
   };
 
   // --- Logs: one buffered SSE stream per (step, attempt); the scoped attempt's
@@ -208,11 +231,33 @@ export default function StepPane(props: {
               <For each={attemptsOf()}>
                 {(a, i) => (
                   <button
-                    class={`achip ${a.failed ? "failed" : "ok"} ${scoped()?.id === a.id ? "sel" : ""}`}
+                    class="achip"
+                    classList={{
+                      failed: a.failed && !isSuperseded(a),
+                      superseded: isSuperseded(a),
+                      shadowed: isShadowed(a),
+                      ok: !a.failed && !isSuperseded(a),
+                      sel: scoped()?.id === a.id,
+                    }}
                     onClick={() => props.onAttemptSelect(a.id)}
-                    title={`attempt ${a.id}${causes()?.readopted.has(a.id) ? " — re-adopted after a control-plane restart (same attempt, same fence)" : ""}`}
+                    title={`try ${a.id}${
+                      isSuperseded(a)
+                        ? " — cut short by a rerun of an upstream step (superseded)"
+                        : isShadowed(a)
+                          ? " — succeeded, but a newer try replaced it as the of-record version (shadowed)"
+                          : ""
+                    }${
+                      causes()?.readopted.has(a.id)
+                        ? " — re-adopted after a control-plane restart (same attempt, same fence)"
+                        : ""
+                    }`}
                   >
                     {chipLabel(a, i())}
+                    <Show when={isShadowed(a)}>
+                      <span class="ashadow" title="no longer the of-record version">
+                        shadowed
+                      </span>
+                    </Show>
                     <Show when={causes()?.readopted.has(a.id)}>
                       <span class="areadopt" title="re-adopted after control-plane restart">
                         ⟲
@@ -243,7 +288,7 @@ export default function StepPane(props: {
               <div class="tabpane logpane">
                 <div class="steplogs-tools">
                   <span class="subtle mono">
-                    {scoped() ? `attempt ${scoped()!.id}` : "no attempts"}
+                    {scoped() ? `try ${scoped()!.id}` : "no tries"}
                   </span>
                   <span class="grow1" />
                   <button class={`lgtog ${wrap() ? "on" : ""}`} onClick={() => setWrap((v) => !v)}>
@@ -276,7 +321,7 @@ export default function StepPane(props: {
               <div class="tabpane">
                 <Show
                   when={(results()?.length ?? 0) > 0}
-                  fallback={<p class="empty">no results published by this attempt</p>}
+                  fallback={<p class="empty">no results published by this try</p>}
                 >
                   <div class="kvgrid">
                     <For each={results()}>
@@ -320,7 +365,7 @@ export default function StepPane(props: {
                 <Show
                   when={(results()?.length ?? 0) > 0}
                   fallback={
-                    <p class="empty">nothing for a downstream step to read from this attempt</p>
+                    <p class="empty">nothing for a downstream step to read from this try</p>
                   }
                 >
                   <div class="exprs">
@@ -423,7 +468,7 @@ export default function StepPane(props: {
                       <Show when={!ws.loading} fallback={<p class="empty">loading…</p>}>
                         <div class="ws-fallback">
                           <p class="empty">
-                            No snapshot for this attempt — it's still running, a gate,
+                            No snapshot for this try — it's still running, a gate,
                             a backend that doesn't snapshot, or the CAS was cleared.
                           </p>
                           <Show when={props.canDebug && props.onDebugPod}>

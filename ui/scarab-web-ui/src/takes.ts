@@ -123,40 +123,82 @@ export function replayTake(events: RunEvent[], takes: Take[], take: Take): TakeV
   return { status, frontier, attempts, finishedInTake };
 }
 
-/** The cause of one attempt of a step (drives the attempt-strip chip label):
- * `initial` (first attempt), `restart` (a human boundary immediately precedes
- * it and names the step in its invalidation set), or `retry` (the engine's
- * own doing). `readopted` marks attempts a resumed control plane adopted. */
-export type AttemptCause = "initial" | "restart" | "retry";
+/** Why one try (Attempt) of a step exists (ADR-0056 amendment):
+ * - `initial`  — the step's first-ever execution.
+ * - `retry`    — the engine auto-retrying a not-yet-succeeded step (within
+ *                budget); same history row, no fork.
+ * - `rerun`    — a human reran THIS step (it was the rerun target): a fork.
+ * - `cascade`  — a human reran an ANCESTOR and this step was dragged along by
+ *                smart invalidation (ADR-0027) — "you did one thing; the rest
+ *                followed" (points back at the rerun with "⟵ …").
+ * The discriminator is the step's state + who acted, all read off the event
+ * log — nothing is stored. */
+export type AttemptCause = "initial" | "retry" | "rerun" | "cascade";
 
+/** Attempt-grain derivations for one step, all from the event log:
+ * - `causes`     — per-attempt cause (above).
+ * - `readopted`  — attempts a resumed control plane re-adopted (a visibility
+ *                  marker, never a new execution).
+ * - `superseded` — attempts CUT SHORT while running by a rerun of an ancestor
+ *                  (started, never finished, then the step was re-armed by a
+ *                  later RunRestartRequested). Distinct from failed/cancelled.
+ * - `shadowed`   — succeeded attempts that are no longer the of-record latest
+ *                  (a newer successful attempt replaced their role). */
 export function attemptCauses(
   events: RunEvent[],
   step: string,
-): { causes: Record<string, AttemptCause>; readopted: Set<string> } {
+): {
+  causes: Record<string, AttemptCause>;
+  readopted: Set<string>;
+  superseded: Set<string>;
+  shadowed: Set<string>;
+} {
   const causes: Record<string, AttemptCause> = {};
   const readopted = new Set<string>();
-  // A restart naming this step arms the NEXT attempt of it.
-  let armedByRestart = false;
+  const superseded = new Set<string>();
+  const shadowed = new Set<string>();
+
+  const started: string[] = []; // attempt ids of this step, in order
+  const finished = new Set<string>(); // ids that got an AttemptFinished
+  const succeeded: string[] = []; // ids that finished WITHOUT a failure, in order
+
+  // A restart naming this step arms the NEXT attempt of it — as a `rerun` when
+  // this step IS the target, else as a `cascade` (dragged in via invalidated).
+  let armedBy: AttemptCause | null = null;
   let seen = 0;
   for (const e of events) {
     const k = kindOf(e);
     if (!k) continue;
     if (k.tag === "RunRestartRequested") {
       const invalidated = (k.v.invalidated as string[]) ?? [];
-      if (invalidated.includes(step) || (k.v.target as string) === step) {
-        armedByRestart = true;
-      }
+      const target = k.v.target as string;
+      if (target === step) armedBy = "rerun";
+      else if (invalidated.includes(step)) armedBy = "cascade";
+      else continue;
+      // The rerun re-arms this step: any attempt still in flight at this
+      // boundary is cut short — superseded (never finished, replaced).
+      for (const id of started) if (!finished.has(id)) superseded.add(id);
       continue;
     }
     if ((k.v.step as string) !== step) continue;
     if (k.tag === "AttemptStarted") {
       const id = String(k.v.attempt ?? "");
       seen += 1;
-      causes[id] = seen === 1 ? "initial" : armedByRestart ? "restart" : "retry";
-      armedByRestart = false;
+      causes[id] = seen === 1 ? "initial" : (armedBy ?? "retry");
+      armedBy = null;
+      started.push(id);
+    } else if (k.tag === "AttemptFinished") {
+      const id = String(k.v.attempt ?? "");
+      finished.add(id);
+      const failure = k.v.failure;
+      if (failure === null || failure === undefined) succeeded.push(id);
     } else if (k.tag === "AttemptReadopted") {
       readopted.add(String(k.v.attempt ?? ""));
     }
   }
-  return { causes, readopted };
+
+  // Of-record = the latest successful attempt; earlier successes are shadowed.
+  for (let i = 0; i < succeeded.length - 1; i++) shadowed.add(succeeded[i]);
+
+  return { causes, readopted, superseded, shadowed };
 }

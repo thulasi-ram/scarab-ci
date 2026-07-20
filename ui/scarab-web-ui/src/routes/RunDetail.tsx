@@ -1,11 +1,13 @@
 // Run detail — the operator view. A provenance header answers "what is this
-// run"; the Take dropdown (ADR-0056) is the run's version history — one Take
-// per human restart, derived purely from the event log, each closed Take a
-// read-only snapshot-at-boundary replay. The DAG (blueprint spine) shows the
-// step graph with live status; the merged step pane scopes Logs/Results/
-// Outputs/Workspace to the selected (step, attempt); artifacts are run-level,
-// immutable per attempt; and the Activity rail is the durable event log made
-// legible — restarts, retries, and crash re-adoptions you can read at a glance.
+// run"; below it, ONE Pipeline component (ADR-0056 + amendment) holds the DAG,
+// the selected step's evidence, and a version-aware Artifacts footer. Its header
+// carries the always-present version dropdown — the run's history as a row per
+// Rerun (derived purely from the event log; "Take"/"attempt" never surface).
+// Zoom out = which whole-run version; zoom in = which try of a step (the strip
+// inside the step pane). Picking an older version turns the whole component into
+// a read-only snapshot-at-boundary. The Activity rail stays separate — the
+// unfiltered, cross-version event log where reruns, retries, and crash
+// re-adoptions are witnessed.
 import { createSignal, createEffect, createResource, onMount, onCleanup, For, Show } from "solid-js";
 import { A, useParams, useNavigate } from "@solidjs/router";
 import {
@@ -62,6 +64,10 @@ export default function RunDetail() {
   // The viewed Take (1-based), or null = latest. Only a CLOSED take is a
   // time-travel view; selecting the latest take clears back to live.
   const [viewTake, setViewTake] = createSignal<number | null>(null);
+  // The version dropdown (ADR-0056 amendment): the run-history control, always
+  // present on the Pipeline component header — collapsed to "latest · live"
+  // when there's only one version, expanding into a row per Rerun.
+  const [histOpen, setHistOpen] = createSignal(false);
 
   const stepList = (): StepStatus[] => run()?.steps ?? [];
 
@@ -239,17 +245,21 @@ export default function RunDetail() {
     }
   }
 
-  const takeLabel = (t: Take) =>
-    t.n === latestTakeN()
-      ? `Take ${t.n} of ${latestTakeN()} (latest)`
-      : `Take ${t.n} of ${latestTakeN()} — closed by restart of ${t.closedByTarget ?? "?"}`;
-
-  // Straddling steps in the viewed Take: mid-flight at the boundary, finished
-  // in a later Take (or never) — the "finished in Take N →" affordance.
-  const straddlers = () => {
-    const tv = takeView();
-    if (!tv) return [] as { step: string; take: number }[];
-    return Object.entries(tv.finishedInTake).map(([step, take]) => ({ step, take }));
+  // Version-dropdown row copy (ADR-0056 amendment): the run history is a row per
+  // Rerun, never surfacing "Take"/"attempt". Take 1 is the "original run"; every
+  // later Take is named by the Rerun that OPENED it — the previous Take's closing
+  // target (deriveTakes records it as `closedByTarget`) and time.
+  const openedBy = (t: Take): string | null =>
+    t.n <= 1 ? null : (takes()[t.n - 2]?.closedByTarget ?? null);
+  const rowLabel = (t: Take): string => {
+    const by = openedBy(t);
+    return by ? `you reran ${by}` : "original run";
+  };
+  const rowTime = (t: Take): number | null =>
+    t.n <= 1 ? startedAt() : (takes()[t.n - 2]?.closedAt ?? null);
+  const viewedLabel = (): string => {
+    const v = viewing();
+    return v ? rowLabel(v) : "latest";
   };
 
   return (
@@ -272,79 +282,28 @@ export default function RunDetail() {
                   <span class="dot" /> live
                 </span>
               </Show>
-              {/* The Take dropdown (ADR-0056): appears once history exists. */}
-              <Show when={latestTakeN() > 1}>
-                <label class="take-select" title="run history — one take per restart">
-                  <Icon icon="history" size={13} />
-                  <select
-                    value={String(viewTake() ?? latestTakeN())}
-                    onChange={(e) => {
-                      const n = Number(e.currentTarget.value);
-                      setViewTake(n >= latestTakeN() ? null : n);
-                    }}
-                  >
-                    <For each={takes()}>
-                      {(t) => <option value={String(t.n)}>{takeLabel(t)}</option>}
-                    </For>
-                  </select>
-                </label>
-              </Show>
             </div>
 
-            <Show when={viewing()}>
-              {(t) => (
-                <div class="take-banner">
-                  <Icon icon="history" size={14} />
-                  <span>
-                    viewing <b>Take {t().n}</b> — a read-only snapshot of the run the instant{" "}
-                    <b class="mono">{t().closedByTarget}</b> was restarted
-                    {t().closedBy ? ` by ${t().closedBy}` : ""}
-                    {t().closedAt ? ` ${relTime(t().closedAt!)}` : ""}
-                  </span>
-                  <For each={straddlers()}>
-                    {(x) => (
-                      <span class="take-straddle">
-                        <b class="mono">{x.step}</b> was still running —{" "}
-                        <Show when={x.take > 0} fallback={<>never finished</>}>
-                          <button
-                            class="linklike"
-                            onClick={() =>
-                              setViewTake(x.take >= latestTakeN() ? null : x.take)
-                            }
-                          >
-                            finished in Take {x.take} →
-                          </button>
-                        </Show>
-                      </span>
-                    )}
-                  </For>
-                  <span class="grow1" />
-                  <button class="btn btn-ghost btn-sm" onClick={() => setViewTake(null)}>
-                    jump to latest
-                  </button>
-                </div>
-              )}
-            </Show>
-
             <div class="run-toolbar">
-              {/* Restart mutates THIS run — it closes the current Take and
-                  opens the next; Re-run mints a whole NEW run. Distinct verbs,
-                  distinct icons (ADR-0056). While time-traveling, everything
-                  that would mutate this run is disabled; "New run" stays (it
-                  touches nothing here) and debug-pod stays (evidence-only). */}
+              {/* Rerun re-runs THIS step (and everything downstream) in place —
+                  it forks the run into a new history row; New run mints a whole
+                  NEW run. Distinct verbs, distinct icons (ADR-0056 amendment).
+                  While viewing an older version everything that would mutate this
+                  run is disabled; "New run" stays (it touches nothing here) and
+                  debug-pod stays (evidence-only). */}
               <button
                 class="btn btn-ghost btn-sm"
                 onClick={() => sel() && onRestart(sel()!)}
                 disabled={restarting() !== null || !sel() || timeTraveling()}
                 title={
                   timeTraveling()
-                    ? "read-only take view — jump to latest to restart"
+                    ? "read-only — back to latest to rerun"
                     : sel()
-                      ? `restart ${sel()} and its descendants — opens a new take`
+                      ? `rerun ${sel()} and everything downstream — forks a new version`
                       : "select a step"
                 }
               >
-                <Icon icon="rotate-ccw" size={13} /> {restarting() ? "restarting…" : "Restart step"}
+                <Icon icon="rotate-ccw" size={13} /> {restarting() ? "rerunning…" : "Rerun step"}
               </button>
               <button
                 class="btn btn-ghost btn-sm"
@@ -362,7 +321,9 @@ export default function RunDetail() {
                   cancelling() || timeTraveling() || (run() ? isTerminal(run()!.status) : true)
                 }
                 title={
-                  timeTraveling() ? "read-only take view" : "cancel this run and tear down its steps"
+                  timeTraveling()
+                    ? "read-only — back to latest to act"
+                    : "cancel this run and tear down its steps"
                 }
               >
                 {cancelling() ? "cancelling…" : "Cancel"}
@@ -415,20 +376,91 @@ export default function RunDetail() {
               </div>
             </div>
 
-            <div class="rd-grid">
-              <div class="panel dag-panel">
-                <div class="panel-h">
-                  <span>DAG</span>
-                  <span class="subtle">
-                    {r().steps.length} steps
-                    {!timeTraveling() && runningCount() ? ` · ${runningCount()} running` : ""}
-                    {timeTraveling() ? ` · as of take ${viewing()!.n}` : ""}
-                  </span>
+            {/* Pipeline component (ADR-0056 amendment): DAG + the selected
+                step's evidence + a version-aware Artifacts footer, under ONE
+                header carrying the always-present version dropdown. Zoom out =
+                which whole-run version (the dropdown); zoom in = which try of a
+                step (the strip inside StepPane). An older version turns the
+                whole component read-only. */}
+            <div class="panel pipeline-panel" classList={{ readonly: timeTraveling() }}>
+              <div class="panel-h">
+                <span>Pipeline</span>
+                <span class="subtle">
+                  {r().steps.length} steps
+                  {!timeTraveling() && runningCount() ? ` · ${runningCount()} running` : ""}
+                </span>
+                <span class="grow1" />
+                {/* Version dropdown — always present. Collapsed label = the
+                    current version; open, it lists a row per Rerun. */}
+                <div class="verdrop" classList={{ open: histOpen() }}>
+                  <button
+                    class="verdrop-btn"
+                    classList={{ traveling: timeTraveling() }}
+                    onClick={() => setHistOpen((v) => !v)}
+                    title="run history — a row per rerun"
+                  >
+                    <Icon icon="history" size={13} />
+                    <span class="vd-label">{timeTraveling() ? `👁 ${viewedLabel()}` : "latest"}</span>
+                    <Show when={live() && !timeTraveling()}>
+                      <span class="vd-live">· live</span>
+                    </Show>
+                    <Icon icon="chevron-down" size={13} class="vd-caret" />
+                  </button>
+                  <Show when={histOpen()}>
+                    <div class="verdrop-backdrop" onClick={() => setHistOpen(false)} />
+                    <ul class="verdrop-list">
+                      <For each={[...takes()].reverse()}>
+                        {(t) => {
+                          const isSel = () => (viewTake() ?? latestTakeN()) === t.n;
+                          const isLatest = () => t.n === latestTakeN();
+                          return (
+                            <li>
+                              <button
+                                class="verdrop-row"
+                                classList={{ sel: isSel() }}
+                                onClick={() => {
+                                  setViewTake(isLatest() ? null : t.n);
+                                  setHistOpen(false);
+                                }}
+                              >
+                                <span class="vr-dot">{isSel() ? "●" : "○"}</span>
+                                <span class="vr-label">{isLatest() ? "latest" : rowLabel(t)}</span>
+                                <span class="vr-time">{rowTime(t) ? relTime(rowTime(t)!) : ""}</span>
+                                <Show when={isLatest() && live()}>
+                                  <span class="vr-live">live</span>
+                                </Show>
+                              </button>
+                            </li>
+                          );
+                        }}
+                      </For>
+                    </ul>
+                  </Show>
                 </div>
-                <Dag steps={dagSteps()} selected={sel()} onSelect={setSel} />
               </div>
 
-              <StepPane
+              <Show when={viewing()}>
+                {(t) => (
+                  <div class="ro-banner">
+                    <span>
+                      👁 Viewing <b>{rowLabel(t())}</b>
+                      {rowTime(t()) ? ` · ${relTime(rowTime(t())!)}` : ""} · read-only, this
+                      already happened.
+                    </span>
+                    <span class="grow1" />
+                    <button class="btn btn-ghost btn-sm" onClick={() => setViewTake(null)}>
+                      Back to latest →
+                    </button>
+                  </div>
+                )}
+              </Show>
+
+              <div class="rd-grid">
+                <div class="dag-wrap">
+                  <Dag steps={dagSteps()} selected={sel()} onSelect={setSel} />
+                </div>
+
+                <StepPane
                 runId={id()}
                 step={selectedStep()}
                 events={visibleEvents()}
@@ -441,15 +473,15 @@ export default function RunDetail() {
               />
             </div>
 
-            {/* Artifacts — run-level files of record, immutable per attempt
-                (ADR-0056): every version listed with its provenance; the bare
-                download is the of-record resolution, shadowed/failed versions
-                download by pinned version. */}
-            <div class="panel artifacts-panel">
-              <div class="panel-h">
-                <span>Artifacts</span>
-                <span class="subtle">{visibleArtifacts().length} versions</span>
-              </div>
+              {/* Artifacts — run-level files of record, immutable per try
+                  (ADR-0056): version-aware footer of the Pipeline component; the
+                  bare download is the of-record resolution, shadowed/failed
+                  versions download by pinned version. */}
+              <div class="artifacts-foot">
+                <div class="af-h">
+                  <span>Artifacts</span>
+                  <span class="subtle">{visibleArtifacts().length} versions</span>
+                </div>
               <Show
                 when={visibleArtifacts().length > 0}
                 fallback={<p class="empty">no artifacts published by this run</p>}
@@ -492,6 +524,7 @@ export default function RunDetail() {
                   </For>
                 </ul>
               </Show>
+              </div>
             </div>
 
             <div class="panel activity-panel">
@@ -500,7 +533,7 @@ export default function RunDetail() {
                 <span class="subtle">
                   {visibleEvents().length} events
                   {timeTraveling()
-                    ? ` · ${events().length - visibleEvents().length} later hidden by take view`
+                    ? ` · ${events().length - visibleEvents().length} later hidden by this version`
                     : ""}
                 </span>
               </div>

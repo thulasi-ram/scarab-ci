@@ -1,8 +1,23 @@
 # Handoff — Take vs attempt: end-user ergonomics & language
 
-A design brainstorm that is **not finished**. This session shipped a batch of
+> **RESOLVED (2026-07-20).** The design below is settled and captured in the
+> **ADR-0056 amendment** ("end-user language, retry vs rerun, superseded/
+> shadowed") and the `CONTEXT.md` glossary (Rerun, Auto-retry, Cascade,
+> Superseded, Shadowed; Take realigned to internal-only). Implementation is on
+> branch `feat/adr-0056-rerun-retry-language` and tracked in git-bug:
+> `ca6b530` (read model), `10d346e` (merge into one Pipeline component),
+> `b1d9d13` (tries vocabulary + read-only version view + "Rerun" verb),
+> `fd6e6d4` (engine follow-up: tear down the orphaned Pod on a superseded
+> in-flight attempt — the one deferred piece). The resolved model in one line:
+> **the run is a timeline; one human button (Rerun) forks a new version row;
+> the machine's auto-retry stays within a row; every try is kept.** The
+> brainstorm below is retained for the reasoning trail.
+
+---
+
+A design brainstorm (now **resolved**, see above). This session shipped a batch of
 Run-detail / Run-pipeline UI polish (see the PR this doc lands in) and then
-opened a bigger question we want to continue **in a fresh session**: how do we
+opened a bigger question we continued in a fresh session: how do we
 explain the run-history model to an end user *without* leaking our internal
 constructs ("Take", "attempt")?
 

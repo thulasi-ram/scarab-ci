@@ -128,3 +128,86 @@ frontiers from the event log it already fetches.
   system never destroys evidence; the UI was the only thing hiding it.
 - **Auto-retries as Take boundaries** — noise; retries are the engine doing its
   job within a chapter, already legible per step.
+
+## Amendment (2026-07-20): end-user language, retry vs rerun, superseded/shadowed
+
+The original decision defined the *internal* model (Take = derived lens; Attempt
+= evidence grain) but left the **end-user** framing open, and a grilling session
+found the two history controls (a `Take` dropdown + a per-step attempt strip)
+were presented as confusing **peers**. This amendment fixes the user-facing model
+and sharpens the re-execution vocabulary. It changes **no execution semantics**;
+`superseded`, `shadowed`, and the `cascade` cause are all derived client-side
+from the existing event log, exactly as Takes are.
+
+### One mental model: the run is a timeline; the pipeline is its fixed shape
+
+The pipeline is *space* (what runs after what); the run is *time* (what actually
+happened). Every step **try** (Attempt) is kept, immutable, read-only, until the
+run's TTL. "Take"/"attempt" are **internal words** and are never surfaced
+verbatim; the user sees a **row per rerun** and a per-step **tries** strip.
+
+### Two "agains", split on step state — not on who pressed
+
+The discriminating axis is **what state the step was in**, not machine-vs-human:
+
+- **auto-retry** — the *engine* re-executing a **not-yet-succeeded** step within
+  its budget (ADR-0047). Same history row, **no fork**. The only "retry".
+- **rerun** — the *single human action*. Re-running a **terminal** step —
+  **failed or succeeded** — which **always forks** the run into a new Take (a new
+  history row) and cascades to descendants.
+
+A separate **"manual retry"** concept was **rejected**: a human re-running a
+failed step is just a `rerun` of a terminal step (one human control on the
+screen, not two). This *confirms and generalizes* the original "every restart
+mints a Take": a rerun of a dead-lettered step is a genuine new version — the
+"before" is *the run that died*, the "after" is *the run revived and continued* —
+so `restart_step` correctly emits `RunRestartRequested` on **every** press,
+regardless of the target's prior status. (Auto-retry emits no boundary.)
+
+### Attempt causes gain `cascade`
+
+The read model distinguishes the rerun's **target** (`rerun`) from descendants
+**dragged along** by smart invalidation (`cascade`, ADR-0027). Prior
+`attemptCauses` tagged both as `restart`, hiding "you did one thing; the rest
+followed". Full set: `initial · auto-retry · rerun · cascade` (plus
+`readopted` as a visibility flag, never a new attempt).
+
+### Two new non-success outcomes (derived, not stored)
+
+An Attempt ends `running → succeeded | failed | superseded | cancelled`:
+
+- **superseded** — an Attempt **cut short while running** because a human reran an
+  ancestor (its input was being replaced, so it could not honestly finish; a
+  fresh Attempt replaces it). Distinct from **cancelled** (a *deliberate* stop
+  with **no** replacement, `cancel_run_request`) and **failed** (ran and errored).
+  Derived client-side: `AttemptStarted` with no matching `AttemptFinished`, whose
+  step is re-armed by a later `RunRestartRequested`.
+- **shadowed** — a **finished-successful** Attempt that is **no longer the
+  of-record latest** (a newer Attempt from a rerun/cascade took its role). Not a
+  terminal state but a flag on a succeeded try; the of-record = latest-successful
+  resolution already decided above *is* the shadowing rule.
+
+### UI: one component, two zoom levels (supersedes the peer-controls layout)
+
+The DAG, the selected step's evidence (logs/results/outputs/files), and a
+**version-aware Artifacts footer** merge into a single `PIPELINE` component:
+
+- **zoom out** = an **always-present version dropdown** on the component header
+  (rich rows: cause + time + result; single-version state reads "latest · live").
+- **zoom in** = the selected step's **tries** strip, chips labelled by cause
+  (auto-retry / you reran / ⟵ cascade) and outcome (✗ / ⊘ superseded / shadowed).
+
+The two are **zoom levels, not peers**. Selecting a non-latest version turns the
+**whole component read-only** (tinted + a "👁 …" banner; `Rerun`/`Cancel`
+disabled, `New run`/`Debug pod` live). **Activity stays separate** — the
+unfiltered cross-version event log where reruns are witnessed and versions are
+derived. User-facing verb is **Rerun** (not "Restart").
+
+### Follow-up (the one real engine gap)
+
+`restart_step` re-arms an in-flight descendant Running→Pending but does **not**
+tear down its Pod; fencing keeps results *correct* (the superseded Pod's late
+verdict is rejected), but the Pod can run on as an **orphan** wasting resources.
+Tracked separately — a superseded in-flight attempt should trigger an
+executor teardown (SIGTERM + grace), and MAY emit an explicit `AttemptSuperseded`
+event for audit rather than relying solely on the derived read.
