@@ -445,7 +445,7 @@ export default function RunDetail() {
               <div class="prov-main">
                 {/* Line 1: kind + Headline — the shared runs-list cell. */}
                 <div class="rr-head">
-                  <TriggerCell kind={triggerInfo()?.kind} title={r().trigger_title} variant="row" />
+                  <TriggerCell kind={triggerInfo()?.kind} title={r().trigger_title} />
                 </div>
                 {/* Line 2: origin facts — pipeline · commit · base ← head · PR ·
                     who · when · id. */}

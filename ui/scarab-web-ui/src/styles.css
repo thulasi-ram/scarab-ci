@@ -820,6 +820,19 @@ h2 {
 .pfact.idfact { cursor: pointer; }
 .pfact.idfact:hover, .pfact.idfact:hover .mono { color: var(--emerald); }
 .idcap { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted-sage); }
+
+/* The run-detail context bar runs ~20% larger than the runs-list row — same
+   markup, scaled up for the page's focal surface. Scoped under `.prov` so the
+   list stays compact. */
+.prov { padding: 17px 24px; gap: 14px 17px; }
+.prov-main { gap: 10px; }
+.prov .tcell-row .tcell-kind { font-size: 15px; }
+.prov .tcell-row .tcell-title { font-size: 16px; }
+.prov .rr-facts { gap: 6px 17px; }
+.prov .rr-facts .pfact { font-size: 14.5px; }
+.prov .rr-facts .pfact .mono { font-size: 14px; }
+.prov .rr-head svg, .prov .rr-facts svg { width: 14px; height: 14px; }
+.prov .idcap { font-size: 12px; }
 .pcell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .pcell .k {
   font-family: var(--font-mono); font-size: 10px; font-weight: 600;
@@ -879,9 +892,6 @@ h2 {
   color: var(--muted-sage);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;
 }
-/* Cell variant (run detail): value line at the pcell size, headline a touch smaller. */
-.tcell-cell .tcell-kind { font-size: 14px; color: var(--soft-white); }
-.tcell-cell .tcell-title { font-size: 12px; }
 /* Row variant (runs list, A·2 primary line): kind + Headline on ONE line —
    kind a fixed muted chip, the headline the prominent text that flexes and
    truncates. (The `cell` variant stays stacked for the run-detail grid.) */

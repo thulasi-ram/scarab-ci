@@ -308,7 +308,7 @@ export default function RepoView() {
                           {/* Primary line: the run Headline (trigger kind + title),
                               the SAME shared cell the run-detail bar uses (ADR-0057). */}
                           <div class="rr-head">
-                            <TriggerCell kind={r.trigger_kind} title={r.trigger_title} variant="row" />
+                            <TriggerCell kind={r.trigger_kind} title={r.trigger_title} />
                           </div>
                           {/* Secondary line: the origin facts — pipeline · commit ·
                               base ← head · PR · who · when. */}
