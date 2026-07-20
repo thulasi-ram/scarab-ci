@@ -1136,6 +1136,13 @@ export interface components {
             pipeline?: string | null;
             status: string;
             steps: components["schemas"]["StepStatusDto"][];
+            /**
+             * @description The run **Headline** (ADR-0057) — the one human line saying what this run
+             *     is about (a push's commit subject; later a PR title / dispatch reason),
+             *     disambiguated by the trigger kind. Display/audit only; absent when the
+             *     trigger carried no headline and on runs created before headline-stamping.
+             */
+            trigger_title?: string | null;
         };
         /**
          * @description One run in the list view: identity, status, creation time (epoch millis),
@@ -1180,6 +1187,13 @@ export interface components {
              *     (`push`/`pull_request`/`tag`/…).
              */
             trigger_kind?: string | null;
+            /**
+             * @description The run **Headline** (ADR-0057) — the one human line saying what this run
+             *     is about (a push's commit subject; later a PR title / dispatch reason),
+             *     disambiguated by the trigger kind. Display/audit only; absent when the
+             *     trigger carried no headline and on runs created before headline-stamping.
+             */
+            trigger_title?: string | null;
         };
         /**
          * @description `GET /v1/secrets` body: the secret **names** at a scope. Values are never

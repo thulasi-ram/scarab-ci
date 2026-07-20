@@ -30,6 +30,7 @@ async fn fake_forge_passes_the_port_contract() {
             repo: repo.clone(),
             r#ref: "refs/heads/main".into(),
             after: "cafe1234".into(),
+            message: "initial commit".into(),
         })
         .unwrap(),
     };

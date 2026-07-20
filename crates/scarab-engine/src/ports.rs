@@ -332,6 +332,15 @@ pub trait Db: Send + Sync {
     /// The run's pipeline name, if stamped.
     async fn run_pipeline(&self, run: &RunId) -> Result<Option<String>, DbError>;
 
+    /// Stamp the run **Headline** (ADR-0057) — the one human line that says what
+    /// this run is about (a push's commit subject; later a PR title / dispatch
+    /// reason), already subject-only + capped by the caller. Display/audit only,
+    /// never load-bearing. Set at creation for triggers that carry a headline.
+    async fn set_run_trigger_title(&self, run: &RunId, title: &str) -> Result<(), DbError>;
+
+    /// The run's Headline, if stamped.
+    async fn run_trigger_title(&self, run: &RunId) -> Result<Option<String>, DbError>;
+
     /// How many runs are in-flight (started, not terminal). With `project`,
     /// scoped to that project (fairness cap); without, the global count
     /// (backpressure).

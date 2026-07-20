@@ -27,6 +27,7 @@ fn push() -> Event {
         },
         r#ref: "refs/heads/main".into(),
         after: "sha123".into(),
+        message: "build the thing".into(),
     }
 }
 

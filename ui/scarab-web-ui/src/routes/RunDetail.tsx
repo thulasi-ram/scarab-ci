@@ -29,13 +29,13 @@ import { eventParts, eventCategory, EVENT_GLYPH } from "../events";
 import { deriveTakes, replayTake, attemptCauses, type Take, type TakeView } from "../takes";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
-import { triggerText, triggerIcon } from "../trigger";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 import Dag, { type DagStep, type DagTry } from "../components/Dag";
 import StepPane from "../components/StepPane";
 import DebugShell from "../components/DebugShell";
+import TriggerCell from "../components/TriggerCell";
 
 const POLL_MS = 1200;
 
@@ -502,17 +502,9 @@ export default function RunDetail() {
                   }}
                 </Show>
 
-                <Show when={triggerInfo()?.kind}>
-                  {(kind) => (
-                    <div class="pcell">
-                      <div class="k">trigger</div>
-                      <div class="v">
-                        <Icon icon={triggerIcon(kind())} size={13} />
-                        <span>{triggerText(kind())}</span>
-                      </div>
-                    </div>
-                  )}
-                </Show>
+                {/* Trigger cell (ADR-0057): kind + the run Headline beneath —
+                    the SAME shared component the runs list uses. */}
+                <TriggerCell kind={triggerInfo()?.kind} title={r().trigger_title} variant="cell" />
                 <Show when={triggerInfo()?.actor}>
                   {(actor) => (
                     <div class="pcell">

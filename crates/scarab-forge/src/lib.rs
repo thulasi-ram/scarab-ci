@@ -123,6 +123,22 @@ pub struct WebhookDelivery {
     pub payload: serde_json::Value,
 }
 
+/// Server-side cap on a stored [`Event::trigger_title`] (ADR-0057 §1): an
+/// anti-bloat backstop, not the display truncation. 200 covers effectively every
+/// real subject / PR title (GitHub soft-wraps subjects at ~72, hard-limits PR
+/// titles at 256); the UI owns the *display* clamp + full-text tooltip.
+pub const TRIGGER_TITLE_MAX: usize = 200;
+
+/// Truncate `s` to at most `max` **chars** (Unicode scalar values), never
+/// splitting a UTF-8 sequence. Returns `s` unchanged when already within the
+/// cap. No ellipsis — the value is stored clean (ADR-0057 §1).
+fn truncate_on_char_boundary(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        None => s.to_string(),
+        Some((byte_idx, _)) => s[..byte_idx].to_string(),
+    }
+}
+
 /// A forge event, normalized across providers into Scarab's own vocabulary.
 ///
 /// Adapters parse a vendor payload into exactly one of these (see
@@ -138,6 +154,12 @@ pub enum Event {
         repo: RepoRef,
         r#ref: String,
         after: String,
+        /// The head commit's full message (`head_commit.message`). Source of the
+        /// run **Headline** (its first line = the commit subject) via
+        /// [`Event::trigger_title`] (ADR-0057). Display/audit only —
+        /// **deliberately excluded from [`Event::context()`]** (see that method's
+        /// security note). Empty when the payload carried no head commit.
+        message: String,
     },
     PullRequest {
         /// The forge principal who triggered the PR event (the webhook `sender`).
@@ -297,6 +319,29 @@ impl Event {
         (!a.is_empty()).then_some(a)
     }
 
+    /// The run **Headline** (CONTEXT §4.5, ADR-0057) — the one normalized human
+    /// line that says *what a run is about*, its meaning fixed by the trigger
+    /// kind. For `push` it is the head commit **subject** (the first line of
+    /// `message`), truncated to [`TRIGGER_TITLE_MAX`] chars on a **char
+    /// boundary** (never mid-UTF-8-sequence) and returned **clean** — no
+    /// ellipsis; the UI owns the overflow signal. `None` when there is no
+    /// headline (an empty commit message, or a kind that carries none). The
+    /// other kinds return `None` for now — thread B/C fill PR title / dispatch
+    /// reason. Display/audit only; this value never enters [`Event::context()`].
+    pub fn trigger_title(&self) -> Option<String> {
+        let raw = match self {
+            // The commit subject = the first line of the message; the body is
+            // dropped (ADR-0057 §1).
+            Event::Push { message, .. } => message.lines().next().unwrap_or_default(),
+            _ => "",
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(truncate_on_char_boundary(trimmed, TRIGGER_TITLE_MAX))
+    }
+
     /// The repository this event targets, if any. Only `cron` is truly repo-less;
     /// `manual`/`api` dispatch carry their target repo (ADR-0043).
     pub fn repo(&self) -> Option<&RepoRef> {
@@ -317,6 +362,18 @@ impl Event {
     /// (ADR-0010): `{ "event": { "kind", "repo", … } }` with event-specific
     /// fields (`branch`/`ref`/`sha` for push, `tag`, `number`, …). Authoring
     /// reads e.g. `event.branch == 'main'`.
+    ///
+    /// **Security boundary (ADR-0057 §2, Q6/Q7 — load-bearing, do not undo):**
+    /// the provenance/**Headline** fields (`Push::message`, and later PR
+    /// `title` / `base` / dispatch `reason`) are **deliberately excluded** from
+    /// this map. `${{ event.message }}` spliced into a `run:` script is the
+    /// GitHub-Actions script-injection class, and shell has no context-free
+    /// escape (the sink — quoted / unquoted / env / arg — is unknowable at
+    /// template time). These fields have no matching or interpolation use, so
+    /// exposing them would be pure attack surface with zero benefit; they flow
+    /// only adapter → `Event` field → `trigger_title` / origin column → DTO →
+    /// UI (which escapes). `Comment::body` *is* here because comment-command
+    /// triggers structurally need to match it.
     pub fn context(&self) -> serde_json::Value {
         use serde_json::json;
         let mut e = serde_json::Map::new();
@@ -792,6 +849,7 @@ mod tests {
                     repo: repo(),
                     r#ref: "refs/heads/main".into(),
                     after: "deadbeef".into(),
+                    message: "fix: the thing".into(),
                 },
                 TriggerKind::Push,
             ),
@@ -876,6 +934,7 @@ mod tests {
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 after: "abc".into(),
+                message: "subject".into(),
             }
             .actor(),
             Some("octocat")
@@ -906,6 +965,7 @@ mod tests {
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 after: "abc".into(),
+                message: "subject".into(),
             }
             .actor(),
             None
@@ -936,7 +996,8 @@ mod tests {
             actor: "octocat".into(),
             repo: repo(),
             r#ref: "main".into(),
-            after: "z".into()
+            after: "z".into(),
+            message: "subject".into(),
         }
         .is_fork_pr());
     }
@@ -978,7 +1039,8 @@ mod tests {
                 actor: "octocat".into(),
                 repo: repo(),
                 r#ref: "main".into(),
-                after: "x".into()
+                after: "x".into(),
+                message: "subject".into(),
             }
             .repo(),
             Some(&repo())
@@ -995,6 +1057,7 @@ mod tests {
                 repo: repo(),
                 r#ref: "refs/heads/main".into(),
                 after: "deadbeef".into(),
+                message: "subject".into(),
             }
             .protection_ref()
             .as_deref(),
@@ -1105,6 +1168,7 @@ mod tests {
             repo: repo(),
             r#ref: "refs/heads/main".into(),
             after: "deadbeef".into(),
+            message: "feat: add the widget".into(),
         }
         .context();
         assert_eq!(ctx["event"]["kind"], "push");
@@ -1112,6 +1176,89 @@ mod tests {
         assert_eq!(ctx["event"]["ref"], "refs/heads/main");
         assert_eq!(ctx["event"]["sha"], "deadbeef");
         assert_eq!(ctx["event"]["repo"]["owner"], "acme");
+    }
+
+    #[test]
+    fn push_message_is_excluded_from_context_map() {
+        // Security boundary (ADR-0057 §2, Q6/Q7): the commit message is a
+        // provenance/Headline field — it MUST NOT enter the CEL/`${{ }}` context
+        // map, or `${{ event.message }}` becomes a shell script-injection sink.
+        let ctx = Event::Push {
+            actor: "octocat".into(),
+            repo: repo(),
+            r#ref: "refs/heads/main".into(),
+            after: "deadbeef".into(),
+            message: "$(rm -rf /) evil subject".into(),
+        }
+        .context();
+        assert!(
+            ctx["event"].get("message").is_none(),
+            "the commit message must never appear in the trigger-matching context"
+        );
+        // Belt-and-suspenders: the injection string appears nowhere in the map.
+        assert!(
+            !ctx.to_string().contains("rm -rf"),
+            "no part of the message may leak into the flat context"
+        );
+    }
+
+    #[test]
+    fn trigger_title_is_the_commit_subject_first_line_only() {
+        // The subject is the first line; the body (blank line + prose) is dropped.
+        let title = Event::Push {
+            actor: "octocat".into(),
+            repo: repo(),
+            r#ref: "refs/heads/main".into(),
+            after: "deadbeef".into(),
+            message: "fix: handle empty input\n\nA longer body explaining why.\n".into(),
+        }
+        .trigger_title();
+        assert_eq!(title.as_deref(), Some("fix: handle empty input"));
+
+        // An empty message yields no headline (graceful degrade).
+        assert_eq!(
+            Event::Push {
+                actor: "octocat".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                after: "deadbeef".into(),
+                message: String::new(),
+            }
+            .trigger_title(),
+            None
+        );
+
+        // Non-push kinds carry no headline yet (thread B/C fill them).
+        assert_eq!(
+            Event::Manual {
+                actor: "u".into(),
+                repo: repo(),
+                r#ref: "refs/heads/main".into(),
+                sha: "abc".into(),
+            }
+            .trigger_title(),
+            None
+        );
+    }
+
+    #[test]
+    fn trigger_title_caps_on_a_char_boundary_without_splitting_utf8() {
+        // A subject of multi-byte chars past the cap: the result is exactly
+        // TRIGGER_TITLE_MAX chars, no partial UTF-8 sequence, no ellipsis.
+        let subject = "é".repeat(TRIGGER_TITLE_MAX + 50);
+        let title = Event::Push {
+            actor: "octocat".into(),
+            repo: repo(),
+            r#ref: "refs/heads/main".into(),
+            after: "deadbeef".into(),
+            message: subject,
+        }
+        .trigger_title()
+        .expect("a non-empty subject yields a headline");
+        assert_eq!(title.chars().count(), TRIGGER_TITLE_MAX);
+        assert!(!title.ends_with('…'), "stored value is clean — no ellipsis");
+        // `String` is always valid UTF-8; assert we cut at a boundary explicitly.
+        assert!(title.is_char_boundary(title.len()));
     }
 
     #[test]

@@ -61,11 +61,20 @@ pub fn normalize(delivery: &WebhookDelivery) -> Result<Event, ForgeError> {
                     tag: tag.to_string(),
                 })
             } else {
+                // The head commit message — source of the run Headline (its first
+                // line = the commit subject; ADR-0057). Absent on a
+                // branch-delete push (no head commit) → empty, no headline.
+                let message = p
+                    .pointer("/head_commit/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 Ok(Event::Push {
                     actor,
                     repo,
                     r#ref,
                     after,
+                    message,
                 })
             }
         }
@@ -972,6 +981,7 @@ mod tests {
             json!({
                 "ref": r#ref,
                 "after": "abc123",
+                "head_commit": { "message": "fix: handle empty input\n\nbody line" },
                 "repository": { "name": "app", "owner": { "login": "acme" } },
                 "sender": { "login": "octocat" }
             })
@@ -986,6 +996,9 @@ mod tests {
                 },
                 r#ref: "refs/heads/main".into(),
                 after: "abc123".into(),
+                // The full head-commit message is parsed onto the event; the
+                // Headline extractor (scarab-forge) later takes its first line.
+                message: "fix: handle empty input\n\nbody line".into(),
             }
         );
         // A push to a tag ref normalizes to Tag.

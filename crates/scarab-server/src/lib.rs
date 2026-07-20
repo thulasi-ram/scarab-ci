@@ -519,6 +519,12 @@ pub struct RunStatusResponse {
     /// Absent for inline runs and runs created before pipeline-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
+    /// The run **Headline** (ADR-0057) — the one human line saying what this run
+    /// is about (a push's commit subject; later a PR title / dispatch reason),
+    /// disambiguated by the trigger kind. Display/audit only; absent when the
+    /// trigger carried no headline and on runs created before headline-stamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_title: Option<String>,
 }
 
 /// `GET /v1/runs` body: the most recent runs, newest first.
@@ -566,6 +572,12 @@ pub struct RunSummaryDto {
     /// Absent for inline runs and runs created before pipeline-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<String>,
+    /// The run **Headline** (ADR-0057) — the one human line saying what this run
+    /// is about (a push's commit subject; later a PR title / dispatch reason),
+    /// disambiguated by the trigger kind. Display/audit only; absent when the
+    /// trigger carried no headline and on runs created before headline-stamping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_title: Option<String>,
 }
 
 impl From<scarab_engine::RunSummary> for RunSummaryDto {
@@ -586,6 +598,7 @@ impl From<scarab_engine::RunSummary> for RunSummaryDto {
             sha: s.sha,
             pr_number: s.pr_number,
             pipeline: s.pipeline,
+            trigger_title: s.trigger_title,
         }
     }
 }
@@ -1250,6 +1263,7 @@ async fn get_run(
     let steps = st.db.steps_of_run(&run).await?;
     let params = st.db.run_params(&run).await?;
     let pipeline = st.db.run_pipeline(&run).await?;
+    let trigger_title = st.db.run_trigger_title(&run).await?;
     Ok(Json(RunStatusResponse {
         id: run.0,
         status: run_status_name(status).to_string(),
@@ -1266,6 +1280,7 @@ async fn get_run(
             .collect(),
         params,
         pipeline,
+        trigger_title,
     }))
 }
 
@@ -3144,6 +3159,14 @@ async fn persist_run_from_ir(
         .clone()
         .unwrap_or_else(|| bare_pipeline_name(pipeline));
     db.set_run_pipeline(run, &pipeline_name).await?;
+    // The Headline (ADR-0057): the one human line saying what this run is about,
+    // extracted from the trigger event (a push's commit subject; thread B/C fill
+    // PR title / dispatch reason) — already subject-only + capped char-safe by
+    // the extractor. Display/audit only, never in the CEL/interpolation context.
+    // Only stamped when the trigger carried one (skipped otherwise, leaving NULL).
+    if let Some(title) = event.trigger_title() {
+        db.set_run_trigger_title(run, &title).await?;
+    }
     db.store_run_ir(
         run,
         &serde_json::to_value(ir).unwrap_or(serde_json::Value::Null),

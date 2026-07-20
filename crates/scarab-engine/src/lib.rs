@@ -115,6 +115,12 @@ pub struct RunSummary {
     /// inline runs (no named pipeline) and pre-stamping runs.
     #[serde(default)]
     pub pipeline: Option<String>,
+    /// The run **Headline** (ADR-0057) — the one human line saying what this run
+    /// is about, disambiguated by `trigger_kind` (a push's commit subject; later
+    /// a PR title / dispatch reason). Display/audit only. `None` when the trigger
+    /// carried no headline and on pre-stamping runs.
+    #[serde(default)]
+    pub trigger_title: Option<String>,
 }
 
 /// Lifecycle status of a single step.

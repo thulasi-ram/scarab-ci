@@ -1,0 +1,16 @@
+-- Run trigger title (the Headline, ADR-0057): the one normalized human line
+-- that says WHAT a Run is about, disambiguated by the already-stamped
+-- origin_trigger_kind — a push's commit SUBJECT (this slice), later a PR title
+-- or a manual/api dispatch reason (thread B/C).
+--
+-- One column, not three (commit_message/pr_title/reason): all three are the
+-- same UI slot — "the line that says what this run is about" — and the kind
+-- disambiguates, so only one is ever non-null per run. Display/audit only:
+-- never load-bearing for scheduling, and deliberately NOT in Event::context()
+-- (no trigger-matching / `${{ }}` interpolation). Stored CLEAN — the value is
+-- the honest first 200 chars (subject-only, char-boundary-safe, no ellipsis);
+-- the UI owns the overflow signal (tooltip / clamp).
+--
+-- NULL on runs created before this migration (no backfill), as origin_* and
+-- pipeline were — pre-migration runs simply show no headline.
+ALTER TABLE runs ADD COLUMN trigger_title TEXT;

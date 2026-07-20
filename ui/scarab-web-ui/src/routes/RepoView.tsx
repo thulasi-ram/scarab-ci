@@ -25,7 +25,7 @@ import {
 } from "../api/client";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
-import { triggerText, triggerIcon } from "../trigger";
+import TriggerCell from "../components/TriggerCell";
 import Icon from "../components/Icon";
 import SearchSelect from "../components/SearchSelect";
 import Doodle from "../components/Doodle";
@@ -344,18 +344,15 @@ export default function RepoView() {
                               )}
                             </Show>
                           </div>
-                          {/* Secondary line: trigger + who + when / how long. */}
+                          {/* Secondary line: trigger (+ headline) + who + when.
+                              The trigger cell is the SAME shared component the run
+                              detail bar uses (ADR-0057). */}
                           <div class="rr-facts">
                             <Show when={r.trigger_kind}>
-                              {(kind) => (
-                                <>
-                                  <span class="pfact" title="trigger">
-                                    <Icon icon={triggerIcon(kind())} size={12} />
-                                    <span>{triggerText(kind())}</span>
-                                  </span>
-                                  <span class="rr-facts-sep">·</span>
-                                </>
-                              )}
+                              <>
+                                <TriggerCell kind={r.trigger_kind} title={r.trigger_title} variant="row" />
+                                <span class="rr-facts-sep">·</span>
+                              </>
                             </Show>
                             <Show when={r.actor}>
                               {(actor) => (

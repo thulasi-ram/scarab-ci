@@ -131,6 +131,7 @@ fn push(branch: &str) -> Event {
         r#ref: format!("refs/heads/{branch}"),
         // A REAL commit SHA — the value pre-fix wrongly matched against allowed_refs.
         after: "1234567890abcdef1234567890abcdef12345678".into(),
+        message: "deploy subject".into(),
     }
 }
 

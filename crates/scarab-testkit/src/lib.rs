@@ -127,6 +127,7 @@ fn fake_run_summary(st: &InMemoryState, run: &RunId, status: RunStatus) -> RunSu
         sha: origin.and_then(|o| o.3.clone()),
         pr_number: origin.and_then(|o| o.4),
         pipeline: st.run_pipeline.get(run).cloned(),
+        trigger_title: st.run_trigger_title.get(run).cloned(),
     }
 }
 
@@ -168,6 +169,8 @@ struct InMemoryState {
     run_origin: HashMap<RunId, (String, Option<String>, Option<String>, Option<String>, Option<i64>)>,
     /// Per-run pipeline name (mirrors the `pipeline` run column).
     run_pipeline: HashMap<RunId, String>,
+    /// Per-run Headline / trigger title (mirrors the `trigger_title` column).
+    run_trigger_title: HashMap<RunId, String>,
     /// ForgeConnection registry rows (ADR-0046).
     forge_connections: HashMap<String, scarab_forge::ForgeConnection>,
     /// Repo bindings: (owner, name) → (connection id, org, project).
@@ -664,6 +667,25 @@ impl Db for InMemoryDb {
 
     async fn run_pipeline(&self, run: &RunId) -> Result<Option<String>, DbError> {
         Ok(self.state.lock().unwrap().run_pipeline.get(run).cloned())
+    }
+
+    async fn set_run_trigger_title(&self, run: &RunId, title: &str) -> Result<(), DbError> {
+        self.state
+            .lock()
+            .unwrap()
+            .run_trigger_title
+            .insert(run.clone(), title.to_string());
+        Ok(())
+    }
+
+    async fn run_trigger_title(&self, run: &RunId) -> Result<Option<String>, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .run_trigger_title
+            .get(run)
+            .cloned())
     }
 
     async fn count_in_flight_runs(&self, project: Option<&str>) -> Result<u32, DbError> {

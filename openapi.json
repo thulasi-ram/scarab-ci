@@ -1980,6 +1980,13 @@
             "items": {
               "$ref": "#/components/schemas/StepStatusDto"
             }
+          },
+          "trigger_title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The run **Headline** (ADR-0057) — the one human line saying what this run\nis about (a push's commit subject; later a PR title / dispatch reason),\ndisambiguated by the trigger kind. Display/audit only; absent when the\ntrigger carried no headline and on runs created before headline-stamping."
           }
         }
       },
@@ -2064,6 +2071,13 @@
               "null"
             ],
             "description": "The run's **origin** — the trigger facts it was born from, each stamped at\ncreation and independently nullable (sparse across trigger kinds; all\nabsent on runs created before origin-stamping). The trigger kind\n(`push`/`pull_request`/`tag`/…)."
+          },
+          "trigger_title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The run **Headline** (ADR-0057) — the one human line saying what this run\nis about (a push's commit subject; later a PR title / dispatch reason),\ndisambiguated by the trigger kind. Display/audit only; absent when the\ntrigger carried no headline and on runs created before headline-stamping."
           }
         }
       },

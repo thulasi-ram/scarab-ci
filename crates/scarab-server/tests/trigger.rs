@@ -32,6 +32,8 @@ fn push(branch: &str) -> Event {
         repo: repo(),
         r#ref: format!("refs/heads/{branch}"),
         after: "sha123".into(),
+        // A subject + body — the Headline extractor keeps only the first line.
+        message: "fix: the login redirect\n\nA longer body explaining the fix.".into(),
     }
 }
 
@@ -62,6 +64,15 @@ async fn push_matching_on_push_starts_a_run() {
     assert_eq!(steps[0].status, StepStatus::Pending);
     // The IR was stored on the run (self-describing).
     assert!(db.run_ir(&run).await.unwrap().is_some());
+
+    // The Headline (ADR-0057) is stamped at creation: a push run's trigger_title
+    // is the commit SUBJECT (first line only — the body is dropped), surfaced on
+    // the runs list + run detail beside origin/pipeline.
+    assert_eq!(
+        db.run_trigger_title(&run).await.unwrap().as_deref(),
+        Some("fix: the login redirect"),
+        "a push run stamps trigger_title = the commit subject, body dropped"
+    );
 }
 
 /// A committed `.scarab` authoring slice-4 engine features: a concurrency group
