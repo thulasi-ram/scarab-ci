@@ -10,6 +10,7 @@ import { useParams, useNavigate } from "@solidjs/router";
 import { recordVisit } from "../visited";
 import {
   listRepoRuns,
+  repoForgeUrl,
   listSecrets,
   putSecret,
   deleteSecret,
@@ -23,6 +24,8 @@ import {
   type SecretScope,
 } from "../api/client";
 import { relTime, absTime, duration } from "../fmt";
+import { forgeCommitUrl, forgePrUrl } from "../forge";
+import { triggerText, triggerIcon } from "../trigger";
 import Icon from "../components/Icon";
 import SearchSelect from "../components/SearchSelect";
 import Doodle from "../components/Doodle";
@@ -100,6 +103,11 @@ export default function RepoView() {
   const [rows, { refetch }] = createResource(
     () => ({ org: org(), repo: repo() }),
     (k): Promise<RunSummary[]> => listRepoRuns(k.org, k.repo, 50),
+  );
+  // The repo's forge web base (for commit/PR deep links); shared by all rows.
+  const [repoUrl] = createResource(
+    () => ({ org: org(), repo: repo() }),
+    (k) => repoForgeUrl(k.org, k.repo).catch(() => null),
   );
 
   const [tab, setTab] = createSignal<Tab>("runs");
@@ -284,42 +292,103 @@ export default function RepoView() {
             >
               <div class="runlist">
                 <For each={filtered()}>
-                  {(r) => (
-                    <div class="runrow" onClick={() => nav(`/${org()}/${repo()}/runs/${r.id}`)}>
-                      <span class={`sdot ${r.status}`} title={r.status} />
-                      <div class="rr-body">
-                        <div class="rr-head">
-                          <span class="rr-sha mono">{(r.sha ?? r.id).slice(0, 7)}</span>
-                          <span class={`rr-status ${r.status}`}>{r.status}</span>
-                          <Show when={triggerLabel(r.trigger_kind)}>
-                            {(t) => <span class="rr-trigger">{t()}</span>}
-                          </Show>
-                          <span class="rr-when mono" title={absTime(r.created_at)}>
-                            {relTime(r.created_at)}
-                          </span>
+                  {(r) => {
+                    const commitUrl = () => forgeCommitUrl(repoUrl(), r.sha);
+                    const prUrl = () => forgePrUrl(repoUrl(), r.pr_number);
+                    const stop = (e: MouseEvent) => e.stopPropagation();
+                    return (
+                      <div class="runrow" onClick={() => nav(`/${org()}/${repo()}/runs/${r.id}`)}>
+                        <div class="rr-body">
+                          {/* Primary line: which pipeline + what code. */}
+                          <div class="rr-head">
+                            <Show when={r.pipeline}>
+                              {(name) => (
+                                <span class="pfact strong" title="pipeline">
+                                  <Icon icon="workflow" size={13} />
+                                  <span class="mono">{name()}</span>
+                                </span>
+                              )}
+                            </Show>
+                            <Show when={r.pr_number != null}>
+                              <a
+                                class="pfact"
+                                classList={{ link: !!prUrl() }}
+                                href={prUrl() ?? undefined}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={stop}
+                                title="pull request on the forge"
+                              >
+                                <Icon icon="git-pull-request" size={13} />
+                                <span class="mono">#{r.pr_number}</span>
+                              </a>
+                            </Show>
+                            <a
+                              class="pfact"
+                              classList={{ link: !!commitUrl() }}
+                              href={commitUrl() ?? undefined}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={stop}
+                              title="commit on the forge"
+                            >
+                              <Icon icon="git-commit-horizontal" size={13} />
+                              <span class="mono sha">{(r.sha ?? r.id).slice(0, 7)}</span>
+                            </a>
+                            <Show when={branchLabel(r) && branchLabel(r) !== r.sha}>
+                              {(b) => (
+                                <span class="pfact" title="branch / ref">
+                                  <Icon icon="git-branch" size={13} />
+                                  <span class="mono">{b()}</span>
+                                </span>
+                              )}
+                            </Show>
+                          </div>
+                          {/* Secondary line: trigger + who + when / how long. */}
+                          <div class="rr-facts">
+                            <Show when={r.trigger_kind}>
+                              {(kind) => (
+                                <>
+                                  <span class="pfact" title="trigger">
+                                    <Icon icon={triggerIcon(kind())} size={12} />
+                                    <span>{triggerText(kind())}</span>
+                                  </span>
+                                  <span class="rr-facts-sep">·</span>
+                                </>
+                              )}
+                            </Show>
+                            <Show when={r.actor}>
+                              {(actor) => (
+                                <>
+                                  <span class="pfact" title="triggered by">
+                                    <Icon icon="user" size={12} />
+                                    <span>{actor()}</span>
+                                  </span>
+                                  <span class="rr-facts-sep">·</span>
+                                </>
+                              )}
+                            </Show>
+                            <span
+                              class="pfact"
+                              classList={{ live: isLive(r.status) }}
+                              title={absTime(r.created_at)}
+                            >
+                              <Icon icon="timer" size={12} />
+                              <span>
+                                {relTime(r.created_at)} · <span class="mono">{durationLabel(r, now())}</span>
+                              </span>
+                            </span>
+                          </div>
                         </div>
-                        <div class="rr-facts">
-                          <Show when={r.actor}>
-                            {(a) => (
-                              <span class="rr-fact" title="author">
-                                <Icon icon="user" size={12} /> {a()}
-                              </span>
-                            )}
-                          </Show>
-                          <Show when={refLabel(r)}>
-                            {(ref) => (
-                              <span class="rr-fact" title="ref">
-                                <Icon icon="git-branch" size={12} /> {ref()}
-                              </span>
-                            )}
-                          </Show>
-                          <span class="rr-fact" classList={{ live: isLive(r.status) }} title="duration">
-                            <Icon icon="timer" size={12} /> {durationLabel(r, now())}
+
+                        <div class="rr-right">
+                          <span class={`rr-status ${r.status}`}>
+                            <span class={`sdot ${r.status}`} /> {r.status}
                           </span>
                         </div>
                       </div>
-                    </div>
-                  )}
+                    );
+                  }}
                 </For>
               </div>
             </Show>

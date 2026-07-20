@@ -1069,6 +1069,13 @@ export interface components {
             /** @description The forge coordinate backing it (1:1 in v1). */
             owner: string;
             project: string;
+            /**
+             * @description The forge WEB base for this repo (e.g. `https://github.com/owner/name`) —
+             *     what the UI appends `/commit/<sha>` or `/pull/<n>` to for deep links.
+             *     Derived from the connection's kind + base_url (the stored base is the API
+             *     host, which differs from the web host on GitHub).
+             */
+            repo_url: string;
         };
         /**
          * @description `POST /v1/secrets` body: define (or overwrite) a secret at a scope. The
@@ -1122,6 +1129,11 @@ export interface components {
              *     re-run flow pre-fill the form from the prior run's params.
              */
             params?: Record<string, never>;
+            /**
+             * @description The pipeline this run executed (the bare `.scarab/<name>` selection).
+             *     Absent for inline runs and runs created before pipeline-stamping.
+             */
+            pipeline?: string | null;
             status: string;
             steps: components["schemas"]["StepStatusDto"][];
         };
@@ -1146,6 +1158,11 @@ export interface components {
             id: string;
             /** @description The owning org, if the run is tenanted (trigger-created). */
             org?: string | null;
+            /**
+             * @description The pipeline this run executed (the bare `.scarab/<name>` selection).
+             *     Absent for inline runs and runs created before pipeline-stamping.
+             */
+            pipeline?: string | null;
             /**
              * Format: int64
              * @description The pull-request number, for `pull_request` runs.

@@ -794,33 +794,62 @@ h2 {
 .prov {
   position: relative;
   display: flex;
+  align-items: center;
   flex-wrap: wrap;
-  gap: 12px 32px;
-  padding: 18px 20px;
+  gap: 12px 14px;
+  padding: 14px 20px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--emerald-surface);
   margin-bottom: 16px;
 }
-
-.prov .cell .k {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  color: var(--muted-sage);
+/* Two-level labeled cells (LABEL over value), grouped left; status floats right. */
+.prov-main { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 12px 28px; flex: 1; min-width: 0; }
+.prov-right { display: inline-flex; align-items: center; gap: 10px; margin-left: auto; flex: none; }
+.pcell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.pcell .k {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1px; color: var(--muted-sage);
 }
-
-.prov .cell .v {
-  font-size: 14px;
-  color: var(--soft-white);
-  margin-top: 4px;
+.pcell .v {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 14px; color: var(--soft-white); text-decoration: none; min-width: 0;
 }
+.pcell .v svg { color: var(--muted-sage); flex: none; }
+.pcell .v .mono { font-family: var(--font-mono); font-size: 13px; }
+.pcell .v .sha { color: var(--copper); }
+.pcell .v.subtle { color: var(--muted-sage); }
+.pcell .v.strong { font-weight: 600; }
+.pcell .v.strong svg { color: var(--emerald); }
+.pcell .v.link { cursor: pointer; transition: color 0.12s ease; }
+.pcell .v.link:hover, .pcell .v.link:hover .sha { color: var(--emerald); }
+.pcell .v.link:hover svg { color: var(--emerald); }
 
-.prov .cell .v.mono {
-  font-family: var(--font-mono);
-  font-size: 13px;
+/* Shared fact chip — icon + value, used by the provenance bar AND the run-list
+   rows so both read identically. `.link` variants deep-link to the forge. */
+.pfact {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--soft-white); min-width: 0;
+  text-decoration: none; white-space: nowrap;
 }
+.pfact svg { color: var(--muted-sage); flex: none; }
+.pfact .mono { font-family: var(--font-mono); font-size: 12.5px; }
+.pfact .sha { color: var(--copper); }
+.pfact.subtle { color: var(--muted-sage); }
+/* Pipeline name — the "what is this run" anchor: a touch heavier + emerald icon. */
+.pfact.strong { font-weight: 600; }
+.pfact.strong svg { color: var(--emerald); }
+.pfact.strong .mono { font-size: 13px; }
+/* A fact that couldn't resolve a forge link — plain text, no link affordance. */
+.pfact.plain { cursor: default; }
+.pfact.subtle.mono, .pfact.subtle .mono { color: var(--muted-sage); }
+.pfact.link { cursor: pointer; transition: color 0.12s ease; }
+.pfact.link:hover, .pfact.link:hover .sha { color: var(--emerald); }
+.pfact.link:hover svg { color: var(--emerald); }
+.pfact.live, .pfact.live svg { color: var(--emerald); }
+
+/* Thin divider between fact groups (code · who · when). */
+.pdiv { width: 1px; align-self: center; height: 15px; background: var(--border); flex: none; }
 
 .prov-pending .v {
   color: var(--muted-sage);
@@ -1329,16 +1358,26 @@ h2 {
    trigger · when). Reads at a glance without the eye tracking column edges. */
 .runlist { border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; background: var(--emerald-surface); }
 .runrow {
-  display: grid; grid-template-columns: 16px 1fr; gap: 12px; align-items: start;
+  display: flex; align-items: center; gap: 12px;
   padding: 12px 16px; border-bottom: 1px solid var(--border-soft); cursor: pointer;
 }
 .runrow:last-child { border-bottom: none; }
 .runrow:hover { background: color-mix(in srgb, var(--emerald) 7%, transparent); }
-.runrow .sdot { margin-top: 5px; }
-.rr-body { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.rr-head { display: flex; align-items: baseline; gap: 10px; }
-.rr-sha { color: var(--copper); font-size: 13px; flex: none; }
-.rr-status { font-size: 12px; text-transform: capitalize; color: var(--muted-sage); }
+/* Two-level row: primary line (pipeline + code) over a secondary facts line
+   (who + when); status floats right, centered over both. `.pfact` shared with
+   the run-detail provenance bar. */
+.rr-body { display: flex; flex-direction: column; gap: 5px; min-width: 0; flex: 1; }
+.rr-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 16px; }
+.rr-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
+.rr-facts .pfact { font-size: 12px; color: var(--muted-sage); }
+.rr-facts .pfact.live { color: var(--emerald); }
+.rr-facts .pfact .mono { font-size: 11.5px; }
+.rr-facts-sep { color: var(--muted-sage); opacity: 0.5; }
+.rr-right { display: inline-flex; align-items: center; margin-left: auto; flex: none; }
+.rr-status {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 12.5px; text-transform: capitalize; color: var(--muted-sage);
+}
 .rr-status.running, .rr-status.pending, .rr-status.suspended { color: var(--emerald); }
 .rr-status.failed, .rr-status.dead_lettered { color: var(--danger, #d66); }
 .rr-status.succeeded { color: var(--ok); }
@@ -1775,7 +1814,7 @@ h1, .crumb-head, .run-title {
   width: 190px;
   padding: 10px 12px;
   border: 1px solid var(--terminal-line);
-  border-radius: 9px;
+  border-radius: 3px;
   background: var(--terminal-elev);
   color: var(--terminal-ink);
   font-family: var(--font-ui);
@@ -1791,10 +1830,11 @@ h1, .crumb-head, .run-title {
 .dnode-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .dnode-id { font-family: var(--font-mono); font-size: 12.5px; color: var(--terminal-ink); font-weight: 500; }
 .dnode-meta { font-family: var(--font-mono); font-size: 10px; color: var(--muted-sage); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dnode-retry {
-  display: inline-flex; align-items: center; gap: 2px;
-  font-family: var(--font-mono); font-size: 9.5px; color: var(--copper);
-  border: 1px solid var(--border-copper); border-radius: 20px; padding: 1px 5px;
+/* `×N` tries badge — tabular mono, sits where the old retry pill did. */
+.dnode-count {
+  font-family: var(--font-mono); font-size: 10px; font-variant-numeric: tabular-nums;
+  color: var(--copper); border: 1px solid var(--border-copper);
+  border-radius: 3px; padding: 1px 6px;
 }
 .dnode-gate { color: var(--copper); }
 .dnode-prog {
@@ -1804,6 +1844,57 @@ h1, .crumb-head, .run-title {
   animation: dnode-scan 1.6s ease-in-out infinite;
 }
 @keyframes dnode-scan { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
+
+/* ── Deck + fan: a step's tries in the graph (ADR-0056) ───────────────────── */
+/* Each step is a cell: the node (as a DECK when it took >1 try) and, when
+   selected, its tries FANNED beneath as a compact in-rail stack. */
+.dcell { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+/* Deck: offset shadow-cards peeking behind the node — the "retried N times"
+   signal at a glance. The node paints on top (later in DOM). */
+.ddeck { position: relative; display: inline-block; }
+.ddeck-layer {
+  position: absolute; inset: 0; z-index: 0;
+  border: 1px solid var(--terminal-line); border-radius: 3px;
+  background: var(--terminal);
+}
+.dcell.fanned .ddeck-layer { border-color: color-mix(in srgb, var(--emerald) 30%, var(--terminal-line)); }
+.ddeck .dnode { position: relative; z-index: 1; }
+
+/* Fan: the selected step's tries, full rail-width, stacked. Picking one scopes
+   the evidence pane; the active try is filled, shadowed dimmed. Text + surfaces
+   use the always-dark TERMINAL palette (like `.dnode`), not the theme-flipping
+   page tokens — the fan lives on the dark graph canvas in both light and dark. */
+.dfan {
+  display: flex; flex-direction: column; gap: 5px;
+  width: 190px; padding-left: 11px;
+  border-left: 1px solid var(--terminal-line);
+  margin-left: 10px;
+}
+.dfan-card {
+  display: flex; flex-direction: column; gap: 2px; text-align: left; cursor: pointer;
+  padding: 6px 9px; border-radius: 3px;
+  border: 1px solid var(--terminal-line); border-left-width: 3px;
+  background: var(--terminal-elev);
+  transition: border-color 0.12s ease, background 0.12s ease;
+  animation: dfan-in 0.18s ease-out both;
+}
+@keyframes dfan-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.dfan-card.emerald { border-left-color: var(--emerald-bright); }
+.dfan-card.danger { border-left-color: var(--danger); }
+.dfan-card.copper { border-left-color: var(--copper); }
+.dfan-card:hover { border-color: var(--emerald-bright); }
+.dfan-card.on {
+  background: color-mix(in srgb, var(--emerald) 22%, var(--terminal-elev));
+  border-color: var(--emerald-bright);
+}
+.dfan-card.shadow { opacity: 0.72; }
+.dfan-t { font-family: var(--font-mono); font-size: 11px; color: var(--terminal-ink); }
+.dfan-card.on .dfan-t { color: #f4f8f4; }
+.dfan-o { font-family: var(--font-mono); font-size: 9.5px; color: var(--muted-sage); }
+.dfan-readopt { color: var(--copper); }
+@media (prefers-reduced-motion: reduce) {
+  .dfan-card { animation: none; }
+}
 
 /* status ring (conic gauge) */
 .dring { width: 22px; height: 22px; border-radius: 50%; position: relative; display: grid; place-items: center; }
@@ -1889,6 +1980,24 @@ h1, .crumb-head, .run-title {
 .lgrow.ok .lgtx { color: var(--ok); }
 .lgrow.cmd .lgtx { color: var(--emerald-bright); }
 .lgrow.empty { color: var(--muted-sage); padding: 8px 12px; }
+
+/* Log skeleton — shown for the switch window so a reload is unmistakable even
+   when the new try's (cached) output looks like the old. Bars sit in the `.lgtx`
+   column and shimmer. */
+.lgskel .lgrow { align-items: center; min-height: calc(12.5px * 1.6); }
+.lgskel-bar {
+  height: 10px; border-radius: 3px; display: inline-block;
+  background: linear-gradient(
+    90deg,
+    var(--terminal-line) 0%,
+    color-mix(in srgb, var(--terminal-ink) 22%, var(--terminal-line)) 50%,
+    var(--terminal-line) 100%
+  );
+  background-size: 200% 100%;
+  animation: lgskel-shimmer 1.1s ease-in-out infinite;
+}
+@keyframes lgskel-shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) { .lgskel-bar { animation: none; } }
 
 /* ── Inspector: tabs + browse surfaces ────────────────────────────────────── */
 .inspector { margin-bottom: 16px; }
@@ -2084,13 +2193,15 @@ h1, .crumb-head, .run-title {
 }
 /* DAG column: a transparent "Steps" header over the graph canvas, which scrolls. */
 .pipeline-panel .dag-wrap { display: flex; flex-direction: column; }
-/* Section headers over the two columns — caps, tracked, mono micro-labels
-   (a lighter echo of the .panel-h treatment, one level down). */
-.dag-head {
+/* Section headers inside the Pipeline component — STEPS and ARTIFACTS are
+   siblings and share ONE look: caps, tracked, mono micro-labels (a lighter echo
+   of the .panel-h treatment, one level down). */
+.dag-head,
+.artifacts-foot .af-h {
   font-family: var(--font-mono); font-size: 11px; font-weight: 600;
   text-transform: uppercase; letter-spacing: 1.4px; color: var(--sage);
-  padding: 11px 4px 10px;
 }
+.dag-head { padding: 11px 4px 10px; }
 .pipeline-panel .dag-wrap .dag { flex: 1; overflow: auto; border-radius: var(--radius); }
 /* Step evidence: no card of its own — a transparent header, content below. */
 .pipeline-panel .rd-grid > .steppane {
@@ -2109,10 +2220,10 @@ h1, .crumb-head, .run-title {
    height and the list rows align with the header's controls. */
 .verdrop { position: relative; }
 .verdrop-btn {
-  display: inline-flex; align-items: center; gap: 6px; cursor: pointer; height: 26px;
-  font-family: var(--font-mono); font-size: 11.5px; color: var(--sage);
+  display: inline-flex; align-items: center; gap: 8px; cursor: pointer; height: 34px;
+  font-family: var(--font-mono); font-size: 13.5px; color: var(--sage);
   background: var(--emerald-surface); border: 1px solid var(--border);
-  border-radius: var(--radius-sm); padding: 0 9px;
+  border-radius: var(--radius-sm); padding: 0 13px;
 }
 .verdrop-btn:hover { border-color: var(--emerald); color: var(--soft-white); }
 .verdrop-btn.traveling { color: var(--emerald); border-color: var(--emerald); font-style: italic; }
@@ -2121,33 +2232,31 @@ h1, .crumb-head, .run-title {
 .verdrop.open .vd-caret { transform: rotate(180deg); }
 .verdrop-backdrop { position: fixed; inset: 0; z-index: 30; }
 .verdrop-list {
-  position: absolute; right: 0; top: calc(100% + 5px); z-index: 31;
-  min-width: 284px; margin: 0; padding: 5px; list-style: none;
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 31;
+  min-width: 328px; margin: 0; padding: 6px; list-style: none;
   background: var(--pine-deep); border: 1px solid var(--border);
   border-radius: var(--radius); box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28);
 }
 /* Line items (versions AND tries): grouped label + sub, no side border — the
    dot + a soft fill carry selection. */
 .verdrop-row {
-  display: flex; align-items: center; gap: 10px; width: 100%; cursor: pointer;
-  font-family: var(--font-mono); font-size: 11.5px; color: var(--sage);
+  display: flex; align-items: center; gap: 11px; width: 100%; cursor: pointer;
+  font-family: var(--font-mono); font-size: 13px; color: var(--sage);
   background: transparent; border: none;
-  border-radius: var(--radius-sm); padding: 8px 11px; text-align: left;
+  border-radius: var(--radius-sm); padding: 10px 13px; text-align: left;
 }
 .verdrop-row:hover { background: var(--emerald-surface); color: var(--soft-white); }
 .verdrop-row.sel { color: var(--soft-white); background: var(--emerald-surface); }
-.verdrop-row .vr-dot { color: var(--emerald); font-size: 9px; line-height: 1; }
+.verdrop-row .vr-dot { color: var(--emerald); font-size: 10px; line-height: 1; }
 .verdrop-row.sel .vr-dot { color: var(--emerald-bright); }
 .verdrop-row .vr-main { flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.verdrop-row .vr-sub { color: var(--muted-sage); font-size: 10px; }
-.verdrop-row .vr-live { color: var(--emerald); font-size: 10px; }
+.verdrop-row .vr-sub { color: var(--muted-sage); font-size: 11px; }
+.verdrop-row .vr-live { color: var(--emerald); font-size: 11px; }
 .verdrop-row .vr-tag {
   font-size: 9px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted-sage);
   border: 1px solid var(--border); border-radius: 20px; padding: 1px 6px;
 }
 .verdrop-row .areadopt { color: var(--copper); font-size: 12px; }
-/* The attempt ("try") dropdown reuses the version dropdown, one notch lighter. */
-.trydrop .verdrop-btn { height: 24px; font-size: 11px; }
 
 /* Status moved into the top metadata bar (was on the breadcrumb). */
 .prov-status { display: inline-flex; align-items: center; gap: 10px; }
@@ -2157,10 +2266,11 @@ h1, .crumb-head, .run-title {
 .artifacts-foot { border-top: 1px solid var(--border); padding: 2px 12px 10px; }
 .artifacts-foot .af-h {
   display: flex; align-items: baseline; gap: 10px; padding: 10px 0 2px;
-  font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
-  color: var(--muted-sage);
 }
-.artifacts-foot .af-h .subtle { font-size: 10.5px; letter-spacing: 0; text-transform: none; }
+.artifacts-foot .af-h .subtle {
+  font-family: var(--font-ui); font-weight: 400; font-size: 10.5px;
+  letter-spacing: 0; text-transform: none; color: var(--muted-sage);
+}
 .artifacts-foot .empty { padding: 8px 0; }
 .artifacts-foot .filelist { padding: 4px 0 2px; }
 .linklike {
@@ -2171,24 +2281,25 @@ h1, .crumb-head, .run-title {
 
 /* Inside the pane the tab row sits flush under the attempt strip — the
    page-level `.tabs` spacing doesn't apply. */
-/* Tabs align their first label with the step header: the tab's own 14px left
-   padding lands "LOGS" under "STEP" (step-head shares the 14px inset). */
-.steppane .tabs { margin: 0; background: none; padding: 0; border-bottom: 1px solid var(--border); }
-
-/* Step header: a caps micro-label + the step id, then the "try" dropdown. Flat
-   — no surface of its own; typography-led (matches the DAG's "Steps" header). */
-.steppane .step-head {
-  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
-  padding: 11px 14px 10px;
+/* Evidence header = tab-bar only (the step name / try live in the graph). The
+   tabs sit left, a spinner + any dead-letter badge sit right; the underline
+   spans the whole bar. */
+.steppane .pane-tabbar { display: flex; align-items: center; border-bottom: 1px solid var(--border); }
+.steppane .pane-tabbar .grow1 { flex: 1; }
+.steppane .pane-tabbar .tabs { margin: 0; background: none; padding: 0; border-bottom: none; }
+.steppane .pane-tabbar .adeadletter { margin-right: 10px; }
+/* Loading spinner — the only cue that a try/step/tab switch took effect and
+   fresh evidence is arriving. Hidden until in-flight, then a gentle spin. */
+.pane-load {
+  display: inline-flex; align-items: center; padding-right: 12px;
+  color: var(--emerald); opacity: 0; transition: opacity 0.15s ease;
 }
-.steppane .step-head .hdr-label {
-  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 1.4px; color: var(--muted-sage);
+.pane-load.on { opacity: 1; }
+.pane-load.on svg { animation: pane-spin 0.8s linear infinite; transform-origin: center; }
+@keyframes pane-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .pane-load.on svg { animation: none; }
 }
-.steppane .step-head-id {
-  font-size: 13px; font-weight: 500; color: var(--soft-white); letter-spacing: 0.01em;
-}
-.steppane .step-head .grow1 { flex: 1; }
 .achip {
   display: inline-flex; align-items: center; gap: 5px;
   font-family: var(--font-mono); font-size: 11px; cursor: pointer;

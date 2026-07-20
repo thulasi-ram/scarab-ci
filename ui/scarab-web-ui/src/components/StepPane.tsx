@@ -18,7 +18,6 @@ import {
   type Attempt,
 } from "../api/client";
 import type { RunEvent } from "../api/client";
-import { attemptCauses } from "../takes";
 import Icon from "./Icon";
 
 type Tab = "logs" | "results" | "outputs" | "workspace";
@@ -46,9 +45,8 @@ export default function StepPane(props: {
   step: StepStatus | null;
   /** Full event log — the attempt-cause and re-adoption source. */
   events: RunEvent[];
-  /** Selected attempt id (the strip's selection); null = latest. */
+  /** The try scoping every tab — chosen in the graph fan; null = latest. */
   attempt: string | null;
-  onAttemptSelect: (id: string | null) => void;
   /** Viewing a closed Take: pin the strip's default to this frontier attempt
    * and mark attempts beyond it as from a later take. */
   frontierAttempt?: string | null;
@@ -62,7 +60,6 @@ export default function StepPane(props: {
   canDebug?: boolean;
 }) {
   const [tab, setTab] = createSignal<Tab>("logs");
-  const [tryOpen, setTryOpen] = createSignal(false);
   const [wsPath, setWsPath] = createSignal("");
   const [openFile, setOpenFile] = createSignal<string | null>(null);
   const [wrap, setWrap] = createSignal(true);
@@ -94,36 +91,22 @@ export default function StepPane(props: {
     setOpenFile(null);
   });
 
-  const causes = () => (stepId() ? attemptCauses(props.events, stepId()!) : null);
-
-  const isSuperseded = (a: Attempt) => causes()?.superseded.has(a.id) ?? false;
-  const isShadowed = (a: Attempt) => causes()?.shadowed.has(a.id) ?? false;
-
-  // Plain-english cause suffix (ADR-0056 amendment): the machine's own retry vs
-  // the human reran-this-step vs a rerun of an ancestor that dragged this along.
-  const causeSuffix = (a: Attempt): string => {
-    const cause = causes()?.causes[a.id];
-    switch (cause) {
-      case "rerun":
-        return " · you reran";
-      case "cascade":
-        return " · ⟵ rerun";
-      case "retry":
-        return " · auto-retry";
-      default:
-        return "";
-    }
-  };
-
-  // Dropdown line items group two lines: the compact title (try N · cause) and
-  // the outcome beneath it — superseded (cut short) ranks before failed.
-  const tryTitle = (a: Attempt, i: number) => `try ${i + 1}${causeSuffix(a)}`;
-  const tryOutcome = (a: Attempt): string => {
-    if (isSuperseded(a)) return "⊘ superseded · cut short by a rerun";
-    if (a.failed) return `✗ failed${a.failure ? ` · ${a.failure}` : ""}`;
-    return "✓ succeeded";
-  };
-  const scopedIndex = () => attemptsOf().findIndex((a) => a.id === scoped()?.id);
+  // A brief "changed / loading" pulse whenever the scoped (step, try) or tab
+  // moves. The evidence pane no longer repeats the step name or try in a header
+  // (the graph shows both, and highlights the active try in the fan) — this
+  // spinner is the only cue that a switch took effect and fresh evidence is
+  // arriving.
+  const [switching, setSwitching] = createSignal(false);
+  let switchTimer: ReturnType<typeof setTimeout> | undefined;
+  createEffect(() => {
+    void stepId();
+    void scoped()?.id;
+    void tab();
+    setSwitching(true);
+    clearTimeout(switchTimer);
+    switchTimer = setTimeout(() => setSwitching(false), 450);
+  });
+  onCleanup(() => clearTimeout(switchTimer));
 
   // --- Logs: one buffered SSE stream per (step, attempt); the scoped attempt's
   // buffer renders. Historical attempts replay and close; the live one tails. ---
@@ -211,6 +194,28 @@ export default function StepPane(props: {
   const enter = (name: string) => navTo([...crumbs(), name].join("/"));
   const filePath = (name: string) => [...crumbs(), name].join("/");
 
+  // Fresh evidence is on the way when the pulse is live or any tab's fetch is in
+  // flight — drives the tab-bar spinner.
+  const loading = () => switching() || results.loading || consumed.loading || ws.loading;
+
+  // Shimmer stand-in for the log body during a switch. Cached tries swap
+  // instantly and often look near-identical (both cargo output) — the skeleton
+  // makes it unmistakable that the content reloaded. Reuses the `.lgrow` gutter
+  // grid so it lands exactly where real lines will. Varied widths read as text.
+  const SKELETON_WIDTHS = [46, 72, 58, 83, 35, 64, 77, 50, 69, 40, 61, 74, 44, 67];
+  const LogSkeleton = () => (
+    <div class="lgbody lgskel" aria-hidden="true">
+      <For each={SKELETON_WIDTHS}>
+        {(w, i) => (
+          <div class="lgrow">
+            <span class="lgln">{i() + 1}</span>
+            <span class="lgskel-bar" style={{ width: `${w}%`, "animation-delay": `${i() * 40}ms` }} />
+          </div>
+        )}
+      </For>
+    </div>
+  );
+
   const TabBtn = (p: { id: Tab; label: string; count?: number }) => (
     <button class={`tab ${tab() === p.id ? "active" : ""}`} onClick={() => setTab(p.id)}>
       {p.label}
@@ -234,109 +239,58 @@ export default function StepPane(props: {
       >
         {(s) => (
           <>
-            {/* Step header: a caps micro-label + the step id, then a "try"
-                dropdown that scopes every tab below (mirrors the version
-                dropdown; ADR-0056 amendment — no side-border line items). */}
-            <div class="step-head">
-              <span class="hdr-label">Step</span>
-              <span class="step-head-id mono">{s().id}</span>
+            {/* Evidence header = just the tabs (which step + try you're viewing
+                is shown in the graph and its fan, so the pane no longer repeats
+                the step name / try). A spinner on the right is the only cue that
+                a switch took effect and fresh evidence is loading. Dead-letter,
+                being terminal + rare, keeps a badge here. */}
+            <div class="pane-tabbar">
+              <div class="tabs">
+                <TabBtn id="logs" label="Logs" />
+                <TabBtn id="results" label="Results" count={results()?.length ?? 0} />
+                <TabBtn id="outputs" label="Outputs" count={results()?.length ?? 0} />
+                <TabBtn id="workspace" label="Workspace" />
+              </div>
+              <span class="grow1" />
               <Show when={props.deadLettered && attemptsOf().some((a) => a.failed)}>
                 <span class="adeadletter" title="no verdict obtainable — the operator signal">
                   ⊘ dead-lettered
                 </span>
               </Show>
-              <span class="grow1" />
-              <Show
-                when={attemptsOf().length > 0}
-                fallback={<span class="subtle">not started</span>}
-              >
-                <div class="verdrop trydrop" classList={{ open: tryOpen() }}>
-                  <button
-                    class="verdrop-btn"
-                    onClick={() => setTryOpen((v) => !v)}
-                    title="which try to inspect"
-                  >
-                    <span class="vd-label">
-                      {scoped() ? tryTitle(scoped()!, scopedIndex()) : "try"}
-                    </span>
-                    <Icon icon="chevron-down" size={12} class="vd-caret" />
-                  </button>
-                  <Show when={tryOpen()}>
-                    <div class="verdrop-backdrop" onClick={() => setTryOpen(false)} />
-                    <ul class="verdrop-list">
-                      <For each={attemptsOf()}>
-                        {(a, i) => (
-                          <li>
-                            <button
-                              class="verdrop-row"
-                              classList={{ sel: scoped()?.id === a.id }}
-                              onClick={() => {
-                                props.onAttemptSelect(a.id);
-                                setTryOpen(false);
-                              }}
-                            >
-                              <span class="vr-dot">{scoped()?.id === a.id ? "●" : "○"}</span>
-                              <span class="vr-main">
-                                <span class="vr-label">{tryTitle(a, i())}</span>
-                                <span class="vr-sub">{tryOutcome(a)}</span>
-                              </span>
-                              <Show when={isShadowed(a)}>
-                                <span class="vr-tag" title="no longer the of-record version">
-                                  shadowed
-                                </span>
-                              </Show>
-                              <Show when={causes()?.readopted.has(a.id)}>
-                                <span class="areadopt" title="re-adopted after control-plane restart">
-                                  ⟲
-                                </span>
-                              </Show>
-                            </button>
-                          </li>
-                        )}
-                      </For>
-                    </ul>
-                  </Show>
-                </div>
-              </Show>
-            </div>
-
-            <div class="tabs">
-              <TabBtn id="logs" label="Logs" />
-              <TabBtn id="results" label="Results" count={results()?.length ?? 0} />
-              <TabBtn id="outputs" label="Outputs" count={results()?.length ?? 0} />
-              <TabBtn id="workspace" label="Workspace" />
+              <span class="pane-load" classList={{ on: loading() }} aria-hidden="true">
+                <Icon icon="rotate-cw" size={13} />
+              </span>
             </div>
 
             {/* Logs — the scoped attempt's stream. */}
             <Show when={tab() === "logs"}>
               <div class="tabpane logpane">
                 <div class="steplogs-tools">
-                  <span class="subtle mono">
-                    {scoped() ? `try ${scoped()!.id}` : "no tries"}
-                  </span>
                   <span class="grow1" />
                   <button class={`lgtog ${wrap() ? "on" : ""}`} onClick={() => setWrap((v) => !v)}>
                     wrap
                   </button>
                 </div>
-                <div class="lgbody" classList={{ nowrap: !wrap() }}>
-                  <For
-                    each={logRows()}
-                    fallback={
-                      <div class="lgrow empty">
-                        <span class="lgln" />
-                        <span class="lgtx">no output</span>
-                      </div>
-                    }
-                  >
-                    {(r) => (
-                      <div class={`lgrow ${r.lvl}`}>
-                        <span class="lgln">{r.n}</span>
-                        <span class="lgtx">{r.line}</span>
-                      </div>
-                    )}
-                  </For>
-                </div>
+                <Show when={!switching()} fallback={<LogSkeleton />}>
+                  <div class="lgbody" classList={{ nowrap: !wrap() }}>
+                    <For
+                      each={logRows()}
+                      fallback={
+                        <div class="lgrow empty">
+                          <span class="lgln" />
+                          <span class="lgtx">no output for this try</span>
+                        </div>
+                      }
+                    >
+                      {(r) => (
+                        <div class={`lgrow ${r.lvl}`}>
+                          <span class="lgln">{r.n}</span>
+                          <span class="lgtx">{r.line}</span>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </Show>
               </div>
             </Show>
 

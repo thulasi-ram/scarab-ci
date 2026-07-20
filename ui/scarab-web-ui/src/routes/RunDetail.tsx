@@ -19,18 +19,21 @@ import {
   runParams,
   listArtifacts,
   artifactUrl,
+  repoForgeUrl,
   type RunStatus,
   type RunEvent,
   type StepStatus,
   type Artifact,
 } from "../api/client";
 import { eventParts, eventCategory, EVENT_GLYPH } from "../events";
-import { deriveTakes, replayTake, type Take, type TakeView } from "../takes";
+import { deriveTakes, replayTake, attemptCauses, type Take, type TakeView } from "../takes";
 import { relTime, absTime, duration } from "../fmt";
+import { forgeCommitUrl, forgePrUrl } from "../forge";
+import { triggerText, triggerIcon } from "../trigger";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
-import Dag, { type DagStep } from "../components/Dag";
+import Dag, { type DagStep, type DagTry } from "../components/Dag";
 import StepPane from "../components/StepPane";
 import DebugShell from "../components/DebugShell";
 
@@ -149,6 +152,45 @@ export default function RunDetail() {
     });
   };
 
+  // The selected step's tries, resolved from the event log — the fan the DAG
+  // renders beneath the selected node (ADR-0056 amendment). While viewing a
+  // closed Take, tries after the boundary are hidden (they belong to a later
+  // version and never existed in this snapshot), and causes are derived over the
+  // truncated log to match. Mirrors StepPane's `attemptsOf()`/`scoped()`.
+  const dagTries = (): DagTry[] => {
+    const s = selectedStep();
+    if (!s) return [];
+    const list = s.attempt_list ?? [];
+    const f = sel() ? (takeView()?.frontier[sel()!] ?? null) : null;
+    const visible = f ? list.filter((a) => attemptN(a.id) <= attemptN(f)) : list;
+    const c = attemptCauses(visibleEvents(), s.id);
+    return visible.map((a, i) => ({
+      id: a.id,
+      index: i,
+      cause: c.causes[a.id],
+      failed: a.failed,
+      failure: a.failure ?? undefined,
+      superseded: c.superseded.has(a.id),
+      shadowed: c.shadowed.has(a.id),
+      readopted: c.readopted.has(a.id),
+    }));
+  };
+  // The try scoping the evidence pane: explicit selection, else the Take
+  // frontier, else the latest — the same resolution StepPane's `scoped()` uses,
+  // so the fan's highlight and the pane always agree.
+  const dagActiveAttempt = (): string | null => {
+    const ts = dagTries();
+    if (!ts.length) return null;
+    const want = selAttempt() ?? (sel() ? (takeView()?.frontier[sel()!] ?? null) : null);
+    return ts.find((t) => t.id === want)?.id ?? ts[ts.length - 1].id;
+  };
+
+  // The repo's forge web base (for commit/PR deep links), from the registry.
+  const [repoUrl] = createResource(
+    () => [org(), repo()] as const,
+    ([o, r]) => repoForgeUrl(o, r).catch(() => null),
+  );
+
   const [artifacts, { refetch: refetchArtifacts }] = createResource(id, (rid) =>
     listArtifacts(rid).catch(() => [] as Artifact[]),
   );
@@ -258,13 +300,28 @@ export default function RunDetail() {
     branch?: string;
     ref?: string;
     sha?: string;
+    /** Forge coordinate the run was born from (for forge links). */
+    owner?: string;
+    name?: string;
+    /** PR number, when the trigger was a pull request. */
+    pr?: number;
   } | null => {
     for (const e of events()) {
       const k = e.kind as unknown;
       if (k && typeof k === "object" && "Raw" in (k as Record<string, unknown>)) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const t = (k as any).Raw?.trigger?.event;
-        if (t) return t;
+        if (!t) continue;
+        return {
+          kind: t.kind,
+          actor: t.actor,
+          branch: t.branch,
+          ref: t.ref,
+          sha: t.sha,
+          owner: t.repo?.owner,
+          name: t.repo?.name,
+          pr: t.pr ?? t.pr_number ?? t.number ?? undefined,
+        };
       }
     }
     return null;
@@ -375,72 +432,137 @@ export default function RunDetail() {
               </button>
             </div>
 
+            {/* Provenance bar: labeled two-level cells (LABEL over value),
+                grouped left (pipeline → code → who → when → id); status floated
+                right. Commit + PR deep-link to the forge via the repo's registry
+                web base (repoUrl). */}
             <div class="prov">
-              <div class="cell">
-                <div class="k">status</div>
-                <div class="v prov-status">
-                  <StatusBadge status={r().status} />
-                  <Show when={live() && !timeTraveling()}>
-                    <span class="live-dot" title="live">
-                      <span class="dot" /> live
-                    </span>
-                  </Show>
-                </div>
-              </div>
-              <div class="cell">
-                <div class="k">run</div>
-                <div class="v mono"><span class="sha">{id()}</span></div>
-              </div>
-              <Show when={triggerInfo()}>
-                {(t) => (
-                  <>
-                    <Show when={t().kind}>
-                      <div class="cell">
-                        <div class="k">trigger</div>
-                        <div class="v">
-                          {t().kind}
-                          <Show when={t().actor}> · by {t().actor}</Show>
-                        </div>
+              <div class="prov-main">
+                <Show when={r().pipeline}>
+                  {(name) => (
+                    <div class="pcell">
+                      <div class="k">pipeline</div>
+                      <div class="v strong">
+                        <Icon icon="workflow" size={14} />
+                        <span class="mono">{name()}</span>
                       </div>
-                    </Show>
-                    <Show when={t().branch && t().branch !== t().sha}>
-                      <div class="cell">
-                        <div class="k">branch</div>
-                        <div class="v mono">{t().branch}</div>
+                    </div>
+                  )}
+                </Show>
+
+                <Show when={triggerInfo()}>
+                  {(t) => {
+                    const commitUrl = () => forgeCommitUrl(repoUrl(), t().sha);
+                    const prUrl = () => forgePrUrl(repoUrl(), t().pr);
+                    return (
+                      <>
+                        <Show when={t().pr != null}>
+                          <div class="pcell">
+                            <div class="k">pull request</div>
+                            <a
+                              class="v"
+                              classList={{ link: !!prUrl() }}
+                              href={prUrl() ?? undefined}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title="pull request on the forge"
+                            >
+                              <Icon icon="git-pull-request" size={14} />
+                              <span class="mono">#{t().pr}</span>
+                            </a>
+                          </div>
+                        </Show>
+                        <Show when={t().sha}>
+                          <div class="pcell">
+                            <div class="k">commit</div>
+                            <a
+                              class="v"
+                              classList={{ link: !!commitUrl() }}
+                              href={commitUrl() ?? undefined}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title="commit on the forge"
+                            >
+                              <Icon icon="git-commit-horizontal" size={14} />
+                              <span class="mono sha">{t().sha!.slice(0, 8)}</span>
+                            </a>
+                          </div>
+                        </Show>
+                        <Show when={t().branch && t().branch !== t().sha}>
+                          <div class="pcell">
+                            <div class="k">branch</div>
+                            <div class="v">
+                              <Icon icon="git-branch" size={14} />
+                              <span class="mono">{t().branch}</span>
+                            </div>
+                          </div>
+                        </Show>
+                      </>
+                    );
+                  }}
+                </Show>
+
+                <Show when={triggerInfo()?.kind}>
+                  {(kind) => (
+                    <div class="pcell">
+                      <div class="k">trigger</div>
+                      <div class="v">
+                        <Icon icon={triggerIcon(kind())} size={13} />
+                        <span>{triggerText(kind())}</span>
                       </div>
-                    </Show>
-                    <Show when={t().sha}>
-                      <div class="cell">
-                        <div class="k">commit</div>
-                        <div class="v mono"><span class="sha">{t().sha!.slice(0, 8)}</span></div>
+                    </div>
+                  )}
+                </Show>
+                <Show when={triggerInfo()?.actor}>
+                  {(actor) => (
+                    <div class="pcell">
+                      <div class="k">triggered by</div>
+                      <div class="v">
+                        <Icon icon="user" size={13} />
+                        <span>{actor()}</span>
                       </div>
-                    </Show>
-                  </>
-                )}
-              </Show>
-              <Show when={Object.keys(runParams(r())).length > 0}>
-                <div class="cell">
-                  <div class="k">params</div>
-                  <div class="v mono">
-                    {Object.entries(runParams(r()))
-                      .map(([k, v]) => `${k}=${String(v)}`)
-                      .join(" · ")}
+                    </div>
+                  )}
+                </Show>
+
+                <Show when={Object.keys(runParams(r())).length > 0}>
+                  <div class="pcell">
+                    <div class="k">params</div>
+                    <div class="v mono">
+                      {Object.entries(runParams(r()))
+                        .map(([k, v]) => `${k}=${String(v)}`)
+                        .join(" · ")}
+                    </div>
                   </div>
-                </div>
-              </Show>
-              <Show when={startedAt()}>
-                {(t) => (
-                  <div class="cell">
+                </Show>
+
+                <Show when={startedAt()}>
+                  <div class="pcell">
                     <div class="k">started</div>
-                    <div class="v" title={absTime(t())}>{relTime(t())}</div>
+                    <div class="v" title={absTime(startedAt()!)}>{relTime(startedAt()!)}</div>
                   </div>
-                )}
-              </Show>
-              <div class="cell">
-                <div class="k">elapsed</div>
-                <div class="v mono">
-                  {startedAt() ? duration(startedAt()!, finishedAt() ?? Date.now()) : "—"}
+                </Show>
+
+                <div class="pcell">
+                  <div class="k">elapsed</div>
+                  <div class="v mono">
+                    {startedAt() ? duration(startedAt()!, finishedAt() ?? Date.now()) : "—"}
+                  </div>
                 </div>
+
+                <div class="pcell">
+                  <div class="k">run</div>
+                  <div class="v mono subtle">{id().slice(0, 8)}</div>
+                </div>
+              </div>
+
+              <div class="prov-right">
+                <StatusBadge status={r().status} />
+                <Show when={live() && !timeTraveling()}>
+                  <span class="live-dot" title="live">
+                    <span class="dot" /> live
+                  </span>
+                </Show>
               </div>
             </div>
 
@@ -467,12 +589,12 @@ export default function RunDetail() {
                     onClick={() => setHistOpen((v) => !v)}
                     title="run history — a row per rerun"
                   >
-                    <Icon icon="history" size={13} />
+                    <Icon icon="history" size={16} />
                     <span class="vd-label">{timeTraveling() ? `👁 ${viewedLabel()}` : "latest"}</span>
                     <Show when={live() && !timeTraveling()}>
                       <span class="vd-live">· live</span>
                     </Show>
-                    <Icon icon="chevron-down" size={13} class="vd-caret" />
+                    <Icon icon="chevron-down" size={16} class="vd-caret" />
                   </button>
                   <Show when={histOpen()}>
                     <div class="verdrop-backdrop" onClick={() => setHistOpen(false)} />
@@ -516,7 +638,14 @@ export default function RunDetail() {
               <div class="rd-grid">
                 <div class="dag-wrap">
                   <div class="dag-head">Steps</div>
-                  <Dag steps={dagSteps()} selected={sel()} onSelect={setSel} />
+                  <Dag
+                    steps={dagSteps()}
+                    selected={sel()}
+                    onSelect={setSel}
+                    tries={dagTries()}
+                    activeAttempt={dagActiveAttempt()}
+                    onAttemptSelect={setSelAttempt}
+                  />
                 </div>
 
                 <StepPane
@@ -524,7 +653,6 @@ export default function RunDetail() {
                 step={selectedStep()}
                 events={visibleEvents()}
                 attempt={selAttempt()}
-                onAttemptSelect={setSelAttempt}
                 frontierAttempt={sel() ? takeView()?.frontier[sel()!] ?? null : null}
                 deadLettered={r().status === "dead_lettered"}
                 canDebug={canShell()}

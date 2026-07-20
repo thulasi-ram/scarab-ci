@@ -63,6 +63,14 @@ export async function listProjects(): Promise<Project[]> {
   return data;
 }
 
+/** The forge web base for a repo (e.g. `https://github.com/owner/name`), from
+ * the project registry — for building commit/PR deep links. `null` if the repo
+ * isn't in the registry or has no connection. */
+export async function repoForgeUrl(org: string, repo: string): Promise<string | null> {
+  const projects = await listProjects().catch(() => [] as Project[]);
+  return projects.find((p) => p.org === org && p.project === repo)?.repo_url ?? null;
+}
+
 /** One repo's most recent runs (`GET /v1/repos/{org}/{repo}/runs`) — the source
  * for a repo card's pass/fail chart. Newest first. */
 export async function listRepoRuns(
