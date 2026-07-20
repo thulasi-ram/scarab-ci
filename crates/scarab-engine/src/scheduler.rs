@@ -65,6 +65,29 @@ pub const RUN_STATUS_CHANGED: &str = "run_status_changed";
 /// this message and deletes the Pods — API replicas never touch the cluster.
 pub const CANCEL_RUN: &str = "cancel_run";
 
+/// Outbox message kind: tear down the Pods of in-flight steps a Rerun just
+/// superseded (ADR-0056 amendment). [`restart_step`] re-arms an in-flight
+/// descendant Running→Pending; its old attempt is now *superseded*, and its
+/// input is being replaced, so it can never honestly finish — without this its
+/// Pod runs on as an orphan (fencing keeps the late verdict harmless, but the
+/// compute is wasted). Unlike [`CANCEL_RUN`] this is **scoped to named
+/// (step, attempt) handles** — the run itself stays alive. Processed by the
+/// driver (which owns the executor).
+pub const SUPERSEDE_TEARDOWN: &str = "supersede_teardown";
+
+/// Payload of a [`SUPERSEDE_TEARDOWN`] message: the specific attempts to cancel.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SupersedeTeardown {
+    pub attempts: Vec<SupersededAttempt>,
+}
+
+/// One superseded in-flight attempt whose Pod the driver should cancel.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SupersededAttempt {
+    pub step: String,
+    pub attempt: String,
+}
+
 /// The payload of a [`LAUNCH_STEP`] outbox message — the step's fence.
 #[derive(Debug, Serialize, Deserialize)]
 struct LaunchIntent {
@@ -159,7 +182,10 @@ pub async fn restart_step(
     }
 
     // Re-arm each invalidated step (terminal or in-flight) to Pending. A peer
-    // that already moved it is a benign Conflict we skip.
+    // that already moved it is a benign Conflict we skip. An in-flight step
+    // re-armed here has its running attempt SUPERSEDED (ADR-0056 amendment):
+    // collect its Pod for teardown so it does not orphan.
+    let mut superseded: Vec<SupersededAttempt> = Vec::new();
     for s in &steps {
         if invalid.contains(&s.step) && s.status != StepStatus::Pending {
             match db
@@ -179,11 +205,35 @@ pub async fn restart_step(
                         at: now,
                     })
                     .await?;
+                    if s.status == StepStatus::Running {
+                        if let Some(a) = s.attempts.last() {
+                            superseded.push(SupersededAttempt {
+                                step: s.step.0.clone(),
+                                attempt: a.id.0.clone(),
+                            });
+                        }
+                    }
                 }
                 Err(DbError::Conflict) => {}
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    // One teardown intent for every superseded in-flight attempt. The driver
+    // (which owns the executor) SIGTERMs their Pods; the run itself stays alive.
+    if !superseded.is_empty() {
+        let now = clock.now().await;
+        db.enqueue_outbox(&OutboxMessage {
+            id: crate::OutboxId(0),
+            run: run.clone(),
+            kind: SUPERSEDE_TEARDOWN.to_string(),
+            payload: serde_json::to_value(SupersedeTeardown { attempts: superseded })
+                .unwrap_or(serde_json::Value::Null),
+            idempotency_key: format!("supersede:{}:{}", run.0, now.0),
+            at: now,
+        })
+        .await?;
     }
     Ok(())
 }
@@ -538,6 +588,9 @@ impl<'a> Scheduler<'a> {
         // already durably Cancelled. After reconcile so a just-cancelled
         // step's launch intent settles this same tick.
         self.reconcile_cancellations().await?;
+        // Rerun-superseded in-flight Pods (ADR-0056 amendment): tear down the
+        // orphans left when restart_step re-armed a running descendant.
+        self.reconcile_supersessions().await?;
         for run in &runs {
             self.advance(run).await?;
         }
@@ -809,6 +862,37 @@ impl<'a> Scheduler<'a> {
                     {
                         let _ = self.executor.cancel(&ExecHandle(h)).await;
                     }
+                }
+            }
+            self.db.mark_dispatched(msg.id).await?;
+        }
+        Ok(())
+    }
+
+    /// Drain supersede-teardown intents (ADR-0056 amendment): a Rerun re-armed
+    /// in-flight descendants, so each superseded attempt's Pod is cancelled
+    /// (SIGTERM + grace) to stop it orphaning. Scoped to the named handles —
+    /// the run stays alive and the re-armed steps relaunch under fresh fences.
+    pub async fn reconcile_supersessions(&self) -> Result<(), SchedulerError> {
+        let msgs = self
+            .db
+            .claim_outbox(
+                &self.owner,
+                Some(SUPERSEDE_TEARDOWN),
+                self.cfg.outbox_batch,
+                self.cfg.outbox_visibility_ms,
+            )
+            .await?;
+        for msg in msgs {
+            let payload: SupersedeTeardown = serde_json::from_value(msg.payload.clone())
+                .map_err(|e| SchedulerError::BadPayload(e.to_string()))?;
+            for item in payload.attempts {
+                if let Some(h) = self
+                    .db
+                    .attempt_handle(&msg.run, &StepId(item.step), &AttemptId(item.attempt))
+                    .await?
+                {
+                    let _ = self.executor.cancel(&ExecHandle(h)).await;
                 }
             }
             self.db.mark_dispatched(msg.id).await?;
