@@ -257,6 +257,21 @@ export default function RunDetail() {
   };
   const rowTime = (t: Take): number | null =>
     t.n <= 1 ? startedAt() : (takes()[t.n - 2]?.closedAt ?? null);
+  // Who pressed the Rerun that opened this Take (the acting principal, `null`
+  // when auth is off or for the original run).
+  const rowActor = (t: Take): string | null =>
+    t.n <= 1 ? null : (takes()[t.n - 2]?.closedBy ?? null);
+  // The row's second line: on the latest row show what opened it ("you reran b"),
+  // then the actor and time — enough provenance without a banner.
+  const rowSub = (t: Take): string => {
+    const parts: string[] = [];
+    if (t.n === latestTakeN() && t.n > 1) parts.push(rowLabel(t));
+    const who = rowActor(t);
+    if (who) parts.push(`by ${who}`);
+    const at = rowTime(t);
+    if (at) parts.push(relTime(at));
+    return parts.join(" · ");
+  };
   const viewedLabel = (): string => {
     const v = viewing();
     return v ? rowLabel(v) : "latest";
@@ -424,8 +439,14 @@ export default function RunDetail() {
                                 }}
                               >
                                 <span class="vr-dot">{isSel() ? "●" : "○"}</span>
-                                <span class="vr-label">{isLatest() ? "latest" : rowLabel(t)}</span>
-                                <span class="vr-time">{rowTime(t) ? relTime(rowTime(t)!) : ""}</span>
+                                <span class="vr-main">
+                                  <span class="vr-label">
+                                    {isLatest() ? "latest" : rowLabel(t)}
+                                  </span>
+                                  <Show when={rowSub(t)}>
+                                    <span class="vr-sub">{rowSub(t)}</span>
+                                  </Show>
+                                </span>
                                 <Show when={isLatest() && live()}>
                                   <span class="vr-live">live</span>
                                 </Show>
@@ -438,22 +459,6 @@ export default function RunDetail() {
                   </Show>
                 </div>
               </div>
-
-              <Show when={viewing()}>
-                {(t) => (
-                  <div class="ro-banner">
-                    <span>
-                      👁 Viewing <b>{rowLabel(t())}</b>
-                      {rowTime(t()) ? ` · ${relTime(rowTime(t())!)}` : ""} · read-only, this
-                      already happened.
-                    </span>
-                    <span class="grow1" />
-                    <button class="btn btn-ghost btn-sm" onClick={() => setViewTake(null)}>
-                      Back to latest →
-                    </button>
-                  </div>
-                )}
-              </Show>
 
               <div class="rd-grid">
                 <div class="dag-wrap">

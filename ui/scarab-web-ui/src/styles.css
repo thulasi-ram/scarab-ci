@@ -829,7 +829,7 @@ h2 {
 /* DAG = dark terminal canvas (like logs). */
 .dag {
   position: relative;
-  overflow-x: auto;
+  overflow: auto;
   padding: 22px 20px;
   background: var(--terminal);
 }
@@ -853,17 +853,18 @@ h2 {
   position: relative;
   z-index: 1;
   display: flex;
-  gap: 48px;
+  flex-direction: column; /* dependency layers stack top → bottom */
+  gap: 40px;
   align-items: center;
-  width: max-content;
-  min-width: 100%;
+  min-height: max-content;
 }
 
 .dag-col {
   display: flex;
-  flex-direction: column;
-  gap: 14px;
+  flex-direction: row; /* peers within a layer sit side by side */
+  gap: 16px;
   justify-content: center;
+  flex-wrap: wrap;
 }
 
 .dnode {
@@ -2063,71 +2064,78 @@ h1, .crumb-head, .run-title {
    gets a light border back to separate it from the graph. */
 .pipeline-panel { display: flex; flex-direction: column; }
 .pipeline-panel > .panel-h .grow1 { flex: 1; }
-.pipeline-panel .rd-grid { margin: 0; padding: 12px; }
+
+/* Constant height: the graph + evidence area holds its size across step /
+   version / tab switches; the DAG rail and the log body scroll inside it. */
+.pipeline-panel .rd-grid {
+  margin: 0; padding: 12px; height: 58vh; align-items: stretch;
+  grid-template-columns: minmax(190px, 0.7fr) 1.3fr;
+}
 .pipeline-panel .rd-grid > .panel,
 .pipeline-panel .dag-wrap {
   border: none; background: transparent; box-shadow: none; padding: 0;
-  max-height: none;
+  max-height: none; min-height: 0;
 }
-.pipeline-panel .dag-wrap { display: flex; align-items: flex-start; overflow: auto; }
+.pipeline-panel .dag-wrap { display: flex; align-items: stretch; overflow: auto; }
+.pipeline-panel .dag-wrap .dag { flex: 1; border-radius: var(--radius); }
 .pipeline-panel .rd-grid > .steppane {
+  display: flex; flex-direction: column; min-height: 0;
   border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
 }
+/* The selected tab fills the leftover height and scrolls in place. */
+.pipeline-panel .steppane .tabpane { flex: 1; min-height: 0; overflow: auto; }
 
-/* Read-only when viewing an older version: a copper edge + dimmed body, so the
-   compact dropdown can't let you forget you're in the past. */
-.pipeline-panel.readonly { box-shadow: inset 3px 0 0 var(--copper); }
-.pipeline-panel.readonly .rd-grid { opacity: 0.8; }
+/* Read-only (an older version): no banner, no edge, no shadow — a faint wash +
+   gently desaturated body. The "👁 …" dropdown label carries the state. */
+.pipeline-panel.readonly { background: color-mix(in srgb, var(--emerald) 4%, transparent); }
+.pipeline-panel.readonly .rd-grid { filter: saturate(0.72); opacity: 0.9; }
 
-/* The version dropdown — the run's history, a row per Rerun. */
+/* The version dropdown — a row per Rerun. Green-tinted to match the panel; its
+   height and the list rows align with the header's controls. */
 .verdrop { position: relative; }
 .verdrop-btn {
-  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
-  font-family: var(--font-mono); font-size: 11.5px; color: var(--copper);
-  background: var(--emerald-surface); border: 1px solid var(--border-copper);
-  border-radius: var(--radius-sm); padding: 4px 9px;
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer; height: 26px;
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--sage);
+  background: var(--emerald-surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 0 9px;
 }
-.verdrop-btn:hover { border-color: var(--copper); }
-.verdrop-btn.traveling { color: var(--copper); border-color: var(--copper); }
+.verdrop-btn:hover { border-color: var(--emerald); color: var(--soft-white); }
+.verdrop-btn.traveling { color: var(--emerald); border-color: var(--emerald); font-style: italic; }
 .verdrop-btn .vd-live { color: var(--emerald); }
 .verdrop-btn .vd-caret { opacity: 0.7; }
 .verdrop.open .vd-caret { transform: rotate(180deg); }
 .verdrop-backdrop { position: fixed; inset: 0; z-index: 30; }
 .verdrop-list {
-  position: absolute; right: 0; top: calc(100% + 4px); z-index: 31;
-  min-width: 268px; margin: 0; padding: 4px; list-style: none;
-  background: var(--pine-deep); border: 1px solid var(--border-copper);
-  border-radius: var(--radius); box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+  position: absolute; right: 0; top: calc(100% + 5px); z-index: 31;
+  min-width: 284px; margin: 0; padding: 5px; list-style: none;
+  background: var(--pine-deep); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28);
 }
 .verdrop-row {
-  display: flex; align-items: center; gap: 8px; width: 100%; cursor: pointer;
+  display: flex; align-items: center; gap: 9px; width: 100%; cursor: pointer;
   font-family: var(--font-mono); font-size: 11.5px; color: var(--sage);
-  background: transparent; border: none; border-radius: var(--radius-sm);
-  padding: 7px 9px; text-align: left;
+  background: transparent; border: none; border-left: 2px solid transparent;
+  border-radius: var(--radius-sm); padding: 8px 10px; text-align: left;
 }
 .verdrop-row:hover { background: var(--emerald-surface); color: var(--soft-white); }
-.verdrop-row.sel { color: var(--soft-white); }
-.verdrop-row .vr-dot { color: var(--copper); }
-.verdrop-row .vr-label { flex: 1; }
-.verdrop-row .vr-time { color: var(--muted-sage); font-size: 10.5px; }
-.verdrop-row .vr-live { color: var(--emerald); font-size: 10.5px; }
-
-/* Read-only banner inside the component. */
-.ro-banner {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  margin: 0; padding: 9px 13px; font-size: 12.5px; color: var(--ink);
-  background: color-mix(in srgb, var(--copper) 12%, transparent);
-  border-bottom: 1px solid var(--border-copper);
+.verdrop-row.sel {
+  color: var(--soft-white); background: var(--emerald-surface);
+  border-left-color: var(--emerald);
 }
-.ro-banner .grow1 { flex: 1; }
+.verdrop-row .vr-dot { color: var(--emerald); font-size: 9px; }
+.verdrop-row .vr-main { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.verdrop-row .vr-sub { color: var(--muted-sage); font-size: 10px; }
+.verdrop-row .vr-live { color: var(--emerald); font-size: 10px; }
 
-/* Artifacts footer of the Pipeline component. */
+/* Artifacts footer of the Pipeline component — flat, typography-led (matches the
+   flattened step-evidence headers, no surface of its own). */
 .artifacts-foot { border-top: 1px solid var(--border); padding: 2px 12px 10px; }
 .artifacts-foot .af-h {
-  display: flex; align-items: baseline; gap: 10px; padding: 8px 0 2px;
-  font-size: 12.5px; color: var(--soft-white);
+  display: flex; align-items: baseline; gap: 10px; padding: 10px 0 2px;
+  font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted-sage);
 }
-.artifacts-foot .af-h .subtle { font-size: 11px; }
+.artifacts-foot .af-h .subtle { font-size: 10.5px; letter-spacing: 0; text-transform: none; }
 .artifacts-foot .empty { padding: 8px 0; }
 .artifacts-foot .filelist { padding: 4px 0 2px; }
 .linklike {
@@ -2138,15 +2146,19 @@ h1, .crumb-head, .run-title {
 
 /* Inside the pane the tab row sits flush under the attempt strip — the
    page-level `.tabs` spacing doesn't apply. */
-.steppane .tabs { margin: 0; }
+.steppane .tabs { margin: 0; background: none; padding: 0 8px; border-bottom: 1px solid var(--border); }
 
-/* The attempt strip: every tab below is scoped to the lit chip. */
+/* The tries strip: every tab below is scoped to the lit chip. Flat — no surface
+   of its own (the Pipeline header carries the chrome); the step name leads by
+   typography, and the chips + tabs read as content, not a nested toolbar. */
 .steppane .astrip {
   display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
-  padding: 10px 12px; border-bottom: 1px solid var(--border);
-  background: var(--pine-deep);
+  padding: 12px 14px 8px;
 }
-.steppane .astrip-step { font-size: 12.5px; color: var(--soft-white); margin-right: 4px; }
+.steppane .astrip-step {
+  font-size: 13px; font-weight: 600; color: var(--soft-white);
+  letter-spacing: 0.01em; margin-right: 6px;
+}
 .achip {
   display: inline-flex; align-items: center; gap: 5px;
   font-family: var(--font-mono); font-size: 11px; cursor: pointer;

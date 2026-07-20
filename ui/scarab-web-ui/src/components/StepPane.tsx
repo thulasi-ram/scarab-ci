@@ -67,7 +67,15 @@ export default function StepPane(props: {
   const [wrap, setWrap] = createSignal(true);
 
   const stepId = () => props.step?.id ?? null;
-  const attemptsOf = (): Attempt[] => props.step?.attempt_list ?? [];
+  const attemptN = (id: string) => parseInt(id.replace(/^a/, ""), 10) || 0;
+  // Tries to show in the strip. While viewing a past version (a frontier is
+  // pinned), hide tries AFTER the boundary — they belong to a later version and
+  // never existed in this snapshot (ADR-0056 snapshot-at-boundary honesty).
+  const attemptsOf = (): Attempt[] => {
+    const list = props.step?.attempt_list ?? [];
+    const f = props.frontierAttempt;
+    return f ? list.filter((a) => attemptN(a.id) <= attemptN(f)) : list;
+  };
 
   // The attempt every tab is scoped to: explicit selection, else the Take
   // frontier (closed-take view), else the latest attempt.

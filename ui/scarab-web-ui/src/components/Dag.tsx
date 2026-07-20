@@ -89,10 +89,12 @@ export default function Dag(props: {
         if (!from) continue;
         const fb = from.getBoundingClientRect();
         es.push({
-          x1: fb.right - cbox.left,
-          y1: fb.top - cbox.top + fb.height / 2,
-          x2: tb.left - cbox.left,
-          y2: tb.top - cbox.top + tb.height / 2,
+          // Top-to-bottom flow: out the BOTTOM of the dependency, into the TOP
+          // of the dependent (endpoints are horizontal mid-points).
+          x1: fb.left - cbox.left + fb.width / 2,
+          y1: fb.bottom - cbox.top,
+          x2: tb.left - cbox.left + tb.width / 2,
+          y2: tb.top - cbox.top,
           // The edge glows when it feeds a running step (or a running dep).
           hot: hot || byId.get(need)?.status === "running",
         });
@@ -139,16 +141,16 @@ export default function Dag(props: {
       <svg class="dag-edges" aria-hidden="true">
         <For each={edges()}>
           {(e) => {
-            // Orthogonal "circuit" routing: out the right, a mid vertical, into
-            // the left — reads like the engineering-blueprint identity.
-            const mx = (e.x1 + e.x2) / 2;
+            // Orthogonal "circuit" routing, top-to-bottom: out the bottom, a mid
+            // horizontal, into the top — the engineering-blueprint identity.
+            const my = (e.y1 + e.y2) / 2;
             const r = 8;
-            const dir = e.y2 >= e.y1 ? 1 : -1;
+            const dir = e.x2 >= e.x1 ? 1 : -1;
             const d =
-              Math.abs(e.y2 - e.y1) < 2
-                ? `M ${e.x1} ${e.y1} H ${e.x2}`
-                : `M ${e.x1} ${e.y1} H ${mx - r} Q ${mx} ${e.y1} ${mx} ${e.y1 + r * dir} ` +
-                  `V ${e.y2 - r * dir} Q ${mx} ${e.y2} ${mx + r} ${e.y2} H ${e.x2}`;
+              Math.abs(e.x2 - e.x1) < 2
+                ? `M ${e.x1} ${e.y1} V ${e.y2}`
+                : `M ${e.x1} ${e.y1} V ${my - r} Q ${e.x1} ${my} ${e.x1 + r * dir} ${my} ` +
+                  `H ${e.x2 - r * dir} Q ${e.x2} ${my} ${e.x2} ${my + r} V ${e.y2}`;
             return <path d={d} class={e.hot ? "hot" : ""} fill="none" />;
           }}
         </For>
