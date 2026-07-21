@@ -15,24 +15,6 @@ not care which.
 There are two ways to bring Scarab up. They are both legitimate — pick the one
 that fits what you're doing, not a "real" one versus a "toy" one.
 
-```
-   A Kubernetes cluster — local (kind / colima) or remote/production.
-
-
-   HELM CHART  ·  deploy on any cluster
-   ─────────────────────────────────────
-     helm upgrade --install  (via `just local-helm` on kind/colima,
-       └─▶ any Kubernetes         or plain helm on a real cluster)
-             scarab-server runs in-cluster
-
-
-   PROC-MODE LOOP  ·  fast local dev iteration
-   ─────────────────────────────────────
-     just up → just serve / just ui
-       └─▶ scarab-server as a host process, kind for step Pods
-             rebuild-and-run in seconds, no image to publish
-```
-
 ## Which path?
 
 Both run the same engine against a real cluster; they differ in how
