@@ -1559,6 +1559,17 @@ impl FakeExecutor {
             .insert(handle.0.clone());
     }
 
+    /// Declare that a previously-ready shared service (by its handle) has DIED —
+    /// its readiness probe now fails (ADR-0058 mid-run death). Drives the
+    /// scheduler's fail-closed recovery path in tests.
+    pub fn mark_service_unready(&self, handle: &ExecHandle) {
+        self.inner
+            .lock()
+            .unwrap()
+            .ready_services
+            .remove(&handle.0);
+    }
+
     /// Handles of shared services launched via `launch_service`, in call order.
     pub fn launched_services(&self) -> Vec<String> {
         self.inner.lock().unwrap().services_launched.clone()
