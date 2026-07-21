@@ -64,7 +64,6 @@ export default defineConfig({
           navLinks: [
             { label: 'Get Started', link: '/get-started/overview/' },
             { label: 'Usage', link: '/usage/pipeline-syntax/' },
-            { label: 'Tech', link: '/tech/context/' },
           ],
           footerText:
             'Scarab — a modern CI engine for Kubernetes: forge-native, on a durable core. Themed with [Lucode Starlight](https://github.com/lucas-labs/lucode-starlight-theme).',
@@ -94,14 +93,11 @@ export default defineConfig({
           ],
         },
         {
-          label: 'Reference',
-          items: [...openAPISidebarGroups],
-        },
-        {
-          label: 'Tech',
+          label: 'References',
           items: [
+            ...openAPISidebarGroups,
+            { label: 'ADR', items: [{ autogenerate: { directory: 'tech/adr' } }] },
             { label: 'Thesis & language (CONTEXT)', slug: 'tech/context' },
-            { label: 'Architecture decisions', items: [{ autogenerate: { directory: 'tech/adr' } }] },
           ],
         },
       ],
