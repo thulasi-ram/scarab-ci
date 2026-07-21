@@ -203,4 +203,33 @@ impl Executor for CloneEnrichingExecutor {
     async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         self.inner.log_stream(step).await
     }
+
+    // ADR-0058 shared-service methods forward to the wrapped executor. Without
+    // these, the trait's DEFAULT `launch_service` (which REJECTS) shadows the k8s
+    // executor's real impl, so a clone-wired deployment would refuse every shared
+    // service even on the k8s backend. Same forward-or-drop hazard as `results`.
+    async fn launch_service(
+        &self,
+        run: &scarab_engine::RunId,
+        take: i64,
+        name: &str,
+        spec: &scarab_pipeline::ServiceSpec,
+    ) -> Result<ExecHandle, ExecError> {
+        self.inner.launch_service(run, take, name, spec).await
+    }
+
+    async fn service_ready(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
+        self.inner.service_ready(handle).await
+    }
+
+    async fn teardown_service(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        self.inner.teardown_service(handle).await
+    }
+
+    async fn service_log_stream(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.inner.service_log_stream(handle).await
+    }
 }

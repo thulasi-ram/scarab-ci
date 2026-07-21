@@ -206,4 +206,34 @@ impl Executor for SecretInjectingExecutor {
         // in the pipeline, not here.
         self.inner.log_stream(step).await
     }
+
+    // ADR-0058 shared-service methods forward to the wrapped executor. Without
+    // these, the trait's DEFAULT impls shadow the k8s executor's real ones — and
+    // the default `launch_service` REJECTS, so any secrets-wired deployment would
+    // refuse every shared service even on the k8s backend. Same forward-or-drop
+    // hazard as `results`/`log_stream` above.
+    async fn launch_service(
+        &self,
+        run: &scarab_engine::RunId,
+        take: i64,
+        name: &str,
+        spec: &scarab_pipeline::ServiceSpec,
+    ) -> Result<ExecHandle, ExecError> {
+        self.inner.launch_service(run, take, name, spec).await
+    }
+
+    async fn service_ready(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
+        self.inner.service_ready(handle).await
+    }
+
+    async fn teardown_service(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        self.inner.teardown_service(handle).await
+    }
+
+    async fn service_log_stream(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.inner.service_log_stream(handle).await
+    }
 }
