@@ -1,6 +1,6 @@
 ---
-title: Configuration reference
-description: Configuring scarab-server — environment variables, secrets, and Environments.
+title: Environment Variables
+description: Every SCARAB_* knob scarab-server reads, grouped by concern — durability substrate, object store, identity, forge webhooks, execution, and retention.
 ---
 
 import Doodle from '../../../components/Doodle.astro';
@@ -9,9 +9,10 @@ import Doodle from '../../../components/Doodle.astro';
 
 ## Server configuration
 
-`scarab-server` is configured from the environment (see `deploy/local-proc/.env.example` and the
-`Justfile` `serve` recipe); `crates/scarab-server/src/config.rs` is the single documented inventory
-of every `SCARAB_*` knob, validated at boot. The shipped knobs:
+`scarab-server` is configured entirely from the environment; `crates/scarab-server/src/config.rs`
+is the single documented inventory of every `SCARAB_*` knob, validated at boot. This page describes
+what each variable does — for how to set them on your machine, see
+[Local Development](/scarab-ci/get-started/local-development/). The shipped knobs:
 
 **Core**
 
@@ -74,16 +75,12 @@ of every `SCARAB_*` knob, validated at boot. The shipped knobs:
 | `SCARAB_RETENTION_ARTIFACT_DAYS` | Terminal runs' artifact TTL in days (default 90). |
 | `SCARAB_RETENTION_WORKSPACE_DAYS` | Terminal runs' workspace-CAS reachability TTL in days (default 14); non-terminal runs always reachable. |
 
-## Secrets & Environments
-
-Secret handling and admin-owned **Environments** that bundle governance are the model for scoped
-configuration; operator-facing docs land as those slices do.
+Scoped, per-environment configuration is layered on top of these process-level knobs — see
+[Secrets](/scarab-ci/usage/secrets/) and [Environments](/scarab-ci/usage/environments/).
 
 ## References
 
 - [ADR-0003 — Durability substrate: own it, DBOS pattern on Postgres](/scarab-ci/tech/adr/0003-durability-substrate-postgres/)
-- [ADR-0014 — Secrets: envelope-encrypted Postgres + pluggable providers](/scarab-ci/tech/adr/0014-secrets/)
 - [ADR-0015 — Supply-chain: Scarab as OIDC issuer + provenance-by-construction](/scarab-ci/tech/adr/0015-supply-chain-oidc/)
-- [ADR-0037 — Environment governance: scoped secrets, approval-as-gate, admission at point-of-use](/scarab-ci/tech/adr/0037-environment-governance/)
 - [ADR-0042 — Trusted per-Pod egress sidecar → fence-scoped results API → Postgres](/scarab-ci/tech/adr/0042-trusted-egress-sidecar/)
 - [ADR-0055 — Placement profiles: named profiles + baseline + governed `k8s_overlay`](/scarab-ci/tech/adr/0055-placement-profiles/)
