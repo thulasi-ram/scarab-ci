@@ -163,8 +163,11 @@ Neither form is a DAG node (amends [0008](0008-step-contract.md)).
   service resource with status + best-effort logs + a UI Services panel; per-Take service
   instancing and teardown; network-policy scoping for opt-in Pods; governed-grant keying on service
   image digests.
-- **Local executor:** both shapes work unchanged on `scarab-executor-local` (it is a kind cluster —
-  k8s-shaped): Sidecar = an extra Pod container, Shared = a Pod + Service.
+- **Local executor:** `scarab-executor-local` is a **host-process spawner** with no container
+  runtime, so it **rejects** container-image services with direction (mirroring how it already
+  rejects `clone`/`build`). Both service forms run on the **k8s executor** — which is what a local
+  dogfood uses against kind (`just up`) or colima (`just local-helm`). Sidecar = an extra co-located
+  Pod container; Shared = a Pod + Service.
 - **Matrix:** a matrixed Step's Sidecars multiply per instance (each instance's Pod gets its own);
   Shared services are pipeline-level and are **not** multiplied by a Step's matrix.
 - The durable data plane ([0007](0007-data-passing-model.md)) remains the sanctioned way to pass
