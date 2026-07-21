@@ -1025,7 +1025,7 @@ impl Executor for K8sExecutor {
         let services: Api<Service> = Api::namespaced(client.clone(), &self.namespace);
         let netpols: Api<NetworkPolicy> = Api::namespaced(client, &self.namespace);
 
-        let pod = build_service_pod(&run.0, name, &self.namespace, spec, false);
+        let pod = build_service_pod(&run.0, name, &self.namespace, spec);
         let handle = pod.metadata.name.clone().unwrap_or_default();
         // Ignore 409 (adopt existing) on every object — launch is idempotent.
         adopt_conflict(pods.create(&PostParams::default(), &pod).await)?;
@@ -1860,11 +1860,12 @@ pub fn build_pod(
     // optional readiness probe becomes the sidecar's **startupProbe**, so the
     // kubelet holds the MAIN step container until the service is ready — the
     // durable replacement for Woodpecker's `sleep 30s`. The service image is
-    // author-supplied and runs under the ADR-0039 restricted baseline; only the
-    // step's self-service `run-as-root` grant carries over (governed
-    // caps/privileged keyed on a *service* digest are a later slice — fail-closed).
+    // author-supplied and runs under the ADR-0039 restricted baseline, **non-root
+    // by default** (its own `run_as_user`/`run_as_root` govern it — independent of
+    // the step's); governed caps/privileged keyed on a *service* digest are a
+    // later slice — fail-closed.
     for (i, svc) in spec.services.iter().enumerate() {
-        init_containers.push(service_sidecar(i, svc, spec.run_as_root));
+        init_containers.push(service_sidecar(i, svc));
     }
 
     let volumes = (!volumes.is_empty()).then_some(volumes);
@@ -1889,13 +1890,22 @@ pub fn build_pod(
             active_deadline_seconds: Some(
                 spec.timeout_seconds.unwrap_or(default_timeout_secs) as i64
             ),
-            // Workspace Pods: the emptyDir must be writable by the non-root
-            // step (fsGroup), and the egress sidecar needs time to be
-            // snapshotted before SIGKILL.
-            security_context: workspace.then(|| k8s_openapi::api::core::v1::PodSecurityContext {
-                fs_group: Some(65532),
-                ..Default::default()
-            }),
+            // Pod-level fsGroup. Workspace Pods need the emptyDir writable by the
+            // non-root step (65532) + the egress sidecar time to snapshot before
+            // SIGKILL. A non-root sidecar service that pins a uid (ADR-0058) also
+            // needs its data emptyDir group-writable; since fsGroup is Pod-level it
+            // affects ALL of this shared Pod's volumes (incl. the step workspace),
+            // so a service's gid — when set — takes precedence over the workspace
+            // default. Only one service's uid can win; the first that pins one does.
+            security_context: spec
+                .services
+                .iter()
+                .find_map(service_fs_group)
+                .or_else(|| workspace.then_some(65532))
+                .map(|g| k8s_openapi::api::core::v1::PodSecurityContext {
+                    fs_group: Some(g),
+                    ..Default::default()
+                }),
             termination_grace_period_seconds: workspace.then_some(WORKSPACE_TERMINATION_GRACE_SECS),
             ..Default::default()
         }),
@@ -2091,11 +2101,7 @@ const SERVICE_CONTAINER_PREFIX: &str = "service-";
 /// `initContainer` with `restartPolicy: Always` co-located in the step's Pod
 /// (localhost-reachable), its readiness probe wired as the **startupProbe** so
 /// the main step container is held until the service is ready.
-fn service_sidecar(
-    index: usize,
-    svc: &scarab_pipeline::ServiceSpec,
-    run_as_root: bool,
-) -> Container {
+fn service_sidecar(index: usize, svc: &scarab_pipeline::ServiceSpec) -> Container {
     Container {
         name: format!("{SERVICE_CONTAINER_PREFIX}{index}"),
         image: Some(svc.image.clone()),
@@ -2117,7 +2123,7 @@ fn service_sidecar(
         // (fenced by inheritance, ADR-0058), dying with the Pod on every Attempt.
         restart_policy: Some("Always".to_string()),
         startup_probe: service_startup_probe(svc),
-        security_context: Some(service_security_context(run_as_root)),
+        security_context: Some(service_security_context(svc.run_as_user, svc.run_as_root)),
         ..Default::default()
     }
 }
@@ -2164,17 +2170,31 @@ fn service_startup_probe(svc: &scarab_pipeline::ServiceSpec) -> Option<Probe> {
     })
 }
 
-/// The `SecurityContext` for a sidecar service container (ADR-0058): the same
-/// hardened ADR-0039 "restricted" baseline as a step container — `runAsNonRoot`,
-/// drop **ALL** capabilities, `RuntimeDefault` seccomp, no privilege escalation.
-/// Only the step's **self-service** `run-as-root` grant carries over (root inside
-/// the caps-dropped, unprivileged, seccomp-confined sandbox does not escape it);
-/// governed `add-capabilities`/`privileged`, which are keyed on the *service*
-/// image digest, are not applied here (fail-closed — a later slice).
-fn service_security_context(run_as_root: bool) -> SecurityContext {
+/// The `SecurityContext` for a sidecar/standalone service container (ADR-0058):
+/// the same hardened ADR-0039 "restricted" baseline as a step container —
+/// `runAsNonRoot`, drop **ALL** capabilities, `RuntimeDefault` seccomp, no
+/// privilege escalation. Non-root **by default**: when `run_as_user` pins the
+/// image's built-in service uid, it becomes the container `runAsUser`/`runAsGroup`
+/// (the Pod-level `fsGroup` is set separately by the builders so the data volume
+/// is writable). Only the service's own **self-service** `run-as-root` grant opts
+/// out (root inside the caps-dropped, unprivileged, seccomp-confined sandbox does
+/// not escape it); governed `add-capabilities`/`privileged`, which are keyed on
+/// the *service* image digest, are not applied here (fail-closed — a later slice).
+fn service_security_context(run_as_user: Option<u32>, run_as_root: bool) -> SecurityContext {
     SecurityContext {
         run_as_non_root: Some(!run_as_root),
-        run_as_user: run_as_root.then_some(0),
+        // Root escape hatch pins uid 0; otherwise pin the author-supplied non-root
+        // service uid/gid when given (else the image's own built-in user must be
+        // non-root to satisfy `runAsNonRoot`).
+        run_as_user: if run_as_root {
+            Some(0)
+        } else {
+            run_as_user.map(|u| u as i64)
+        },
+        run_as_group: (!run_as_root)
+            .then_some(run_as_user)
+            .flatten()
+            .map(|u| u as i64),
         capabilities: Some(Capabilities {
             drop: Some(vec!["ALL".to_string()]),
             add: None,
@@ -2187,6 +2207,17 @@ fn service_security_context(run_as_root: bool) -> SecurityContext {
         }),
         ..Default::default()
     }
+}
+
+/// The Pod-level `fsGroup` a non-root service needs so its `emptyDir` data volume
+/// is group-writable — the standard k8s non-root pattern that lets e.g. the
+/// official `postgres` image write `PGDATA` (ADR-0058 governance). `Some` only
+/// when the service pins a non-root uid and is not the root escape hatch.
+fn service_fs_group(svc: &scarab_pipeline::ServiceSpec) -> Option<i64> {
+    (!svc.run_as_root)
+        .then_some(svc.run_as_user)
+        .flatten()
+        .map(|u| u as i64)
 }
 
 // ---------------------------------------------------------------------------
@@ -2258,7 +2289,6 @@ pub fn build_service_pod(
     name: &str,
     namespace: &str,
     svc: &scarab_pipeline::ServiceSpec,
-    run_as_root: bool,
 ) -> Pod {
     let container = Container {
         name: SERVICE_POD_CONTAINER.to_string(),
@@ -2276,7 +2306,7 @@ pub fn build_service_pod(
                 .collect()
         }),
         readiness_probe: service_startup_probe(svc),
-        security_context: Some(service_security_context(run_as_root)),
+        security_context: Some(service_security_context(svc.run_as_user, svc.run_as_root)),
         ..Default::default()
     };
     Pod {
@@ -2291,6 +2321,16 @@ pub fn build_service_pod(
             // A standalone backing service is long-lived within the run; keep it
             // up on crash (teardown, not exit, ends it).
             restart_policy: Some("Always".to_string()),
+            // Non-root default (ADR-0058): a pinned uid gets a matching Pod-level
+            // fsGroup so the service's `emptyDir` data volume is group-writable
+            // (the standard k8s pattern that lets the stock postgres image write
+            // PGDATA). None when root or no uid pinned.
+            security_context: service_fs_group(svc).map(|g| {
+                k8s_openapi::api::core::v1::PodSecurityContext {
+                    fs_group: Some(g),
+                    ..Default::default()
+                }
+            }),
             ..Default::default()
         }),
         ..Default::default()
@@ -3116,18 +3156,20 @@ mod tests {
         );
     }
 
-    // ADR-0058: the `run-as-root` self-service grant on the step carries over to
-    // the sidecar (stock DB images start as root); the default probe is a
-    // TCP-connect on the first declared port when `ready:` is omitted.
+    // ADR-0058: a sidecar's `run-as-root` is the service's OWN self-service grant
+    // (independent of the step's) — stock DB images that genuinely need root opt in
+    // on the service, not the step. The default probe is a TCP-connect on the first
+    // declared port when `ready:` is omitted.
     #[test]
-    fn sidecar_inherits_run_as_root_and_defaults_probe_to_first_port() {
+    fn sidecar_run_as_root_is_the_services_own_grant_and_defaults_probe_to_first_port() {
         use scarab_pipeline::ServiceSpec;
         let mut spec = busybox();
-        spec.run_as_root = true;
+        // Step stays baseline non-root; the SERVICE opts into root on its own.
         spec.services = vec![ServiceSpec {
             image: "redis:7".into(),
             ports: vec![6379],
             ready: None, // default → TCP on the first declared port
+            run_as_root: true,
             ..Default::default()
         }];
         let inits = pod_for(&spec).spec.unwrap().init_containers.unwrap();
@@ -3143,6 +3185,71 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(tcp.port, IntOrString::Int(6379));
+    }
+
+    // ADR-0058 (git-bug d2301fb): a service is **non-root by default**. Pinning the
+    // image's built-in non-root uid via `run_as_user` sets the container
+    // runAsUser/runAsGroup AND the Pod-level fsGroup, so the service's emptyDir data
+    // volume is group-writable (stock postgres writes PGDATA without root).
+    #[test]
+    fn sidecar_run_as_user_pins_uid_and_sets_pod_fs_group() {
+        use scarab_pipeline::ServiceSpec;
+        let mut spec = busybox();
+        spec.services = vec![ServiceSpec {
+            image: "postgres:16".into(),
+            ports: vec![5432],
+            run_as_user: Some(999),
+            ..Default::default()
+        }];
+        let ps = pod_for(&spec).spec.unwrap();
+        let inits = ps.init_containers.as_ref().unwrap();
+        let svc = inits.iter().find(|c| c.name == "service-0").unwrap();
+        let sc = svc.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.run_as_user, Some(999));
+        assert_eq!(sc.run_as_group, Some(999));
+        // Pod-level fsGroup makes the (shared) Pod's data emptyDir group-writable.
+        assert_eq!(
+            ps.security_context.as_ref().unwrap().fs_group,
+            Some(999),
+            "the service's non-root gid becomes the Pod fsGroup"
+        );
+    }
+
+    // ADR-0058 (git-bug d2301fb): the `run_as_root` escape hatch runs a shared
+    // service Pod as uid 0 (no fsGroup needed — root writes anything), while the
+    // non-root default with a pinned uid gets a matching Pod fsGroup.
+    #[test]
+    fn shared_service_pod_honors_run_as_user_and_run_as_root() {
+        use scarab_pipeline::ServiceSpec;
+        // Non-root default with a pinned uid → runAsUser/Group + Pod fsGroup.
+        let non_root = ServiceSpec {
+            image: "postgres:16".into(),
+            ports: vec![5432],
+            run_as_user: Some(999),
+            ..Default::default()
+        };
+        let pod = build_service_pod("run-1", "db", "ns", &non_root);
+        let ps = pod.spec.unwrap();
+        let sc = ps.containers[0].security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.run_as_user, Some(999));
+        assert_eq!(sc.run_as_group, Some(999));
+        assert_eq!(ps.security_context.as_ref().unwrap().fs_group, Some(999));
+
+        // Escape hatch: run as root, no Pod fsGroup.
+        let root = ServiceSpec {
+            image: "legacy:1".into(),
+            ports: vec![5432],
+            run_as_root: true,
+            ..Default::default()
+        };
+        let pod = build_service_pod("run-1", "db", "ns", &root);
+        let ps = pod.spec.unwrap();
+        let sc = ps.containers[0].security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(false));
+        assert_eq!(sc.run_as_user, Some(0));
+        assert!(ps.security_context.is_none(), "root needs no fsGroup");
     }
 
     // ADR-0058 (shared service): the standalone service Pod runs the service
@@ -3165,7 +3272,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let pod = build_service_pod("run-1", "db", "ns", &svc, false);
+        let pod = build_service_pod("run-1", "db", "ns", &svc);
         let meta = &pod.metadata;
         assert_eq!(meta.namespace.as_deref(), Some("ns"));
         let labels = meta.labels.as_ref().unwrap();

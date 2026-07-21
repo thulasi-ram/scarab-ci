@@ -533,6 +533,20 @@ pub struct ServiceSpec {
     /// main container starts immediately (no gate).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<ReadyProbe>,
+    /// Pin the service image's built-in **non-root** uid (e.g. `999` for the
+    /// official `postgres` image) so the service starts under the restricted
+    /// baseline without any grant. Applied as the container
+    /// `runAsUser`/`runAsGroup` AND the Pod-level `fsGroup`, so the service's
+    /// `emptyDir` data volume is group-writable — the standard k8s non-root
+    /// pattern (ADR-0058 governance). Ignored when [`run_as_root`](Self::run_as_root).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as_user: Option<u32>,
+    /// Self-service escape hatch (mirrors [`StepSecurity::run_as_root`]): run the
+    /// service as uid 0. Sandbox-bound — caps-dropped, unprivileged,
+    /// seccomp-confined — so root here does not escape. Default `false`: the
+    /// restricted non-root baseline. Deliberately *not* the default path.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub run_as_root: bool,
 }
 
 /// A sidecar service's readiness probe (ADR-0058), authored as a one-key map:
