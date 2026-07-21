@@ -87,6 +87,16 @@ pub struct PipelineIr {
     /// progress rests on step timeouts and gate expiry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<u32>,
+    /// Pipeline-level **shared services** (ADR-0058): Run-scoped standalone
+    /// service instances a Step opts into with [`uses:`](StepSpec::uses). Unlike
+    /// a per-Step [sidecar](StepSpec::services), a shared service is a standalone
+    /// Pod with a cluster DNS name (`<name>:<port>`), born eagerly at Run start
+    /// and torn down at the Run/Take terminal (namespace-per-run teardown, not a
+    /// refcount) — a fresh instance per Take. It is **not** a `needs`-able DAG
+    /// node and is explicitly *unfenced* external state (the double-effect
+    /// contract is the author's, ADR-0021). Empty = no shared services.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<SharedServiceSpec>,
     pub steps: Vec<StepSpec>,
 }
 
@@ -421,6 +431,16 @@ pub struct StepSpec {
     /// sidecars multiply per instance (each instance's Pod gets its own).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<ServiceSpec>,
+    /// Shared-service opt-in (ADR-0058): the names of pipeline-level
+    /// [`SharedServiceSpec`]s this Step reaches over the network. Each name must
+    /// resolve to a declared pipeline service (enforced by [`validate`]). Opting
+    /// in gets this Step three things: the NetworkPolicy hole to the service Pod,
+    /// the cluster DNS path (`<name>:<port>`), and a scheduler **readiness gate**
+    /// that holds the Step until the service's `ready:` probe passes. A Step with
+    /// no `uses:` never waits on any shared service. Not a `needs` edge — a
+    /// service is infrastructure *for* a Step, not a DAG node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<String>,
 }
 
 impl StepSpec {
@@ -551,6 +571,27 @@ pub struct HttpReady {
 
 fn default_http_path() -> String {
     "/".to_string()
+}
+
+/// A **shared service** (ADR-0058): a pipeline-level, Run-scoped standalone
+/// service instance that Steps opt into via [`StepSpec::uses`]. It reuses the
+/// slice-1 [`ServiceSpec`] shape (image/command/args/env/ports/`ready:`) and adds
+/// the `name` that becomes both the opt-in key and the cluster DNS hostname
+/// (`<name>:<port>`). Distinct from a per-Step sidecar: a shared service is a
+/// standalone Pod + k8s Service reachable across Pods (scoped by NetworkPolicy to
+/// the opt-in Pods only), born eagerly at Run start and torn down at Run/Take
+/// terminal — a fresh instance per Take, never shared across Takes. It is **not**
+/// a `needs`-able DAG node and is explicitly *unfenced* external state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedServiceSpec {
+    /// The service name — the opt-in key a Step names in `uses:` and the cluster
+    /// DNS hostname (`<name>:<port>`). Must be non-empty, unique across the
+    /// pipeline's services, and DNS-label-safe (enforced by [`validate`]).
+    #[serde(default)]
+    pub name: String,
+    /// The reused slice-1 service shape (image/command/args/env/ports/`ready:`).
+    #[serde(flatten)]
+    pub spec: ServiceSpec,
 }
 
 /// Configuration of a `clone` step (ADR-0045). Everything is optional —
@@ -848,6 +889,9 @@ pub fn compile_yaml_with_libs(
         environment: authored.environment,
         interface: authored.interface,
         budget: authored.budget,
+        // Pipeline-level shared services (ADR-0058) are not DAG nodes and are not
+        // matrix-expanded — they pass through compilation unchanged.
+        services: authored.services,
         steps: expanded,
     };
 
@@ -1440,6 +1484,45 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Is `s` an RFC-1123 DNS label (lowercase alnum + interior `-`, ≤63 chars)? A
+/// shared service's name is used verbatim as a k8s Service name / cluster DNS
+/// hostname (ADR-0058), so it must be a valid label.
+fn is_dns_label(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Validate a service `ready:` probe (ADR-0058), shared by the per-Step sidecar
+/// and pipeline-level shared-service paths. `ctx` is the diagnostic prefix (e.g.
+/// `` step `test` `` or `` service `db` ``). Absent probe = nothing to check.
+fn validate_ready_probe(ready: &Option<ReadyProbe>, ctx: &str, diagnostics: &mut Vec<String>) {
+    let Some(ready) = ready else { return };
+    // Exactly one of tcp/exec/http (a probe with none set is meaningless; more
+    // than one is ambiguous).
+    if ready.forms_set() != 1 {
+        diagnostics.push(format!(
+            "{ctx}: a service `ready` probe must set exactly one of `tcp`/`exec`/`http`"
+        ));
+    }
+    if ready.tcp == Some(0) {
+        diagnostics.push(format!(
+            "{ctx}: a service `ready.tcp` port must be greater than zero"
+        ));
+    }
+    if ready.http.as_ref().is_some_and(|h| h.port == 0) {
+        diagnostics.push(format!(
+            "{ctx}: a service `ready.http.port` must be greater than zero"
+        ));
+    }
+}
+
 /// Is `s` a valid identifier (`[A-Za-z_][A-Za-z0-9_]*`)? Used to keep declared
 /// input names env-var-safe.
 pub(crate) fn is_identifier(s: &str) -> bool {
@@ -1637,31 +1720,28 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                     step.id
                 ));
             }
-            if let Some(ready) = &svc.ready {
-                // Exactly one of tcp/exec/http (a probe with none set is
-                // meaningless; more than one is ambiguous).
-                if ready.forms_set() != 1 {
-                    diagnostics.push(format!(
-                        "step `{}`: a service `ready` probe must set exactly one of \
-                         `tcp`/`exec`/`http`",
-                        step.id
-                    ));
-                }
-                if ready.tcp == Some(0) {
-                    diagnostics.push(format!(
-                        "step `{}`: a service `ready.tcp` port must be greater than zero",
-                        step.id
-                    ));
-                }
-                if ready.http.as_ref().is_some_and(|h| h.port == 0) {
-                    diagnostics.push(format!(
-                        "step `{}`: a service `ready.http.port` must be greater than zero",
-                        step.id
-                    ));
-                }
-            }
+            // A sidecar's `ready:` probe is validated by the shared helper (the
+            // same rules a shared service's probe obeys).
+            validate_ready_probe(&svc.ready, &format!("step `{}`", step.id), &mut diagnostics);
             // No probe + no port = nothing to gate on; still valid (the main
             // container simply starts immediately alongside the sidecar).
+        }
+        // Shared-service opt-in (ADR-0058): every `uses:` name must resolve to a
+        // pipeline-level service. A gate launches no Pod, so it can reach nothing.
+        if !step.uses.is_empty() && step.is_gate() {
+            diagnostics.push(format!(
+                "step `{}`: `uses` is only valid on a step that runs a Pod (not a gate)",
+                step.id
+            ));
+        }
+        for name in &step.uses {
+            if !ir.services.iter().any(|s| &s.name == name) {
+                diagnostics.push(format!(
+                    "step `{}`: `uses` names unknown shared service `{name}` \
+                     (declare it under pipeline-level `services:`)",
+                    step.id
+                ));
+            }
         }
         // A build step runs the blessed rootless BuildKit image (ADR-0018):
         // the author names no image/command and needs no privilege (rootless
@@ -1904,6 +1984,34 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         if env.is_empty() {
             diagnostics.push("environment: target must not be empty".to_string());
         }
+    }
+
+    // Pipeline-level shared services (ADR-0058): each needs a unique,
+    // DNS-label-safe name (it is also the cluster DNS hostname), an image, and a
+    // well-formed `ready:` probe (the same rules a sidecar's probe obeys).
+    let mut service_names = BTreeSet::new();
+    for svc in &ir.services {
+        if svc.name.trim().is_empty() {
+            diagnostics.push("a pipeline-level `services` entry must set a `name`".to_string());
+        } else {
+            if !is_dns_label(&svc.name) {
+                diagnostics.push(format!(
+                    "service `{}`: name must be a DNS label (lowercase letters, digits, `-`; \
+                     it is the cluster DNS hostname)",
+                    svc.name
+                ));
+            }
+            if !service_names.insert(svc.name.as_str()) {
+                diagnostics.push(format!("duplicate shared service name `{}`", svc.name));
+            }
+        }
+        if svc.spec.image.trim().is_empty() {
+            diagnostics.push(format!(
+                "service `{}`: a shared service must name an `image`",
+                svc.name
+            ));
+        }
+        validate_ready_probe(&svc.spec.ready, &format!("service `{}`", svc.name), &mut diagnostics);
     }
 
     // Launch-parameter interface (ADR-0043): each declared param spec must be
@@ -3836,5 +3944,143 @@ mod tests {
             ),
             other => panic!("expected validation error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shared_services_parse_and_steps_opt_in_with_uses() {
+        let ir = compile(
+            r#"
+            services:
+              - name: db
+                image: postgres:16
+                env: { POSTGRES_PASSWORD: test }
+                ready: { tcp: 5432 }
+            steps:
+              - id: migrate
+                image: migrate:latest
+                uses: [db]
+                command: [migrate, up]
+              - id: test
+                image: rust:1
+                uses: [db]
+                needs: [migrate]
+            "#,
+        );
+        assert_eq!(ir.services.len(), 1);
+        assert_eq!(ir.services[0].name, "db");
+        assert_eq!(ir.services[0].spec.image, "postgres:16");
+        assert_eq!(ir.services[0].spec.ready.as_ref().unwrap().tcp, Some(5432));
+        assert_eq!(ir.steps[0].uses, vec!["db".to_string()]);
+        assert_eq!(ir.steps[1].uses, vec!["db".to_string()]);
+        // Round-trips through serde_json unchanged (self-describing IR).
+        let json = serde_json::to_string(&ir).unwrap();
+        let back: PipelineIr = serde_json::from_str(&json).unwrap();
+        assert_eq!(ir, back);
+    }
+
+    #[test]
+    fn uses_an_undeclared_service_is_rejected() {
+        let errs = errors(
+            r#"
+            services:
+              - name: db
+                image: postgres:16
+            steps:
+              - id: test
+                image: rust:1
+                uses: [cache]
+            "#,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("unknown shared service `cache`")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_shared_service_without_name_or_image_is_rejected() {
+        let errs = errors(
+            r#"
+            services:
+              - image: postgres:16
+              - name: cache
+            steps:
+              - { id: a, image: busybox }
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.contains("must set a `name`")), "{errs:?}");
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("service `cache`: a shared service must name an `image`")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_shared_service_names_are_rejected() {
+        let errs = errors(
+            r#"
+            services:
+              - { name: db, image: postgres:16 }
+              - { name: db, image: mysql:8 }
+            steps:
+              - { id: a, image: busybox }
+            "#,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("duplicate shared service name `db`")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_dns_label_service_name_is_rejected() {
+        let errs = errors(
+            r#"
+            services:
+              - { name: My_DB, image: postgres:16 }
+            steps:
+              - { id: a, image: busybox }
+            "#,
+        );
+        assert!(errs.iter().any(|e| e.contains("must be a DNS label")), "{errs:?}");
+    }
+
+    #[test]
+    fn uses_on_a_gate_step_is_rejected() {
+        let errs = errors(
+            r#"
+            services:
+              - { name: db, image: postgres:16 }
+            steps:
+              - { id: g, gate: manual, uses: [db] }
+            "#,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("`uses` is only valid on a step that runs a Pod")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_shared_service_bad_ready_probe_is_rejected() {
+        let errs = errors(
+            r#"
+            services:
+              - name: db
+                image: postgres:16
+                ready: { tcp: 5432, exec: [pg_isready] }
+            steps:
+              - { id: a, image: busybox }
+            "#,
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("service `db`: a service `ready` probe must set exactly one")),
+            "{errs:?}"
+        );
     }
 }
