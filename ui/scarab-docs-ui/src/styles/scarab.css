@@ -138,3 +138,29 @@ body:has(.hero) .sl-markdown-content {
 
 /* Keep background doodles behind prose (Doodle.astro renders them). */
 .sl-markdown-content { position: relative; z-index: 1; }
+
+/* ---- Code blocks: a subtle emerald-tinted carapace ---------------------
+ * Lucode drives every code surface (Expressive Code frames, cards, tabs,
+ * asides, file-tree) from a single --code-background var (= --gray-7, a
+ * neutral gray). We want only the block <pre>/EC frame to read as a faint
+ * emerald surface — not the cards/tabs/asides — so we re-declare
+ * --code-background SCOPED to the .expressive-code element. EC's generated
+ * --ec-* backgrounds resolve var(--code-background) at that element, so the
+ * override lands on code blocks alone. Inline code uses --muted (untouched).
+ *
+ * We keep the base lightness of --gray-7 (dark 20.5%, light 97%) and only
+ * bend the hue to the brand emerald (162, the same hue as --scarab-emerald)
+ * with a whisper of chroma — tinted, never neon. */
+:root .sl-markdown-content .expressive-code {
+  /* light: near-white paper with a faint green wash */
+  --code-background: oklch(97% 0.012 162);
+}
+:root[data-theme='dark'] .sl-markdown-content .expressive-code {
+  /* dark: near-black carapace with a subtle deep-emerald tint */
+  --code-background: oklch(21% 0.024 162);
+}
+/* A faint emerald hairline ties the block to the brand (Lucode ships EC
+ * border-width 0). Applied to the frame wrapper so tabs/terminal align. */
+.sl-markdown-content .expressive-code figure.frame {
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--scarab-emerald) 14%, transparent);
+}
