@@ -1,7 +1,7 @@
 // @ts-check
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
-import starlightOpenAPI, { openAPISidebarGroups } from 'starlight-openapi';
+import starlightOpenAPI from 'starlight-openapi';
 import lucode from 'lucode-starlight';
 
 // Scarab documentation site — ADR-0040.
@@ -64,6 +64,7 @@ export default defineConfig({
           navLinks: [
             { label: 'Get Started', link: '/get-started/overview/' },
             { label: 'Usage', link: '/usage/pipeline-syntax/' },
+            { label: 'References', link: '/reference/api/' },
           ],
           footerText:
             'Scarab — a modern CI engine for Kubernetes: forge-native, on a durable core. Themed with [Lucode Starlight](https://github.com/lucas-labs/lucode-starlight-theme).',
@@ -98,7 +99,10 @@ export default defineConfig({
         {
           label: 'References',
           items: [
-            ...openAPISidebarGroups,
+            // The API page (/reference/api/) is the full reference: it indexes
+            // every operation grouped by tag, each linking to its operation
+            // page. Link straight to it — no separate "Overview" node.
+            { label: 'API', link: '/reference/api/' },
             { label: 'ADR', items: [{ autogenerate: { directory: 'tech/adr' } }] },
             { label: 'Thesis & language (CONTEXT)', slug: 'tech/context' },
           ],
