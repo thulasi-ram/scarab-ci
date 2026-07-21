@@ -15,15 +15,15 @@ The **same chart** targets any Kubernetes: a local kind/colima cluster or a real
 `just local-helm` (below) is just a convenience loop that installs this chart on colima; a live
 cluster uses the same `helm upgrade --install` with your own Postgres, object store, and
 credentials. The chart is young and gains production hardening as it earns mileage, but nothing
-about it is local-only.
+about it works only locally.
 
 ## The chart
 
 The chart lives at `deploy/helm/scarab/` (`Chart.yaml`, `values.yaml`, `templates/`). It expects:
 
-- **Postgres** — the durable coordination substrate; without it the server runs API-only.
+- **Postgres** — the durable coordination substrate; without it the server serves the API only.
 - **An S3-compatible object store** (AWS S3 or in-cluster MinIO) for logs, artifacts, and the
-  content-addressed workspace snapshots reruns restore; a local-dir fallback exists for dev.
+  content-addressed workspace snapshots reruns restore; a fallback to a local directory exists for development.
 - **The published image** `ghcr.io/thulasi-ram/scarab-server`, built by
   `.github/workflows/image.yml`. Use the mutable `edge` tag or a pinned `sha-<gitsha>`.
 
@@ -40,7 +40,7 @@ helm upgrade --install scarab deploy/helm/scarab \
 ```
 
 For production, keep credentials out of `--set`: create a Secret whose keys are the `SCARAB_*`
-env-var names and reference it with `secrets.existingSecret`.
+environment-variable names and reference it with `secrets.existingSecret`.
 
 ## Key values
 
@@ -99,7 +99,7 @@ reference.
 ## The colima local loop
 
 `just local-helm` installs the same chart on a local colima cluster and brings the whole stack up
-**in-cluster** — in-cluster Postgres + MinIO + `scarab-server` (which also serves the web UI at
+**inside the cluster** — Postgres, MinIO, and `scarab-server` (which also serves the web UI at
 `/`) — so you can repeatedly deploy a pinned image and watch this repo's own CI run on Scarab.
 
 ```sh
@@ -111,10 +111,10 @@ just local-helm-ui 8080     # port-forward the in-cluster UI (reconnects across 
 
 The kube context must be `colima` (the deploy script refuses otherwise). Configuration —
 image source, GitHub App knobs, webhook secrets, seed inputs — lives in one gitignored file,
-`deploy/local-helm/.env`; see `deploy/local-helm/README.md` for the App-configuration steps and
-the object-store caveats.
+`deploy/local-helm/.env`; see `deploy/local-helm/README.md` for the steps to configure the App and
+the caveats about the object store.
 
-For a laptop-only workflow with no cluster at all, [Run locally](/scarab-ci/get-started/run-locally/)
+For a workflow that stays on your laptop with no cluster at all, [Run locally](/scarab-ci/get-started/run-locally/)
 is the lightest way to exercise the system.
 
 ## References

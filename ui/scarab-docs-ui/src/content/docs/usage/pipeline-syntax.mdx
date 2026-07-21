@@ -15,7 +15,7 @@ are triggered and wired together. Structurally a pipeline is a **flat recursive 
 (`Pipeline → Step`).
 
 The real DSL is a **typed IR**; YAML is a frontend and **CEL** provides expressions.
-`invoke` is reuse — compile-time inlining of a library pipeline into the caller's DAG.
+`invoke` is reuse — inlining a library pipeline into the caller's DAG at compile time.
 `matrix` is a modifier that fans a step out over a set of inputs.
 
 Compilation is **static**: the whole DAG — every matrix combination, every inlined library step — is
@@ -106,7 +106,7 @@ steps:
 - `required` defaults to `true`. An optional parameter (`required: false`) **must** carry a
   `default`, keeping the resolved parameter set total.
 - An optional `validate:` CEL predicate over the resolved value (bound as `value`) rejects a bad
-  launch fail-closed.
+  launch, failing closed.
 
 Resolved parameters are read in steps as `${{ inputs.<name> }}` and are also injected into the
 step environment as `SCARAB_PARAM_<NAME>`. A **reusable library** pipeline additionally declares the
@@ -138,7 +138,7 @@ A step names the secrets it needs with `secrets: [KEY, ...]` (resolution and sco
 ```
 
 Privilege above the hardened baseline is requested per step under `security:`. `run_as_root` is
-self-service (root inside the caps-dropped, unprivileged sandbox does not escape it);
+self-service (root inside the unprivileged sandbox, with its capabilities already dropped, does not escape it);
 `add_capabilities` and `privileged` are governed and take effect only if the environment whitelists
 the image digest.
 
@@ -149,16 +149,16 @@ the image digest.
     run_as_root: true
 ```
 
-Some steps are image-less **kinds** the engine runs on your behalf (you set no `image`/`command`):
+Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):
 
 - **`clone: {}`** — source provisioning (see [The `clone` step](#the-clone-step)).
 - **`build: { image: ..., push: true }`** — a rootless BuildKit image build.
 - **`gate: manual`** — a durable approval/wait point (see [Environments & gates](#environments--gates)).
-- **`invoke: .scarab/lib/...`** — compile-time reuse (see [Reuse — `invoke`](#reuse--invoke)).
+- **`invoke: .scarab/lib/...`** — reuse at compile time (see [Reuse — `invoke`](#reuse--invoke)).
 
 ### The `clone` step
 
-Source is provisioned by a first-class **`clone` step**. It is zero-config by design: the repo,
+Source is provisioned by a first-class **`clone` step**. It needs no configuration by design: the repo,
 ref, resolved SHA, and token all come from the run's trigger context, so `clone: {}` is the common
 case. Downstream steps inherit the cloned workspace through ordinary `needs`.
 
@@ -223,8 +223,8 @@ A `when:` CEL guard skips a step whose predicate is false; expressions read the 
 
 `invoke` inlines a **library** pipeline (under `.scarab/lib/` by convention) into the caller's DAG
 at compile time — not a runtime call.
-It is local-only forever: repo-relative paths, read at the caller's ref; no `../` escape and no
-cross-repo references (cross-repo causation is `on: upstream`). The invoked steps are id-namespaced
+It is local only, forever: repo-relative paths, read at the caller's ref; no `../` escape and no
+cross-repo references (cross-repo causation is `on: upstream`). The invoked steps are namespaced
 by the invoke step's id (`deploy/plan`, `deploy/url`), and `matrix` on an invoke step fans out the
 whole subgraph.
 
@@ -283,7 +283,7 @@ stored and scoped, and what an environment governs — see
 Referencing a top-level `environment:` makes the pipeline a **deploy**: its runs are enforced
 against that environment's protection rules at admission. **Secrets** a step needs are named with
 `secrets: [KEY, ...]`; each key is resolved against the run's scope and made available to the step
-under the same name (a fork-PR run is locked out and receives none).
+under the same name (a run from a fork's pull request is locked out and receives none).
 
 ```yaml
 environment: prod
@@ -295,7 +295,7 @@ steps:
     command: ["./deploy.sh"]
 ```
 
-**Gates** are image-less durable suspend points — `gate: manual` is an approval, `gate: timer` waits
+**Gates** are durable suspend points with no image — `gate: manual` is an approval, `gate: timer` waits
 `gate_after` seconds, `gate: external` releases via API/webhook. Placed before a deploy step, a
 manual gate is the approval mechanism for a governed environment:
 
@@ -339,7 +339,7 @@ profile for anything static.
 
 A step may set a `timeout:` (seconds) and an opt-in `retry:` policy. Retry is
 **at-least-once** — declaring it is your assertion that the step is idempotent or fenced; a
-non-cooperating side effect will double-fire.
+side effect that does not cooperate will fire twice.
 
 ```yaml
 - id: flaky
@@ -348,9 +348,9 @@ non-cooperating side effect will double-fire.
   retry: { on: failure, max: 3 }
 ```
 
-Human-initiated re-execution is modelled as **Takes**: a *rerun* re-executes a run from
+Re-execution that a human initiates is modelled as **Takes**: a *rerun* re-executes a run from
 the top, a *retry* resumes from a failed step, and an earlier attempt becomes *superseded* or
-*shadowed* by the newer one. These are run-history concepts surfaced in the UI — there is nothing to
+*shadowed* by the newer one. These are concepts from a run's history surfaced in the UI — there is nothing to
 author for them.
 
 ## References

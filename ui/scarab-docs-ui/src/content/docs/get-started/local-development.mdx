@@ -9,13 +9,13 @@ import Doodle from '../../../components/Doodle.astro';
 
 Scarab's day-to-day development loop is **proc-mode**: `scarab-server` runs straight from the
 working tree as a host process, backed by a compose Postgres + MinIO and a local kind cluster for
-step Pods. This gives you a fast rebuild-and-run cycle with no image to publish. Everything is
-driven by `Justfile` recipes over `deploy/local-proc/` — prefer them over hand-rolled
-docker/kind/kubectl invocations, since they encode the right env, an isolated kubeconfig, and the
+step Pods. This gives you a fast cycle that rebuilds and reruns with no image to publish. Everything is
+driven by `Justfile` recipes over `deploy/local-proc/` — prefer them over
+docker/kind/kubectl invocations you assemble by hand, since they encode the right env, an isolated kubeconfig, and the
 colima safety guards.
 
 For a guided first run see [Run locally](/scarab-ci/get-started/run-locally/); to deploy the
-packaged Helm chart instead — the real in-cluster path — see
+packaged Helm chart instead — the real path inside the cluster — see
 [Installation](/scarab-ci/get-started/deploy-helm/). This page is the reference for the proc-mode
 mechanics and the `.env` those recipes read.
 
@@ -60,7 +60,7 @@ SCARAB_DEV_INSECURE=1
 SCARAB_API_URL=http://127.0.0.1:8080
 ```
 
-Key dev-only settings:
+Key settings for development only:
 
 - **`SCARAB_DEV_INSECURE=1`** boots the server without an authenticator or key-encryption key,
   with loud warnings, so you don't have to stand up identity/KEK to iterate. Under
@@ -100,13 +100,13 @@ just down    # tear it all down
   terminal state — the walking skeleton end-to-end.
 - **`just logs`** tails `deploy/local-proc/server.log` (the background server from `just up`).
 - **`just down`** stops the server, runs `docker compose down -v`, and deletes the kind cluster —
-  best-effort and safe to re-run.
+  best effort and safe to run again.
 
 Also handy: **`just docs`** serves this documentation site locally.
 
-:::note[The other mode: in-cluster Helm]
-Proc-mode runs the server as a host process. For the real in-cluster path — `scarab-server`
-deployed via the Helm chart on colima with in-cluster Postgres + MinIO — use `just local-helm`. See
+:::note[The other mode: Helm inside the cluster]
+Proc-mode runs the server as a host process. For the real path inside the cluster — `scarab-server`
+deployed via the Helm chart on colima with Postgres and MinIO inside the cluster — use `just local-helm`. See
 [Installation](/scarab-ci/get-started/deploy-helm/).
 :::
 

@@ -1,6 +1,6 @@
 ---
 title: Environments
-description: A named, admin-owned governance boundary — approvals, wait timers, allowed refs, require-reason, concurrency, and scoped secrets — enforced at the point of use in the engine.
+description: A named governance boundary owned by an admin — approvals, wait timers, allowed refs, a required reason, concurrency, and scoped secrets — enforced at the point where it is used, in the engine.
 ---
 
 import Doodle from '../../../components/Doodle.astro';
@@ -9,10 +9,10 @@ import Doodle from '../../../components/Doodle.astro';
 
 ## What an Environment is
 
-An Environment is a **named, admin-owned governance boundary** — `staging`, `prod` (ADR-0037). Its
+An Environment is a **named governance boundary owned by an admin** — `staging`, `prod` (ADR-0037). Its
 value is not any single rule: one reference — `environment: prod` in a pipeline — pulls in a
-**governed bundle** (approval + secrets + allowed-refs + OIDC subject) defined **once by an admin**
-and reused across pipelines. Because the rules live in an admin-owned entity, not the pipeline
+**governed bundle** (approval + secrets + allowed refs + OIDC subject) defined **once by an admin**
+and reused across pipelines. Because the rules live in an entity owned by an admin, not the pipeline
 YAML, you get separation of duties: a pipeline author *requests* a deploy; the environment
 *governs* it, regardless of what the YAML says. Editing an environment needs the **Administer**
 capability on the repo.
@@ -30,7 +30,7 @@ An environment's `ProtectionRules` carry:
 - **`approvers`** — principals whose approval is required. Approval is **a gate, not a table**: a
   `manual` gate in the run accumulates distinct approver identities on the run's durable event log
   (`GateApproved { step, by }`), and the run stays suspended until every named approver has
-  approved. Restart-safe and unforgeable by construction.
+  approved. Safe across restarts and unforgeable by construction.
 - **`wait_timer`** — a mandatory wait (seconds) before a run may proceed.
 - **`allowed_refs`** — glob patterns for the git refs allowed to deploy here; checked at **run
   creation** so a disallowed ref is rejected before any pod launches (blank = any ref).
@@ -38,15 +38,15 @@ An environment's `ProtectionRules` carry:
   reason (ADR-0057); push/PR/tag/release/cron are exempt.
 - **`concurrency`** — the maximum concurrent deployments into this environment.
 
-Two further governed knobs are Administer-only and fail-closed: `privileged_images` (the ADR-0039
-digest-keyed privilege whitelist) and `permit_k8s_overlay` (the ADR-0055 raw pod-spec escape
+Two further governed knobs can be set only with Administer and fail closed: `privileged_images` (the
+ADR-0039 privilege whitelist keyed by digest) and `permit_k8s_overlay` (the ADR-0055 raw pod-spec escape
 hatch).
 
 ## Scoped secrets with inheritance
 
 An environment defines a **secret scope**. Steps in a run targeting it resolve keys through the
-chain **`env → repo → org`, most-specific-wins**, so a value shared across environments lives once
-at repo/org scope and only genuinely-different values are stored per-environment. The scope is
+chain **`env → repo → org`, where the most specific scope wins**, so a value shared across environments lives once
+at repo/org scope and only genuinely different values are stored per-environment. The scope is
 canonical — the server stamps it from the environment's `(org, repo, name)` coordinate — and prod
 credentials therefore exist **only** under the gated environment and cannot be relocated by editing
 pipeline YAML. See [Secrets](/scarab-ci/usage/secrets/).
@@ -55,7 +55,7 @@ pipeline YAML. See [Secrets](/scarab-ci/usage/secrets/).
 
 Admission is enforced **in the engine**, not in a request body. `allowed_refs` is checked at run
 creation; `approvers` is satisfied by the accumulated gate approvals on the run; `require_reason`
-is checked at the admission gate. There is no caller-supplied `approvals` list — the old standalone
+is checked at the admission gate. There is no `approvals` list supplied by the caller — the old standalone
 `POST …/deploy` admission path is retired, and deployment history is read-only.
 
 ## API surface
@@ -71,7 +71,7 @@ Environments are managed under `/v1/repos/{org}/{repo}/environments...` (writes 
 | `DELETE` | `/v1/repos/{org}/{repo}/environments/{name}` | Delete (idempotent) |
 | `GET` | `/v1/repos/{org}/{repo}/environments/{name}/deployments` | Deployment history (read-only) |
 
-The surface is **feature-gated**: if the environment store is not configured, these endpoints
+The surface is **behind a feature gate**: if the environment store is not configured, these endpoints
 return **404**.
 
 ## References

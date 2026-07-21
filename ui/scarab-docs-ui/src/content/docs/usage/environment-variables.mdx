@@ -25,7 +25,7 @@ what each variable does — for how to set them on your machine, see
 | `SCARAB_NAMESPACE` | k8s namespace step Pods launch into. |
 | `SCARAB_PUBLIC_URL` | Scarab's public base URL — the run deep-link every forge status carries (default `http://localhost:8080`). |
 
-**Object store** — set `SCARAB_S3_BUCKET` to select S3/MinIO; otherwise `SCARAB_OBJECT_DIR` is the local-dir fallback (dev).
+**Object store** — set `SCARAB_S3_BUCKET` to select S3/MinIO; otherwise `SCARAB_OBJECT_DIR` is the fallback to a local directory (dev).
 
 | Variable | Purpose |
 |---|---|
@@ -33,14 +33,14 @@ what each variable does — for how to set them on your machine, see
 | `SCARAB_S3_ENDPOINT` | S3 endpoint (empty = AWS). |
 | `SCARAB_S3_REGION` | S3 region (default `us-east-1`). |
 | `SCARAB_S3_ACCESS_KEY`, `SCARAB_S3_SECRET_KEY` | S3 credentials. |
-| `SCARAB_OBJECT_DIR` | Local object-store directory (dev). |
+| `SCARAB_OBJECT_DIR` | Local directory for the object store (dev). |
 
 **Security & identity**
 
 | Variable | Purpose |
 |---|---|
 | `SCARAB_MASTER_KEY` | base64 32-byte KEK for envelope encryption — required unless `SCARAB_DEV_INSECURE=1`. |
-| `SCARAB_DEV_INSECURE` | `1`/`true` downgrades the security hard-fails (KEK, auth) to loud boot warnings — dev only; never relaxes the Postgres requirement. |
+| `SCARAB_DEV_INSECURE` | `1`/`true` downgrades the strict security failures (KEK, auth) to loud boot warnings — dev only; never relaxes the Postgres requirement. |
 | `SCARAB_OAUTH_CLIENT_ID`, `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | OAuth/OIDC login provider (all five together enable real authn; a partial set refuses boot). |
 | `SCARAB_OAUTH_SCOPES` | Space-separated scopes for the authorize redirect (optional). |
 | `SCARAB_OAUTH_OWNERS` | Comma-separated subjects granted `Owner` at login (bootstrap until scoped RBAC); others log in as `Viewer`. |

@@ -8,7 +8,7 @@ import Doodle from '../../../components/Doodle.astro';
 <Doodle icon="terminal" size={200} rotate={-10} opacity={0.18} top="7rem" right="-2rem" />
 
 The repo ships a one-command dev harness (a `Justfile` over `deploy/local-proc/`) that runs
-`scarab-server` straight from the tree, giving you a rebuild-and-run loop with no image to
+`scarab-server` straight from the tree, giving you a loop that rebuilds and reruns with no image to
 publish. It runs the durable core end-to-end on your machine. To deploy the packaged chart
 instead — on kind/colima or a live cluster — see [Installation](/scarab-ci/get-started/deploy-helm/);
 the [Overview](/scarab-ci/get-started/overview/) compares the two paths.
@@ -36,7 +36,7 @@ just demo    # submit a one-step pipeline and watch it run to completion
 ```
 
 This posts a pipeline to the running server and follows it to a terminal state — the walking
-skeleton that survives a mid-run control-plane kill.
+skeleton that survives killing the control plane mid-run.
 
 ## Iterate
 
@@ -47,17 +47,17 @@ just docs    # serve this documentation site locally
 just down    # tear the whole stack down
 ```
 
-:::note[The other mode: in-cluster Helm]
-`just up` runs the server as a host process (kind for step Pods). For the real in-cluster path —
-`scarab-server` deployed via the Helm chart on colima, with in-cluster Postgres + MinIO — use
+:::note[The other mode: Helm inside the cluster]
+`just up` runs the server as a host process (kind for step Pods). For the real path inside the cluster —
+`scarab-server` deployed via the Helm chart on colima, with Postgres and MinIO inside the cluster — use
 `just local-helm` (`just local-helm local` builds from the tree; `just local-helm sha-<sha>` pins a
 published build). See [Installation](/scarab-ci/get-started/deploy-helm/).
 :::
 
 :::tip[See the UI]
 `just ui` starts the SolidJS web UI (Vite on <code>http://localhost:5173</code>), which proxies
-`/v1` to the running server. It's an early scaffold today — the rich live-DAG / SSE-logs UI is a
-follow-up.
+`/v1` to the running server. It's an early scaffold today — the rich UI, with a live DAG and logs
+streamed over SSE, is a follow-up.
 :::
 
 ## What just happened

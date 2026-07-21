@@ -22,9 +22,9 @@ Both run the same engine against a real cluster; they differ in how
 
 | If you want to… | Use | Where |
 |---|---|---|
-| Deploy Scarab in-cluster the way it ships — on kind/colima or a live/production cluster | **Helm chart** | [Installation](/scarab-ci/get-started/deploy-helm/) |
-| Iterate on the server from source with a rebuild-and-run loop | **Proc-mode dev loop** | [Run locally](/scarab-ci/get-started/run-locally/) |
-| Reproduce the exact in-cluster deployment on your laptop before shipping | **Helm chart on colima** (`just local-helm`) | [Installation](/scarab-ci/get-started/deploy-helm/) |
+| Deploy Scarab inside the cluster the way it ships — on kind/colima or a live/production cluster | **Helm chart** | [Installation](/scarab-ci/get-started/deploy-helm/) |
+| Iterate on the server from source with a loop that rebuilds and reruns | **Proc-mode dev loop** | [Run locally](/scarab-ci/get-started/run-locally/) |
+| Reproduce the exact deployment inside the cluster on your laptop before shipping | **Helm chart on colima** (`just local-helm`) | [Installation](/scarab-ci/get-started/deploy-helm/) |
 
 The **same Helm chart** targets every environment — a local kind/colima cluster
 and a live production cluster use the identical `helm upgrade --install`. There is
@@ -36,11 +36,11 @@ in seconds.
 
 Whichever path you choose, `scarab-server` needs:
 
-- **Postgres** — the durable coordination substrate; without it the server runs
-  API-only.
+- **Postgres** — the durable coordination substrate; without it the server
+  serves the API only.
 - **An S3-compatible object store** (AWS S3 or in-cluster MinIO) for logs,
   artifacts, and the content-addressed workspace snapshots reruns restore; a
-  local-dir fallback exists for lightweight local runs.
+  fallback to a local directory exists for lightweight local runs.
 - **A Kubernetes namespace with RBAC** so it can launch one Pod per pipeline step.
 
 The [Installation](/scarab-ci/get-started/deploy-helm/) page wires all three up
