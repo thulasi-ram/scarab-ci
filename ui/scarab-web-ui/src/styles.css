@@ -58,6 +58,11 @@
   --radius-sm: 3px;
   --radius-lg: 7px;
 
+  /* Motion: a strong custom ease-out — the built-in CSS easings are too weak to
+     read as intentional. Pressable controls also scale down a hair on :active
+     so the UI confirms it heard the press (see the :active rules below). */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+
   /* Display voice (DESIGN.md §5): Space Grotesk — carries the
      heading/breadcrumb row AND the wordmark. */
   --font-display: "Space Grotesk", "Inter", system-ui, sans-serif;
@@ -292,6 +297,9 @@ code,
     animation: none !important;
     transform: translateX(min(72vw, 900px)) !important;
   }
+  /* Keep color/border feedback, drop the press-scale movement. */
+  .btn:not(:disabled):active, .theme-toggle:active, .search-chip:active,
+  .brand:active, .repo-card:active { transform: none; }
 }
 
 /* The traced emblem as a faint background mark (doodle placement rules). */
@@ -354,13 +362,15 @@ h2 {
   border-radius: var(--radius-sm);
   border: 1px solid transparent;
   cursor: pointer;
-  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  transition: background 0.12s var(--ease-out), border-color 0.12s var(--ease-out),
+    color 0.12s var(--ease-out), transform 0.12s var(--ease-out);
 }
 
 .btn:disabled {
   opacity: 0.5;
   cursor: default;
 }
+.btn:not(:disabled):active { transform: scale(0.97); }
 
 /* Primary: dark pine fill, light text, hover lifts toward emerald */
 .btn-primary {
@@ -1176,7 +1186,9 @@ h2 {
   letter-spacing: 0;
   color: var(--soft-white);
   text-decoration: none;
+  transition: transform 0.12s var(--ease-out);
 }
+.brand:active { transform: scale(0.97); }
 .brand svg { color: var(--copper); }
 .brand-emblem { display: block; }
 .crumbs { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 13px; }
@@ -1190,15 +1202,21 @@ h2 {
   font-family: var(--font-mono); font-size: 11.5px; color: var(--muted-sage);
   background: var(--emerald-surface); border: 1px solid var(--border);
   border-radius: 7px; padding: 5px 11px; cursor: pointer;
+  transition: border-color 0.12s var(--ease-out), color 0.12s var(--ease-out),
+    transform 0.12s var(--ease-out);
 }
 .search-chip:hover { border-color: var(--emerald); color: var(--sage); }
+.search-chip:active { transform: scale(0.97); }
 .theme-toggle {
   display: inline-flex; align-items: center; justify-content: center;
   width: 30px; height: 30px; border-radius: 7px; cursor: pointer;
   background: var(--emerald-surface); border: 1px solid var(--border);
-  color: var(--muted-sage); transition: color 0.12s ease, border-color 0.12s ease;
+  color: var(--muted-sage);
+  transition: color 0.12s var(--ease-out), border-color 0.12s var(--ease-out),
+    transform 0.12s var(--ease-out);
 }
 .theme-toggle:hover { color: var(--copper); border-color: var(--copper); }
+.theme-toggle:active { transform: scale(0.94); }
 .avatar {
   width: 26px; height: 26px; border-radius: 50%;
   background: var(--pine);
@@ -1245,6 +1263,7 @@ h2 {
   text-decoration: underline dotted;
   text-decoration-color: color-mix(in srgb, var(--emerald) 45%, transparent);
   text-underline-offset: 6px;
+  transition: color 0.12s var(--ease-out), text-decoration-color 0.12s var(--ease-out);
 }
 .crumb-head-link:hover {
   color: var(--emerald-bright);
@@ -1362,9 +1381,12 @@ h2 {
   position: relative;
   display: block; text-decoration: none; color: inherit;
   background: var(--emerald-surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
-  padding: 18px 20px; transition: border-color 0.12s ease, background 0.12s ease;
+  padding: 18px 20px;
+  transition: border-color 0.12s var(--ease-out), background 0.12s var(--ease-out),
+    transform 0.12s var(--ease-out);
 }
 .repo-card:hover { border-color: var(--emerald); }
+.repo-card:active { transform: scale(0.985); }
 .repo-card-head { display: flex; align-items: center; gap: 10px; }
 .repo-name { font-family: "Space Grotesk", var(--font-ui); font-size: 15px; font-weight: 600; letter-spacing: -0.3px; color: var(--soft-white); }
 .repo-org { color: var(--muted-sage); font-weight: 400; }
@@ -1391,9 +1413,27 @@ h2 {
   background: none; border: none; cursor: pointer; font-family: var(--font-ui);
   font-size: 14px; color: var(--muted-sage); padding: 0 0 11px; white-space: nowrap;
   border-bottom: 2px solid transparent; margin-bottom: -1px;
+  transition: color 0.12s var(--ease-out);
 }
 .tab:hover { color: var(--sage); }
 .tab.on { color: var(--emerald); border-bottom-color: var(--emerald); font-weight: 600; }
+
+/* Page nav tabs (they carry data-label) emphasise with weight, not just colour
+   — fluidfunctionalism's "weight as feedback". A hidden bold ghost reserves the
+   heavier width so emphasising a tab (on hover, or when it becomes active) never
+   nudges its neighbours. Scoped to [data-label] so the inspector tabs are left
+   alone. */
+.tab[data-label] { display: inline-flex; flex-direction: column; align-items: flex-start; }
+.tab[data-label]::after {
+  content: attr(data-label);
+  font-weight: 600;
+  height: 0;
+  visibility: hidden;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+}
+.tab[data-label]:hover { font-weight: 600; }
 
 /* ---- filters ---- */
 .filters { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
