@@ -9,24 +9,24 @@ import Doodle from '../../../components/Doodle.astro';
 
 ## The model, in brief
 
-A Scarab pipeline is a **flat recursive DAG** (`Pipeline → Step`). The real DSL is a **typed IR**;
-YAML is a frontend and **CEL** provides expressions.
+A **step** is the fundamental unit of work: an OCI **image** plus a **command** — a contract —
+that Scarab runs as a single Kubernetes **Pod**. A **pipeline** is a group of steps, plus how they
+are triggered and wired together. Structurally a pipeline is a **flat recursive DAG**
+(`Pipeline → Step`).
 
-- **`invoke`** is reuse — compile-time inlining of a library pipeline into the caller's DAG.
-- **`matrix`** is a modifier that fans a step out over a set of inputs.
-- A **step** is an OCI image plus a contract.
+The real DSL is a **typed IR**; YAML is a frontend and **CEL** provides expressions.
+`invoke` is reuse — compile-time inlining of a library pipeline into the caller's DAG.
+`matrix` is a modifier that fans a step out over a set of inputs.
 
 Compilation is **static**: the whole DAG — every matrix combination, every inlined library step — is
 materialised and validated at submit time, so a cycle, a dangling `needs`, or an empty matrix
-dimension is rejected up front, never discovered mid-run. Start from
-[Run locally](/scarab-ci/get-started/run-locally/) to submit your first pipeline.
-
-## Where pipelines live
+dimension is rejected up front, never discovered mid-run.
 
 A repo's CI lives in `.scarab/`. A triggered pipeline is a YAML file such as `.scarab/ci.yaml`;
 its file name is the default display name (`ci.yaml` reads as `ci`, overridable with a top-level
-`name:`). Reusable **library** pipelines live under `.scarab/lib/` and are pulled in with `invoke`
-(see [Reuse with `invoke`](#reuse-with-invoke)).
+`name:`). Reusable **library** pipelines live under `.scarab/lib/` and are pulled in with
+[`invoke`](#reuse--invoke). Start from
+[Run locally](/scarab-ci/get-started/run-locally/) to submit your first pipeline.
 
 A minimal pipeline is an `on:` block and a list of `steps`:
 
@@ -44,6 +44,9 @@ steps:
     needs: [checkout]
     command: ["cargo", "check"]
 ```
+
+The rest of this page documents each vocabulary term in turn — from triggers and interface, through
+the step shape, wiring, and reuse, to deploys and operational concerns.
 
 ## Triggers — `on:`
 
@@ -76,7 +79,7 @@ on:
   push: {}
 ```
 
-## Launch parameters — `interface.inputs`
+## Interface — `interface.inputs` (and `outputs`)
 
 A pipeline declares its typed launch parameters under `interface.inputs`. This is the same
 interface an `invoke` caller satisfies with `with:` — one contract for both launching and reuse. A
@@ -106,12 +109,15 @@ steps:
   launch fail-closed.
 
 Resolved parameters are read in steps as `${{ inputs.<name> }}` and are also injected into the
-step environment as `SCARAB_PARAM_<NAME>`.
+step environment as `SCARAB_PARAM_<NAME>`. A **reusable library** pipeline additionally declares the
+`outputs` it exposes to its caller — see [Reuse — `invoke`](#reuse--invoke).
 
-## Steps — image, command, and the built-in kinds
+## Steps — the step shape
 
 The step contract is an OCI `image` plus a `command`; everything else is a modifier. `env` is a list
 of `[NAME, VALUE]` pairs; `artifacts` publishes globs of files the step wrote to `/scarab/artifacts/`.
+A step names the secrets it needs with `secrets: [KEY, ...]` (resolution and scoping is covered under
+[Environments & gates](#environments--gates)).
 
 ```yaml
 - id: check
@@ -131,14 +137,26 @@ of `[NAME, VALUE]` pairs; `artifacts` publishes globs of files the step wrote to
     - "*.txt"
 ```
 
+Privilege above the hardened baseline is requested per step under `security:`. `run_as_root` is
+self-service (root inside the caps-dropped, unprivileged sandbox does not escape it);
+`add_capabilities` and `privileged` are governed and take effect only if the environment whitelists
+the image digest.
+
+```yaml
+- id: check
+  image: rust:1-bookworm      # its USER is root
+  security:
+    run_as_root: true
+```
+
 Some steps are image-less **kinds** the engine runs on your behalf (you set no `image`/`command`):
 
-- **`clone: {}`** — source provisioning (see [Getting source](#getting-source)).
+- **`clone: {}`** — source provisioning (see [The `clone` step](#the-clone-step)).
 - **`build: { image: ..., push: true }`** — a rootless BuildKit image build.
-- **`gate: manual`** — a durable approval/wait point (see [Environments, secrets & gates](#environments-secrets--gates)).
-- **`invoke: .scarab/lib/...`** — compile-time reuse (see [Reuse with `invoke`](#reuse-with-invoke)).
+- **`gate: manual`** — a durable approval/wait point (see [Environments & gates](#environments--gates)).
+- **`invoke: .scarab/lib/...`** — compile-time reuse (see [Reuse — `invoke`](#reuse--invoke)).
 
-### Getting source — the `clone` step
+### The `clone` step
 
 Source is provisioned by a first-class **`clone` step**. It is zero-config by design: the repo,
 ref, resolved SHA, and token all come from the run's trigger context, so `clone: {}` is the common
@@ -158,18 +176,18 @@ case. Downstream steps inherit the cloned workspace through ordinary `needs`.
 Scarab is multi-forge — GitHub and Forgejo are both supported adapters; the `clone` step is
 identical across them.
 
-## Wiring steps — `needs`, `matrix`, and `when`
+## Ordering — `needs`
 
 `needs:` declares the DAG edges. A step runs once all of its needs succeed and inherits their
-workspaces. A `when:` CEL guard skips a step whose predicate is false; expressions read the run's
-context (e.g. `event`, and any `matrix` coordinate):
+workspaces:
 
 ```yaml
 - id: deploy
   image: deployer
   needs: [build]
-  when: "event.branch == 'main'"
 ```
+
+## Fan-out — `matrix`
 
 **`matrix`** fans one authored step into the cartesian product of its dimensions, expanded
 statically at submit time. An `exclude` list of
@@ -189,7 +207,19 @@ CEL predicates (evaluated against each combination's own coordinate) drops combi
 Each instance gets a deterministic id like `test[arch=amd64,os=linux]`, and a downstream
 `needs: [test]` fans in over every surviving instance.
 
-## Reuse with `invoke`
+## Conditions — `when`
+
+A `when:` CEL guard skips a step whose predicate is false; expressions read the run's context
+(e.g. `event`, and any `matrix` coordinate):
+
+```yaml
+- id: deploy
+  image: deployer
+  needs: [build]
+  when: "event.branch == 'main'"
+```
+
+## Reuse — `invoke`
 
 `invoke` inlines a **library** pipeline (under `.scarab/lib/` by convention) into the caller's DAG
 at compile time — not a runtime call.
@@ -227,10 +257,10 @@ steps:
 The interface is validated at compile: every required input present, no unknown extras, and every
 referenced output declared. Supplied inputs reach each inlined step as `SCARAB_PARAM_<NAME>`.
 
-## Passing data — named results & interpolation
+## Results & interpolation
 
 A step publishes **named, typed results** that a downstream step reads at launch via
-`${{ outputs.<step-id>.<name> }}`.
+`${{ outputs.<step-id>.<name> }}`; launch parameters are read the same way as `${{ inputs.<name> }}`.
 Interpolation is resolved at launch time against the upstream step's captured results, so a
 consumer must `needs:` the producer:
 
@@ -244,7 +274,7 @@ consumer must `needs:` the producer:
 Result capture is transparent to authors: on Kubernetes a per-Pod egress sidecar drains each step's
 results back to the control plane — nothing to wire up in the pipeline.
 
-## Environments, secrets & gates — the authoring keys
+## Environments & gates
 
 This section covers only the YAML you author. For the concepts behind them — how secrets are
 stored and scoped, and what an environment governs — see
@@ -305,18 +335,6 @@ profile for anything static.
       schedulerName: my-scheduler
 ```
 
-Privilege above the hardened baseline is requested per step under `security:`. `run_as_root` is
-self-service (root
-inside the caps-dropped, unprivileged sandbox does not escape it); `add_capabilities` and
-`privileged` are governed and take effect only if the environment whitelists the image digest.
-
-```yaml
-- id: check
-  image: rust:1-bookworm      # its USER is root
-  security:
-    run_as_root: true
-```
-
 ## Retries, timeouts & reruns
 
 A step may set a `timeout:` (seconds) and an opt-in `retry:` policy. Retry is
@@ -356,3 +374,4 @@ author for them.
 - [ADR-0055 — Placement profiles: named profiles + baseline + governed `k8s_overlay`](/scarab-ci/tech/adr/0055-placement-profiles/)
 - [ADR-0056 — Run Takes and attempt-grain evidence](/scarab-ci/tech/adr/0056-run-takes-and-attempt-grain-evidence/)
 - [ADR-0057 — Run provenance: trigger context and origin details](/scarab-ci/tech/adr/0057-run-provenance-trigger-context/)
+```
