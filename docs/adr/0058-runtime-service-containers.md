@@ -117,10 +117,14 @@ steps:
 A service image is author-supplied and **no more trusted than a step image**, so it runs under the
 same [0039](0039-privileged-images.md) regime: the hardened **restricted** baseline by default;
 escalations (`run-as-root`, `add-capabilities`, `privileged`) are governed grants keyed on the
-**service image digest** + Environment. Stock DB images (the official `postgres` image starts as
-root to fix perms, then drops) will trip `runAsNonRoot` — but `run-as-root` is the **self-service**
-grant (sandbox-bound), so "my Postgres needs root" is a one-line opt-in, not admin friction. No
-"services are magically trusted" exemption.
+**service image digest** + Environment. Stock DB images (the official `postgres` image *can* start
+as root to fix perms) nonetheless run **non-root here without any grant**: the executor pins the
+image's built-in service uid and sets `fsGroup` so the ephemeral `emptyDir` is group-writable — the
+standard k8s non-root pattern, keeping the service inside the restricted baseline. `run-as-root`
+survives only as a **self-service escape hatch** (sandbox-bound) for the rare image that genuinely
+cannot run non-root — deliberately *not* the default path, because root-in-container is exactly what
+the restricted baseline (and k8s PSS `restricted`, OpenShift's random-uid, rootless runtimes) is
+moving away from. No "services are magically trusted" exemption.
 
 ### Readiness & recovery
 
