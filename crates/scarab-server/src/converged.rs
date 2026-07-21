@@ -10,7 +10,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use scarab_engine::{Clock, Db, Executor, Scheduler, SchedulerError, StepStatus, Supervision};
+use scarab_engine::{
+    Clock, Db, Executor, Scheduler, SchedulerError, ServiceStatus, StepStatus, Supervision,
+};
 use scarab_forge::ForgePort;
 
 use crate::LogTailer;
@@ -49,6 +51,11 @@ pub async fn tick_once(
         if let Err(e) = ensure_log_tails(db, tailer).await {
             tracing::warn!(error = %e, "ensuring log tails failed");
         }
+        // Shared-service log tails (ADR-0058 evidence): same best-effort channel,
+        // keyed on the service instance instead of a step fence.
+        if let Err(e) = ensure_service_tails(db, tailer).await {
+            tracing::warn!(error = %e, "ensuring service log tails failed");
+        }
     }
     if let Some(forge) = forge {
         // Status posting is best-effort within a tick; a failed post stays on the
@@ -70,6 +77,35 @@ async fn ensure_log_tails(db: &Arc<dyn Db>, tailer: &LogTailer) -> Result<(), Sc
         for step in db.steps_of_run(&run).await? {
             if step.status == StepStatus::Running {
                 tailer.ensure(&step);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ensure a best-effort log tail for every **live shared service** of the
+/// current Take across all active runs (ADR-0058). Only the current Take's
+/// instances are tailed (a Rerun's prior Take is being torn down); an instance
+/// without a launch handle, or not yet ready, is skipped and picked up a later
+/// tick. Idempotent per instance — the tailer dedups.
+async fn ensure_service_tails(db: &Arc<dyn Db>, tailer: &LogTailer) -> Result<(), SchedulerError> {
+    for run in db.active_runs().await? {
+        let services = db.run_services(&run).await?;
+        let Some(current_take) = services.iter().map(|s| s.take).max() else {
+            continue;
+        };
+        for s in services {
+            if s.take != current_take {
+                continue;
+            }
+            // A tail needs a launched Pod; readiness is when the container is up
+            // and producing logs. `Starting` has no Pod-log yet; terminal states
+            // have nothing more to add.
+            if !matches!(s.status, ServiceStatus::Ready | ServiceStatus::Running) {
+                continue;
+            }
+            if let Some(handle) = &s.handle {
+                tailer.ensure_service(&run, s.take, &s.name, handle);
             }
         }
     }

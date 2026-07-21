@@ -740,4 +740,17 @@ pub trait Executor: Send + Sync {
     async fn teardown_service(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
     }
+
+    /// Open a best-effort **live tail** of a shared-service unit's stdout/stderr
+    /// (ADR-0058 evidence), addressed by the launch `handle`. Same reliability
+    /// class as [`log_stream`](Self::log_stream): the control plane drains the
+    /// returned [`LogChunks`] into the log pipeline while the service runs, and a
+    /// dropped tail never fails the run. `Ok(None)` = this backend has no log
+    /// source (the default / the host-process local backend), a clean no-op.
+    async fn service_log_stream(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        Ok(None)
+    }
 }

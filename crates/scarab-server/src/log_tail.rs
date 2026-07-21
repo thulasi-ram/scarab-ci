@@ -131,7 +131,50 @@ impl LogTailer {
         };
         let attempt = attempt.id.clone();
         let fence = fence_of(&step.run, &step.step, &attempt);
+        let resource = format!("tail:{}:{}:{}", step.run.0, step.step.0, attempt.0);
+        self.spawn_tail(
+            fence,
+            resource,
+            step.run.clone(),
+            step.step.clone(),
+            attempt,
+            TailSource::Step(step.clone()),
+        );
+    }
 
+    /// Ensure a best-effort tail is running for a **shared service** instance
+    /// (ADR-0058 evidence). Keyed on the synthetic `{run, take, name}` stream
+    /// (see [`crate::logs::service_stream_key`]) so a service's logs replay/tail
+    /// through the exact same pipeline as step logs without a second channel.
+    /// Idempotent per instance; call it every tick for each running service.
+    pub fn ensure_service(&self, run: &RunId, take: i64, name: &str, handle: &str) {
+        let (step, attempt) = crate::logs::service_stream_key(name, take);
+        let fence = fence_of(run, &step, &attempt);
+        let resource = format!("tail:{}:service:{}:{}", run.0, name, attempt.0);
+        self.spawn_tail(
+            fence,
+            resource,
+            run.clone(),
+            step,
+            attempt,
+            TailSource::Service(scarab_engine::ports::ExecHandle(handle.to_string())),
+        );
+    }
+
+    /// The shared spawn/lease/backoff machinery behind [`ensure`](Self::ensure)
+    /// and [`ensure_service`](Self::ensure_service): dedup by fence, claim the
+    /// per-fence tail lease (ADR-0051), drain the `source` into the pipeline under
+    /// `{run, step, attempt}`, then release the fence. `source` selects the
+    /// executor log endpoint (step Pod vs. service Pod).
+    fn spawn_tail(
+        &self,
+        fence: Fence,
+        resource: String,
+        run: RunId,
+        step_id: StepId,
+        attempt: AttemptId,
+        source: TailSource,
+    ) {
         // Already fully drained — the Pod's log is complete; never re-tail it.
         if self.drained.lock().unwrap().contains(&fence) {
             return;
@@ -153,9 +196,6 @@ impl LogTailer {
         let drained = self.drained.clone();
         let retry_at = self.retry_at.clone();
         let lease = self.lease.clone();
-        let step_run = step.clone();
-        let run = step.run.clone();
-        let step_id = step.step.clone();
 
         tokio::spawn(async move {
             // Claim-to-tail (ADR-0051): only the lease holder tails this
@@ -163,7 +203,6 @@ impl LogTailer {
             // the holder's lease expires (crash), a peer takes over here.
             let mut renewer: Option<tokio::task::JoinHandle<()>> = None;
             if let Some((db, owner)) = &lease {
-                let resource = format!("tail:{}:{}:{}", run.0, step_id.0, attempt.0);
                 match db.lease(&resource, owner, TAIL_LEASE_TTL_MS).await {
                     Ok(l) if &l.owner == owner => {
                         // Ours: renew in the background while the drain runs.
@@ -197,7 +236,7 @@ impl LogTailer {
                     }
                 }
             }
-            let result = drain(&*executor, &logs, &step_run, &run, &step_id, &attempt).await;
+            let result = drain(&*executor, &logs, &source, &run, &step_id, &attempt).await;
             if let Some(r) = renewer {
                 r.abort();
             }
@@ -244,18 +283,30 @@ fn is_pod_not_ready(err: &str) -> bool {
     NOT_READY.iter().any(|m| err.contains(m))
 }
 
-/// Open the executor's log source for `step` and pump it into the pipeline. A
+/// The unit whose live log tail is being drained — a step Pod or a shared-service
+/// Pod (ADR-0058). Selects which executor log endpoint the drain opens; both pump
+/// into the same pipeline under the fence's `{run, step, attempt}` stream key.
+enum TailSource {
+    Step(StepRun),
+    Service(scarab_engine::ports::ExecHandle),
+}
+
+/// Open the executor's log source for `source` and pump it into the pipeline. A
 /// backend with no log source (`Ok(None)` — e.g. the local/dev executor) is a
 /// clean no-op.
 async fn drain(
     executor: &dyn Executor,
     logs: &LogService,
-    step_run: &StepRun,
+    source: &TailSource,
     run: &RunId,
     step: &StepId,
     attempt: &AttemptId,
 ) -> Result<(), LogTailError> {
-    match executor.log_stream(step_run).await? {
+    let chunks = match source {
+        TailSource::Step(step_run) => executor.log_stream(step_run).await?,
+        TailSource::Service(handle) => executor.service_log_stream(handle).await?,
+    };
+    match chunks {
         Some(chunks) => {
             pump_log_stream(chunks, logs, run, step, attempt).await?;
             Ok(())

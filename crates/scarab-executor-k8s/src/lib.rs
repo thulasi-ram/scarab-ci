@@ -35,6 +35,10 @@ use scarab_storage::Cas;
 /// pollutes the step's log stream.
 const STEP_CONTAINER: &str = "step";
 
+/// The container name in a standalone shared-service Pod (see [`build_service_pod`]).
+/// The service log tail pins its source to this container (ADR-0058 evidence).
+const SERVICE_POD_CONTAINER: &str = "service";
+
 /// How many bytes the log tail reads per chunk before handing it to the pipeline.
 /// A modest buffer keeps live-tail latency low without a syscall per line.
 const LOG_CHUNK_BYTES: usize = 8 * 1024;
@@ -1090,6 +1094,30 @@ impl Executor for K8sExecutor {
             ignore_missing(services.delete(&sn, &dp).await)?;
         }
         Ok(())
+    }
+
+    /// Best-effort live tail of a shared service's Pod logs (ADR-0058 evidence):
+    /// the service Pod's `service` container, `follow: true` — the same k8s log
+    /// machinery step logs use ([`log_stream`](Self::log_stream)), addressed by
+    /// the launch `handle` (the service Pod name). Errors (Pod still Pending / no
+    /// log yet) are the caller's to retry; the tail is never load-bearing.
+    async fn service_log_stream(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        let pods = self.pods()?;
+        let params = LogParams {
+            follow: true,
+            container: Some(SERVICE_POD_CONTAINER.to_string()),
+            ..LogParams::default()
+        };
+        let reader = pods
+            .log_stream(&handle.0, &params)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        Ok(Some(Box::new(PodLogChunks {
+            reader: Box::pin(reader),
+        })))
     }
 }
 
@@ -2233,7 +2261,7 @@ pub fn build_service_pod(
     run_as_root: bool,
 ) -> Pod {
     let container = Container {
-        name: "service".to_string(),
+        name: SERVICE_POD_CONTAINER.to_string(),
         image: Some(svc.image.clone()),
         command: (!svc.command.is_empty()).then(|| svc.command.clone()),
         args: (!svc.args.is_empty()).then(|| svc.args.clone()),
