@@ -20,7 +20,6 @@ hero:
       variant: minimal
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
 import AsciiScene from '../../components/AsciiScene.astro';
 
 CI tools tend to fall into two camps. **Workflow engines** — Argo, Tekton, Temporal — have a
@@ -36,28 +35,61 @@ it forgets the moment it restarts.
 
 ## What makes it different
 
-<CardGrid>
-  <Card title="One product, not a kit" icon="puzzle">
-    A CI that lives in your forge — DSL, secrets, approvals, identity, UI — on a durable engine.
-    Not a workflow engine you have to build a CI on top of, and not a job-runner CI with nothing
-    durable underneath.
-  </Card>
-  <Card title="Runs are state, not processes" icon="approve-check">
-    A durable state machine on Postgres, in the spirit of DBOS. When the control plane restarts, a
-    run resumes from its last completed step, and each step runs exactly once. That's the
-    architecture doing its job, not a boast.
-  </Card>
-  <Card title="Keyless identity" icon="seti:lock">
-    OIDC that doesn't care which forge you use, with Scarab acting as its own OIDC issuer so runs
-    can federate into your cloud without long-lived keys. Adapters for GitHub and Forgejo are
-    implemented today — see Status.
-  </Card>
-  <Card title="A real DSL" icon="seti:config">
-    A typed intermediate representation — the actual DSL — with a YAML frontend and CEL
-    expressions. Under it all is one flat recursive DAG, where <code>invoke</code> is how you reuse
-    a pipeline and matrix is just a modifier.
-  </Card>
-</CardGrid>
+<figure class="sc-home-camps" role="img" aria-label="Workflow engines have a durable core but are not CI; forge CIs are batteries-included but not durable. Scarab is both at once.">
+  <svg viewBox="0 0 640 224" xmlns="http://www.w3.org/2000/svg" class="sc-home-camps-svg">
+    <defs>
+      <marker id="sc-home-chev" viewBox="0 0 8 8" refX="4" refY="6.4" markerWidth="7" markerHeight="7" orient="auto">
+        <path d="M1.4 3 L4 6 L6.6 3" class="sc-home-chev-head" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+      </marker>
+    </defs>
+    <g class="sc-home-camp">
+      <rect x="34" y="20" width="214" height="62" rx="12" class="sc-home-camp-box"/>
+      <text x="141" y="47" class="sc-home-camp-title" text-anchor="middle">workflow engines</text>
+      <text x="141" y="66" class="sc-home-camp-sub" text-anchor="middle">durable core &middot; not CI</text>
+    </g>
+    <g class="sc-home-camp">
+      <rect x="392" y="20" width="214" height="62" rx="12" class="sc-home-camp-box"/>
+      <text x="499" y="47" class="sc-home-camp-title" text-anchor="middle">forge CIs</text>
+      <text x="499" y="66" class="sc-home-camp-sub" text-anchor="middle">batteries &middot; not durable</text>
+    </g>
+    <path d="M141 82 C141 122 282 110 282 148" class="sc-home-flow" fill="none" marker-end="url(#sc-home-chev)"/>
+    <path d="M499 82 C499 122 358 110 358 148" class="sc-home-flow" fill="none" marker-end="url(#sc-home-chev)"/>
+    <rect x="230" y="150" width="180" height="56" rx="13" class="sc-home-both-box"/>
+    <text x="320" y="176" class="sc-home-both-title" text-anchor="middle">Scarab</text>
+    <text x="320" y="193" class="sc-home-both-sub" text-anchor="middle">both at once</text>
+  </svg>
+</figure>
+
+<dl class="sc-home-specsheet">
+  <div class="sc-home-spec-row">
+    <dt class="sc-home-spec-key">cohesion</dt>
+    <dd class="sc-home-spec-body">
+      <p class="sc-home-spec-claim">One product, not a kit.</p>
+      <p class="sc-home-spec-support">A CI that lives in your forge — DSL, secrets, approvals, identity, UI — on a durable engine. Not a workflow engine you have to build a CI on top of, and not a job-runner CI with nothing durable underneath.</p>
+    </dd>
+  </div>
+  <div class="sc-home-spec-row">
+    <dt class="sc-home-spec-key">durability</dt>
+    <dd class="sc-home-spec-body">
+      <p class="sc-home-spec-claim">Runs are state, not processes.</p>
+      <p class="sc-home-spec-support">A durable state machine on Postgres, in the spirit of DBOS. When the control plane restarts, a run resumes from its last completed step, and each step runs exactly once. That's the architecture doing its job, not a boast.</p>
+    </dd>
+  </div>
+  <div class="sc-home-spec-row">
+    <dt class="sc-home-spec-key">identity</dt>
+    <dd class="sc-home-spec-body">
+      <p class="sc-home-spec-claim">Keyless by design.</p>
+      <p class="sc-home-spec-support">OIDC that doesn't care which forge you use, with Scarab acting as its own OIDC issuer so runs can federate into your cloud without long-lived keys. Adapters for GitHub and Forgejo are implemented today — see Status.</p>
+    </dd>
+  </div>
+  <div class="sc-home-spec-row">
+    <dt class="sc-home-spec-key">the DSL</dt>
+    <dd class="sc-home-spec-body">
+      <p class="sc-home-spec-claim">A real language, not templated YAML.</p>
+      <p class="sc-home-spec-support">A typed intermediate representation with a YAML frontend and CEL expressions. Under it all is one flat recursive DAG, where <code>invoke</code> is reuse and matrix is just a modifier.</p>
+    </dd>
+  </div>
+</dl>
 
 ## Why now
 
@@ -83,16 +115,22 @@ leaning on AI can now hold.
 
 ## Where to go next
 
-<CardGrid>
-  <Card title="Run it locally" icon="rocket">
-    Bring up Postgres + MinIO + a kind cluster and watch a pipeline complete — [Run
-    locally](/scarab-ci/get-started/run-locally/).
-  </Card>
-  <Card title="Read the design" icon="open-book">
-    The thesis, the durability contract, and the ubiquitous language live in the
-    [Tech](/scarab-ci/tech/context/) section — 40+ ADRs on the *why* behind every choice.
-  </Card>
-</CardGrid>
+<div class="sc-home-next">
+  <a class="sc-home-next-el" href="/scarab-ci/get-started/run-locally/">
+    <span class="sc-home-next-main">
+      <span class="sc-home-next-label">Run it locally</span>
+      <span class="sc-home-next-desc">bring up Postgres + MinIO + a kind cluster and watch a pipeline complete</span>
+    </span>
+    <span class="sc-home-next-arrow" aria-hidden="true">&rarr;</span>
+  </a>
+  <a class="sc-home-next-el" href="/scarab-ci/tech/context/">
+    <span class="sc-home-next-main">
+      <span class="sc-home-next-label">Read the design</span>
+      <span class="sc-home-next-desc">the thesis, the durability contract, and the ubiquitous language — 40+ ADRs on the why</span>
+    </span>
+    <span class="sc-home-next-arrow" aria-hidden="true">&rarr;</span>
+  </a>
+</div>
 
 :::note[Status — honest]
 A proven core, with real forge and Kubernetes I/O wired in around it. **Proven against real
@@ -109,3 +147,148 @@ machine with its edges freshly wired up — implemented, but not yet battle-test
 ## References
 
 - [ADR-0005 — Tenancy & deployment: Kubernetes as the only backend](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)
+
+<style>{`
+/* ===== Home-page scoped styles (sc-home-*) — do not leak to other pages ===== */
+
+/* ---- Positioning diagram ---- */
+.sc-home-camps { margin: 0 0 2.5rem; padding: 0; }
+.sc-home-camps-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  max-width: 560px;
+  margin-inline: auto;
+}
+.sc-home-camp-box, .sc-home-both-box {
+  fill: color-mix(in oklab, var(--scarab-emerald) 4%, transparent);
+  stroke-width: 1.25;
+  stroke-dasharray: 1.5 4;
+  stroke-linecap: round;
+}
+.sc-home-camp-box { stroke: color-mix(in oklab, var(--muted-foreground, gray) 55%, transparent); }
+.sc-home-both-box {
+  stroke: var(--scarab-copper);
+  stroke-dasharray: 2 4;
+  fill: color-mix(in oklab, var(--scarab-copper) 9%, transparent);
+}
+.sc-home-camp-title, .sc-home-both-title {
+  font-family: var(--sl-font-mono);
+  font-size: 14px;
+  font-weight: 500;
+  fill: var(--foreground, var(--sl-color-white));
+}
+.sc-home-both-title { fill: var(--scarab-copper); font-size: 15px; }
+.sc-home-camp-sub, .sc-home-both-sub {
+  font-family: var(--sl-font-mono);
+  font-size: 10.5px;
+  fill: var(--muted-foreground, var(--sl-color-gray-3));
+}
+.sc-home-both-sub { fill: color-mix(in oklab, var(--scarab-copper) 80%, var(--muted-foreground)); }
+.sc-home-flow {
+  stroke: var(--scarab-emerald);
+  stroke-width: 1.5;
+  stroke-dasharray: 1.5 5;
+  stroke-linecap: round;
+  opacity: 0.9;
+}
+.sc-home-chev-head {
+  stroke: var(--scarab-emerald);
+  stroke-width: 1.4;
+}
+
+/* ---- Spec-sheet definition list ---- */
+.sc-home-specsheet { margin: 0 0 0.5rem; padding: 0; }
+.sc-home-spec-row {
+  display: grid;
+  grid-template-columns: 10.5rem 1fr;
+  gap: 1.5rem;
+  padding: 1.15rem 0;
+  border-top: 1px dotted color-mix(in oklab, var(--scarab-emerald) 26%, var(--border));
+  align-items: baseline;
+}
+.sc-home-spec-row:last-child {
+  border-bottom: 1px dotted color-mix(in oklab, var(--scarab-emerald) 26%, var(--border));
+}
+.sc-home-spec-key {
+  font-family: var(--sl-font-mono);
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--scarab-emerald);
+  letter-spacing: 0.01em;
+  position: relative;
+  padding-left: 0.9rem;
+}
+.sc-home-spec-key::before {
+  content: "\\2022";
+  position: absolute;
+  left: 0;
+  color: color-mix(in oklab, var(--scarab-emerald) 60%, transparent);
+}
+.sc-home-spec-body { margin: 0; }
+.sc-home-spec-claim {
+  margin: 0 0 0.35rem;
+  font-weight: 700;
+  font-size: 1.05rem;
+  line-height: 1.35;
+  color: var(--foreground, var(--sl-color-white));
+}
+.sc-home-spec-support {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.6;
+  color: var(--muted-foreground, var(--sl-color-gray-3));
+  max-width: 46rem;
+}
+
+/* ---- Editorial "next" links ---- */
+.sc-home-next { margin: 0; }
+.sc-home-next-el {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 1.3rem 0.25rem 1.3rem 0;
+  text-decoration: none !important;
+  border-top: 1px dotted color-mix(in oklab, var(--scarab-emerald) 26%, var(--border));
+  color: inherit;
+  transition: padding-left 0.18s ease, background 0.18s ease;
+}
+.sc-home-next-el:last-child {
+  border-bottom: 1px dotted color-mix(in oklab, var(--scarab-emerald) 26%, var(--border));
+}
+.sc-home-next-el:hover { padding-left: 0.75rem; }
+.sc-home-next-main { display: flex; flex-direction: column; gap: 0.3rem; flex: 1; }
+.sc-home-next-label {
+  font-family: var(--sl-font-mono);
+  font-size: 1.25rem;
+  font-weight: 500;
+  color: var(--foreground, var(--sl-color-white));
+  letter-spacing: -0.01em;
+}
+.sc-home-next-el:hover .sc-home-next-label { color: var(--scarab-emerald); }
+.sc-home-next-desc {
+  font-size: 0.9rem;
+  color: var(--muted-foreground, var(--sl-color-gray-3));
+  line-height: 1.5;
+}
+.sc-home-next-arrow {
+  font-family: var(--sl-font-mono);
+  font-size: 1.6rem;
+  color: var(--scarab-emerald);
+  transition: transform 0.18s ease;
+  flex-shrink: 0;
+}
+.sc-home-next-el:hover .sc-home-next-arrow { transform: translateX(4px); }
+
+/* ---- Responsive ---- */
+@media (max-width: 640px) {
+  .sc-home-spec-row { grid-template-columns: 1fr; gap: 0.5rem; }
+  .sc-home-next-el { gap: 0.75rem; }
+  .sc-home-next-label { font-size: 1.05rem; }
+}
+
+/* ---- Reduced motion: no essential motion; disable hover transitions ---- */
+@media (prefers-reduced-motion: reduce) {
+  .sc-home-next-el, .sc-home-next-arrow { transition: none; }
+}
+`}</style>
