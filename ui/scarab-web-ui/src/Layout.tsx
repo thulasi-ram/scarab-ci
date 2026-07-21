@@ -39,7 +39,9 @@ export default function Layout(props: ParentProps) {
           title={theme() === "dark" ? "Switch to light" : "Switch to dark"}
           aria-label="Toggle theme"
         >
-          <Icon icon={theme() === "dark" ? "sun" : "moon"} size={15} />
+          {/* Both rendered, stacked; CSS crossfades/rotates on theme change. */}
+          <Icon icon="sun" size={15} class="tt-icon tt-sun" />
+          <Icon icon="moon" size={15} class="tt-icon tt-moon" />
         </button>
         <UserMenu />
       </nav>
