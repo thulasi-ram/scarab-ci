@@ -1,0 +1,22 @@
+# A small reusable **library pipeline** (ADR-0038) — invoked + inlined at
+# compile time by dogfood.yaml's `notify` step. A library declares its reuse
+# `interface` (the inputs a caller must pass via `with:`); its steps are
+# flattened into the caller's DAG, id-namespaced by the invoke-step id.
+interface:
+  inputs:
+    # A typed, optional input with a default — supplied by the caller's `with:`
+    # and injected into every inlined step as `SCARAB_PARAM_CHANNEL`.
+    - name: channel
+      type: string
+      required: false
+      default: general
+      description: Chat channel to post the deploy notification to.
+
+steps:
+  - id: post
+    image: curlimages/curl:8.10.1
+    command:
+      - sh
+      - -c
+      # `${{ inputs.channel }}` — reference the library's own launch input.
+      - 'echo "posting deploy notification to #${{ inputs.channel }}"'

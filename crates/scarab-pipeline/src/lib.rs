@@ -4083,4 +4083,33 @@ mod tests {
             "{errs:?}"
         );
     }
+
+    // --- kitchen-sink sample guard --------------------------------------------
+
+    /// The repo's `.scarab/dogfood.yaml` kitchen-sink sample (and the library it
+    /// invokes) must always compile to IR — this guards the teaching sample in CI
+    /// so a schema change can never leave it stale/broken. The invoke is resolved
+    /// against the inlined library source, mirroring the server trigger path.
+    #[test]
+    fn dogfood_sample_compiles() {
+        let dogfood = include_str!("../../../.scarab/dogfood.yaml");
+        let notify = include_str!("../../../.scarab/lib/notify.yaml");
+        let libs = libs(&[(".scarab/lib/notify.yaml", notify)]);
+        let ir = compile_yaml_with_libs(dogfood, &libs)
+            .expect("the dogfood kitchen-sink sample must compile to IR");
+
+        // A few features must have survived compilation.
+        assert!(ir.steps.iter().any(|s| s.is_clone()), "has a clone step");
+        assert!(!ir.services.is_empty(), "has pipeline-level shared services");
+        assert_eq!(ir.environment.as_deref(), Some("production"));
+        assert!(ir.interface.inputs.iter().any(|p| p.name == "deploy_env"));
+        // Matrix expanded (2 x 2 minus one exclude = 3 instances), invokes inlined.
+        assert_eq!(
+            ir.steps.iter().filter(|s| s.id.starts_with("test[")).count(),
+            3,
+            "matrix expanded with the excluded combo dropped"
+        );
+        assert!(ir.steps.iter().all(|s| !s.is_invoke()), "invokes inlined");
+        assert!(ir.steps.iter().any(|s| s.id == "notify/post"), "library step inlined");
+    }
 }
