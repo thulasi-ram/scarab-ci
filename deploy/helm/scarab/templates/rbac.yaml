@@ -37,6 +37,18 @@ rules:
     # helpers (ADR-0029/0045 CAS materialize/ingest).
     resources: ["pods/exec"]
     verbs: ["create", "get"]
+  - apiGroups: [""]
+    # Shared services (ADR-0058): the executor creates a cluster-DNS Service per
+    # shared-service instance so opt-in step Pods can reach it, and deletes it on
+    # Run/Take teardown. (The service *Pod* itself is covered by the pods rule.)
+    resources: ["services"]
+    verbs: ["get", "create", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    # Shared services (ADR-0058): a NetworkPolicy scopes reachability of each
+    # shared service to the Pods that opted in via `uses:`; created with the
+    # service and deleted on teardown.
+    resources: ["networkpolicies"]
+    verbs: ["get", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
