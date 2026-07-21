@@ -79,6 +79,22 @@ async fn tick(db: &InMemoryDb, clock: &FakeClock, exec: &FakeExecutor, run: &Run
     .unwrap();
 }
 
+/// One converged cross-run tick (`tick_all`) — the background-loop entrypoint,
+/// where per-run tick isolation lives (git-bug 6825830).
+async fn tick_all(db: &InMemoryDb, clock: &FakeClock, exec: &FakeExecutor) {
+    Scheduler::new(
+        db as &dyn Db,
+        clock as &dyn Clock,
+        exec as &dyn Executor,
+        "drv",
+    )
+    .with_outbox_visibility_ms(0)
+    .with_service_ready_timeout_ms(1_000)
+    .tick_all()
+    .await
+    .unwrap();
+}
+
 fn has_unready_diag(events: &[scarab_engine::EventKind], step: &str) -> bool {
     events.iter().any(|e| {
         matches!(&e.kind, scarab_engine::EventPayload::StepServicesUnready { step: s, .. } if s.0 == step)
@@ -312,5 +328,214 @@ async fn non_opt_in_step_survives_service_death() {
         status_of(&steps, "migrate"),
         StepStatus::Failed,
         "the opt-in step fails fail-closed"
+    );
+}
+
+/// (Fix A) Poison launch: `launch_service` never succeeds. The launch error is
+/// bounded by the SAME readiness deadline (git-bug 6825830) — it must NOT abort
+/// the tick and retry forever. Within the budget the row stays `Starting`; past
+/// it the service Fails fail-closed, the opt-in step fails, and the Run reaches
+/// a terminal state (forward progress, not an infinite launch loop).
+#[tokio::test]
+async fn poison_launch_bounded_reaches_terminal_not_infinite_loop() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-poison".into());
+    db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run,
+        &ir_with_db_service(json!([{ "id": "migrate", "image": "busybox", "uses": ["db"] }])),
+    )
+    .await
+    .unwrap();
+    db.create_step_run(&run, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.seed_run(&run, RunStatus::Running);
+
+    let clock = FakeClock::new(0);
+    let exec = FakeExecutor::new();
+    exec.fail_service_launches(u32::MAX); // launch never succeeds
+
+    // A launch that keeps erroring does NOT abort the tick: it succeeds, the row
+    // is durably `Starting` within the budget, the opt-in step is held.
+    tick(&db, &clock, &exec, &run).await;
+    assert_eq!(
+        service(&db.run_services(&run).await.unwrap(), 1, "db").status,
+        ServiceStatus::Starting,
+        "held Starting within the budget while the launch keeps erroring"
+    );
+    assert_eq!(
+        status_of(&db.steps_of_run(&run).await.unwrap(), "migrate"),
+        StepStatus::Pending
+    );
+    assert!(
+        exec.launched_services().is_empty(),
+        "no launch ever succeeded"
+    );
+
+    // Past the readiness budget the launch error is bounded fail-closed.
+    clock.advance(2_000);
+    tick(&db, &clock, &exec, &run).await;
+
+    assert_eq!(
+        service(&db.run_services(&run).await.unwrap(), 1, "db").status,
+        ServiceStatus::Failed,
+        "launch-error bound → service Failed at the deadline"
+    );
+    assert_eq!(
+        status_of(&db.steps_of_run(&run).await.unwrap(), "migrate"),
+        StepStatus::Failed,
+        "opt-in step fails fail-closed"
+    );
+    assert!(has_unready_diag(&db.events(&run).await.unwrap(), "migrate"));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Failed),
+        "forward progress: a terminal state, not an infinite launch loop"
+    );
+    assert_eq!(
+        db.run_services(&run).await.unwrap().len(),
+        1,
+        "exactly one row ever born (the budget IS the bound — no counter)"
+    );
+}
+
+/// (Fix A) Transient launch: `launch_service` errors on the first attempts then
+/// succeeds within the readiness window. The bounded errors are swallowed (the
+/// row stays `Starting`), the service becomes `Ready`, and the opt-in step runs
+/// to success — the resilient path, no dead-letter (git-bug 6825830).
+#[tokio::test]
+async fn transient_launch_recovers_within_budget() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-transient".into());
+    db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run,
+        &ir_with_db_service(json!([{ "id": "migrate", "image": "busybox", "uses": ["db"] }])),
+    )
+    .await
+    .unwrap();
+    db.create_step_run(&run, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.seed_run(&run, RunStatus::Running);
+
+    // The clock stays at 0 — well inside the 1_000ms budget for the whole test.
+    let clock = FakeClock::new(0);
+    let exec = FakeExecutor::new();
+    exec.fail_service_launches(2); // first two launch attempts fail, then succeed
+    let db_handle = FakeExecutor::service_handle("run-transient", 1, "db");
+    exec.mark_service_ready(&db_handle);
+    exec.script_outcome(scarab_engine::ports::ExecState::Succeeded);
+
+    // First tick: the launch errors (fail #1), caught within the budget, row
+    // durably Starting with no handle — nothing launched yet.
+    tick(&db, &clock, &exec, &run).await;
+    assert_eq!(
+        service(&db.run_services(&run).await.unwrap(), 1, "db").status,
+        ServiceStatus::Starting,
+        "held Starting while the transient error is swallowed"
+    );
+    assert!(exec.launched_services().is_empty(), "no launch has succeeded yet");
+
+    // Further ticks inside the window: fail #2 is swallowed, the third launch
+    // succeeds, the service becomes Ready, and the opt-in step runs to success.
+    for _ in 0..5 {
+        tick(&db, &clock, &exec, &run).await;
+    }
+
+    // The FakeExecutor only records a launch on SUCCESS — one recorded launch
+    // after two swallowed failures proves the resilient recovery within budget.
+    assert_eq!(
+        exec.launched_services(),
+        vec![db_handle.0.clone()],
+        "launched exactly once, only after the two transient errors cleared"
+    );
+    assert_ne!(
+        service(&db.run_services(&run).await.unwrap(), 1, "db").status,
+        ServiceStatus::Failed,
+        "the service recovered — it was never failed-closed"
+    );
+    assert_eq!(
+        status_of(&db.steps_of_run(&run).await.unwrap(), "migrate"),
+        StepStatus::Succeeded,
+        "the opt-in step proceeds against the recovered service"
+    );
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded),
+        "no dead-letter — the Run succeeds"
+    );
+}
+
+/// (Fix B) Per-run tick isolation: a `reconcile_services` error on ONE run
+/// (here a poisoned readiness probe — a non-launch error that still `?`-escapes)
+/// must not abort the whole converged tick and starve the other runs. Run A
+/// (iterated first) errors; run B (iterated after) must still make forward
+/// progress in the same `tick_all` cycle (git-bug 6825830).
+#[tokio::test]
+async fn reconcile_error_on_one_run_does_not_starve_another() {
+    let db = InMemoryDb::new();
+    let clock = FakeClock::new(0);
+    let exec = FakeExecutor::new();
+
+    // Run A: `db` already Starting with a handle; its readiness probe is poisoned
+    // so reconcile_services(A) returns Err. ("run-a" sorts before "run-b", same
+    // priority + creation time → A is iterated first in `active_runs`.)
+    let run_a = RunId("run-a".into());
+    db.create_run(&run_a, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run_a,
+        &ir_with_db_service(json!([{ "id": "migrate", "image": "busybox", "uses": ["db"] }])),
+    )
+    .await
+    .unwrap();
+    db.create_step_run(&run_a, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.seed_run(&run_a, RunStatus::Running);
+    let a_handle = FakeExecutor::service_handle("run-a", 1, "db");
+    db.create_run_service(&run_a, 1, "db", Timestamp(0)).await.unwrap();
+    db.set_run_service(&run_a, 1, "db", ServiceStatus::Starting, Some(&a_handle.0))
+        .await
+        .unwrap();
+    exec.fail_service_ready(&a_handle);
+
+    // Run B: a fresh run whose `db` service should still be born + launched this
+    // same cycle despite run A's reconcile error.
+    let run_b = RunId("run-b".into());
+    db.create_run(&run_b, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run_b,
+        &ir_with_db_service(json!([{ "id": "migrate", "image": "busybox", "uses": ["db"] }])),
+    )
+    .await
+    .unwrap();
+    db.create_step_run(&run_b, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.seed_run(&run_b, RunStatus::Running);
+    let b_handle = FakeExecutor::service_handle("run-b", 1, "db");
+
+    // Without per-run isolation, run A's reconcile error would `?`-abort the whole
+    // tick (the `.unwrap()` in `tick_all` would panic) and run B would never be
+    // reconciled.
+    tick_all(&db, &clock, &exec).await;
+
+    // Run B made forward progress this cycle.
+    assert_eq!(
+        service(&db.run_services(&run_b).await.unwrap(), 1, "db").status,
+        ServiceStatus::Starting,
+        "run B's service is born despite run A's reconcile error"
+    );
+    assert!(
+        exec.launched_services().contains(&b_handle.0),
+        "run B's service is launched despite run A's reconcile error"
+    );
+    // Run A was merely skipped this cycle — its row is untouched, not aborted.
+    assert_eq!(
+        service(&db.run_services(&run_a).await.unwrap(), 1, "db").status,
+        ServiceStatus::Starting,
+        "run A's poisoned reconcile leaves its row unchanged, not aborted"
     );
 }

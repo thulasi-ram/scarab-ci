@@ -1454,6 +1454,14 @@ struct FakeExecState {
     ready_services: std::collections::HashSet<String>,
     /// Service handles torn down via `teardown_service`, in call order.
     services_torn_down: Vec<String>,
+    /// Remaining number of `launch_service` calls to fail before succeeding
+    /// (ADR-0058 launch-error bound, git-bug 6825830). `u32::MAX` models a
+    /// poison launch that never recovers; a small N models a transient blip.
+    service_launch_failures: u32,
+    /// Service handles whose readiness probe should return `Err` — drives a
+    /// `reconcile_services` error that is NOT a launch error, for the per-run
+    /// tick-isolation test (git-bug 6825830).
+    service_ready_failures: std::collections::HashSet<String>,
 }
 
 /// An [`Executor`] whose behaviour a test scripts: it can be told that a given
@@ -1570,6 +1578,25 @@ impl FakeExecutor {
             .remove(&handle.0);
     }
 
+    /// Make the next `n` `launch_service` calls return `Err` before any
+    /// succeeds (ADR-0058 launch-error bound, git-bug 6825830). `n = u32::MAX`
+    /// models a poison launch that never recovers; a small `n` models a
+    /// transient/since-fixed error that recovers on a later tick.
+    pub fn fail_service_launches(&self, n: u32) {
+        self.inner.lock().unwrap().service_launch_failures = n;
+    }
+
+    /// Make `service_ready` for `handle` return `Err` — a non-launch
+    /// `reconcile_services` error, for the per-run tick-isolation test
+    /// (git-bug 6825830).
+    pub fn fail_service_ready(&self, handle: &ExecHandle) {
+        self.inner
+            .lock()
+            .unwrap()
+            .service_ready_failures
+            .insert(handle.0.clone());
+    }
+
     /// Handles of shared services launched via `launch_service`, in call order.
     pub fn launched_services(&self) -> Vec<String> {
         self.inner.lock().unwrap().services_launched.clone()
@@ -1646,6 +1673,16 @@ impl Executor for FakeExecutor {
     ) -> Result<ExecHandle, ExecError> {
         let handle = Self::service_handle(&run.0, take, name);
         let mut st = self.inner.lock().unwrap();
+        // Scripted launch failure (git-bug 6825830): consume one budgeted failure
+        // and reject *before* recording the launch, so a failed launch never
+        // counts as one and the launch-error bound path is exercised.
+        if st.service_launch_failures > 0 {
+            st.service_launch_failures = st.service_launch_failures.saturating_sub(1);
+            return Err(ExecError::Launch(format!(
+                "scripted launch_service failure for {}",
+                handle.0
+            )));
+        }
         // Idempotent on the {run, take, name} fence: record the launch once.
         if !st.services_launched.contains(&handle.0) {
             st.services_launched.push(handle.0.clone());
@@ -1654,7 +1691,14 @@ impl Executor for FakeExecutor {
     }
 
     async fn service_ready(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
-        Ok(self.inner.lock().unwrap().ready_services.contains(&handle.0))
+        let st = self.inner.lock().unwrap();
+        if st.service_ready_failures.contains(&handle.0) {
+            return Err(ExecError::Other(format!(
+                "scripted service_ready failure for {}",
+                handle.0
+            )));
+        }
+        Ok(st.ready_services.contains(&handle.0))
     }
 
     async fn teardown_service(&self, handle: &ExecHandle) -> Result<(), ExecError> {
