@@ -7,8 +7,11 @@ import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="terminal" size={200} rotate={-10} opacity={0.18} top="7rem" right="-2rem" />
 
-The repo ships a one-command dev harness (a `Justfile` over `deploy/local-proc/`). This is the path
-that works **today** — it runs the durable core end-to-end on your machine.
+The repo ships a one-command dev harness (a `Justfile` over `deploy/local-proc/`) that runs
+`scarab-server` straight from the tree, giving you a rebuild-and-run loop with no image to
+publish. It runs the durable core end-to-end on your machine. To deploy the packaged chart
+instead — on kind/colima or a live cluster — see [Installation](/scarab-ci/get-started/deploy-helm/);
+the [Overview](/scarab-ci/get-started/overview/) compares the two paths.
 
 ## Prerequisites
 
@@ -48,7 +51,7 @@ just down    # tear the whole stack down
 `just up` runs the server as a host process (kind for step Pods). For the real in-cluster path —
 `scarab-server` deployed via the Helm chart on colima, with in-cluster Postgres + MinIO — use
 `just local-helm` (`just local-helm local` builds from the tree; `just local-helm sha-<sha>` pins a
-published build). See [Deploy with Helm](/scarab-ci/get-started/deploy-helm/).
+published build). See [Installation](/scarab-ci/get-started/deploy-helm/).
 :::
 
 :::tip[See the UI]

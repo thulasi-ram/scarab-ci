@@ -62,7 +62,7 @@ export default defineConfig({
           // Links are relative to the site root; Starlight prepends `base`
           // (/scarab-ci/) itself — including it here would double it.
           navLinks: [
-            { label: 'Get Started', link: '/get-started/run-locally/' },
+            { label: 'Get Started', link: '/get-started/overview/' },
             { label: 'Guides', link: '/guides/authoring/' },
             { label: 'Tech', link: '/tech/context/' },
           ],
@@ -78,8 +78,9 @@ export default defineConfig({
         {
           label: 'Get Started',
           items: [
+            { label: 'Overview', slug: 'get-started/overview' },
+            { label: 'Installation', slug: 'get-started/deploy-helm' },
             { label: 'Run locally', slug: 'get-started/run-locally' },
-            { label: 'Deploy with Helm', slug: 'get-started/deploy-helm' },
           ],
         },
         {

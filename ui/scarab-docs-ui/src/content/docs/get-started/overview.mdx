@@ -1,0 +1,70 @@
+---
+title: Overview
+description: What you need to run Scarab, and the two ways to bring it up — the Helm chart on any Kubernetes cluster, or the local proc-mode dev loop.
+---
+
+import Doodle from '../../../components/Doodle.astro';
+
+<Doodle icon="waypoints" size={210} rotate={-8} opacity={0.17} top="7rem" right="-2rem" />
+
+Scarab is a Kubernetes-native CI engine — every pipeline step runs as a Pod, so
+you always need a **Kubernetes cluster** to run against. That cluster can live on
+your laptop (kind / colima) or be a real, remote/production cluster — Scarab does
+not care which.
+
+There are two ways to bring Scarab up. They are both legitimate — pick the one
+that fits what you're doing, not a "real" one versus a "toy" one.
+
+```
+   A Kubernetes cluster — local (kind / colima) or remote/production.
+
+
+   HELM CHART  ·  deploy on any cluster
+   ─────────────────────────────────────
+     helm upgrade --install  (via `just local-helm` on kind/colima,
+       └─▶ any Kubernetes         or plain helm on a real cluster)
+             scarab-server runs in-cluster
+
+
+   PROC-MODE LOOP  ·  fast local dev iteration
+   ─────────────────────────────────────
+     just up → just serve / just ui
+       └─▶ scarab-server as a host process, kind for step Pods
+             rebuild-and-run in seconds, no image to publish
+```
+
+## Which path?
+
+Both run the same engine against a real cluster; they differ in how
+`scarab-server` itself is deployed and how quickly you can iterate.
+
+| If you want to… | Use | Where |
+|---|---|---|
+| Deploy Scarab in-cluster the way it ships — on kind/colima or a live/production cluster | **Helm chart** | [Installation](/scarab-ci/get-started/deploy-helm/) |
+| Iterate on the server from source with a rebuild-and-run loop | **Proc-mode dev loop** | [Run locally](/scarab-ci/get-started/run-locally/) |
+| Reproduce the exact in-cluster deployment on your laptop before shipping | **Helm chart on colima** (`just local-helm`) | [Installation](/scarab-ci/get-started/deploy-helm/) |
+
+The **same Helm chart** targets every environment — a local kind/colima cluster
+and a live production cluster use the identical `helm upgrade --install`. There is
+no separate "production build"; the proc-mode loop just swaps the packaged image
+for a `scarab-server` you run straight from the tree, so you can rebuild and rerun
+in seconds.
+
+## What Scarab needs
+
+Whichever path you choose, `scarab-server` needs:
+
+- **Postgres** — the durable coordination substrate; without it the server runs
+  API-only.
+- **An S3-compatible object store** (AWS S3 or in-cluster MinIO) for logs,
+  artifacts, and the content-addressed workspace snapshots reruns restore; a
+  local-dir fallback exists for lightweight local runs.
+- **A Kubernetes namespace with RBAC** so it can launch one Pod per pipeline step.
+
+The [Installation](/scarab-ci/get-started/deploy-helm/) page wires all three up
+through the chart; the [Run locally](/scarab-ci/get-started/run-locally/) recipes
+stand them up for you on your machine.
+
+## References
+
+- [ADR-0005 — Tenancy & deployment: Kubernetes as the only backend](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)
