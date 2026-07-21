@@ -768,8 +768,9 @@ impl<'a> Scheduler<'a> {
                 // Shared-service readiness gate (ADR-0058): a step that `uses:` a
                 // service waits until that service is ready — a durable suspend,
                 // per-step (never a whole-run suspend like a gate). A step with no
-                // `uses:` never waits. Fail-closed: a service that failed to come
-                // up (ready-timeout) fails its opt-in steps with an
+                // `uses:` never waits. Fail-closed: a service that is `Failed` —
+                // whether it never came up (startup ready-timeout) or died after
+                // being healthy (mid-run death) — fails its opt-in steps with an
                 // unbound-dependency diagnostic.
                 let uses = self
                     .db
@@ -2045,8 +2046,13 @@ impl<'a> Scheduler<'a> {
                             .set_run_service(run, take, &svc.name, crate::ServiceStatus::Ready, None)
                             .await?;
                     } else if now.0 - r.created_at.0 > self.cfg.service_ready_timeout_ms {
-                        // Fail-closed: exhausted the readiness budget. The opt-in
-                        // steps fail with an unbound-dependency diagnostic in admit.
+                        // Startup flake, fail-closed (ADR-0058): nothing has been
+                        // written yet, so the flaky Pod is auto-retried in place —
+                        // the k8s `restartPolicy: Always` restarts it, and *this*
+                        // readiness budget (`service_ready_timeout_ms`) is the
+                        // bound on that retry, no separate counter. Exhausted → the
+                        // service Failed; its opt-in steps then fail with an
+                        // unbound-dependency diagnostic in `admit`, failing the Run.
                         self.db
                             .set_run_service(
                                 run,
@@ -2058,7 +2064,37 @@ impl<'a> Scheduler<'a> {
                             .await?;
                     }
                 }
-                Some(_) => {} // ready / running / terminal — nothing to do.
+                Some(r)
+                    if matches!(
+                        r.status,
+                        crate::ServiceStatus::Ready | crate::ServiceStatus::Running
+                    ) =>
+                {
+                    // Mid-run death, fail-closed (ADR-0058): a previously-HEALTHY
+                    // shared service that stops being ready has died. Mark it
+                    // Failed — the opt-in steps then fail with an unbound-dependency
+                    // diagnostic in `admit` and their descendants cascade
+                    // (ADR-0027); steps that never `uses:` it proceed untouched.
+                    // The engine does NOT auto-restart it (a fresh instance would
+                    // be silently empty — a green retry over lost state) and does
+                    // NOT fork a Take: honest recovery re-runs every writer against
+                    // a fresh instance, which *is* a human Rerun (ADR-0056), never
+                    // an engine auto-rerun.
+                    if let Some(h) = &r.handle {
+                        if !self.executor.service_ready(&ExecHandle(h.clone())).await? {
+                            self.db
+                                .set_run_service(
+                                    run,
+                                    take,
+                                    &svc.name,
+                                    crate::ServiceStatus::Failed,
+                                    None,
+                                )
+                                .await?;
+                        }
+                    }
+                }
+                Some(_) => {} // torn-down / already-failed — nothing to do.
             }
         }
         Ok(())
