@@ -385,3 +385,82 @@ async fn embedded_ui_serves_index_assets_and_spa_fallback() {
         .unwrap();
     assert!(String::from_utf8_lossy(&body(resp).await).contains("scarab-ui"));
 }
+
+/// Shared-service evidence (ADR-0058 slice 4): a run's Services panel reads
+/// `GET /v1/runs/{id}/services` for the current Take's instances + their
+/// lifecycle status, and `GET …/services/{name}/logs` replays that instance's
+/// best-effort log tail through the SAME pipeline as step logs (ADR-0013).
+#[tokio::test]
+async fn shared_service_status_and_logs_are_exposed() {
+    use scarab_engine::{RunStatus, ServiceStatus, Timestamp};
+
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock: Arc<FakeClock> = Arc::new(FakeClock::new(1_000));
+    // Build state by hand so the test appends to the SAME LogService the app reads.
+    let store = Arc::new(InMemoryObjectStore::new());
+    let logs = Arc::new(LogService::new(store, db.clone()));
+    let app = router(AppState::new(db.clone(), clock, logs.clone()));
+
+    let run = RunId("run-with-svc".into());
+    // Terminal so the log SSE replays and closes (hermetic — no live tail hang).
+    db.seed_run(&run, RunStatus::Succeeded);
+    // A shared service instance at Take 1, promoted to `ready`.
+    db.create_run_service(&run, 1, "db", Timestamp(1_000))
+        .await
+        .unwrap();
+    db.set_run_service(&run, 1, "db", ServiceStatus::Ready, Some("scarab-svc-db-abcd"))
+        .await
+        .unwrap();
+    // Some best-effort log output on that instance's stream.
+    let (step, attempt) = scarab_server::logs::service_stream_key("db", 1);
+    logs.append(&run, &step, &attempt, b"postgres is ready to accept connections\n")
+        .await
+        .unwrap();
+
+    // Status list: the current Take's `db`, `ready`.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs/run-with-svc/services")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc = body_json(resp).await;
+    let svcs = doc.as_array().unwrap();
+    assert_eq!(svcs.len(), 1);
+    assert_eq!(svcs[0]["name"], "db");
+    assert_eq!(svcs[0]["status"], "ready");
+    assert_eq!(svcs[0]["take"], 1);
+
+    // Logs: the appended bytes replay over SSE.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs/run-with-svc/services/db/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_string(resp)
+        .await
+        .contains("postgres is ready to accept connections"));
+
+    // An unknown service on a known run is 404.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs/run-with-svc/services/nope/logs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

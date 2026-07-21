@@ -2856,6 +2856,7 @@ dependencies = [
  "scarab-engine",
  "scarab-forge",
  "scarab-identity",
+ "scarab-pipeline",
  "scarab-secrets",
  "scarab-storage",
  "serde_json",

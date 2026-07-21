@@ -2352,6 +2352,28 @@ h1, .crumb-head, .run-title {
 }
 .dag-head { padding: 11px 4px 10px; }
 .pipeline-panel .dag-wrap .dag { flex: 1; overflow: auto; border-radius: var(--radius); }
+
+/* Services panel (ADR-0058): a compact evidence section beneath the DAG in the
+   left column — beside the graph, never a node in it. Minimal on purpose; a
+   later human design pass owns placement/polish. */
+.svc-wrap { margin-top: 10px; flex: 0 0 auto; }
+.svc-wrap .dag-head { padding: 8px 4px 6px; }
+.svc-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.svc-row {
+  display: flex; align-items: center; gap: 8px; width: 100%; cursor: pointer;
+  background: var(--emerald-surface); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 6px 10px; text-align: left;
+}
+.svc-row:hover { border-color: var(--emerald); }
+.svc-row.open { border-color: var(--emerald); }
+.svc-name { font-size: 13px; color: var(--soft-white); }
+.svc-status {
+  margin-left: auto; font-family: var(--font-mono); font-size: 11px;
+  letter-spacing: 0.4px; color: var(--sage);
+}
+.svc-logs { margin: 4px 0 2px; max-height: 180px; overflow: auto; border-radius: var(--radius-sm); }
+.sdot.starting { background: var(--muted-sage); }
+.sdot.torn-down { background: color-mix(in srgb, var(--muted-sage) 55%, transparent); }
 /* Step evidence: no card of its own — a transparent header, content below. */
 .pipeline-panel .rd-grid > .steppane {
   display: flex; flex-direction: column; min-height: 0;

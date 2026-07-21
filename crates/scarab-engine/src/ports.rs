@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Attempt, AttemptId, ConcurrencyPolicy, DbError, EventKind, ExecError, FailureKind,
-    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec,
-    StepStatus, Timestamp,
+    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService, RunStatus, RunSummary, ServiceStatus,
+    StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -386,6 +386,34 @@ pub trait Db: Send + Sync {
     /// gate (or is unknown). Read at admission to decide auto-release.
     async fn gate_timer_seconds(&self, run: &RunId, step: &StepId) -> Result<Option<i64>, DbError>;
 
+    /// Create the durable [`RunService`] row for a shared service (ADR-0058),
+    /// born in [`ServiceStatus::Starting`]. Idempotent on `{run, take, name}` —
+    /// a re-create (crash resume, re-tick) is a no-op, never a second instance.
+    async fn create_run_service(
+        &self,
+        run: &RunId,
+        take: i64,
+        name: &str,
+        at: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// Update a shared service's lifecycle status (and, when launched, its
+    /// executor handle) — the `starting → ready → running → torn-down | failed`
+    /// transition. Unconditional (last-writer-wins); the scheduler owns ordering.
+    async fn set_run_service(
+        &self,
+        run: &RunId,
+        take: i64,
+        name: &str,
+        status: ServiceStatus,
+        handle: Option<&str>,
+    ) -> Result<(), DbError>;
+
+    /// All shared-service instances of a run, across every Take, name-ordered
+    /// then take-ordered. The scheduler folds these to find the current Take
+    /// (`max(take)`), gate opt-in steps on readiness, and drive teardown.
+    async fn run_services(&self, run: &RunId) -> Result<Vec<RunService>, DbError>;
+
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;
 
@@ -675,6 +703,54 @@ pub trait Executor: Send + Sync {
     /// because the source is derived from the fence — the same derivation `launch`
     /// uses — so the caller needs no handle bookkeeping to start a tail.
     async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        Ok(None)
+    }
+
+    /// Provision (or re-attach to) the standalone **shared-service** unit for
+    /// `{run, take, name}` (ADR-0058): a service Pod + a cluster-DNS Service +
+    /// a NetworkPolicy scoping reachability to opt-in Pods. Returns a handle the
+    /// orchestrator records for readiness polling and teardown. Idempotent on
+    /// `{run, take, name}` (like `launch`). The default **rejects** — a backend
+    /// without cross-Pod networking (the host-process local executor) cannot run
+    /// a shared service, mirroring how it rejects `clone`/`build`.
+    async fn launch_service(
+        &self,
+        _run: &RunId,
+        _take: i64,
+        _name: &str,
+        _spec: &scarab_pipeline::ServiceSpec,
+    ) -> Result<ExecHandle, ExecError> {
+        Err(ExecError::Launch(
+            "this executor does not support shared services (container images need the k8s backend)"
+                .to_string(),
+        ))
+    }
+
+    /// Whether the shared-service unit behind `handle` has passed its readiness
+    /// probe (ADR-0058) — the scheduler's readiness-gate release signal. Default
+    /// `false` (never ready) so a backend that cannot observe it holds opt-in
+    /// steps rather than releasing them prematurely.
+    async fn service_ready(&self, _handle: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(false)
+    }
+
+    /// Tear down the shared-service unit behind `handle` (ADR-0058), riding the
+    /// Run/Take-terminal teardown. Idempotent; a missing unit is success. Default
+    /// no-op for backends that never launched one.
+    async fn teardown_service(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    /// Open a best-effort **live tail** of a shared-service unit's stdout/stderr
+    /// (ADR-0058 evidence), addressed by the launch `handle`. Same reliability
+    /// class as [`log_stream`](Self::log_stream): the control plane drains the
+    /// returned [`LogChunks`] into the log pipeline while the service runs, and a
+    /// dropped tail never fails the run. `Ok(None)` = this backend has no log
+    /// source (the default / the host-process local backend), a clean no-op.
+    async fn service_log_stream(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         Ok(None)
     }
 }
