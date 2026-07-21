@@ -181,6 +181,24 @@ pub async fn restart_step(
         }
     }
 
+    // Fresh service instance per Take (ADR-0058): a Rerun opens a new Take, so
+    // birth a new generation of every shared service keyed by the new take. The
+    // prior Take's instances are torn down by `reconcile_services`, and the new
+    // instances start empty — a Rerun never sees the prior Take's writes. Only
+    // the birth (durable intent) happens here; launch/teardown ride the executor
+    // in the scheduler's service reconcile.
+    let svc_rows = db.run_services(run).await?;
+    if let Some(cur) = svc_rows.iter().map(|r| r.take).max() {
+        let names: std::collections::BTreeSet<&str> = svc_rows
+            .iter()
+            .filter(|r| r.take == cur)
+            .map(|r| r.name.as_str())
+            .collect();
+        for name in names {
+            db.create_run_service(run, cur + 1, name, now).await?;
+        }
+    }
+
     // Re-arm each invalidated step (terminal or in-flight) to Pending. A peer
     // that already moved it is a benign Conflict we skip. An in-flight step
     // re-armed here has its running attempt SUPERSEDED (ADR-0056 amendment):
@@ -462,6 +480,9 @@ struct Config {
     /// no `timeout:`. Default 1h — mandatory, so a hung Pod can never wedge a
     /// run forever.
     default_step_timeout_ms: i64,
+    /// How long a shared service (ADR-0058) may stay `starting` before the
+    /// scheduler fails it (and its opt-in steps) fail-closed. Default 5 min.
+    service_ready_timeout_ms: i64,
 }
 
 /// One control-plane instance's supervision memory (ADR-0056): the attempts
@@ -524,8 +545,15 @@ impl<'a> Scheduler<'a> {
                 project_run_cap: 20,
                 global_run_cap: u32::MAX,
                 default_step_timeout_ms: 3_600_000,
+                service_ready_timeout_ms: 300_000,
             },
         }
+    }
+
+    /// Override the shared-service readiness timeout (ADR-0058).
+    pub fn with_service_ready_timeout_ms(mut self, ms: i64) -> Self {
+        self.cfg.service_ready_timeout_ms = ms;
+        self
     }
 
     /// Override the global default step deadline (ADR-0047).
@@ -567,8 +595,11 @@ impl<'a> Scheduler<'a> {
         self
     }
 
-    /// One full cycle for a run: admit → reconcile → advance.
+    /// One full cycle for a run: reconcile services → admit → reconcile → advance.
     pub async fn tick(&self, run: &RunId) -> Result<(), SchedulerError> {
+        // Shared services (ADR-0058) are born + readiness-polled before admission
+        // so the readiness gate reads fresh statuses this same tick.
+        self.reconcile_services(run).await?;
         self.admit(run).await?;
         self.reconcile().await?;
         self.advance(run).await?;
@@ -581,6 +612,9 @@ impl<'a> Scheduler<'a> {
     pub async fn tick_all(&self) -> Result<(), SchedulerError> {
         let runs = self.db.active_runs().await?;
         for run in &runs {
+            // Shared services (ADR-0058) before admit, so the readiness gate sees
+            // fresh statuses this tick.
+            self.reconcile_services(run).await?;
             self.admit(run).await?;
         }
         self.reconcile().await?;
@@ -716,11 +750,80 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        // Shared-service readiness (ADR-0058): the current Take's service
+        // statuses, for gating opt-in steps below. Cheap when there are none.
+        let service_rows = self.db.run_services(run).await?;
+        let svc_take = Self::current_service_take(&service_rows);
+        let service_status: HashMap<&str, crate::ServiceStatus> = service_rows
+            .iter()
+            .filter(|r| r.take == svc_take)
+            .map(|r| (r.name.as_str(), r.status))
+            .collect();
+
         for step in &steps {
             if step.status != StepStatus::Pending || step.is_gate() {
                 continue;
             }
             if deps_satisfied(step) {
+                // Shared-service readiness gate (ADR-0058): a step that `uses:` a
+                // service waits until that service is ready — a durable suspend,
+                // per-step (never a whole-run suspend like a gate). A step with no
+                // `uses:` never waits. Fail-closed: a service that failed to come
+                // up (ready-timeout) fails its opt-in steps with an
+                // unbound-dependency diagnostic.
+                let uses = self
+                    .db
+                    .step_spec(run, &step.step)
+                    .await?
+                    .map(|s| s.uses)
+                    .unwrap_or_default();
+                if !uses.is_empty() {
+                    let failed: Vec<&str> = uses
+                        .iter()
+                        .filter(|n| {
+                            service_status.get(n.as_str()) == Some(&crate::ServiceStatus::Failed)
+                        })
+                        .map(String::as_str)
+                        .collect();
+                    if !failed.is_empty() {
+                        let now = self.clock.now().await;
+                        let reason = format!(
+                            "unbound dependency: shared service(s) {} never became ready",
+                            failed
+                                .iter()
+                                .map(|s| format!("`{s}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        self.append(
+                            run,
+                            EventPayload::StepServicesUnready {
+                                step: step.step.clone(),
+                                reason,
+                            },
+                            now,
+                        )
+                        .await?;
+                        self.transition_step(
+                            run,
+                            &step.step,
+                            StepStatus::Pending,
+                            StepStatus::Failed,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let all_ready = uses.iter().all(|n| {
+                        matches!(
+                            service_status.get(n.as_str()),
+                            Some(crate::ServiceStatus::Ready) | Some(crate::ServiceStatus::Running)
+                        )
+                    });
+                    if !all_ready {
+                        // Hold the step Pending — the durable readiness suspend.
+                        continue;
+                    }
+                }
                 // Skip-if-unchanged (ADR-0027): a re-armed step whose input
                 // signature matches the one it last consumed, and which produced
                 // a content-addressed output, is skipped — its prior output is
@@ -1291,6 +1394,10 @@ impl<'a> Scheduler<'a> {
                     .await?;
                 }
                 self.transition_run(run, current, outcome).await?;
+                // Tear down any shared services (ADR-0058) as the run settles —
+                // namespace-per-run teardown, at the terminal moment (the run
+                // leaves the active set, so no later tick would do it).
+                self.teardown_services(run).await?;
                 // Free the concurrency slot so a queued run can start.
                 if let Some((group, _)) = self.db.run_concurrency(run).await? {
                     self.db.release_slot(&group, run).await?;
@@ -1325,6 +1432,8 @@ impl<'a> Scheduler<'a> {
                     .await?;
             }
         }
+        // Tear down shared services (ADR-0058) on cancel too.
+        self.teardown_services(run).await?;
         if let Some((group, _)) = self.db.run_concurrency(run).await? {
             self.db.release_slot(&group, run).await?;
         }
@@ -1818,6 +1927,157 @@ impl<'a> Scheduler<'a> {
             Err(DbError::Conflict) => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// The pipeline-level shared services declared in the run's stored IR
+    /// (ADR-0058), read the same way per-step config is (self-describing runs,
+    /// ADR-0022). Tolerant: an absent/malformed IR yields none.
+    async fn pipeline_services(
+        &self,
+        run: &RunId,
+    ) -> Result<Vec<scarab_pipeline::SharedServiceSpec>, SchedulerError> {
+        let Some(ir) = self.db.run_ir(run).await? else {
+            return Ok(Vec::new());
+        };
+        Ok(ir
+            .get("services")
+            .and_then(|s| s.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// The engine's "current Take" for a run's shared services: the max stored
+    /// generation, or `1` when none have been born yet (ADR-0058). A Rerun
+    /// advances it by birthing rows at `max + 1` in [`restart_step`].
+    fn current_service_take(rows: &[crate::RunService]) -> i64 {
+        rows.iter().map(|r| r.take).max().unwrap_or(1)
+    }
+
+    /// Reconcile a run's shared services (ADR-0058): eagerly birth + launch the
+    /// current Take's instances, poll their readiness (fail-closed at the
+    /// timeout), tear down stale Takes a Rerun left behind, and tear everything
+    /// down once the run is terminal. Leader-only + executor-owning, like the
+    /// launch reconcile. A run with no `services:` is a no-op.
+    pub async fn reconcile_services(&self, run: &RunId) -> Result<(), SchedulerError> {
+        if !self.is_leader().await? {
+            return Ok(());
+        }
+        let services = self.pipeline_services(run).await?;
+        if services.is_empty() {
+            return Ok(());
+        }
+        let status = self
+            .db
+            .run_status(run)
+            .await?
+            .ok_or_else(|| SchedulerError::RunNotFound(run.clone()))?;
+        // Terminal run → ride namespace-per-run teardown (not a refcount).
+        if status.is_terminal() {
+            self.teardown_services(run).await?;
+            return Ok(());
+        }
+
+        let rows = self.db.run_services(run).await?;
+        let take = Self::current_service_take(&rows);
+        let now = self.clock.now().await;
+
+        // A Rerun advanced the Take: tear down every earlier Take's instance so
+        // the fresh Take never shares state with it.
+        for r in &rows {
+            if r.take < take && !r.status.is_terminal() {
+                if let Some(h) = &r.handle {
+                    self.executor.teardown_service(&ExecHandle(h.clone())).await?;
+                }
+                self.db
+                    .set_run_service(run, r.take, &r.name, crate::ServiceStatus::TornDown, None)
+                    .await?;
+            }
+        }
+
+        // Birth (eager) + launch + readiness-poll the current Take.
+        for svc in &services {
+            let row = rows.iter().find(|r| r.take == take && r.name == svc.name);
+            match row {
+                None => {
+                    // Eager birth at Run start, then launch the standalone unit.
+                    self.db.create_run_service(run, take, &svc.name, now).await?;
+                    let handle = self
+                        .executor
+                        .launch_service(run, take, &svc.name, &svc.spec)
+                        .await?;
+                    self.db
+                        .set_run_service(
+                            run,
+                            take,
+                            &svc.name,
+                            crate::ServiceStatus::Starting,
+                            Some(&handle.0),
+                        )
+                        .await?;
+                }
+                Some(r) if r.status == crate::ServiceStatus::Starting => {
+                    // Resolve the handle (relaunch idempotently if a crash lost it).
+                    let handle = match &r.handle {
+                        Some(h) => ExecHandle(h.clone()),
+                        None => {
+                            let h = self
+                                .executor
+                                .launch_service(run, take, &svc.name, &svc.spec)
+                                .await?;
+                            self.db
+                                .set_run_service(
+                                    run,
+                                    take,
+                                    &svc.name,
+                                    crate::ServiceStatus::Starting,
+                                    Some(&h.0),
+                                )
+                                .await?;
+                            h
+                        }
+                    };
+                    if self.executor.service_ready(&handle).await? {
+                        self.db
+                            .set_run_service(run, take, &svc.name, crate::ServiceStatus::Ready, None)
+                            .await?;
+                    } else if now.0 - r.created_at.0 > self.cfg.service_ready_timeout_ms {
+                        // Fail-closed: exhausted the readiness budget. The opt-in
+                        // steps fail with an unbound-dependency diagnostic in admit.
+                        self.db
+                            .set_run_service(
+                                run,
+                                take,
+                                &svc.name,
+                                crate::ServiceStatus::Failed,
+                                None,
+                            )
+                            .await?;
+                    }
+                }
+                Some(_) => {} // ready / running / terminal — nothing to do.
+            }
+        }
+        Ok(())
+    }
+
+    /// Tear down every non-terminal shared-service instance of a run (ADR-0058),
+    /// riding the Run/Take-terminal teardown. Idempotent (teardown_service is).
+    async fn teardown_services(&self, run: &RunId) -> Result<(), SchedulerError> {
+        for r in self.db.run_services(run).await? {
+            if !r.status.is_terminal() {
+                if let Some(h) = &r.handle {
+                    self.executor.teardown_service(&ExecHandle(h.clone())).await?;
+                }
+                self.db
+                    .set_run_service(run, r.take, &r.name, crate::ServiceStatus::TornDown, None)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn transition_run(

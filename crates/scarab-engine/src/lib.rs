@@ -699,6 +699,13 @@ pub enum EventPayload {
         active_ms: i64,
         budget_ms: i64,
     },
+    /// An opt-in step (ADR-0058 `uses:`) was failed **fail-closed** because a
+    /// shared service it depends on never became ready (a ready-timeout). The
+    /// unbound-dependency diagnostic — `reason` names the service(s).
+    StepServicesUnready {
+        step: StepId,
+        reason: String,
+    },
     /// Escape hatch for forward-compatible payloads not yet modelled.
     Raw(serde_json::Value),
 }
