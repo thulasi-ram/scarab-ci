@@ -1,10 +1,10 @@
 ---
 title: Scarab
-description: A modern CI engine for Kubernetes — forge-native, on a durable core. The cohesion of a forge CI, on a control plane that treats a run as state, not a process. Written in Rust.
+description: A modern CI engine for Kubernetes. It gives you the cohesion of a CI that lives in your forge, built on a control plane that treats a run as state rather than a process. Written in Rust.
 template: splash
 hero:
   layout: split-left
-  tagline: A modern CI engine for Kubernetes — forge-native, on a durable core. It treats your run as state, not a process.
+  tagline: A modern CI engine for Kubernetes that lives in your forge. It treats your run as state, not a process you hope stays alive.
   image:
     # The brand emblem, square-cropped (1:1) — ink outline on light, gold on dark.
     light: ../../assets/brand/scarab-emblem-square.svg
@@ -23,34 +23,39 @@ hero:
 import { Card, CardGrid } from '@astrojs/starlight/components';
 import AsciiScene from '../../components/AsciiScene.astro';
 
-CI tools fall into two camps. **Workflow engines** — Argo, Tekton, Temporal — have a durable,
-crash-safe core, but they aren't CI: forge integration, in-repo config, PR checks, identity,
-secrets, DSL, and UI are yours to build. **Forge-native CIs** — GitHub Actions, GitLab,
-Woodpecker, Drone — hand you all of that, but the orchestrator is a job runner: if the control
-plane restarts mid-run, the run is orphaned or starts over. Scarab is built to be **both at
-once** — the batteries-included feel of a forge CI, on a control plane that treats a run as
-durable **state**, not a fire-and-forget process.
+CI tools tend to fall into two camps. **Workflow engines** — Argo, Tekton, Temporal — have a
+durable core that survives a crash, but they aren't really CI: forge integration, in-repo config,
+PR checks, identity, secrets, the DSL, and the UI are all yours to build. **CIs that live in your
+forge** — GitHub Actions, GitLab, Woodpecker, Drone — hand you all of that, but underneath, the
+orchestrator is just a job runner. If the control plane restarts partway through a run, the run is
+orphaned or starts over. Scarab is built to be **both at once**: the batteries-included feel of a
+forge CI, sitting on a control plane that treats a run as durable **state** rather than a process
+it forgets the moment it restarts.
 
-![The Scarab dashboard — an action inbox of runs suspended on a gate, recently-visited repos as pass/fail status cards, and the recency-sorted repo list](../../assets/dashboard.jpg)
+![The Scarab dashboard — an action inbox of runs paused on a gate, recently visited repos shown as pass/fail status cards, and the repo list sorted by what you touched last](../../assets/dashboard.jpg)
 
 ## What makes it different
 
 <CardGrid>
-  <Card title="Cohesion, not assembly" icon="puzzle">
-    One forge-native CI product — DSL, secrets, approvals, identity, UI — on a durable engine.
-    Not a workflow engine you build a CI on top of, nor a job-runner CI with no durable core.
+  <Card title="One product, not a kit" icon="puzzle">
+    A CI that lives in your forge — DSL, secrets, approvals, identity, UI — on a durable engine.
+    Not a workflow engine you have to build a CI on top of, and not a job-runner CI with nothing
+    durable underneath.
   </Card>
   <Card title="Runs are state, not processes" icon="approve-check">
-    A DBOS-pattern durable state machine on Postgres. A control-plane restart resumes the run
-    from its last completed step, with exactly-once step execution — the architecture, not a boast.
+    A durable state machine on Postgres, in the spirit of DBOS. When the control plane restarts, a
+    run resumes from its last completed step, and each step runs exactly once. That's the
+    architecture doing its job, not a boast.
   </Card>
   <Card title="Keyless identity" icon="seti:lock">
-    Forge-agnostic OIDC, with Scarab itself as an OIDC issuer for keyless federation to your
-    cloud. Forge-native by design, with GitHub and Forgejo adapters implemented — see Status.
+    OIDC that doesn't care which forge you use, with Scarab acting as its own OIDC issuer so runs
+    can federate into your cloud without long-lived keys. Adapters for GitHub and Forgejo are
+    implemented today — see Status.
   </Card>
   <Card title="A real DSL" icon="seti:config">
-    A typed IR (the actual DSL) with a YAML frontend and CEL expressions — a flat recursive DAG
-    where <code>invoke</code> is reuse and matrix is a modifier.
+    A typed intermediate representation — the actual DSL — with a YAML frontend and CEL
+    expressions. Under it all is one flat recursive DAG, where <code>invoke</code> is how you reuse
+    a pipeline and matrix is just a modifier.
   </Card>
 </CardGrid>
 
@@ -58,20 +63,22 @@ durable **state**, not a fire-and-forget process.
 
 <AsciiScene name="dungroller" fontSize={5} class="ascii-accent" />
 
-As pipelines get longer and more autonomous — agents, long review gates, multi-day workflows —
-"the job died, click re-run" stops being good enough. Scarab holds a suspended run at near-zero
-cost and resumes exactly where it paused, with an append-only event log of everything that
-happened. That's where a durable core earns its keep — and it's the substrate agent-driven
-development wants, not a nicer YAML dialect. Scarab is also *built* AI-first: ambitious systems
-software from a small team, at a pace that used to need a room full of people.
+As pipelines get longer and more autonomous — agents, review gates that sit open for hours,
+workflows that span days — "the job died, click re-run" stops being good enough. Scarab can hold
+a paused run almost for free and pick up exactly where it left off, and it keeps an event log that
+only ever grows, so you can see everything that happened. That's where a durable core earns its
+keep. It's also the kind of foundation that agent-driven development actually wants, rather than
+just a nicer YAML dialect. And Scarab is *built* that way too: ambitious systems software from a
+small team, at a pace that used to take a room full of people.
 
-![A Scarab run — the step DAG, live logs, and an event timeline showing a retried step and the run suspended on a manual deploy gate](../../assets/run-detail.jpg)
+![A Scarab run — the step DAG, live logs, and an event timeline showing a retried step and the run paused on a manual deploy gate](../../assets/run-detail.jpg)
 
 :::tip[Lineage]
-Scarab owes its shape to [Woodpecker](https://woodpecker-ci.org/) — lean, forge-native CI with
-no enterprise ceremony. It's inspired at least as much by Woodpecker's *limits*: the many-backend
-surface it carries, and the pace a volunteer project can sustain. Kubernetes-only is us shedding
-that backend baggage on purpose; the pace is what a small AI-first team can now hold.
+Scarab owes its shape to [Woodpecker](https://woodpecker-ci.org/) — lean CI that lives in your
+forge, with none of the enterprise ceremony. It's shaped just as much by Woodpecker's *limits*:
+the many backends it has to support, and the pace a volunteer project can sustain. Sticking to
+Kubernetes alone is us shedding that backend baggage on purpose, and the pace is what a small team
+leaning on AI can now hold.
 :::
 
 ## Where to go next
@@ -88,14 +95,15 @@ that backend baggage on purpose; the pace is what a small AI-first team can now 
 </CardGrid>
 
 :::note[Status — honest]
-A proven core, with real forge and Kubernetes I/O wired in. **Proven against real Postgres:** the
-durable engine — crash/resume, exactly-once, restart-a-step, gates, content-addressed workspace,
-`invoke`, secrets, OIDC issuer (the workspace suite passes locally). **Implemented:** the GitHub
-adapter (webhook ingest + commit-status posting) and a Forgejo adapter for multi-forge support;
-live-Kubernetes Pod execution (`scarab-executor-k8s`, with cluster tests); the results-egress
-sidecar image (`docker/sidecar/`); and CI that runs the Rust suite on push
-(`.github/workflows/ci.yml`). None of it is yet hardened at scale — read a proven state machine
-with its edges freshly wired, not a battle-tested product.
+A proven core, with real forge and Kubernetes I/O wired in around it. **Proven against real
+Postgres:** the durable engine — crash and resume, exactly-once execution, restarting a single
+step, gates, the content-addressed workspace, `invoke`, secrets, and the OIDC issuer (the
+workspace suite passes locally). **Implemented:** the GitHub adapter (it ingests webhooks and
+posts commit statuses) and a Forgejo adapter, so more than one forge is supported; Pod execution
+on a live Kubernetes cluster (`scarab-executor-k8s`, with cluster tests); the results-egress
+sidecar image (`docker/sidecar/`); and CI that runs the Rust suite on every push
+(`.github/workflows/ci.yml`). None of it is yet hardened at scale. Read this as a proven state
+machine with its edges freshly wired up — implemented, but not yet battle-tested in production.
 :::
 
 ## References
