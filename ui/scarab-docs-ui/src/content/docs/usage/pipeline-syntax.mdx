@@ -244,12 +244,16 @@ consumer must `needs:` the producer:
 Result capture is transparent to authors: on Kubernetes a per-Pod egress sidecar drains each step's
 results back to the control plane — nothing to wire up in the pipeline.
 
-## Environments, secrets & gates
+## Environments, secrets & gates — the authoring keys
 
-Referencing a top-level `environment:` makes the pipeline a **deploy**: its runs are enforced against
-that environment's protection rules at admission.
+This section covers only the YAML you author. For the concepts behind them — how secrets are
+stored and scoped, and what an environment governs — see
+[Secrets](/scarab-ci/usage/secrets/) and [Environments](/scarab-ci/usage/environments/).
 
-![The Environments screen — a governed environment with its protection rules, required approvals, and scoped secrets](../../../assets/environments.jpg)
+Referencing a top-level `environment:` makes the pipeline a **deploy**: its runs are enforced
+against that environment's protection rules at admission. **Secrets** a step needs are named with
+`secrets: [KEY, ...]`; each key is resolved against the run's scope and made available to the step
+under the same name (a fork-PR run is locked out and receives none).
 
 ```yaml
 environment: prod
@@ -260,12 +264,6 @@ steps:
     secrets: [DEPLOY_TOKEN]
     command: ["./deploy.sh"]
 ```
-
-**Secrets** are named on a step with `secrets: [KEY, ...]`. Each key is resolved against the run's
-scope with `env → repo → org` inheritance and
-injected as an environment variable of the same name. A fork-PR run is locked out and receives none.
-
-![The Secrets screen — named secrets scoped at org, repo, and environment levels with env → repo → org inheritance](../../../assets/secrets.jpg)
 
 **Gates** are image-less durable suspend points — `gate: manual` is an approval, `gate: timer` waits
 `gate_after` seconds, `gate: external` releases via API/webhook. Placed before a deploy step, a
