@@ -24,7 +24,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0005](0005-tenancy-and-k8s-only.md) | Tenancy & deployment; Kubernetes as the only backend | Accepted |
 | [0006](0006-pipeline-ontology.md) | Pipeline ontology: flat recursive DAG | Accepted |
 | [0007](0007-data-passing-model.md) | Data-passing model: Workspace / Result / Artifact / Cache | Accepted |
-| [0008](0008-step-contract.md) | Step contract: OCI image + convention + built-in kinds | Accepted |
+| [0008](0008-step-contract.md) | Step contract: OCI image + convention + built-in kinds | Accepted (amended by 0058) |
 | [0009](0009-dsl-ir-yaml-cel.md) | DSL: typed Pipeline IR + YAML frontend + CEL | Accepted |
 | [0010](0010-forge-integration.md) | Forge integration: agnostic core, OIDC identity, in-repo config | Accepted |
 | [0011](0011-durable-scheduler.md) | Scheduling: durable admission control | Accepted |
@@ -72,6 +72,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0054](0054-product-surface-serving.md) | Product surface: embed UI in the binary, run-cancel API, OpenAPI drift gate, CLI truthfulness (stubs exit non-zero) | Accepted |
 | [0055](0055-placement-profiles.md) | Placement profiles: named `placement_profiles` + control-plane baseline + governed `k8s_overlay` (refines 0026) | Accepted |
 | [0056](0056-run-takes-and-attempt-grain-evidence.md) | Run Takes (derived, human-boundary version lens) + attempt-grain evidence (results/workspace/artifacts/consumption keyed by attempt; restart & re-adoption events) | Accepted |
+| [0058](0058-runtime-service-containers.md) | Runtime service containers: co-located **Sidecar** (default, fenced-by-inheritance) + Run-scoped **Shared** (opt-in `uses:`, per-Take instance, unfenced) — not DAG nodes (amends 0008) | Accepted |
 
 > For *features* deliberately deferred until demand appears (as opposed to ADRs
 > to be written), see [`docs/followups.md`](../followups.md).
