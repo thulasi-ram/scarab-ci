@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Attempt, AttemptId, ConcurrencyPolicy, DbError, EventKind, ExecError, FailureKind,
-    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec,
-    StepStatus, Timestamp,
+    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService, RunStatus, RunSummary, ServiceStatus,
+    StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 
 /// A time-bounded lease over a work item, used to guarantee single-owner
@@ -385,6 +385,34 @@ pub trait Db: Send + Sync {
     /// The wait (seconds) of a `timer` gate, or `None` if the step is not a timer
     /// gate (or is unknown). Read at admission to decide auto-release.
     async fn gate_timer_seconds(&self, run: &RunId, step: &StepId) -> Result<Option<i64>, DbError>;
+
+    /// Create the durable [`RunService`] row for a shared service (ADR-0058),
+    /// born in [`ServiceStatus::Starting`]. Idempotent on `{run, take, name}` —
+    /// a re-create (crash resume, re-tick) is a no-op, never a second instance.
+    async fn create_run_service(
+        &self,
+        run: &RunId,
+        take: i64,
+        name: &str,
+        at: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// Update a shared service's lifecycle status (and, when launched, its
+    /// executor handle) — the `starting → ready → running → torn-down | failed`
+    /// transition. Unconditional (last-writer-wins); the scheduler owns ordering.
+    async fn set_run_service(
+        &self,
+        run: &RunId,
+        take: i64,
+        name: &str,
+        status: ServiceStatus,
+        handle: Option<&str>,
+    ) -> Result<(), DbError>;
+
+    /// All shared-service instances of a run, across every Take, name-ordered
+    /// then take-ordered. The scheduler folds these to find the current Take
+    /// (`max(take)`), gate opt-in steps on readiness, and drive teardown.
+    async fn run_services(&self, run: &RunId) -> Result<Vec<RunService>, DbError>;
 
     /// Current status of a run, or `None` if it does not exist.
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError>;

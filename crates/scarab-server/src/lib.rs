@@ -399,6 +399,10 @@ pub struct StepDto {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schema(value_type = Object)]
     pub services: Vec<scarab_pipeline::ServiceSpec>,
+    /// Shared-service opt-in (ADR-0058): names of pipeline-level shared services
+    /// this step reaches over the network (DNS `<name>:<port>` + readiness gate).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -919,6 +923,7 @@ async fn create_run(
             k8s_overlay,
             oidc_token: None,
             services: step.services.clone(),
+            uses: step.uses.clone(),
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -3401,6 +3406,7 @@ async fn persist_run_from_ir(
                 // A clone step runs the canonical scarab-clone image; validation
                 // forbids `services` on it, so this is always empty.
                 services: Vec::new(),
+                uses: Vec::new(),
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -3466,6 +3472,9 @@ async fn persist_run_from_ir(
                 oidc_token: None,
                 // Sidecar services (ADR-0058) co-locate in this executed step's Pod.
                 services: step.services.clone(),
+                // Shared-service opt-in (ADR-0058): the executor labels this Pod
+                // so each named service's NetworkPolicy admits it.
+                uses: step.uses.clone(),
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;

@@ -88,6 +88,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
 
     // launch, then launch again — the second call must re-attach, not relaunch.
@@ -158,6 +159,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -216,6 +218,7 @@ async fn log_stream_tails_pod_stdout() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch");
@@ -308,6 +311,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
     async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
         for _ in 0..90 {
@@ -439,6 +443,7 @@ async fn clone_step_produces_a_source_workspace() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch clone");
@@ -530,6 +535,7 @@ async fn clone_step_produces_a_source_workspace() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
     let bh = exec
         .launch(&build, &build_spec)
@@ -616,6 +622,7 @@ async fn clone_depth_full_exposes_history() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
     let h = exec.launch(&step, &spec).await.expect("launch full clone");
     let mut terminal = None;
@@ -672,6 +679,7 @@ async fn clone_depth_full_exposes_history() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
     let ch = exec
         .launch(&count, &count_spec)
@@ -757,6 +765,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
 
     let started = std::time::Instant::now();
@@ -867,6 +876,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
     let h = exec.launch(&step, &spec).await.expect("launch build");
     let mut terminal = None;
@@ -921,6 +931,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
     let vh = exec
         .launch(&verify, &verify_spec)
@@ -1039,6 +1050,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     let mut terminal = None;
@@ -1116,6 +1128,7 @@ async fn cancel_tears_down_a_running_pod() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     // Wait until it is actually Running (the interesting teardown case).
@@ -1204,6 +1217,7 @@ async fn artifacts_are_harvested_post_step() {
         k8s_overlay: None,
         oidc_token: None,
         services: Vec::new(),
+        uses: Vec::new(),
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     let mut terminal = None;

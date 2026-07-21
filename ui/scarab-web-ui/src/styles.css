@@ -1263,6 +1263,7 @@ h2 {
   text-decoration: underline dotted;
   text-decoration-color: color-mix(in srgb, var(--emerald) 45%, transparent);
   text-underline-offset: 6px;
+  transition: color 0.12s var(--ease-out), text-decoration-color 0.12s var(--ease-out);
 }
 .crumb-head-link:hover {
   color: var(--emerald-bright);

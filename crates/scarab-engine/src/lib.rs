@@ -242,6 +242,80 @@ pub struct Attempt {
     pub failure: Option<FailureKind>,
 }
 
+/// A **Run-scoped shared service** instance (ADR-0058): the durable projection
+/// of one pipeline-level `services:` entry, born eagerly at Run start and torn
+/// down when the Run/Take reaches terminal (namespace-per-run teardown, not a
+/// refcount). Keyed `{run, take, name}` — a **fresh instance per Take**, so a
+/// Rerun (a new Take) provisions a new instance that cannot see the prior Take's
+/// writes. Not a `needs`-able DAG node; explicitly *unfenced* external state.
+///
+/// The `take` is materialized here as a stored generation integer. This is a
+/// narrow, deliberate departure from ADR-0056 (which keeps Takes a *derived*
+/// lens with "no take column anywhere"): a live k8s object cannot be re-derived
+/// from event replay, and ADR-0058 explicitly keys the instance on `{run, take}`.
+/// The engine's "current take" for a run is `max(take)` over its services.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunService {
+    pub run: RunId,
+    /// The Take generation this instance belongs to (1 for the first Take).
+    pub take: i64,
+    /// The declared service name — also the cluster DNS hostname.
+    pub name: String,
+    pub status: ServiceStatus,
+    /// The executor handle once launched (`None` before launch / after a crash
+    /// before the handle was recorded). Lets teardown/readiness address the unit.
+    pub handle: Option<String>,
+    pub created_at: Timestamp,
+}
+
+/// The lifecycle of a [`RunService`] (ADR-0058): `starting → ready → running`,
+/// terminal `torn-down | failed`. `Ready` is the readiness-gate release signal;
+/// `Failed` (e.g. a ready-timeout) fails opt-in steps fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceStatus {
+    /// Provisioning; the readiness probe has not yet passed.
+    Starting,
+    /// The readiness probe passed — opt-in steps may proceed.
+    Ready,
+    /// Ready and observed live (a post-ready liveness marker).
+    Running,
+    /// Torn down at Run/Take terminal (namespace-per-run teardown).
+    TornDown,
+    /// Failed to become ready within budget (fail-closed for opt-in steps).
+    Failed,
+}
+
+impl ServiceStatus {
+    /// The wire token stored in the `status` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ServiceStatus::Starting => "starting",
+            ServiceStatus::Ready => "ready",
+            ServiceStatus::Running => "running",
+            ServiceStatus::TornDown => "torn-down",
+            ServiceStatus::Failed => "failed",
+        }
+    }
+
+    /// Parse a stored wire token; `None` for an unknown value.
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "starting" => ServiceStatus::Starting,
+            "ready" => ServiceStatus::Ready,
+            "running" => ServiceStatus::Running,
+            "torn-down" => ServiceStatus::TornDown,
+            "failed" => ServiceStatus::Failed,
+            _ => return None,
+        })
+    }
+
+    /// A terminal instance is never provisioned or gated on again.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, ServiceStatus::TornDown | ServiceStatus::Failed)
+    }
+}
+
 /// The executable contract of a Step (ADR-0008): an OCI image + command, plus
 /// environment. This is the minimal spec the [`Executor`] needs to launch one
 /// Pod; the full IR (`scarab-pipeline`) compiles down to it. It is handed to the
@@ -321,6 +395,13 @@ pub struct StepSpec {
     /// and are re-created fresh on every Attempt.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub services: Vec<scarab_pipeline::ServiceSpec>,
+    /// Shared-service opt-in (ADR-0058): the names of pipeline-level shared
+    /// services this Step reaches over the network. The executor stamps an
+    /// opt-in label per name on the Step's Pod so the service's NetworkPolicy
+    /// admits it (least-privilege: non-opt-in Pods cannot reach the service).
+    /// The scheduler readiness-gates this Step on those services becoming ready.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<String>,
 }
 
 /// The launch context of a `kind: build` step (ADR-0018): what to build

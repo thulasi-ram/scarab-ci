@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Lease};
 use scarab_engine::{
     Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, ExecError, Executor,
-    FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId,
-    StepRun, StepSpec, StepStatus, Timestamp,
+    FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService, RunStatus, RunSummary,
+    ServiceStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 use scarab_storage::{ObjectStore, StorageError};
 
@@ -201,6 +201,10 @@ struct InMemoryState {
     artifacts: HashMap<(RunId, String, StepId, AttemptId), scarab_engine::ArtifactRecord>,
     /// Per-attempt immutable evidence (ADR-0056).
     attempt_evidence: HashMap<(RunId, StepId, AttemptId), AttemptEvidenceRec>,
+    /// Run-scoped shared services (ADR-0058), keyed `{run, take, name}` —
+    /// value is `(status, handle, created_at)`.
+    #[allow(clippy::type_complexity)]
+    run_services: HashMap<(RunId, i64, String), (ServiceStatus, Option<String>, Timestamp)>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -771,6 +775,61 @@ impl Db for InMemoryDb {
             .steps
             .get(&(run.clone(), step.clone()))
             .and_then(|r| r.gate_timer_seconds))
+    }
+
+    async fn create_run_service(
+        &self,
+        run: &RunId,
+        take: i64,
+        name: &str,
+        at: Timestamp,
+    ) -> Result<(), DbError> {
+        // Idempotent on {run, take, name}: an existing row is left untouched.
+        self.state
+            .lock()
+            .unwrap()
+            .run_services
+            .entry((run.clone(), take, name.to_string()))
+            .or_insert((ServiceStatus::Starting, None, at));
+        Ok(())
+    }
+
+    async fn set_run_service(
+        &self,
+        run: &RunId,
+        take: i64,
+        name: &str,
+        status: ServiceStatus,
+        handle: Option<&str>,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(rec) = st.run_services.get_mut(&(run.clone(), take, name.to_string())) {
+            rec.0 = status;
+            // Preserve an already-recorded handle if this update carries none.
+            if let Some(h) = handle {
+                rec.1 = Some(h.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_services(&self, run: &RunId) -> Result<Vec<RunService>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<RunService> = st
+            .run_services
+            .iter()
+            .filter(|((r, _, _), _)| r == run)
+            .map(|((r, take, name), (status, handle, created))| RunService {
+                run: r.clone(),
+                take: *take,
+                name: name.clone(),
+                status: *status,
+                handle: handle.clone(),
+                created_at: *created,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.take.cmp(&b.take)));
+        Ok(out)
     }
 
     async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError> {

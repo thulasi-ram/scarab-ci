@@ -2472,6 +2472,7 @@ mod tests {
             k8s_overlay: None,
             oidc_token: None,
             services: vec![],
+            uses: vec![],
         }
     }
 
@@ -2683,6 +2684,7 @@ mod tests {
             k8s_overlay: None,
             oidc_token: None,
             services: vec![],
+            uses: vec![],
         };
         let pod = build_pod(
             "scarab-x",
