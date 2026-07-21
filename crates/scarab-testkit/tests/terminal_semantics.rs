@@ -10,8 +10,8 @@
 
 use scarab_engine::ports::{ExecState, FailureClass};
 use scarab_engine::{
-    Clock, Db, EventPayload, Executor, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus,
-    Timestamp,
+    restart_step, Clock, Db, EventKind, EventPayload, Executor, RunId, RunStatus, Scheduler,
+    StepId, StepSpec, StepStatus, Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
@@ -307,6 +307,106 @@ async fn run_budget_counts_active_time_only_and_fails_on_exhaustion() {
             }
         )),
         "diagnostics on the event log"
+    );
+}
+
+/// Regression (ADR-0047): the run's active-time budget counts only time spent
+/// in `Running`, so time the run sat queued in `Pending` before admission ever
+/// launched it does NOT bill the budget. The old accounting billed wall-clock
+/// since creation, so a run that waited out a long queue was failed the instant
+/// it started — before doing any work.
+#[tokio::test]
+async fn budget_ignores_time_queued_before_the_run_started() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    let at = Timestamp(1_000);
+    let step = StepId("s".into());
+    db.create_run(&run_id(), 1, 1, at).await.unwrap();
+    db.create_step_run(&run_id(), &step, Some(&spec()), &[], at)
+        .await
+        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 1, "budget": 60,
+            "steps": [{ "id": "s", "image": "img" }] }),
+    )
+    .await
+    .unwrap();
+    // The `RunCreated` anchor the real event log carries (the in-memory
+    // create_run omits it): without it, "wall time since creation" and "since
+    // first Running" coincide and the queue gap below would be invisible.
+    db.append_event(&EventKind {
+        version: 1,
+        run: run_id(),
+        kind: EventPayload::RunCreated,
+        at,
+    })
+    .await
+    .unwrap();
+
+    // The run sits queued for 10 hours before admission ever runs it.
+    clock.advance(10 * 3_600_000);
+    tick(&db, &clock, &exec).await; // Pending → Running; a1 launches at the 10h mark
+    tick(&db, &clock, &exec).await; // budget check sees ~0s of ACTIVE time
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Running),
+        "queue time is not active time — a 10h wait must not blow a 60s budget"
+    );
+}
+
+/// Regression (ADR-0047 / ADR-0056): a Rerun of a budget-carrying run must make
+/// progress, not re-fail on the first tick. Time the run spent `Failed` awaiting
+/// a human Rerun is idle, not active compute, so it must not bill the budget.
+/// The old accounting billed wall-clock since creation, so any Rerun of a run
+/// older than its budget re-failed at once (the reported bug).
+#[tokio::test]
+async fn rerun_after_failure_does_not_bill_idle_time_to_the_budget() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    let at = Timestamp(1_000);
+    let step = StepId("s".into());
+    db.create_run(&run_id(), 1, 1, at).await.unwrap();
+    db.create_step_run(&run_id(), &step, Some(&spec()), &[], at)
+        .await
+        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 1, "budget": 60,
+            "steps": [{ "id": "s", "image": "img" }] }),
+    )
+    .await
+    .unwrap();
+
+    // The step fails on its verdict → the run settles Failed after only a moment
+    // of active time (well under the 60s budget).
+    exec.script_outcome(failed(FailureClass::Step));
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed)
+    );
+
+    // It then sits Failed for 10 hours awaiting a human Rerun — idle, not active.
+    clock.advance(10 * 3_600_000);
+    restart_step(&db, &clock, &run_id(), &step, Some("alice".into()))
+        .await
+        .unwrap();
+
+    // The reopened run must NOT be instantly re-failed on the budget.
+    tick(&db, &clock, &exec).await;
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Running),
+        "a Rerun must make progress, not re-fail on the idle time it spent Failed"
     );
 }
 

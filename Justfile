@@ -21,13 +21,6 @@ ui:
     set -a && source deploy/local-proc/.env && set +a
     npm --prefix ui/scarab-web-ui run dev
 
-# Run the web UI against a built-in fixture (no server, no DB) — the fastest way
-# to eyeball UI changes. Serves a fixed "acme" org (dashboard/run-detail/env/
-# secrets) with the dark theme forced. See ui/scarab-web-ui/src/mock.ts.
-ui-mock:
-    npm --prefix ui/scarab-web-ui install
-    VITE_SCARAB_MOCK=1 npm --prefix ui/scarab-web-ui run dev
-
 # Run the docs site dev server (Astro Starlight; ADR-0040).
 docs:
     npm --prefix ui/scarab-docs-ui install

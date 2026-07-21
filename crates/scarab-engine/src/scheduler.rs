@@ -1570,8 +1570,22 @@ impl<'a> Scheduler<'a> {
 
     /// Enforce the run's opt-in active-time `budget:` (ADR-0047). Returns
     /// `true` when the budget is exhausted and the run was failed (admission
-    /// must stop). Active time = wall time since creation minus gate-suspended
-    /// intervals; there is deliberately **no default**.
+    /// must stop). Active time = the wall time the run has actually spent in
+    /// `Running`, summed over its `Running` intervals; there is deliberately
+    /// **no default**.
+    ///
+    /// Summing `Running` intervals — rather than the older "wall time since
+    /// creation minus gate-suspended intervals" — is what makes the budget an
+    /// *active*-time ceiling and, critically, what lets a Rerun of a
+    /// budget-exhausted run make progress. The old form billed two spans that
+    /// are not active compute: time the run sat `Pending` in the admission
+    /// queue before it ever ran, and time it sat `Failed` awaiting a human
+    /// Rerun. Because `created_at` never moves, both grew without bound, so any
+    /// run older than its budget re-failed on the first tick after a Rerun
+    /// (the run flips `Failed → Running`, the next tick recomputes an
+    /// ever-larger elapsed span, and it trips the ceiling again). Gate-suspended
+    /// waits, queue time, and post-failure idle now all fall outside the summed
+    /// `Running` intervals, so none of them bill.
     async fn enforce_run_budget(&self, run: &RunId) -> Result<bool, SchedulerError> {
         if self.db.run_status(run).await? != Some(RunStatus::Running) {
             return Ok(false);
@@ -1580,34 +1594,32 @@ impl<'a> Scheduler<'a> {
             return Ok(false);
         };
         let events = self.db.events(run).await?;
-        let Some(created_at) = events.first().map(|e| e.at.0) else {
-            return Ok(false);
-        };
-        // Sum the closed suspended intervals (the run is Running now, so no
-        // interval is open).
-        let mut suspended_ms: i64 = 0;
-        let mut open: Option<i64> = None;
+        // Sum the run's `Running` intervals from the event log. Every entry into
+        // `Running` opens an interval; the next transition out of it closes it.
+        // The run is `Running` now, so the final interval is still open — close
+        // it at `now`.
+        let now = self.clock.now().await;
+        let mut active_ms: i64 = 0;
+        let mut entered_running: Option<i64> = None;
         for e in &events {
-            match &e.kind {
-                EventPayload::RunTransitioned {
-                    to: RunStatus::Suspended,
-                    ..
-                } => {
-                    open = Some(e.at.0);
-                }
-                EventPayload::RunTransitioned {
-                    from: RunStatus::Suspended,
-                    ..
-                } => {
-                    if let Some(started) = open.take() {
-                        suspended_ms += e.at.0 - started;
+            if let EventPayload::RunTransitioned { to, .. } = &e.kind {
+                match to {
+                    RunStatus::Running => {
+                        if entered_running.is_none() {
+                            entered_running = Some(e.at.0);
+                        }
+                    }
+                    _ => {
+                        if let Some(start) = entered_running.take() {
+                            active_ms += e.at.0 - start;
+                        }
                     }
                 }
-                _ => {}
             }
         }
-        let now = self.clock.now().await;
-        let active_ms = now.0 - created_at - suspended_ms;
+        if let Some(start) = entered_running.take() {
+            active_ms += now.0 - start;
+        }
         let budget_ms = budget_secs.saturating_mul(1000);
         if active_ms < budget_ms {
             return Ok(false);

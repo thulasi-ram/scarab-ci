@@ -8,7 +8,6 @@
     "gen": "openapi-typescript ../../openapi.json -o src/api/schema.ts",
     "typecheck": "tsc --noEmit",
     "dev": "vite",
-    "dev:mock": "VITE_SCARAB_MOCK=1 vite",
     "build": "vite build",
     "preview": "vite preview"
   },
