@@ -313,6 +313,14 @@ pub struct StepSpec {
     /// issuer is not configured.
     #[serde(skip)]
     pub oidc_token: Option<String>,
+    /// Sidecar services (ADR-0058): throwaway backing containers co-located in
+    /// this Step's Pod, reachable at `localhost:<port>`. The executor injects
+    /// each as a native sidecar (an `initContainer` with `restartPolicy: Always`,
+    /// reusing the ADR-0042 machinery); an optional readiness probe gates the
+    /// step's main container start. Fenced by inheritance — they die with the Pod
+    /// and are re-created fresh on every Attempt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<scarab_pipeline::ServiceSpec>,
 }
 
 /// The launch context of a `kind: build` step (ADR-0018): what to build

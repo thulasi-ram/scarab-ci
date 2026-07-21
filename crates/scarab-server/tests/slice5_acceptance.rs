@@ -146,6 +146,7 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        services: Vec::new(),
     };
     let pod = build_pod(
         "scarab-image",

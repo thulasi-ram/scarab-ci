@@ -305,6 +305,7 @@ async fn drive_to_gate(pg: &Arc<PostgresDb>, run: &RunId) {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        services: Vec::new(),
     };
     pg.create_run(run, 1, 1, Timestamp(0)).await.unwrap();
     pg.create_step_run(run, &a, Some(&spec), &[], Timestamp(0))

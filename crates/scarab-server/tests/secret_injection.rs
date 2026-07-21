@@ -61,6 +61,7 @@ fn spec_with_secret() -> StepSpec {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        services: Vec::new(),
     }
 }
 fn logs(db: Arc<dyn Db>) -> Arc<LogService> {
@@ -233,6 +234,7 @@ fn plain_spec() -> StepSpec {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        services: Vec::new(),
     }
 }
 

@@ -33,6 +33,7 @@ fn spec() -> StepSpec {
         resources: Default::default(),
         k8s_overlay: None,
         oidc_token: None,
+        services: Vec::new(),
     }
 }
 

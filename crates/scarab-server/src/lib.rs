@@ -393,6 +393,12 @@ pub struct StepDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object)]
     pub k8s_overlay: Option<serde_json::Value>,
+    /// Sidecar services (ADR-0058): throwaway backing containers co-located in
+    /// this step's Pod, reachable at `localhost:<port>`, with an optional
+    /// readiness probe gating the step's main container start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Object)]
+    pub services: Vec<scarab_pipeline::ServiceSpec>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -912,6 +918,7 @@ async fn create_run(
             resources: step.resources.clone(),
             k8s_overlay,
             oidc_token: None,
+            services: step.services.clone(),
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -3391,6 +3398,9 @@ async fn persist_run_from_ir(
                         TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
                     })?,
                 oidc_token: None,
+                // A clone step runs the canonical scarab-clone image; validation
+                // forbids `services` on it, so this is always empty.
+                services: Vec::new(),
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -3454,6 +3464,8 @@ async fn persist_run_from_ir(
                         TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
                     })?,
                 oidc_token: None,
+                // Sidecar services (ADR-0058) co-locate in this executed step's Pod.
+                services: step.services.clone(),
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;

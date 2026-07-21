@@ -12,10 +12,12 @@ use async_trait::async_trait;
 use futures::io::AsyncBufRead;
 use futures::AsyncReadExt;
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EmptyDirVolumeSource, EnvVar, Pod, PodSpec, ResourceRequirements,
-    SeccompProfile, SecurityContext, Volume, VolumeMount,
+    Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, ExecAction,
+    HTTPGetAction, Pod, PodSpec, Probe, ResourceRequirements, SeccompProfile, SecurityContext,
+    TCPSocketAction, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::{Api, AttachParams, DeleteParams, LogParams, Patch, PatchParams, PostParams};
 use std::sync::Arc;
@@ -1720,6 +1722,19 @@ pub fn build_pod(
             );
         }
     }
+    // Sidecar services (ADR-0058): each declared service co-locates in THIS Pod
+    // as a native sidecar (an initContainer with `restartPolicy: Always`, reusing
+    // the ADR-0042 machinery), reachable by the step at `localhost:<port>`. Its
+    // optional readiness probe becomes the sidecar's **startupProbe**, so the
+    // kubelet holds the MAIN step container until the service is ready — the
+    // durable replacement for Woodpecker's `sleep 30s`. The service image is
+    // author-supplied and runs under the ADR-0039 restricted baseline; only the
+    // step's self-service `run-as-root` grant carries over (governed
+    // caps/privileged keyed on a *service* digest are a later slice — fail-closed).
+    for (i, svc) in spec.services.iter().enumerate() {
+        init_containers.push(service_sidecar(i, svc, spec.run_as_root));
+    }
+
     let volumes = (!volumes.is_empty()).then_some(volumes);
     let init_containers = (!init_containers.is_empty()).then_some(init_containers);
 
@@ -1928,6 +1943,112 @@ fn step_security_context(spec: &StepSpec) -> SecurityContext {
         // Privilege escalation stays off unless the container is privileged.
         allow_privilege_escalation: Some(spec.privileged),
         privileged: Some(spec.privileged),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "RuntimeDefault".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Name prefix for a sidecar service container (ADR-0058); the index makes each
+/// service in a Step deterministic and unique (`service-0`, `service-1`, …).
+const SERVICE_CONTAINER_PREFIX: &str = "service-";
+
+/// Build the native-sidecar [`Container`] for a declared service (ADR-0058): an
+/// `initContainer` with `restartPolicy: Always` co-located in the step's Pod
+/// (localhost-reachable), its readiness probe wired as the **startupProbe** so
+/// the main step container is held until the service is ready.
+fn service_sidecar(
+    index: usize,
+    svc: &scarab_pipeline::ServiceSpec,
+    run_as_root: bool,
+) -> Container {
+    Container {
+        name: format!("{SERVICE_CONTAINER_PREFIX}{index}"),
+        image: Some(svc.image.clone()),
+        command: (!svc.command.is_empty()).then(|| svc.command.clone()),
+        args: (!svc.args.is_empty()).then(|| svc.args.clone()),
+        env: (!svc.env.is_empty())
+            .then(|| svc.env.iter().map(|(k, v)| env_var(k, v)).collect()),
+        ports: (!svc.ports.is_empty()).then(|| {
+            svc.ports
+                .iter()
+                .map(|p| ContainerPort {
+                    container_port: *p as i32,
+                    ..Default::default()
+                })
+                .collect()
+        }),
+        // Native sidecar: starts alongside the step and is terminated by the
+        // kubelet after the main container exits — its lifecycle is the Step's
+        // (fenced by inheritance, ADR-0058), dying with the Pod on every Attempt.
+        restart_policy: Some("Always".to_string()),
+        startup_probe: service_startup_probe(svc),
+        security_context: Some(service_security_context(run_as_root)),
+        ..Default::default()
+    }
+}
+
+/// The `startupProbe` for a service sidecar (ADR-0058), derived from its `ready:`
+/// probe: `tcp` (the default — a TCP-connect on the first declared port when
+/// `ready:` is omitted), `exec`, or `http`. Returns `None` when there is nothing
+/// to gate on (no probe and no declared port), so the main container starts
+/// immediately alongside the sidecar.
+fn service_startup_probe(svc: &scarab_pipeline::ServiceSpec) -> Option<Probe> {
+    let (tcp, exec, http) = match &svc.ready {
+        Some(ready) if !ready.exec.is_empty() => (None, Some(ready.exec.clone()), None),
+        Some(ready) if ready.http.is_some() => {
+            let h = ready.http.as_ref().unwrap();
+            (None, None, Some((h.port, h.path.clone())))
+        }
+        Some(ready) if ready.tcp.is_some() => (ready.tcp, None, None),
+        // No `ready:` (or an empty one): default to a TCP-connect on the first
+        // declared port.
+        _ => (svc.ports.first().copied(), None, None),
+    };
+    if tcp.is_none() && exec.is_none() && http.is_none() {
+        return None;
+    }
+    Some(Probe {
+        tcp_socket: tcp.map(|p| TCPSocketAction {
+            port: IntOrString::Int(p as i32),
+            host: None,
+        }),
+        exec: exec.map(|command| ExecAction {
+            command: Some(command),
+        }),
+        http_get: http.map(|(p, path)| HTTPGetAction {
+            port: IntOrString::Int(p as i32),
+            path: Some(path),
+            ..Default::default()
+        }),
+        // Poll briskly but allow a generous startup window (the durable
+        // "wait until healthy", not a fixed sleep): ~2 minutes before failing.
+        period_seconds: Some(2),
+        failure_threshold: Some(60),
+        timeout_seconds: Some(2),
+        ..Default::default()
+    })
+}
+
+/// The `SecurityContext` for a sidecar service container (ADR-0058): the same
+/// hardened ADR-0039 "restricted" baseline as a step container — `runAsNonRoot`,
+/// drop **ALL** capabilities, `RuntimeDefault` seccomp, no privilege escalation.
+/// Only the step's **self-service** `run-as-root` grant carries over (root inside
+/// the caps-dropped, unprivileged, seccomp-confined sandbox does not escape it);
+/// governed `add-capabilities`/`privileged`, which are keyed on the *service*
+/// image digest, are not applied here (fail-closed — a later slice).
+fn service_security_context(run_as_root: bool) -> SecurityContext {
+    SecurityContext {
+        run_as_non_root: Some(!run_as_root),
+        run_as_user: run_as_root.then_some(0),
+        capabilities: Some(Capabilities {
+            drop: Some(vec!["ALL".to_string()]),
+            add: None,
+        }),
+        allow_privilege_escalation: Some(false),
+        privileged: Some(false),
         seccomp_profile: Some(SeccompProfile {
             type_: "RuntimeDefault".to_string(),
             ..Default::default()
@@ -2350,6 +2471,7 @@ mod tests {
             resources: Default::default(),
             k8s_overlay: None,
             oidc_token: None,
+            services: vec![],
         }
     }
 
@@ -2560,6 +2682,7 @@ mod tests {
             resources: Default::default(),
             k8s_overlay: None,
             oidc_token: None,
+            services: vec![],
         };
         let pod = build_pod(
             "scarab-x",
@@ -2610,6 +2733,94 @@ mod tests {
         assert_eq!(sc.privileged, Some(false));
         // Self-service root stays unprivileged and non-escalating.
         assert_eq!(sc.allow_privilege_escalation, Some(false));
+    }
+
+    // ADR-0058: a declared sidecar service is injected as a native sidecar
+    // (initContainer, restartPolicy Always) co-located in the step's Pod, with
+    // its readiness probe wired as the container's startupProbe so the kubelet
+    // holds the MAIN step container until the service is ready.
+    #[test]
+    fn sidecar_service_is_colocated_with_wired_startup_probe() {
+        use scarab_pipeline::{ReadyProbe, ServiceSpec};
+        let mut spec = busybox();
+        spec.services = vec![ServiceSpec {
+            image: "postgres:16".into(),
+            env: std::collections::BTreeMap::from([(
+                "POSTGRES_PASSWORD".to_string(),
+                "test".to_string(),
+            )]),
+            ports: vec![5432],
+            ready: Some(ReadyProbe {
+                tcp: Some(5432),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let pod = pod_for(&spec);
+        let ps = pod.spec.unwrap();
+
+        // The MAIN step container is untouched and stays a single app container.
+        assert_eq!(ps.containers.len(), 1);
+        assert_eq!(ps.containers[0].name, STEP_CONTAINER);
+
+        // The service rides as a native sidecar: an initContainer with
+        // restartPolicy Always (co-located, localhost-reachable).
+        let inits = ps.init_containers.expect("service sidecar injected");
+        let svc = inits
+            .iter()
+            .find(|c| c.name == "service-0")
+            .expect("service-0 sidecar present");
+        assert_eq!(svc.image.as_deref(), Some("postgres:16"));
+        assert_eq!(svc.restart_policy.as_deref(), Some("Always"));
+        assert_eq!(svc.ports.as_ref().unwrap()[0].container_port, 5432);
+        assert_eq!(
+            svc.env.as_ref().unwrap()[0].name.as_str(),
+            "POSTGRES_PASSWORD"
+        );
+
+        // Readiness → the sidecar's startupProbe (a TCP-connect on 5432): this is
+        // what gates the main container start until the service is ready.
+        let probe = svc.startup_probe.as_ref().expect("startup probe wired");
+        let tcp = probe.tcp_socket.as_ref().expect("tcp probe");
+        assert_eq!(tcp.port, IntOrString::Int(5432));
+
+        // Governance (ADR-0039): the sidecar inherits the restricted baseline.
+        let sc = svc.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.privileged, Some(false));
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().drop,
+            Some(vec!["ALL".to_string()])
+        );
+    }
+
+    // ADR-0058: the `run-as-root` self-service grant on the step carries over to
+    // the sidecar (stock DB images start as root); the default probe is a
+    // TCP-connect on the first declared port when `ready:` is omitted.
+    #[test]
+    fn sidecar_inherits_run_as_root_and_defaults_probe_to_first_port() {
+        use scarab_pipeline::ServiceSpec;
+        let mut spec = busybox();
+        spec.run_as_root = true;
+        spec.services = vec![ServiceSpec {
+            image: "redis:7".into(),
+            ports: vec![6379],
+            ready: None, // default → TCP on the first declared port
+            ..Default::default()
+        }];
+        let inits = pod_for(&spec).spec.unwrap().init_containers.unwrap();
+        let svc = inits.iter().find(|c| c.name == "service-0").unwrap();
+        let sc = svc.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(false));
+        assert_eq!(sc.run_as_user, Some(0));
+        let tcp = svc
+            .startup_probe
+            .as_ref()
+            .unwrap()
+            .tcp_socket
+            .as_ref()
+            .unwrap();
+        assert_eq!(tcp.port, IntOrString::Int(6379));
     }
 
     #[test]
