@@ -415,6 +415,12 @@ pub struct StepSpec {
     /// steps authored without a matrix). Consumed later by CEL interpolation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub matrix_values: BTreeMap<String, String>,
+    /// Sidecar services (ADR-0058): throwaway backing containers co-located in
+    /// this Step's Pod, reachable at `localhost:<port>`. Each is a
+    /// [`ServiceSpec`]; none is a `needs`-able DAG node. A matrixed Step's
+    /// sidecars multiply per instance (each instance's Pod gets its own).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<ServiceSpec>,
 }
 
 impl StepSpec {
@@ -470,6 +476,81 @@ impl StepSecurity {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// A **sidecar service** (ADR-0058): a throwaway backing container co-located
+/// inside the declaring Step's Pod, reachable at `localhost:<port>`, alive only
+/// for that one Step's execution. It reuses ADR-0042's native-sidecar machinery
+/// and is **fenced by inheritance** — it shares the Step's Attempt identity and
+/// teardown, dies with the Pod, and is re-created fresh on every Attempt. A
+/// service is **not** a `needs`-able DAG node: it is infrastructure *for* a Step,
+/// not a Step (no id, no exit code, no Attempt of its own). Its image is
+/// author-supplied and no more trusted than a step image — it runs under the
+/// ADR-0039 restricted baseline; the `run-as-root` self-service grant applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceSpec {
+    /// The OCI image (e.g. `postgres:16`). Serde-defaulted so an absent image
+    /// surfaces as a validation diagnostic, not a parse error (cf. `BuildSpec`).
+    #[serde(default)]
+    pub image: String,
+    /// Optional command (entrypoint) override — the image default when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Optional args appended after the command/entrypoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Environment for the service container, authored as a map
+    /// (`env: { POSTGRES_PASSWORD: test }`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Container ports the service listens on (all reachable at `localhost:<p>`).
+    /// The **first** port is the default target of a `tcp` readiness probe.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<u16>,
+    /// Optional readiness probe: gates the Step's **main** container start until
+    /// the service is ready (ADR-0058). Absent = a TCP-connect on the first
+    /// declared [`port`](ServiceSpec::ports); if no port is declared either, the
+    /// main container starts immediately (no gate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<ReadyProbe>,
+}
+
+/// A sidecar service's readiness probe (ADR-0058), authored as a one-key map:
+/// `tcp` is the default form (`ready: { tcp: 5432 }`); `exec`
+/// (`ready: { exec: [pg_isready] }`) and `http` (`ready: { http: { port, path } }`)
+/// are also allowed. Exactly one form must be set (enforced by [`validate`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadyProbe {
+    /// Ready when a TCP connection to this port succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp: Option<u16>,
+    /// Ready when this command, run inside the service container, exits 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exec: Vec<String>,
+    /// Ready on a 2xx/3xx from an HTTP GET.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<HttpReady>,
+}
+
+impl ReadyProbe {
+    /// How many probe forms this authored probe sets (must be exactly 1).
+    fn forms_set(&self) -> usize {
+        self.tcp.is_some() as usize + (!self.exec.is_empty()) as usize + self.http.is_some() as usize
+    }
+}
+
+/// The `http` form of a [`ReadyProbe`] (ADR-0058).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpReady {
+    /// Port to GET.
+    pub port: u16,
+    /// Request path (default `/`).
+    #[serde(default = "default_http_path")]
+    pub path: String,
+}
+
+fn default_http_path() -> String {
+    "/".to_string()
 }
 
 /// Configuration of a `clone` step (ADR-0045). Everything is optional —
@@ -1538,6 +1619,49 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                     step.id
                 ));
             }
+        }
+        // Sidecar services (ADR-0058): a service co-locates in the *executed*
+        // Step's Pod, so it is only meaningful on an ordinary step — never on a
+        // gate (no Pod), a clone (canonical image), or a build (rootless BuildKit).
+        if !step.services.is_empty() && (step.is_gate() || step.is_clone() || step.is_build()) {
+            diagnostics.push(format!(
+                "step `{}`: `services` is only valid on an ordinary executed step \
+                 (not a gate, clone, or build step)",
+                step.id
+            ));
+        }
+        for svc in &step.services {
+            if svc.image.trim().is_empty() {
+                diagnostics.push(format!(
+                    "step `{}`: a `services` entry must name an `image`",
+                    step.id
+                ));
+            }
+            if let Some(ready) = &svc.ready {
+                // Exactly one of tcp/exec/http (a probe with none set is
+                // meaningless; more than one is ambiguous).
+                if ready.forms_set() != 1 {
+                    diagnostics.push(format!(
+                        "step `{}`: a service `ready` probe must set exactly one of \
+                         `tcp`/`exec`/`http`",
+                        step.id
+                    ));
+                }
+                if ready.tcp == Some(0) {
+                    diagnostics.push(format!(
+                        "step `{}`: a service `ready.tcp` port must be greater than zero",
+                        step.id
+                    ));
+                }
+                if ready.http.as_ref().is_some_and(|h| h.port == 0) {
+                    diagnostics.push(format!(
+                        "step `{}`: a service `ready.http.port` must be greater than zero",
+                        step.id
+                    ));
+                }
+            }
+            // No probe + no port = nothing to gate on; still valid (the main
+            // container simply starts immediately alongside the sidecar).
         }
         // A build step runs the blessed rootless BuildKit image (ADR-0018):
         // the author names no image/command and needs no privilege (rootless
@@ -3644,6 +3768,73 @@ mod tests {
                     max: 2
                 })
             );
+        }
+    }
+
+    // --- sidecar services (ADR-0058) ----------------------------------------
+
+    #[test]
+    fn sidecar_services_parse_with_a_ready_probe() {
+        let ir = compile(
+            r#"
+            steps:
+              - id: test
+                image: rust:1
+                command: [cargo, test]
+                services:
+                  - image: postgres:16
+                    env: { POSTGRES_PASSWORD: test }
+                    ports: [5432]
+                    ready: { tcp: 5432 }
+            "#,
+        );
+        let svcs = &ir.steps[0].services;
+        assert_eq!(svcs.len(), 1);
+        assert_eq!(svcs[0].image, "postgres:16");
+        assert_eq!(svcs[0].ports, vec![5432]);
+        assert_eq!(svcs[0].ready.as_ref().unwrap().tcp, Some(5432));
+        assert_eq!(
+            svcs[0].env.get("POSTGRES_PASSWORD").map(String::as_str),
+            Some("test")
+        );
+    }
+
+    #[test]
+    fn a_service_without_an_image_is_rejected() {
+        match compile_yaml(
+            r#"
+            steps:
+              - id: test
+                image: rust:1
+                services:
+                  - env: { A: b }
+            "#,
+        ) {
+            Err(PipelineError::Validation(errs)) => assert!(
+                errs.iter().any(|e| e.contains("must name an `image`")),
+                "{errs:?}"
+            ),
+            other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn services_on_a_gate_step_are_rejected() {
+        match compile_yaml(
+            r#"
+            steps:
+              - id: approve
+                gate: manual
+                services:
+                  - image: postgres:16
+            "#,
+        ) {
+            Err(PipelineError::Validation(errs)) => assert!(
+                errs.iter()
+                    .any(|e| e.contains("`services` is only valid on an ordinary executed step")),
+                "{errs:?}"
+            ),
+            other => panic!("expected validation error, got {other:?}"),
         }
     }
 }
