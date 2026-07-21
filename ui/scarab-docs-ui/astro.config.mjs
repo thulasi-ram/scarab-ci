@@ -70,7 +70,10 @@ export default defineConfig({
         }),
         // API reference generated from the canonical spec, in place.
         starlightOpenAPI([
-          { base: 'reference/api', label: 'API', schema: '../../openapi.json' },
+          // Tagged copy produced by scripts/gen-openapi.mjs (the canonical
+          // ../../openapi.json ships tag-free; starlight-openapi needs tags to
+          // render per-operation pages). Regenerated on every predev/prebuild.
+          { base: 'reference/api', label: 'API', schema: './openapi.gen.json' },
         ]),
       ],
       sidebar: [
