@@ -1,5 +1,5 @@
 # Default values for the scarab chart.
-# Every stanza maps to scarab-server's env-driven config (see crates/scarab-server/src/main.rs).
+# Every stanza maps to scarab-server's env-driven config (see crates/scarab-server/src/config.rs).
 
 image:
   repository: ghcr.io/thulasi-ram/scarab-server
@@ -88,6 +88,9 @@ secrets:
   # MANDATORY unless scarab.devInsecure is on (ADR-0048).
   masterKey: ""
   # HMAC secrets for webhook verification / gate + results token minting.
+  # githubWebhookSecret renders SCARAB_GITHUB_WEBHOOK_SECRET (/webhooks/github).
+  # Forgejo binds its own secret (ADR-0046): set SCARAB_FORGEJO_WEBHOOK_SECRET via
+  # existingSecret / envFrom (this chart does not render a dedicated key for it).
   githubWebhookSecret: ""
   gateTokenSecret: ""
   resultsTokenSecret: ""

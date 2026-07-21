@@ -7,8 +7,8 @@ import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="terminal" size={200} rotate={-10} opacity={0.18} top="7rem" right="-2rem" />
 
-The repo ships a one-command dev harness (a `Justfile` over `dev/`). This is the path that works
-**today** — it runs the durable core end-to-end on your machine.
+The repo ships a one-command dev harness (a `Justfile` over `deploy/local-proc/`). This is the path
+that works **today** — it runs the durable core end-to-end on your machine.
 
 ## Prerequisites
 
@@ -23,8 +23,8 @@ The repo ships a one-command dev harness (a `Justfile` over `dev/`). This is the
 just up      # Postgres + MinIO + kind + scarab-server (background)
 ```
 
-`just up` starts Postgres and MinIO (via `dev/compose.yaml`), creates a kind cluster
-(`dev/kind.yaml`), and runs `scarab-server` in converged mode against them.
+`just up` starts Postgres and MinIO (via `deploy/local-proc/compose.yaml`), creates a kind cluster
+(`deploy/local-proc/kind.yaml`), and runs `scarab-server` in converged mode against them.
 
 ## Submit a pipeline and watch it complete
 
@@ -40,8 +40,16 @@ skeleton that survives a mid-run control-plane kill.
 ```sh
 just serve   # run scarab-server in the FOREGROUND against the dev stack (Ctrl-C to stop)
 just logs    # tail the background server log
+just docs    # serve this documentation site locally
 just down    # tear the whole stack down
 ```
+
+:::note[The other mode: in-cluster Helm]
+`just up` runs the server as a host process (kind for step Pods). For the real in-cluster path —
+`scarab-server` deployed via the Helm chart on colima, with in-cluster Postgres + MinIO — use
+`just local-helm` (`just local-helm local` builds from the tree; `just local-helm sha-<sha>` pins a
+published build). See [Deploy with Helm](/scarab-ci/get-started/deploy-helm/).
+:::
 
 :::tip[See the UI]
 `just ui` starts the SolidJS web UI (Vite on <code>http://localhost:5173</code>), which proxies
@@ -53,5 +61,8 @@ follow-up.
 
 The server persisted every step transition to Postgres as a durable state machine. Kill the
 control plane mid-run and bring it back — the run resumes from where it stopped rather than
-restarting. That durability contract is the whole point; see
-[ADR-0002](/scarab-ci/tech/adr/0002-durability-model/).
+restarting. That durability contract is the whole point.
+
+## References
+
+- [ADR-0002 — Durability model: durable DAG orchestrator + at-least-once steps](/scarab-ci/tech/adr/0002-durability-model/)

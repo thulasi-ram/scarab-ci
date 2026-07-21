@@ -79,16 +79,16 @@ export default defineConfig({
           label: 'Get Started',
           items: [
             { label: 'Run locally', slug: 'get-started/run-locally' },
-            { label: 'Deploy with Helm', slug: 'get-started/deploy-helm', badge: { text: 'stub', variant: 'caution' } },
+            { label: 'Deploy with Helm', slug: 'get-started/deploy-helm' },
           ],
         },
         {
           label: 'Guides',
-          items: [{ label: 'Pipeline authoring', slug: 'guides/authoring', badge: { text: 'wip', variant: 'note' } }],
+          items: [{ label: 'Pipeline authoring', slug: 'guides/authoring' }],
         },
         {
           label: 'Configure',
-          items: [{ label: 'Configuration reference', slug: 'configure/reference', badge: { text: 'wip', variant: 'note' } }],
+          items: [{ label: 'Configuration reference', slug: 'configure/reference' }],
         },
         {
           label: 'Reference',

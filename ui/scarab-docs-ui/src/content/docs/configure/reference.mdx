@@ -7,24 +7,83 @@ import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="key-round" size={200} rotate={9} opacity={0.18} top="7rem" right="-2rem" />
 
-:::note[Work in progress]
-This will be the operator's configuration reference. It's stubbed to the real surface that exists
-today; it fills out as configuration stabilizes.
-:::
-
 ## Server configuration
 
-`scarab-server` is configured from the environment (see `.env.local.example` and the `Justfile`
-`serve` recipe). The core knobs today:
+`scarab-server` is configured from the environment (see `deploy/local-proc/.env.example` and the
+`Justfile` `serve` recipe); `crates/scarab-server/src/config.rs` is the single documented inventory
+of every `SCARAB_*` knob, validated at boot. The shipped knobs:
+
+**Core**
 
 | Variable | Purpose |
 |---|---|
-| `SCARAB_DATABASE_URL` | Postgres connection — the durability substrate ([ADR-0003](/scarab-ci/tech/adr/0003-durability-substrate-postgres/)). |
-| `SCARAB_S3_BUCKET`, `SCARAB_S3_ENDPOINT`, `SCARAB_S3_ACCESS_KEY`, `SCARAB_S3_SECRET_KEY`, `SCARAB_S3_REGION` | Object store for logs/blobs. |
-| `KUBECONFIG`, `SCARAB_NAMESPACE` | Target cluster and namespace for pod-per-step execution. |
+| `SCARAB_DATABASE_URL` | Postgres connection — the durability substrate, mandatory for every serving role. |
+| `SCARAB_ADDR` | Bind address (default `0.0.0.0:8080`). |
+| `SCARAB_ROLE` | Which slice(s) this process runs: `api` / `scheduler` / `executor` / `webhook` / `converged`. |
+| `SCARAB_EXECUTOR` | `k8s` (prod) or `local` (dev/CLI). |
+| `SCARAB_NAMESPACE` | k8s namespace step Pods launch into. |
+| `SCARAB_PUBLIC_URL` | Scarab's public base URL — the run deep-link every forge status carries (default `http://localhost:8080`). |
+
+**Object store** — set `SCARAB_S3_BUCKET` to select S3/MinIO; otherwise `SCARAB_OBJECT_DIR` is the local-dir fallback (dev).
+
+| Variable | Purpose |
+|---|---|
+| `SCARAB_S3_BUCKET` | Selects the S3/MinIO object store when set. |
+| `SCARAB_S3_ENDPOINT` | S3 endpoint (empty = AWS). |
+| `SCARAB_S3_REGION` | S3 region (default `us-east-1`). |
+| `SCARAB_S3_ACCESS_KEY`, `SCARAB_S3_SECRET_KEY` | S3 credentials. |
+| `SCARAB_OBJECT_DIR` | Local object-store directory (dev). |
+
+**Security & identity**
+
+| Variable | Purpose |
+|---|---|
+| `SCARAB_MASTER_KEY` | base64 32-byte KEK for envelope encryption — required unless `SCARAB_DEV_INSECURE=1`. |
+| `SCARAB_DEV_INSECURE` | `1`/`true` downgrades the security hard-fails (KEK, auth) to loud boot warnings — dev only; never relaxes the Postgres requirement. |
+| `SCARAB_OAUTH_CLIENT_ID`, `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | OAuth/OIDC login provider (all five together enable real authn; a partial set refuses boot). |
+| `SCARAB_OAUTH_SCOPES` | Space-separated scopes for the authorize redirect (optional). |
+| `SCARAB_OAUTH_OWNERS` | Comma-separated subjects granted `Owner` at login (bootstrap until scoped RBAC); others log in as `Viewer`. |
+| `SCARAB_OIDC_ISSUER` | Enables the OIDC issuer for keyless federation. |
+| `SCARAB_OIDC_SIGNING_KEY_FILE` | PKCS#8 RSA PEM the issuer signs with — required when the issuer is enabled. |
+| `SCARAB_OIDC_AUDIENCE` | `aud` of minted per-run tokens (default `scarab`). |
+
+**Forge & webhooks**
+
+| Variable | Purpose |
+|---|---|
+| `SCARAB_GITHUB_APP_ID` | GitHub App id — when set, GitHub connections authenticate in App mode (credential secret is the App PEM); absent = token mode (dev). |
+| `SCARAB_GITHUB_WEBHOOK_SECRET` | HMAC secret for `/webhooks/github`. |
+| `SCARAB_FORGEJO_WEBHOOK_SECRET` | HMAC secret for `/webhooks/forgejo` (each forge endpoint binds its own secret). |
+
+**Execution & sources**
+
+| Variable | Purpose |
+|---|---|
+| `SCARAB_CLONE_IMAGE` | Canonical scarab-clone image a `clone` step runs (default `ghcr.io/thulasi-ram/scarab-clone:edge` — digest-pin in prod). |
+| `SCARAB_SIDECAR_IMAGE` | Results-egress sidecar image. |
+| `SCARAB_RESULTS_TOKEN_SECRET` | Enables the results-egress sidecar + ingest. |
+| `SCARAB_RESULTS_API_URL` | Base URL the sidecar posts results to. |
+| `SCARAB_STEP_TIMEOUT_SECS` | Global default step deadline (default 3600); per-step overridable via `timeout:`. |
+| `SCARAB_PLACEMENT_CONFIG_FILE` | Path to the operator placement config: cluster baseline + PlacementProfile registry; a bad path/parse fails boot. |
+
+**Retention**
+
+| Variable | Purpose |
+|---|---|
+| `SCARAB_RETENTION_LOG_DAYS` | Terminal runs' log TTL in days (default 30); metadata retained regardless. |
+| `SCARAB_RETENTION_ARTIFACT_DAYS` | Terminal runs' artifact TTL in days (default 90). |
+| `SCARAB_RETENTION_WORKSPACE_DAYS` | Terminal runs' workspace-CAS reachability TTL in days (default 14); non-terminal runs always reachable. |
 
 ## Secrets & Environments
 
-Secret handling ([ADR-0014](/scarab-ci/tech/adr/0014-secrets/)) and admin-owned **Environments**
-that bundle governance ([ADR-0037](/scarab-ci/tech/adr/0037-environment-governance/)) are the model
-for scoped configuration; operator-facing docs land as those slices do.
+Secret handling and admin-owned **Environments** that bundle governance are the model for scoped
+configuration; operator-facing docs land as those slices do.
+
+## References
+
+- [ADR-0003 — Durability substrate: own it, DBOS pattern on Postgres](/scarab-ci/tech/adr/0003-durability-substrate-postgres/)
+- [ADR-0014 — Secrets: envelope-encrypted Postgres + pluggable providers](/scarab-ci/tech/adr/0014-secrets/)
+- [ADR-0015 — Supply-chain: Scarab as OIDC issuer + provenance-by-construction](/scarab-ci/tech/adr/0015-supply-chain-oidc/)
+- [ADR-0037 — Environment governance: scoped secrets, approval-as-gate, admission at point-of-use](/scarab-ci/tech/adr/0037-environment-governance/)
+- [ADR-0042 — Trusted per-Pod egress sidecar → fence-scoped results API → Postgres](/scarab-ci/tech/adr/0042-trusted-egress-sidecar/)
+- [ADR-0055 — Placement profiles: named profiles + baseline + governed `k8s_overlay`](/scarab-ci/tech/adr/0055-placement-profiles/)

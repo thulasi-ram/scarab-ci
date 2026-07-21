@@ -1,26 +1,122 @@
 ---
 title: Deploy with Helm
-description: Deploying Scarab to a real cluster via a packaged Helm chart.
+description: Deploying Scarab to any Kubernetes cluster via the packaged Helm chart.
 ---
 
 import Doodle from '../../../components/Doodle.astro';
 
 <Doodle icon="package" size={210} rotate={11} opacity={0.17} top="7rem" right="-2rem" />
 
-:::caution[Stub — lands with the chart]
-A packaged, distributed Helm chart is **not built yet** (ADR-0040 scopes the chart itself as
-separate product work). This page is a placeholder so the deployment story has a home; it fills in
-when the chart ships.
-:::
+Scarab is Kubernetes-only by design, so Helm is the install path for a cluster. The chart deploys
+`scarab-server` (one binary,
+selectable roles) with the RBAC it needs to launch one Pod per step in its namespace.
 
-## Planned shape
+The **same chart** targets any Kubernetes: a local kind/colima cluster or a real, live cluster.
+`just local-helm` (below) is just a convenience loop that installs this chart on colima; a live
+cluster uses the same `helm upgrade --install` with your own Postgres, object store, and
+credentials. The chart is young and gains production hardening as it earns mileage, but nothing
+about it is local-only.
 
-Scarab is Kubernetes-only by design ([ADR-0005](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)),
-so a Helm chart is the intended install path for a real cluster:
+## The chart
 
-- A published chart (chart repo or OCI registry) with a versioned `values.yaml`.
-- Wiring for the durability substrate (Postgres) and the blob/object store.
-- Namespace-per-run tenancy and the hardened step baseline
-  ([ADR-0039](/scarab-ci/tech/adr/0039-privileged-images/)).
+The chart lives at `deploy/helm/scarab/` (`Chart.yaml`, `values.yaml`, `templates/`). It expects:
 
-Until then, use [Run locally](/scarab-ci/get-started/run-locally/) to exercise the system.
+- **Postgres** — the durable coordination substrate; without it the server runs API-only.
+- **An S3-compatible object store** (AWS S3 or in-cluster MinIO) for logs, artifacts, and the
+  content-addressed workspace snapshots reruns restore; a local-dir fallback exists for dev.
+- **The published image** `ghcr.io/thulasi-ram/scarab-server`, built by
+  `.github/workflows/image.yml`. Use the mutable `edge` tag or a pinned `sha-<gitsha>`.
+
+A direct install:
+
+```sh
+helm upgrade --install scarab deploy/helm/scarab \
+  --namespace scarab --create-namespace \
+  --set image.tag=edge \
+  --set secrets.databaseUrl='postgres://scarab:scarab@postgres.scarab.svc:5432/scarab' \
+  --set scarab.s3.bucket=scarab-logs \
+  --set scarab.s3.endpoint=http://minio.scarab.svc:9000 \
+  --set secrets.s3AccessKey=scarab --set secrets.s3SecretKey=scarabsecret
+```
+
+For production, keep credentials out of `--set`: create a Secret whose keys are the `SCARAB_*`
+env-var names and reference it with `secrets.existingSecret`.
+
+## Key values
+
+Only keys that exist in `values.yaml`:
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `image.repository` / `image.tag` | `ghcr.io/thulasi-ram/scarab-server` / appVersion | container image |
+| `scarab.role` | `converged` | `api` / `scheduler` / `executor` / `webhook` / `converged` |
+| `scarab.executor` | `k8s` | `k8s` (prod) or `local` (dev only) |
+| `scarab.namespace` | release ns | namespace step Pods launch into (RBAC granted there) |
+| `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
+| `secrets.*` / `secrets.existingSecret` | — | sensitive `SCARAB_*` env (DB URL, S3 keys, master key, webhook secrets) |
+| `rbac.create` | `true` | Role/RoleBinding for Pod execution |
+| `ingress.enabled` | `false` | expose the HTTP API |
+
+See `deploy/helm/scarab/README.md` and `values.yaml` for the full surface.
+
+## A minimal `values.yaml`
+
+A representative override for a real cluster — Postgres and S3 credentials come from a Secret you
+manage out-of-band (`secrets.existingSecret`), not inline:
+
+```yaml
+image:
+  tag: sha-<gitsha>        # pin an immutable published tag; `edge` tracks main
+
+scarab:
+  role: converged          # or split: api / scheduler / executor / webhook
+  executor: k8s
+  publicUrl: https://scarab.example.com   # run deep-link in commit statuses
+  s3:
+    bucket: scarab-artifacts
+    endpoint: ""           # empty => AWS S3; set for in-cluster MinIO
+    region: us-east-1
+
+secrets:
+  # Keys in this Secret must match the SCARAB_* env-var names
+  # (e.g. SCARAB_DATABASE_URL, SCARAB_S3_ACCESS_KEY, SCARAB_MASTER_KEY,
+  #  SCARAB_GITHUB_WEBHOOK_SECRET).
+  existingSecret: scarab-env
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: scarab.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+```
+
+Every key above exists in the chart's `values.yaml`; see it (and `README.md`) for the full
+reference.
+
+## The colima local loop
+
+`just local-helm` installs the same chart on a local colima cluster and brings the whole stack up
+**in-cluster** — in-cluster Postgres + MinIO + `scarab-server` (which also serves the web UI at
+`/`) — so you can repeatedly deploy a pinned image and watch this repo's own CI run on Scarab.
+
+```sh
+just local-helm             # deploy the latest ghcr `edge` image
+just local-helm sha-<sha>   # deploy a specific published SHA
+just local-helm local       # build server + clone + sidecar from the tree, then deploy
+just local-helm-ui 8080     # port-forward the in-cluster UI (reconnects across deploys)
+```
+
+The kube context must be `colima` (the deploy script refuses otherwise). Configuration —
+image source, GitHub App knobs, webhook secrets, seed inputs — lives in one gitignored file,
+`deploy/local-helm/.env`; see `deploy/local-helm/README.md` for the App-configuration steps and
+the object-store caveats.
+
+For a laptop-only workflow with no cluster at all, [Run locally](/scarab-ci/get-started/run-locally/)
+is the lightest way to exercise the system.
+
+## References
+
+- [ADR-0005 — Tenancy & deployment: Kubernetes as the only backend](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)

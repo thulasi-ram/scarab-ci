@@ -1,7 +1,7 @@
 # scarab Helm chart
 
-Deploys **scarab-server** (ADR-0016: one binary, selectable roles) onto Kubernetes,
-with the RBAC it needs to launch one Pod per step (ADR-0005) in its namespace.
+Deploys **scarab-server** (one binary, selectable roles) onto Kubernetes,
+with the RBAC it needs to launch one Pod per step in its namespace.
 
 ## Prerequisites
 
@@ -54,4 +54,12 @@ helm upgrade --install scarab deploy/helm/scarab -n scarab \
 | `ingress.enabled` | `false` | expose the HTTP API |
 
 See `values.yaml` for the full surface. Every value maps to a `SCARAB_*` env var
-read by `crates/scarab-server/src/main.rs`.
+read by `crates/scarab-server/src/config.rs`. Webhook verification binds a secret
+per forge endpoint: `SCARAB_GITHUB_WEBHOOK_SECRET` for `/webhooks/github`
+and `SCARAB_FORGEJO_WEBHOOK_SECRET` for `/webhooks/forgejo`.
+
+## References
+
+- [ADR-0005 — Tenancy & deployment; Kubernetes as the only backend](../../../docs/adr/0005-tenancy-and-k8s-only.md)
+- [ADR-0016 — Code architecture: hexagonal + adapter crates + converged binary](../../../docs/adr/0016-code-architecture.md)
+- [ADR-0046 — Forge auth is adapter-internal; GitHub + Forgejo adapters in v1](../../../docs/adr/0046-forge-auth-and-multi-adapter.md)

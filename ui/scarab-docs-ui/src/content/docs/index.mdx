@@ -46,7 +46,7 @@ durable **state**, not a fire-and-forget process.
   </Card>
   <Card title="Keyless identity" icon="seti:lock">
     Forge-agnostic OIDC, with Scarab itself as an OIDC issuer for keyless federation to your
-    cloud. (Designed forge-native; the live GitHub adapter is in progress — see Status.)
+    cloud. Forge-native by design, with GitHub and Forgejo adapters implemented — see Status.
   </Card>
   <Card title="A real DSL" icon="seti:config">
     A typed IR (the actual DSL) with a YAML frontend and CEL expressions — a flat recursive DAG
@@ -71,8 +71,7 @@ software from a small team, at a pace that used to need a room full of people.
 Scarab owes its shape to [Woodpecker](https://woodpecker-ci.org/) — lean, forge-native CI with
 no enterprise ceremony. It's inspired at least as much by Woodpecker's *limits*: the many-backend
 surface it carries, and the pace a volunteer project can sustain. Kubernetes-only is us shedding
-that backend baggage on purpose ([ADR-0005](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)); the
-pace is what a small AI-first team can now hold.
+that backend baggage on purpose; the pace is what a small AI-first team can now hold.
 :::
 
 ## Where to go next
@@ -89,10 +88,16 @@ pace is what a small AI-first team can now hold.
 </CardGrid>
 
 :::note[Status — honest]
-A proven core, with the live-I/O edges being wired. **Proven against real Postgres:** the durable
-engine — crash/resume, exactly-once, restart-a-step, gates, content-addressed workspace,
-`invoke`, secrets, OIDC issuer (~230 tests). **Proven against a *fake* forge:** the full flow
-(webhook → in-repo `.scarab` → run → checks → login). **In progress:** the live GitHub adapter
-(outbound calls are `unimplemented!()` today), live-Kubernetes Pod execution, the results sidecar
-image, and CI that runs the Rust suite on push. Read a proven state machine, not a shipped product.
+A proven core, with real forge and Kubernetes I/O wired in. **Proven against real Postgres:** the
+durable engine — crash/resume, exactly-once, restart-a-step, gates, content-addressed workspace,
+`invoke`, secrets, OIDC issuer (the workspace suite passes locally). **Implemented:** the GitHub
+adapter (webhook ingest + commit-status posting) and a Forgejo adapter for multi-forge support;
+live-Kubernetes Pod execution (`scarab-executor-k8s`, with cluster tests); the results-egress
+sidecar image (`docker/sidecar/`); and CI that runs the Rust suite on push
+(`.github/workflows/ci.yml`). None of it is yet hardened at scale — read a proven state machine
+with its edges freshly wired, not a battle-tested product.
 :::
+
+## References
+
+- [ADR-0005 — Tenancy & deployment: Kubernetes as the only backend](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)

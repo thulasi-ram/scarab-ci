@@ -28,10 +28,7 @@ Written in Rust.
 
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/dashboard-dark.jpg">
-  <img alt="Scarab dashboard — an action inbox of runs suspended on a gate, recently-visited repos as pass/fail status cards, and the recency-sorted repo list" src="docs/assets/screenshots/dashboard-light.jpg" width="820">
-</picture>
+<img alt="Scarab dashboard — an action inbox of runs suspended on a gate, recently-visited repos as pass/fail status cards, and the recency-sorted repo list" src="docs/assets/screenshots/dashboard-dark.jpg" width="820">
 
 <sub>The dashboard: an **action inbox** of runs suspended on a gate, **recently-visited repos** as pass/fail status cards, and the recency-sorted repo list. ⌘K to jump anywhere.</sub>
 
@@ -62,7 +59,7 @@ and resumes exactly where it paused.
 **Lineage.** Scarab owes its shape to [Woodpecker](https://woodpecker-ci.org/) — lean,
 forge-native CI, no enterprise ceremony — and is inspired as much by its *limits*: the
 many-backend surface it carries, and the pace a volunteer project can sustain. Kubernetes-only
-sheds the backend baggage on purpose ([ADR-0005](docs/adr/0005-tenancy-and-k8s-only.md)); the
+sheds the backend baggage on purpose; the
 pace is what a small team building AI-first can now hold.
 
 ## Status (honest)
@@ -72,12 +69,16 @@ Read this as *a proven core with the live-I/O edges being wired*, not a shipped 
 - **Proven (against real Postgres).** The durable engine: crash-mid-run → resume, exactly-once
   step execution, restart-a-step, durable gates, content-addressed workspace, `invoke`
   inlining, scheduler (concurrency/fairness/supersede), secrets + fork-PR lockout, and a
-  self-hosted OIDC issuer. ~230 tests pass locally.
+  self-hosted OIDC issuer. The workspace test suite passes locally.
 - **Proven against a *fake* forge.** The forge-native flow end-to-end: signed webhook →
   in-repo `.scarab` config → run → checks posted back → OAuth-gated reads.
-- **In progress.** The live GitHub adapter (outbound calls are currently `unimplemented!()`),
-  live-Kubernetes Pod execution and re-attach (tested only via `#[ignore]`d live-cluster
-  paths), the results-egress sidecar image, and a CI job that runs the Rust suite on push.
+- **Implemented, not yet battle-tested against a live forge.** Two real forge adapters —
+  GitHub (`/webhooks/github`) and Forgejo (`/webhooks/forgejo`) — each with HMAC webhook
+  ingest and commit-status posting over real HTTP (multi-adapter). The end-to-end
+  loop against a live forge is wired but not yet hardened.
+- **In progress.** Live-Kubernetes Pod execution and re-attach (tested only via `#[ignore]`d
+  live-cluster paths), the results-egress sidecar image, and a CI job that runs the Rust
+  suite on push.
 
 So: the hard core (the durable state machine) is real and tested; the claims scoped to *a
 live forge* and *a live cluster* are not yet demonstrated. Implementation proceeds in
@@ -87,7 +88,7 @@ and don't claim, and why.
 ## Documentation
 
 The full docs site — **[docs.scarab](https://thulasi-ram.github.io/scarab-ci/)** — is built
-with Astro Starlight and published to GitHub Pages on tag (ADR-0040). It carries the
+with Astro Starlight and published to GitHub Pages on tag. It carries the
 getting-started guides, the pipeline authoring/config reference, the generated OpenAPI, and
 all ~40 ADRs. In-repo, the same sources live under:
 
@@ -103,10 +104,7 @@ all ~40 ADRs. In-repo, the same sources live under:
 
 <div align="center">
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/run-detail-dark.jpg">
-  <img alt="Scarab run detail — the step DAG, live logs, and an event timeline showing a retried step and the run suspended on a manual deploy gate" src="docs/assets/screenshots/run-detail-light.jpg" width="820">
-</picture>
+<img alt="Scarab run detail — the step DAG, live logs, and an event timeline showing a retried step and the run suspended on a manual deploy gate" src="docs/assets/screenshots/run-detail-dark.jpg" width="820">
 
 <sub>A run is durable **state**: the step DAG, live logs, and an append-only event timeline —
 here a flaky step auto-retried, then the run parked on a manual <code>deploy-prod</code> gate,
@@ -120,10 +118,10 @@ held at near-zero cost until someone approves.</sub>
 |---|---|
 | **Cohesion, not assembly** | One forge-native CI product — DSL, secrets, approvals, identity, UI — on a durable engine. Not a workflow engine you build a CI on top of, nor a job-runner CI with no durable core. |
 | **Runs are state, not processes** | A DBOS-pattern durable state machine on Postgres. A control-plane restart resumes the run from its last completed step, with exactly-once step execution — the architecture, not a boast. |
-| **Keyless identity** | Forge-agnostic OIDC, with Scarab itself as an OIDC issuer for keyless federation to your cloud. *(Designed forge-native; the live GitHub adapter is in progress — see Status.)* |
+| **Keyless identity** | Forge-agnostic OIDC, with Scarab itself as an OIDC issuer for keyless federation to your cloud. *(GitHub + Forgejo adapters implemented; the live-forge loop is not yet hardened — see Status.)* |
 | **A real DSL** | A typed IR (the actual DSL) with a YAML frontend and CEL expressions — a flat recursive DAG where `invoke` is reuse and matrix is a modifier. |
 
-The durable core is the *architectural* wedge ([ADR-0001](docs/adr/0001-ci-as-durable-execution.md)) —
+The durable core is the *architectural* wedge —
 the thing every other decision is judged against — but the *public* pitch is the cohesion. See
 [docs/positioning.md](docs/positioning.md) for how we talk about it, and the honest boundaries.
 
@@ -152,8 +150,9 @@ crates/
   scarab-identity     Authenticator, OidcIssuer, RBAC (pure)
   scarab-secrets      SecretProvider (pure)
   scarab-storage      ObjectStore + Cas (pure)
-  scarab-projects     Org/Repo/Project/Environment (pure)
-  scarab-*-{postgres,github,s3,k8s,local}   adapters (infra lives here)
+  scarab-project      Org/Repo/Project/Environment (pure)
+  scarab-db-postgres · scarab-secrets-postgres · scarab-storage-s3   state/blob adapters
+  scarab-executor-{k8s,local} · scarab-forge-{github,forgejo}        exec/forge adapters
   scarab-testkit      fakes: FakeClock / InMemoryDb / FakeExecutor
   scarab-server       composition root: axum + OpenAPI + SSE; role runner
   scarab-cli          CLI (generated from OpenAPI)
@@ -170,9 +169,11 @@ cargo run -p scarab-server -- --help
 
 Config for the local stack lives in `deploy/local-proc/.env` — gitignored (env
 files may hold secrets), seeded from the committed `deploy/local-proc/.env.example`
-the first time you run a recipe. Edit your copy to customise. There is no direnv
-or per-machine `.env.local` to set up; real secrets for the in-cluster dogfood
-live in its own gitignored `deploy/local-helm/.env`.
+the first time you run a recipe. Edit your copy to customise. A root `.env.local`
+can hold optional per-machine overrides (e.g. a dev `SCARAB_ADDR`) — it's
+gitignored and loaded by your shell/direnv, not by the recipes themselves. Real
+secrets for the in-cluster dogfood live in its own gitignored
+`deploy/local-helm/.env`.
 
 ```sh
 just ui       # Vite dev server on http://localhost:5173, proxies /v1 → server
@@ -226,7 +227,7 @@ Needs `deploy/local-helm/.env` and kube context `colima`; see
 > env, isolated kubeconfig, image source, and colima guards. Missing something?
 > Add a recipe. (Agents: this is also in `CLAUDE.md`.)
 
-## API contract workflow (ADR-0054)
+## API contract workflow
 
 `openapi.json` (committed at the repo root) and the generated TS client
 (`ui/scarab-web-ui/src/api/schema.ts`) are **gated against drift in CI** —
@@ -245,3 +246,11 @@ a `#[utoipa::path]` annotation fails the suite.
 
 [GNU Affero General Public License v3.0](LICENSE) (`AGPL-3.0-only`). Running a
 modified Scarab as a network service obliges you to offer users its source.
+
+## References
+
+- [ADR-0001 — CI as durable execution (the wedge)](docs/adr/0001-ci-as-durable-execution.md)
+- [ADR-0005 — Tenancy & deployment; Kubernetes as the only backend](docs/adr/0005-tenancy-and-k8s-only.md)
+- [ADR-0040 — Documentation site: Astro Starlight, in-repo, DESIGN.md-branded](docs/adr/0040-documentation-site.md)
+- [ADR-0046 — Forge auth is adapter-internal; GitHub + Forgejo adapters in v1](docs/adr/0046-forge-auth-and-multi-adapter.md)
+- [ADR-0054 — Product surface: embedded UI, run cancellation, API/CLI truthfulness](docs/adr/0054-product-surface-serving.md)
