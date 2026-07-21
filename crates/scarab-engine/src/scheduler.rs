@@ -613,8 +613,18 @@ impl<'a> Scheduler<'a> {
         let runs = self.db.active_runs().await?;
         for run in &runs {
             // Shared services (ADR-0058) before admit, so the readiness gate sees
-            // fresh statuses this tick.
-            self.reconcile_services(run).await?;
+            // fresh statuses this tick. Per-run isolation (git-bug 6825830): a
+            // reconcile error for ONE run (a db/teardown blip; launch errors no
+            // longer escape after the launch-error bound) must not abort the whole
+            // converged tick and starve the other runs — log it and skip this run
+            // this cycle; it is retried next tick.
+            if let Err(e) = self.reconcile_services(run).await {
+                tracing::warn!(
+                    run = %run.0, error = %e,
+                    "reconcile_services failed for run; skipping it this tick (git-bug 6825830)"
+                );
+                continue;
+            }
             self.admit(run).await?;
         }
         self.reconcile().await?;
@@ -1958,6 +1968,74 @@ impl<'a> Scheduler<'a> {
         rows.iter().map(|r| r.take).max().unwrap_or(1)
     }
 
+    /// Launch (or relaunch) the current Take's shared-service unit, bounding a
+    /// launch **error** by the SAME readiness deadline as the readiness probe
+    /// (ADR-0058, git-bug 6825830). A launch `Err` is CAUGHT here, never
+    /// `?`-propagated out of [`reconcile_services`] — a propagated launch error
+    /// would abort the whole tick and retry the launch forever:
+    ///
+    /// * within the startup window (`now - created_at <= service_ready_timeout_ms`)
+    ///   the error is logged and swallowed, leaving the durable `Starting` row in
+    ///   place to retry next tick. This is the resilient path: a transient /
+    ///   since-fixed error (a decorator/RBAC blip) recovers on a later tick.
+    /// * past the deadline the service is marked `Failed` — the same fail-closed
+    ///   verdict as the readiness-timeout, so `admit` fails the opt-in step, its
+    ///   descendants cascade (ADR-0027), and the run makes forward progress
+    ///   instead of the tick spinning on the launch forever.
+    ///
+    /// Returns the launch handle on success (so the caller can readiness-poll it
+    /// this same tick), else `None` (left `Starting`, or newly `Failed`). This is
+    /// the launch-error twin of the readiness budget — no separate counter/clock.
+    async fn launch_service_bounded(
+        &self,
+        run: &RunId,
+        take: i64,
+        svc: &scarab_pipeline::SharedServiceSpec,
+        created_at: Timestamp,
+        now: Timestamp,
+    ) -> Result<Option<ExecHandle>, SchedulerError> {
+        match self
+            .executor
+            .launch_service(run, take, &svc.name, &svc.spec)
+            .await
+        {
+            Ok(handle) => {
+                self.db
+                    .set_run_service(
+                        run,
+                        take,
+                        &svc.name,
+                        crate::ServiceStatus::Starting,
+                        Some(&handle.0),
+                    )
+                    .await?;
+                Ok(Some(handle))
+            }
+            Err(e) if now.0 - created_at.0 > self.cfg.service_ready_timeout_ms => {
+                // Launch kept erroring past the readiness budget → fail-closed,
+                // unified with the readiness-timeout path (git-bug 6825830).
+                tracing::warn!(
+                    run = %run.0, take, service = %svc.name, error = %e,
+                    "shared-service launch still failing past the readiness budget; marking Failed (ADR-0058)"
+                );
+                self.db
+                    .set_run_service(run, take, &svc.name, crate::ServiceStatus::Failed, None)
+                    .await?;
+                Ok(None)
+            }
+            Err(e) => {
+                // Within the startup window: swallow and retry next tick. The
+                // durable `Starting` row (its `created_at` already ticking) is
+                // left untouched so the next tick's `Starting` arm relaunches it.
+                tracing::warn!(
+                    run = %run.0, take, service = %svc.name, error = %e,
+                    "shared-service launch failed within the readiness budget; leaving Starting to retry next tick (ADR-0058)"
+                );
+                Ok(None)
+            }
+        }
+    }
+
     /// Reconcile a run's shared services (ADR-0058): eagerly birth + launch the
     /// current Take's instances, poll their readiness (fail-closed at the
     /// timeout), tear down stale Takes a Rerun left behind, and tear everything
@@ -2005,41 +2083,32 @@ impl<'a> Scheduler<'a> {
             match row {
                 None => {
                     // Eager birth at Run start, then launch the standalone unit.
+                    // `create_run_service` persists the `Starting` row (with
+                    // `created_at`) FIRST, so a caught first-launch error leaves a
+                    // durable `Starting` row whose readiness deadline is already
+                    // ticking — the next tick's `Starting` arm relaunches it, and
+                    // a launch that keeps erroring fails-closed at the deadline
+                    // (git-bug 6825830). No `?` on the launch: a launch error must
+                    // not abort the whole tick.
                     self.db.create_run_service(run, take, &svc.name, now).await?;
-                    let handle = self
-                        .executor
-                        .launch_service(run, take, &svc.name, &svc.spec)
-                        .await?;
-                    self.db
-                        .set_run_service(
-                            run,
-                            take,
-                            &svc.name,
-                            crate::ServiceStatus::Starting,
-                            Some(&handle.0),
-                        )
-                        .await?;
+                    self.launch_service_bounded(run, take, svc, now, now).await?;
                 }
                 Some(r) if r.status == crate::ServiceStatus::Starting => {
                     // Resolve the handle (relaunch idempotently if a crash lost it).
+                    // A relaunch error is bounded by the readiness deadline, not
+                    // `?`-propagated (git-bug 6825830): within the window it leaves
+                    // the row `Starting` (→ `None` here, poll skipped this tick);
+                    // past the deadline it fails-closed to `Failed` inside the
+                    // helper (→ `None`, readiness-timeout branch below is moot).
                     let handle = match &r.handle {
-                        Some(h) => ExecHandle(h.clone()),
+                        Some(h) => Some(ExecHandle(h.clone())),
                         None => {
-                            let h = self
-                                .executor
-                                .launch_service(run, take, &svc.name, &svc.spec)
-                                .await?;
-                            self.db
-                                .set_run_service(
-                                    run,
-                                    take,
-                                    &svc.name,
-                                    crate::ServiceStatus::Starting,
-                                    Some(&h.0),
-                                )
-                                .await?;
-                            h
+                            self.launch_service_bounded(run, take, svc, r.created_at, now)
+                                .await?
                         }
+                    };
+                    let Some(handle) = handle else {
+                        continue;
                     };
                     if self.executor.service_ready(&handle).await? {
                         self.db

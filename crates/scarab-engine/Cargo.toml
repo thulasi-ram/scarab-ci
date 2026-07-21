@@ -13,3 +13,7 @@ async-trait = { workspace = true }
 # interpolation of upstream results (ADR-0041). No cycle: pipeline never depends
 # on the engine.
 scarab-pipeline = { workspace = true }
+# Logging facade only (no subscriber pulled in here) — lets the scheduler warn
+# on caught, non-fatal launch/reconcile errors (git-bug 6825830) without
+# coupling the domain crate to a concrete logging backend.
+tracing = { workspace = true }
