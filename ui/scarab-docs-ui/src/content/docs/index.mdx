@@ -9,7 +9,7 @@ hero:
     # The brand emblem, square-cropped (1:1) — ink outline on light, gold on dark.
     light: ../../assets/brand/scarab-emblem-square.svg
     dark: ../../assets/brand/scarab-emblem-dark-square.svg
-    alt: The Scarab emblem — a scarab with spread wings inside a ring
+    alt: The Scarab emblem: a scarab with spread wings inside a ring
   actions:
     - text: Run it locally
       link: /scarab-ci/get-started/run-locally/
@@ -22,16 +22,16 @@ hero:
 
 import AsciiScene from '../../components/AsciiScene.astro';
 
-CI tools tend to fall into two camps. **Workflow engines** — Argo, Tekton, Temporal — have a
+CI tools tend to fall into two camps. **Workflow engines** (Argo, Tekton, Temporal) have a
 durable core that survives a crash, but they aren't really CI: forge integration, in-repo config,
 PR checks, identity, secrets, the DSL, and the UI are all yours to build. **CIs that live in your
-forge** — GitHub Actions, GitLab, Woodpecker, Drone — hand you all of that, but underneath, the
+forge** (GitHub Actions, GitLab, Woodpecker, Drone) hand you all of that, but underneath, the
 orchestrator is just a job runner. If the control plane restarts partway through a run, the run is
 orphaned or starts over. Scarab is built to be **both at once**: the batteries-included feel of a
 forge CI, sitting on a control plane that treats a run as durable **state** rather than a process
 it forgets the moment it restarts.
 
-![The Scarab dashboard — an action inbox of runs paused on a gate, recently visited repos shown as pass/fail status cards, and the repo list sorted by what you touched last](../../assets/dashboard.jpg)
+![The Scarab dashboard: an action inbox of runs paused on a gate, recently visited repos shown as pass/fail status cards, and the repo list sorted by what you touched last](../../assets/dashboard.jpg)
 
 ## What makes it different
 
@@ -65,7 +65,7 @@ it forgets the moment it restarts.
     <dt class="sc-home-spec-key">cohesion</dt>
     <dd class="sc-home-spec-body">
       <p class="sc-home-spec-claim">One product, not a kit.</p>
-      <p class="sc-home-spec-support">A CI that lives in your forge — DSL, secrets, approvals, identity, UI — on a durable engine. Not a workflow engine you have to build a CI on top of, and not a job-runner CI with nothing durable underneath.</p>
+      <p class="sc-home-spec-support">A CI that lives in your forge (DSL, secrets, approvals, identity, UI) on a durable engine. Not a workflow engine you have to build a CI on top of, and not a job-runner CI with nothing durable underneath.</p>
     </dd>
   </div>
   <div class="sc-home-spec-row">
@@ -79,7 +79,7 @@ it forgets the moment it restarts.
     <dt class="sc-home-spec-key">identity</dt>
     <dd class="sc-home-spec-body">
       <p class="sc-home-spec-claim">Keyless by design.</p>
-      <p class="sc-home-spec-support">OIDC that doesn't care which forge you use, with Scarab acting as its own OIDC issuer so runs can federate into your cloud without long-lived keys. Adapters for GitHub and Forgejo are implemented today — see Status.</p>
+      <p class="sc-home-spec-support">OIDC that doesn't care which forge you use, with Scarab acting as its own OIDC issuer so runs can federate into your cloud without long-lived keys. Adapters for GitHub and Forgejo are implemented today. See Status.</p>
     </dd>
   </div>
   <div class="sc-home-spec-row">
@@ -95,19 +95,19 @@ it forgets the moment it restarts.
 
 <AsciiScene name="dungroller" fontSize={5} class="ascii-accent" />
 
-As pipelines get longer and more autonomous — agents, review gates that sit open for hours,
-workflows that span days — "the job died, click re-run" stops being good enough. Scarab can hold
+As pipelines get longer and more autonomous (agents, review gates that sit open for hours,
+workflows that span days), "the job died, click re-run" stops being good enough. Scarab can hold
 a paused run almost for free and pick up exactly where it left off, and it keeps an event log that
 only ever grows, so you can see everything that happened. That's where a durable core earns its
 keep. It's also the kind of foundation that agent-driven development actually wants, rather than
 just a nicer YAML dialect. And Scarab is *built* that way too: ambitious systems software from a
 small team, at a pace that used to take a room full of people.
 
-![A Scarab run — the step DAG, live logs, and an event timeline showing a retried step and the run paused on a manual deploy gate](../../assets/run-detail.jpg)
+![A Scarab run: the step DAG, live logs, and an event timeline showing a retried step and the run paused on a manual deploy gate](../../assets/run-detail.jpg)
 
 ## Lineage
 
-Scarab owes its shape to [Woodpecker](https://woodpecker-ci.org/) — lean CI that lives in your
+Scarab owes its shape to [Woodpecker](https://woodpecker-ci.org/): lean CI that lives in your
 forge, with none of the enterprise ceremony. It's shaped just as much by Woodpecker's *limits*:
 the many backends it has to support, and the pace a volunteer project can sustain. Sticking to
 Kubernetes alone is us shedding that backend baggage on purpose, and the pace is what a small team
@@ -126,27 +126,27 @@ leaning on AI can now hold.
   <a class="sc-home-next-el" href="/scarab-ci/tech/context/">
     <span class="sc-home-next-main">
       <span class="sc-home-next-label">Read the design</span>
-      <span class="sc-home-next-desc">the thesis, the durability contract, and the ubiquitous language — 40+ ADRs on the why</span>
+      <span class="sc-home-next-desc">the thesis, the durability contract, and the ubiquitous language: 40+ ADRs on the why</span>
     </span>
     <span class="sc-home-next-arrow" aria-hidden="true">&rarr;</span>
   </a>
 </div>
 
-:::note[Status — honest]
+:::note[Status: honest]
 A proven core, with real forge and Kubernetes I/O wired in around it. **Proven against real
-Postgres:** the durable engine — crash and resume, exactly-once execution, restarting a single
+Postgres:** the durable engine, crash and resume, exactly-once execution, restarting a single
 step, gates, the content-addressed workspace, `invoke`, secrets, and the OIDC issuer (the
 workspace suite passes locally). **Implemented:** the GitHub adapter (it ingests webhooks and
 posts commit statuses) and a Forgejo adapter, so more than one forge is supported; Pod execution
 on a live Kubernetes cluster (`scarab-executor-k8s`, with cluster tests); the results-egress
 sidecar image (`docker/sidecar/`); and CI that runs the Rust suite on every push
 (`.github/workflows/ci.yml`). None of it is yet hardened at scale. Read this as a proven state
-machine with its edges freshly wired up — implemented, but not yet battle-tested in production.
+machine with its edges freshly wired up: implemented, but not yet battle-tested in production.
 :::
 
 ## References
 
-- [ADR-0005 — Tenancy & deployment: Kubernetes as the only backend](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)
+- [ADR-0005: Tenancy & deployment: Kubernetes as the only backend](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)
 
 <style>{`
 /* ===== Home-page scoped styles (sc-home-*) — do not leak to other pages ===== */

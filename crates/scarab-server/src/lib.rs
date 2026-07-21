@@ -393,16 +393,6 @@ pub struct StepDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object)]
     pub k8s_overlay: Option<serde_json::Value>,
-    /// Sidecar services (ADR-0058): throwaway backing containers co-located in
-    /// this step's Pod, reachable at `localhost:<port>`, with an optional
-    /// readiness probe gating the step's main container start.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schema(value_type = Object)]
-    pub services: Vec<scarab_pipeline::ServiceSpec>,
-    /// Shared-service opt-in (ADR-0058): names of pipeline-level shared services
-    /// this step reaches over the network (DNS `<name>:<port>` + readiness gate).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub uses: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -767,33 +757,6 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
     }
 }
 
-/// A **shared service** instance of a run (ADR-0058) — the evidence a shared
-/// service exists and its lifecycle state. A shared service is NOT a DAG node
-/// (it has no `needs`, no rerun action), so it is surfaced in a Services panel
-/// beside the DAG, never inside it. Keyed `{run, take, name}`; a Rerun's new
-/// Take is a fresh instance.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ServiceStatusDto {
-    /// The declared service name — also its cluster DNS hostname (`<name>:<port>`).
-    pub name: String,
-    /// Lifecycle: `starting` | `ready` | `running` | `torn-down` | `failed`.
-    pub status: String,
-    /// The Take generation this instance belongs to (a Rerun opens a new one).
-    pub take: i64,
-    /// When the instance was born (unix-ms).
-    pub created_at: i64,
-}
-
-/// Project a durable [`scarab_engine::RunService`] to its wire DTO.
-fn service_status_dto(s: &scarab_engine::RunService) -> ServiceStatusDto {
-    ServiceStatusDto {
-        name: s.name.clone(),
-        status: s.status.as_str().to_string(),
-        take: s.take,
-        created_at: s.created_at.0,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -949,8 +912,6 @@ async fn create_run(
             resources: step.resources.clone(),
             k8s_overlay,
             oidc_token: None,
-            services: step.services.clone(),
-            uses: step.uses.clone(),
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -1610,137 +1571,6 @@ async fn get_step_logs(
                 Event::default().data(String::from_utf8_lossy(&body))
             };
             Some((Ok(event), (st, run, step, attempts, seen, terminal)))
-        },
-    );
-    Ok(Sse::new(replay_stream.chain(live).boxed()))
-}
-
-/// The shared services of a run's **current Take** (ADR-0058), name-ordered —
-/// each with its lifecycle status, for the run detail's Services panel beside the
-/// DAG. A shared service is not a DAG node, so it is never folded into the step
-/// list. Read at the run's tenant. Empty when the pipeline declares no shared
-/// services.
-#[utoipa::path(
-    get,
-    path = "/v1/runs/{id}/services",
-    params(("id" = String, Path, description = "run id")),
-    responses((status = 200, body = [ServiceStatusDto]), (status = 404, description = "no such run"))
-)]
-async fn get_services(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<Vec<ServiceStatusDto>>, ApiError> {
-    let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
-    if st.db.run_status(&run).await?.is_none() {
-        return Err(ApiError::NotFound);
-    }
-    let services = st.db.run_services(&run).await?;
-    // Surface the current Take's instances (a Rerun's prior Take is being torn
-    // down); `run_services` folds every Take, so pick `max(take)`.
-    let current = services.iter().map(|s| s.take).max();
-    Ok(Json(
-        services
-            .iter()
-            .filter(|s| Some(s.take) == current)
-            .map(service_status_dto)
-            .collect(),
-    ))
-}
-
-/// The `?take=` scope for a shared-service log stream. Absent = the current Take.
-#[derive(Debug, Deserialize)]
-struct ServiceLogsQuery {
-    #[serde(default)]
-    take: Option<i64>,
-}
-
-/// SSE of ONE shared service's log output (ADR-0058 evidence), the source for the
-/// run detail's Services panel "logs" view. Best-effort, the SAME reliability
-/// class and pipeline as step logs (ADR-0013): replays committed chunks then
-/// live-tails while the run is still going. `?take=` reads an older Take's
-/// instance in isolation; absent = the current Take. Read at the run's tenant.
-#[utoipa::path(
-    get,
-    path = "/v1/runs/{id}/services/{service}/logs",
-    params(
-        ("id" = String, Path, description = "run id"),
-        ("service" = String, Path, description = "declared service name"),
-        ("take" = Option<i64>, Query, description = "restrict to one Take generation (default = current)")
-    ),
-    responses((status = 200, description = "SSE stream of this service's log output"), (status = 404, description = "no such run or service"))
-)]
-async fn get_service_logs(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((id, service)): Path<(String, String)>,
-    Query(q): Query<ServiceLogsQuery>,
-) -> Result<Sse<BoxStream<'static, Result<Event, Infallible>>>, ApiError> {
-    let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
-    let status = st.db.run_status(&run).await?.ok_or(ApiError::NotFound)?;
-    let services = st.db.run_services(&run).await?;
-    // Resolve the instance: a requested Take, else the current (`max`) one. 404
-    // if the run declares no such service (or not at that Take).
-    let take = match q.take {
-        Some(t) => t,
-        None => services
-            .iter()
-            .filter(|s| s.name == service)
-            .map(|s| s.take)
-            .max()
-            .ok_or(ApiError::NotFound)?,
-    };
-    if !services.iter().any(|s| s.name == service && s.take == take) {
-        return Err(ApiError::NotFound);
-    }
-    let (step, attempt) = crate::logs::service_stream_key(&service, take);
-
-    // Replay committed chunks, remembering how far the stream was consumed.
-    let mut replay: Vec<Result<Event, Infallible>> = Vec::new();
-    let (body, next) = st
-        .logs
-        .read_from(&run, &step, &attempt, 0)
-        .await
-        .unwrap_or_default();
-    if !body.is_empty() {
-        replay.push(Ok(Event::default().data(String::from_utf8_lossy(&body))));
-    }
-    let replay_stream = stream::iter(replay);
-    if status.is_terminal() {
-        // Nothing more will be written: replay and close.
-        return Ok(Sse::new(replay_stream.boxed()));
-    }
-    // Live tail: poll the durable index for new chunks (ADR-0051), replica-
-    // agnostic like the step-log tail; the stream ends one poll after settle. The
-    // next seq to read rides in the fold state (like the step-log tail's `seen`).
-    let live = futures::stream::unfold(
-        (st.clone(), run.clone(), step, attempt, next, false),
-        |(st, run, step, attempt, mut next, done)| async move {
-            if done {
-                return None;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let terminal = matches!(
-                st.db.run_status(&run).await,
-                Ok(Some(s)) if s.is_terminal()
-            );
-            let mut body = Vec::new();
-            if let Ok((bytes, n)) = st.logs.read_from(&run, &step, &attempt, next).await {
-                if !bytes.is_empty() {
-                    body.extend(bytes);
-                }
-                next = n;
-            }
-            let event = if body.is_empty() {
-                Event::default().comment("keepalive")
-            } else {
-                Event::default().data(String::from_utf8_lossy(&body))
-            };
-            Some((Ok(event), (st, run, step, attempt, next, terminal)))
         },
     );
     Ok(Sse::new(replay_stream.chain(live).boxed()))
@@ -3561,10 +3391,6 @@ async fn persist_run_from_ir(
                         TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
                     })?,
                 oidc_token: None,
-                // A clone step runs the canonical scarab-clone image; validation
-                // forbids `services` on it, so this is always empty.
-                services: Vec::new(),
-                uses: Vec::new(),
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -3628,11 +3454,6 @@ async fn persist_run_from_ir(
                         TriggerError::Pipeline(format!("step `{}`: {}", step.id, v.join("; ")))
                     })?,
                 oidc_token: None,
-                // Sidecar services (ADR-0058) co-locate in this executed step's Pod.
-                services: step.services.clone(),
-                // Shared-service opt-in (ADR-0058): the executor labels this Pod
-                // so each named service's NetworkPolicy admits it.
-                uses: step.uses.clone(),
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -5326,8 +5147,6 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         get_events,
         get_logs,
         get_step_logs,
-        get_services,
-        get_service_logs,
         attach_step,
         debug_pod_step,
         restart_step,
@@ -5361,7 +5180,6 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         RunStatusResponse,
         StepStatusDto,
         AttemptDto,
-        ServiceStatusDto,
         StepResultDto,
         ConsumedDto,
         ArtifactDto,
@@ -5422,11 +5240,6 @@ fn router_inner(state: AppState) -> Router {
         .route("/v1/runs/{id}/artifacts", get(list_artifacts))
         .route("/v1/runs/{id}/artifacts/{*name}", get(download_artifact))
         .route("/v1/runs/{id}/steps/{step}/logs", get(get_step_logs))
-        .route("/v1/runs/{id}/services", get(get_services))
-        .route(
-            "/v1/runs/{id}/services/{service}/logs",
-            get(get_service_logs),
-        )
         .route("/v1/runs/{id}/steps/{step}/attach", get(attach_step))
         .route("/v1/runs/{id}/steps/{step}/debug-pod", get(debug_pod_step))
         .route("/v1/runs/{id}/steps/{step}/workspace", get(list_workspace))

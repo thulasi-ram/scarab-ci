@@ -154,19 +154,6 @@ impl Executor for LocalExecutor {
                     .into(),
             ));
         }
-        // Sidecar services (ADR-0058) co-locate an author-supplied container image
-        // in the step's Pod (localhost-reachable, restricted baseline). The
-        // host-process backend runs a bare command, not a container image, so it
-        // cannot honor a sidecar — fail with direction, never a silent no-service
-        // run. Same Pod-shaped contract as clone/build above.
-        if !spec.services.is_empty() {
-            return Err(ExecError::Launch(
-                "sidecar services require the k8s executor (a co-located container in \
-                 the step's Pod, ADR-0058); the local backend runs bare host processes \
-                 and has no sidecar support"
-                    .into(),
-            ));
-        }
         // The step contract is an OCI image + command; locally there is no image,
         // so a command is required (ADR-0036).
         let (program, args) = spec

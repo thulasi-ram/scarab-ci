@@ -43,18 +43,6 @@ fn object_key(run: &RunId, step: &StepId, attempt: &AttemptId, seq: u64) -> Stri
     format!("logs/{}/{}/{}/{seq:08}.gz", run.0, step.0, attempt.0)
 }
 
-/// Map a **shared-service** instance `{run, take, name}` (ADR-0058) onto the log
-/// pipeline's `(StepId, AttemptId)` stream key. A shared service is not a DAG
-/// step, but ADR-0058 says its logs are the same best-effort tail (ADR-0013) as
-/// step logs — so instead of a second pipeline it reuses this one under a stable
-/// synthetic key: the `service:` prefix cannot collide with a real step id (step
-/// ids are validated identifiers, no colon), and the Take maps to the attempt
-/// slot so a Rerun's fresh instance keeps its own stream. Kept in one place so
-/// the tail source and the read endpoint agree on the key.
-pub fn service_stream_key(name: &str, take: i64) -> (StepId, AttemptId) {
-    (StepId(format!("service:{name}")), AttemptId(format!("t{take}")))
-}
-
 /// Persists and streams step logs.
 pub struct LogService {
     store: Arc<dyn ObjectStore>,

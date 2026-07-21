@@ -918,87 +918,6 @@
         }
       }
     },
-    "/v1/runs/{id}/services": {
-      "get": {
-        "tags": [],
-        "summary": "The shared services of a run's **current Take** (ADR-0058), name-ordered —\neach with its lifecycle status, for the run detail's Services panel beside the\nDAG. A shared service is not a DAG node, so it is never folded into the step\nlist. Read at the run's tenant. Empty when the pipeline declares no shared\nservices.",
-        "operationId": "get_services",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "run id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ServiceStatusDto"
-                  }
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "no such run"
-          }
-        }
-      }
-    },
-    "/v1/runs/{id}/services/{service}/logs": {
-      "get": {
-        "tags": [],
-        "summary": "SSE of ONE shared service's log output (ADR-0058 evidence), the source for the\nrun detail's Services panel \"logs\" view. Best-effort, the SAME reliability\nclass and pipeline as step logs (ADR-0013): replays committed chunks then\nlive-tails while the run is still going. `?take=` reads an older Take's\ninstance in isolation; absent = the current Take. Read at the run's tenant.",
-        "operationId": "get_service_logs",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "run id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "service",
-            "in": "path",
-            "description": "declared service name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "take",
-            "in": "query",
-            "description": "restrict to one Take generation (default = current)",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int64"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "SSE stream of this service's log output"
-          },
-          "404": {
-            "description": "no such run or service"
-          }
-        }
-      }
-    },
     "/v1/runs/{id}/steps/{step}/attach": {
       "get": {
         "tags": [],
@@ -2266,36 +2185,6 @@
           }
         }
       },
-      "ServiceStatusDto": {
-        "type": "object",
-        "description": "A **shared service** instance of a run (ADR-0058) — the evidence a shared\nservice exists and its lifecycle state. A shared service is NOT a DAG node\n(it has no `needs`, no rerun action), so it is surfaced in a Services panel\nbeside the DAG, never inside it. Keyed `{run, take, name}`; a Rerun's new\nTake is a fresh instance.",
-        "required": [
-          "name",
-          "status",
-          "take",
-          "created_at"
-        ],
-        "properties": {
-          "created_at": {
-            "type": "integer",
-            "format": "int64",
-            "description": "When the instance was born (unix-ms)."
-          },
-          "name": {
-            "type": "string",
-            "description": "The declared service name — also its cluster DNS hostname (`<name>:<port>`)."
-          },
-          "status": {
-            "type": "string",
-            "description": "Lifecycle: `starting` | `ready` | `running` | `torn-down` | `failed`."
-          },
-          "take": {
-            "type": "integer",
-            "format": "int64",
-            "description": "The Take generation this instance belongs to (a Rerun opens a new one)."
-          }
-        }
-      },
       "StepDto": {
         "type": "object",
         "description": "One step (IR subset): the step contract is an OCI `image` + `command`.",
@@ -2361,10 +2250,6 @@
             "type": "object",
             "description": "Privilege escalation requested above the hardened baseline (ADR-0039).\nOn an inline API run only the self-service `run_as_root` grant is admitted\n(it stays inside the sandbox); governed grants (add-capabilities /\nprivileged) require a target Environment and are rejected fail-closed."
           },
-          "services": {
-            "type": "object",
-            "description": "Sidecar services (ADR-0058): throwaway backing containers co-located in\nthis step's Pod, reachable at `localhost:<port>`, with an optional\nreadiness probe gating the step's main container start."
-          },
           "timeout": {
             "type": [
               "integer",
@@ -2373,13 +2258,6 @@
             "format": "int32",
             "description": "Per-step execution deadline in seconds (ADR-0047). Absent = the global\ndefault (1h). Exceeding it is a `Timeout` failure.",
             "minimum": 0
-          },
-          "uses": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Shared-service opt-in (ADR-0058): names of pipeline-level shared services\nthis step reaches over the network (DNS `<name>:<port>` + readiness gate)."
           }
         }
       },

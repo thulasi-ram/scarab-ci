@@ -1,6 +1,6 @@
 ---
 title: Environment Variables
-description: Every SCARAB_* knob scarab-server reads, grouped by concern — durability substrate, object store, identity, forge webhooks, execution, and retention.
+description: Every SCARAB_* knob scarab-server reads, grouped by concern: durability substrate, object store, identity, forge webhooks, execution, and retention.
 ---
 
 import Doodle from '../../../components/Doodle.astro';
@@ -11,21 +11,21 @@ import Doodle from '../../../components/Doodle.astro';
 
 `scarab-server` is configured entirely from the environment; `crates/scarab-server/src/config.rs`
 is the single documented inventory of every `SCARAB_*` knob, validated at boot. This page describes
-what each variable does — for how to set them on your machine, see
+what each variable does. For how to set them on your machine, see
 [Local Development](/scarab-ci/get-started/local-development/). The shipped knobs:
 
 **Core**
 
 | Variable | Purpose |
 |---|---|
-| `SCARAB_DATABASE_URL` | Postgres connection — the durability substrate, mandatory for every serving role. |
+| `SCARAB_DATABASE_URL` | Postgres connection, the durability substrate; mandatory for every serving role. |
 | `SCARAB_ADDR` | Bind address (default `0.0.0.0:8080`). |
 | `SCARAB_ROLE` | Which slice(s) this process runs: `api` / `scheduler` / `executor` / `webhook` / `converged`. |
 | `SCARAB_EXECUTOR` | `k8s` (prod) or `local` (dev/CLI). |
 | `SCARAB_NAMESPACE` | k8s namespace step Pods launch into. |
-| `SCARAB_PUBLIC_URL` | Scarab's public base URL — the run deep-link every forge status carries (default `http://localhost:8080`). |
+| `SCARAB_PUBLIC_URL` | Scarab's public base URL, the run deep-link every forge status carries (default `http://localhost:8080`). |
 
-**Object store** — set `SCARAB_S3_BUCKET` to select S3/MinIO; otherwise `SCARAB_OBJECT_DIR` is the fallback to a local directory (dev).
+**Object store**: set `SCARAB_S3_BUCKET` to select S3/MinIO; otherwise `SCARAB_OBJECT_DIR` is the fallback to a local directory (dev).
 
 | Variable | Purpose |
 |---|---|
@@ -39,20 +39,20 @@ what each variable does — for how to set them on your machine, see
 
 | Variable | Purpose |
 |---|---|
-| `SCARAB_MASTER_KEY` | base64 32-byte KEK for envelope encryption — required unless `SCARAB_DEV_INSECURE=1`. |
-| `SCARAB_DEV_INSECURE` | `1`/`true` downgrades the strict security failures (KEK, auth) to loud boot warnings — dev only; never relaxes the Postgres requirement. |
+| `SCARAB_MASTER_KEY` | base64 32-byte KEK for envelope encryption, required unless `SCARAB_DEV_INSECURE=1`. |
+| `SCARAB_DEV_INSECURE` | `1`/`true` downgrades the strict security failures (KEK, auth) to loud boot warnings (dev only); never relaxes the Postgres requirement. |
 | `SCARAB_OAUTH_CLIENT_ID`, `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | OAuth/OIDC login provider (all five together enable real authn; a partial set refuses boot). |
 | `SCARAB_OAUTH_SCOPES` | Space-separated scopes for the authorize redirect (optional). |
 | `SCARAB_OAUTH_OWNERS` | Comma-separated subjects granted `Owner` at login (bootstrap until scoped RBAC); others log in as `Viewer`. |
 | `SCARAB_OIDC_ISSUER` | Enables the OIDC issuer for keyless federation. |
-| `SCARAB_OIDC_SIGNING_KEY_FILE` | PKCS#8 RSA PEM the issuer signs with — required when the issuer is enabled. |
+| `SCARAB_OIDC_SIGNING_KEY_FILE` | PKCS#8 RSA PEM the issuer signs with, required when the issuer is enabled. |
 | `SCARAB_OIDC_AUDIENCE` | `aud` of minted per-run tokens (default `scarab`). |
 
 **Forge & webhooks**
 
 | Variable | Purpose |
 |---|---|
-| `SCARAB_GITHUB_APP_ID` | GitHub App id — when set, GitHub connections authenticate in App mode (credential secret is the App PEM); absent = token mode (dev). |
+| `SCARAB_GITHUB_APP_ID` | GitHub App id: when set, GitHub connections authenticate in App mode (credential secret is the App PEM); absent = token mode (dev). |
 | `SCARAB_GITHUB_WEBHOOK_SECRET` | HMAC secret for `/webhooks/github`. |
 | `SCARAB_FORGEJO_WEBHOOK_SECRET` | HMAC secret for `/webhooks/forgejo` (each forge endpoint binds its own secret). |
 
@@ -60,7 +60,7 @@ what each variable does — for how to set them on your machine, see
 
 | Variable | Purpose |
 |---|---|
-| `SCARAB_CLONE_IMAGE` | Canonical scarab-clone image a `clone` step runs (default `ghcr.io/thulasi-ram/scarab-clone:edge` — digest-pin in prod). |
+| `SCARAB_CLONE_IMAGE` | Canonical scarab-clone image a `clone` step runs (default `ghcr.io/thulasi-ram/scarab-clone:edge`, digest-pin in prod). |
 | `SCARAB_SIDECAR_IMAGE` | Results-egress sidecar image. |
 | `SCARAB_RESULTS_TOKEN_SECRET` | Enables the results-egress sidecar + ingest. |
 | `SCARAB_RESULTS_API_URL` | Base URL the sidecar posts results to. |
@@ -75,12 +75,12 @@ what each variable does — for how to set them on your machine, see
 | `SCARAB_RETENTION_ARTIFACT_DAYS` | Terminal runs' artifact TTL in days (default 90). |
 | `SCARAB_RETENTION_WORKSPACE_DAYS` | Terminal runs' workspace-CAS reachability TTL in days (default 14); non-terminal runs always reachable. |
 
-Scoped, per-environment configuration is layered on top of these process-level knobs — see
+Scoped, per-environment configuration is layered on top of these process-level knobs. See
 [Secrets](/scarab-ci/usage/secrets/) and [Environments](/scarab-ci/usage/environments/).
 
 ## References
 
-- [ADR-0003 — Durability substrate: own it, DBOS pattern on Postgres](/scarab-ci/tech/adr/0003-durability-substrate-postgres/)
-- [ADR-0015 — Supply-chain: Scarab as OIDC issuer + provenance-by-construction](/scarab-ci/tech/adr/0015-supply-chain-oidc/)
-- [ADR-0042 — Trusted per-Pod egress sidecar → fence-scoped results API → Postgres](/scarab-ci/tech/adr/0042-trusted-egress-sidecar/)
-- [ADR-0055 — Placement profiles: named profiles + baseline + governed `k8s_overlay`](/scarab-ci/tech/adr/0055-placement-profiles/)
+- [ADR-0003: Durability substrate: own it, DBOS pattern on Postgres](/scarab-ci/tech/adr/0003-durability-substrate-postgres/)
+- [ADR-0015: Supply-chain: Scarab as OIDC issuer + provenance-by-construction](/scarab-ci/tech/adr/0015-supply-chain-oidc/)
+- [ADR-0042: Trusted per-Pod egress sidecar → fence-scoped results API → Postgres](/scarab-ci/tech/adr/0042-trusted-egress-sidecar/)
+- [ADR-0055: Placement profiles: named profiles + baseline + governed `k8s_overlay`](/scarab-ci/tech/adr/0055-placement-profiles/)

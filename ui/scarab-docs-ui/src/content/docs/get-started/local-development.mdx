@@ -1,6 +1,6 @@
 ---
 title: Local Development
-description: Run scarab-server from the tree in proc-mode — the .env setup and the just up → serve → demo → down loop.
+description: Run scarab-server from the tree in proc-mode: the .env setup and the just up → serve → demo → down loop.
 ---
 
 import Doodle from '../../../components/Doodle.astro';
@@ -10,22 +10,22 @@ import Doodle from '../../../components/Doodle.astro';
 Scarab's day-to-day development loop is **proc-mode**: `scarab-server` runs straight from the
 working tree as a host process, backed by a compose Postgres + MinIO and a local kind cluster for
 step Pods. This gives you a fast cycle that rebuilds and reruns with no image to publish. Everything is
-driven by `Justfile` recipes over `deploy/local-proc/` — prefer them over
+driven by `Justfile` recipes over `deploy/local-proc/`. Prefer them over
 docker/kind/kubectl invocations you assemble by hand, since they encode the right env, an isolated kubeconfig, and the
 colima safety guards.
 
 For a guided first run see [Run locally](/scarab-ci/get-started/run-locally/); to deploy the
-packaged Helm chart instead — the real path inside the cluster — see
+packaged Helm chart instead (the real path inside the cluster), see
 [Installation](/scarab-ci/get-started/deploy-helm/). This page is the reference for the proc-mode
 mechanics and the `.env` those recipes read.
 
 ## Prerequisites
 
-- **docker** (or colima) — hosts the compose Postgres + MinIO and backs kind.
-- **kind**, **kubectl** — step Pods run against a local kind cluster (`scarab-dev`).
-- **cargo** (Rust toolchain, see `rust-toolchain.toml`) — the server is built from source.
-- **python3** — `just demo` submits a pipeline over the REST API.
-- [`just`](https://github.com/casey/just) — the task runner that fronts every recipe below.
+- **docker** (or colima): hosts the compose Postgres + MinIO and backs kind.
+- **kind**, **kubectl**: step Pods run against a local kind cluster (`scarab-dev`).
+- **cargo** (Rust toolchain, see `rust-toolchain.toml`): the server is built from source.
+- **python3**: `just demo` submits a pipeline over the REST API.
+- [`just`](https://github.com/casey/just): the task runner that fronts every recipe below.
 
 ## Configuring your environment
 
@@ -36,7 +36,7 @@ hold secrets), so seed it from the committed template on first run:
 cp deploy/local-proc/.env.example deploy/local-proc/.env
 ```
 
-You don't strictly need to do this by hand — `just up`, `just serve`, and `just ui` each create the
+You don't strictly need to do this by hand: `just up`, `just serve`, and `just ui` each create the
 `.env` from `.env.example` if it's missing, then `source` it. Copy it yourself only when you want to
 edit values before the first run.
 
@@ -65,14 +65,14 @@ Key settings for development only:
 - **`SCARAB_DEV_INSECURE=1`** boots the server without an authenticator or key-encryption key,
   with loud warnings, so you don't have to stand up identity/KEK to iterate. Under
   [fail-closed startup (ADR-0048)](/scarab-ci/tech/adr/0048-fail-closed-startup/) this is the *only*
-  way to skip those mandatory checks — **production must never set it.**
+  way to skip those mandatory checks. **Production must never set it.**
 - **`SCARAB_DATABASE_URL`** points at the compose Postgres on host port **55432** (mapped from the
   container's 5432, so it won't clash with a Postgres already on 5432). Migrations run on connect.
 - **`SCARAB_S3_*`** point at the compose MinIO: the S3 API on **9000** and the `scarab-logs` bucket
   (the console is on **9001**). `SCARAB_NAMESPACE=scarab` is where step Pods launch in kind.
 - **`SCARAB_API_URL`** is consumed by the Vite dev server (`just ui`); Vite refuses to guess it.
 
-`KUBECONFIG` is *not* in the file — it's dynamic per run and set by the recipes to
+`KUBECONFIG` is *not* in the file; it's dynamic per run and set by the recipes to
 `deploy/local-proc/.kubeconfig`. For the full catalogue of every `SCARAB_*` knob and what each does,
 see [Environment Variables](/scarab-ci/usage/environment-variables/).
 
@@ -92,26 +92,26 @@ just down    # tear it all down
   ensures the `scarab` namespace, builds `scarab-server`, and runs it `--role converged --serve` in
   the background, waiting on `/healthz`.
 - **`just serve`** runs `scarab-server --role converged --serve` in the **foreground** (Ctrl-C to
-  stop) against an already-up stack — the loop to use while editing server code. It sources
+  stop) against an already-up stack, the loop to use while editing server code. It sources
   `deploy/local-proc/.env` and sets `KUBECONFIG` for you.
 - **`just ui`** runs the SolidJS web UI on Vite (`http://localhost:5173`), which proxies `/v1` to
   the running server using `SCARAB_API_URL` from the env file.
 - **`just demo`** POSTs a one-step `busybox` pipeline to the running server and polls it to a
-  terminal state — the walking skeleton end-to-end.
+  terminal state, the walking skeleton end-to-end.
 - **`just logs`** tails `deploy/local-proc/server.log` (the background server from `just up`).
-- **`just down`** stops the server, runs `docker compose down -v`, and deletes the kind cluster —
+- **`just down`** stops the server, runs `docker compose down -v`, and deletes the kind cluster,
   best effort and safe to run again.
 
 Also handy: **`just docs`** serves this documentation site locally.
 
 :::note[The other mode: Helm inside the cluster]
-Proc-mode runs the server as a host process. For the real path inside the cluster — `scarab-server`
-deployed via the Helm chart on colima with Postgres and MinIO inside the cluster — use `just local-helm`. See
+Proc-mode runs the server as a host process. For the real path inside the cluster (`scarab-server`
+deployed via the Helm chart on colima with Postgres and MinIO inside the cluster), use `just local-helm`. See
 [Installation](/scarab-ci/get-started/deploy-helm/).
 :::
 
 ## References
 
-- [ADR-0019 — Local execution: executor-local behind the Executor port](/scarab-ci/tech/adr/0019-local-execution/)
-- [ADR-0036 — Local execution: a non-production dev/CLI backend](/scarab-ci/tech/adr/0036-local-execution-dev-backend/)
-- [ADR-0048 — Fail-closed startup: validated config, boot refusal, mandatory Postgres](/scarab-ci/tech/adr/0048-fail-closed-startup/)
+- [ADR-0019: Local execution: executor-local behind the Executor port](/scarab-ci/tech/adr/0019-local-execution/)
+- [ADR-0036: Local execution: a non-production dev/CLI backend](/scarab-ci/tech/adr/0036-local-execution-dev-backend/)
+- [ADR-0048: Fail-closed startup: validated config, boot refusal, mandatory Postgres](/scarab-ci/tech/adr/0048-fail-closed-startup/)

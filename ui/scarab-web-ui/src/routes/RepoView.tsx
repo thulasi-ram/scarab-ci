@@ -205,11 +205,7 @@ export default function RepoView() {
       <div class="tabs">
         <For each={TABS}>
           {([key, label]) => (
-            <button
-              class={`tab ${tab() === key ? "on" : ""}`}
-              data-label={label}
-              onClick={() => setTab(key)}
-            >
+            <button class={`tab ${tab() === key ? "on" : ""}`} onClick={() => setTab(key)}>
               {label}
             </button>
           )}

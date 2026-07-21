@@ -595,52 +595,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/runs/{id}/services": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * The shared services of a run's **current Take** (ADR-0058), name-ordered —
-         *     each with its lifecycle status, for the run detail's Services panel beside the
-         *     DAG. A shared service is not a DAG node, so it is never folded into the step
-         *     list. Read at the run's tenant. Empty when the pipeline declares no shared
-         *     services.
-         */
-        get: operations["get_services"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/runs/{id}/services/{service}/logs": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * SSE of ONE shared service's log output (ADR-0058 evidence), the source for the
-         *     run detail's Services panel "logs" view. Best-effort, the SAME reliability
-         *     class and pipeline as step logs (ADR-0013): replays committed chunks then
-         *     live-tails while the run is still going. `?take=` reads an older Take's
-         *     instance in isolation; absent = the current Take. Read at the run's tenant.
-         */
-        get: operations["get_service_logs"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/runs/{id}/steps/{step}/attach": {
         parameters: {
             query?: never;
@@ -1307,29 +1261,6 @@ export interface components {
                 [key: string]: string;
             };
         };
-        /**
-         * @description A **shared service** instance of a run (ADR-0058) — the evidence a shared
-         *     service exists and its lifecycle state. A shared service is NOT a DAG node
-         *     (it has no `needs`, no rerun action), so it is surfaced in a Services panel
-         *     beside the DAG, never inside it. Keyed `{run, take, name}`; a Rerun's new
-         *     Take is a fresh instance.
-         */
-        ServiceStatusDto: {
-            /**
-             * Format: int64
-             * @description When the instance was born (unix-ms).
-             */
-            created_at: number;
-            /** @description The declared service name — also its cluster DNS hostname (`<name>:<port>`). */
-            name: string;
-            /** @description Lifecycle: `starting` | `ready` | `running` | `torn-down` | `failed`. */
-            status: string;
-            /**
-             * Format: int64
-             * @description The Take generation this instance belongs to (a Rerun opens a new one).
-             */
-            take: number;
-        };
         /** @description One step (IR subset): the step contract is an OCI `image` + `command`. */
         StepDto: {
             command?: string[];
@@ -1368,22 +1299,11 @@ export interface components {
              */
             security?: Record<string, never>;
             /**
-             * @description Sidecar services (ADR-0058): throwaway backing containers co-located in
-             *     this step's Pod, reachable at `localhost:<port>`, with an optional
-             *     readiness probe gating the step's main container start.
-             */
-            services?: Record<string, never>;
-            /**
              * Format: int32
              * @description Per-step execution deadline in seconds (ADR-0047). Absent = the global
              *     default (1h). Exceeding it is a `Timeout` failure.
              */
             timeout?: number | null;
-            /**
-             * @description Shared-service opt-in (ADR-0058): names of pipeline-level shared services
-             *     this step reaches over the network (DNS `<name>:<port>` + readiness gate).
-             */
-            uses?: string[];
         };
         /**
          * @description One named result a step published (ADR-0041) — the `${{ outputs.<step>.<name> }}`
@@ -2331,68 +2251,6 @@ export interface operations {
         responses: {
             /** @description SSE stream of step log output */
             200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_services: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description run id */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ServiceStatusDto"][];
-                };
-            };
-            /** @description no such run */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_service_logs: {
-        parameters: {
-            query?: {
-                /** @description restrict to one Take generation (default = current) */
-                take?: number;
-            };
-            header?: never;
-            path: {
-                /** @description run id */
-                id: string;
-                /** @description declared service name */
-                service: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description SSE stream of this service's log output */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description no such run or service */
-            404: {
                 headers: {
                     [name: string]: unknown;
                 };

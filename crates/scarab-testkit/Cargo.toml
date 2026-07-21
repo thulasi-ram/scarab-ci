@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 scarab-engine = { workspace = true }
-scarab-pipeline = { workspace = true }
 scarab-storage = { workspace = true }
 scarab-forge = { workspace = true }
 scarab-identity = { workspace = true }

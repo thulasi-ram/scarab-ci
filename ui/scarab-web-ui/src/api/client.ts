@@ -18,8 +18,6 @@ export type WorkspaceEntry = components["schemas"]["WorkspaceEntryDto"];
 export type Attempt = components["schemas"]["AttemptDto"];
 /** One step's status projection in a run's DAG. */
 export type StepStatus = components["schemas"]["StepStatusDto"];
-/** A run-scoped shared service instance (ADR-0058) — not a DAG node. */
-export type Service = components["schemas"]["ServiceStatusDto"];
 
 export const api = createClient<paths>({ baseUrl: "/" });
 
@@ -473,48 +471,6 @@ export function streamStepLogs(
 ): () => void {
   const base = `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}/logs`;
   const url = opts.attempt ? `${base}?attempt=${encodeURIComponent(opts.attempt)}` : base;
-  const es = new EventSource(url);
-  let closed = false;
-  const close = () => {
-    if (!closed) {
-      closed = true;
-      es.close();
-    }
-  };
-  es.onmessage = (e) => opts.onChunk(e.data);
-  es.onerror = () => {
-    close();
-    opts.onEnd?.();
-  };
-  return close;
-}
-
-/**
- * List a run's shared services (`GET /v1/runs/{id}/services`) — the current
- * Take's instances + lifecycle status, for the Services panel beside the DAG
- * (ADR-0058). Empty when the pipeline declares no shared services.
- */
-export async function listServices(id: string): Promise<Service[]> {
-  const { data, error } = await api.GET("/v1/runs/{id}/services", {
-    params: { path: { id } },
-  });
-  if (error) throw new Error(`failed to load services for ${id}`);
-  return data ?? [];
-}
-
-/**
- * Live-stream ONE shared service's log output (`GET …/services/{service}/logs`),
- * optionally scoped to a `take` — the Services panel's "logs" view (ADR-0058).
- * Best-effort, same SSE contract as step logs: replays committed chunks then
- * live-tails while the run is going. Returns a cleanup fn.
- */
-export function streamServiceLogs(
-  id: string,
-  service: string,
-  opts: { take?: number; onChunk: (text: string) => void; onEnd?: () => void },
-): () => void {
-  const base = `/v1/runs/${encodeURIComponent(id)}/services/${encodeURIComponent(service)}/logs`;
-  const url = opts.take != null ? `${base}?take=${opts.take}` : base;
   const es = new EventSource(url);
   let closed = false;
   const close = () => {

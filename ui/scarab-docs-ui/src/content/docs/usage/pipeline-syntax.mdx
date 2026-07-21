@@ -1,6 +1,6 @@
 ---
 title: Pipeline Syntax
-description: Writing Scarab pipelines — YAML frontend, the typed IR, CEL expressions, invoke, and matrix.
+description: Writing Scarab pipelines: YAML frontend, the typed IR, CEL expressions, invoke, and matrix.
 ---
 
 import Doodle from '../../../components/Doodle.astro';
@@ -9,23 +9,23 @@ import Doodle from '../../../components/Doodle.astro';
 
 ## The model, in brief
 
-A **step** is the fundamental unit of work: an OCI **image** plus a **command** — a contract —
+A **step** is the fundamental unit of work: an OCI **image** plus a **command** (a contract)
 that Scarab runs as a single Kubernetes **Pod**. A **pipeline** is a group of steps, plus how they
 are triggered and wired together. Structurally a pipeline is a **flat recursive DAG**
 (`Pipeline → Step`).
 
 The real DSL is a **typed IR**; YAML is a frontend and **CEL** provides expressions.
-`invoke` is reuse — inlining a library pipeline into the caller's DAG at compile time.
+`invoke` is reuse: inlining a library pipeline into the caller's DAG at compile time.
 `matrix` is a modifier that fans a step out over a set of inputs.
 
-Compilation is **static**: the whole DAG — every matrix combination, every inlined library step — is
+Compilation is **static**: the whole DAG (every matrix combination, every inlined library step) is
 materialised and validated at submit time, so a cycle, a dangling `needs`, or an empty matrix
 dimension is rejected up front, never discovered mid-run.
 
 A repo's CI lives in `.scarab/`. A triggered pipeline is a YAML file such as `.scarab/ci.yaml`;
 its file name is the default display name (`ci.yaml` reads as `ci`, overridable with a top-level
 `name:`). Reusable **library** pipelines live under `.scarab/lib/` and are pulled in with
-[`invoke`](#reuse--invoke). Start from
+[`invoke`](#reuse-invoke). Start from
 [Run locally](/scarab-ci/get-started/run-locally/) to submit your first pipeline.
 
 A minimal pipeline is an `on:` block and a list of `steps`:
@@ -45,14 +45,14 @@ steps:
     command: ["cargo", "check"]
 ```
 
-The rest of this page documents each vocabulary term in turn — from triggers and interface, through
+The rest of this page documents each vocabulary term in turn, from triggers and interface, through
 the step shape, wiring, and reuse, to deploys and operational concerns.
 
-## Triggers — `on:`
+## Triggers: `on:`
 
 `on:` maps a trigger kind to a filter. The kinds Scarab understands are `push`, `pull_request`,
 `tag`, `release`, `comment`, `cron`, `manual`, `api`, and `upstream`. An empty `on:` means the
-pipeline has no automatic triggers — it runs only when launched explicitly.
+pipeline has no automatic triggers: it runs only when launched explicitly.
 
 ```yaml
 on:
@@ -70,8 +70,8 @@ on:
 ```
 
 **Manual dispatch is opt-in**: a pipeline is dispatchable from the UI/API only if it declares
-`on: manual`. The trigger context also feeds each run's provenance and **Headline** — the trigger
-title shown against the run.
+`on: manual`. The trigger context also feeds each run's provenance and **Headline** (the trigger
+title shown against the run).
 
 ```yaml
 on:
@@ -79,10 +79,10 @@ on:
   push: {}
 ```
 
-## Interface — `interface.inputs` (and `outputs`)
+## Interface: `interface.inputs` (and `outputs`)
 
 A pipeline declares its typed launch parameters under `interface.inputs`. This is the same
-interface an `invoke` caller satisfies with `with:` — one contract for both launching and reuse. A
+interface an `invoke` caller satisfies with `with:`, one contract for both launching and reuse. A
 bare string is shorthand for a required string; the map form is fully typed:
 
 ```yaml
@@ -110,9 +110,9 @@ steps:
 
 Resolved parameters are read in steps as `${{ inputs.<name> }}` and are also injected into the
 step environment as `SCARAB_PARAM_<NAME>`. A **reusable library** pipeline additionally declares the
-`outputs` it exposes to its caller — see [Reuse — `invoke`](#reuse--invoke).
+`outputs` it exposes to its caller (see [Reuse: `invoke`](#reuse-invoke)).
 
-## Steps — the step shape
+## Steps: the step shape
 
 The step contract is an OCI `image` plus a `command`; everything else is a modifier. `env` is a list
 of `[NAME, VALUE]` pairs; `artifacts` publishes globs of files the step wrote to `/scarab/artifacts/`.
@@ -151,10 +151,10 @@ the image digest.
 
 Some steps are **kinds** with no image that the engine runs on your behalf (you set no `image`/`command`):
 
-- **`clone: {}`** — source provisioning (see [The `clone` step](#the-clone-step)).
-- **`build: { image: ..., push: true }`** — a rootless BuildKit image build.
-- **`gate: manual`** — a durable approval/wait point (see [Environments & gates](#environments--gates)).
-- **`invoke: .scarab/lib/...`** — reuse at compile time (see [Reuse — `invoke`](#reuse--invoke)).
+- **`clone: {}`**: source provisioning (see [The `clone` step](#the-clone-step)).
+- **`build: { image: ..., push: true }`**: a rootless BuildKit image build.
+- **`gate: manual`**: a durable approval/wait point (see [Environments & gates](#environments--gates)).
+- **`invoke: .scarab/lib/...`**: reuse at compile time (see [Reuse: `invoke`](#reuse-invoke)).
 
 ### The `clone` step
 
@@ -173,10 +173,10 @@ case. Downstream steps inherit the cloned workspace through ordinary `needs`.
     lfs: true
 ```
 
-Scarab is multi-forge — GitHub and Forgejo are both supported adapters; the `clone` step is
+Scarab is multi-forge: GitHub and Forgejo are both supported adapters; the `clone` step is
 identical across them.
 
-## Ordering — `needs`
+## Ordering: `needs`
 
 `needs:` declares the DAG edges. A step runs once all of its needs succeed and inherits their
 workspaces:
@@ -187,7 +187,7 @@ workspaces:
   needs: [build]
 ```
 
-## Fan-out — `matrix`
+## Fan-out: `matrix`
 
 **`matrix`** fans one authored step into the cartesian product of its dimensions, expanded
 statically at submit time. An `exclude` list of
@@ -207,7 +207,7 @@ CEL predicates (evaluated against each combination's own coordinate) drops combi
 Each instance gets a deterministic id like `test[arch=amd64,os=linux]`, and a downstream
 `needs: [test]` fans in over every surviving instance.
 
-## Conditions — `when`
+## Conditions: `when`
 
 A `when:` CEL guard skips a step whose predicate is false; expressions read the run's context
 (e.g. `event`, and any `matrix` coordinate):
@@ -219,17 +219,17 @@ A `when:` CEL guard skips a step whose predicate is false; expressions read the 
   when: "event.branch == 'main'"
 ```
 
-## Reuse — `invoke`
+## Reuse: `invoke`
 
 `invoke` inlines a **library** pipeline (under `.scarab/lib/` by convention) into the caller's DAG
-at compile time — not a runtime call.
+at compile time, not a runtime call.
 It is local only, forever: repo-relative paths, read at the caller's ref; no `../` escape and no
 cross-repo references (cross-repo causation is `on: upstream`). The invoked steps are namespaced
 by the invoke step's id (`deploy/plan`, `deploy/url`), and `matrix` on an invoke step fans out the
 whole subgraph.
 
-A library declares its contract with `interface` — the `inputs` it requires and the `outputs` it
-exposes — and the caller supplies inputs with `with:`:
+A library declares its contract with `interface` (the `inputs` it requires and the `outputs` it
+exposes) and the caller supplies inputs with `with:`:
 
 ```yaml
 # .scarab/lib/deploy.yaml
@@ -272,12 +272,12 @@ consumer must `needs:` the producer:
 ```
 
 Result capture is transparent to authors: on Kubernetes a per-Pod egress sidecar drains each step's
-results back to the control plane — nothing to wire up in the pipeline.
+results back to the control plane, nothing to wire up in the pipeline.
 
 ## Environments & gates
 
-This section covers only the YAML you author. For the concepts behind them — how secrets are
-stored and scoped, and what an environment governs — see
+This section covers only the YAML you author. For the concepts behind them (how secrets are
+stored and scoped, and what an environment governs), see
 [Secrets](/scarab-ci/usage/secrets/) and [Environments](/scarab-ci/usage/environments/).
 
 Referencing a top-level `environment:` makes the pipeline a **deploy**: its runs are enforced
@@ -295,7 +295,7 @@ steps:
     command: ["./deploy.sh"]
 ```
 
-**Gates** are durable suspend points with no image — `gate: manual` is an approval, `gate: timer` waits
+**Gates** are durable suspend points with no image: `gate: manual` is an approval, `gate: timer` waits
 `gate_after` seconds, `gate: external` releases via API/webhook. Placed before a deploy step, a
 manual gate is the approval mechanism for a governed environment:
 
@@ -312,7 +312,7 @@ manual gate is the approval mechanism for a governed environment:
 ## Placement & resources
 
 By default steps land on the operator's `default` placement profile. An author targets scheduling by
-**naming profiles** — never raw Kubernetes — via `placement_profiles`, and requests exact compute
+**naming profiles** (never raw Kubernetes) via `placement_profiles`, and requests exact compute
 with `resources`:
 
 ```yaml
@@ -322,7 +322,7 @@ with `resources`:
   resources: { cpu_millis: 8000, memory_mib: 16384 }
 ```
 
-For a rare dynamic per-job Kubernetes need there is a governed `k8s_overlay` escape hatch — a raw
+For a rare dynamic per-job Kubernetes need there is a governed `k8s_overlay` escape hatch: a raw
 pod-spec fragment merged last onto the Pod. It carries no authority: it is admitted only if the run's
 target environment permits raw overlays, else the run is rejected fail-closed. Prefer a named
 profile for anything static.
@@ -338,7 +338,7 @@ profile for anything static.
 ## Retries, timeouts & reruns
 
 A step may set a `timeout:` (seconds) and an opt-in `retry:` policy. Retry is
-**at-least-once** — declaring it is your assertion that the step is idempotent or fenced; a
+**at-least-once**: declaring it is your assertion that the step is idempotent or fenced; a
 side effect that does not cooperate will fire twice.
 
 ```yaml
@@ -350,28 +350,28 @@ side effect that does not cooperate will fire twice.
 
 Re-execution that a human initiates is modelled as **Takes**: a *rerun* re-executes a run from
 the top, a *retry* resumes from a failed step, and an earlier attempt becomes *superseded* or
-*shadowed* by the newer one. These are concepts from a run's history surfaced in the UI — there is nothing to
+*shadowed* by the newer one. These are concepts from a run's history surfaced in the UI. There is nothing to
 author for them.
 
 ## References
 
-- [ADR-0006 — Pipeline ontology: flat recursive DAG](/scarab-ci/tech/adr/0006-pipeline-ontology/)
-- [ADR-0008 — Step contract: OCI image + convention + built-in kinds](/scarab-ci/tech/adr/0008-step-contract/)
-- [ADR-0009 — DSL: typed Pipeline IR + YAML frontend + CEL](/scarab-ci/tech/adr/0009-dsl-ir-yaml-cel/)
-- [ADR-0014 — Secrets: envelope-encrypted Postgres + pluggable providers](/scarab-ci/tech/adr/0014-secrets/)
-- [ADR-0018 — Container image building: rootless BuildKit](/scarab-ci/tech/adr/0018-image-building/)
-- [ADR-0023 — DAG shape: static matrix v1, dynamic reserved](/scarab-ci/tech/adr/0023-dag-shape/)
-- [ADR-0037 — Environment governance: scoped secrets, approval-as-gate, admission at point-of-use](/scarab-ci/tech/adr/0037-environment-governance/)
-- [ADR-0038 — `invoke` is compile-time inlining; local reuse via `.scarab/lib`](/scarab-ci/tech/adr/0038-invoke-and-local-reuse/)
-- [ADR-0039 — Privileged step images: hardened baseline + governed capability grants](/scarab-ci/tech/adr/0039-privileged-images/)
-- [ADR-0041 — Named step results + launch-time interpolation](/scarab-ci/tech/adr/0041-named-results-and-interpolation/)
-- [ADR-0042 — Trusted per-Pod egress sidecar → fence-scoped results API → Postgres](/scarab-ci/tech/adr/0042-trusted-egress-sidecar/)
-- [ADR-0043 — Launch parameters + manual dispatch as a repo-aware trigger](/scarab-ci/tech/adr/0043-launch-parameters-and-manual-dispatch/)
-- [ADR-0045 — Source provisioning: the `clone` step kind](/scarab-ci/tech/adr/0045-source-provisioning/)
-- [ADR-0046 — Forge auth is adapter-internal; GitHub + Forgejo adapters in v1](/scarab-ci/tech/adr/0046-forge-auth-and-multi-adapter/)
-- [ADR-0047 — Retry classification, attempt/fence model, and dead-letter](/scarab-ci/tech/adr/0047-retry-classification-and-attempt-model/)
-- [ADR-0052 — Artifacts: a dedicated per-run store, convention-emitted](/scarab-ci/tech/adr/0052-artifacts/)
-- [ADR-0055 — Placement profiles: named profiles + baseline + governed `k8s_overlay`](/scarab-ci/tech/adr/0055-placement-profiles/)
-- [ADR-0056 — Run Takes and attempt-grain evidence](/scarab-ci/tech/adr/0056-run-takes-and-attempt-grain-evidence/)
-- [ADR-0057 — Run provenance: trigger context and origin details](/scarab-ci/tech/adr/0057-run-provenance-trigger-context/)
+- [ADR-0006: Pipeline ontology: flat recursive DAG](/scarab-ci/tech/adr/0006-pipeline-ontology/)
+- [ADR-0008: Step contract: OCI image + convention + built-in kinds](/scarab-ci/tech/adr/0008-step-contract/)
+- [ADR-0009: DSL: typed Pipeline IR + YAML frontend + CEL](/scarab-ci/tech/adr/0009-dsl-ir-yaml-cel/)
+- [ADR-0014: Secrets: envelope-encrypted Postgres + pluggable providers](/scarab-ci/tech/adr/0014-secrets/)
+- [ADR-0018: Container image building: rootless BuildKit](/scarab-ci/tech/adr/0018-image-building/)
+- [ADR-0023: DAG shape: static matrix v1, dynamic reserved](/scarab-ci/tech/adr/0023-dag-shape/)
+- [ADR-0037: Environment governance: scoped secrets, approval-as-gate, admission at point-of-use](/scarab-ci/tech/adr/0037-environment-governance/)
+- [ADR-0038: `invoke` is compile-time inlining; local reuse via `.scarab/lib`](/scarab-ci/tech/adr/0038-invoke-and-local-reuse/)
+- [ADR-0039: Privileged step images: hardened baseline + governed capability grants](/scarab-ci/tech/adr/0039-privileged-images/)
+- [ADR-0041: Named step results + launch-time interpolation](/scarab-ci/tech/adr/0041-named-results-and-interpolation/)
+- [ADR-0042: Trusted per-Pod egress sidecar → fence-scoped results API → Postgres](/scarab-ci/tech/adr/0042-trusted-egress-sidecar/)
+- [ADR-0043: Launch parameters + manual dispatch as a repo-aware trigger](/scarab-ci/tech/adr/0043-launch-parameters-and-manual-dispatch/)
+- [ADR-0045: Source provisioning: the `clone` step kind](/scarab-ci/tech/adr/0045-source-provisioning/)
+- [ADR-0046: Forge auth is adapter-internal; GitHub + Forgejo adapters in v1](/scarab-ci/tech/adr/0046-forge-auth-and-multi-adapter/)
+- [ADR-0047: Retry classification, attempt/fence model, and dead-letter](/scarab-ci/tech/adr/0047-retry-classification-and-attempt-model/)
+- [ADR-0052: Artifacts: a dedicated per-run store, convention-emitted](/scarab-ci/tech/adr/0052-artifacts/)
+- [ADR-0055: Placement profiles: named profiles + baseline + governed `k8s_overlay`](/scarab-ci/tech/adr/0055-placement-profiles/)
+- [ADR-0056: Run Takes and attempt-grain evidence](/scarab-ci/tech/adr/0056-run-takes-and-attempt-grain-evidence/)
+- [ADR-0057: Run provenance: trigger context and origin details](/scarab-ci/tech/adr/0057-run-provenance-trigger-context/)
 ```

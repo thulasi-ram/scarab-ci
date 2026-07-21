@@ -33,7 +33,6 @@ import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 import Dag, { type DagStep, type DagTry } from "../components/Dag";
-import ServicesPanel from "../components/ServicesPanel";
 import StepPane from "../components/StepPane";
 import DebugShell from "../components/DebugShell";
 import TriggerCell from "../components/TriggerCell";
@@ -651,11 +650,6 @@ export default function RunDetail() {
                     activeAttempt={dagActiveAttempt()}
                     onAttemptSelect={setSelAttempt}
                   />
-                  {/* Shared services (ADR-0058) live BESIDE the DAG, never as
-                      nodes in it — a compact evidence section beneath the graph
-                      in the same left column. Renders nothing when there are
-                      none (the common case). */}
-                  <ServicesPanel runId={id()} live={live() && !timeTraveling()} />
                 </div>
 
                 <StepPane

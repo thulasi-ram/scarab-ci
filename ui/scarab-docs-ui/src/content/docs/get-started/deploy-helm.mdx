@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: Installing Scarab on any Kubernetes cluster — local kind/colima or a live/production cluster — via the packaged Helm chart.
+description: Installing Scarab on any Kubernetes cluster (local kind/colima or a live/production cluster) via the packaged Helm chart.
 ---
 
 import Doodle from '../../../components/Doodle.astro';
@@ -21,7 +21,7 @@ about it works only locally.
 
 The chart lives at `deploy/helm/scarab/` (`Chart.yaml`, `values.yaml`, `templates/`). It expects:
 
-- **Postgres** — the durable coordination substrate; without it the server serves the API only.
+- **Postgres**: the durable coordination substrate; without it the server serves the API only.
 - **An S3-compatible object store** (AWS S3 or in-cluster MinIO) for logs, artifacts, and the
   content-addressed workspace snapshots reruns restore; a fallback to a local directory exists for development.
 - **The published image** `ghcr.io/thulasi-ram/scarab-server`, built by
@@ -61,7 +61,7 @@ See `deploy/helm/scarab/README.md` and `values.yaml` for the full surface.
 
 ## A minimal `values.yaml`
 
-A representative override for a real cluster — Postgres and S3 credentials come from a Secret you
+A representative override for a real cluster, where Postgres and S3 credentials come from a Secret you
 manage out-of-band (`secrets.existingSecret`), not inline:
 
 ```yaml
@@ -99,8 +99,8 @@ reference.
 ## The colima local loop
 
 `just local-helm` installs the same chart on a local colima cluster and brings the whole stack up
-**inside the cluster** — Postgres, MinIO, and `scarab-server` (which also serves the web UI at
-`/`) — so you can repeatedly deploy a pinned image and watch this repo's own CI run on Scarab.
+**inside the cluster**: Postgres, MinIO, and `scarab-server` (which also serves the web UI at
+`/`), so you can repeatedly deploy a pinned image and watch this repo's own CI run on Scarab.
 
 ```sh
 just local-helm             # deploy the latest ghcr `edge` image
@@ -109,8 +109,8 @@ just local-helm local       # build server + clone + sidecar from the tree, then
 just local-helm-ui 8080     # port-forward the in-cluster UI (reconnects across deploys)
 ```
 
-The kube context must be `colima` (the deploy script refuses otherwise). Configuration —
-image source, GitHub App knobs, webhook secrets, seed inputs — lives in one gitignored file,
+The kube context must be `colima` (the deploy script refuses otherwise). Configuration
+(image source, GitHub App knobs, webhook secrets, seed inputs) lives in one gitignored file,
 `deploy/local-helm/.env`; see `deploy/local-helm/README.md` for the steps to configure the App and
 the caveats about the object store.
 
@@ -119,4 +119,4 @@ is the lightest way to exercise the system.
 
 ## References
 
-- [ADR-0005 — Tenancy & deployment: Kubernetes as the only backend](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)
+- [ADR-0005: Tenancy & deployment: Kubernetes as the only backend](/scarab-ci/tech/adr/0005-tenancy-and-k8s-only/)

@@ -21,8 +21,8 @@ use sqlx::{PgPool, Row};
 use scarab_engine::ports::Lease;
 use scarab_engine::{
     Attempt, AttemptId, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, FailureKind,
-    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService, RunStatus, RunSummary, ServiceStatus,
-    StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId, StepRun, StepSpec,
+    StepStatus, Timestamp,
 };
 use scarab_forge::{
     ForgeConnection, ForgeConnectionStore, ForgeKind, RegistryError, RepoRef, ResolvedRepo,
@@ -986,82 +986,6 @@ impl Db for PostgresDb {
         .await
         .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<Option<i64>, _>("gate_timer_seconds")))
-    }
-
-    async fn create_run_service(
-        &self,
-        run: &RunId,
-        take: i64,
-        name: &str,
-        at: Timestamp,
-    ) -> Result<(), DbError> {
-        // Idempotent on {run, take, name} (ADR-0058): a re-tick / crash resume
-        // never provisions a second instance.
-        sqlx::query(
-            "INSERT INTO run_services (run_id, take, name, status, created_at, updated_at)
-             VALUES ($1, $2, $3, 'starting', $4, $4)
-             ON CONFLICT (run_id, take, name) DO NOTHING",
-        )
-        .bind(&run.0)
-        .bind(take)
-        .bind(name)
-        .bind(at.0)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn set_run_service(
-        &self,
-        run: &RunId,
-        take: i64,
-        name: &str,
-        status: ServiceStatus,
-        handle: Option<&str>,
-    ) -> Result<(), DbError> {
-        // COALESCE keeps a previously-recorded handle when this update omits one.
-        sqlx::query(
-            "UPDATE run_services
-                SET status = $4, handle = COALESCE($5, handle),
-                    updated_at = (extract(epoch from now()) * 1000)::bigint
-             WHERE run_id = $1 AND take = $2 AND name = $3",
-        )
-        .bind(&run.0)
-        .bind(take)
-        .bind(name)
-        .bind(status.as_str())
-        .bind(handle)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(())
-    }
-
-    async fn run_services(&self, run: &RunId) -> Result<Vec<RunService>, DbError> {
-        let rows = sqlx::query(
-            "SELECT run_id, take, name, status, handle, created_at
-             FROM run_services WHERE run_id = $1 ORDER BY name, take",
-        )
-        .bind(&run.0)
-        .fetch_all(self.pool())
-        .await
-        .map_err(db_err)?;
-        rows.into_iter()
-            .map(|r| {
-                let status = r.get::<String, _>("status");
-                Ok(RunService {
-                    run: RunId(r.get::<String, _>("run_id")),
-                    take: r.get::<i64, _>("take"),
-                    name: r.get::<String, _>("name"),
-                    status: ServiceStatus::from_str(&status).ok_or_else(|| {
-                        DbError::Other(format!("unknown run_service status `{status}`"))
-                    })?,
-                    handle: r.get::<Option<String>, _>("handle"),
-                    created_at: Timestamp(r.get::<i64, _>("created_at")),
-                })
-            })
-            .collect()
     }
 
     async fn run_status(&self, run: &RunId) -> Result<Option<RunStatus>, DbError> {

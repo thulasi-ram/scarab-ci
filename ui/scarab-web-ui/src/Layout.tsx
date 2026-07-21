@@ -9,17 +9,18 @@ import UserMenu from "./components/UserMenu";
 import CommandPalette from "./components/CommandPalette";
 import { setPaletteOpen } from "./palette";
 import { theme, toggleTheme } from "./theme";
-import emblemGold from "./assets/brand/scarab-emblem-dark.svg";
+import emblemLight from "./assets/brand/scarab-emblem.svg";
+import emblemDark from "./assets/brand/scarab-emblem-dark.svg";
 
 export default function Layout(props: ParentProps) {
   return (
     <div class="app">
       <nav class="topbar">
         <A href="/" class="brand" end>
-          {/* The brand emblem (ui/brand): gold carapace in both themes. */}
+          {/* The brand emblem (ui/brand): ink outline on light, gold on dark. */}
           <img
             class="brand-emblem"
-            src={emblemGold}
+            src={theme() === "dark" ? emblemDark : emblemLight}
             alt=""
             width={26}
             height={23}

@@ -18,8 +18,8 @@ use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Lease};
 use scarab_engine::{
     Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, ExecError, Executor,
-    FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService, RunStatus, RunSummary,
-    ServiceStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunStatus, RunSummary, StepId,
+    StepRun, StepSpec, StepStatus, Timestamp,
 };
 use scarab_storage::{ObjectStore, StorageError};
 
@@ -201,10 +201,6 @@ struct InMemoryState {
     artifacts: HashMap<(RunId, String, StepId, AttemptId), scarab_engine::ArtifactRecord>,
     /// Per-attempt immutable evidence (ADR-0056).
     attempt_evidence: HashMap<(RunId, StepId, AttemptId), AttemptEvidenceRec>,
-    /// Run-scoped shared services (ADR-0058), keyed `{run, take, name}` —
-    /// value is `(status, handle, created_at)`.
-    #[allow(clippy::type_complexity)]
-    run_services: HashMap<(RunId, i64, String), (ServiceStatus, Option<String>, Timestamp)>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -775,61 +771,6 @@ impl Db for InMemoryDb {
             .steps
             .get(&(run.clone(), step.clone()))
             .and_then(|r| r.gate_timer_seconds))
-    }
-
-    async fn create_run_service(
-        &self,
-        run: &RunId,
-        take: i64,
-        name: &str,
-        at: Timestamp,
-    ) -> Result<(), DbError> {
-        // Idempotent on {run, take, name}: an existing row is left untouched.
-        self.state
-            .lock()
-            .unwrap()
-            .run_services
-            .entry((run.clone(), take, name.to_string()))
-            .or_insert((ServiceStatus::Starting, None, at));
-        Ok(())
-    }
-
-    async fn set_run_service(
-        &self,
-        run: &RunId,
-        take: i64,
-        name: &str,
-        status: ServiceStatus,
-        handle: Option<&str>,
-    ) -> Result<(), DbError> {
-        let mut st = self.state.lock().unwrap();
-        if let Some(rec) = st.run_services.get_mut(&(run.clone(), take, name.to_string())) {
-            rec.0 = status;
-            // Preserve an already-recorded handle if this update carries none.
-            if let Some(h) = handle {
-                rec.1 = Some(h.to_string());
-            }
-        }
-        Ok(())
-    }
-
-    async fn run_services(&self, run: &RunId) -> Result<Vec<RunService>, DbError> {
-        let st = self.state.lock().unwrap();
-        let mut out: Vec<RunService> = st
-            .run_services
-            .iter()
-            .filter(|((r, _, _), _)| r == run)
-            .map(|((r, take, name), (status, handle, created))| RunService {
-                run: r.clone(),
-                take: *take,
-                name: name.clone(),
-                status: *status,
-                handle: handle.clone(),
-                created_at: *created,
-            })
-            .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.take.cmp(&b.take)));
-        Ok(out)
     }
 
     async fn store_run_ir(&self, run: &RunId, ir: &serde_json::Value) -> Result<(), DbError> {
@@ -1448,12 +1389,6 @@ struct FakeExecState {
     /// The most recent spec each handle was launched with — lets a test assert
     /// launch-time interpolation (ADR-0041) rewrote `${{ … }}` before launch.
     launched_specs: HashMap<String, StepSpec>,
-    /// Shared services launched via `launch_service` (ADR-0058), by handle.
-    services_launched: Vec<String>,
-    /// Service handles a test has declared ready (their readiness probe passed).
-    ready_services: std::collections::HashSet<String>,
-    /// Service handles torn down via `teardown_service`, in call order.
-    services_torn_down: Vec<String>,
 }
 
 /// An [`Executor`] whose behaviour a test scripts: it can be told that a given
@@ -1542,43 +1477,6 @@ impl FakeExecutor {
             .copied()
             .unwrap_or(0)
     }
-
-    /// The deterministic handle a shared service `{run, take, name}` maps to
-    /// (ADR-0058), mirroring the k8s executor's per-run/take/name identity.
-    pub fn service_handle(run: &str, take: i64, name: &str) -> ExecHandle {
-        ExecHandle(format!("svc://{run}/{take}/{name}"))
-    }
-
-    /// Declare that a shared service (by its handle) has passed readiness — the
-    /// scheduler's gate-release signal in tests.
-    pub fn mark_service_ready(&self, handle: &ExecHandle) {
-        self.inner
-            .lock()
-            .unwrap()
-            .ready_services
-            .insert(handle.0.clone());
-    }
-
-    /// Declare that a previously-ready shared service (by its handle) has DIED —
-    /// its readiness probe now fails (ADR-0058 mid-run death). Drives the
-    /// scheduler's fail-closed recovery path in tests.
-    pub fn mark_service_unready(&self, handle: &ExecHandle) {
-        self.inner
-            .lock()
-            .unwrap()
-            .ready_services
-            .remove(&handle.0);
-    }
-
-    /// Handles of shared services launched via `launch_service`, in call order.
-    pub fn launched_services(&self) -> Vec<String> {
-        self.inner.lock().unwrap().services_launched.clone()
-    }
-
-    /// Handles of shared services torn down via `teardown_service`, in call order.
-    pub fn torn_down_services(&self) -> Vec<String> {
-        self.inner.lock().unwrap().services_torn_down.clone()
-    }
 }
 
 impl Default for FakeExecutor {
@@ -1635,35 +1533,6 @@ impl Executor for FakeExecutor {
         Ok(step
             .and_then(|s| self.inner.lock().unwrap().results.get(s).cloned())
             .unwrap_or_default())
-    }
-
-    async fn launch_service(
-        &self,
-        run: &RunId,
-        take: i64,
-        name: &str,
-        _spec: &scarab_pipeline::ServiceSpec,
-    ) -> Result<ExecHandle, ExecError> {
-        let handle = Self::service_handle(&run.0, take, name);
-        let mut st = self.inner.lock().unwrap();
-        // Idempotent on the {run, take, name} fence: record the launch once.
-        if !st.services_launched.contains(&handle.0) {
-            st.services_launched.push(handle.0.clone());
-        }
-        Ok(handle)
-    }
-
-    async fn service_ready(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
-        Ok(self.inner.lock().unwrap().ready_services.contains(&handle.0))
-    }
-
-    async fn teardown_service(&self, handle: &ExecHandle) -> Result<(), ExecError> {
-        self.inner
-            .lock()
-            .unwrap()
-            .services_torn_down
-            .push(handle.0.clone());
-        Ok(())
     }
 }
 
