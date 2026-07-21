@@ -63,7 +63,7 @@ export default defineConfig({
           // (/scarab-ci/) itself — including it here would double it.
           navLinks: [
             { label: 'Get Started', link: '/get-started/overview/' },
-            { label: 'Guides', link: '/guides/authoring/' },
+            { label: 'Guides', link: '/guides/pipeline-syntax/' },
             { label: 'Tech', link: '/tech/context/' },
           ],
           footerText:
@@ -85,7 +85,7 @@ export default defineConfig({
         },
         {
           label: 'Guides',
-          items: [{ label: 'Pipeline authoring', slug: 'guides/authoring' }],
+          items: [{ label: 'Pipeline Syntax', slug: 'guides/pipeline-syntax' }],
         },
         {
           label: 'Configure',
