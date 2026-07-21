@@ -609,20 +609,24 @@ impl<'a> Scheduler<'a> {
     /// One cycle across *every* active run — the converged-driver tick. Admits
     /// each active run, reconciles the outbox globally (one pass covers all
     /// runs), then advances each. This is what the background loop calls.
-    pub async fn tick_all(&self) -> Result<(), SchedulerError> {
+    ///
+    /// Returns the per-run reconcile errors that were **swallowed** this cycle
+    /// (git-bug 6825830). A `reconcile_services` error for ONE run (a db /
+    /// teardown blip; launch errors no longer escape after the launch-error
+    /// bound) must not abort the whole converged tick and starve the other runs,
+    /// so it is caught and the run is skipped this cycle (retried next tick). The
+    /// pure engine emits no logs; it hands the swallowed errors back so the
+    /// caller — the converged driver in `scarab-server`, which legitimately owns
+    /// `tracing` — surfaces them. An empty vec = a fully clean tick.
+    pub async fn tick_all(&self) -> Result<Vec<(RunId, SchedulerError)>, SchedulerError> {
         let runs = self.db.active_runs().await?;
+        let mut skipped: Vec<(RunId, SchedulerError)> = Vec::new();
         for run in &runs {
             // Shared services (ADR-0058) before admit, so the readiness gate sees
-            // fresh statuses this tick. Per-run isolation (git-bug 6825830): a
-            // reconcile error for ONE run (a db/teardown blip; launch errors no
-            // longer escape after the launch-error bound) must not abort the whole
-            // converged tick and starve the other runs — log it and skip this run
-            // this cycle; it is retried next tick.
+            // fresh statuses this tick. Per-run isolation: collect + skip on error
+            // rather than aborting the whole converged tick.
             if let Err(e) = self.reconcile_services(run).await {
-                tracing::warn!(
-                    run = %run.0, error = %e,
-                    "reconcile_services failed for run; skipping it this tick (git-bug 6825830)"
-                );
+                skipped.push((run.clone(), e));
                 continue;
             }
             self.admit(run).await?;
@@ -638,7 +642,7 @@ impl<'a> Scheduler<'a> {
         for run in &runs {
             self.advance(run).await?;
         }
-        Ok(())
+        Ok(skipped)
     }
 
     /// Are we the admission leader right now?
@@ -1975,9 +1979,9 @@ impl<'a> Scheduler<'a> {
     /// would abort the whole tick and retry the launch forever:
     ///
     /// * within the startup window (`now - created_at <= service_ready_timeout_ms`)
-    ///   the error is logged and swallowed, leaving the durable `Starting` row in
-    ///   place to retry next tick. This is the resilient path: a transient /
-    ///   since-fixed error (a decorator/RBAC blip) recovers on a later tick.
+    ///   the error is swallowed, leaving the durable `Starting` row in place to
+    ///   retry next tick. This is the resilient path: a transient / since-fixed
+    ///   error (a decorator/RBAC blip) recovers on a later tick.
     /// * past the deadline the service is marked `Failed` — the same fail-closed
     ///   verdict as the readiness-timeout, so `admit` fails the opt-in step, its
     ///   descendants cascade (ADR-0027), and the run makes forward progress
@@ -2011,26 +2015,22 @@ impl<'a> Scheduler<'a> {
                     .await?;
                 Ok(Some(handle))
             }
-            Err(e) if now.0 - created_at.0 > self.cfg.service_ready_timeout_ms => {
+            Err(_) if now.0 - created_at.0 > self.cfg.service_ready_timeout_ms => {
                 // Launch kept erroring past the readiness budget → fail-closed,
                 // unified with the readiness-timeout path (git-bug 6825830).
-                tracing::warn!(
-                    run = %run.0, take, service = %svc.name, error = %e,
-                    "shared-service launch still failing past the readiness budget; marking Failed (ADR-0058)"
-                );
                 self.db
                     .set_run_service(run, take, &svc.name, crate::ServiceStatus::Failed, None)
                     .await?;
                 Ok(None)
             }
-            Err(e) => {
+            Err(_) => {
                 // Within the startup window: swallow and retry next tick. The
                 // durable `Starting` row (its `created_at` already ticking) is
                 // left untouched so the next tick's `Starting` arm relaunches it.
-                tracing::warn!(
-                    run = %run.0, take, service = %svc.name, error = %e,
-                    "shared-service launch failed within the readiness budget; leaving Starting to retry next tick (ADR-0058)"
-                );
+                // No engine log: this pure domain crate surfaces the transient
+                // launch retry only through the service STATUS (`Starting`), the
+                // same way slice-3 surfaces readiness-timeout / mid-run-death —
+                // status only, never an engine-side log line.
                 Ok(None)
             }
         }

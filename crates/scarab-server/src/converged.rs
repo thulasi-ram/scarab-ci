@@ -38,12 +38,21 @@ pub async fn tick_once(
     // The Scheduler is per-cycle; the Supervision memory is per-PROCESS
     // (ADR-0056) — that is what lets a resumed control plane recognise the
     // attempts it did NOT launch and emit `AttemptReadopted` exactly once.
-    Scheduler::new(&**db, &**clock, &**executor, owner)
+    // Per-run reconcile errors the engine swallowed for tick isolation
+    // (git-bug 6825830) come back here — the pure engine does not log; the
+    // driver (which owns tracing) surfaces them without aborting the tick.
+    let skipped = Scheduler::new(&**db, &**clock, &**executor, owner)
         .with_outbox_visibility_ms(visibility_ms)
         .with_default_step_timeout_ms(step_timeout_ms)
         .with_supervision(supervision.clone())
         .tick_all()
         .await?;
+    for (run, e) in &skipped {
+        tracing::warn!(
+            run = %run.0, error = %e,
+            "reconcile_services failed for run; skipped this tick, retried next (git-bug 6825830)"
+        );
+    }
     // Log tail (ADR-0013): pull each running step's stdout/stderr into the log
     // pipeline. Best-effort and idempotent per fence — the tailer dedups, so
     // re-ensuring every tick just no-ops for streams already in flight.
