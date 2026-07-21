@@ -14,16 +14,20 @@ use futures::AsyncReadExt;
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, ExecAction,
     HTTPGetAction, Pod, PodSpec, Probe, ResourceRequirements, SeccompProfile, SecurityContext,
-    TCPSocketAction, Volume, VolumeMount,
+    Service, ServicePort, ServiceSpec, TCPSocketAction, Volume, VolumeMount,
+};
+use k8s_openapi::api::networking::v1::{
+    NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
+    NetworkPolicySpec,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use kube::api::{Api, AttachParams, DeleteParams, LogParams, Patch, PatchParams, PostParams};
 use std::sync::Arc;
 
 use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogChunks};
-use scarab_engine::{ExecError, Executor, StepRun, StepSpec};
+use scarab_engine::{ExecError, Executor, RunId, StepRun, StepSpec};
 use scarab_storage::Cas;
 
 /// The step container's name in every step Pod (see [`build_pod`]). The log tail
@@ -995,6 +999,98 @@ impl Executor for K8sExecutor {
             reader: Box::pin(reader),
         })))
     }
+
+    /// Provision a shared service (ADR-0058): create the service Pod, the cluster
+    /// DNS Service, and the opt-in-scoped NetworkPolicy. Idempotent — a 409 on any
+    /// object means a prior launch created it, so we adopt rather than fail. The
+    /// handle is the service Pod name (what readiness/teardown address).
+    ///
+    /// NOTE: this uses the executor's single namespace. Per-Take isolation
+    /// (a Rerun's fresh instance) relies on the namespace-per-run substrate the
+    /// ADR assumes; the durable per-Take instancing is enforced at the engine
+    /// layer regardless (`RunService` keyed `{run, take}`).
+    async fn launch_service(
+        &self,
+        run: &RunId,
+        _take: i64,
+        name: &str,
+        spec: &scarab_pipeline::ServiceSpec,
+    ) -> Result<ExecHandle, ExecError> {
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &self.namespace);
+        let services: Api<Service> = Api::namespaced(client.clone(), &self.namespace);
+        let netpols: Api<NetworkPolicy> = Api::namespaced(client, &self.namespace);
+
+        let pod = build_service_pod(&run.0, name, &self.namespace, spec, false);
+        let handle = pod.metadata.name.clone().unwrap_or_default();
+        // Ignore 409 (adopt existing) on every object — launch is idempotent.
+        adopt_conflict(pods.create(&PostParams::default(), &pod).await)?;
+        adopt_conflict(
+            services
+                .create(
+                    &PostParams::default(),
+                    &build_service(&run.0, name, &self.namespace, &spec.ports),
+                )
+                .await,
+        )?;
+        adopt_conflict(
+            netpols
+                .create(
+                    &PostParams::default(),
+                    &build_network_policy(&run.0, name, &self.namespace, &spec.ports),
+                )
+                .await,
+        )?;
+        Ok(ExecHandle(handle))
+    }
+
+    /// A shared service is ready when its Pod reports the `Ready` condition
+    /// `True` (its readiness probe has passed) — the readiness-gate signal.
+    async fn service_ready(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
+        let pods = self.pods()?;
+        let Some(pod) = pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?
+        else {
+            return Ok(false);
+        };
+        let ready = pod
+            .status
+            .and_then(|s| s.conditions)
+            .map(|cs| {
+                cs.iter()
+                    .any(|c| c.type_ == "Ready" && c.status == "True")
+            })
+            .unwrap_or(false);
+        Ok(ready)
+    }
+
+    /// Tear down a shared service's Pod, Service, and NetworkPolicy (ADR-0058).
+    /// Idempotent: a 404 (already gone) is success. The Service and NetworkPolicy
+    /// share the Pod's resource name except the Service, which is named for the
+    /// declared service — recovered from the Pod's `scarab.io/service` label.
+    async fn teardown_service(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &self.namespace);
+        let netpols: Api<NetworkPolicy> = Api::namespaced(client.clone(), &self.namespace);
+        let services: Api<Service> = Api::namespaced(client, &self.namespace);
+        let dp = DeleteParams::default();
+        // Recover the declared service name (the Service object's name) from the
+        // Pod label before deleting the Pod.
+        let svc_name = pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?
+            .and_then(|p| p.metadata.labels)
+            .and_then(|l| l.get("scarab.io/service").cloned());
+        ignore_missing(pods.delete(&handle.0, &dp).await)?;
+        ignore_missing(netpols.delete(&handle.0, &dp).await)?;
+        if let Some(sn) = svc_name {
+            ignore_missing(services.delete(&sn, &dp).await)?;
+        }
+        Ok(())
+    }
 }
 
 /// A [`LogChunks`] over a k8s Pod's followed log stream. Wraps kube's
@@ -1608,7 +1704,7 @@ pub fn build_pod(
         ..Default::default()
     };
 
-    let labels = std::collections::BTreeMap::from([
+    let mut labels = std::collections::BTreeMap::from([
         (
             "app.kubernetes.io/managed-by".to_string(),
             "scarab".to_string(),
@@ -1617,6 +1713,14 @@ pub fn build_pod(
         ("scarab.io/step".to_string(), sanitize_label(&step.step.0)),
         ("scarab.io/attempt".to_string(), sanitize_label(&attempt)),
     ]);
+    // Shared-service opt-in (ADR-0058): one label per `uses:` name so each named
+    // service's NetworkPolicy admits this Pod (least-privilege — a Pod that opts
+    // into nothing carries no service label and every service NetworkPolicy
+    // denies it). The label key is the service-name-scoped selector the matching
+    // `build_network_policy` ingress rule looks for.
+    for name in &spec.uses {
+        labels.insert(service_uses_label(name), "true".to_string());
+    }
 
     // Egress wiring (ADR-0042): a shared emptyDir + the sidecar as a native
     // sidecar (initContainer with restartPolicy Always), so it starts alongside
@@ -2051,6 +2155,194 @@ fn service_security_context(run_as_root: bool) -> SecurityContext {
         privileged: Some(false),
         seccomp_profile: Some(SeccompProfile {
             type_: "RuntimeDefault".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared services (ADR-0058): a Run-scoped standalone Pod + k8s Service (cluster
+// DNS `<name>:<port>`) + a NetworkPolicy scoping reachability to opt-in Pods.
+// These builders are pure (no client), so they are unit-tested against the typed
+// specs with no live cluster; the `Executor` impl creates/deletes them.
+// ---------------------------------------------------------------------------
+
+/// Treat a create that 409s (already exists) as success — launch is idempotent
+/// on the service fence, so a re-drive adopts the existing object.
+fn adopt_conflict<T>(r: Result<T, kube::Error>) -> Result<(), ExecError> {
+    match r {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(ae)) if ae.code == 409 => Ok(()),
+        Err(e) => Err(ExecError::Launch(e.to_string())),
+    }
+}
+
+/// Treat a delete that 404s (already gone) as success — teardown is idempotent.
+fn ignore_missing<T>(r: Result<T, kube::Error>) -> Result<(), ExecError> {
+    match r {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+        Err(e) => Err(ExecError::Other(e.to_string())),
+    }
+}
+
+/// The k8s object name for a shared service's resources (Pod / Service /
+/// NetworkPolicy) in a run's namespace: `scarab-svc-<name>-<runhash>`. Keyed on
+/// `{run, name}` (not the Take) because a Take opens a fresh namespace — within
+/// one namespace `{run, name}` is unique. DNS-1123-safe, ≤63 chars.
+fn service_resource_name(run: &str, name: &str) -> String {
+    let hash = fnv1a(run);
+    let slug = truncate(&sanitize_dns(name), 40);
+    format!("scarab-svc-{slug}-{hash:08x}")
+}
+
+/// The opt-in label key a Step's Pod carries for shared service `name` (ADR-0058)
+/// — the selector a service's NetworkPolicy ingress rule matches. `scarab.io/`
+/// prefixed and name-scoped so distinct services get distinct holes.
+fn service_uses_label(name: &str) -> String {
+    format!("scarab.io/uses.{}", sanitize_label(name))
+}
+
+/// Labels stamped on a shared service's Pod/Service/NetworkPolicy — the anchor
+/// the Service selector, the NetworkPolicy podSelector, and teardown-by-label all
+/// key on. `scarab.io/service` names the instance within the run.
+fn service_labels(run: &str, name: &str) -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([
+        (
+            "app.kubernetes.io/managed-by".to_string(),
+            "scarab".to_string(),
+        ),
+        ("scarab.io/run".to_string(), sanitize_label(run)),
+        ("scarab.io/service".to_string(), sanitize_label(name)),
+    ])
+}
+
+/// Build the standalone **service Pod** for a shared service (ADR-0058): the
+/// service image runs as the Pod's single main container (not a sidecar), under
+/// the ADR-0039 restricted baseline (reusing the slice-1 security context). Its
+/// `ready:` probe becomes the container's **readinessProbe** so the k8s Service
+/// only routes once it is ready — the same builder slice-1 uses for a sidecar's
+/// startupProbe. `restartPolicy: Always` keeps a flaky service alive; the run's
+/// teardown removes it.
+pub fn build_service_pod(
+    run: &str,
+    name: &str,
+    namespace: &str,
+    svc: &scarab_pipeline::ServiceSpec,
+    run_as_root: bool,
+) -> Pod {
+    let container = Container {
+        name: "service".to_string(),
+        image: Some(svc.image.clone()),
+        command: (!svc.command.is_empty()).then(|| svc.command.clone()),
+        args: (!svc.args.is_empty()).then(|| svc.args.clone()),
+        env: (!svc.env.is_empty()).then(|| svc.env.iter().map(|(k, v)| env_var(k, v)).collect()),
+        ports: (!svc.ports.is_empty()).then(|| {
+            svc.ports
+                .iter()
+                .map(|p| ContainerPort {
+                    container_port: *p as i32,
+                    ..Default::default()
+                })
+                .collect()
+        }),
+        readiness_probe: service_startup_probe(svc),
+        security_context: Some(service_security_context(run_as_root)),
+        ..Default::default()
+    };
+    Pod {
+        metadata: ObjectMeta {
+            name: Some(service_resource_name(run, name)),
+            namespace: Some(namespace.to_string()),
+            labels: Some(service_labels(run, name)),
+            ..Default::default()
+        },
+        spec: Some(PodSpec {
+            containers: vec![container],
+            // A standalone backing service is long-lived within the run; keep it
+            // up on crash (teardown, not exit, ends it).
+            restart_policy: Some("Always".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Build the **k8s Service** for a shared service (ADR-0058): a stable cluster
+/// DNS name equal to the declared service `name`, so opt-in Pods reach it at
+/// `<name>:<port>`. Its selector targets the service Pod's labels.
+pub fn build_service(run: &str, name: &str, namespace: &str, ports: &[u16]) -> Service {
+    Service {
+        metadata: ObjectMeta {
+            // The Service object name IS the declared name → DNS `<name>:<port>`.
+            name: Some(sanitize_dns(name)),
+            namespace: Some(namespace.to_string()),
+            labels: Some(service_labels(run, name)),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            selector: Some(service_labels(run, name)),
+            ports: Some(
+                ports
+                    .iter()
+                    .map(|p| ServicePort {
+                        port: *p as i32,
+                        target_port: Some(IntOrString::Int(*p as i32)),
+                        protocol: Some("TCP".to_string()),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Build the **NetworkPolicy** for a shared service (ADR-0058): default-deny
+/// ingress to the service Pod, with a single rule admitting only Pods **in the
+/// same run** that carry the service's opt-in label ([`service_uses_label`]).
+/// Non-opt-in Pods (and Pods of other runs) cannot reach it — the least-privilege
+/// hole `uses:` scopes.
+pub fn build_network_policy(run: &str, name: &str, namespace: &str, ports: &[u16]) -> NetworkPolicy {
+    let peer = NetworkPolicyPeer {
+        pod_selector: Some(LabelSelector {
+            match_labels: Some(std::collections::BTreeMap::from([
+                ("scarab.io/run".to_string(), sanitize_label(run)),
+                (service_uses_label(name), "true".to_string()),
+            ])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    NetworkPolicy {
+        metadata: ObjectMeta {
+            name: Some(service_resource_name(run, name)),
+            namespace: Some(namespace.to_string()),
+            labels: Some(service_labels(run, name)),
+            ..Default::default()
+        },
+        spec: Some(NetworkPolicySpec {
+            // Selects the service Pod (the policy target).
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(service_labels(run, name)),
+                ..Default::default()
+            }),
+            policy_types: Some(vec!["Ingress".to_string()]),
+            ingress: Some(vec![NetworkPolicyIngressRule {
+                from: Some(vec![peer]),
+                ports: Some(
+                    ports
+                        .iter()
+                        .map(|p| NetworkPolicyPort {
+                            port: Some(IntOrString::Int(*p as i32)),
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+            }]),
             ..Default::default()
         }),
         ..Default::default()
@@ -2823,6 +3115,116 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(tcp.port, IntOrString::Int(6379));
+    }
+
+    // ADR-0058 (shared service): the standalone service Pod runs the service
+    // image as its single main container under the restricted baseline, with the
+    // `ready:` probe wired as the container's readinessProbe (so the k8s Service
+    // only routes once ready), and carries the run + service labels.
+    #[test]
+    fn shared_service_pod_is_standalone_hardened_with_readiness_probe() {
+        use scarab_pipeline::{ReadyProbe, ServiceSpec};
+        let svc = ServiceSpec {
+            image: "postgres:16".into(),
+            env: std::collections::BTreeMap::from([(
+                "POSTGRES_PASSWORD".to_string(),
+                "test".to_string(),
+            )]),
+            ports: vec![5432],
+            ready: Some(ReadyProbe {
+                tcp: Some(5432),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pod = build_service_pod("run-1", "db", "ns", &svc, false);
+        let meta = &pod.metadata;
+        assert_eq!(meta.namespace.as_deref(), Some("ns"));
+        let labels = meta.labels.as_ref().unwrap();
+        assert_eq!(labels.get("scarab.io/run").map(String::as_str), Some("run-1"));
+        assert_eq!(labels.get("scarab.io/service").map(String::as_str), Some("db"));
+
+        let ps = pod.spec.unwrap();
+        // Single standalone container (NOT an init/sidecar).
+        assert_eq!(ps.containers.len(), 1);
+        assert!(ps.init_containers.is_none());
+        let c = &ps.containers[0];
+        assert_eq!(c.image.as_deref(), Some("postgres:16"));
+        // readinessProbe (not startupProbe) gates the Service endpoint.
+        let tcp = c
+            .readiness_probe
+            .as_ref()
+            .expect("readiness probe")
+            .tcp_socket
+            .as_ref()
+            .unwrap();
+        assert_eq!(tcp.port, IntOrString::Int(5432));
+        // Restricted baseline (ADR-0039).
+        let sc = c.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.privileged, Some(false));
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().drop,
+            Some(vec!["ALL".to_string()])
+        );
+    }
+
+    // ADR-0058: the k8s Service is named for the declared service (cluster DNS
+    // `<name>:<port>`) and selects the service Pod by its labels.
+    #[test]
+    fn shared_service_object_gives_dns_name_and_selects_the_pod() {
+        let svc = build_service("run-1", "db", "ns", &[5432]);
+        assert_eq!(svc.metadata.name.as_deref(), Some("db"), "DNS name = service name");
+        let sp = svc.spec.unwrap();
+        let sel = sp.selector.unwrap();
+        assert_eq!(sel.get("scarab.io/service").map(String::as_str), Some("db"));
+        assert_eq!(sel.get("scarab.io/run").map(String::as_str), Some("run-1"));
+        let port = &sp.ports.unwrap()[0];
+        assert_eq!(port.port, 5432);
+        assert_eq!(port.target_port, Some(IntOrString::Int(5432)));
+    }
+
+    // ADR-0058: the NetworkPolicy targets the service Pod and admits ingress ONLY
+    // from same-run Pods carrying the service's opt-in label — the least-privilege
+    // hole `uses:` scopes. A Pod that opts into nothing is denied.
+    #[test]
+    fn shared_service_network_policy_admits_only_opt_in_pods() {
+        let np = build_network_policy("run-1", "db", "ns", &[5432]);
+        let spec = np.spec.unwrap();
+        // Target = the service Pod.
+        let target = spec.pod_selector.unwrap().match_labels.unwrap();
+        assert_eq!(target.get("scarab.io/service").map(String::as_str), Some("db"));
+        assert_eq!(spec.policy_types.as_deref(), Some(&["Ingress".to_string()][..]));
+        // Ingress source peer = same-run Pods with the db opt-in label.
+        let rule = &spec.ingress.unwrap()[0];
+        let peer_sel = rule.from.as_ref().unwrap()[0]
+            .pod_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap();
+        assert_eq!(peer_sel.get("scarab.io/run").map(String::as_str), Some("run-1"));
+        assert_eq!(
+            peer_sel.get("scarab.io/uses.db").map(String::as_str),
+            Some("true"),
+            "only Pods opted into `db` are admitted"
+        );
+        assert_eq!(rule.ports.as_ref().unwrap()[0].port, Some(IntOrString::Int(5432)));
+    }
+
+    // ADR-0058: an opt-in step's Pod carries the per-service `uses` label so the
+    // service NetworkPolicy admits it; a step that opts into nothing does not.
+    #[test]
+    fn step_pod_carries_uses_opt_in_labels() {
+        let mut spec = busybox();
+        spec.uses = vec!["db".to_string()];
+        let labels = pod_for(&spec).metadata.labels.unwrap();
+        assert_eq!(labels.get("scarab.io/uses.db").map(String::as_str), Some("true"));
+
+        let plain = busybox();
+        let plain_labels = pod_for(&plain).metadata.labels.unwrap();
+        assert!(!plain_labels.keys().any(|k| k.starts_with("scarab.io/uses.")));
     }
 
     #[test]

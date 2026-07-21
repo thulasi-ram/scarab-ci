@@ -705,4 +705,39 @@ pub trait Executor: Send + Sync {
     async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         Ok(None)
     }
+
+    /// Provision (or re-attach to) the standalone **shared-service** unit for
+    /// `{run, take, name}` (ADR-0058): a service Pod + a cluster-DNS Service +
+    /// a NetworkPolicy scoping reachability to opt-in Pods. Returns a handle the
+    /// orchestrator records for readiness polling and teardown. Idempotent on
+    /// `{run, take, name}` (like `launch`). The default **rejects** — a backend
+    /// without cross-Pod networking (the host-process local executor) cannot run
+    /// a shared service, mirroring how it rejects `clone`/`build`.
+    async fn launch_service(
+        &self,
+        _run: &RunId,
+        _take: i64,
+        _name: &str,
+        _spec: &scarab_pipeline::ServiceSpec,
+    ) -> Result<ExecHandle, ExecError> {
+        Err(ExecError::Launch(
+            "this executor does not support shared services (container images need the k8s backend)"
+                .to_string(),
+        ))
+    }
+
+    /// Whether the shared-service unit behind `handle` has passed its readiness
+    /// probe (ADR-0058) — the scheduler's readiness-gate release signal. Default
+    /// `false` (never ready) so a backend that cannot observe it holds opt-in
+    /// steps rather than releasing them prematurely.
+    async fn service_ready(&self, _handle: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(false)
+    }
+
+    /// Tear down the shared-service unit behind `handle` (ADR-0058), riding the
+    /// Run/Take-terminal teardown. Idempotent; a missing unit is success. Default
+    /// no-op for backends that never launched one.
+    async fn teardown_service(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
 }

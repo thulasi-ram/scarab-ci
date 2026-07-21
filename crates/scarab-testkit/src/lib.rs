@@ -1448,6 +1448,12 @@ struct FakeExecState {
     /// The most recent spec each handle was launched with — lets a test assert
     /// launch-time interpolation (ADR-0041) rewrote `${{ … }}` before launch.
     launched_specs: HashMap<String, StepSpec>,
+    /// Shared services launched via `launch_service` (ADR-0058), by handle.
+    services_launched: Vec<String>,
+    /// Service handles a test has declared ready (their readiness probe passed).
+    ready_services: std::collections::HashSet<String>,
+    /// Service handles torn down via `teardown_service`, in call order.
+    services_torn_down: Vec<String>,
 }
 
 /// An [`Executor`] whose behaviour a test scripts: it can be told that a given
@@ -1536,6 +1542,32 @@ impl FakeExecutor {
             .copied()
             .unwrap_or(0)
     }
+
+    /// The deterministic handle a shared service `{run, take, name}` maps to
+    /// (ADR-0058), mirroring the k8s executor's per-run/take/name identity.
+    pub fn service_handle(run: &str, take: i64, name: &str) -> ExecHandle {
+        ExecHandle(format!("svc://{run}/{take}/{name}"))
+    }
+
+    /// Declare that a shared service (by its handle) has passed readiness — the
+    /// scheduler's gate-release signal in tests.
+    pub fn mark_service_ready(&self, handle: &ExecHandle) {
+        self.inner
+            .lock()
+            .unwrap()
+            .ready_services
+            .insert(handle.0.clone());
+    }
+
+    /// Handles of shared services launched via `launch_service`, in call order.
+    pub fn launched_services(&self) -> Vec<String> {
+        self.inner.lock().unwrap().services_launched.clone()
+    }
+
+    /// Handles of shared services torn down via `teardown_service`, in call order.
+    pub fn torn_down_services(&self) -> Vec<String> {
+        self.inner.lock().unwrap().services_torn_down.clone()
+    }
 }
 
 impl Default for FakeExecutor {
@@ -1592,6 +1624,35 @@ impl Executor for FakeExecutor {
         Ok(step
             .and_then(|s| self.inner.lock().unwrap().results.get(s).cloned())
             .unwrap_or_default())
+    }
+
+    async fn launch_service(
+        &self,
+        run: &RunId,
+        take: i64,
+        name: &str,
+        _spec: &scarab_pipeline::ServiceSpec,
+    ) -> Result<ExecHandle, ExecError> {
+        let handle = Self::service_handle(&run.0, take, name);
+        let mut st = self.inner.lock().unwrap();
+        // Idempotent on the {run, take, name} fence: record the launch once.
+        if !st.services_launched.contains(&handle.0) {
+            st.services_launched.push(handle.0.clone());
+        }
+        Ok(handle)
+    }
+
+    async fn service_ready(&self, handle: &ExecHandle) -> Result<bool, ExecError> {
+        Ok(self.inner.lock().unwrap().ready_services.contains(&handle.0))
+    }
+
+    async fn teardown_service(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        self.inner
+            .lock()
+            .unwrap()
+            .services_torn_down
+            .push(handle.0.clone());
+        Ok(())
     }
 }
 
