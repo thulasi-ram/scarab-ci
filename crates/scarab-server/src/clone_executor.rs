@@ -233,3 +233,35 @@ impl Executor for CloneEnrichingExecutor {
         self.inner.service_log_stream(handle).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scarab_engine::RunId;
+    use scarab_testkit::{FakeExecutor, FakeForge, InMemoryDb};
+
+    // Regression: this decorator must FORWARD `launch_service` to its inner
+    // executor. Without the explicit forward it inherits the trait's DEFAULT
+    // impl, which REJECTS shared services — refusing every service on the k8s
+    // backend for a clone-wired deployment (fixed in 82f5840).
+    #[tokio::test]
+    async fn forwards_launch_service_to_inner() {
+        let inner = Arc::new(FakeExecutor::new());
+        let connections: Arc<dyn ForgeConnectionStore> = Arc::new(InMemoryDb::new());
+        let forge: Arc<dyn ForgePort> = Arc::new(FakeForge::new());
+        let decorator = CloneEnrichingExecutor::new(inner.clone(), connections, forge);
+
+        let run = RunId("run-1".into());
+        let spec = scarab_pipeline::ServiceSpec {
+            image: "postgres:16".into(),
+            ..Default::default()
+        };
+
+        let handle = decorator
+            .launch_service(&run, 0, "db", &spec)
+            .await
+            .expect("launch_service must forward to inner, not hit the reject default");
+
+        assert_eq!(inner.launched_services(), vec![handle.0]);
+    }
+}
