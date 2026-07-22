@@ -5,10 +5,11 @@
 //! `reconcile_supersessions` (which owns the executor) cancels exactly that
 //! descendant's Pod — while the run itself stays alive.
 
+use scarab_engine::ports::ExecHandle;
 use scarab_engine::{
-    rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db, EventPayload, RestartError,
-    RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, SupersedeTeardown, Timestamp,
-    SUPERSEDE_TEARDOWN,
+    rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db, EventPayload, OutboxId,
+    OutboxMessage, RestartError, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus,
+    SupersedeTeardown, Timestamp, LAUNCH_STEP, SUPERSEDE_TEARDOWN,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
@@ -483,4 +484,131 @@ async fn same_tick_supersessions_get_distinct_outbox_keys() {
         2,
         "two same-tick supersessions must get two distinct teardown keys, got {keys:?}"
     );
+}
+
+/// Regression (live-caught in real k8s): after a rerun supersedes an in-flight
+/// attempt (`a1`) and tears down its Pod, the backend reports that Pod `Lost`.
+/// `a1`'s launch intent was never dispatched (it was superseded out of band, not
+/// settled), so it lingers on the outbox and `reconcile` re-polls it — observing
+/// `Lost`. The engine PREVIOUSLY recorded that `Lost` on `a1`'s attempt row
+/// (`set_attempt_failure` ran *before* the "only the frontier attempt may settle"
+/// guard), DOWNGRADING the terminal `Superseded` to `{failed:true,
+/// failure:"lost", outcome:"failed"}` and rendering the intentionally torn-down
+/// attempt as a failure in `AttemptDto`. The immutable event log was always
+/// correct (no `AttemptFinished` for `a1`); only the attempts-table
+/// denormalization was clobbered. A self-inflicted `Lost` for a non-frontier,
+/// already-`Superseded` attempt must be IGNORED — no row write, no event.
+#[tokio::test]
+async fn superseded_attempt_survives_teardown_induced_lost() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-lost".into());
+    let b = StepId("b".into());
+    let c = StepId("c".into());
+    let a1 = AttemptId("a1".into());
+    let a2 = AttemptId("a2".into());
+    let handle = "fake://run-lost/c/a1";
+
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
+        .await
+        .unwrap();
+
+    // b succeeded; c is in-flight (a1 with a launched Pod handle).
+    db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Succeeded)
+        .await
+        .unwrap();
+    db.record_attempt(
+        &run,
+        &c,
+        &Attempt {
+            id: a1.clone(),
+            started_at: Timestamp(0),
+            failure: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    db.set_attempt_handle(&run, &c, &a1, handle).await.unwrap();
+    db.record_step_transition(&run, &c, StepStatus::Pending, StepStatus::Running)
+        .await
+        .unwrap();
+    db.seed_run(&run, RunStatus::Running);
+
+    // The human reruns b: c's a1 is stamped Superseded and c is re-armed.
+    let clock = FakeClock::new(1_000);
+    rerun_step(&db, &clock, &run, &b, Some("alice".into()))
+        .await
+        .expect("rerun_step");
+
+    // c relaunches under a fresh fence — a2 becomes the frontier attempt, so a1
+    // is now a non-frontier, superseded generation (the reported live state).
+    db.record_attempt(
+        &run,
+        &c,
+        &Attempt {
+            id: a2.clone(),
+            started_at: Timestamp(1_000),
+            failure: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+
+    // a1's launch intent is still on the outbox (never dispatched — a1 never
+    // terminally settled). reconcile re-polls it; its SIGTERMed Pod polls `Lost`.
+    db.enqueue_outbox(&OutboxMessage {
+        id: OutboxId(0),
+        run: run.clone(),
+        kind: LAUNCH_STEP.to_string(),
+        payload: serde_json::json!({ "run": run.0, "step": c.0, "attempt": a1.0 }),
+        idempotency_key: format!("launch:{}/{}/{}", run.0, c.0, a1.0),
+        at: Timestamp(1_000),
+    })
+    .await
+    .unwrap();
+
+    let exec = FakeExecutor::new();
+    exec.kill(ExecHandle(handle.to_string())); // a1's Pod is gone → poll ⇒ Lost
+    let sched = Scheduler::new(&db, &clock, &exec, "drv");
+    sched
+        .reconcile()
+        .await
+        .expect("reconcile drains the stale a1 launch intent and observes Lost");
+
+    let c_attempts = db.attempts_of_step(&run, &c).await.unwrap();
+    let a1_row = c_attempts.iter().find(|x| x.id == a1).expect("a1 present");
+    // (a) a1's terminal Superseded is intact — NOT downgraded to failed/lost.
+    assert_eq!(
+        a1_row.outcome,
+        AttemptOutcome::Superseded,
+        "the teardown-induced Lost must not downgrade the superseded attempt"
+    );
+    // (b) supersession is not a failure — `failure` stays None.
+    assert!(
+        a1_row.failure.is_none(),
+        "superseded attempt's `failure` must stay None, not `lost`"
+    );
+
+    // (c) no AttemptFinished was appended for a1 — the event log stays correct.
+    let events = db.events(&run).await.unwrap();
+    assert!(
+        !events.iter().any(|e| matches!(&e.kind,
+            EventPayload::AttemptFinished { step, attempt, .. }
+                if step == &c && attempt == &a1)),
+        "no AttemptFinished event for the superseded attempt"
+    );
+
+    // (d) the new frontier attempt a2 is unaffected.
+    let a2_row = c_attempts.iter().find(|x| x.id == a2).expect("a2 present");
+    assert_eq!(
+        a2_row.outcome,
+        AttemptOutcome::Running,
+        "frontier attempt a2 must be untouched"
+    );
+    assert!(a2_row.failure.is_none(), "frontier a2 carries no failure");
 }

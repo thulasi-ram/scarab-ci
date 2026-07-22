@@ -1142,9 +1142,14 @@ impl Db for InMemoryDb {
         let mut st = self.state.lock().unwrap();
         if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
             if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
-                // Failure and outcome move together (ADR-0056 amendment).
-                a.failure = Some(failure);
-                a.outcome = AttemptOutcome::Failed;
+                // Defense in depth: never downgrade a terminal `Superseded` — a
+                // self-inflicted teardown `Lost` must not clobber it (mirrors the
+                // postgres `IS DISTINCT FROM 'superseded'` guard).
+                if a.outcome != AttemptOutcome::Superseded {
+                    // Failure and outcome move together (ADR-0056 amendment).
+                    a.failure = Some(failure);
+                    a.outcome = AttemptOutcome::Failed;
+                }
             }
         }
         Ok(())
@@ -1160,7 +1165,11 @@ impl Db for InMemoryDb {
         let mut st = self.state.lock().unwrap();
         if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
             if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
-                a.outcome = outcome;
+                // Defense in depth (mirrors `set_attempt_failure`): a terminal
+                // `Superseded` is never overwritten by a later observation.
+                if a.outcome != AttemptOutcome::Superseded {
+                    a.outcome = outcome;
+                }
             }
         }
         Ok(())

@@ -1366,10 +1366,15 @@ impl Db for PostgresDb {
         failure: FailureKind,
     ) -> Result<(), DbError> {
         // Record the classification and the `Failed` outcome together so the two
-        // columns never diverge (ADR-0056 amendment).
+        // columns never diverge (ADR-0056 amendment). Defense in depth: never
+        // downgrade a terminal `Superseded` — a rerun tore this attempt down on
+        // purpose, and the self-inflicted `Lost` its dying Pod reports must not
+        // clobber that verdict (`IS DISTINCT FROM` keeps NULL/other outcomes
+        // writable).
         sqlx::query(
             "UPDATE attempts SET failure = $4, outcome = $5
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+               AND outcome IS DISTINCT FROM 'superseded'",
         )
         .bind(&run.0)
         .bind(&step.0)
@@ -1389,9 +1394,14 @@ impl Db for PostgresDb {
         attempt: &AttemptId,
         outcome: AttemptOutcome,
     ) -> Result<(), DbError> {
+        // Defense in depth (mirrors `set_attempt_failure`): a terminal
+        // `Superseded` is never overwritten — the intentional teardown verdict
+        // wins over any later observation. Setting `Superseded` itself is still
+        // fine (the row is `running` at that point).
         sqlx::query(
             "UPDATE attempts SET outcome = $4
-             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
+               AND outcome IS DISTINCT FROM 'superseded'",
         )
         .bind(&run.0)
         .bind(&step.0)

@@ -2022,18 +2022,33 @@ impl<'a> Scheduler<'a> {
         attempt: &AttemptId,
         kind: FailureKind,
     ) -> Result<(), SchedulerError> {
-        // Record the classified failure on the attempt row (idempotent).
+        // Stale-/self-inflicted-observation guard — evaluated BEFORE any write so
+        // a doomed observation never touches the attempt row. Two conditions
+        // disqualify it, and either one skips the write entirely (no attempt-row
+        // clobber, no re-arm, no finalize, no event):
+        //   * it names an attempt that is no longer the step's frontier — a
+        //     redelivered intent for an older generation whose successor already
+        //     runs under a higher fence (the original stale-delivery guard), or
+        //   * that attempt is already `Superseded` — a rerun re-armed its
+        //     still-`Running` step and SIGTERMed its Pod, which the backend now
+        //     reports `Lost`. That `Lost` is self-inflicted and fenced, not a
+        //     verdict; recording it would downgrade the terminal `Superseded` to
+        //     `failed`/`lost` and render the torn-down attempt as a failure.
+        let attempts = self.db.attempts_of_step(run, step).await?;
+        let is_frontier = attempts.last().map(|a| &a.id) == Some(attempt);
+        let superseded = attempts
+            .iter()
+            .find(|a| &a.id == attempt)
+            .is_some_and(|a| a.outcome == AttemptOutcome::Superseded);
+        if !is_frontier || superseded {
+            return Ok(());
+        }
+
+        // Record the classified failure on the (frontier) attempt row (idempotent).
         self.db
             .set_attempt_failure(run, step, attempt, kind)
             .await?;
 
-        // Stale-delivery guard: only the step's LATEST attempt may settle it.
-        // A redelivered intent for an older attempt (whose successor is already
-        // running under a higher fence) must neither re-arm nor fail the step.
-        let attempts = self.db.attempts_of_step(run, step).await?;
-        if attempts.last().map(|a| &a.id) != Some(attempt) {
-            return Ok(());
-        }
         let used = attempts.len() as u32;
 
         let configured = self.step_retry(run, step).await?.map(|r| 1 + r.max);
