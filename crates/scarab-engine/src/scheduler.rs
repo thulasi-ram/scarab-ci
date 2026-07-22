@@ -747,11 +747,23 @@ impl<'a> Scheduler<'a> {
         // Gate pre-pass (ADR-0008): a Pending gate whose deps are satisfied
         // suspends the whole run — a durable, near-zero-cost wait for approval /
         // timer / external event. It launches no Pod; `release_gate` resumes.
+        // A gate whose deps can never succeed can never be approved, so skip it
+        // here: the non-gate skip loop below `continue`s past gates (line ~778),
+        // so without this a dead-upstream gate lingers Pending, `advance` never
+        // sees an all-terminal DAG, and the run hangs Running until its budget
+        // (a liveness backstop) eventually fails it.
         for step in &steps {
-            if step.status == StepStatus::Pending && step.is_gate() && deps_satisfied(step) {
+            if step.status != StepStatus::Pending || !step.is_gate() {
+                continue;
+            }
+            if deps_satisfied(step) {
                 self.transition_run(run, RunStatus::Running, RunStatus::Suspended)
                     .await?;
                 return Ok(());
+            }
+            if dep_dead(step) {
+                self.transition_step(run, &step.step, StepStatus::Pending, StepStatus::Skipped)
+                    .await?;
             }
         }
 
@@ -1570,22 +1582,26 @@ impl<'a> Scheduler<'a> {
 
     /// Enforce the run's opt-in active-time `budget:` (ADR-0047). Returns
     /// `true` when the budget is exhausted and the run was failed (admission
-    /// must stop). Active time = the wall time the run has actually spent in
-    /// `Running`, summed over its `Running` intervals; there is deliberately
-    /// **no default**.
+    /// must stop). Active time = the wall time the run has spent in `Running`
+    /// **within the current Take** (ADR-0056), summed over its `Running`
+    /// intervals; there is deliberately **no default**.
     ///
     /// Summing `Running` intervals — rather than the older "wall time since
     /// creation minus gate-suspended intervals" — is what makes the budget an
-    /// *active*-time ceiling and, critically, what lets a Rerun of a
-    /// budget-exhausted run make progress. The old form billed two spans that
-    /// are not active compute: time the run sat `Pending` in the admission
-    /// queue before it ever ran, and time it sat `Failed` awaiting a human
-    /// Rerun. Because `created_at` never moves, both grew without bound, so any
-    /// run older than its budget re-failed on the first tick after a Rerun
-    /// (the run flips `Failed → Running`, the next tick recomputes an
-    /// ever-larger elapsed span, and it trips the ceiling again). Gate-suspended
+    /// *active*-time ceiling. The old form billed two spans that are not active
+    /// compute: time the run sat `Pending` in the admission queue before it ever
+    /// ran, and time it sat `Failed` awaiting a human Rerun. Because
+    /// `created_at` never moves, both grew without bound, so any run older than
+    /// its budget re-failed on the first tick after a Rerun. Gate-suspended
     /// waits, queue time, and post-failure idle now all fall outside the summed
     /// `Running` intervals, so none of them bill.
+    ///
+    /// The budget is **per-Take**: a Rerun (`RunRestartRequested`) opens a new
+    /// Take, and active time from prior Takes does not carry over. Auto-retries
+    /// *within* a Take still accumulate (bounding total active time is the whole
+    /// point), but a human Rerun grants a fresh ceiling — otherwise a run that
+    /// legitimately spent its budget could never be rerun, recreating the very
+    /// "rerun always re-exhausts" failure this ceiling is not meant to cause.
     async fn enforce_run_budget(&self, run: &RunId) -> Result<bool, SchedulerError> {
         if self.db.run_status(run).await? != Some(RunStatus::Running) {
             return Ok(false);
@@ -1594,16 +1610,21 @@ impl<'a> Scheduler<'a> {
             return Ok(false);
         };
         let events = self.db.events(run).await?;
-        // Sum the run's `Running` intervals from the event log. Every entry into
+        // Sum the `Running` intervals of the current Take. Every entry into
         // `Running` opens an interval; the next transition out of it closes it.
-        // The run is `Running` now, so the final interval is still open — close
-        // it at `now`.
+        // A `RunRestartRequested` (Take boundary) resets the accumulator, so
+        // only the latest Take's active time is billed. The run is `Running`
+        // now, so the final interval is still open — close it at `now`.
         let now = self.clock.now().await;
         let mut active_ms: i64 = 0;
         let mut entered_running: Option<i64> = None;
         for e in &events {
-            if let EventPayload::RunTransitioned { to, .. } = &e.kind {
-                match to {
+            match &e.kind {
+                EventPayload::RunRestartRequested { .. } => {
+                    active_ms = 0;
+                    entered_running = None;
+                }
+                EventPayload::RunTransitioned { to, .. } => match to {
                     RunStatus::Running => {
                         if entered_running.is_none() {
                             entered_running = Some(e.at.0);
@@ -1614,7 +1635,8 @@ impl<'a> Scheduler<'a> {
                             active_ms += e.at.0 - start;
                         }
                     }
-                }
+                },
+                _ => {}
             }
         }
         if let Some(start) = entered_running.take() {

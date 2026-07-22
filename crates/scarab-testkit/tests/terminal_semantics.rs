@@ -410,6 +410,122 @@ async fn rerun_after_failure_does_not_bill_idle_time_to_the_budget() {
     );
 }
 
+/// Regression (ADR-0008/0023): a gate whose upstream can never succeed is
+/// itself Skipped, so the run SETTLES to its verdict instead of hanging Running
+/// on a gate that will never activate. Before the fix the gate lingered Pending
+/// — the non-gate skip path `continue`s past gates and the gate pre-pass only
+/// handled satisfied deps — so `advance` never saw an all-terminal DAG and the
+/// run burned time until its budget (a liveness backstop) failed it.
+#[tokio::test]
+async fn gate_with_a_dead_dependency_is_skipped_so_the_run_settles() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    let at = Timestamp(1_000);
+    let (build, gate) = (StepId("build".into()), StepId("approve".into()));
+    db.create_run(&run_id(), 1, 1, at).await.unwrap();
+    db.create_step_run(&run_id(), &build, Some(&spec()), &[], at)
+        .await
+        .unwrap();
+    db.create_step_run(&run_id(), &gate, None, &[build.clone()], at)
+        .await
+        .unwrap();
+    db.set_step_gate(&run_id(), &gate, "manual", None)
+        .await
+        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 1, "steps": [
+            { "id": "build", "image": "img" },
+            { "id": "approve", "gate": "manual", "needs": ["build"] },
+        ]}),
+    )
+    .await
+    .unwrap();
+
+    // build fails on its verdict → the gate downstream can never be approved.
+    exec.script_outcome(failed(FailureClass::Step));
+    for _ in 0..5 {
+        tick(&db, &clock, &exec).await;
+    }
+
+    let steps = db.steps_of_run(&run_id()).await.unwrap();
+    let gate_step = steps.iter().find(|s| s.step == gate).unwrap();
+    assert_eq!(
+        gate_step.status,
+        StepStatus::Skipped,
+        "a gate whose dep can never succeed must be Skipped, not left Pending"
+    );
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed),
+        "the run settles to its verdict instead of hanging Running on a dead gate"
+    );
+}
+
+/// Regression (ADR-0056): the active-time budget is per-Take. A run that
+/// exhausts its budget in one Take gets a FRESH ceiling on Rerun — prior-Take
+/// active time does not carry over — while the ceiling still applies within the
+/// new Take (auto-retries inside a Take accumulate; a human Rerun resets).
+#[tokio::test]
+async fn budget_is_per_take_a_rerun_starts_a_fresh_ceiling() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    let at = Timestamp(1_000);
+    let step = StepId("s".into());
+    db.create_run(&run_id(), 1, 1, at).await.unwrap();
+    db.create_step_run(&run_id(), &step, Some(&spec()), &[], at)
+        .await
+        .unwrap();
+    db.store_run_ir(
+        &run_id(),
+        &serde_json::json!({ "ir_version": 1, "budget": 60,
+            "steps": [{ "id": "s", "image": "img" }] }),
+    )
+    .await
+    .unwrap();
+
+    // Take 1: 61s of active time → budget exhausted, run Failed.
+    tick(&db, &clock, &exec).await;
+    clock.advance(61_000);
+    for _ in 0..2 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed)
+    );
+
+    // Rerun opens Take 2 — the prior Take's 61s must NOT carry over.
+    restart_step(&db, &clock, &run_id(), &step, Some("alice".into()))
+        .await
+        .unwrap();
+    tick(&db, &clock, &exec).await; // reopened; a fresh attempt launches
+    clock.advance(30_000); // 30s into Take 2 — within the fresh 60s ceiling
+    tick(&db, &clock, &exec).await;
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Running),
+        "Take 2 gets a fresh budget — prior-Take active time does not carry over"
+    );
+
+    // The ceiling still applies WITHIN Take 2: cross 60s of Take-2 active time.
+    clock.advance(31_000); // 61s into Take 2
+    for _ in 0..2 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed),
+        "the per-Take ceiling still fires once THIS Take exceeds the budget"
+    );
+}
+
 /// No budget configured = no run-level ceiling: a long-running run keeps going
 /// (forward progress rests on step timeouts + gate expiry, so the step here
 /// carries an explicit long `timeout:` to keep the step-deadline backstop out
