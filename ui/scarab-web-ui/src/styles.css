@@ -695,7 +695,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   margin-top: 0;
 }
 
-.step-restart {
+.step-rerun {
   padding: 4px 10px;
   font-size: 12px;
   display: inline-flex;
@@ -1106,7 +1106,7 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   color: var(--soft-white);
 }
 
-.step-detail .step-restart {
+.step-detail .step-rerun {
   margin-top: 4px;
   align-self: flex-start;
   padding: 6px 12px;

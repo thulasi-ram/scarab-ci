@@ -25,8 +25,8 @@ enum Command {
     Validate(FileArgs),
     /// Stream a run's logs (replay + live tail via SSE).
     Logs(LogsArgs),
-    /// Restart a step (and its dependents) of a run.
-    Restart(RestartArgs),
+    /// Rerun a step (and its dependents) of a run.
+    Rerun(RerunArgs),
 }
 
 /// A local pipeline file (offline — no server needed).
@@ -47,10 +47,10 @@ struct LogsArgs {
 }
 
 #[derive(Debug, Args)]
-struct RestartArgs {
+struct RerunArgs {
     /// The run id.
     run: String,
-    /// The step to restart (its descendants re-run too, ADR-0027).
+    /// The step to rerun (its descendants re-run too, ADR-0027).
     step: String,
     #[arg(long, env = "SCARAB_SERVER", default_value = "http://localhost:8080")]
     server: String,
@@ -157,7 +157,7 @@ async fn main() {
         Command::Lint(args) => lint(&args),
         Command::Validate(args) => validate(&args),
         Command::Logs(args) => logs(args).await,
-        Command::Restart(args) => restart(args).await,
+        Command::Rerun(args) => rerun(args).await,
     };
     std::process::exit(code);
 }
@@ -261,10 +261,10 @@ async fn logs(args: LogsArgs) -> i32 {
     }
 }
 
-/// `scarab restart <run> <step>`: re-arm a step + its dependents (ADR-0027).
-async fn restart(args: RestartArgs) -> i32 {
+/// `scarab rerun <run> <step>`: re-arm a step + its dependents (ADR-0027).
+async fn rerun(args: RerunArgs) -> i32 {
     let base = args.server.trim_end_matches('/');
-    let url = format!("{base}/v1/runs/{}/steps/{}/restart", args.run, args.step);
+    let url = format!("{base}/v1/runs/{}/steps/{}/rerun", args.run, args.step);
     let client = reqwest::Client::new();
     let resp = match with_auth(client.post(&url), &args.token).send().await {
         Ok(r) => r,
@@ -274,11 +274,11 @@ async fn restart(args: RestartArgs) -> i32 {
         }
     };
     if resp.status().is_success() {
-        println!("restart accepted: {}/{}", args.run, args.step);
+        println!("rerun accepted: {}/{}", args.run, args.step);
         0
     } else {
         eprintln!(
-            "restart failed ({}): {}",
+            "rerun failed ({}): {}",
             resp.status().as_u16(),
             resp.text().await.unwrap_or_default().trim()
         );

@@ -263,10 +263,10 @@ async fn scoped_writes_respect_role_and_tenant() {
         .unwrap();
     let amy = login(&h.app, "amy-code").await;
 
-    let restart = |run: &str, session: &str| {
+    let rerun = |run: &str, session: &str| {
         Request::builder()
             .method("POST")
-            .uri(format!("/v1/runs/{run}/steps/b/restart"))
+            .uri(format!("/v1/runs/{run}/steps/b/rerun"))
             .header("authorization", format!("Bearer {session}"))
             .body(Body::empty())
             .unwrap()
@@ -275,7 +275,7 @@ async fn scoped_writes_respect_role_and_tenant() {
     let resp = h
         .app
         .clone()
-        .oneshot(restart(&acme_run, &amy))
+        .oneshot(rerun(&acme_run, &amy))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
@@ -283,7 +283,7 @@ async fn scoped_writes_respect_role_and_tenant() {
     let resp = h
         .app
         .clone()
-        .oneshot(restart(&evil_run, &amy))
+        .oneshot(rerun(&evil_run, &amy))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);

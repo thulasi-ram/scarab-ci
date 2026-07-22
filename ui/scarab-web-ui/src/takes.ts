@@ -1,8 +1,8 @@
 // Takes (ADR-0056): the run-level version lens, derived ENTIRELY client-side
 // from the event log — no take is stored anywhere. A Take is the span of a
-// run between two human interventions (`RunRestartRequested` events); Take N's
+// run between two human interventions (`RunRerunRequested` events); Take N's
 // view is a pure replay of the log up to its closing boundary, so a closed
-// Take shows the run exactly as it stood the instant Restart was pressed
+// Take shows the run exactly as it stood the instant Rerun was pressed
 // (snapshot-at-boundary). An attempt that straddles a boundary — started in
 // Take N, finished later — honestly shows as running in Take N, with a
 // "finished in Take M" affordance from `finishedInTake`.
@@ -21,21 +21,21 @@ export type Take = {
   /** Exclusive end index into the event array: the boundary event that CLOSED
    * this take, or events.length for the latest (open) take. */
   endIdx: number;
-  /** The step whose restart closed this take (null for the latest take). */
+  /** The step whose rerun closed this take (null for the latest take). */
   closedByTarget: string | null;
-  /** Who pressed the restart that closed this take (null = unknown/latest). */
+  /** Who pressed the rerun that closed this take (null = unknown/latest). */
   closedBy: string | null;
   /** Timestamp of the closing boundary, or null for the latest take. */
   closedAt: number | null;
 };
 
-/** Split the event log at its `RunRestartRequested` boundaries. Always returns
- * at least one take (the whole log). Take N ends where restart N happens. */
+/** Split the event log at its `RunRerunRequested` boundaries. Always returns
+ * at least one take (the whole log). Take N ends where rerun N happens. */
 export function deriveTakes(events: RunEvent[]): Take[] {
   const takes: Take[] = [];
   events.forEach((e, i) => {
     const k = kindOf(e);
-    if (k?.tag === "RunRestartRequested") {
+    if (k?.tag === "RunRerunRequested") {
       takes.push({
         n: takes.length + 1,
         endIdx: i,
@@ -162,7 +162,7 @@ export type AttemptCause = "initial" | "retry" | "rerun" | "cascade";
  *                  marker, never a new execution).
  * - `superseded` — attempts CUT SHORT while running by a rerun of an ancestor
  *                  (started, never finished, then the step was re-armed by a
- *                  later RunRestartRequested). Distinct from failed/cancelled.
+ *                  later RunRerunRequested). Distinct from failed/cancelled.
  * - `shadowed`   — succeeded attempts that are no longer the of-record latest
  *                  (a newer successful attempt replaced their role). */
 export function attemptCauses(
@@ -183,7 +183,7 @@ export function attemptCauses(
   const finished = new Set<string>(); // ids that got an AttemptFinished
   const succeeded: string[] = []; // ids that finished WITHOUT a failure, in order
 
-  // A restart naming this step arms the NEXT attempt of it — as a `rerun` when
+  // A rerun naming this step arms the NEXT attempt of it — as a `rerun` when
   // this step IS the target, else as a `cascade` (dragged in via invalidated).
   let armedBy: AttemptCause | null = null;
   let seen = 0;
@@ -194,7 +194,7 @@ export function attemptCauses(
     // both re-arm the target + its dependent cascade. The target's next attempt
     // is a `rerun` (fork) or a `retry` (same-Take try); dragged descendants are
     // `cascade`. Either way, an attempt still in flight is cut short → superseded.
-    if (k.tag === "RunRestartRequested" || k.tag === "StepRetryRequested") {
+    if (k.tag === "RunRerunRequested" || k.tag === "StepRetryRequested") {
       const invalidated = (k.v.invalidated as string[]) ?? [];
       const target = k.v.target as string;
       if (target === step) armedBy = k.tag === "StepRetryRequested" ? "retry" : "rerun";

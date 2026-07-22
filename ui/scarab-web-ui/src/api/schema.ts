@@ -735,7 +735,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/runs/{id}/steps/{step}/restart": {
+    "/v1/runs/{id}/steps/{step}/rerun": {
         parameters: {
             query?: never;
             header?: never;
@@ -751,7 +751,7 @@ export interface paths {
          *     as-is. Rejected `409` if the target's dependencies have not all succeeded (it
          *     could not run).
          */
-        post: operations["restart_step"];
+        post: operations["rerun_step"];
         delete?: never;
         options?: never;
         head?: never;
@@ -938,8 +938,10 @@ export interface components {
          */
         AttemptDto: {
             /**
-             * @description `true` if this attempt ended in failure. A later attempt may still have
-             *     succeeded — that divergence is exactly the retry story worth showing.
+             * @description `true` if this attempt ended in a classified failure. A later attempt may
+             *     still have succeeded — that divergence is exactly the retry story worth
+             *     showing. Retained for back-compat; prefer `outcome` for the full picture
+             *     (a `superseded`/`cancelled` attempt is `failed:false` but NOT green).
              */
             failed: boolean;
             /**
@@ -948,6 +950,14 @@ export interface components {
              */
             failure?: string | null;
             id: string;
+            /**
+             * @description The attempt's recorded outcome (ADR-0056 amendment): `running` |
+             *     `succeeded` | `failed` | `superseded` | `cancelled`. Unlike `failed` this
+             *     distinguishes a *superseded* attempt (a rerun/retry replaced its input
+             *     while it was still running and its Pod was torn down) from a genuine
+             *     success — so the UI never renders an abandoned attempt green.
+             */
+            outcome: string;
             /**
              * Format: int64
              * @description When this attempt started (unix-ms).
@@ -2559,7 +2569,7 @@ export interface operations {
             };
         };
     };
-    restart_step: {
+    rerun_step: {
         parameters: {
             query?: never;
             header?: never;

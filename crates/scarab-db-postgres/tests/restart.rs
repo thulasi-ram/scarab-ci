@@ -1,5 +1,5 @@
-//! Restart-a-step acceptance (ADR-0027, 0002): against *real* Postgres with a
-//! *fake* executor, restarting a middle step re-runs that step and its
+//! Rerun-a-step acceptance (ADR-0027, 0002): against *real* Postgres with a
+//! *fake* executor, rerunning a middle step re-runs that step and its
 //! transitive descendants only — siblings and ancestors keep their single
 //! attempt. Skips cleanly when `SCARAB_TEST_DATABASE_URL` is unset.
 
@@ -9,7 +9,7 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    restart_step, AttemptId, Db, EventPayload, RunId, RunStatus, Scheduler, StepId, StepSpec,
+    rerun_step, AttemptId, Db, EventPayload, RunId, RunStatus, Scheduler, StepId, StepSpec,
     StepStatus, Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor};
@@ -61,10 +61,10 @@ fn attempts_of(steps: &[scarab_engine::StepRun], id: &str) -> usize {
         .len()
 }
 
-/// Diamond A -> {B, C} -> D. Run it, then restart B: B and D (its descendant)
+/// Diamond A -> {B, C} -> D. Run it, then rerun B: B and D (its descendant)
 /// re-run; A (ancestor) and C (sibling) do not.
 #[tokio::test]
-async fn restarting_a_middle_step_reruns_only_it_and_descendants() {
+async fn rerunning_a_middle_step_reruns_only_it_and_descendants() {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
@@ -111,10 +111,10 @@ async fn restarting_a_middle_step_reruns_only_it_and_descendants() {
         assert_eq!(attempts_of(&steps, id), 1, "{id} ran once initially");
     }
 
-    // Restart B: re-arms B and its transitive descendant D.
-    restart_step(&db, &clock, &run, &dep("B"), Some("thulasi".into()))
+    // Rerun B: re-arms B and its transitive descendant D.
+    rerun_step(&db, &clock, &run, &dep("B"), Some("thulasi".into()))
         .await
-        .expect("restart");
+        .expect("rerun");
     // The run reopened; B and D are Pending again, A and C still Succeeded.
     assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Running));
 
@@ -124,14 +124,14 @@ async fn restarting_a_middle_step_reruns_only_it_and_descendants() {
     let boundary = events
         .iter()
         .find_map(|e| match &e.kind {
-            EventPayload::RunRestartRequested {
+            EventPayload::RunRerunRequested {
                 target,
                 invalidated,
                 by,
             } => Some((target.clone(), invalidated.clone(), by.clone())),
             _ => None,
         })
-        .expect("a RunRestartRequested event");
+        .expect("a RunRerunRequested event");
     assert_eq!(boundary.0, dep("B"));
     assert_eq!(boundary.1, vec![dep("B"), dep("D")], "target + descendants");
     assert_eq!(boundary.2.as_deref(), Some("thulasi"));
@@ -151,12 +151,12 @@ async fn restarting_a_middle_step_reruns_only_it_and_descendants() {
     tdb.cleanup().await;
 }
 
-/// Diamond A -> {B, C} -> D with recorded outputs. Restart B: because B's
+/// Diamond A -> {B, C} -> D with recorded outputs. Rerun B: because B's
 /// re-run produces an *unchanged* output, D's inputs are unchanged and D is
-/// **skipped** (ADR-0027), not re-run. Then change B's output and restart again:
+/// **skipped** (ADR-0027), not re-run. Then change B's output and rerun again:
 /// now D's inputs differ, so D **cascades** (re-runs).
 #[tokio::test]
-async fn restart_skips_unchanged_descendant_then_cascades_when_output_changes() {
+async fn rerun_skips_unchanged_descendant_then_cascades_when_output_changes() {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
@@ -206,10 +206,10 @@ async fn restart_skips_unchanged_descendant_then_cascades_when_output_changes() 
         assert_eq!(attempts_of(&steps, id), 1, "{id} ran once initially");
     }
 
-    // Restart B — its output is unchanged, so D must be skipped, not re-run.
-    restart_step(&db, &clock, &run, &dep("B"), None)
+    // Rerun B — its output is unchanged, so D must be skipped, not re-run.
+    rerun_step(&db, &clock, &run, &dep("B"), None)
         .await
-        .expect("restart");
+        .expect("rerun");
     drive_to_terminal(&sched, &db, &run).await;
     assert_eq!(
         db.run_status(&run).await.unwrap(),
@@ -233,11 +233,11 @@ async fn restart_skips_unchanged_descendant_then_cascades_when_output_changes() 
         "expected a StepSkipped event for D"
     );
 
-    // Now B produces a *different* output; restarting B must cascade to D.
+    // Now B produces a *different* output; rerunning B must cascade to D.
     exec.set_output("B", "ob2");
-    restart_step(&db, &clock, &run, &dep("B"), None)
+    rerun_step(&db, &clock, &run, &dep("B"), None)
         .await
-        .expect("restart 2");
+        .expect("rerun 2");
     drive_to_terminal(&sched, &db, &run).await;
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(attempts_of(&steps, "B"), 3, "target B re-ran again");
@@ -285,12 +285,12 @@ async fn restart_skips_unchanged_descendant_then_cascades_when_output_changes() 
     tdb.cleanup().await;
 }
 
-/// Explicit `inputs:` sharpen restart invalidation (ADR-0007, 0027). B and C
-/// both feed D and E; D declares `inputs: [B]` while E inherits both. Restart C
+/// Explicit `inputs:` sharpen rerun invalidation (ADR-0007, 0027). B and C
+/// both feed D and E; D declares `inputs: [B]` while E inherits both. Rerun C
 /// producing a *changed* output: E cascades (it consumes C) but D is skipped
 /// (it consumes only B, which is unchanged).
 #[tokio::test]
-async fn explicit_inputs_scope_restart_invalidation() {
+async fn explicit_inputs_scope_rerun_invalidation() {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
@@ -345,11 +345,11 @@ async fn explicit_inputs_scope_restart_invalidation() {
         Some(RunStatus::Succeeded)
     );
 
-    // C now produces a *different* output; restart it.
+    // C now produces a *different* output; rerun it.
     exec.set_output("C", "oc2");
-    restart_step(&db, &clock, &run, &dep("C"), None)
+    rerun_step(&db, &clock, &run, &dep("C"), None)
         .await
-        .expect("restart");
+        .expect("rerun");
     drive_to_terminal(&sched, &db, &run).await;
 
     let steps = db.steps_of_run(&run).await.unwrap();
@@ -364,9 +364,9 @@ async fn explicit_inputs_scope_restart_invalidation() {
     tdb.cleanup().await;
 }
 
-/// Restarting an unknown step is an error, not a silent no-op.
+/// Rerunning an unknown step is an error, not a silent no-op.
 #[tokio::test]
-async fn restarting_unknown_step_errors() {
+async fn rerunning_unknown_step_errors() {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
@@ -381,7 +381,7 @@ async fn restarting_unknown_step_errors() {
         .unwrap();
 
     let clock = FakeClock::new(1_000);
-    assert!(restart_step(&db, &clock, &run, &dep("ghost"), None)
+    assert!(rerun_step(&db, &clock, &run, &dep("ghost"), None)
         .await
         .is_err());
 

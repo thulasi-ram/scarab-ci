@@ -3,7 +3,7 @@
 //! fakes (no Postgres, no cluster), proving the engine behavior end to end.
 
 use scarab_engine::{
-    restart_step, Db, RunId, RunStatus, Scheduler, ServiceStatus, StepId, StepSpec, StepStatus,
+    rerun_step, Db, RunId, RunStatus, Scheduler, ServiceStatus, StepId, StepSpec, StepStatus,
     Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
@@ -214,7 +214,7 @@ async fn rerun_provisions_fresh_take_and_tears_down_the_prior() {
     let exec = FakeExecutor::new();
 
     // The human reruns `test` — a Take boundary → a fresh service generation.
-    restart_step(&db, &clock, &run, &StepId("test".into()), Some("alice".into()))
+    rerun_step(&db, &clock, &run, &StepId("test".into()), Some("alice".into()))
         .await
         .unwrap();
     let rows = db.run_services(&run).await.unwrap();

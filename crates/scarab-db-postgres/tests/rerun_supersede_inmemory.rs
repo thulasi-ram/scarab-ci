@@ -1,12 +1,12 @@
 //! ADR-0056 amendment — a Rerun of a succeeded step tears down the Pod of any
 //! in-flight descendant it supersedes. Driven over the in-memory store so it
-//! runs without Postgres. Proves the orphan gap is closed: `restart_step`
+//! runs without Postgres. Proves the orphan gap is closed: `rerun_step`
 //! re-arms the running descendant AND enqueues a scoped teardown, and
 //! `reconcile_supersessions` (which owns the executor) cancels exactly that
 //! descendant's Pod — while the run itself stays alive.
 
 use scarab_engine::{
-    restart_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db, EventPayload, RestartError,
+    rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db, EventPayload, RestartError,
     RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, SupersedeTeardown, Timestamp,
     SUPERSEDE_TEARDOWN,
 };
@@ -79,9 +79,9 @@ async fn rerun_supersedes_in_flight_descendant_pod() {
 
     // The human reruns b.
     let clock = FakeClock::new(1_000);
-    restart_step(&db, &clock, &run, &b, Some("alice".into()))
+    rerun_step(&db, &clock, &run, &b, Some("alice".into()))
         .await
-        .expect("restart_step");
+        .expect("rerun_step");
 
     // c was re-armed (its old attempt superseded); b too.
     let steps = db.steps_of_run(&run).await.unwrap();
@@ -155,9 +155,9 @@ async fn rerun_without_in_flight_descendant_tears_down_nothing() {
     db.seed_run(&run, RunStatus::Succeeded);
 
     let clock = FakeClock::new(1_000);
-    restart_step(&db, &clock, &run, &b, Some("alice".into()))
+    rerun_step(&db, &clock, &run, &b, Some("alice".into()))
         .await
-        .expect("restart_step");
+        .expect("rerun_step");
 
     let exec = FakeExecutor::new();
     let sched = Scheduler::new(&db, &clock, &exec, "drv");
@@ -193,7 +193,7 @@ async fn rerun_rejects_target_with_unsatisfied_dependency() {
     db.seed_run(&run, RunStatus::Failed);
 
     let clock = FakeClock::new(1_000);
-    let err = restart_step(&db, &clock, &run, &c, Some("alice".into()))
+    let err = rerun_step(&db, &clock, &run, &c, Some("alice".into()))
         .await
         .expect_err("rerun of c must be rejected — b has not succeeded");
     match err {
@@ -209,7 +209,7 @@ async fn rerun_rejects_target_with_unsatisfied_dependency() {
             .await
             .unwrap()
             .iter()
-            .any(|e| matches!(e.kind, EventPayload::RunRestartRequested { .. })),
+            .any(|e| matches!(e.kind, EventPayload::RunRerunRequested { .. })),
         "a rejected rerun must not fork a Take"
     );
 }
@@ -239,7 +239,7 @@ async fn rerun_allowed_when_dependency_was_skipped() {
     db.seed_run(&run, RunStatus::Succeeded);
 
     let clock = FakeClock::new(1_000);
-    restart_step(&db, &clock, &run, &x, Some("alice".into()))
+    rerun_step(&db, &clock, &run, &x, Some("alice".into()))
         .await
         .expect("rerun of x is allowed — its dependency was skipped, not failed");
     assert!(
@@ -247,7 +247,7 @@ async fn rerun_allowed_when_dependency_was_skipped() {
             .await
             .unwrap()
             .iter()
-            .any(|e| matches!(e.kind, EventPayload::RunRestartRequested { .. })),
+            .any(|e| matches!(e.kind, EventPayload::RunRerunRequested { .. })),
         "the rerun forked a Take"
     );
 }
@@ -276,7 +276,7 @@ async fn retry_rejects_non_failed_step() {
 
 /// A Retry of a Failed step re-arms it and its dependent cascade **in the current
 /// Take**: it emits `StepRetryRequested` (an attribution fact), NOT the
-/// Take-boundary `RunRestartRequested`, and reopens the settled run.
+/// Take-boundary `RunRerunRequested`, and reopens the settled run.
 #[tokio::test]
 async fn retry_reruns_in_take_without_forking() {
     let db = InMemoryDb::new();
@@ -322,7 +322,7 @@ async fn retry_reruns_in_take_without_forking() {
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e.kind, EventPayload::RunRestartRequested { .. })),
+            .any(|e| matches!(e.kind, EventPayload::RunRerunRequested { .. })),
         "a Retry must NOT fork a Take"
     );
 }
@@ -361,9 +361,9 @@ async fn rerun_captures_descendant_that_raced_into_running() {
     db.arm_toctou_race(&c, &a1);
 
     let clock = FakeClock::new(1_000);
-    restart_step(&db, &clock, &run, &b, Some("alice".into()))
+    rerun_step(&db, &clock, &run, &b, Some("alice".into()))
         .await
-        .expect("restart_step");
+        .expect("rerun_step");
 
     // Despite the race, c ends Pending — re-armed from its ACTUAL Running status.
     let steps = db.steps_of_run(&run).await.unwrap();
@@ -464,10 +464,10 @@ async fn same_tick_supersessions_get_distinct_outbox_keys() {
     // Never advance the clock: both reruns land in the SAME tick — the exact
     // condition that collided the old key.
     let clock = FakeClock::new(1_000);
-    restart_step(&db, &clock, &run, &b, Some("alice".into()))
+    rerun_step(&db, &clock, &run, &b, Some("alice".into()))
         .await
         .expect("rerun b");
-    restart_step(&db, &clock, &run, &x, Some("alice".into()))
+    rerun_step(&db, &clock, &run, &x, Some("alice".into()))
         .await
         .expect("rerun x");
 

@@ -279,8 +279,10 @@ async fn get_run_exposes_step_needs_for_the_dag() {
 /// Full-route OpenAPI coverage (ADR-0054): every route registered on the
 /// router appears in the generated spec (and vice versa), so the committed
 /// openapi.json — which CI diffs against — can never silently under-describe
-/// the API. Parses the router source; `/openapi.json` (the spec serving
-/// itself) is the one exemption.
+/// the API. Parses the router source. Two exemptions: `/openapi.json` (the
+/// spec serving itself) and the deprecated `.../steps/{step}/restart` alias —
+/// the pre-rename name for `.../rerun` (2026-07-23), kept live for old callers
+/// but intentionally off the documented surface.
 #[test]
 fn every_registered_route_is_in_the_openapi_spec() {
     let src = include_str!("../src/lib.rs");
@@ -289,6 +291,7 @@ fn every_registered_route_is_in_the_openapi_spec() {
         .captures_iter(src)
         .map(|c| c[1].replace("{*name}", "{name}"))
         .filter(|r| r != "/openapi.json")
+        .filter(|r| r != "/v1/runs/{id}/steps/{step}/restart")
         .collect();
     routes.sort();
     routes.dedup();

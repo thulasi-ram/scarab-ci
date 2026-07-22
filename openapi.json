@@ -1166,11 +1166,11 @@
         }
       }
     },
-    "/v1/runs/{id}/steps/{step}/restart": {
+    "/v1/runs/{id}/steps/{step}/rerun": {
       "post": {
         "tags": [],
         "summary": "Rerun a step and its transitive descendants (ADR-0027 smart invalidation) —\n**forks a new Take** (ADR-0056). The target and every step depending on it are\nre-armed and re-run in dependency order; siblings and ancestors are left\nas-is. Rejected `409` if the target's dependencies have not all succeeded (it\ncould not run).",
-        "operationId": "restart_step",
+        "operationId": "rerun_step",
         "parameters": [
           {
             "name": "id",

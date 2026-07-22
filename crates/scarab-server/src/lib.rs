@@ -1767,7 +1767,7 @@ async fn get_service_logs(
 /// unknown step; `409` when the request conflicts with the step's state (ADR-0056
 /// amendment: rerunning a step whose dependency has not succeeded, or retrying a
 /// non-failed step).
-fn restart_outcome(res: Result<(), RestartError>) -> Result<StatusCode, ApiError> {
+fn rerun_outcome(res: Result<(), RestartError>) -> Result<StatusCode, ApiError> {
     match res {
         Ok(()) => Ok(StatusCode::ACCEPTED),
         Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
@@ -1786,7 +1786,7 @@ fn restart_outcome(res: Result<(), RestartError>) -> Result<StatusCode, ApiError
 /// could not run).
 #[utoipa::path(
     post,
-    path = "/v1/runs/{id}/steps/{step}/restart",
+    path = "/v1/runs/{id}/steps/{step}/rerun",
     params(
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "step id")
@@ -1797,7 +1797,7 @@ fn restart_outcome(res: Result<(), RestartError>) -> Result<StatusCode, ApiError
         (status = 409, description = "target's dependencies have not succeeded")
     )
 )]
-async fn restart_step(
+async fn rerun_step(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
@@ -1808,8 +1808,8 @@ async fn restart_step(
     // event it emits carries WHO pressed it — the same attribution pattern as
     // gate approval.
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    restart_outcome(
-        scarab_engine::restart_step(
+    rerun_outcome(
+        scarab_engine::rerun_step(
             &*st.db,
             &*st.clock,
             &run,
@@ -1844,7 +1844,7 @@ async fn retry_step(
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    restart_outcome(
+    rerun_outcome(
         scarab_engine::retry_step(
             &*st.db,
             &*st.clock,
@@ -5408,7 +5408,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         get_service_logs,
         attach_step,
         debug_pod_step,
-        restart_step,
+        rerun_step,
         retry_step,
         cancel_run,
         list_artifacts,
@@ -5496,7 +5496,10 @@ fn router_inner(state: AppState) -> Router {
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/events", get(get_events))
         .route("/v1/runs/{id}/logs", get(get_logs))
-        .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
+        .route("/v1/runs/{id}/steps/{step}/rerun", post(rerun_step))
+        // Deprecated alias for pre-rename callers (restart→rerun, 2026-07-23):
+        // same handler, intentionally NOT in the OpenAPI surface.
+        .route("/v1/runs/{id}/steps/{step}/restart", post(rerun_step))
         .route("/v1/runs/{id}/steps/{step}/retry", post(retry_step))
         .route("/v1/runs/{id}/cancel", post(cancel_run))
         .route("/v1/runs/{id}/artifacts", get(list_artifacts))

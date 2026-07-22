@@ -13,7 +13,7 @@ import { A, useParams, useNavigate } from "@solidjs/router";
 import {
   getRun,
   fetchEvents,
-  restartStep,
+  rerunStep,
   retryStep,
   cancelRun,
   isTerminal,
@@ -63,7 +63,7 @@ export default function RunDetail() {
   const [live, setLive] = createSignal(true);
   const [sel, setSel] = createSignal<string | null>(null);
   const [selAttempt, setSelAttempt] = createSignal<string | null>(null);
-  const [restarting, setRestarting] = createSignal<string | null>(null);
+  const [rerunning, setRerunning] = createSignal<string | null>(null);
   const [retrying, setRetrying] = createSignal<string | null>(null);
   const [cancelling, setCancelling] = createSignal(false);
   const [shellOpen, setShellOpen] = createSignal(false);
@@ -87,7 +87,7 @@ export default function RunDetail() {
   };
   const timeTraveling = () => viewing() !== null;
   // Snapshot-at-boundary: a closed Take's view is a pure replay of the log up
-  // to the restart press that closed it.
+  // to the rerun press that closed it.
   const takeView = (): TakeView | null => {
     const t = viewing();
     return t ? replayTake(events(), takes(), t) : null;
@@ -290,15 +290,15 @@ export default function RunDetail() {
     setSelAttempt(null);
   });
 
-  async function onRestart(step: string) {
-    setRestarting(step);
+  async function onRerun(step: string) {
+    setRerunning(step);
     try {
-      await restartStep(id(), step);
+      await rerunStep(id(), step);
       setLive(true);
       await refresh();
       if (!poll && live()) poll = setInterval(() => void refresh(), POLL_MS);
     } finally {
-      setRestarting(null);
+      setRerunning(null);
     }
   }
 
@@ -426,7 +426,7 @@ export default function RunDetail() {
                 <button
                   class="btn btn-ghost btn-sm"
                   onClick={() => sel() && onRetry(sel()!)}
-                  disabled={retrying() !== null || restarting() !== null || !!prereqBlocker(sel())}
+                  disabled={retrying() !== null || rerunning() !== null || !!prereqBlocker(sel())}
                   title={
                     prereqBlocker(sel())
                       ? `blocked — prerequisite ${prereqBlocker(sel())} failed; retry that first`
@@ -438,9 +438,9 @@ export default function RunDetail() {
               </Show>
               <button
                 class="btn btn-ghost btn-sm"
-                onClick={() => sel() && onRestart(sel()!)}
+                onClick={() => sel() && onRerun(sel()!)}
                 disabled={
-                  restarting() !== null ||
+                  rerunning() !== null ||
                   retrying() !== null ||
                   !sel() ||
                   timeTraveling() ||
@@ -457,7 +457,7 @@ export default function RunDetail() {
                 }
               >
                 <Icon icon="rotate-ccw" size={13} />{" "}
-                {restarting() ? "rerunning…" : "Rerun pipeline from this step"}
+                {rerunning() ? "rerunning…" : "Rerun pipeline from this step"}
               </button>
               <button
                 class="btn btn-ghost btn-sm"

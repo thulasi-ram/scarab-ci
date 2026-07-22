@@ -22,7 +22,7 @@ pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor, LogChunks};
 pub use scheduler::{
-    cancel_run_request, record_gate_approval, release_gate, restart_step, retry_step, RestartError,
+    cancel_run_request, record_gate_approval, release_gate, rerun_step, retry_step, RestartError,
     Scheduler, SchedulerError, SupersedeTeardown, SupersededAttempt, Supervision, CANCEL_RUN,
     LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, SUPERSEDE_TEARDOWN, RUN_STATUS_CHANGED,
 };
@@ -742,13 +742,19 @@ pub enum EventPayload {
     GateExpired {
         step: StepId,
     },
-    /// A human requested a step restart (ADR-0056) — the **Take boundary**.
+    /// A human requested a step rerun (ADR-0056) — the **Take boundary**.
     /// Emitted before any re-arming, so a Take view is a pure replay up to
     /// this event. `invalidated` is the resolved invalidation set (target +
     /// transitive descendants) recorded at press time — deterministic record,
     /// not re-derivation; `by` is the acting principal's subject (the
-    /// who-restarted-this audit fact, `None` only when auth is off).
-    RunRestartRequested {
+    /// who-reran-this audit fact, `None` only when auth is off).
+    ///
+    /// Serialized tag is `RunRerunRequested`; the `RunRestartRequested` alias
+    /// keeps events persisted before the restart→rerun rename (2026-07-23)
+    /// deserializable — zero-migration, since the DB read path is pure serde
+    /// and nothing keys SQL on the tag string.
+    #[serde(rename = "RunRerunRequested", alias = "RunRestartRequested")]
+    RunRerunRequested {
         target: StepId,
         invalidated: Vec<StepId>,
         by: Option<String>,
@@ -757,7 +763,7 @@ pub enum EventPayload {
     /// attribution/audit fact, **NOT a Take boundary**. A Retry re-executes the
     /// target (and its dependent cascade) as fresh Attempts *within the current
     /// Take* — `deriveTakes` deliberately ignores this event, so only
-    /// `RunRestartRequested` splits Takes. `invalidated` is the resolved cascade
+    /// `RunRerunRequested` splits Takes. `invalidated` is the resolved cascade
     /// (target + transitive descendants); `by` is the acting principal.
     StepRetryRequested {
         target: StepId,
@@ -1212,7 +1218,7 @@ mod tests {
         let ba = input_signature(&[StepId("b".into()), StepId("a".into())], &outputs);
         assert_eq!(ab, ba);
 
-        // A changed upstream output changes the signature (→ cascade on restart).
+        // A changed upstream output changes the signature (→ cascade on rerun).
         let changed = HashMap::from([
             (StepId("a".into()), "hash-a2".to_string()),
             (StepId("b".into()), "hash-b".to_string()),
@@ -1231,7 +1237,7 @@ mod tests {
         );
     }
 
-    /// Diamond: A -> {B, C} -> D. Restarting B invalidates B and its descendant
+    /// Diamond: A -> {B, C} -> D. Rerunning B invalidates B and its descendant
     /// D, but not its sibling C nor its ancestor A.
     #[test]
     fn invalidation_set_is_target_plus_transitive_dependents() {
@@ -1252,5 +1258,32 @@ mod tests {
         assert!(invalid.contains(&StepId("D".into())));
         assert!(!invalid.contains(&StepId("A".into())), "ancestor untouched");
         assert!(!invalid.contains(&StepId("C".into())), "sibling untouched");
+    }
+
+    /// Guards the serde alias behind the restart→rerun rename (2026-07-23): an
+    /// event PERSISTED under the old tag `RunRestartRequested` must still
+    /// deserialize into the renamed `RunRerunRequested` variant. The DB read
+    /// path is pure serde and nothing keys SQL on the tag string, so this alias
+    /// is the whole zero-migration contract — do not drop
+    /// `#[serde(alias = "RunRestartRequested")]` without a data migration.
+    #[test]
+    fn legacy_run_restart_requested_tag_deserializes_as_rerun() {
+        let legacy = serde_json::json!({
+            "RunRestartRequested": { "target": "b", "invalidated": ["b"], "by": null }
+        });
+        let payload: EventPayload =
+            serde_json::from_value(legacy).expect("legacy tag deserializes via alias");
+        match payload {
+            EventPayload::RunRerunRequested {
+                target,
+                invalidated,
+                by,
+            } => {
+                assert_eq!(target, StepId("b".into()));
+                assert_eq!(invalidated, vec![StepId("b".into())]);
+                assert_eq!(by, None);
+            }
+            other => panic!("expected RunRerunRequested, got {other:?}"),
+        }
     }
 }

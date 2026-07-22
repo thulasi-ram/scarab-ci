@@ -10,7 +10,7 @@
 
 use scarab_engine::ports::{ExecState, FailureClass};
 use scarab_engine::{
-    restart_step, Clock, Db, EventKind, EventPayload, Executor, RunId, RunStatus, Scheduler,
+    rerun_step, Clock, Db, EventKind, EventPayload, Executor, RunId, RunStatus, Scheduler,
     StepId, StepSpec, StepStatus, Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
@@ -443,7 +443,7 @@ async fn rerun_after_failure_does_not_bill_idle_time_to_the_budget() {
 
     // It then sits Failed for 10 hours awaiting a human Rerun — idle, not active.
     clock.advance(10 * 3_600_000);
-    restart_step(&db, &clock, &run_id(), &step, Some("alice".into()))
+    rerun_step(&db, &clock, &run_id(), &step, Some("alice".into()))
         .await
         .unwrap();
 
@@ -548,7 +548,7 @@ async fn budget_is_per_take_a_rerun_starts_a_fresh_ceiling() {
     );
 
     // Rerun opens Take 2 — the prior Take's 61s must NOT carry over.
-    restart_step(&db, &clock, &run_id(), &step, Some("alice".into()))
+    rerun_step(&db, &clock, &run_id(), &step, Some("alice".into()))
         .await
         .unwrap();
     tick(&db, &clock, &exec).await; // reopened; a fresh attempt launches

@@ -7,7 +7,7 @@
 //!      concurrently, D last.
 //!   3. Content-addressed workspace flows A → B/C → D; D sees both B's and C's
 //!      outputs.
-//!   4. Restart C: C and its descendant D re-run; its sibling B does not.
+//!   4. Rerun C: C and its descendant D re-run; its sibling B does not.
 //!
 //! The live-kind variant (real Pods doing the workspace I/O via the dev harness)
 //! is `#[ignore]`-gated at the bottom. Skips cleanly when
@@ -21,7 +21,7 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    restart_step, AttemptId, Db, RunId, RunStatus, Scheduler, StepId, StepStatus, Timestamp,
+    rerun_step, AttemptId, Db, RunId, RunStatus, Scheduler, StepId, StepStatus, Timestamp,
 };
 use scarab_storage::Cas;
 use scarab_storage_s3::S3Storage;
@@ -112,10 +112,10 @@ fn attempts_of(steps: &[scarab_engine::StepRun], id: &str) -> usize {
         .len()
 }
 
-/// Compile → admit-in-order (B and C concurrent, D last) → restart C cascades to
+/// Compile → admit-in-order (B and C concurrent, D last) → rerun C cascades to
 /// D only, leaving B.
 #[tokio::test]
-async fn diamond_compiles_admits_concurrently_and_restart_cascades() {
+async fn diamond_compiles_admits_concurrently_and_rerun_cascades() {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
@@ -170,15 +170,15 @@ async fn diamond_compiles_admits_concurrently_and_restart_cascades() {
         assert_eq!(attempts_of(&steps, id), 1, "{id} ran once");
     }
 
-    // Restart C: C and its descendant D re-run; sibling B and ancestor A do not.
-    restart_step(&db, &clock, &run, &StepId("C".into()), None)
+    // Rerun C: C and its descendant D re-run; sibling B and ancestor A do not.
+    rerun_step(&db, &clock, &run, &StepId("C".into()), None)
         .await
-        .expect("restart C");
+        .expect("rerun C");
     drive_to_terminal(&sched, &db, &run).await;
     let steps = db.steps_of_run(&run).await.unwrap();
     assert_eq!(attempts_of(&steps, "A"), 1, "ancestor A not re-run");
     assert_eq!(attempts_of(&steps, "B"), 1, "sibling B not re-run");
-    assert_eq!(attempts_of(&steps, "C"), 2, "restarted C re-ran");
+    assert_eq!(attempts_of(&steps, "C"), 2, "reran C re-ran");
     assert_eq!(attempts_of(&steps, "D"), 2, "descendant D re-ran");
 
     tdb.cleanup().await;

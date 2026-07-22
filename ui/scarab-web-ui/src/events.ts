@@ -25,8 +25,8 @@ export function describeEvent(e: RunEvent): string {
       return `${s(v.step)} — gate released`;
     case "StepSkipped":
       return `${s(v.step)} — skipped (${s(v.reason)})`;
-    case "RunRestartRequested":
-      return `${s(v.target)} restarted${v.by ? ` by ${s(v.by)}` : ""} — new take`;
+    case "RunRerunRequested":
+      return `${s(v.target)} reran${v.by ? ` by ${s(v.by)}` : ""} — new version`;
     case "StepRetryRequested":
       return `${s(v.target)} retried${v.by ? ` by ${s(v.by)}` : ""} — same version`;
     case "AttemptReadopted":
@@ -66,7 +66,7 @@ export function eventParts(e: RunEvent): { step: string | null; text: string } {
 
 /** The activity-rail category for an event — drives its glyph and colour. `err`
  * covers a failed attempt (the retry story) and a run/step that ended failed.
- * `take` is a human restart — the Take boundary (ADR-0056); `recover` is a
+ * `take` is a human rerun — the Take boundary (ADR-0056); `recover` is a
  * control-plane crash re-adoption — durability made visible. */
 export type EventCat = "info" | "ok" | "run" | "err" | "gate" | "take" | "recover";
 
@@ -92,7 +92,7 @@ export function eventCategory(e: RunEvent): EventCat {
       return v.failure ? "err" : "ok";
     case "GateReleased":
       return "gate";
-    case "RunRestartRequested":
+    case "RunRerunRequested":
       return "take";
     case "StepRetryRequested":
       // A human "again", but NOT a Take boundary — a re-execution trigger.

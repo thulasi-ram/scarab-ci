@@ -66,7 +66,7 @@ pub const RUN_STATUS_CHANGED: &str = "run_status_changed";
 pub const CANCEL_RUN: &str = "cancel_run";
 
 /// Outbox message kind: tear down the Pods of in-flight steps a Rerun just
-/// superseded (ADR-0056 amendment). [`restart_step`] re-arms an in-flight
+/// superseded (ADR-0056 amendment). [`rerun_step`] re-arms an in-flight
 /// descendant Running→Pending; its old attempt is now *superseded*, and its
 /// input is being replaced, so it can never honestly finish — without this its
 /// Pod runs on as an orphan (fencing keeps the late verdict harmless, but the
@@ -131,7 +131,7 @@ pub enum RestartError {
     NotFailed { step: StepId, status: StepStatus },
 }
 
-/// Restart a step (ADR-0027): re-arm `target` and every step that transitively
+/// Rerun a step (ADR-0027): re-arm `target` and every step that transitively
 /// depends on it back to `Pending`, then reopen a settled run. A subsequent
 /// admission mints a fresh [`Attempt`] for each re-armed step and re-runs them
 /// in dependency order; siblings and ancestors are left untouched (smart
@@ -140,12 +140,12 @@ pub enum RestartError {
 /// Needs only the [`Db`] and [`Clock`] ports (no executor), so the API role can
 /// call it directly without an execution backend.
 ///
-/// Content-addressed *skip*-if-unchanged (skip a descendant when the restarted
+/// Content-addressed *skip*-if-unchanged (skip a descendant when the rerun
 /// step's new output hash equals its old one — ADR-0027's optimization over a
 /// plain cascade) is a fast-follow (TODO(slice-2)); the per-step output-snapshot
 /// substrate it needs is already in place. The re-armed descendants therefore
 /// re-run (the safe cascade branch) until that lands.
-pub async fn restart_step(
+pub async fn rerun_step(
     db: &dyn Db,
     clock: &dyn Clock,
     run: &RunId,
@@ -180,7 +180,7 @@ pub async fn restart_step(
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
-        kind: EventPayload::RunRestartRequested {
+        kind: EventPayload::RunRerunRequested {
             target: target.clone(),
             invalidated,
             by: by.clone(),
@@ -213,9 +213,9 @@ pub async fn restart_step(
 
 /// Retry a **Failed** step (ADR-0056 amendment 2026-07-22): re-execute it (and
 /// its dependent cascade) as fresh Attempts **within the current Take** — NOT a
-/// Take fork. Unlike [`restart_step`] it emits `StepRetryRequested` (an
+/// Take fork. Unlike [`rerun_step`] it emits `StepRetryRequested` (an
 /// attribution/audit fact `deriveTakes` ignores) rather than the Take-boundary
-/// `RunRestartRequested`, and it does not bump the shared-service generation
+/// `RunRerunRequested`, and it does not bump the shared-service generation
 /// (the Take, and thus its services, is unchanged). Failed steps only — a
 /// non-failed step is *reran* (a fork), not retried.
 pub async fn retry_step(
@@ -285,7 +285,7 @@ fn blocking_dep(step: &StepRun, steps: &[StepRun]) -> Option<StepId> {
 
 /// Re-arm the invalidation set to `Pending` (superseding any in-flight attempt),
 /// reopen a settled run, and clear the target's input signature so it re-runs.
-/// Shared by rerun ([`restart_step`]) and retry ([`retry_step`]); the caller has
+/// Shared by rerun ([`rerun_step`]) and retry ([`retry_step`]); the caller has
 /// already emitted the boundary/attribution event (and, for rerun, bumped the
 /// service generation).
 async fn rearm_invalidation_set(
@@ -867,7 +867,7 @@ impl<'a> Scheduler<'a> {
         // step's launch intent settles this same tick.
         self.reconcile_cancellations().await?;
         // Rerun-superseded in-flight Pods (ADR-0056 amendment): tear down the
-        // orphans left when restart_step re-armed a running descendant.
+        // orphans left when rerun_step re-armed a running descendant.
         self.reconcile_supersessions().await?;
         for run in &runs {
             self.advance(run).await?;
@@ -1829,7 +1829,7 @@ impl<'a> Scheduler<'a> {
     /// waits, queue time, and post-failure idle now all fall outside the summed
     /// `Running` intervals, so none of them bill.
     ///
-    /// The budget is **per-Take**: a Rerun (`RunRestartRequested`) opens a new
+    /// The budget is **per-Take**: a Rerun (`RunRerunRequested`) opens a new
     /// Take, and active time from prior Takes does not carry over. Auto-retries
     /// *within* a Take still accumulate (bounding total active time is the whole
     /// point), but a human Rerun grants a fresh ceiling — otherwise a run that
@@ -1845,7 +1845,7 @@ impl<'a> Scheduler<'a> {
         let events = self.db.events(run).await?;
         // Sum the `Running` intervals of the current Take. Every entry into
         // `Running` opens an interval; the next transition out of it closes it.
-        // A `RunRestartRequested` (Take boundary) resets the accumulator, so
+        // A `RunRerunRequested` (Take boundary) resets the accumulator, so
         // only the latest Take's active time is billed. The run is `Running`
         // now, so the final interval is still open — close it at `now`.
         let now = self.clock.now().await;
@@ -1853,7 +1853,7 @@ impl<'a> Scheduler<'a> {
         let mut entered_running: Option<i64> = None;
         for e in &events {
             match &e.kind {
-                EventPayload::RunRestartRequested { .. } => {
+                EventPayload::RunRerunRequested { .. } => {
                     active_ms = 0;
                     entered_running = None;
                 }
@@ -2263,7 +2263,7 @@ impl<'a> Scheduler<'a> {
 
     /// The engine's "current Take" for a run's shared services: the max stored
     /// generation, or `1` when none have been born yet (ADR-0058). A Rerun
-    /// advances it by birthing rows at `max + 1` in [`restart_step`].
+    /// advances it by birthing rows at `max + 1` in [`rerun_step`].
     fn current_service_take(rows: &[crate::RunService]) -> i64 {
         rows.iter().map(|r| r.take).max().unwrap_or(1)
     }

@@ -12,7 +12,7 @@ fn openapi_document_has_v1_paths_and_ir_schemas() {
         "/v1/runs/{id}",
         "/v1/runs/{id}/events",
         "/v1/runs/{id}/logs",
-        "/v1/runs/{id}/steps/{step}/restart",
+        "/v1/runs/{id}/steps/{step}/rerun",
         "/v1/runs/{id}/gates/{step}/approve",
     ] {
         assert!(paths.get(p).is_some(), "missing path {p}");

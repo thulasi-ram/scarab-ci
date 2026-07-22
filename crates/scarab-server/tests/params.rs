@@ -5,7 +5,7 @@
 //!     into a launched step, a numeric guard compares numerically (not
 //!     lexicographically), unreferenced params still reach the step as
 //!     `SCARAB_PARAM_*` env, and a re-launched attempt re-derives byte-identical
-//!     interpolation (restart determinism);
+//!     interpolation (rerun determinism);
 //!   * the **supply path** — `POST /v1/runs` resolves supplied params against the
 //!     declared interface, rejecting a missing required param *before* creating a
 //!     run and persisting the resolved blob on a valid one.
@@ -90,7 +90,7 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn params_interpolate_inputs_and_restart_re_derives_identically() {
+async fn params_interpolate_inputs_and_rerun_re_derives_identically() {
     let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
     let clock: Arc<FakeClock> = Arc::new(FakeClock::new(1_000));
     let run = RunId("r1".into());
@@ -117,8 +117,8 @@ async fn params_interpolate_inputs_and_restart_re_derives_identically() {
         sched.tick(&run).await.unwrap();
     }
 
-    // Restart the step (a new Attempt) and drive again.
-    scarab_engine::restart_step(&*db as &dyn Db, &*clock as &dyn Clock, &run, &step, None)
+    // Rerun the step (a new Attempt) and drive again.
+    scarab_engine::rerun_step(&*db as &dyn Db, &*clock as &dyn Clock, &run, &step, None)
         .await
         .unwrap();
     {
@@ -127,7 +127,7 @@ async fn params_interpolate_inputs_and_restart_re_derives_identically() {
     }
 
     let launches = exec.launches.lock().unwrap().clone();
-    assert_eq!(launches.len(), 2, "launched once, then again after restart");
+    assert_eq!(launches.len(), 2, "launched once, then again after rerun");
 
     // `${{ inputs.region }}` interpolated; the numeric guard resolved numerically.
     let (cmd, env) = &launches[0];
@@ -154,7 +154,7 @@ async fn params_interpolate_inputs_and_restart_re_derives_identically() {
         "{env:?}"
     );
 
-    // Restart determinism (ADR-0027): the re-launched attempt re-derives the
+    // Rerun determinism (ADR-0027): the re-launched attempt re-derives the
     // exact same interpolation + env from the frozen params.
     assert_eq!(launches[0], launches[1], "re-launch is byte-identical");
 }

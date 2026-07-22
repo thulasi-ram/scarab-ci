@@ -561,12 +561,12 @@ export async function fetchEvents(id: string): Promise<RunEvent[]> {
   return out;
 }
 
-/** Restart a step and its transitive descendants (`POST …/steps/{step}/restart`). */
-export async function restartStep(id: string, step: string): Promise<void> {
-  const { error } = await api.POST("/v1/runs/{id}/steps/{step}/restart", {
+/** Rerun a step and its transitive descendants (`POST …/steps/{step}/rerun`). */
+export async function rerunStep(id: string, step: string): Promise<void> {
+  const { error } = await api.POST("/v1/runs/{id}/steps/{step}/rerun", {
     params: { path: { id, step } },
   });
-  if (error) throw new Error(`failed to restart ${step}`);
+  if (error) throw new Error(`failed to rerun ${step}`);
 }
 
 /** Retry a FAILED step (ADR-0056 amendment) — another attempt in the CURRENT
