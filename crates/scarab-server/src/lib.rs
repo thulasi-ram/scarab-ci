@@ -743,7 +743,8 @@ pub struct AttemptDto {
     /// `true` if this attempt ended in failure. A later attempt may still have
     /// succeeded — that divergence is exactly the retry story worth showing.
     pub failed: bool,
-    /// Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`.
+    /// Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`
+    /// | `config`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
 }
@@ -756,6 +757,7 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
             scarab_engine::FailureKind::Step => "step",
             scarab_engine::FailureKind::Timeout => "timeout",
             scarab_engine::FailureKind::Lost => "lost",
+            scarab_engine::FailureKind::Config => "config",
         }
         .to_string()
     });

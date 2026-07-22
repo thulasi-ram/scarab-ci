@@ -2572,16 +2572,27 @@ pub fn pod_state(pod: &Pod) -> ExecState {
         // states are terminal-while-Pending: a container `waiting` reason the
         // kubelet can never recover from (bad config, unpullable image), or a
         // scheduler verdict of Unschedulable. Such a Pod stays Pending forever,
-        // hanging the run. Surface it as a *never-started infra* failure
-        // (ADR-0047): the main process never ran, so no side effect is
-        // possible and auto-retry is safe.
-        _ if has_terminal_waiting_reason(pod) || is_unschedulable(pod) => ExecState::Failed {
-            exit_code: None,
-            class: FailureClass::Infra {
-                never_started: true,
-            },
-        },
-        _ => ExecState::Pending,
+        // hanging the run, so surface it now (ADR-0047). The main process never
+        // ran, so no side effect is possible; the class splits by whether the
+        // rejection is permanent (`Config`, fail fast) or possibly transient
+        // (`Infra { never_started }`, bounded auto-retry).
+        _ => {
+            if let Some(class) = terminal_waiting_class(pod) {
+                ExecState::Failed {
+                    exit_code: None,
+                    class,
+                }
+            } else if is_unschedulable(pod) {
+                ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Infra {
+                        never_started: true,
+                    },
+                }
+            } else {
+                ExecState::Pending
+            }
+        }
     }
 }
 
@@ -2700,29 +2711,48 @@ fn is_unschedulable(pod: &Pod) -> bool {
         })
 }
 
-/// True if any container (step or native sidecar) is stuck in a `waiting` state
-/// the kubelet cannot recover from on its own — a container-config error or an
-/// unpullable image. These keep the Pod `Pending` indefinitely, so we treat them
-/// as terminal rather than waiting forever.
-fn has_terminal_waiting_reason(pod: &Pod) -> bool {
-    const TERMINAL: &[&str] = &[
+/// Classify a container (step or native sidecar) stuck in a `waiting` state the
+/// kubelet cannot recover from on its own — these keep the Pod `Pending`
+/// indefinitely, so we treat them as terminal rather than waiting forever.
+/// Returns `None` when no such reason is present (the Pod is legitimately still
+/// scheduling / pulling / initializing).
+///
+/// The split drives retry policy (ADR-0047):
+/// - **Config rejection** (bad securityContext, invalid image name, container-
+///   config error) is permanent — re-running the identical spec can never
+///   succeed — so it is `Config`: fail fast with a developer verdict, no retry.
+/// - **Image-pull** failure can be a transient registry/network blip, so it
+///   stays `Infra { never_started }` (bounded auto-retry). A genuinely absent
+///   image simply exhausts that budget and dead-letters — an operator concern.
+///
+/// A config reason is definitive and wins over a co-occurring pull reason.
+fn terminal_waiting_class(pod: &Pod) -> Option<FailureClass> {
+    const CONFIG: &[&str] = &[
         "CreateContainerConfigError",
         "CreateContainerError",
         "RunContainerError",
         "InvalidImageName",
-        "ErrImagePull",
-        "ImagePullBackOff",
     ];
-    let Some(status) = pod.status.as_ref() else {
-        return false;
-    };
-    status
+    const IMAGE_PULL: &[&str] = &["ErrImagePull", "ImagePullBackOff"];
+    let status = pod.status.as_ref()?;
+    let mut class = None;
+    for reason in status
         .container_statuses
         .iter()
         .flatten()
         .chain(status.init_container_statuses.iter().flatten())
         .filter_map(|c| c.state.as_ref()?.waiting.as_ref()?.reason.as_deref())
-        .any(|reason| TERMINAL.contains(&reason))
+    {
+        if CONFIG.contains(&reason) {
+            return Some(FailureClass::Config);
+        }
+        if IMAGE_PULL.contains(&reason) {
+            class = Some(FailureClass::Infra {
+                never_started: true,
+            });
+        }
+    }
+    class
 }
 
 fn container_exit_code(pod: &Pod) -> Option<i32> {
@@ -4195,17 +4225,30 @@ mod tests {
         };
 
         // Un-recoverable container/image errors surface as a terminal failure so
-        // the run does not hang forever (and the log tail stops retrying).
+        // the run does not hang forever (and the log tail stops retrying). The
+        // class splits by whether re-running the identical spec could ever help.
+
+        // Permanent config/admission rejections: fail fast as a developer
+        // verdict (`Config`), never auto-retried (ADR-0047).
         for reason in [
             "CreateContainerConfigError",
             "CreateContainerError",
             "RunContainerError",
             "InvalidImageName",
-            "ErrImagePull",
-            "ImagePullBackOff",
         ] {
-            // The main process never ran: never-started infra (ADR-0047),
-            // safe to auto-retry.
+            assert_eq!(
+                pod_state(&waiting(reason)),
+                ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Config,
+                },
+                "{reason} is a permanent config rejection"
+            );
+        }
+
+        // Image-pull failures may be a transient registry/network blip: the main
+        // process never ran, so never-started infra — safe to bounded-auto-retry.
+        for reason in ["ErrImagePull", "ImagePullBackOff"] {
             assert_eq!(
                 pod_state(&waiting(reason)),
                 ExecState::Failed {
@@ -4214,7 +4257,7 @@ mod tests {
                         never_started: true
                     },
                 },
-                "{reason} should be terminal"
+                "{reason} is (possibly transient) never-started infra"
             );
         }
 

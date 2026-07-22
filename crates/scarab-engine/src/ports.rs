@@ -39,6 +39,16 @@ pub enum FailureClass {
     /// The step exceeded its deadline (kubelet `DeadlineExceeded`, local
     /// kill-timer). Post-start by definition.
     Timeout,
+    /// The platform rejected the step's **configuration** before the main
+    /// process could run — an invalid securityContext (e.g. a root-defaulting
+    /// image under the non-root baseline, ADR-0039), a malformed image
+    /// reference, a missing mounted secret/config key. Like `Infra {
+    /// never_started: true }` the process never ran (no side effect is
+    /// possible), but unlike it this is **permanent and author-fixable**:
+    /// re-running the identical spec can never succeed. So it fails fast with a
+    /// developer verdict (`Failed`) instead of churning the infra auto-retry
+    /// budget and dead-lettering as an operator problem it is not.
+    Config,
 }
 
 /// Observed state of a launched execution when polled.

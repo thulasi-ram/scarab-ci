@@ -186,6 +186,52 @@ async fn step_and_timeout_verdicts_fail_the_run_not_dead_letter() {
     }
 }
 
+/// Regression (ADR-0047): a permanent config/admission rejection (`Config`)
+/// fails fast — a single attempt, no auto-retry even with `retry:` configured —
+/// and settles the run as `Failed` (the developer signal), NOT `DeadLettered`.
+/// It is the twin of never-started infra (the process never ran) but is
+/// author-fixable, so it must not churn the infra auto-retry budget nor be
+/// mislabeled an operator problem.
+#[tokio::test]
+async fn config_rejection_fails_fast_as_a_developer_verdict() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    // Retries are configured, yet a Config rejection is still not retried.
+    seed_one_step(
+        &db,
+        serde_json::json!({ "id": "s", "image": "img", "retry": { "max": 3 } }),
+    )
+    .await;
+    exec.script_outcome(failed(FailureClass::Config));
+
+    for _ in 0..4 {
+        tick(&db, &clock, &exec).await;
+    }
+
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed),
+        "a config rejection is a developer verdict, not an operator dead-letter"
+    );
+    let steps = db.steps_of_run(&run_id()).await.unwrap();
+    assert_eq!(steps[0].status, StepStatus::Failed);
+    assert_eq!(
+        steps[0].attempts.len(),
+        1,
+        "fail fast: exactly one attempt, no auto-retry despite retry: max 3"
+    );
+    assert!(
+        !events(&db)
+            .await
+            .iter()
+            .any(|e| matches!(e, EventPayload::RunDeadLettered { .. })),
+        "no dead-letter diagnostics for an author-fixable config error"
+    );
+}
+
 #[tokio::test]
 async fn unapproved_gate_expires_at_its_deadline_and_fails_the_run() {
     let (db, clock, exec) = (

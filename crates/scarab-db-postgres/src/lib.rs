@@ -2173,6 +2173,7 @@ fn failure_str(f: FailureKind) -> &'static str {
         FailureKind::Step => "step",
         FailureKind::Timeout => "timeout",
         FailureKind::Lost => "lost",
+        FailureKind::Config => "config",
     }
 }
 
@@ -2187,6 +2188,7 @@ fn failure_from_str(s: &str) -> Result<FailureKind, DbError> {
         "step" => Ok(FailureKind::Step),
         "timeout" => Ok(FailureKind::Timeout),
         "lost" => Ok(FailureKind::Lost),
+        "config" => Ok(FailureKind::Config),
         other => Err(DbError::Other(format!("unknown failure kind {other:?}"))),
     }
 }

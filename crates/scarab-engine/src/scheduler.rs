@@ -1234,6 +1234,7 @@ impl<'a> Scheduler<'a> {
                         }
                         FailureClass::Step => FailureKind::Step,
                         FailureClass::Timeout => FailureKind::Timeout,
+                        FailureClass::Config => FailureKind::Config,
                     };
                     self.settle_failed_attempt(&run, &step, &attempt, kind)
                         .await?;
@@ -1808,6 +1809,10 @@ impl<'a> Scheduler<'a> {
             FailureKind::Infra {
                 never_started: true,
             } => configured.unwrap_or(0).max(NEVER_STARTED_AUTO_ATTEMPTS),
+            // A permanent config/admission rejection can never succeed on a
+            // re-run of the identical spec — fail fast on the first attempt,
+            // ignoring any author `retry:` (ADR-0047).
+            FailureKind::Config => 1,
             _ => configured.unwrap_or(1),
         };
 

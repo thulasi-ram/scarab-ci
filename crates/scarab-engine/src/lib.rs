@@ -186,6 +186,10 @@ impl ConcurrencyPolicy {
 ///   author's `retry:` assertion (ADR-0047, wired by the retry-loop slice).
 /// - `Step` — the user's command exited non-zero; never auto-retried.
 /// - `Timeout` — the step exceeded its deadline; post-start by definition.
+/// - `Config` — the platform rejected the step's spec before it ran (bad
+///   securityContext, invalid image name, missing mounted key): permanent and
+///   author-fixable, so it fails fast as a developer verdict and is never
+///   retried (retrying the identical spec cannot succeed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureKind {
     Infra {
@@ -198,6 +202,11 @@ pub enum FailureKind {
     /// so retry is assertion-gated and **counts against the attempt budget**
     /// (ADR-0047).
     Lost,
+    /// Permanent, author-fixable configuration/admission rejection — see
+    /// [`FailureClass::Config`](crate::ports::FailureClass::Config). Never
+    /// auto-retried; settles the run as `Failed` (developer signal), not
+    /// `DeadLettered`.
+    Config,
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,7 +1024,11 @@ impl StepRun {
         let from = StepStatus::Running;
         let to = match failure {
             None => StepStatus::Succeeded,
-            Some(FailureKind::Step | FailureKind::Timeout) => StepStatus::Failed,
+            // A verdict (Step/Timeout) or a permanent config rejection (Config)
+            // fails the step outright — never auto-retried.
+            Some(FailureKind::Step | FailureKind::Timeout | FailureKind::Config) => {
+                StepStatus::Failed
+            }
             Some(FailureKind::Infra {
                 never_started: true,
             }) => {

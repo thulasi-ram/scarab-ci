@@ -185,7 +185,11 @@ async fn post_start_classes_fail_immediately_without_the_assertion() {
         // the run; a verdict-less post-start infra failure dead-letters it.
         let expected = match class {
             FailureClass::Infra { .. } => RunStatus::DeadLettered,
-            FailureClass::Step | FailureClass::Timeout => RunStatus::Failed,
+            // Config is never-started (not iterated here), but fails fast to a
+            // developer verdict like Step/Timeout.
+            FailureClass::Step | FailureClass::Timeout | FailureClass::Config => {
+                RunStatus::Failed
+            }
         };
         assert_eq!(
             db.run_status(&run_id()).await.unwrap(),
