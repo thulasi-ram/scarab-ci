@@ -115,7 +115,13 @@ steps:
   - id: version
     image: alpine:3.20
     needs: [checkout]
-    command: [sh, -c, "git describe --tags --always > /scarab/results/tag"]
+    # alpine is USER root, so opt into the self-service run-as-root grant (like
+    # lint/test above) — without it the kubelet refuses the container under the
+    # non-root baseline (CreateContainerConfigError). Base alpine ships no git,
+    # so install it before `git describe`.
+    security:
+      run_as_root: true
+    command: [sh, -c, "apk add --no-cache git && git describe --tags --always > /scarab/results/tag"]
 
   # --- build step (ADR-0018): rootless BuildKit image build -----------------
   # + placement_profiles + resources (ADR-0055). The author names no
