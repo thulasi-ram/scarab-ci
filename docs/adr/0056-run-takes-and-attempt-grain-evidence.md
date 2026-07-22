@@ -361,17 +361,19 @@ Rerun from `b`:
 
 ### Naming
 
-Two controls, split by what they fork:
+Only the fork is renamed. The in-place control keeps **Retry** — it is one concept
+with the engine's auto-retry (manual vs auto), and the auto side's `retry:` YAML key
+is authored + persisted, so the name is fixed at "retry":
 
 - **Rerun** — forks a new run **version** (Take). Backend `rerun_step`; event
-  `RunRerunRequested`; error `RerunError`.
-- **Reattempt** — another **Attempt in the same version**, **failed-step-only**.
-  Backend `reattempt_step`; event `StepReattemptRequested`; error `ReattemptError`.
-  **"Retry" is UI microcopy only** — the button label, never a code or event name.
+  `RunRerunRequested` (**serde-aliased** to the prior `RunRestartRequested` —
+  **zero migration**, guarded by a fixture test). `RestartError` stays the shared
+  run-op error (it also serves gate/cancel) — no misleading split.
+- **Retry** — another **Attempt in the same version**, **failed-step-only**; the
+  human trigger of the same concept as auto-retry. **Unchanged:** `retry_step`,
+  event `StepRetryRequested`, the authored `retry:` policy.
 
-Both persisted events are **serde-aliased** to their prior strings
-(`RunRestartRequested` / `StepRetryRequested`) — **zero migration**. New event
-**`AttemptSuperseded { step, attempt, by }`**. New per-Attempt outcome enum
+New event **`AttemptSuperseded { step, attempt, by }`**. New per-Attempt outcome enum
 **`AttemptOutcome { Running, Succeeded, Failed, Superseded, Cancelled }`**, exposed
 **additively** as `outcome` on `AttemptDto` (`shadowed` stays a *flag* on a succeeded
 Attempt, not an outcome — see the 2026-07-20 amendment).
@@ -389,7 +391,7 @@ control is chosen by the **cardinality** of its axis:
   status*, never version or attempt history.
 - **try** is a small ordered set → an **attempts filmstrip** in the evidence-pane
   header: one **outcome-shaped marker** per try, the active one enlarged and labeled.
-  A run of identical auto-reattempts may collapse to a single marker with a count;
+  A run of identical auto-retries may collapse to a single marker with a count;
   the strip scales to any N.
 
 The evidence pane carries a **permanent coordinate stamp** — `step · try · version` —
