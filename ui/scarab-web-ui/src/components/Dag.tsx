@@ -254,7 +254,7 @@ export default function Dag(props: {
                           <span class={`dring ${s.status}`}>
                             <span class="dring-core" />
                           </span>
-                          <span class="dnode-main">
+                          <span class="dnode-main" title={s.id}>
                             <span class="dnode-id">{s.id}</span>
                             <span class="dnode-meta">{meta(s)}</span>
                           </span>
