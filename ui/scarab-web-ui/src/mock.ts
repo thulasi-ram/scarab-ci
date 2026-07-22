@@ -231,7 +231,7 @@ const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"]
 const secretMatrix = {
   environments: ["staging", "production"],
   keys: [
-    { key: "GHCR_TOKEN", status: { staging: "unset", production: "unset" } },
+    { key: "GHCR_TOKEN", status: { staging: "inherited", production: "inherited" } },
     { key: "DATABASE_URL", status: { staging: "set", production: "set" } },
     { key: "SLACK_WEBHOOK_URL", status: { staging: "unset", production: "set" } },
   ],
