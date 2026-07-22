@@ -415,11 +415,13 @@ export default function RunDetail() {
             </div>
 
             <div class="run-toolbar">
-              {/* Two "agains" (ADR-0056 amendment): Retry gives a FAILED step
-                  another attempt in the CURRENT version (no fork); Rerun re-runs
-                  THIS step + downstream as a NEW version. New run mints a whole
-                  new run. While viewing an older version everything that would
-                  mutate this run is disabled; "New run" and debug-pod stay. */}
+              {/* Two "agains" (ADR-0056 amendment): "Retry step" gives a FAILED
+                  step another attempt in the CURRENT version (no fork); "Rerun
+                  pipeline from this step" re-runs this step + everything
+                  downstream as a NEW version. "New run" mints a whole new run.
+                  Both are blocked when a prerequisite failed. While viewing an
+                  older version everything that would mutate this run is disabled;
+                  "New run" and debug-pod stay. */}
               <Show when={selectedStatus() === "failed" && !timeTraveling()}>
                 <button
                   class="btn btn-ghost btn-sm"
@@ -454,7 +456,8 @@ export default function RunDetail() {
                         : `rerun ${sel()} and everything downstream — forks a new version`
                 }
               >
-                <Icon icon="rotate-ccw" size={13} /> {restarting() ? "rerunning…" : "Rerun step"}
+                <Icon icon="rotate-ccw" size={13} />{" "}
+                {restarting() ? "rerunning…" : "Rerun pipeline from this step"}
               </button>
               <button
                 class="btn btn-ghost btn-sm"
