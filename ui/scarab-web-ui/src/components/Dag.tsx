@@ -19,6 +19,9 @@ export type DagStep = {
   status: string;
   /** Attempt count — >1 means it was retried/restarted (the rerun signal). */
   attempts: number;
+  /** Time-travel only: this step was carried forward untouched by the viewed
+   * Take (0 attempts in it) — render muted, "not part of this rerun". */
+  reused?: boolean;
   needs: string[];
   gate?: string | null;
   /** When the current (running) attempt started, epoch-ms — drives live elapsed. */
@@ -244,6 +247,7 @@ export default function Dag(props: {
                         </For>
                         <button
                           class={`dnode ${s.status} ${sel() ? "sel" : ""}`}
+                          classList={{ reused: !!s.reused }}
                           ref={(el) => nodes.set(s.id, el)}
                           onClick={() => props.onSelect(s.id)}
                         >

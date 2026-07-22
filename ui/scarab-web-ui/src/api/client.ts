@@ -569,6 +569,15 @@ export async function restartStep(id: string, step: string): Promise<void> {
   if (error) throw new Error(`failed to restart ${step}`);
 }
 
+/** Retry a FAILED step (ADR-0056 amendment) — another attempt in the CURRENT
+ * Take, no fork. 409 if the step is not failed (rerun it instead). */
+export async function retryStep(id: string, step: string): Promise<void> {
+  const { error } = await api.POST("/v1/runs/{id}/steps/{step}/retry", {
+    params: { path: { id, step } },
+  });
+  if (error) throw new Error(`failed to retry ${step}`);
+}
+
 /** Cancel a run — steps settle Cancelled, Pods tear down (`POST …/cancel`). */
 export async function cancelRun(id: string): Promise<void> {
   const { error } = await api.POST("/v1/runs/{id}/cancel", {

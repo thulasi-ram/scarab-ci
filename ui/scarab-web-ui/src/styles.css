@@ -1002,6 +1002,14 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   border-color: var(--copper);
 }
 
+/* Reused (ADR-0056 amendment): while time-traveling, a step carried forward
+ * untouched by the viewed Take — present and keeping its verdict colour, but
+ * visibly muted so it doesn't read as having re-run in this rerun. */
+.dnode.reused {
+  opacity: 0.5;
+  filter: saturate(0.55);
+}
+
 .dnode-id {
   font-family: var(--font-mono);
   font-size: 12.5px;
@@ -1975,6 +1983,7 @@ h1, .crumb-head, .run-title {
 .dnode.sel { border-color: var(--emerald-bright); box-shadow: inset 0 0 0 1px var(--emerald-bright); }
 .dnode.running { border-color: var(--copper); }
 .dnode.failed { border-color: color-mix(in srgb, var(--danger) 60%, var(--terminal-line)); }
+.dnode.reused { opacity: 0.5; filter: saturate(0.55); }
 
 .dnode-main { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .dnode-id { font-family: var(--font-mono); font-size: 12.5px; color: var(--terminal-ink); font-weight: 500; }

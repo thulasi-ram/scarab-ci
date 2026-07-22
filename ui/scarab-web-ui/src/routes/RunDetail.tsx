@@ -14,6 +14,7 @@ import {
   getRun,
   fetchEvents,
   restartStep,
+  retryStep,
   cancelRun,
   isTerminal,
   runParams,
@@ -63,6 +64,7 @@ export default function RunDetail() {
   const [sel, setSel] = createSignal<string | null>(null);
   const [selAttempt, setSelAttempt] = createSignal<string | null>(null);
   const [restarting, setRestarting] = createSignal<string | null>(null);
+  const [retrying, setRetrying] = createSignal<string | null>(null);
   const [cancelling, setCancelling] = createSignal(false);
   const [shellOpen, setShellOpen] = createSignal(false);
   // The viewed Take (1-based), or null = latest. Only a CLOSED take is a
@@ -138,10 +140,15 @@ export default function RunDetail() {
     const tv = takeView();
     return stepList().map((s) => {
       const t = timing[s.id];
+      // Reused (ADR-0056 amendment): while time-traveling, a step with a known
+      // (carried-forward) status but ZERO attempts in THIS Take wasn't part of
+      // this rerun — render it muted, not as if it re-ran here.
+      const reused = !!tv && !!tv.status[s.id] && (tv.attempts[s.id] ?? 0) === 0;
       return {
         id: s.id,
         status: tv ? (tv.status[s.id] ?? "pending") : s.status,
         attempts: tv ? (tv.attempts[s.id] ?? 0) : s.attempts,
+        reused,
         needs: s.needs ?? [],
         gate: s.gate,
         runningSince:
@@ -162,8 +169,11 @@ export default function RunDetail() {
     const s = selectedStep();
     if (!s) return [];
     const list = s.attempt_list ?? [];
-    const f = sel() ? (takeView()?.frontier[sel()!] ?? null) : null;
-    const visible = f ? list.filter((a) => attemptN(a.id) <= attemptN(f)) : list;
+    // While time-traveling, the tries strip shows only THIS Take's attempts
+    // (per-Take scoping, ADR-0056 amendment 2026-07-22) — a step carried
+    // forward untouched shows none. Live view shows the full history.
+    const win = timeTraveling() && sel() ? (takeView()?.windowAttempts[sel()!] ?? []) : null;
+    const visible = win ? list.filter((a) => win.includes(a.id)) : list;
     const c = attemptCauses(visibleEvents(), s.id);
     return visible.map((a, i) => ({
       id: a.id,
@@ -278,6 +288,20 @@ export default function RunDetail() {
     }
   }
 
+  // Retry (ADR-0056 amendment): another Attempt in the CURRENT Take, no fork.
+  // Failed steps only (the button is gated so; the server also 409s otherwise).
+  async function onRetry(step: string) {
+    setRetrying(step);
+    try {
+      await retryStep(id(), step);
+      setLive(true);
+      await refresh();
+      if (!poll && live()) poll = setInterval(() => void refresh(), POLL_MS);
+    } finally {
+      setRetrying(null);
+    }
+  }
+
   async function onCancel() {
     setCancelling(true);
     try {
@@ -377,16 +401,25 @@ export default function RunDetail() {
             </div>
 
             <div class="run-toolbar">
-              {/* Rerun re-runs THIS step (and everything downstream) in place —
-                  it forks the run into a new history row; New run mints a whole
-                  NEW run. Distinct verbs, distinct icons (ADR-0056 amendment).
-                  While viewing an older version everything that would mutate this
-                  run is disabled; "New run" stays (it touches nothing here) and
-                  debug-pod stays (evidence-only). */}
+              {/* Two "agains" (ADR-0056 amendment): Retry gives a FAILED step
+                  another attempt in the CURRENT version (no fork); Rerun re-runs
+                  THIS step + downstream as a NEW version. New run mints a whole
+                  new run. While viewing an older version everything that would
+                  mutate this run is disabled; "New run" and debug-pod stay. */}
+              <Show when={selectedStatus() === "failed" && !timeTraveling()}>
+                <button
+                  class="btn btn-ghost btn-sm"
+                  onClick={() => sel() && onRetry(sel()!)}
+                  disabled={retrying() !== null || restarting() !== null}
+                  title={`retry ${sel()} — another attempt in this version (no new version)`}
+                >
+                  <Icon icon="rotate-cw" size={13} /> {retrying() ? "retrying…" : "Retry step"}
+                </button>
+              </Show>
               <button
                 class="btn btn-ghost btn-sm"
                 onClick={() => sel() && onRestart(sel()!)}
-                disabled={restarting() !== null || !sel() || timeTraveling()}
+                disabled={restarting() !== null || retrying() !== null || !sel() || timeTraveling()}
                 title={
                   timeTraveling()
                     ? "read-only — back to latest to rerun"

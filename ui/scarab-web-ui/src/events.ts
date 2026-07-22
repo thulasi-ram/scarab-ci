@@ -27,6 +27,8 @@ export function describeEvent(e: RunEvent): string {
       return `${s(v.step)} — skipped (${s(v.reason)})`;
     case "RunRestartRequested":
       return `${s(v.target)} restarted${v.by ? ` by ${s(v.by)}` : ""} — new take`;
+    case "StepRetryRequested":
+      return `${s(v.target)} retried${v.by ? ` by ${s(v.by)}` : ""} — same version`;
     case "AttemptReadopted":
       return `${s(v.step)} — re-adopted after control-plane restart`;
     default:
@@ -92,6 +94,9 @@ export function eventCategory(e: RunEvent): EventCat {
       return "gate";
     case "RunRestartRequested":
       return "take";
+    case "StepRetryRequested":
+      // A human "again", but NOT a Take boundary — a re-execution trigger.
+      return "run";
     case "AttemptReadopted":
       return "recover";
     default:

@@ -56,13 +56,21 @@ export function deriveTakes(events: RunEvent[]): Take[] {
 }
 
 export type TakeView = {
-  /** Per-step status as of the boundary instant (steps absent = never seen). */
+  /** Per-step status as of the boundary instant — replayed cumulatively from
+   * run birth, so a step NOT re-run in this Take keeps its carried-forward
+   * verdict (steps absent = never seen). */
   status: Record<string, string>;
-  /** Per-step latest attempt id as of the boundary — the evidence frontier the
-   * attempt-scoped reads (`?attempt=`) are keyed with. */
+  /** Per-step latest attempt id **within this Take's window** — the evidence
+   * frontier the attempt-scoped reads (`?attempt=`) are keyed with. Absent for a
+   * step not re-armed in this Take. */
   frontier: Record<string, string>;
-  /** Per-step attempt COUNT as of the boundary (drives the ×N retry badge). */
+  /** Per-step attempt COUNT **within this Take's window** (drives the ×N badge).
+   * 0 for a step carried forward untouched (a partial rerun left it alone). */
   attempts: Record<string, number>;
+  /** Per-step attempt ids started **within this Take's window**, in order — the
+   * exact set the tries strip renders (so a carried-forward step shows none,
+   * and a re-run step shows only THIS Take's tries, numbered per-Take). */
+  windowAttempts: Record<string, string[]>;
   /** Steps that were mid-flight at the boundary, mapped to the take number in
    * which their straddling attempt finished (the "finished in Take M →"
    * affordance), or 0 if it never finished. */
@@ -75,21 +83,34 @@ export function replayTake(events: RunEvent[], takes: Take[], take: Take): TakeV
   const status: Record<string, string> = {};
   const frontier: Record<string, string> = {};
   const attempts: Record<string, number> = {};
+  const windowAttempts: Record<string, string[]> = {};
   const inFlight = new Map<string, string>(); // step -> attempt currently running
+
+  // This Take's window opens at the previous Take's closing boundary (0 for
+  // Take 1). Status replays cumulatively from birth (a step untouched by this
+  // Take keeps its carried verdict), but attempts/frontier are scoped to the
+  // window — so the latest Take reads THIS Take's tries, not every Take's summed
+  // (the pre-2026-07-22 bug counted from index 0 for every Take).
+  const startIdx = take.n > 1 ? (takes[take.n - 2]?.endIdx ?? 0) : 0;
 
   for (let i = 0; i < take.endIdx; i++) {
     const k = kindOf(events[i]);
     if (!k) continue;
     const step = (k.v.step as string) ?? null;
+    const inWindow = i >= startIdx;
     switch (k.tag) {
       case "StepTransitioned":
         if (step) status[step] = String(k.v.to ?? "");
         break;
       case "AttemptStarted":
         if (step) {
-          frontier[step] = String(k.v.attempt ?? "");
-          attempts[step] = (attempts[step] ?? 0) + 1;
-          inFlight.set(step, String(k.v.attempt ?? ""));
+          const attempt = String(k.v.attempt ?? "");
+          if (inWindow) {
+            frontier[step] = attempt;
+            attempts[step] = (attempts[step] ?? 0) + 1;
+            (windowAttempts[step] ??= []).push(attempt);
+          }
+          inFlight.set(step, attempt);
           // Admission's ready→running claim is not a logged transition — the
           // attempt start IS the "running" fact; the verdict arrives as a
           // later StepTransitioned.
@@ -120,7 +141,7 @@ export function replayTake(events: RunEvent[], takes: Take[], take: Take): TakeV
     }
   }
 
-  return { status, frontier, attempts, finishedInTake };
+  return { status, frontier, attempts, windowAttempts, finishedInTake };
 }
 
 /** Why one try (Attempt) of a step exists (ADR-0056 amendment):
@@ -169,14 +190,16 @@ export function attemptCauses(
   for (const e of events) {
     const k = kindOf(e);
     if (!k) continue;
-    if (k.tag === "RunRestartRequested") {
+    // A rerun (Take fork) OR a retry (in-Take, ADR-0056 amendment 2026-07-22)
+    // both re-arm the target + its dependent cascade. The target's next attempt
+    // is a `rerun` (fork) or a `retry` (same-Take try); dragged descendants are
+    // `cascade`. Either way, an attempt still in flight is cut short → superseded.
+    if (k.tag === "RunRestartRequested" || k.tag === "StepRetryRequested") {
       const invalidated = (k.v.invalidated as string[]) ?? [];
       const target = k.v.target as string;
-      if (target === step) armedBy = "rerun";
+      if (target === step) armedBy = k.tag === "StepRetryRequested" ? "retry" : "rerun";
       else if (invalidated.includes(step)) armedBy = "cascade";
       else continue;
-      // The rerun re-arms this step: any attempt still in flight at this
-      // boundary is cut short — superseded (never finished, replaced).
       for (const id of started) if (!finished.has(id)) superseded.add(id);
       continue;
     }
