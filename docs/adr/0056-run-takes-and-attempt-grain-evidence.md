@@ -249,18 +249,23 @@ an auto-retry — both are "another try in this version"); its human origin is
 witnessed by the `StepRetryRequested` event in Activity, not by a distinct chip.
 Dependent Attempts it drags along carry `cascade`, as with rerun.
 
-### Rerun validation — reject, don't silently skip (refines ADR-0027)
+### Rerun/retry validation — a FAILED prerequisite blocks (refines ADR-0027)
 
-A rerun whose **target's `needs` are not all `Succeeded`** can never run (admission
-would `dep_dead`-skip it). `restart_step` now **rejects** such a call up front —
-`RestartError::DependencyNotSatisfied { step, blocker }` → **409**, e.g. "cannot
-rerun `c`: dependency `b` has not Succeeded" — instead of forking a Take that
-just re-skips. The gate is purely on **deps**, never the target's own status:
+Both controls reject up front — `RestartError::DependencyNotSatisfied { step,
+blocker }` → **409** — when a **prerequisite is not in a non-failing terminal
+state**. The allowed set is **`{Succeeded, Skipped}`**: a `Succeeded` or
+`Skipped` prerequisite does not block; a **`Failed`** one does (as does a
+Cancelled or not-yet-terminal one). The gate is on the **prerequisites**, never
+the target's own status:
 
-- `c` `Skipped` because dep `b` **Failed** → deps not Succeeded → **reject**.
-- a step `Skipped` by its own `when:` (deps **did** Succeed) → **allowed**; the
-  rerun replays and the still-false condition **skips it again**. Rerun does not
-  concern itself with conditions — it never force-overrides a `when:`.
+- `c` blocked because dep `b` **Failed** → **reject** (the pipeline has a real
+  upstream failure — rerun/retry `b`, not `c`).
+- `x` whose dep `y` was **Skipped** → **allowed**; the rerun replays and — under
+  the all-success join (ADR-0023) — `x` re-skips. A skipped upstream is a
+  resolved, non-failing outcome, so it must not hard-block the control.
+- a step `Skipped` by its own `when:` (its deps **did** Succeed) → **allowed**;
+  the rerun replays and the still-false condition **skips it again**. Rerun
+  never force-overrides a `when:`.
 
 ### Per-Take attempt scoping (fixes the read model, not the engine)
 

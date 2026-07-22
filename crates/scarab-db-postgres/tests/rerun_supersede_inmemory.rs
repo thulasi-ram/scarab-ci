@@ -188,6 +188,44 @@ async fn rerun_rejects_target_with_unsatisfied_dependency() {
     );
 }
 
+/// A prerequisite that was SKIPPED (not failed) does NOT block a rerun — only a
+/// failed prerequisite does (ADR-0056 amendment). Rerunning such a step is
+/// allowed (it forks a Take and re-skips under the all-success join).
+#[tokio::test]
+async fn rerun_allowed_when_dependency_was_skipped() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-skip".into());
+    let (y, x) = (StepId("y".into()), StepId("x".into()));
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &y, Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.create_step_run(&run, &x, Some(&spec()), &[y.clone()], Timestamp(0))
+        .await
+        .unwrap();
+    // y was skipped (e.g. a `when:` guard); x cascade-skipped behind it.
+    db.record_step_transition(&run, &y, StepStatus::Pending, StepStatus::Skipped)
+        .await
+        .unwrap();
+    db.record_step_transition(&run, &x, StepStatus::Pending, StepStatus::Skipped)
+        .await
+        .unwrap();
+    db.seed_run(&run, RunStatus::Succeeded);
+
+    let clock = FakeClock::new(1_000);
+    restart_step(&db, &clock, &run, &x, Some("alice".into()))
+        .await
+        .expect("rerun of x is allowed — its dependency was skipped, not failed");
+    assert!(
+        db.events(&run)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, EventPayload::RunRestartRequested { .. })),
+        "the rerun forked a Take"
+    );
+}
+
 /// Retry is Failed-only: retrying a Succeeded step is rejected (rerun it instead).
 #[tokio::test]
 async fn retry_rejects_non_failed_step() {

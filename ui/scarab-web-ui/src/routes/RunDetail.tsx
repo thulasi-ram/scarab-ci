@@ -107,6 +107,20 @@ export default function RunDetail() {
     return selectedStep()?.status;
   };
   const selectedRunning = () => selectedStatus() === "running" && !timeTraveling();
+  // Rerun/retry are blocked when a prerequisite FAILED (ADR-0056 amendment):
+  // only {succeeded, skipped} prerequisites permit the action. Uses live
+  // statuses (the action targets the latest version).
+  const prereqBlocker = (stepId: string | null): string | null => {
+    if (!stepId) return null;
+    const by = new Map(stepList().map((s) => [s.id, s.status]));
+    const s = stepList().find((x) => x.id === stepId);
+    return (
+      (s?.needs ?? []).find((d) => {
+        const st = by.get(d);
+        return st !== "succeeded" && st !== "skipped";
+      }) ?? null
+    );
+  };
   // A running step attaches to its live Pod; a finished one is reproduced in a
   // fresh debug Pod. Debug-pod is the ONE action allowed while viewing a
   // closed Take (it reproduces immutable evidence and mutates nothing durable).
@@ -410,8 +424,12 @@ export default function RunDetail() {
                 <button
                   class="btn btn-ghost btn-sm"
                   onClick={() => sel() && onRetry(sel()!)}
-                  disabled={retrying() !== null || restarting() !== null}
-                  title={`retry ${sel()} — another attempt in this version (no new version)`}
+                  disabled={retrying() !== null || restarting() !== null || !!prereqBlocker(sel())}
+                  title={
+                    prereqBlocker(sel())
+                      ? `blocked — prerequisite ${prereqBlocker(sel())} failed; retry that first`
+                      : `retry ${sel()} — another attempt in this version (no new version)`
+                  }
                 >
                   <Icon icon="rotate-cw" size={13} /> {retrying() ? "retrying…" : "Retry step"}
                 </button>
@@ -419,13 +437,21 @@ export default function RunDetail() {
               <button
                 class="btn btn-ghost btn-sm"
                 onClick={() => sel() && onRestart(sel()!)}
-                disabled={restarting() !== null || retrying() !== null || !sel() || timeTraveling()}
+                disabled={
+                  restarting() !== null ||
+                  retrying() !== null ||
+                  !sel() ||
+                  timeTraveling() ||
+                  !!prereqBlocker(sel())
+                }
                 title={
                   timeTraveling()
                     ? "read-only — back to latest to rerun"
-                    : sel()
-                      ? `rerun ${sel()} and everything downstream — forks a new version`
-                      : "select a step"
+                    : !sel()
+                      ? "select a step"
+                      : prereqBlocker(sel())
+                        ? `blocked — prerequisite ${prereqBlocker(sel())} failed; rerun that first`
+                        : `rerun ${sel()} and everything downstream — forks a new version`
                 }
               >
                 <Icon icon="rotate-ccw" size={13} /> {restarting() ? "rerunning…" : "Rerun step"}

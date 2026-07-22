@@ -120,10 +120,10 @@ pub enum RestartError {
     Db(#[from] DbError),
     #[error("no such step {0:?} in run")]
     StepNotFound(StepId),
-    /// Rerun rejected: the target cannot run because a dependency has not
-    /// Succeeded (ADR-0056 amendment). Admission would just `dep_dead`-skip it,
-    /// so forking a Take would be a no-op — reject up front instead.
-    #[error("cannot rerun {step:?}: dependency {blocker:?} has not succeeded")]
+    /// Rerun/retry rejected: a prerequisite FAILED (ADR-0056 amendment), so the
+    /// pipeline has a real upstream failure — rerun/retry that, not this. A
+    /// Succeeded or Skipped prerequisite does not block.
+    #[error("cannot rerun/retry {step:?}: prerequisite {blocker:?} has not succeeded or been skipped")]
     DependencyNotSatisfied { step: StepId, blocker: StepId },
     /// Retry rejected: retry is for **Failed** steps only (ADR-0056 amendment).
     /// A non-failed step is reran (a Take fork), not retried.
@@ -156,12 +156,13 @@ pub async fn restart_step(
     let Some(target_step) = steps.iter().find(|s| &s.step == target) else {
         return Err(RestartError::StepNotFound(target.clone()));
     };
-    // Rerun validation (ADR-0056 amendment): the target must be runnable — all
-    // its `needs` Succeeded. Otherwise admission would `dep_dead`-skip it, so a
-    // fork would be a no-op; reject instead of silently skipping. The gate is on
-    // deps only, never the target's own status (a `when:`-skipped step whose
-    // deps DID succeed is rerunnable — it replays and re-skips).
-    if let Some(blocker) = unsatisfied_dep(target_step, &steps) {
+    // Rerun validation (ADR-0056 amendment): a prerequisite that FAILED blocks
+    // the rerun — the pipeline has a real upstream failure, so the user should
+    // rerun/retry THAT, not this. A prerequisite that Succeeded OR was Skipped
+    // does not block (a skipped upstream is a resolved, non-failing outcome; the
+    // rerun replays and re-skips as needed). The gate never inspects the
+    // target's own status.
+    if let Some(blocker) = blocking_dep(target_step, &steps) {
         return Err(RestartError::DependencyNotSatisfied {
             step: target.clone(),
             blocker,
@@ -234,6 +235,14 @@ pub async fn retry_step(
             status: target_step.status,
         });
     }
+    // Same prerequisite gate as rerun (a failed dependency blocks). A genuinely
+    // Failed target ran, so its deps all Succeeded — this is defensive/consistent.
+    if let Some(blocker) = blocking_dep(target_step, &steps) {
+        return Err(RestartError::DependencyNotSatisfied {
+            step: target.clone(),
+            blocker,
+        });
+    }
     let invalid = crate::invalidation_set(target, &steps);
 
     // Attribution/audit fact — NOT a Take boundary (`deriveTakes` ignores it),
@@ -256,14 +265,21 @@ pub async fn retry_step(
     rearm_invalidation_set(db, clock, run, target, &invalid, &steps).await
 }
 
-/// The first `need` of `step` that has not `Succeeded` (so `step` cannot run),
-/// or `None` when every dependency succeeded. Deterministic order (the step's
-/// declared `needs` order) so the rejection names a stable blocker.
-fn unsatisfied_dep(step: &StepRun, steps: &[StepRun]) -> Option<StepId> {
+/// The first `need` of `step` that is **not** in a non-failing terminal state
+/// (`Succeeded` or `Skipped`) — a blocker for a rerun/retry — or `None` when
+/// every dependency is Succeeded or Skipped. A Failed (or Cancelled, or
+/// not-yet-terminal) dependency blocks; a Skipped one does not. Deterministic
+/// order (the step's declared `needs`) so the rejection names a stable blocker.
+fn blocking_dep(step: &StepRun, steps: &[StepRun]) -> Option<StepId> {
     let status_of = |id: &StepId| steps.iter().find(|s| &s.step == id).map(|s| s.status);
     step.needs
         .iter()
-        .find(|d| status_of(d) != Some(StepStatus::Succeeded))
+        .find(|d| {
+            !matches!(
+                status_of(d),
+                Some(StepStatus::Succeeded) | Some(StepStatus::Skipped)
+            )
+        })
         .cloned()
 }
 
