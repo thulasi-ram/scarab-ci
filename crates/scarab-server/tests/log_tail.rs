@@ -10,7 +10,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Executor, LogChunks};
 use scarab_engine::{
-    Attempt, AttemptId, ExecError, RunId, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, AttemptOutcome, ExecError, RunId, StepId, StepRun, StepSpec, StepStatus,
+    Timestamp,
 };
 use scarab_server::{pump_log_stream, LogService, LogTailer};
 use scarab_testkit::{InMemoryDb, InMemoryObjectStore};
@@ -109,6 +110,7 @@ fn running_step() -> StepRun {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
         gate_kind: None,

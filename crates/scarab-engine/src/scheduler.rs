@@ -45,9 +45,9 @@ pub const MAX_DELIVERY_ATTEMPTS: u32 = 10;
 /// and the grace keeps the two from racing in the normal case.
 const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 use crate::{
-    Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, ExecError,
-    Executor, FailureKind, OutboxMessage, RunId, RunStatus, StepId, StepRun, StepSpec, StepStatus,
-    Timestamp, TransitionError, EVENT_VERSION,
+    Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db, DbError, EventKind,
+    EventPayload, ExecError, Executor, FailureKind, OutboxMessage, RunId, RunStatus, StepId,
+    StepRun, StepSpec, StepStatus, Timestamp, TransitionError, EVENT_VERSION,
 };
 
 /// Outbox `kind` for "launch this step".
@@ -183,7 +183,7 @@ pub async fn restart_step(
         kind: EventPayload::RunRestartRequested {
             target: target.clone(),
             invalidated,
-            by,
+            by: by.clone(),
         },
         at: now,
     })
@@ -208,7 +208,7 @@ pub async fn restart_step(
         }
     }
 
-    rearm_invalidation_set(db, clock, run, target, &invalid, &steps).await
+    rearm_invalidation_set(db, clock, run, target, &invalid, &steps, by).await
 }
 
 /// Retry a **Failed** step (ADR-0056 amendment 2026-07-22): re-execute it (and
@@ -256,13 +256,13 @@ pub async fn retry_step(
         kind: EventPayload::StepRetryRequested {
             target: target.clone(),
             invalidated,
-            by,
+            by: by.clone(),
         },
         at: now,
     })
     .await?;
 
-    rearm_invalidation_set(db, clock, run, target, &invalid, &steps).await
+    rearm_invalidation_set(db, clock, run, target, &invalid, &steps, by).await
 }
 
 /// The first `need` of `step` that is **not** in a non-failing terminal state
@@ -295,6 +295,7 @@ async fn rearm_invalidation_set(
     target: &StepId,
     invalid: &std::collections::HashSet<StepId>,
     steps: &[StepRun],
+    by: Option<String>,
 ) -> Result<(), RestartError> {
     // Force the explicit target to re-run: clear its stored input signature so
     // admission never mistakes it for an unchanged descendant and skips it
@@ -310,9 +311,11 @@ async fn rearm_invalidation_set(
     }
 
     // Re-arm each invalidated step (terminal or in-flight) to Pending. A peer
-    // that already moved it is a benign Conflict we skip. An in-flight step
-    // re-armed here has its running attempt SUPERSEDED (ADR-0056 amendment):
-    // collect its Pod for teardown so it does not orphan.
+    // that already moved it is a benign Conflict. An in-flight step re-armed
+    // here has its running attempt SUPERSEDED (ADR-0056 amendment): its Pod is
+    // collected for teardown so it does not orphan, its attempt is stamped
+    // `Superseded` (never a green `failed:false`), and an `AttemptSuperseded`
+    // event records the fact.
     let mut superseded: Vec<SupersededAttempt> = Vec::new();
     for s in steps {
         if invalid.contains(&s.step) && s.status != StepStatus::Pending {
@@ -335,14 +338,30 @@ async fn rearm_invalidation_set(
                     .await?;
                     if s.status == StepStatus::Running {
                         if let Some(a) = s.attempts.last() {
-                            superseded.push(SupersededAttempt {
-                                step: s.step.0.clone(),
-                                attempt: a.id.0.clone(),
-                            });
+                            mark_superseded(
+                                db,
+                                clock,
+                                run,
+                                &s.step,
+                                &a.id,
+                                by.as_deref(),
+                                &mut superseded,
+                            )
+                            .await?;
                         }
                     }
                 }
-                Err(DbError::Conflict) => {}
+                // TOCTOU (orphan fix): the optimistic `from` came from a stale
+                // snapshot. A descendant may have raced Pending/Ready→Running
+                // between the snapshot and now, so the guarded UPDATE matched 0
+                // rows. Naively swallowing this leaves that descendant Running
+                // under the old generation with no teardown — an orphan Pod.
+                // Re-read the live row and re-arm from its ACTUAL status,
+                // capturing an in-flight attempt for teardown.
+                Err(DbError::Conflict) => {
+                    rearm_raced_step(db, clock, run, &s.step, by.as_deref(), &mut superseded)
+                        .await?;
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -352,16 +371,117 @@ async fn rearm_invalidation_set(
     // (which owns the executor) SIGTERMs their Pods; the run itself stays alive.
     if !superseded.is_empty() {
         let now = clock.now().await;
+        // The idempotency key must be distinct per distinct supersession
+        // (collision fix): the old `supersede:{run}:{tick}` collided for two
+        // reruns landing in the same clock tick, deduping one teardown away and
+        // orphaning its Pod. Key on the rerun target plus the specific
+        // superseded (step, attempt) handles, so distinct supersessions never
+        // collapse while an identical re-enqueue still dedups exactly-once.
+        let mut disc: Vec<String> = superseded
+            .iter()
+            .map(|a| format!("{}/{}", a.step, a.attempt))
+            .collect();
+        disc.sort();
         db.enqueue_outbox(&OutboxMessage {
             id: crate::OutboxId(0),
             run: run.clone(),
             kind: SUPERSEDE_TEARDOWN.to_string(),
             payload: serde_json::to_value(SupersedeTeardown { attempts: superseded })
                 .unwrap_or(serde_json::Value::Null),
-            idempotency_key: format!("supersede:{}:{}", run.0, now.0),
+            idempotency_key: format!("supersede:{}:{}:{}", run.0, target.0, disc.join(",")),
             at: now,
         })
         .await?;
+    }
+    Ok(())
+}
+
+/// Record one superseded in-flight attempt (ADR-0056 amendment): enqueue it for
+/// Pod teardown, stamp its attempt row `Superseded` (so the abandoned attempt
+/// never renders as a green `failed:false`), and append an [`AttemptSuperseded`]
+/// event — promoting the previously-invisible supersession into a recorded fact.
+async fn mark_superseded(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    step: &StepId,
+    attempt: &AttemptId,
+    by: Option<&str>,
+    superseded: &mut Vec<SupersededAttempt>,
+) -> Result<(), RestartError> {
+    superseded.push(SupersededAttempt {
+        step: step.0.clone(),
+        attempt: attempt.0.clone(),
+    });
+    db.set_attempt_outcome(run, step, attempt, AttemptOutcome::Superseded)
+        .await?;
+    let now = clock.now().await;
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::AttemptSuperseded {
+            step: step.clone(),
+            attempt: attempt.clone(),
+            by: by.map(str::to_string),
+        },
+        at: now,
+    })
+    .await?;
+    Ok(())
+}
+
+/// Recover a re-arm that hit [`DbError::Conflict`] because the invalidation-set
+/// snapshot was stale (the TOCTOU orphan fix). Re-read the live row and re-arm
+/// from its ACTUAL status; if the step raced into `Running` (an in-flight Pod
+/// the snapshot missed) capture it via [`mark_superseded`] so it is torn down
+/// rather than orphaned. A step a peer already re-armed to `Pending`, or one now
+/// terminal with no live attempt, is genuinely benign. Bounded re-read/retry:
+/// each competing transition moves the step toward `Pending` or a terminal sink,
+/// so this converges in a couple of passes — the bound only guards a
+/// pathological write storm.
+async fn rearm_raced_step(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    step: &StepId,
+    by: Option<&str>,
+    superseded: &mut Vec<SupersededAttempt>,
+) -> Result<(), RestartError> {
+    for _ in 0..8 {
+        let live = db.steps_of_run(run).await?;
+        let Some(s) = live.iter().find(|x| &x.step == step) else {
+            return Ok(());
+        };
+        if s.status == StepStatus::Pending {
+            return Ok(());
+        }
+        match db
+            .record_step_transition(run, step, s.status, StepStatus::Pending)
+            .await
+        {
+            Ok(()) => {
+                let now = clock.now().await;
+                db.append_event(&EventKind {
+                    version: EVENT_VERSION,
+                    run: run.clone(),
+                    kind: EventPayload::StepTransitioned {
+                        step: step.clone(),
+                        from: s.status,
+                        to: StepStatus::Pending,
+                    },
+                    at: now,
+                })
+                .await?;
+                if s.status == StepStatus::Running {
+                    if let Some(a) = s.attempts.last() {
+                        mark_superseded(db, clock, run, step, &a.id, by, superseded).await?;
+                    }
+                }
+                return Ok(());
+            }
+            Err(DbError::Conflict) => continue,
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
 }
@@ -1007,6 +1127,7 @@ impl<'a> Scheduler<'a> {
                         id: attempt.clone(),
                         started_at: now,
                         failure: None,
+                        outcome: AttemptOutcome::Running,
                     },
                 )
                 .await?;
@@ -1275,6 +1396,7 @@ impl<'a> Scheduler<'a> {
                             id: attempt.clone(),
                             started_at: self.clock.now().await,
                             failure: None,
+                            outcome: AttemptOutcome::Running,
                         }],
                         needs: Vec::new(),
                         gate_kind: None,
@@ -2065,6 +2187,31 @@ impl<'a> Scheduler<'a> {
             .await
         {
             Ok(()) => {
+                // Stamp the attempt's terminal outcome (ADR-0056 amendment) so it
+                // never renders as a green `failed:false` attempt. `Succeeded`
+                // here; on the Failed terminus record the classified failure —
+                // which also stamps `Failed` — covering the direct-finalize paths
+                // (e.g. a launch-time interpolation failure) that never routed
+                // through `settle_failed_attempt`. Idempotent when they did.
+                match to {
+                    StepStatus::Succeeded => {
+                        self.db
+                            .set_attempt_outcome(run, step, attempt, AttemptOutcome::Succeeded)
+                            .await?;
+                    }
+                    StepStatus::Failed => {
+                        if let Some(kind) = failure {
+                            self.db
+                                .set_attempt_failure(run, step, attempt, kind)
+                                .await?;
+                        } else {
+                            self.db
+                                .set_attempt_outcome(run, step, attempt, AttemptOutcome::Failed)
+                                .await?;
+                        }
+                    }
+                    _ => {}
+                }
                 let now = self.clock.now().await;
                 self.append(
                     run,

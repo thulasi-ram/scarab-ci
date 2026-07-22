@@ -8,8 +8,8 @@ mod common;
 use common::fresh_db;
 use scarab_db_postgres::{PostgresDb, MIGRATOR};
 use scarab_engine::{
-    Attempt, AttemptId, Db, DbError, EventPayload, FailureKind, Run, RunId, RunStatus, StepId,
-    StepStatus, Timestamp, EVENT_VERSION,
+    Attempt, AttemptId, AttemptOutcome, Db, DbError, EventPayload, FailureKind, Run, RunId,
+    RunStatus, StepId, StepStatus, Timestamp, EVENT_VERSION,
 };
 use sqlx::Row;
 
@@ -102,6 +102,7 @@ async fn tables_round_trip_via_adapter() {
         failure: Some(FailureKind::Infra {
             never_started: false,
         }),
+        outcome: AttemptOutcome::Failed,
     };
     db.record_attempt(&run, &step, &attempt).await.unwrap();
     let got = db.attempts(&run, &step).await.unwrap();
@@ -122,6 +123,7 @@ async fn tables_round_trip_via_adapter() {
             id: AttemptId(format!("a{}", i + 2)),
             started_at: Timestamp(1_200 + i as i64),
             failure: Some(failure),
+            outcome: AttemptOutcome::Failed,
         };
         db.record_attempt(&run, &step, &attempt).await.unwrap();
         let got = db.attempts(&run, &step).await.unwrap();

@@ -740,13 +740,21 @@ pub struct AttemptDto {
     pub id: String,
     /// When this attempt started (unix-ms).
     pub started_at: i64,
-    /// `true` if this attempt ended in failure. A later attempt may still have
-    /// succeeded — that divergence is exactly the retry story worth showing.
+    /// `true` if this attempt ended in a classified failure. A later attempt may
+    /// still have succeeded — that divergence is exactly the retry story worth
+    /// showing. Retained for back-compat; prefer `outcome` for the full picture
+    /// (a `superseded`/`cancelled` attempt is `failed:false` but NOT green).
     pub failed: bool,
     /// Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`
     /// | `config`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    /// The attempt's recorded outcome (ADR-0056 amendment): `running` |
+    /// `succeeded` | `failed` | `superseded` | `cancelled`. Unlike `failed` this
+    /// distinguishes a *superseded* attempt (a rerun/retry replaced its input
+    /// while it was still running and its Pod was torn down) from a genuine
+    /// success — so the UI never renders an abandoned attempt green.
+    pub outcome: String,
 }
 
 /// Project a durable [`scarab_engine::Attempt`] to its wire DTO.
@@ -766,6 +774,9 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
         started_at: a.started_at.0,
         failed: a.failure.is_some(),
         failure,
+        // The durable read (storage boundary) already resolved back-compat, so
+        // `a.outcome` is authoritative here.
+        outcome: a.outcome.as_str().to_string(),
     }
 }
 

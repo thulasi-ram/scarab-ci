@@ -22,8 +22,8 @@ use common::fresh_db;
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::ports::ExecState;
 use scarab_engine::{
-    Attempt, AttemptId, Db, EventPayload, RunId, RunStatus, Scheduler, StepId, StepRun, StepSpec,
-    StepStatus, Timestamp,
+    Attempt, AttemptId, AttemptOutcome, Db, EventPayload, RunId, RunStatus, Scheduler, StepId,
+    StepRun, StepSpec, StepStatus, Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor};
 
@@ -77,6 +77,7 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
         gate_kind: None,

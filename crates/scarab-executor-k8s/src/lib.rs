@@ -2826,7 +2826,7 @@ fn fnv1a(s: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scarab_engine::{Attempt, AttemptId, RunId, StepId, StepStatus, Timestamp};
+    use scarab_engine::{Attempt, AttemptId, AttemptOutcome, RunId, StepId, StepStatus, Timestamp};
 
     fn step_with_attempt(run: &str, step: &str, attempt: &str) -> StepRun {
         StepRun {
@@ -2837,6 +2837,7 @@ mod tests {
                 id: AttemptId(attempt.into()),
                 started_at: Timestamp(0),
                 failure: None,
+                outcome: AttemptOutcome::Running,
             }],
             needs: vec![],
             gate_kind: None,

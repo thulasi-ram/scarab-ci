@@ -6,8 +6,9 @@
 //! descendant's Pod — while the run itself stays alive.
 
 use scarab_engine::{
-    restart_step, retry_step, Attempt, AttemptId, Db, EventPayload, RestartError, RunId, RunStatus,
-    Scheduler, StepId, StepSpec, StepStatus, Timestamp,
+    restart_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db, EventPayload, RestartError,
+    RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus, SupersedeTeardown, Timestamp,
+    SUPERSEDE_TEARDOWN,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
@@ -65,6 +66,7 @@ async fn rerun_supersedes_in_flight_descendant_pod() {
             id: a1.clone(),
             started_at: Timestamp(0),
             failure: None,
+            outcome: AttemptOutcome::Running,
         },
     )
     .await
@@ -86,6 +88,30 @@ async fn rerun_supersedes_in_flight_descendant_pod() {
     let status = |id: &StepId| steps.iter().find(|s| &s.step == id).unwrap().status;
     assert_eq!(status(&c), StepStatus::Pending, "c re-armed");
     assert_eq!(status(&b), StepStatus::Pending, "b re-armed");
+
+    // (a) The abandoned attempt is RECORDED as superseded — the core defect: it
+    // previously stayed failure=NULL and served as `failed:false`, rendering the
+    // torn-down attempt green.
+    let c_attempts = db.attempts_of_step(&run, &c).await.unwrap();
+    let a = c_attempts.iter().find(|x| x.id == a1).expect("a1 present");
+    assert_eq!(
+        a.outcome,
+        AttemptOutcome::Superseded,
+        "superseded attempt records Superseded, not a silent failed:false"
+    );
+    assert!(
+        a.failure.is_none(),
+        "supersession is not a failure classification"
+    );
+    // ...and the supersession is a durable fact (mirrors AttemptReadopted), with
+    // the acting principal attributed.
+    let events = db.events(&run).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(&e.kind,
+            EventPayload::AttemptSuperseded { step, attempt, by }
+                if step == &c && attempt == &a1 && by.as_deref() == Some("alice"))),
+        "AttemptSuperseded event appended with attribution"
+    );
 
     // The driver drains the teardown intent and cancels exactly c's Pod.
     let exec = FakeExecutor::new();
@@ -298,5 +324,163 @@ async fn retry_reruns_in_take_without_forking() {
             .iter()
             .any(|e| matches!(e.kind, EventPayload::RunRestartRequested { .. })),
         "a Retry must NOT fork a Take"
+    );
+}
+
+/// (b) TOCTOU orphan fix: a descendant that races Ready→Running *between* the
+/// rerun's `steps_of_run` snapshot and its guarded re-arm was previously left
+/// Running under the old generation with no teardown (a swallowed benign
+/// Conflict) — an orphan Pod. It must instead be captured: re-armed from its
+/// ACTUAL status, stamped Superseded, and enqueued for teardown.
+#[tokio::test]
+async fn rerun_captures_descendant_that_raced_into_running() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-toctou".into());
+    let b = StepId("b".into());
+    let c = StepId("c".into());
+    let a1 = AttemptId("a1".into());
+
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
+        .await
+        .unwrap();
+    // b succeeded; c is Ready (claimed, not yet launched) at snapshot time.
+    db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Succeeded)
+        .await
+        .unwrap();
+    db.record_step_transition(&run, &c, StepStatus::Pending, StepStatus::Ready)
+        .await
+        .unwrap();
+    db.seed_run(&run, RunStatus::Running);
+
+    // Arm the race: c flips Ready→Running (minting a1) exactly when the rerun's
+    // re-arm first tries to move it, so the stale-snapshot guard Conflicts.
+    db.arm_toctou_race(&c, &a1);
+
+    let clock = FakeClock::new(1_000);
+    restart_step(&db, &clock, &run, &b, Some("alice".into()))
+        .await
+        .expect("restart_step");
+
+    // Despite the race, c ends Pending — re-armed from its ACTUAL Running status.
+    let steps = db.steps_of_run(&run).await.unwrap();
+    let status = |id: &StepId| steps.iter().find(|s| &s.step == id).unwrap().status;
+    assert_eq!(
+        status(&c),
+        StepStatus::Pending,
+        "raced descendant still re-armed"
+    );
+
+    // The raced attempt is recorded Superseded (not a silent failed:false)...
+    let raced = db
+        .attempts_of_step(&run, &c)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|x| x.id == a1)
+        .expect("raced attempt a1 recorded");
+    assert_eq!(raced.outcome, AttemptOutcome::Superseded);
+    assert!(raced.failure.is_none());
+    // ...an AttemptSuperseded fact was recorded...
+    let events = db.events(&run).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(&e.kind,
+            EventPayload::AttemptSuperseded { step, attempt, by }
+                if step == &c && attempt == &a1 && by.as_deref() == Some("alice"))),
+        "AttemptSuperseded recorded for the raced attempt"
+    );
+    // ...and it was captured for teardown (the orphan fix): a scoped
+    // SUPERSEDE_TEARDOWN intent naming (c, a1) is enqueued.
+    let msgs = db
+        .claim_outbox("insp", Some(SUPERSEDE_TEARDOWN), 10, 1_000)
+        .await
+        .unwrap();
+    let captured: Vec<(String, String)> = msgs
+        .iter()
+        .flat_map(|m| {
+            serde_json::from_value::<SupersedeTeardown>(m.payload.clone())
+                .unwrap()
+                .attempts
+                .into_iter()
+                .map(|x| (x.step, x.attempt))
+        })
+        .collect();
+    assert!(
+        captured.contains(&(c.0.clone(), a1.0.clone())),
+        "raced descendant captured for teardown, not orphaned: {captured:?}"
+    );
+}
+
+/// (c) Idempotency-key collision fix: two supersessions in the SAME run at the
+/// SAME clock tick previously shared the key `supersede:{run}:{tick}`, so the
+/// outbox deduped one teardown away and orphaned its Pod. Distinct supersessions
+/// must get distinct keys. Two independent subtrees (`b→c`, `x→y`) reran in one
+/// tick each supersede their own in-flight descendant.
+#[tokio::test]
+async fn same_tick_supersessions_get_distinct_outbox_keys() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-collide".into());
+    let (b, c) = (StepId("b".into()), StepId("c".into()));
+    let (x, y) = (StepId("x".into()), StepId("y".into()));
+    let (ca1, ya1) = (AttemptId("ca1".into()), AttemptId("ya1".into()));
+
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    for (s, needs) in [
+        (&b, vec![]),
+        (&c, vec![b.clone()]),
+        (&x, vec![]),
+        (&y, vec![x.clone()]),
+    ] {
+        db.create_step_run(&run, s, Some(&spec()), &needs, Timestamp(0))
+            .await
+            .unwrap();
+    }
+    // Both subtrees: parent Succeeded, descendant Running (in-flight).
+    for (parent, child, att) in [(&b, &c, &ca1), (&x, &y, &ya1)] {
+        db.record_step_transition(&run, parent, StepStatus::Pending, StepStatus::Succeeded)
+            .await
+            .unwrap();
+        db.record_attempt(
+            &run,
+            child,
+            &Attempt {
+                id: att.clone(),
+                started_at: Timestamp(0),
+                failure: None,
+                outcome: AttemptOutcome::Running,
+            },
+        )
+        .await
+        .unwrap();
+        db.record_step_transition(&run, child, StepStatus::Pending, StepStatus::Running)
+            .await
+            .unwrap();
+    }
+    db.seed_run(&run, RunStatus::Running);
+
+    // Never advance the clock: both reruns land in the SAME tick — the exact
+    // condition that collided the old key.
+    let clock = FakeClock::new(1_000);
+    restart_step(&db, &clock, &run, &b, Some("alice".into()))
+        .await
+        .expect("rerun b");
+    restart_step(&db, &clock, &run, &x, Some("alice".into()))
+        .await
+        .expect("rerun x");
+
+    let keys: std::collections::BTreeSet<String> = db
+        .claim_outbox("insp", Some(SUPERSEDE_TEARDOWN), 10, 1_000)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.idempotency_key)
+        .collect();
+    assert_eq!(
+        keys.len(),
+        2,
+        "two same-tick supersessions must get two distinct teardown keys, got {keys:?}"
     );
 }

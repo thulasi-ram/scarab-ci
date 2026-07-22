@@ -526,13 +526,28 @@ pub trait Db: Send + Sync {
         attempt: &AttemptId,
     ) -> Result<Option<String>, DbError>;
 
-    /// Record the classified failure on a finished attempt (ADR-0047).
+    /// Record the classified failure on a finished attempt (ADR-0047). Also
+    /// stamps the attempt's [`AttemptOutcome::Failed`] outcome, so `failure` and
+    /// `outcome` never diverge.
     async fn set_attempt_failure(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
         failure: FailureKind,
+    ) -> Result<(), DbError>;
+
+    /// Record the terminal (or in-flight) [`AttemptOutcome`] on an attempt
+    /// (ADR-0056 amendment) — the non-failure outcomes (`Succeeded`,
+    /// `Superseded`, `Cancelled`) that [`set_attempt_failure`](Db::set_attempt_failure)
+    /// does not cover. `Failed` is recorded through `set_attempt_failure` (which
+    /// also carries the classification).
+    async fn set_attempt_outcome(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        outcome: crate::AttemptOutcome,
     ) -> Result<(), DbError>;
 
     /// Append one entry to the run's append-only event log.

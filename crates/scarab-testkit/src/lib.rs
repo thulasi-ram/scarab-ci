@@ -17,9 +17,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState, Lease};
 use scarab_engine::{
-    Attempt, AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, ExecError, Executor,
-    FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService, RunStatus, RunSummary,
-    ServiceStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db, DbError, EventKind,
+    ExecError, Executor, FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService,
+    RunStatus, RunSummary, ServiceStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 use scarab_storage::{ObjectStore, StorageError};
 
@@ -205,6 +205,12 @@ struct InMemoryState {
     /// value is `(status, handle, created_at)`.
     #[allow(clippy::type_complexity)]
     run_services: HashMap<(RunId, i64, String), (ServiceStatus, Option<String>, Timestamp)>,
+    /// Test-only one-shot TOCTOU injector (ADR-0056 orphan fix): when armed for
+    /// a step, that step's next `record_step_transition` is rejected as a
+    /// `Conflict` AFTER the store flips it to `Running` and mints the given
+    /// attempt — modelling a concurrent admission that claimed the step between
+    /// a rerun's snapshot and its guarded re-arm. See [`InMemoryDb::arm_toctou_race`].
+    toctou_race: Option<(StepId, AttemptId)>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -275,6 +281,15 @@ impl InMemoryDb {
                 },
             );
         }
+    }
+
+    /// Arm a one-shot TOCTOU race (test seam for the ADR-0056 orphan fix): the
+    /// next [`record_step_transition`](Db::record_step_transition) targeting
+    /// `step` is rejected as a `Conflict` after the store flips `step` to
+    /// `Running` with a freshly-minted `attempt` — modelling a descendant that
+    /// raced into `Running` between a rerun's snapshot and its guarded re-arm.
+    pub fn arm_toctou_race(&self, step: &StepId, attempt: &AttemptId) {
+        self.state.lock().unwrap().toctou_race = Some((step.clone(), attempt.clone()));
     }
 }
 
@@ -1035,6 +1050,22 @@ impl Db for InMemoryDb {
         to: StepStatus,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
+        // Test-only one-shot TOCTOU injector (see `arm_toctou_race`): fire before
+        // the guard so the caller sees a `Conflict` against a step that has just
+        // (as far as it can tell, concurrently) raced into `Running`.
+        if matches!(&st.toctou_race, Some((s, _)) if s == step) {
+            let (_, attempt) = st.toctou_race.take().unwrap();
+            if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
+                rec.status = Some(StepStatus::Running);
+                rec.attempts.push(Attempt {
+                    id: attempt,
+                    started_at: Timestamp(0),
+                    failure: None,
+                    outcome: AttemptOutcome::Running,
+                });
+            }
+            return Err(DbError::Conflict);
+        }
         let rec = st
             .steps
             .get_mut(&(run.clone(), step.clone()))
@@ -1111,7 +1142,25 @@ impl Db for InMemoryDb {
         let mut st = self.state.lock().unwrap();
         if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
             if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
+                // Failure and outcome move together (ADR-0056 amendment).
                 a.failure = Some(failure);
+                a.outcome = AttemptOutcome::Failed;
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_attempt_outcome(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        outcome: AttemptOutcome,
+    ) -> Result<(), DbError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
+            if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
+                a.outcome = outcome;
             }
         }
         Ok(())

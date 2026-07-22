@@ -13,7 +13,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use scarab_engine::{Attempt, AttemptId, Db, FailureKind, RunId, RunStatus, StepId, Timestamp};
+use scarab_engine::{
+    Attempt, AttemptId, AttemptOutcome, Db, FailureKind, RunId, RunStatus, StepId, Timestamp,
+};
 use scarab_server::{router, AppState, LogService};
 use scarab_storage::{BlobHash, Cas, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget};
 use scarab_testkit::{FakeClock, InMemoryDb, InMemoryObjectStore};
@@ -266,6 +268,7 @@ async fn run_detail_exposes_attempt_list_for_reruns() {
             failure: Some(FailureKind::Infra {
                 never_started: false,
             }),
+            outcome: AttemptOutcome::Failed,
         },
     )
     .await
@@ -277,6 +280,7 @@ async fn run_detail_exposes_attempt_list_for_reruns() {
             id: AttemptId("a2".into()),
             started_at: Timestamp(20),
             failure: None,
+            outcome: AttemptOutcome::Succeeded,
         },
     )
     .await
@@ -316,6 +320,7 @@ async fn step_logs_scope_by_attempt() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(10),
             failure: Some(FailureKind::Step),
+            outcome: AttemptOutcome::Failed,
         },
     )
     .await
@@ -327,6 +332,7 @@ async fn step_logs_scope_by_attempt() {
             id: AttemptId("a2".into()),
             started_at: Timestamp(20),
             failure: None,
+            outcome: AttemptOutcome::Succeeded,
         },
     )
     .await

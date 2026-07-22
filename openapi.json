@@ -1647,12 +1647,13 @@
         "required": [
           "id",
           "started_at",
-          "failed"
+          "failed",
+          "outcome"
         ],
         "properties": {
           "failed": {
             "type": "boolean",
-            "description": "`true` if this attempt ended in failure. A later attempt may still have\nsucceeded — that divergence is exactly the retry story worth showing."
+            "description": "`true` if this attempt ended in a classified failure. A later attempt may\nstill have succeeded — that divergence is exactly the retry story worth\nshowing. Retained for back-compat; prefer `outcome` for the full picture\n(a `superseded`/`cancelled` attempt is `failed:false` but NOT green)."
           },
           "failure": {
             "type": [
@@ -1663,6 +1664,10 @@
           },
           "id": {
             "type": "string"
+          },
+          "outcome": {
+            "type": "string",
+            "description": "The attempt's recorded outcome (ADR-0056 amendment): `running` |\n`succeeded` | `failed` | `superseded` | `cancelled`. Unlike `failed` this\ndistinguishes a *superseded* attempt (a rerun/retry replaced its input\nwhile it was still running and its Pod was torn down) from a genuine\nsuccess — so the UI never renders an abandoned attempt green."
           },
           "started_at": {
             "type": "integer",

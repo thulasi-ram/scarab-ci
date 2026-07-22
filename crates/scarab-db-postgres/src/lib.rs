@@ -20,9 +20,9 @@ use sqlx::{PgPool, Row};
 
 use scarab_engine::ports::Lease;
 use scarab_engine::{
-    Attempt, AttemptId, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, FailureKind,
-    LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService, RunStatus, RunSummary, ServiceStatus,
-    StepId, StepRun, StepSpec, StepStatus, Timestamp,
+    Attempt, AttemptId, AttemptOutcome, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload,
+    FailureKind, LogChunkMeta, OutboxId, OutboxMessage, RunId, RunService, RunStatus, RunSummary,
+    ServiceStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp,
 };
 use scarab_forge::{
     ForgeConnection, ForgeConnectionStore, ForgeKind, RegistryError, RepoRef, ResolvedRepo,
@@ -86,7 +86,7 @@ impl PostgresDb {
     /// All attempts of a step, in start order.
     pub async fn attempts(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
         let rows = sqlx::query(
-            "SELECT attempt_id, started_at, failure FROM attempts
+            "SELECT attempt_id, started_at, failure, outcome FROM attempts
              WHERE run_id = $1 AND step_id = $2 ORDER BY started_at",
         )
         .bind(&run.0)
@@ -100,10 +100,22 @@ impl PostgresDb {
                     .get::<Option<String>, _>("failure")
                     .map(|s| failure_from_str(&s))
                     .transpose()?;
+                // Back-compat derivation lives at this storage boundary — the
+                // only place the NULL `outcome` column is observed — so the
+                // in-memory `Attempt.outcome` is authoritative for every
+                // consumer. A pre-migration row (NULL outcome) derives `Failed`
+                // when a failure was recorded, else `Running`.
+                let outcome = match r.get::<Option<String>, _>("outcome") {
+                    Some(s) => AttemptOutcome::from_str(&s)
+                        .ok_or_else(|| DbError::Other(format!("unknown attempt outcome {s:?}")))?,
+                    None if failure.is_some() => AttemptOutcome::Failed,
+                    None => AttemptOutcome::Running,
+                };
                 Ok(Attempt {
                     id: AttemptId(r.get::<String, _>("attempt_id")),
                     started_at: Timestamp(r.get::<i64, _>("started_at")),
                     failure,
+                    outcome,
                 })
             })
             .collect()
@@ -1285,16 +1297,17 @@ impl Db for PostgresDb {
         // Idempotent on the monotonic attempt id (the fencing unit) — a re-drive
         // records the same attempt rather than a duplicate.
         sqlx::query(
-            "INSERT INTO attempts (run_id, step_id, attempt_id, started_at, failure)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO attempts (run_id, step_id, attempt_id, started_at, failure, outcome)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (run_id, step_id, attempt_id)
-             DO UPDATE SET failure = EXCLUDED.failure",
+             DO UPDATE SET failure = EXCLUDED.failure, outcome = EXCLUDED.outcome",
         )
         .bind(&run.0)
         .bind(&step.0)
         .bind(&attempt.id.0)
         .bind(attempt.started_at.0)
         .bind(attempt.failure.map(failure_str))
+        .bind(attempt.outcome.as_str())
         .execute(self.pool())
         .await
         .map_err(db_err)?;
@@ -1352,14 +1365,38 @@ impl Db for PostgresDb {
         attempt: &AttemptId,
         failure: FailureKind,
     ) -> Result<(), DbError> {
+        // Record the classification and the `Failed` outcome together so the two
+        // columns never diverge (ADR-0056 amendment).
         sqlx::query(
-            "UPDATE attempts SET failure = $4
+            "UPDATE attempts SET failure = $4, outcome = $5
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
         )
         .bind(&run.0)
         .bind(&step.0)
         .bind(&attempt.0)
         .bind(failure_str(failure))
+        .bind(AttemptOutcome::Failed.as_str())
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn set_attempt_outcome(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        outcome: AttemptOutcome,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE attempts SET outcome = $4
+             WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .bind(outcome.as_str())
         .execute(self.pool())
         .await
         .map_err(db_err)?;

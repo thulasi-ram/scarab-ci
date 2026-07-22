@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use scarab_engine::ports::{ExecHandle, ExecState};
 use scarab_engine::{
-    Attempt, AttemptId, Db, ExecError, Executor, LogChunks, RunId, StepId, StepRun, StepStatus,
-    Timestamp,
+    Attempt, AttemptId, AttemptOutcome, Db, ExecError, Executor, LogChunks, RunId, StepId, StepRun,
+    StepStatus, Timestamp,
 };
 use scarab_server::log_tail::LogTailer;
 use scarab_server::LogService;
@@ -67,6 +67,7 @@ fn running_step() -> StepRun {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
         gate_kind: None,
@@ -198,6 +199,7 @@ fn running_step_with_run(run: &str) -> StepRun {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
         gate_kind: None,

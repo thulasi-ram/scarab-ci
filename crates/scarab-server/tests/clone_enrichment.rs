@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use scarab_engine::{
-    Attempt, AttemptId, CloneConfig, Executor, RunId, StepId, StepRun, StepSpec, StepStatus,
-    Timestamp,
+    Attempt, AttemptId, AttemptOutcome, CloneConfig, Executor, RunId, StepId, StepRun, StepSpec,
+    StepStatus, Timestamp,
 };
 use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
 use scarab_server::clone_executor::{clone_url, CloneEnrichingExecutor};
@@ -23,6 +23,7 @@ fn step_run(id: &str) -> StepRun {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
         gate_kind: None,

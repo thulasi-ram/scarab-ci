@@ -1,0 +1,13 @@
+-- ADR-0056 amendment: give every attempt a first-class OUTCOME, so a
+-- non-failure termination is legible instead of being served as `failed:false`.
+--
+-- Before this an attempt row carried only `failure` (NULL while running or
+-- succeeded). A *superseded* attempt — one a rerun/retry re-armed while it was
+-- still Running, whose input is being replaced and whose Pod is torn down —
+-- recorded nothing, so it read as `failed:false` and rendered green. `outcome`
+-- distinguishes running | succeeded | failed | superseded | cancelled.
+--
+-- Nullable expand (ADR-0022): pre-migration rows keep NULL and the read path
+-- derives their outcome from the legacy `failure` column (`failed` when set,
+-- else `running`). Every new write populates it.
+ALTER TABLE attempts ADD COLUMN outcome TEXT;

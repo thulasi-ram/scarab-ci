@@ -249,6 +249,65 @@ pub struct Attempt {
     pub id: AttemptId,
     pub started_at: Timestamp,
     pub failure: Option<FailureKind>,
+    /// The recorded terminal (or in-flight) outcome of this attempt (ADR-0056
+    /// amendment). `Running` until an outcome is written; `Superseded` and
+    /// `Cancelled` are the non-failure terminations that must never render as a
+    /// green `failed:false` attempt. `#[serde(default)]` keeps rows/blobs written
+    /// before the column existed decodable — the storage read derives
+    /// `Failed`/`Running` from the legacy `failure` column for such rows.
+    #[serde(default)]
+    pub outcome: AttemptOutcome,
+}
+
+/// The recorded outcome of a single [`Attempt`] (ADR-0056 amendment). Distinct
+/// from [`FailureKind`], which only classifies *why* a `Failed` attempt failed:
+/// this also names the non-failure terminations. In particular `Superseded` — a
+/// rerun/retry re-armed the step while this attempt was still `Running`, so its
+/// input is being replaced and it can never honestly finish (its Pod is torn
+/// down) — was previously invisible and served as `failed:false`, rendering the
+/// abandoned attempt green. `Running` is the in-flight state before any terminal
+/// outcome is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptOutcome {
+    /// In flight — no terminal outcome recorded yet.
+    #[default]
+    Running,
+    /// The attempt finished and its step succeeded.
+    Succeeded,
+    /// The attempt finished in a classified failure (see the attempt's `failure`).
+    Failed,
+    /// A rerun/retry re-armed this attempt's still-`Running` step: its input is
+    /// being replaced so it can never honestly finish; its Pod is torn down. A
+    /// wasted-compute stop, not a failure.
+    Superseded,
+    /// The attempt's run/step was cancelled (ADR-0054). Not a failure.
+    Cancelled,
+}
+
+impl AttemptOutcome {
+    /// The wire/column token (snake_case), mirroring the serde representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AttemptOutcome::Running => "running",
+            AttemptOutcome::Succeeded => "succeeded",
+            AttemptOutcome::Failed => "failed",
+            AttemptOutcome::Superseded => "superseded",
+            AttemptOutcome::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parse a stored column/wire token; `None` for an unknown value.
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "running" => AttemptOutcome::Running,
+            "succeeded" => AttemptOutcome::Succeeded,
+            "failed" => AttemptOutcome::Failed,
+            "superseded" => AttemptOutcome::Superseded,
+            "cancelled" => AttemptOutcome::Cancelled,
+            _ => return None,
+        })
+    }
 }
 
 /// A **Run-scoped shared service** instance (ADR-0058): the durable projection
@@ -713,6 +772,17 @@ pub enum EventPayload {
         step: StepId,
         attempt: AttemptId,
     },
+    /// A rerun/retry re-armed a step while this attempt was still `Running`
+    /// (ADR-0056 amendment): the attempt's input is being replaced, so it can
+    /// never honestly finish and its Pod is torn down. Recorded as a fact
+    /// (mirroring [`AttemptReadopted`](EventPayload::AttemptReadopted)) so the
+    /// supersession is legible rather than a silently-abandoned green attempt;
+    /// `by` is the acting principal (`None` only when auth is off).
+    AttemptSuperseded {
+        step: StepId,
+        attempt: AttemptId,
+        by: Option<String>,
+    },
     /// The run's opt-in active-time `budget:` was exhausted (ADR-0047);
     /// in-flight steps were cancelled and the run fails.
     RunBudgetExhausted {
@@ -987,6 +1057,7 @@ impl StepRun {
             id: attempt.clone(),
             started_at: at,
             failure: None,
+            outcome: AttemptOutcome::Running,
         });
         Ok(vec![
             self.step_transition(from, StepStatus::Running, at),
