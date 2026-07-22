@@ -1,0 +1,383 @@
+// Fixture / demo mode for the web UI. Gated behind VITE_SCARAB_MOCK=1
+// (`just ui-mock` / `npm run dev:mock`); patches window.fetch +
+// window.EventSource to serve a fixed "acme" org so the UI renders with no
+// server or DB. The fastest way to eyeball a UI change, and the source of the
+// docs screenshots. Off by default — the guard in index.tsx never imports this
+// module unless the flag is set, so it stays out of the production build.
+//
+// Neutral identity so nothing real leaks into screenshots: org=acme,
+// author=a.kim, approver=j.lee; the `scarab` repo is kept (its build log
+// references the crates), the rest are generic. Add `?theme=dark` (or `light`)
+// to the URL to pin the theme (used for deterministic capture); otherwise the
+// normal stored/toggle theme applies.
+
+const now = Date.now();
+const ago = (ms: number) => now - ms;
+
+const RUN_ID = "0190f8a2000071fb8c0011223344aabb";
+
+// ── /v1/me ────────────────────────────────────────────────────────────────
+const me = { subject: "a.kim", display_name: "Avery Kim", roles: ["Owner"] };
+
+// ── /v1/repos (dashboard: first 4 → "most active" cards; count → "repos · 7")
+const proj = (project: string, mins: number | null) => ({
+  org: "acme",
+  project,
+  name: project,
+  owner: "acme",
+  repo_url: `https://github.com/acme/${project}`,
+  last_run_at: mins == null ? null : ago(mins * 60000),
+});
+const projects = [
+  proj("scarab", 3),
+  proj("orders-api", 21),
+  proj("inventory-svc", 48),
+  proj("edge-gateway", 120),
+  proj("billing", 9),
+  proj("messaging", 300),
+  proj("scarab-infra", null),
+];
+
+// ── /v1/runs (dashboard inbox = 2 suspended) ────────────────────────────────
+const summary = (o: Record<string, unknown>) => ({
+  duration_ms: 0,
+  created_at: ago(60000),
+  ...o,
+});
+const runs = [
+  summary({
+    id: "01984f10a1b24c7e8f0012ab34cd56ef",
+    status: "suspended",
+    org: "acme",
+    project: "scarab",
+    created_at: ago(12 * 60000),
+  }),
+  summary({
+    id: "01984f22bb334d8e9a1122cd44ef6600",
+    status: "suspended",
+    org: "acme",
+    project: "billing",
+    created_at: ago(27 * 60000),
+  }),
+];
+
+// ── per-repo run strips (dashboard cards) — status+duration_ms drive bars ────
+// Tune succeeded/failed ratios to the "N% pass" shown per card.
+const strip = (pattern: string) =>
+  ({
+    runs: pattern.split("").map((c, i) => ({
+      id: `r${i}`,
+      status: c === "x" ? "failed" : c === "c" ? "cancelled" : "succeeded",
+      duration_ms: 40000 + ((i * 37) % 11) * 22000,
+      created_at: ago((i + 1) * 900000),
+    })),
+  });
+const repoRuns: Record<string, ReturnType<typeof strip>> = {
+  scarab: strip("ooxooooxooxooo"), // ~64% pass window near the older tail
+  "orders-api": strip("oxooxooxooooo"),
+  "inventory-svc": strip("oxoxooxxooxoo"), // ~50%
+  "edge-gateway": strip("ooooooooxoooo"), // ~93%
+};
+// A gentler pass mix so the shown percentages land ~64/64/50/93 like the
+// original: recompute deterministically by fixed strings above (close enough).
+
+// ── run detail ──────────────────────────────────────────────────────────────
+const runStatus = {
+  id: RUN_ID,
+  status: "running",
+  run_number: 142,
+  pipeline: "ci",
+  trigger_title: "Add exponential backoff to step retries",
+  origin_pr_base: null,
+  params: {},
+  steps: [
+    {
+      id: "clone",
+      status: "succeeded",
+      attempts: 1,
+      needs: [],
+      attempt_list: [{ id: "a1", started_at: ago(325000), failed: false }],
+    },
+    {
+      id: "build",
+      status: "succeeded",
+      attempts: 2,
+      needs: ["clone"],
+      attempt_list: [
+        { id: "a1", started_at: ago(297000), failed: true, failure: "step" },
+        { id: "a2", started_at: ago(250000), failed: false },
+      ],
+    },
+    {
+      id: "test",
+      status: "running",
+      attempts: 1,
+      needs: ["build"],
+      attempt_list: [{ id: "a1", started_at: ago(190000), failed: false }],
+    },
+  ],
+};
+
+// events (text/event-stream body) — trigger provenance + step timing.
+const ev = (at: number, kind: unknown) =>
+  `data: ${JSON.stringify({ version: 1, run: RUN_ID, at, kind })}\n\n`;
+const eventsBody = [
+  ev(ago(330000), {
+    Raw: {
+      trigger: {
+        event: {
+          kind: "pull_request",
+          actor: "a.kim",
+          branch: "main",
+          ref: "refs/heads/feature",
+          sha: "3f9a1c2d9e8b7a6c5d4e3f2a1b0c9d8e",
+          repo: { owner: "acme", name: "scarab" },
+          pr: 128,
+        },
+      },
+    },
+  }),
+  ev(ago(325000), { AttemptStarted: { step: "clone", attempt: "a1" } }),
+  ev(ago(298000), { AttemptFinished: { step: "clone", attempt: "a1" } }),
+  ev(ago(297000), { AttemptStarted: { step: "build", attempt: "a1" } }),
+  ev(ago(260000), { AttemptFinished: { step: "build", attempt: "a1", failure: "step" } }),
+  ev(ago(250000), { AttemptStarted: { step: "build", attempt: "a2" } }),
+  ev(ago(190000), { AttemptFinished: { step: "build", attempt: "a2" } }),
+  ev(ago(190000), { AttemptStarted: { step: "test", attempt: "a1" } }),
+].join("");
+
+const testResults = [
+  { name: "tests_passed", type_name: "number", value: 214 },
+  { name: "coverage", type_name: "string", value: "92.4%" },
+];
+const testConsumed = { attempt: "a1", consumed: { build: "a2" } };
+
+const testLogLines = [
+  "$ cargo test --workspace --locked",
+  "   Compiling scarab-core v0.4.0",
+  "   Compiling scarab-engine v0.4.0",
+  "   Compiling scarab-server v0.4.0",
+  "    Finished test [unoptimized + debuginfo] target(s) in 48.21s",
+  "     Running unittests src/lib.rs (target/debug/deps/scarab_engine-9f2c1a)",
+  "running 214 tests",
+  "test executor::retry::backoff_is_exponential ... ok",
+  "test executor::retry::gives_up_after_max_attempts ... ok",
+  "test engine::admission::env_gate_blocks_unapproved_ref ... ok",
+  "test engine::dag::topological_order_is_stable ... ok",
+  "test store::cas::roundtrips_content_addressed_blob ... ok",
+  "test store::cas::dedups_identical_blobs ... ok",
+  "test log::pipeline::appends_are_ordered_per_fence ... ok",
+];
+
+// ── environments / secrets ───────────────────────────────────────────────────
+const environments = [
+  {
+    name: "production",
+    protection: {
+      approvers: ["ops-lead", "j.lee"],
+      wait_timer: 300,
+      allowed_refs: ["main"],
+      concurrency: 1,
+      require_reason: true,
+    },
+  },
+  {
+    name: "staging",
+    protection: {
+      approvers: ["ops-lead"],
+      wait_timer: 0,
+      allowed_refs: ["main", "release/*"],
+      concurrency: 1,
+      require_reason: false,
+    },
+  },
+  {
+    name: "preview",
+    protection: {
+      approvers: [],
+      wait_timer: 0,
+      allowed_refs: [],
+      concurrency: 1,
+      require_reason: false,
+    },
+  },
+];
+const deployments: Record<string, unknown[]> = {
+  production: [
+    {
+      org: "acme",
+      project: "scarab",
+      environment: "production",
+      git_ref: "main",
+      run: "01984e00aa",
+      approved_by: ["ops-lead"],
+      at: ago(3600000),
+    },
+    {
+      org: "acme",
+      project: "scarab",
+      environment: "production",
+      git_ref: "main",
+      run: "01984d00bb",
+      approved_by: ["ops-lead"],
+      at: ago(86400000),
+    },
+  ],
+  staging: [],
+  preview: [],
+};
+
+const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"] };
+const secretMatrix = {
+  environments: ["staging", "production"],
+  keys: [
+    { key: "GHCR_TOKEN", status: { staging: "unset", production: "unset" } },
+    { key: "DATABASE_URL", status: { staging: "set", production: "set" } },
+    { key: "SLACK_WEBHOOK_URL", status: { staging: "unset", production: "set" } },
+  ],
+};
+
+// ── router ────────────────────────────────────────────────────────────────
+function json(body: unknown, init?: ResponseInit) {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+    ...init,
+  });
+}
+
+function route(pathname: string, search: string): Response | null {
+  const p = pathname;
+  if (p === "/v1/me") return json(me);
+  if (p === "/v1/repos") return json(projects);
+  if (p === "/v1/runs") return json({ runs });
+
+  let m: RegExpMatchArray | null;
+
+  // /v1/repos/{org}/{repo}/runs
+  if ((m = p.match(/^\/v1\/repos\/[^/]+\/([^/]+)\/runs$/))) {
+    return json(repoRuns[m[1]] ?? strip("ooooooooooooo"));
+  }
+  // /v1/repos/{org}/{repo}/environments
+  if (/^\/v1\/repos\/[^/]+\/[^/]+\/environments$/.test(p)) return json(environments);
+  // /v1/repos/{org}/{repo}/environments/{name}/deployments
+  if ((m = p.match(/^\/v1\/repos\/[^/]+\/[^/]+\/environments\/([^/]+)\/deployments$/))) {
+    return json(deployments[m[1]] ?? []);
+  }
+  // /v1/repos/{org}/{repo}/secrets/matrix
+  if (/^\/v1\/repos\/[^/]+\/[^/]+\/secrets\/matrix$/.test(p)) return json(secretMatrix);
+  // /v1/repos/{org}/{repo}/refs  (ref picker — not on the shot screens)
+  if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) return json({ refs: [] });
+
+  if (p === "/v1/secrets") return json(secretNames);
+
+  // run-scoped
+  if (p === `/v1/runs/${RUN_ID}`) return json(runStatus);
+  if (p === `/v1/runs/${RUN_ID}/events`)
+    return new Response(eventsBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  if (p === `/v1/runs/${RUN_ID}/artifacts`) return json([]);
+  if (p === `/v1/runs/${RUN_ID}/services`) return json([]);
+  if (/\/steps\/[^/]+\/results$/.test(p)) return json(testResults);
+  if (/\/steps\/[^/]+\/consumed$/.test(p)) return json(testConsumed);
+  if (/\/steps\/[^/]+\/workspace$/.test(p))
+    return json({ available: false, path: "", entries: [] });
+
+  // any other /v1 → benign empty 200 so nothing errors mid-capture
+  if (p.startsWith("/v1/")) return json({});
+  return null;
+}
+
+function urlOf(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.toString();
+  return (input as Request).url;
+}
+
+export function installMock() {
+  // Optional theme pin via `?theme=dark|light` — deterministic for capture.
+  // Without it, the app's normal stored/toggle theme applies.
+  const pinned = new URLSearchParams(window.location.search).get("theme");
+  if (pinned === "dark" || pinned === "light") {
+    try {
+      localStorage.setItem("scarab-theme", pinned);
+    } catch {
+      /* ignore */
+    }
+    document.documentElement.setAttribute("data-theme", pinned);
+  }
+
+  const realFetch = window.fetch.bind(window);
+  window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    let pathname = "";
+    let search = "";
+    try {
+      const u = new URL(urlOf(input), window.location.origin);
+      pathname = u.pathname;
+      search = u.search;
+    } catch {
+      /* fall through to real fetch */
+    }
+    const res = pathname ? route(pathname, search) : null;
+    if (res) return Promise.resolve(res);
+    return realFetch(input as RequestInfo, init);
+  }) as typeof window.fetch;
+
+  // EventSource — step/service log streams. Replays fixture lines then idles.
+  const RealES = window.EventSource;
+  class MockES extends EventTarget {
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSED = 2;
+    readyState = 1;
+    url: string;
+    onmessage: ((e: MessageEvent) => void) | null = null;
+    onerror: ((e: Event) => void) | null = null;
+    onopen: ((e: Event) => void) | null = null;
+    constructor(url: string | URL) {
+      super();
+      this.url = url.toString();
+      const path = (() => {
+        try {
+          return new URL(this.url, window.location.origin).pathname;
+        } catch {
+          return this.url;
+        }
+      })();
+      if (/\/steps\/[^/]+\/logs$/.test(path)) {
+        queueMicrotask(() => {
+          for (const line of testLogLines) {
+            const e = new MessageEvent("message", { data: line });
+            this.onmessage?.(e);
+            this.dispatchEvent(e);
+          }
+          // leave open (running step keeps tailing) — no onerror.
+        });
+      }
+    }
+    close() {
+      this.readyState = 2;
+    }
+  }
+  // Only intercept our own log streams; anything else falls back to real ES.
+  window.EventSource = new Proxy(RealES, {
+    construct(target, args: [string | URL, EventSourceInit?]) {
+      const url = args[0]?.toString() ?? "";
+      let path = url;
+      try {
+        path = new URL(url, window.location.origin).pathname;
+      } catch {
+        /* keep raw */
+      }
+      if (path.startsWith("/v1/runs/") && /\/logs$/.test(path)) {
+        return new MockES(args[0]) as unknown as EventSource;
+      }
+      return new target(...args);
+    },
+  });
+
+  // eslint-disable-next-line no-console
+  console.log("[scarab-mock] installed — acme fixture, dark theme");
+}

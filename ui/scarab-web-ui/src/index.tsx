@@ -14,6 +14,14 @@ import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/500.css";
 import "./styles.css";
 
+// Fixture/demo mode (`just ui-mock`): VITE_SCARAB_MOCK=1 serves an "acme" org
+// with no server — quick UI eyeballing + the docs screenshots. The dynamic
+// import keeps src/mock.ts out of the production bundle when the flag is unset.
+if (import.meta.env.VITE_SCARAB_MOCK === "1") {
+  const { installMock } = await import("./mock");
+  installMock();
+}
+
 const root = document.getElementById("root");
 if (root) {
   render(() => <App />, root);
