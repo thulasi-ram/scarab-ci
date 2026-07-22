@@ -193,6 +193,10 @@ export default function RunDetail() {
       id: a.id,
       index: i,
       cause: c.causes[a.id],
+      // The backend's authoritative verdict (running/succeeded/failed/
+      // superseded/cancelled) — the fan reads this so it never shows an
+      // abandoned attempt green; the derived flags below stay as fallback.
+      outcome: a.outcome,
       failed: a.failed,
       failure: a.failure ?? undefined,
       superseded: c.superseded.has(a.id),

@@ -2053,6 +2053,10 @@ h1, .crumb-head, .run-title {
 .dfan-card.emerald { border-left-color: var(--emerald-bright); }
 .dfan-card.danger { border-left-color: var(--danger); }
 .dfan-card.copper { border-left-color: var(--copper); }
+/* running: a running try — the cool token the node ring/logs use, so an
+   in-flight attempt reads as "in motion", not green. (--running is dark-safe;
+   the DAG canvas is always-dark, so these terminal tokens don't flip.) */
+.dfan-card.running { border-left-color: var(--running); }
 .dfan-card:hover { border-color: var(--emerald-bright); }
 .dfan-card.on {
   background: color-mix(in srgb, var(--emerald) 22%, var(--terminal-elev));

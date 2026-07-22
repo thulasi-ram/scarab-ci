@@ -164,7 +164,11 @@ export type AttemptCause = "initial" | "retry" | "rerun" | "cascade";
  *                  (started, never finished, then the step was re-armed by a
  *                  later RunRerunRequested). Distinct from failed/cancelled.
  * - `shadowed`   — succeeded attempts that are no longer the of-record latest
- *                  (a newer successful attempt replaced their role). */
+ *                  (a newer successful attempt replaced their role).
+ * NOTE: the backend's `AttemptDto.outcome` is now authoritative for
+ * running/succeeded/failed/superseded (the fan reads it directly); this
+ * derivation stays as the fallback for older events/servers, and `shadowed`
+ * (an of-record lens over successes) remains client-derived here. */
 export function attemptCauses(
   events: RunEvent[],
   step: string,

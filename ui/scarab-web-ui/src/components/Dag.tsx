@@ -37,6 +37,10 @@ export type DagTry = {
   /** 0-based order; the label is `try {index + 1}`. */
   index: number;
   cause?: AttemptCause;
+  /** The backend's authoritative per-attempt verdict (AttemptDto.outcome):
+   * `running | succeeded | failed | superseded | cancelled`. Preferred over the
+   * `failed` bool so a running/superseded/cancelled try never renders green. */
+  outcome: string;
   failed: boolean;
   failure?: string;
   /** Cut short by a rerun of an ancestor (started, never finished). */
@@ -58,13 +62,41 @@ const MAX_DECK = 3;
 const causeSuffix = (c?: AttemptCause): string =>
   c === "rerun" ? " · you reran" : c === "cascade" ? " · ⟵ rerun" : c === "retry" ? " · auto-retry" : "";
 const tryTitle = (t: DagTry): string => `try ${t.index + 1}${causeSuffix(t.cause)}`;
+// Prefer the backend's authoritative `outcome` (AttemptDto.outcome) so a
+// still-running / superseded / cancelled try is never mislabelled green. Fall
+// back to the pre-fix superseded→failed→green derivation only when `outcome` is
+// absent (an old server), so nothing regresses.
 const tryOutcome = (t: DagTry): string => {
+  switch (t.outcome) {
+    case "running":
+      return "● running";
+    case "succeeded":
+      return "✓ succeeded";
+    case "failed":
+      return `✗ failed${t.failure ? ` · ${t.failure}` : ""}`;
+    case "superseded":
+      return "⊘ superseded";
+    case "cancelled":
+      return "⊘ cancelled";
+  }
   if (t.superseded) return "⊘ superseded";
   if (t.failed) return `✗ failed${t.failure ? ` · ${t.failure}` : ""}`;
   return "✓ succeeded";
 };
-const tryTone = (t: DagTry): string =>
-  t.superseded ? "copper" : t.failed ? "danger" : "emerald";
+const tryTone = (t: DagTry): string => {
+  switch (t.outcome) {
+    case "running":
+      return "running";
+    case "succeeded":
+      return "emerald";
+    case "failed":
+      return "danger";
+    case "superseded":
+    case "cancelled":
+      return "copper";
+  }
+  return t.superseded ? "copper" : t.failed ? "danger" : "emerald";
+};
 
 /** m:ss (or h:mm:ss) elapsed since `since`, ticking off the caller's `now`. */
 function elapsed(since: number, now: number): string {
