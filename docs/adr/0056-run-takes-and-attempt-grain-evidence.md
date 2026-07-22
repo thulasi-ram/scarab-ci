@@ -211,3 +211,70 @@ verdict is rejected), but the Pod can run on as an **orphan** wasting resources.
 Tracked separately — a superseded in-flight attempt should trigger an
 executor teardown (SIGTERM + grace), and MAY emit an explicit `AttemptSuperseded`
 event for audit rather than relying solely on the derived read.
+
+## Amendment (2026-07-22): reinstate a human Retry; rerun validation; per-Take attempt scoping
+
+The 2026-07-20 amendment **rejected** a human "manual retry" ("one human control,
+not two"), collapsing every human re-execution into a Take-forking `rerun`.
+Dogfooding reversed that call. Two forces the earlier reasoning under-weighted:
+
+1. **Version proliferation.** A flaky step a human nudges three times minted
+   three Takes — three near-identical version rows for what a user reads as "the
+   same run, tried again." The Take dropdown became noise.
+2. **The user's own mental split.** "Retry this failed step" and "redo this (even
+   a green) step" are *different intents*. Forcing both to fork erased the
+   cheaper one. Giving the user the choice **is** the control the earlier
+   amendment thought it was removing.
+
+This reverses the "manual retry rejected" point **only**; the Take model, the
+derived-lens principle, and `superseded`/`shadowed`/`cascade` are unchanged.
+
+### Two human controls, split on step state (supersedes "one human control")
+
+- **Retry** — a human re-executing a **Failed** step. Produces **another Attempt
+  in the *current* Take — no fork.** It reopens the settled run
+  (`Failed → Running`) and re-arms the target **plus its dependent cascade**
+  (ADR-0027) — a Retry of `b` must re-arm the now-`Skipped` `c`, or a recovered
+  `b` would leave the pipeline stuck. It emits **`StepRetryRequested { step, by }`**
+  — an attribution/audit fact and Activity-feed entry, but **not** a Take
+  boundary (`deriveTakes` ignores it; only `RunRestartRequested` splits Takes).
+  Offered on Failed steps only.
+- **Rerun** — a human re-executing **any terminal step whose deps all Succeeded**.
+  **Forks a new Take** (`RunRestartRequested`) as before. Offered on
+  Succeeded/Failed steps; on a Failed step both controls appear (retry-in-place
+  vs redo-as-new-version — the user picks).
+
+A human Retry's target Attempt carries the `retry` cause (same strip treatment as
+an auto-retry — both are "another try in this version"); its human origin is
+witnessed by the `StepRetryRequested` event in Activity, not by a distinct chip.
+Dependent Attempts it drags along carry `cascade`, as with rerun.
+
+### Rerun validation — reject, don't silently skip (refines ADR-0027)
+
+A rerun whose **target's `needs` are not all `Succeeded`** can never run (admission
+would `dep_dead`-skip it). `restart_step` now **rejects** such a call up front —
+`RestartError::DependencyNotSatisfied { step, blocker }` → **409**, e.g. "cannot
+rerun `c`: dependency `b` has not Succeeded" — instead of forking a Take that
+just re-skips. The gate is purely on **deps**, never the target's own status:
+
+- `c` `Skipped` because dep `b` **Failed** → deps not Succeeded → **reject**.
+- a step `Skipped` by its own `when:` (deps **did** Succeed) → **allowed**; the
+  rerun replays and the still-false condition **skips it again**. Rerun does not
+  concern itself with conditions — it never force-overrides a `when:`.
+
+### Per-Take attempt scoping (fixes the read model, not the engine)
+
+The original "a Take's view = replay **up to** its boundary" made `replayTake`
+count Attempts **cumulatively from run birth** — so the latest Take showed every
+Take's attempts summed (`a`=3 where it should read 1). Corrected: a step's
+attempt count / frontier / tries-strip is scoped to the Take's **own window**
+(previous boundary → this boundary), not from birth. Status still carries
+forward cumulatively (a step not re-run in a Take keeps its prior verdict).
+Durable Attempt ids stay globally monotonic (`a1..aN`, needed for `?attempt=`
+reads); the strip displays the **per-Take positional index**, so Take 2's `a`
+reads "attempt 1" though its durable id is `a3`.
+
+A step **not re-armed** in the viewed Take (a partial rerun left it untouched)
+shows **0 attempts** for that Take and renders as a **muted/desaturated** version
+of its carried-forward status — present and green, but visibly "not part of this
+rerun" — rather than fabricating an attempt it never had.

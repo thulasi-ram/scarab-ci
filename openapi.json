@@ -1169,7 +1169,7 @@
     "/v1/runs/{id}/steps/{step}/restart": {
       "post": {
         "tags": [],
-        "summary": "Restart a step and its transitive descendants (ADR-0027 smart invalidation):\nthe target and every step depending on it are re-armed and re-run in\ndependency order; siblings and ancestors are left as-is.",
+        "summary": "Rerun a step and its transitive descendants (ADR-0027 smart invalidation) —\n**forks a new Take** (ADR-0056). The target and every step depending on it are\nre-armed and re-run in dependency order; siblings and ancestors are left\nas-is. Rejected `409` if the target's dependencies have not all succeeded (it\ncould not run).",
         "operationId": "restart_step",
         "parameters": [
           {
@@ -1193,10 +1193,13 @@
         ],
         "responses": {
           "202": {
-            "description": "restart accepted"
+            "description": "rerun accepted"
           },
           "404": {
             "description": "no such run or step"
+          },
+          "409": {
+            "description": "target's dependencies have not succeeded"
           }
         }
       }
@@ -1287,6 +1290,44 @@
           },
           "404": {
             "description": "no such step, or results ingest disabled"
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/steps/{step}/retry": {
+      "post": {
+        "tags": [],
+        "summary": "Retry a **Failed** step (ADR-0056 amendment) — another Attempt **in the\ncurrent Take** (no fork). Re-arms the target and its dependent cascade;\nrejected `409` if the step is not Failed (use rerun instead).",
+        "operationId": "retry_step",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "retry accepted"
+          },
+          "404": {
+            "description": "no such run or step"
+          },
+          "409": {
+            "description": "step is not failed"
           }
         }
       }
@@ -1618,7 +1659,7 @@
               "string",
               "null"
             ],
-            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`."
+            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`\n| `config`."
           },
           "id": {
             "type": "string"

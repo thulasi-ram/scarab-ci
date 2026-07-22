@@ -745,9 +745,11 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Restart a step and its transitive descendants (ADR-0027 smart invalidation):
-         *     the target and every step depending on it are re-armed and re-run in
-         *     dependency order; siblings and ancestors are left as-is.
+         * Rerun a step and its transitive descendants (ADR-0027 smart invalidation) —
+         *     **forks a new Take** (ADR-0056). The target and every step depending on it are
+         *     re-armed and re-run in dependency order; siblings and ancestors are left
+         *     as-is. Rejected `409` if the target's dependencies have not all succeeded (it
+         *     could not run).
          */
         post: operations["restart_step"];
         delete?: never;
@@ -782,6 +784,27 @@ export interface paths {
          *     fence (a re-drive overwrites deterministically, ADR-0021).
          */
         post: operations["ingest_step_results"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{id}/steps/{step}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry a **Failed** step (ADR-0056 amendment) — another Attempt **in the
+         *     current Take** (no fork). Re-arms the target and its dependent cascade;
+         *     rejected `409` if the step is not Failed (use rerun instead).
+         */
+        post: operations["retry_step"];
         delete?: never;
         options?: never;
         head?: never;
@@ -919,7 +942,10 @@ export interface components {
              *     succeeded — that divergence is exactly the retry story worth showing.
              */
             failed: boolean;
-            /** @description Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`. */
+            /**
+             * @description Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`
+             *     | `config`.
+             */
             failure?: string | null;
             id: string;
             /**
@@ -2547,7 +2573,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description restart accepted */
+            /** @description rerun accepted */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -2556,6 +2582,13 @@ export interface operations {
             };
             /** @description no such run or step */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description target's dependencies have not succeeded */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2626,6 +2659,43 @@ export interface operations {
             };
             /** @description no such step, or results ingest disabled */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retry_step: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description retry accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such run or step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description step is not failed */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

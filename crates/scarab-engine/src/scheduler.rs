@@ -113,13 +113,22 @@ pub enum SchedulerError {
     BadPayload(String),
 }
 
-/// Errors from a restart request.
+/// Errors from a restart/retry request.
 #[derive(Debug, thiserror::Error)]
 pub enum RestartError {
     #[error(transparent)]
     Db(#[from] DbError),
     #[error("no such step {0:?} in run")]
     StepNotFound(StepId),
+    /// Rerun rejected: the target cannot run because a dependency has not
+    /// Succeeded (ADR-0056 amendment). Admission would just `dep_dead`-skip it,
+    /// so forking a Take would be a no-op — reject up front instead.
+    #[error("cannot rerun {step:?}: dependency {blocker:?} has not succeeded")]
+    DependencyNotSatisfied { step: StepId, blocker: StepId },
+    /// Retry rejected: retry is for **Failed** steps only (ADR-0056 amendment).
+    /// A non-failed step is reran (a Take fork), not retried.
+    #[error("cannot retry {step:?}: not a failed step (is {status:?})")]
+    NotFailed { step: StepId, status: StepStatus },
 }
 
 /// Restart a step (ADR-0027): re-arm `target` and every step that transitively
@@ -144,8 +153,19 @@ pub async fn restart_step(
     by: Option<String>,
 ) -> Result<(), RestartError> {
     let steps = db.steps_of_run(run).await?;
-    if !steps.iter().any(|s| &s.step == target) {
+    let Some(target_step) = steps.iter().find(|s| &s.step == target) else {
         return Err(RestartError::StepNotFound(target.clone()));
+    };
+    // Rerun validation (ADR-0056 amendment): the target must be runnable — all
+    // its `needs` Succeeded. Otherwise admission would `dep_dead`-skip it, so a
+    // fork would be a no-op; reject instead of silently skipping. The gate is on
+    // deps only, never the target's own status (a `when:`-skipped step whose
+    // deps DID succeed is rerunnable — it replays and re-skips).
+    if let Some(blocker) = unsatisfied_dep(target_step, &steps) {
+        return Err(RestartError::DependencyNotSatisfied {
+            step: target.clone(),
+            blocker,
+        });
     }
     let invalid = crate::invalidation_set(target, &steps);
 
@@ -168,6 +188,98 @@ pub async fn restart_step(
     })
     .await?;
 
+    // Fresh service instance per Take (ADR-0058): a Rerun opens a new Take, so
+    // birth a new generation of every shared service keyed by the new take. The
+    // prior Take's instances are torn down by `reconcile_services`, and the new
+    // instances start empty — a Rerun never sees the prior Take's writes. Only
+    // the birth (durable intent) happens here; launch/teardown ride the executor
+    // in the scheduler's service reconcile. (A Retry stays in-Take, so it does
+    // NOT bump the service generation — see `retry_step`.)
+    let svc_rows = db.run_services(run).await?;
+    if let Some(cur) = svc_rows.iter().map(|r| r.take).max() {
+        let names: std::collections::BTreeSet<&str> = svc_rows
+            .iter()
+            .filter(|r| r.take == cur)
+            .map(|r| r.name.as_str())
+            .collect();
+        for name in names {
+            db.create_run_service(run, cur + 1, name, now).await?;
+        }
+    }
+
+    rearm_invalidation_set(db, clock, run, target, &invalid, &steps).await
+}
+
+/// Retry a **Failed** step (ADR-0056 amendment 2026-07-22): re-execute it (and
+/// its dependent cascade) as fresh Attempts **within the current Take** — NOT a
+/// Take fork. Unlike [`restart_step`] it emits `StepRetryRequested` (an
+/// attribution/audit fact `deriveTakes` ignores) rather than the Take-boundary
+/// `RunRestartRequested`, and it does not bump the shared-service generation
+/// (the Take, and thus its services, is unchanged). Failed steps only — a
+/// non-failed step is *reran* (a fork), not retried.
+pub async fn retry_step(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    target: &StepId,
+    by: Option<String>,
+) -> Result<(), RestartError> {
+    let steps = db.steps_of_run(run).await?;
+    let Some(target_step) = steps.iter().find(|s| &s.step == target) else {
+        return Err(RestartError::StepNotFound(target.clone()));
+    };
+    if target_step.status != StepStatus::Failed {
+        return Err(RestartError::NotFailed {
+            step: target.clone(),
+            status: target_step.status,
+        });
+    }
+    let invalid = crate::invalidation_set(target, &steps);
+
+    // Attribution/audit fact — NOT a Take boundary (`deriveTakes` ignores it),
+    // so the retried attempts land in the current Take's history.
+    let now = clock.now().await;
+    let mut invalidated: Vec<StepId> = invalid.iter().cloned().collect();
+    invalidated.sort_by(|a, b| a.0.cmp(&b.0));
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::StepRetryRequested {
+            target: target.clone(),
+            invalidated,
+            by,
+        },
+        at: now,
+    })
+    .await?;
+
+    rearm_invalidation_set(db, clock, run, target, &invalid, &steps).await
+}
+
+/// The first `need` of `step` that has not `Succeeded` (so `step` cannot run),
+/// or `None` when every dependency succeeded. Deterministic order (the step's
+/// declared `needs` order) so the rejection names a stable blocker.
+fn unsatisfied_dep(step: &StepRun, steps: &[StepRun]) -> Option<StepId> {
+    let status_of = |id: &StepId| steps.iter().find(|s| &s.step == id).map(|s| s.status);
+    step.needs
+        .iter()
+        .find(|d| status_of(d) != Some(StepStatus::Succeeded))
+        .cloned()
+}
+
+/// Re-arm the invalidation set to `Pending` (superseding any in-flight attempt),
+/// reopen a settled run, and clear the target's input signature so it re-runs.
+/// Shared by rerun ([`restart_step`]) and retry ([`retry_step`]); the caller has
+/// already emitted the boundary/attribution event (and, for rerun, bumped the
+/// service generation).
+async fn rearm_invalidation_set(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    target: &StepId,
+    invalid: &std::collections::HashSet<StepId>,
+    steps: &[StepRun],
+) -> Result<(), RestartError> {
     // Force the explicit target to re-run: clear its stored input signature so
     // admission never mistakes it for an unchanged descendant and skips it
     // (ADR-0027). Its descendants keep their signatures, so they skip-if-unchanged
@@ -181,30 +293,12 @@ pub async fn restart_step(
         }
     }
 
-    // Fresh service instance per Take (ADR-0058): a Rerun opens a new Take, so
-    // birth a new generation of every shared service keyed by the new take. The
-    // prior Take's instances are torn down by `reconcile_services`, and the new
-    // instances start empty — a Rerun never sees the prior Take's writes. Only
-    // the birth (durable intent) happens here; launch/teardown ride the executor
-    // in the scheduler's service reconcile.
-    let svc_rows = db.run_services(run).await?;
-    if let Some(cur) = svc_rows.iter().map(|r| r.take).max() {
-        let names: std::collections::BTreeSet<&str> = svc_rows
-            .iter()
-            .filter(|r| r.take == cur)
-            .map(|r| r.name.as_str())
-            .collect();
-        for name in names {
-            db.create_run_service(run, cur + 1, name, now).await?;
-        }
-    }
-
     // Re-arm each invalidated step (terminal or in-flight) to Pending. A peer
     // that already moved it is a benign Conflict we skip. An in-flight step
     // re-armed here has its running attempt SUPERSEDED (ADR-0056 amendment):
     // collect its Pod for teardown so it does not orphan.
     let mut superseded: Vec<SupersededAttempt> = Vec::new();
-    for s in &steps {
+    for s in steps {
         if invalid.contains(&s.step) && s.status != StepStatus::Pending {
             match db
                 .record_step_transition(run, &s.step, s.status, StepStatus::Pending)

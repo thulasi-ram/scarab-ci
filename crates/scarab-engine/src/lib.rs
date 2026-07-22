@@ -22,9 +22,9 @@ pub mod scheduler;
 
 pub use ports::{Clock, Db, Executor, LogChunks};
 pub use scheduler::{
-    cancel_run_request, record_gate_approval, release_gate, restart_step, RestartError, Scheduler,
-    SchedulerError, SupersedeTeardown, SupersededAttempt, Supervision, CANCEL_RUN, LAUNCH_STEP,
-    MAX_DELIVERY_ATTEMPTS, SUPERSEDE_TEARDOWN, RUN_STATUS_CHANGED,
+    cancel_run_request, record_gate_approval, release_gate, restart_step, retry_step, RestartError,
+    Scheduler, SchedulerError, SupersedeTeardown, SupersededAttempt, Supervision, CANCEL_RUN,
+    LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, SUPERSEDE_TEARDOWN, RUN_STATUS_CHANGED,
 };
 
 use serde::{Deserialize, Serialize};
@@ -690,6 +690,17 @@ pub enum EventPayload {
     /// not re-derivation; `by` is the acting principal's subject (the
     /// who-restarted-this audit fact, `None` only when auth is off).
     RunRestartRequested {
+        target: StepId,
+        invalidated: Vec<StepId>,
+        by: Option<String>,
+    },
+    /// A human retried a **Failed** step (ADR-0056 amendment 2026-07-22) — an
+    /// attribution/audit fact, **NOT a Take boundary**. A Retry re-executes the
+    /// target (and its dependent cascade) as fresh Attempts *within the current
+    /// Take* — `deriveTakes` deliberately ignores this event, so only
+    /// `RunRestartRequested` splits Takes. `invalidated` is the resolved cascade
+    /// (target + transitive descendants); `by` is the acting principal.
+    StepRetryRequested {
         target: StepId,
         invalidated: Vec<StepId>,
         by: Option<String>,

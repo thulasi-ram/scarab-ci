@@ -805,6 +805,9 @@ pub enum ApiError {
     Unauthorized,
     Forbidden,
     BadRequest(String),
+    /// The request conflicts with the resource's current state (e.g. rerunning a
+    /// step whose dependency has not succeeded, or retrying a non-failed step).
+    Conflict(String),
     Db(DbError),
 }
 
@@ -835,6 +838,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "insufficient role").into_response(),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m).into_response(),
             ApiError::Db(e) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response()
             }
@@ -1748,9 +1752,27 @@ async fn get_service_logs(
     Ok(Sse::new(replay_stream.chain(live).boxed()))
 }
 
-/// Restart a step and its transitive descendants (ADR-0027 smart invalidation):
-/// the target and every step depending on it are re-armed and re-run in
-/// dependency order; siblings and ancestors are left as-is.
+/// Map a rerun/retry outcome to an HTTP status. `202` on success; `404` for an
+/// unknown step; `409` when the request conflicts with the step's state (ADR-0056
+/// amendment: rerunning a step whose dependency has not succeeded, or retrying a
+/// non-failed step).
+fn restart_outcome(res: Result<(), RestartError>) -> Result<StatusCode, ApiError> {
+    match res {
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
+        Err(e @ RestartError::DependencyNotSatisfied { .. }) => {
+            Err(ApiError::Conflict(e.to_string()))
+        }
+        Err(e @ RestartError::NotFailed { .. }) => Err(ApiError::Conflict(e.to_string())),
+        Err(RestartError::Db(e)) => Err(ApiError::Db(e)),
+    }
+}
+
+/// Rerun a step and its transitive descendants (ADR-0027 smart invalidation) —
+/// **forks a new Take** (ADR-0056). The target and every step depending on it are
+/// re-armed and re-run in dependency order; siblings and ancestors are left
+/// as-is. Rejected `409` if the target's dependencies have not all succeeded (it
+/// could not run).
 #[utoipa::path(
     post,
     path = "/v1/runs/{id}/steps/{step}/restart",
@@ -1759,8 +1781,9 @@ async fn get_service_logs(
         ("step" = String, Path, description = "step id")
     ),
     responses(
-        (status = 202, description = "restart accepted"),
-        (status = 404, description = "no such run or step")
+        (status = 202, description = "rerun accepted"),
+        (status = 404, description = "no such run or step"),
+        (status = 409, description = "target's dependencies have not succeeded")
     )
 )]
 async fn restart_step(
@@ -1770,23 +1793,56 @@ async fn restart_step(
 ) -> Result<StatusCode, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    // Bind the principal (ADR-0056): a restart is a Take boundary and the
+    // Bind the principal (ADR-0056): a rerun is a Take boundary and the
     // event it emits carries WHO pressed it — the same attribution pattern as
     // gate approval.
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    match scarab_engine::restart_step(
-        &*st.db,
-        &*st.clock,
-        &run,
-        &StepId(step),
-        Some(principal.subject),
+    restart_outcome(
+        scarab_engine::restart_step(
+            &*st.db,
+            &*st.clock,
+            &run,
+            &StepId(step),
+            Some(principal.subject),
+        )
+        .await,
     )
-    .await
-    {
-        Ok(()) => Ok(StatusCode::ACCEPTED),
-        Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
-        Err(RestartError::Db(e)) => Err(ApiError::Db(e)),
-    }
+}
+
+/// Retry a **Failed** step (ADR-0056 amendment) — another Attempt **in the
+/// current Take** (no fork). Re-arms the target and its dependent cascade;
+/// rejected `409` if the step is not Failed (use rerun instead).
+#[utoipa::path(
+    post,
+    path = "/v1/runs/{id}/steps/{step}/retry",
+    params(
+        ("id" = String, Path, description = "run id"),
+        ("step" = String, Path, description = "step id")
+    ),
+    responses(
+        (status = 202, description = "retry accepted"),
+        (status = 404, description = "no such run or step"),
+        (status = 409, description = "step is not failed")
+    )
+)]
+async fn retry_step(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, step)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let run = RunId(id);
+    let scope = run_scope(&st, &run).await;
+    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    restart_outcome(
+        scarab_engine::retry_step(
+            &*st.db,
+            &*st.clock,
+            &run,
+            &StepId(step),
+            Some(principal.subject),
+        )
+        .await,
+    )
 }
 
 /// Cancel a run (ADR-0054): drive its non-terminal steps and the run to
@@ -4558,6 +4614,9 @@ async fn approve_gate(
     {
         Ok(()) => {}
         Err(RestartError::StepNotFound(_)) => return Err(ApiError::NotFound),
+        Err(e @ (RestartError::DependencyNotSatisfied { .. } | RestartError::NotFailed { .. })) => {
+            return Err(ApiError::Conflict(e.to_string()))
+        }
         Err(RestartError::Db(e)) => return Err(ApiError::Db(e)),
     }
 
@@ -4608,6 +4667,9 @@ async fn approve_gate(
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => {}
         Err(RestartError::StepNotFound(_)) => return Err(ApiError::NotFound),
+        Err(e @ (RestartError::DependencyNotSatisfied { .. } | RestartError::NotFailed { .. })) => {
+            return Err(ApiError::Conflict(e.to_string()))
+        }
         Err(RestartError::Db(e)) => return Err(ApiError::Db(e)),
     }
 
@@ -4689,6 +4751,9 @@ async fn release_gate_external(
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
         Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
+        Err(e @ (RestartError::DependencyNotSatisfied { .. } | RestartError::NotFailed { .. })) => {
+            Err(ApiError::Conflict(e.to_string()))
+        }
         Err(RestartError::Db(e)) => Err(ApiError::Db(e)),
     }
 }
@@ -5333,6 +5398,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         attach_step,
         debug_pod_step,
         restart_step,
+        retry_step,
         cancel_run,
         list_artifacts,
         download_artifact,
@@ -5420,6 +5486,7 @@ fn router_inner(state: AppState) -> Router {
         .route("/v1/runs/{id}/events", get(get_events))
         .route("/v1/runs/{id}/logs", get(get_logs))
         .route("/v1/runs/{id}/steps/{step}/restart", post(restart_step))
+        .route("/v1/runs/{id}/steps/{step}/retry", post(retry_step))
         .route("/v1/runs/{id}/cancel", post(cancel_run))
         .route("/v1/runs/{id}/artifacts", get(list_artifacts))
         .route("/v1/runs/{id}/artifacts/{*name}", get(download_artifact))

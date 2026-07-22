@@ -6,8 +6,8 @@
 //! descendant's Pod — while the run itself stays alive.
 
 use scarab_engine::{
-    restart_step, Attempt, AttemptId, Db, RunId, RunStatus, Scheduler, StepId, StepSpec,
-    StepStatus, Timestamp,
+    restart_step, retry_step, Attempt, AttemptId, Db, EventPayload, RestartError, RunId, RunStatus,
+    Scheduler, StepId, StepSpec, StepStatus, Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
@@ -139,5 +139,126 @@ async fn rerun_without_in_flight_descendant_tears_down_nothing() {
     assert!(
         exec.cancelled_handles().is_empty(),
         "no in-flight descendant ⇒ no teardown"
+    );
+}
+
+/// ADR-0056 amendment (2026-07-22): a Rerun of a step whose dependency has NOT
+/// succeeded is rejected up front (it could only be `dep_dead`-skipped), rather
+/// than forking a no-op Take.
+#[tokio::test]
+async fn rerun_rejects_target_with_unsatisfied_dependency() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-dep".into());
+    let (b, c) = (StepId("b".into()), StepId("c".into()));
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
+        .await
+        .unwrap();
+    // b failed; c never ran (dead-dep skipped).
+    db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Failed)
+        .await
+        .unwrap();
+    db.record_step_transition(&run, &c, StepStatus::Pending, StepStatus::Skipped)
+        .await
+        .unwrap();
+    db.seed_run(&run, RunStatus::Failed);
+
+    let clock = FakeClock::new(1_000);
+    let err = restart_step(&db, &clock, &run, &c, Some("alice".into()))
+        .await
+        .expect_err("rerun of c must be rejected — b has not succeeded");
+    match err {
+        RestartError::DependencyNotSatisfied { step, blocker } => {
+            assert_eq!(step, c);
+            assert_eq!(blocker, b);
+        }
+        other => panic!("expected DependencyNotSatisfied, got {other:?}"),
+    }
+    // No Take boundary was forked.
+    assert!(
+        !db.events(&run)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, EventPayload::RunRestartRequested { .. })),
+        "a rejected rerun must not fork a Take"
+    );
+}
+
+/// Retry is Failed-only: retrying a Succeeded step is rejected (rerun it instead).
+#[tokio::test]
+async fn retry_rejects_non_failed_step() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-retry-ok".into());
+    let b = StepId("b".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Succeeded)
+        .await
+        .unwrap();
+    db.seed_run(&run, RunStatus::Succeeded);
+
+    let clock = FakeClock::new(1_000);
+    let err = retry_step(&db, &clock, &run, &b, Some("alice".into()))
+        .await
+        .expect_err("retry of a succeeded step must be rejected");
+    assert!(matches!(err, RestartError::NotFailed { status, .. } if status == StepStatus::Succeeded));
+}
+
+/// A Retry of a Failed step re-arms it and its dependent cascade **in the current
+/// Take**: it emits `StepRetryRequested` (an attribution fact), NOT the
+/// Take-boundary `RunRestartRequested`, and reopens the settled run.
+#[tokio::test]
+async fn retry_reruns_in_take_without_forking() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-retry".into());
+    let (b, c) = (StepId("b".into()), StepId("c".into()));
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
+        .await
+        .unwrap();
+    // b failed; c dead-dep skipped; run settled Failed.
+    db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Failed)
+        .await
+        .unwrap();
+    db.record_step_transition(&run, &c, StepStatus::Pending, StepStatus::Skipped)
+        .await
+        .unwrap();
+    db.seed_run(&run, RunStatus::Failed);
+
+    let clock = FakeClock::new(1_000);
+    retry_step(&db, &clock, &run, &b, Some("alice".into()))
+        .await
+        .expect("retry_step");
+
+    // Cascade re-armed: b (target) and c (dependent) both back to Pending.
+    let steps = db.steps_of_run(&run).await.unwrap();
+    let status = |id: &StepId| steps.iter().find(|s| &s.step == id).unwrap().status;
+    assert_eq!(status(&b), StepStatus::Pending, "b re-armed");
+    assert_eq!(status(&c), StepStatus::Pending, "dependent c re-armed");
+    // Run reopened so admission picks the re-armed steps back up.
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Running));
+
+    // The attribution fact is present, but NO Take boundary was forked.
+    let events = db.events(&run).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(&e.kind,
+            EventPayload::StepRetryRequested { target, by, .. }
+                if target == &b && by.as_deref() == Some("alice"))),
+        "StepRetryRequested recorded with attribution"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventPayload::RunRestartRequested { .. })),
+        "a Retry must NOT fork a Take"
     );
 }
