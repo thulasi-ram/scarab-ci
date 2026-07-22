@@ -283,3 +283,124 @@ A step **not re-armed** in the viewed Take (a partial rerun left it untouched)
 shows **0 attempts** for that Take and renders as a **muted/desaturated** version
 of its carried-forward status — present and green, but visibly "not part of this
 rerun" — rather than fabricating an attempt it never had.
+
+## Amendment (2026-07-23): rerun voids in-flight work; superseded is intrinsic-terminal; naming; UI direction
+
+A design session crystallizing the re-execution model settled questions the prior
+two amendments left open or had decided the other way — whether Rerun requires a
+terminal target, how a closed version paints an attempt still running when an
+ancestor was reran over it, the difference between a step **cut short** and one that
+**never started**, and the canonical names — and records the (not-yet-built) UI
+working spec so it is not lost. The **only** execution-semantics change is a Pod
+**teardown** (it adopts the orphan-Pod follow-up from the 2026-07-20 amendment);
+everything else is read-model, vocabulary, and one new audit event.
+
+### Rerun is allowed on any target — in-flight work inside the fork is voided
+
+The "Rerun re-executes a **terminal** step" qualifier (both prior amendments) is
+**retired**. Rerun is offered on **any** target, terminal or not: `restart_step`
+already carries no terminal guard, and the 2026-07-22 validation gate was always on
+the **prerequisites**, never the target's own status. Rerunning a step whose subtree
+is still executing is legal.
+
+The Rerun re-arms its **invalidation set** (target + transitive dependents,
+ADR-0027). Any member holding a **live Pod is voided (superseded)**: the Pod is torn
+down (SIGTERM + grace) and its Attempt is marked `Superseded`. In-flight steps
+**outside** the invalidation set — unrelated siblings — are **untouched**. This
+targeted void is strictly better than the GitHub Actions posture, which forces you to
+**cancel the whole run** just to rerun one step. It is safe under the monotonic fence
+(ADR-0021): a late verdict from a torn-down Pod is rejected. The at-least-once caveat
+for non-cooperating sinks (ADR-0047) is **unchanged** — and blocking Rerun would not
+fix it (cancel-then-rerun double-fires the same way).
+
+This resolves the "orphan Pod" follow-up from the 2026-07-20 amendment: the
+superseded in-flight Attempt **must** now trigger an executor teardown, and
+`AttemptSuperseded` becomes a real event (below), not a MAY.
+
+### Superseded is an intrinsic terminal outcome, shown in every view
+
+This **revises** the original "snapshot-at-boundary" rule.
+
+**Principle (the rule every view obeys):** *a version shows each step's own outcome
+within that version — never a transient, and never a different attempt's outcome.*
+
+A voided Attempt was **cut short**; `superseded` is **its own** terminal fate, not
+borrowed from the re-execution that displaced it. So a closed version shows a voided
+Attempt as **superseded** — **not** as "running at the press instant". "Running" is a
+transient the Attempt merely passed through: technically true, operationally useless
+(no one wants a permanently-spinning step inside a finished version).
+
+The original anti-**absorption** concern is **not** relaxed: a re-execution's success
+— a *later* Attempt — must never be painted onto the earlier version. That would be
+showing a *different* Attempt's outcome, which the principle forbids. Superseded is
+not absorption; it is the Attempt's own honest terminal state.
+
+Consequence: the `finishedInTake` straddling affordance is **retired for voided
+Attempts** — a voided Attempt never finishes. "Running-at-boundary → finished later"
+survives **only** for genuinely **carried-forward** (non-invalidated) Attempts: an
+unrelated sibling that was mid-flight at the press and completes on its own, outside
+the fork.
+
+### "Not run" is a distinct terminal state
+
+A step that **never started**, in a version superseded **before its turn**, is
+**not run** — *not* `Skipped` (which means a `when:` was false or a dependency died)
+and *not* `Pending` (which implies a future that will not happen in *this* version).
+It is distinct from `Superseded`, which requires an in-flight Attempt that was cut
+short. The distinction is operationally real: a superseded step **had a live Pod** and
+may have partially side-effected; a not-run step **did nothing**.
+
+Worked example — pipeline `a → b → {c, d} → e` (`c` and `d` each need `b`; `e` needs
+both `c` and `d`). At the press: `b` succeeded, `c` and `d` running, `e` pending.
+Rerun from `b`:
+
+- **v1** (the version being forked from) reads
+  `a ✓ · b ✓ · c ⊘ superseded · d ⊘ superseded · e — not run`. `b` shows its **own**
+  success; `c`/`d` held live Pods and were cut short; `e` never started.
+- **v2** re-runs `b`, `c`, `d`, `e` fresh, with `a` carried forward.
+
+### Naming
+
+Two controls, split by what they fork:
+
+- **Rerun** — forks a new run **version** (Take). Backend `rerun_step`; event
+  `RunRerunRequested`; error `RerunError`.
+- **Reattempt** — another **Attempt in the same version**, **failed-step-only**.
+  Backend `reattempt_step`; event `StepReattemptRequested`; error `ReattemptError`.
+  **"Retry" is UI microcopy only** — the button label, never a code or event name.
+
+Both persisted events are **serde-aliased** to their prior strings
+(`RunRestartRequested` / `StepRetryRequested`) — **zero migration**. New event
+**`AttemptSuperseded { step, attempt, by }`**. New per-Attempt outcome enum
+**`AttemptOutcome { Running, Succeeded, Failed, Superseded, Cancelled }`**, exposed
+**additively** as `outcome` on `AttemptDto` (`shadowed` stays a *flag* on a succeeded
+Attempt, not an outcome — see the 2026-07-20 amendment).
+
+### UI direction (working spec — not yet built)
+
+Recorded so the design is not lost; nothing here is implemented. One coherent surface
+that is really a **3-axis selector — version × step × try** — feeding five evidence
+surfaces (Logs / Results / Outputs / Workspace, plus run-level Artifacts). Each
+control is chosen by the **cardinality** of its axis:
+
+- **version** grows unbounded → a persistent left **rail** (a list, not a dropdown).
+- **step** → the **DAG as a pure status map**: a status ring plus an `×N` badge.
+  **No history is encoded in the graph** — the DAG carries *shape and current
+  status*, never version or attempt history.
+- **try** is a small ordered set → an **attempts filmstrip** in the evidence-pane
+  header: one **outcome-shaped marker** per try, the active one enlarged and labeled.
+  A run of identical auto-reattempts may collapse to a single marker with a count;
+  the strip scales to any N.
+
+The evidence pane carries a **permanent coordinate stamp** — `step · try · version` —
+and must distinguish **per-try** evidence from **of-record** resolution:
+
+- **Per-try** (Logs, Workspace): each try has its own.
+- **Of-record** (Outputs, Artifacts): the **latest *successful*** Attempt, which may
+  be a **different try** than the one selected. A failed try's Outputs must say
+  **"nothing of record here"** — never render blank in a way that reads as success.
+
+A design-study artifact explored three selector variations
+(version-tabs / history-rail / timeline) plus a live coupled screen; the
+**rail + filmstrip** is the chosen direction. This supersedes the 2026-07-20
+"version dropdown + tries strip" zoom sketch.
