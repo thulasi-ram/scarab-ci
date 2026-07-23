@@ -750,6 +750,7 @@ export default function RunDetail() {
                 tries={stripTries()}
                 activeAttempt={stripActiveAttempt()}
                 onAttemptSelect={setSelAttempt}
+                versionLabel={viewedLabel()}
                 frontierAttempt={sel() ? takeView()?.frontier[sel()!] ?? null : null}
                 deadLettered={r().status === "dead_lettered"}
                 canDebug={canShell()}

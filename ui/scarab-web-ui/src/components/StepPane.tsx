@@ -18,6 +18,7 @@ import {
   type Attempt,
 } from "../api/client";
 import type { RunEvent } from "../api/client";
+import { ofRecordAttemptId } from "../takes";
 import Icon from "./Icon";
 import AttemptsFilmstrip, { type FilmstripTry } from "./AttemptsFilmstrip";
 
@@ -55,6 +56,10 @@ export default function StepPane(props: {
   activeAttempt: string | null;
   /** Pick a try in the filmstrip — scopes every tab to `(step, attempt)`. */
   onAttemptSelect: (id: string | null) => void;
+  /** The viewed version's label ("latest" or a rerun label). The third
+   * coordinate in the pane's permanent stamp (`step · try N · version`) — the
+   * caller passes its `viewedLabel()`. */
+  versionLabel: string;
   /** Viewing a closed Take: pin the strip's default to this frontier attempt
    * and mark attempts beyond it as from a later take. */
   frontierAttempt?: string | null;
@@ -90,6 +95,37 @@ export default function StepPane(props: {
     if (!list.length) return null;
     const want = props.attempt ?? props.frontierAttempt ?? null;
     return list.find((a) => a.id === want) ?? list[list.length - 1];
+  };
+
+  // The selected step didn't run in the viewed version — the caller's filmstrip
+  // (already windowed to this version's tries) is empty. Both a time-travel
+  // `not_run` step (re-armed but never executed in a superseded version) and a
+  // not-yet-launched step land here. Its tabs read a short "didn't run / nothing
+  // of record" line instead of a stale or empty-looking shell (ADR-0056 §3:
+  // never render blank-that-reads-as-success).
+  const notRun = (): boolean => !!props.step && props.tries.length === 0;
+
+  // The 1-based try number of the scoped attempt within this version's attempts
+  // — the coordinate stamp's "try N". Null when nothing ran here (not-run) so
+  // the stamp drops the try segment rather than naming a stale attempt.
+  const scopedTryN = (): number | null => {
+    if (notRun()) return null;
+    const a = scoped();
+    if (!a) return null;
+    const i = attemptsOf().findIndex((x) => x.id === a.id);
+    return i < 0 ? null : i + 1;
+  };
+
+  // Of-record (ADR-0056 §3): the Outputs tab shows the latest SUCCESSFUL attempt
+  // WITHIN THE VIEWED VERSION, not the selected try — so a failed/superseded/
+  // running selected try still surfaces the values a downstream step would read.
+  // `attemptsOf()` is already windowed to this version; a not-run step (or one
+  // with no success here) has nothing of record.
+  const ofRecordTry = (): string | null =>
+    notRun() ? null : ofRecordAttemptId(attemptsOf());
+  const ofRecordIndex = (): number => {
+    const rec = ofRecordTry();
+    return rec ? attemptsOf().findIndex((a) => a.id === rec) : -1;
   };
 
   // Reset per-step view state when the DAG selection moves.
@@ -133,7 +169,9 @@ export default function StepPane(props: {
   createEffect(() => {
     const s = stepId();
     const a = scoped();
-    if (!s || !a || tab() !== "logs") return;
+    // A not-run step's `scoped()` may resolve to a stale attempt from a LATER
+    // version — never stream it; the Logs tab shows the not-run line instead.
+    if (!s || !a || notRun() || tab() !== "logs") return;
     const key = logKey(s, a.id);
     if (streams.has(key)) return;
     const close = streamStepLogs(props.runId, s, {
@@ -158,16 +196,33 @@ export default function StepPane(props: {
       .filter((r) => r.line.length > 0);
   };
 
-  // --- Results / Outputs / Workspace: attempt-scoped fetches (ADR-0056). ---
+  // --- Results / Logs / Workspace: fetches scoped to the SELECTED try
+  // (`scoped()`), ADR-0056. Outputs read a DIFFERENT (of-record) attempt below. ---
   const evidenceArg = () => {
     const s = stepId();
     const a = scoped();
-    return s ? { run: props.runId, step: s, attempt: a?.id } : null;
+    // Not-run in this version → no per-try evidence to fetch (the tabs render a
+    // "didn't run" line); skip the request rather than pull a stale attempt.
+    return s && !notRun() ? { run: props.runId, step: s, attempt: a?.id } : null;
   };
   const [results] = createResource(evidenceArg, (a) =>
     getStepResults(a.run, a.step, a.attempt).catch(() => []),
   );
-  const [consumed] = createResource(evidenceArg, (a) =>
+
+  // Outputs are OF-RECORD, not per-try (ADR-0056 §3): they resolve to the of-
+  // record attempt (latest success in this version) via a dedicated arg/resource
+  // pair. Null (no success, or not-run) simply doesn't fetch — the tab shows the
+  // of-record empty copy. The interpolation view AND the "built on …" consumed
+  // line both read these, so what a downstream step would see is what shows.
+  const outputsArg = () => {
+    const s = stepId();
+    const rec = ofRecordTry();
+    return s && rec ? { run: props.runId, step: s, attempt: rec } : null;
+  };
+  const [outResults] = createResource(outputsArg, (a) =>
+    getStepResults(a.run, a.step, a.attempt).catch(() => []),
+  );
+  const [outConsumed] = createResource(outputsArg, (a) =>
     getConsumed(a.run, a.step, a.attempt).catch(() => null),
   );
   const wsArg = () => {
@@ -212,7 +267,12 @@ export default function StepPane(props: {
 
   // Fresh evidence is on the way when the pulse is live or any tab's fetch is in
   // flight — drives the tab-bar spinner.
-  const loading = () => switching() || results.loading || consumed.loading || ws.loading;
+  const loading = () =>
+    switching() ||
+    results.loading ||
+    outResults.loading ||
+    outConsumed.loading ||
+    ws.loading;
 
   // Shimmer stand-in for the log body during a switch. Cached tries swap
   // instantly and often look near-identical (both cargo output) — the skeleton
@@ -255,12 +315,23 @@ export default function StepPane(props: {
       >
         {(s) => (
           <>
-            {/* Evidence header = the attempts filmstrip (the try axis, moved out
-                of the graph — ADR-0056 amendment) above the tab row. The strip's
-                enlarged marker names the active try; the tabs below scope to it.
-                A spinner on the right is the only cue that a switch took effect
-                and fresh evidence is loading. Dead-letter, being terminal + rare,
-                keeps a badge here. */}
+            {/* Evidence header. A permanent coordinate stamp names WHERE you are
+                — step · try N · version — so the evidence below never floats
+                context-free (redesign stage 4). Beneath it the attempts filmstrip
+                (the try axis, moved out of the graph — ADR-0056 amendment) sits
+                above the tab row: its enlarged marker names the active try; the
+                tabs below scope to it. A spinner on the right is the only cue
+                that a switch took effect and fresh evidence is loading. Dead-
+                letter, being terminal + rare, keeps a badge here. */}
+            <div class="coord-stamp mono">
+              <span class="cs-step">{s().id}</span>
+              <Show when={scopedTryN() != null}>
+                <span class="cs-dot">·</span>
+                <span class="cs-try">try {scopedTryN()}</span>
+              </Show>
+              <span class="cs-dot">·</span>
+              <span class="cs-ver">{props.versionLabel}</span>
+            </div>
             <AttemptsFilmstrip
               tries={props.tries}
               active={props.activeAttempt}
@@ -270,7 +341,7 @@ export default function StepPane(props: {
               <div class="tabs">
                 <TabBtn id="logs" label="Logs" />
                 <TabBtn id="results" label="Results" count={results()?.length ?? 0} />
-                <TabBtn id="outputs" label="Outputs" count={results()?.length ?? 0} />
+                <TabBtn id="outputs" label="Outputs" count={outResults()?.length ?? 0} />
                 <TabBtn id="workspace" label="Workspace" />
               </div>
               <span class="grow1" />
@@ -284,8 +355,16 @@ export default function StepPane(props: {
               </span>
             </div>
 
-            {/* Logs — the scoped attempt's stream. */}
+            {/* Logs — the scoped attempt's stream (per-try). */}
             <Show when={tab() === "logs"}>
+              <Show
+                when={!notRun()}
+                fallback={
+                  <div class="tabpane">
+                    <p class="empty">this step didn't run in this version</p>
+                  </div>
+                }
+              >
               <div class="tabpane logpane">
                 <div class="steplogs-tools">
                   <span class="grow1" />
@@ -314,11 +393,16 @@ export default function StepPane(props: {
                   </div>
                 </Show>
               </div>
+              </Show>
             </Show>
 
-            {/* Results — the scoped attempt's typed values. */}
+            {/* Results — the scoped attempt's typed values (per-try). */}
             <Show when={tab() === "results"}>
               <div class="tabpane">
+                <Show
+                  when={!notRun()}
+                  fallback={<p class="empty">nothing of record here</p>}
+                >
                 <Show
                   when={(results()?.length ?? 0) > 0}
                   fallback={<p class="empty">no results published by this try</p>}
@@ -341,51 +425,90 @@ export default function StepPane(props: {
                     </For>
                   </div>
                 </Show>
+                </Show>
               </div>
             </Show>
 
-            {/* Outputs — interpolation view + consumption provenance. */}
+            {/* Outputs — OF-RECORD (ADR-0056 §3): the interpolation view + the
+                "built on …" consumed line both read the latest SUCCESSFUL attempt
+                in this version (`ofRecordTry()`), NOT the selected try. So a
+                failed / superseded / running selected try still shows what a
+                downstream step would read, and a coordinate note names which try
+                that is — with a "try N →" button that jumps the selection there.
+                Never a blank-that-reads-as-success: no success ⇒ explicit copy. */}
             <Show when={tab() === "outputs"}>
               <div class="tabpane">
-                <Show when={consumed() && Object.keys(consumed()!.consumed).length > 0}>
-                  <div class="consumed mono">
-                    built on{" "}
-                    <For each={Object.entries(consumed()!.consumed)}>
-                      {([up, at], i) => (
-                        <>
-                          <Show when={i() > 0}> · </Show>
-                          <span class="consumed-edge">
-                            {up}@{at}
-                          </span>
-                        </>
-                      )}
-                    </For>
-                  </div>
-                </Show>
                 <Show
-                  when={(results()?.length ?? 0) > 0}
+                  when={ofRecordTry()}
                   fallback={
-                    <p class="empty">nothing for a downstream step to read from this try</p>
+                    <p class="empty">
+                      {notRun()
+                        ? "nothing of record here"
+                        : "nothing of record here — no successful attempt in this version"}
+                    </p>
                   }
                 >
-                  <div class="exprs">
-                    <For each={results()}>
-                      {(r) => (
-                        <div class="expr mono">
-                          <span class="tok">{`\${{ outputs.${s().id}.${r.name} }}`}</span>
-                          <span class="arrow">→</span>
-                          <span class="val">{showValue(r.value)}</span>
-                        </div>
-                      )}
-                    </For>
+                  {/* Coordinate note: is the of-record try the one selected? */}
+                  <div class="ofrec-note mono">
+                    <Show
+                      when={ofRecordTry() === scoped()?.id}
+                      fallback={
+                        <button
+                          class="ofrec-jump"
+                          onClick={() => props.onAttemptSelect(ofRecordTry())}
+                          title="jump the selection to the of-record try"
+                        >
+                          of record · try {ofRecordIndex() + 1} →
+                        </button>
+                      }
+                    >
+                      <span class="ofrec-here">of record · this try</span>
+                    </Show>
                   </div>
+                  <Show when={outConsumed() && Object.keys(outConsumed()!.consumed).length > 0}>
+                    <div class="consumed mono">
+                      built on{" "}
+                      <For each={Object.entries(outConsumed()!.consumed)}>
+                        {([up, at], i) => (
+                          <>
+                            <Show when={i() > 0}> · </Show>
+                            <span class="consumed-edge">
+                              {up}@{at}
+                            </span>
+                          </>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                  <Show
+                    when={(outResults()?.length ?? 0) > 0}
+                    fallback={
+                      <p class="empty">nothing for a downstream step to read of record</p>
+                    }
+                  >
+                    <div class="exprs">
+                      <For each={outResults()}>
+                        {(r) => (
+                          <div class="expr mono">
+                            <span class="tok">{`\${{ outputs.${s().id}.${r.name} }}`}</span>
+                            <span class="arrow">→</span>
+                            <span class="val">{showValue(r.value)}</span>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
                 </Show>
               </div>
             </Show>
 
-            {/* Workspace — the scoped attempt's immutable snapshot. */}
+            {/* Workspace — the scoped attempt's immutable snapshot (per-try). */}
             <Show when={tab() === "workspace"}>
               <div class="tabpane">
+                <Show
+                  when={!notRun()}
+                  fallback={<p class="empty">this step didn't run in this version</p>}
+                >
                 <div class="ws-crumbs mono">
                   <button class="crumb" onClick={() => navTo("")}>
                     {s().id}
@@ -517,6 +640,7 @@ export default function StepPane(props: {
                       </For>
                     </ul>
                   </Show>
+                </Show>
                 </Show>
               </div>
             </Show>

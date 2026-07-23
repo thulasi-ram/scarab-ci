@@ -2507,6 +2507,18 @@ h1, .crumb-head, .run-title {
 @media (prefers-reduced-motion: reduce) {
   .pane-load.on svg { animation: none; }
 }
+/* Permanent coordinate stamp (redesign stage 4): the pane's "you are here" —
+   step · try N · version — always visible above the filmstrip so the evidence
+   below never floats context-free. PAGE/theme chrome (not the dark DAG canvas),
+   so it reads the page tokens. The try segment drops when nothing ran here. */
+.steppane .coord-stamp {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px;
+  padding: 8px 12px 6px; font-size: 11px; color: var(--muted-sage);
+}
+.steppane .coord-stamp .cs-step { color: var(--soft-white); font-weight: 600; }
+.steppane .coord-stamp .cs-try { color: var(--sage); }
+.steppane .coord-stamp .cs-ver { color: var(--copper); }
+.steppane .coord-stamp .cs-dot { color: var(--muted-sage); opacity: 0.5; }
 /* ── Attempts filmstrip (redesign stage 3): the "which try" axis, in the pane
    header — promoted from the former orphaned `.achip*` rules. PAGE/theme chrome
    (NOT the always-dark DAG canvas), so it reads the page tokens. Outcome shape =
@@ -2561,6 +2573,25 @@ h1, .crumb-head, .run-title {
 .consumed .consumed-edge {
   color: var(--copper); border: 1px solid var(--border-copper);
   border-radius: 20px; padding: 1px 7px; margin: 0 1px;
+}
+
+/* Of-record coordinate note atop the Outputs tab (redesign stage 4): names the
+   attempt the of-record values come from. "this try" when it matches the
+   selected try; otherwise a "try N →" pill that jumps the filmstrip selection to
+   the of-record try — so a failed/superseded selected try makes plain where the
+   real outputs live. PAGE/theme chrome. */
+.ofrec-note { margin-bottom: 12px; font-size: 11.5px; }
+.ofrec-note .ofrec-here { color: var(--emerald); }
+.ofrec-note .ofrec-jump {
+  font: inherit; cursor: pointer; color: var(--emerald);
+  background: color-mix(in srgb, var(--emerald) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--emerald) 40%, transparent);
+  border-radius: 20px; padding: 2px 10px;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.ofrec-note .ofrec-jump:hover {
+  background: color-mix(in srgb, var(--emerald) 18%, transparent);
+  border-color: var(--emerald);
 }
 
 /* Artifact versions: provenance tag, of-record badge, shadowed rows dimmed. */
