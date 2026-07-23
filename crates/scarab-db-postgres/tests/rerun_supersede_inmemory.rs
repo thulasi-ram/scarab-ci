@@ -9,7 +9,8 @@ use scarab_engine::ports::ExecHandle;
 use scarab_engine::{
     cancel_run_request, rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db,
     EventPayload, FailureKind, OutboxId, OutboxMessage, RestartError, RunId, RunStatus, Scheduler,
-    StepId, StepSpec, StepStatus, SupersedeTeardown, Timestamp, LAUNCH_STEP, SUPERSEDE_TEARDOWN,
+    StepId, StepSpec, StepStatus, SupersedeTeardown, SupersededAttempt, Timestamp, LAUNCH_STEP,
+    MAX_DELIVERY_ATTEMPTS, SUPERSEDE_TEARDOWN,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
@@ -876,5 +877,206 @@ async fn record_attempt_never_downgrades_recorded_evidence() {
         a.started_at,
         Timestamp(5),
         "original started_at preserved (budget source)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Teardown reliability (git-bug fd6e6d4): a failed `cancel` in the supersede
+// teardown drainer must retry (bounded by the ADR-0047 poison ceiling) instead
+// of silently retiring the outbox message and orphaning the Pod.
+// ---------------------------------------------------------------------------
+
+/// Seed a run with one in-flight step whose Pod handle is recorded, and enqueue
+/// a `SUPERSEDE_TEARDOWN` naming that attempt — the fixture for the teardown
+/// retry / dead-letter tests. Returns the run id and the Pod handle.
+async fn seed_supersede_teardown(db: &InMemoryDb, run_name: &str) -> (RunId, String) {
+    let run = RunId(run_name.into());
+    let c = StepId("c".into());
+    let a1 = AttemptId("a1".into());
+    let handle = format!("fake://{run_name}/c/a1");
+
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &c, Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.record_attempt(
+        &run,
+        &c,
+        &Attempt {
+            id: a1.clone(),
+            started_at: Timestamp(0),
+            failure: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    db.set_attempt_handle(&run, &c, &a1, &handle).await.unwrap();
+    db.record_step_transition(&run, &c, StepStatus::Pending, StepStatus::Running)
+        .await
+        .unwrap();
+    db.seed_run(&run, RunStatus::Running);
+
+    db.enqueue_outbox(&OutboxMessage {
+        id: OutboxId(0),
+        run: run.clone(),
+        kind: SUPERSEDE_TEARDOWN.to_string(),
+        payload: serde_json::to_value(SupersedeTeardown {
+            attempts: vec![SupersededAttempt {
+                step: c.0.clone(),
+                attempt: a1.0.clone(),
+            }],
+        })
+        .unwrap(),
+        idempotency_key: format!("supersede:{run_name}"),
+        at: Timestamp(0),
+    })
+    .await
+    .unwrap();
+
+    (run, handle)
+}
+
+/// A cancel that genuinely fails (a transient k8s API error — NOT an
+/// already-gone Pod, which the adapters fold into `Ok`) must NOT retire the
+/// teardown message: doing so silently orphans the Pod. The message stays
+/// claimable and a later reconcile — once the cancel succeeds — retires it, so
+/// the Pod is torn down rather than leaked.
+#[tokio::test]
+async fn supersede_teardown_retries_when_cancel_fails() {
+    let db = InMemoryDb::new();
+    let (_run, handle) = seed_supersede_teardown(&db, "run-retry").await;
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.fail_cancels(1); // the first cancel errors; the next succeeds
+    // visibility 0 ⇒ an un-dispatched (still-claimed) message is re-servable on
+    // the next reconcile, modelling the claim-lease lapse a production tick
+    // waits out before retrying.
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_outbox_visibility_ms(0);
+
+    // First pass: the cancel fails, so the message is NOT retired.
+    sched
+        .reconcile_supersessions()
+        .await
+        .expect("first reconcile");
+    assert_eq!(
+        exec.cancelled_handles(),
+        vec![handle.clone()],
+        "cancel was attempted once"
+    );
+    assert_eq!(
+        db.outbox_depth().await.unwrap(),
+        1,
+        "a failed cancel must not retire the teardown — the Pod would be orphaned"
+    );
+
+    // Second pass: the cancel now succeeds, so the message is retired.
+    sched
+        .reconcile_supersessions()
+        .await
+        .expect("second reconcile");
+    assert_eq!(
+        exec.cancelled_handles(),
+        vec![handle.clone(), handle.clone()],
+        "the teardown was retried (cancel attempted a second time)"
+    );
+    assert_eq!(
+        db.outbox_depth().await.unwrap(),
+        0,
+        "a successful retry retires the teardown"
+    );
+}
+
+/// A cancel that fails persistently (a Pod the backend can never reach) must
+/// not spin forever: the teardown rides the same delivery-attempt/poison bound
+/// as launch intents (ADR-0047) and dead-letters after `MAX_DELIVERY_ATTEMPTS`,
+/// recording a diagnostic — without ever touching the run's own state.
+#[tokio::test]
+async fn supersede_teardown_dead_letters_after_max_delivery_attempts() {
+    let db = InMemoryDb::new();
+    let (run, _handle) = seed_supersede_teardown(&db, "run-poison").await;
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.fail_cancels(u32::MAX); // a Pod the backend can never tear down
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_outbox_visibility_ms(0);
+
+    // Drive one reconcile per delivery until the poison bound trips.
+    for _ in 0..MAX_DELIVERY_ATTEMPTS {
+        sched.reconcile_supersessions().await.expect("reconcile");
+    }
+
+    // It was retried up to the bound, then abandoned.
+    assert_eq!(
+        exec.cancelled_handles().len() as u32,
+        MAX_DELIVERY_ATTEMPTS,
+        "teardown retried exactly up to the delivery bound"
+    );
+    assert_eq!(
+        db.outbox_depth().await.unwrap(),
+        0,
+        "the poison teardown is dead-lettered (dropped from the backlog gauge)"
+    );
+
+    // Dead-lettered ⇒ never claimed again (a further reconcile is a no-op).
+    sched
+        .reconcile_supersessions()
+        .await
+        .expect("post-dead-letter reconcile");
+    assert_eq!(
+        exec.cancelled_handles().len() as u32,
+        MAX_DELIVERY_ATTEMPTS,
+        "a dead-lettered teardown is never redelivered"
+    );
+
+    // A diagnostic was recorded on the event log — the operator signal (the
+    // failure is no longer silent).
+    let events = db.events(&run).await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(&e.kind,
+            EventPayload::Raw(v)
+                if v.get("event").and_then(|x| x.as_str()) == Some("TeardownAbandoned"))),
+        "a TeardownAbandoned diagnostic is appended when teardown is abandoned"
+    );
+
+    // The run itself is untouched — teardown is pure resource hygiene.
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Running),
+        "an abandoned teardown never changes the run's own state"
+    );
+}
+
+/// The desired end state is "no live Pod", so a cancel that returns `Ok` —
+/// whether it tore the Pod down or found it already gone (the adapters fold a
+/// missing Pod into `Ok`) — retires the teardown on the FIRST pass, with no
+/// spurious retry.
+#[tokio::test]
+async fn supersede_teardown_ok_cancel_retires_on_first_pass() {
+    let db = InMemoryDb::new();
+    let (_run, handle) = seed_supersede_teardown(&db, "run-gone").await;
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new(); // cancel returns Ok (cancelled-or-already-gone)
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_outbox_visibility_ms(0);
+
+    sched.reconcile_supersessions().await.expect("reconcile");
+    assert_eq!(
+        db.outbox_depth().await.unwrap(),
+        0,
+        "an Ok cancel (cancelled or already-gone) retires the teardown at once"
+    );
+
+    // A second reconcile is a no-op — the dispatched message is never re-served,
+    // so there is no spurious re-cancel.
+    sched
+        .reconcile_supersessions()
+        .await
+        .expect("second reconcile");
+    assert_eq!(
+        exec.cancelled_handles(),
+        vec![handle],
+        "no spurious retry: cancel happened exactly once"
     );
 }

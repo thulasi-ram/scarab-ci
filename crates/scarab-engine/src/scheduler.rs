@@ -1215,9 +1215,11 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    /// Drain cancel-teardown intents (ADR-0054): for each cancelled run,
-    /// best-effort delete every recorded in-flight execution (the executor's
-    /// `cancel` — SIGTERM + grace period), then mark the message dispatched.
+    /// Drain cancel-teardown intents (ADR-0054): for each cancelled run, delete
+    /// every recorded in-flight execution (the executor's `cancel` — SIGTERM +
+    /// grace period). The message is retired only once every Pod reached the
+    /// desired end state; a genuinely failed cancel is retried rather than
+    /// silently orphaning the Pod (see [`settle_teardown`](Self::settle_teardown)).
     pub async fn reconcile_cancellations(&self) -> Result<(), SchedulerError> {
         let msgs = self
             .db
@@ -1229,6 +1231,11 @@ impl<'a> Scheduler<'a> {
             )
             .await?;
         for msg in msgs {
+            // Attempt every recorded Pod's teardown, remembering whether any
+            // cancel genuinely failed (an already-gone Pod is `Ok`). Keep going
+            // past a failure so the reachable Pods still die this tick; the whole
+            // message is retried idempotently if any cancel failed.
+            let mut outcome: Result<(), ExecError> = Ok(());
             for step in self.db.steps_of_run(&msg.run).await? {
                 if let Some(attempt) = step.attempts.last() {
                     if let Some(h) = self
@@ -1236,11 +1243,13 @@ impl<'a> Scheduler<'a> {
                         .attempt_handle(&msg.run, &step.step, &attempt.id)
                         .await?
                     {
-                        let _ = self.executor.cancel(&ExecHandle(h)).await;
+                        if let Err(e) = self.executor.cancel(&ExecHandle(h)).await {
+                            outcome = Err(e);
+                        }
                     }
                 }
             }
-            self.db.mark_dispatched(msg.id).await?;
+            self.settle_teardown(&msg, outcome).await?;
         }
         Ok(())
     }
@@ -1262,16 +1271,75 @@ impl<'a> Scheduler<'a> {
         for msg in msgs {
             let payload: SupersedeTeardown = serde_json::from_value(msg.payload.clone())
                 .map_err(|e| SchedulerError::BadPayload(e.to_string()))?;
+            // Cancel every named Pod, remembering whether any cancel genuinely
+            // failed (an already-gone Pod is `Ok`). A later reconcile re-cancels
+            // the already-gone ones harmlessly and retries only those still up.
+            let mut outcome: Result<(), ExecError> = Ok(());
             for item in payload.attempts {
                 if let Some(h) = self
                     .db
                     .attempt_handle(&msg.run, &StepId(item.step), &AttemptId(item.attempt))
                     .await?
                 {
-                    let _ = self.executor.cancel(&ExecHandle(h)).await;
+                    if let Err(e) = self.executor.cancel(&ExecHandle(h)).await {
+                        outcome = Err(e);
+                    }
                 }
             }
-            self.db.mark_dispatched(msg.id).await?;
+            self.settle_teardown(&msg, outcome).await?;
+        }
+        Ok(())
+    }
+
+    /// Retire a Pod-teardown outbox message iff the teardown reached its desired
+    /// end state, otherwise leave it to be retried — closing the orphan-Pod leak
+    /// (git-bug fd6e6d4). Shared by [`reconcile_cancellations`](Self::reconcile_cancellations)
+    /// and [`reconcile_supersessions`](Self::reconcile_supersessions).
+    ///
+    /// `cancel` returns `Ok` both when it tore the Pod down AND when the Pod was
+    /// already gone (the k8s adapter folds a `404` into `Ok`; the local backend
+    /// `Ok`s an absent process) — either way the goal (no live Pod) is met, so
+    /// the message is dispatched. A genuine `Err` (a transient k8s API error /
+    /// throttling — the Pod may still be running) must NOT retire the message:
+    /// leaving it un-dispatched lets a later reconcile re-serve it once the claim
+    /// lease lapses and retry the teardown, rather than discarding the failure
+    /// and orphaning the Pod. The retry rides the same delivery-attempt/poison
+    /// ceiling as launch intents (ADR-0047): at [`MAX_DELIVERY_ATTEMPTS`] the
+    /// message dead-letters (stops redelivering) and a diagnostic lands on the
+    /// run's event log, so an unreachable backend can't spin teardown forever.
+    /// Teardown is idempotent, so a redelivery after a partial success re-cancels
+    /// the already-gone Pods harmlessly. The run's own state is never touched —
+    /// this is pure resource hygiene; fencing already keeps the durable state
+    /// correct whether or not the stale Pod dies.
+    async fn settle_teardown(
+        &self,
+        msg: &OutboxMessage,
+        outcome: Result<(), ExecError>,
+    ) -> Result<(), SchedulerError> {
+        match outcome {
+            Ok(()) => self.db.mark_dispatched(msg.id).await?,
+            Err(e) => {
+                let failures = self.db.record_outbox_failure(msg.id).await?;
+                if failures >= MAX_DELIVERY_ATTEMPTS {
+                    self.db.dead_letter_outbox(msg.id).await?;
+                    let now = self.clock.now().await;
+                    self.append(
+                        &msg.run,
+                        EventPayload::Raw(serde_json::json!({
+                            "event": "TeardownAbandoned",
+                            "outbox_kind": msg.kind,
+                            "outbox_id": msg.id.0,
+                            "reason": format!(
+                                "Pod teardown failed {MAX_DELIVERY_ATTEMPTS} times and \
+                                 was abandoned; the backend unit may be orphaned \
+                                 (fencing keeps run state correct): {e}"
+                            ),
+                        })),
+                        now,
+                    )
+                    .await?;
+                }
+            }
         }
         Ok(())
     }

@@ -1557,6 +1557,11 @@ struct FakeExecState {
     /// `reconcile_services` error that is NOT a launch error, for the per-run
     /// tick-isolation test (git-bug 6825830).
     service_ready_failures: std::collections::HashSet<String>,
+    /// Remaining number of `cancel` calls to fail before succeeding — drives the
+    /// supersede/cancel teardown retry path (git-bug fd6e6d4). `u32::MAX` models
+    /// a Pod the backend can never reach (persistent failure → dead-letter); a
+    /// small N models a transient API blip that clears on a later reconcile.
+    cancel_failures: u32,
 }
 
 /// An [`Executor`] whose behaviour a test scripts: it can be told that a given
@@ -1692,6 +1697,14 @@ impl FakeExecutor {
             .insert(handle.0.clone());
     }
 
+    /// Make the next `n` `cancel` calls return `Err` before any succeeds
+    /// (git-bug fd6e6d4 teardown-retry). `n = u32::MAX` models a Pod the backend
+    /// can never tear down (drives the dead-letter bound); a small `n` models a
+    /// transient error that clears on a later reconcile.
+    pub fn fail_cancels(&self, n: u32) {
+        self.inner.lock().unwrap().cancel_failures = n;
+    }
+
     /// Handles of shared services launched via `launch_service`, in call order.
     pub fn launched_services(&self) -> Vec<String> {
         self.inner.lock().unwrap().services_launched.clone()
@@ -1733,7 +1746,20 @@ impl Executor for FakeExecutor {
     }
 
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {
+        // Record the attempt first (so `cancelled_handles` counts retries too),
+        // then consume one scripted failure if any are budgeted. Mirrors the
+        // real adapters: a genuine `Err` (transient API blip) is retryable,
+        // whereas an already-gone Pod is folded into `Ok` — never modelled here
+        // as an error, since the FakeExecutor has no backend to lose.
         self.cancelled.lock().unwrap().push(handle.0.clone());
+        let mut st = self.inner.lock().unwrap();
+        if st.cancel_failures > 0 {
+            st.cancel_failures = st.cancel_failures.saturating_sub(1);
+            return Err(ExecError::Other(format!(
+                "scripted cancel failure for {}",
+                handle.0
+            )));
+        }
         Ok(())
     }
 
