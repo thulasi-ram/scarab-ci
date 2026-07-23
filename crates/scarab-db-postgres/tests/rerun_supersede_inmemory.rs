@@ -8,7 +8,7 @@
 use scarab_engine::ports::ExecHandle;
 use scarab_engine::{
     cancel_run_request, rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db,
-    EventPayload, FailureKind, OutboxId, OutboxMessage, RestartError, RunId, RunStatus, Scheduler,
+    EventPayload, FailureKind, OutboxId, OutboxMessage, RerunError, RunId, RunStatus, Scheduler,
     StepId, StepSpec, StepStatus, SupersedeTeardown, SupersededAttempt, Timestamp, LAUNCH_STEP,
     MAX_DELIVERY_ATTEMPTS, SUPERSEDE_TEARDOWN,
 };
@@ -199,7 +199,7 @@ async fn rerun_rejects_target_with_unsatisfied_dependency() {
         .await
         .expect_err("rerun of c must be rejected — b has not succeeded");
     match err {
-        RestartError::DependencyNotSatisfied { step, blocker } => {
+        RerunError::DependencyNotSatisfied { step, blocker } => {
             assert_eq!(step, c);
             assert_eq!(blocker, b);
         }
@@ -273,7 +273,7 @@ async fn retry_rejects_non_failed_step() {
     let err = retry_step(&db, &clock, &run, &b, Some("alice".into()))
         .await
         .expect_err("retry of a succeeded step must be rejected");
-    assert!(matches!(err, RestartError::NotFailed { status, .. } if status == StepStatus::Succeeded));
+    assert!(matches!(err, RerunError::NotFailed { status, .. } if status == StepStatus::Succeeded));
 }
 
 /// A Retry of a Failed step re-arms it and its dependent cascade **in the current

@@ -251,7 +251,7 @@ Dependent Attempts it drags along carry `cascade`, as with rerun.
 
 ### Rerun/retry validation — a FAILED prerequisite blocks (refines ADR-0027)
 
-Both controls reject up front — `RestartError::DependencyNotSatisfied { step,
+Both controls reject up front — `RerunError::DependencyNotSatisfied { step,
 blocker }` → **409** — when a **prerequisite is not in a non-failing terminal
 state**. The allowed set is **`{Succeeded, Skipped}`**: a `Succeeded` or
 `Skipped` prerequisite does not block; a **`Failed`** one does (as does a
@@ -367,7 +367,7 @@ is authored + persisted, so the name is fixed at "retry":
 
 - **Rerun** — forks a new run **version** (Take). Backend `rerun_step`; event
   `RunRerunRequested` (**serde-aliased** to the prior `RunRestartRequested` —
-  **zero migration**, guarded by a fixture test). `RestartError` stays the shared
+  **zero migration**, guarded by a fixture test). `RerunError` stays the shared
   run-op error (it also serves gate/cancel) — no misleading split.
 - **Retry** — another **Attempt in the same version**, **failed-step-only**; the
   human trigger of the same concept as auto-retry. **Unchanged:** `retry_step`,

@@ -40,7 +40,7 @@ fn new_run_id() -> RunId {
 }
 
 use scarab_engine::{
-    AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RestartError,
+    AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RerunError,
     RunId, RunStatus, StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION,
     MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
 };
@@ -1831,15 +1831,15 @@ async fn get_service_logs(
 /// unknown step; `409` when the request conflicts with the step's state (ADR-0056
 /// amendment: rerunning a step whose dependency has not succeeded, or retrying a
 /// non-failed step).
-fn rerun_outcome(res: Result<(), RestartError>) -> Result<StatusCode, ApiError> {
+fn rerun_outcome(res: Result<(), RerunError>) -> Result<StatusCode, ApiError> {
     match res {
         Ok(()) => Ok(StatusCode::ACCEPTED),
-        Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
-        Err(e @ RestartError::DependencyNotSatisfied { .. }) => {
+        Err(RerunError::StepNotFound(_)) => Err(ApiError::NotFound),
+        Err(e @ RerunError::DependencyNotSatisfied { .. }) => {
             Err(ApiError::Conflict(e.to_string()))
         }
-        Err(e @ RestartError::NotFailed { .. }) => Err(ApiError::Conflict(e.to_string())),
-        Err(RestartError::Db(e)) => Err(ApiError::Db(e)),
+        Err(e @ RerunError::NotFailed { .. }) => Err(ApiError::Conflict(e.to_string())),
+        Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
 }
 
@@ -4688,11 +4688,11 @@ async fn approve_gate(
     .await
     {
         Ok(()) => {}
-        Err(RestartError::StepNotFound(_)) => return Err(ApiError::NotFound),
-        Err(e @ (RestartError::DependencyNotSatisfied { .. } | RestartError::NotFailed { .. })) => {
+        Err(RerunError::StepNotFound(_)) => return Err(ApiError::NotFound),
+        Err(e @ (RerunError::DependencyNotSatisfied { .. } | RerunError::NotFailed { .. })) => {
             return Err(ApiError::Conflict(e.to_string()))
         }
-        Err(RestartError::Db(e)) => return Err(ApiError::Db(e)),
+        Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
 
     // If the gate is already released, this is a late/duplicate approval — the
@@ -4741,11 +4741,11 @@ async fn approve_gate(
     // 4. Finalize the gate and resume the run (exactly-once).
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => {}
-        Err(RestartError::StepNotFound(_)) => return Err(ApiError::NotFound),
-        Err(e @ (RestartError::DependencyNotSatisfied { .. } | RestartError::NotFailed { .. })) => {
+        Err(RerunError::StepNotFound(_)) => return Err(ApiError::NotFound),
+        Err(e @ (RerunError::DependencyNotSatisfied { .. } | RerunError::NotFailed { .. })) => {
             return Err(ApiError::Conflict(e.to_string()))
         }
-        Err(RestartError::Db(e)) => return Err(ApiError::Db(e)),
+        Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
 
     // 5. Record the deployment in history (ADR-0024, 0037).
@@ -4825,11 +4825,11 @@ async fn release_gate_external(
 
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
-        Err(RestartError::StepNotFound(_)) => Err(ApiError::NotFound),
-        Err(e @ (RestartError::DependencyNotSatisfied { .. } | RestartError::NotFailed { .. })) => {
+        Err(RerunError::StepNotFound(_)) => Err(ApiError::NotFound),
+        Err(e @ (RerunError::DependencyNotSatisfied { .. } | RerunError::NotFailed { .. })) => {
             Err(ApiError::Conflict(e.to_string()))
         }
-        Err(RestartError::Db(e)) => Err(ApiError::Db(e)),
+        Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
 }
 

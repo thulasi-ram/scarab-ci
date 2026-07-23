@@ -115,7 +115,7 @@ pub enum SchedulerError {
 
 /// Errors from a restart/retry request.
 #[derive(Debug, thiserror::Error)]
-pub enum RestartError {
+pub enum RerunError {
     #[error(transparent)]
     Db(#[from] DbError),
     #[error("no such step {0:?} in run")]
@@ -151,10 +151,10 @@ pub async fn rerun_step(
     run: &RunId,
     target: &StepId,
     by: Option<String>,
-) -> Result<(), RestartError> {
+) -> Result<(), RerunError> {
     let steps = db.steps_of_run(run).await?;
     let Some(target_step) = steps.iter().find(|s| &s.step == target) else {
-        return Err(RestartError::StepNotFound(target.clone()));
+        return Err(RerunError::StepNotFound(target.clone()));
     };
     // Rerun validation (ADR-0056 amendment): a prerequisite that FAILED blocks
     // the rerun — the pipeline has a real upstream failure, so the user should
@@ -163,7 +163,7 @@ pub async fn rerun_step(
     // rerun replays and re-skips as needed). The gate never inspects the
     // target's own status.
     if let Some(blocker) = blocking_dep(target_step, &steps) {
-        return Err(RestartError::DependencyNotSatisfied {
+        return Err(RerunError::DependencyNotSatisfied {
             step: target.clone(),
             blocker,
         });
@@ -224,13 +224,13 @@ pub async fn retry_step(
     run: &RunId,
     target: &StepId,
     by: Option<String>,
-) -> Result<(), RestartError> {
+) -> Result<(), RerunError> {
     let steps = db.steps_of_run(run).await?;
     let Some(target_step) = steps.iter().find(|s| &s.step == target) else {
-        return Err(RestartError::StepNotFound(target.clone()));
+        return Err(RerunError::StepNotFound(target.clone()));
     };
     if target_step.status != StepStatus::Failed {
-        return Err(RestartError::NotFailed {
+        return Err(RerunError::NotFailed {
             step: target.clone(),
             status: target_step.status,
         });
@@ -238,7 +238,7 @@ pub async fn retry_step(
     // Same prerequisite gate as rerun (a failed dependency blocks). A genuinely
     // Failed target ran, so its deps all Succeeded — this is defensive/consistent.
     if let Some(blocker) = blocking_dep(target_step, &steps) {
-        return Err(RestartError::DependencyNotSatisfied {
+        return Err(RerunError::DependencyNotSatisfied {
             step: target.clone(),
             blocker,
         });
@@ -296,7 +296,7 @@ async fn rearm_invalidation_set(
     invalid: &std::collections::HashSet<StepId>,
     steps: &[StepRun],
     by: Option<String>,
-) -> Result<(), RestartError> {
+) -> Result<(), RerunError> {
     // Force the explicit target to re-run: clear its stored input signature so
     // admission never mistakes it for an unchanged descendant and skips it
     // (ADR-0027). Its descendants keep their signatures, so they skip-if-unchanged
@@ -408,7 +408,7 @@ async fn mark_superseded(
     attempt: &AttemptId,
     by: Option<&str>,
     superseded: &mut Vec<SupersededAttempt>,
-) -> Result<(), RestartError> {
+) -> Result<(), RerunError> {
     superseded.push(SupersededAttempt {
         step: step.0.clone(),
         attempt: attempt.0.clone(),
@@ -446,7 +446,7 @@ async fn rearm_raced_step(
     step: &StepId,
     by: Option<&str>,
     superseded: &mut Vec<SupersededAttempt>,
-) -> Result<(), RestartError> {
+) -> Result<(), RerunError> {
     for _ in 0..8 {
         let live = db.steps_of_run(run).await?;
         let Some(s) = live.iter().find(|x| &x.step == step) else {
@@ -496,7 +496,7 @@ pub async fn release_gate(
     clock: &dyn Clock,
     run: &RunId,
     step: &StepId,
-) -> Result<(), RestartError> {
+) -> Result<(), RerunError> {
     // The target must be a known gate step.
     let is_gate = db
         .steps_of_run(run)
@@ -504,7 +504,7 @@ pub async fn release_gate(
         .iter()
         .any(|s| &s.step == step && s.is_gate());
     if !is_gate {
-        return Err(RestartError::StepNotFound(step.clone()));
+        return Err(RerunError::StepNotFound(step.clone()));
     }
 
     match db
@@ -548,7 +548,7 @@ pub async fn record_gate_approval(
     run: &RunId,
     step: &StepId,
     by: &str,
-) -> Result<(), RestartError> {
+) -> Result<(), RerunError> {
     // The target must be a known `manual` gate step (timer/external gates are
     // released by other means, ADR-0034).
     let is_manual_gate = db
@@ -557,7 +557,7 @@ pub async fn record_gate_approval(
         .iter()
         .any(|s| &s.step == step && s.gate_kind.as_deref() == Some("manual"));
     if !is_manual_gate {
-        return Err(RestartError::StepNotFound(step.clone()));
+        return Err(RerunError::StepNotFound(step.clone()));
     }
 
     // Best-effort dedup: skip if this principal already approved this gate. The
@@ -694,7 +694,7 @@ async fn reopen(
     run: &RunId,
     from: RunStatus,
     to: RunStatus,
-) -> Result<(), RestartError> {
+) -> Result<(), RerunError> {
     match db.record_transition(run, from, to).await {
         Ok(()) => {
             let now = clock.now().await;
