@@ -299,6 +299,23 @@ impl Default for InMemoryDb {
     }
 }
 
+/// Deterministic attempt ordering — mirrors the postgres `attempts()`
+/// `ORDER BY started_at, CAST(substring(attempt_id FROM 2) AS INTEGER)`: start
+/// time first, then mint order by the numeric id suffix (attempt ids are minted
+/// `a{n}` — `a1`,`a2`,…). Numeric, not lexical, so `a2` precedes `a10`. Every
+/// read path that returns attempts sorts by this key so `.last()` (the frontier
+/// / latest attempt) is stable and IDENTICAL to the postgres adapter, even when
+/// `started_at` ties (the `FakeClock` case, and same-millisecond real minting).
+fn attempt_order_key(a: &Attempt) -> (i64, u64) {
+    let seq = a
+        .id
+        .0
+        .strip_prefix('a')
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    (a.started_at.0, seq)
+}
+
 #[async_trait]
 impl Db for InMemoryDb {
     async fn claim_ready_steps(&self, limit: u32) -> Result<Vec<StepRun>, DbError> {
@@ -317,11 +334,13 @@ impl Db for InMemoryDb {
         for key in keys.into_iter().take(limit as usize) {
             let rec = st.steps.get_mut(&key).unwrap();
             rec.status = Some(StepStatus::Running);
+            let mut attempts = rec.attempts.clone();
+            attempts.sort_by_key(attempt_order_key);
             claimed.push(StepRun {
                 run: key.0.clone(),
                 step: key.1.clone(),
                 status: StepStatus::Running,
-                attempts: rec.attempts.clone(),
+                attempts,
                 needs: rec.needs.clone(),
                 gate_kind: rec.gate_kind.clone(),
             });
@@ -1018,13 +1037,17 @@ impl Db for InMemoryDb {
             .iter()
             .filter(|((r, _), _)| r == run)
             .filter_map(|((r, s), rec)| {
-                rec.status.map(|status| StepRun {
-                    run: r.clone(),
-                    step: s.clone(),
-                    status,
-                    attempts: rec.attempts.clone(),
-                    needs: rec.needs.clone(),
-                    gate_kind: rec.gate_kind.clone(),
+                rec.status.map(|status| {
+                    let mut attempts = rec.attempts.clone();
+                    attempts.sort_by_key(attempt_order_key);
+                    StepRun {
+                        run: r.clone(),
+                        step: s.clone(),
+                        status,
+                        attempts,
+                        needs: rec.needs.clone(),
+                        gate_kind: rec.gate_kind.clone(),
+                    }
                 })
             })
             .collect();
@@ -1085,10 +1108,14 @@ impl Db for InMemoryDb {
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
         let rec = st.steps.entry((run.clone(), step.clone())).or_default();
-        // Idempotent on the attempt id.
-        if let Some(existing) = rec.attempts.iter_mut().find(|a| a.id == attempt.id) {
-            *existing = attempt.clone();
-        } else {
+        // Idempotent AND non-downgrading on the attempt id (mirrors the postgres
+        // `ON CONFLICT ... DO NOTHING`). `record_attempt` mints a FRESH Running
+        // row at launch/adoption; a re-drive for an id that already exists must
+        // NOT overwrite evidence a later `set_attempt_failure`/
+        // `set_attempt_outcome` recorded — overwriting would reset a real
+        // Failed/Superseded/Cancelled verdict back to Running/None. The row
+        // exists ⇒ keep it untouched.
+        if !rec.attempts.iter().any(|a| a.id == attempt.id) {
             rec.attempts.push(attempt.clone());
         }
         Ok(())
@@ -1096,11 +1123,13 @@ impl Db for InMemoryDb {
 
     async fn attempts_of_step(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
         let st = self.state.lock().unwrap();
-        Ok(st
+        let mut attempts = st
             .steps
             .get(&(run.clone(), step.clone()))
             .map(|rec| rec.attempts.clone())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        attempts.sort_by_key(attempt_order_key);
+        Ok(attempts)
     }
 
     async fn set_attempt_handle(

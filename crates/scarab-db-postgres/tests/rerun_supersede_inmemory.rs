@@ -8,8 +8,8 @@
 use scarab_engine::ports::ExecHandle;
 use scarab_engine::{
     cancel_run_request, rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db,
-    EventPayload, OutboxId, OutboxMessage, RestartError, RunId, RunStatus, Scheduler, StepId,
-    StepSpec, StepStatus, SupersedeTeardown, Timestamp, LAUNCH_STEP, SUPERSEDE_TEARDOWN,
+    EventPayload, FailureKind, OutboxId, OutboxMessage, RestartError, RunId, RunStatus, Scheduler,
+    StepId, StepSpec, StepStatus, SupersedeTeardown, Timestamp, LAUNCH_STEP, SUPERSEDE_TEARDOWN,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
@@ -746,5 +746,135 @@ async fn cancelled_attempt_survives_teardown_induced_lost() {
             EventPayload::AttemptFinished { step, attempt, .. }
                 if step == &c && attempt == &a1)),
         "no spurious AttemptFinished event for the cancelled attempt"
+    );
+}
+
+/// Attempts that share a `started_at` (common under `FakeClock`, possible under
+/// fast real execution) must still order by mint sequence, so `.last()` — the
+/// frontier that anchors `?attempt=` reads and the settle-path frontier guard —
+/// is deterministic. Without the numeric-suffix tiebreak this is
+/// nondeterministic; a lexical tiebreak would wrongly place `a10` before `a2`.
+/// Exercises the in-memory `Db`, which mirrors the postgres `ORDER BY`.
+#[tokio::test]
+async fn attempts_order_by_mint_sequence_on_started_at_tie() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-order".into());
+    let step = StepId("s".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &step, Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+
+    // a1 and a2 minted with the SAME started_at, inserted a2-then-a1 to prove
+    // the order comes from the id's mint sequence, not insertion order.
+    let running = |id: &str| Attempt {
+        id: AttemptId(id.into()),
+        started_at: Timestamp(7),
+        failure: None,
+        outcome: AttemptOutcome::Running,
+    };
+    db.record_attempt(&run, &step, &running("a2")).await.unwrap();
+    db.record_attempt(&run, &step, &running("a1")).await.unwrap();
+
+    let attempts = db.attempts_of_step(&run, &step).await.unwrap();
+    let ids: Vec<&str> = attempts.iter().map(|a| a.id.0.as_str()).collect();
+    assert_eq!(ids, ["a1", "a2"], "equal started_at ties break on mint order");
+    assert_eq!(
+        attempts.last().unwrap().id,
+        AttemptId("a2".into()),
+        "frontier = latest-minted attempt (a2)"
+    );
+
+    // Lexical trap: with the same started_at, `a10` must sort AFTER `a2`
+    // (numeric suffix), not before it (lexical string order).
+    db.record_attempt(&run, &step, &running("a10"))
+        .await
+        .unwrap();
+    let attempts = db.attempts_of_step(&run, &step).await.unwrap();
+    let ids: Vec<&str> = attempts.iter().map(|a| a.id.0.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["a1", "a2", "a10"],
+        "tiebreak is numeric, not lexical (a10 last)"
+    );
+    assert_eq!(attempts.last().unwrap().id, AttemptId("a10".into()));
+
+    // steps_of_run must expose the same frontier as attempts_of_step.
+    let steps = db.steps_of_run(&run).await.unwrap();
+    let s_attempts = &steps.iter().find(|s| s.step == step).unwrap().attempts;
+    assert_eq!(
+        s_attempts.last().unwrap().id,
+        AttemptId("a10".into()),
+        "steps_of_run frontier matches attempts_of_step"
+    );
+}
+
+/// `record_attempt` mints a FRESH Running row at launch/adoption; if it is ever
+/// re-invoked for an id whose evidence was already recorded (crash re-adoption,
+/// idempotent re-launch), it must NEVER downgrade that evidence back to
+/// running/NULL. Mirror of the postgres `ON CONFLICT ... DO NOTHING`.
+#[tokio::test]
+async fn record_attempt_never_downgrades_recorded_evidence() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-nodown".into());
+    let step = StepId("s".into());
+    let a1 = AttemptId("a1".into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &step, Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+
+    // Launch mints the fresh Running row.
+    db.record_attempt(
+        &run,
+        &step,
+        &Attempt {
+            id: a1.clone(),
+            started_at: Timestamp(5),
+            failure: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Evidence recorded: the attempt failed (failure + Failed outcome move
+    // together — ADR-0056 amendment).
+    db.set_attempt_failure(&run, &step, &a1, FailureKind::Step)
+        .await
+        .unwrap();
+
+    // Re-drive: record_attempt fires again for a1 with a fresh Running row (and
+    // a different started_at, to prove nothing on the row is clobbered).
+    db.record_attempt(
+        &run,
+        &step,
+        &Attempt {
+            id: a1.clone(),
+            started_at: Timestamp(999),
+            failure: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+
+    let attempts = db.attempts_of_step(&run, &step).await.unwrap();
+    assert_eq!(attempts.len(), 1, "re-record is idempotent — no duplicate row");
+    let a = &attempts[0];
+    assert_eq!(
+        a.outcome,
+        AttemptOutcome::Failed,
+        "recorded outcome NOT downgraded to Running"
+    );
+    assert_eq!(
+        a.failure,
+        Some(FailureKind::Step),
+        "recorded failure NOT reset to NULL"
+    );
+    assert_eq!(
+        a.started_at,
+        Timestamp(5),
+        "original started_at preserved (budget source)"
     );
 }

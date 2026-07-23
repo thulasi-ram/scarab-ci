@@ -84,10 +84,20 @@ impl PostgresDb {
     }
 
     /// All attempts of a step, in start order.
+    ///
+    /// Deterministic tiebreak on the attempt id: `started_at` alone is not
+    /// unique (the test `FakeClock` ties, and fast real execution can mint two
+    /// attempts in the same millisecond), which would make attempt order — and
+    /// therefore `.last()`, the frontier that anchors `?attempt=` reads and the
+    /// settle-path frontier guard — nondeterministic. Attempt ids are minted
+    /// `a{n}` (`a1`,`a2`,…; monotonic — see the scheduler), so ties break on the
+    /// numeric suffix. It must be numeric, not lexical: lexical order puts `a10`
+    /// before `a2`. The in-memory `Db` (scarab-testkit) mirrors this exact order.
     pub async fn attempts(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
         let rows = sqlx::query(
             "SELECT attempt_id, started_at, failure, outcome FROM attempts
-             WHERE run_id = $1 AND step_id = $2 ORDER BY started_at",
+             WHERE run_id = $1 AND step_id = $2
+             ORDER BY started_at, CAST(substring(attempt_id FROM 2) AS INTEGER)",
         )
         .bind(&run.0)
         .bind(&step.0)
@@ -1294,13 +1304,21 @@ impl Db for PostgresDb {
         step: &StepId,
         attempt: &Attempt,
     ) -> Result<(), DbError> {
-        // Idempotent on the monotonic attempt id (the fencing unit) — a re-drive
-        // records the same attempt rather than a duplicate.
+        // Idempotent AND non-downgrading on the monotonic attempt id (the
+        // fencing unit). `record_attempt` always mints a FRESH row
+        // (failure=NULL, outcome='running') at launch/adoption; a re-drive
+        // (crash re-adoption, idempotent re-launch) must therefore NEVER
+        // overwrite evidence a later `set_attempt_failure`/`set_attempt_outcome`
+        // already recorded on this id — a `DO UPDATE` would reset a real
+        // Failed/Superseded/Cancelled verdict (and its failure classification)
+        // back to running/NULL: silent evidence loss. The row already holds the
+        // authoritative evidence and nothing in this INSERT legitimately
+        // refreshes (the launch handle is a separate column, written by
+        // `set_attempt_handle`), so keep the existing row untouched.
         sqlx::query(
             "INSERT INTO attempts (run_id, step_id, attempt_id, started_at, failure, outcome)
              VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (run_id, step_id, attempt_id)
-             DO UPDATE SET failure = EXCLUDED.failure, outcome = EXCLUDED.outcome",
+             ON CONFLICT (run_id, step_id, attempt_id) DO NOTHING",
         )
         .bind(&run.0)
         .bind(&step.0)
