@@ -112,8 +112,14 @@ async fn a_matrix_coordinate_resolves_at_launch() {
     let db = InMemoryDb::new();
     let run = RunId("run-m".into());
     let step = StepId("test".into());
-    let mut s = spec(vec!["cargo", "test", "--features", "${{ matrix.features }}"]);
-    s.matrix_values = std::collections::BTreeMap::from([("features".to_string(), "all".to_string())]);
+    let mut s = spec(vec![
+        "cargo",
+        "test",
+        "--features",
+        "${{ matrix.features }}",
+    ]);
+    s.matrix_values =
+        std::collections::BTreeMap::from([("features".to_string(), "all".to_string())]);
     db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
     db.create_step_run(&run, &step, Some(&s), &[], Timestamp(0))
         .await

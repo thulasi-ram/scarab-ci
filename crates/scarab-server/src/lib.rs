@@ -3630,9 +3630,8 @@ async fn persist_run_from_ir(
             .map(|p| serde_json::Value::Object(p.clone().into_iter().collect()))
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
         let interp_ctx = serde_json::json!({ "inputs": inputs, "event": event.context() });
-        let group = scarab_pipeline::cel::interpolate(&c.group, &interp_ctx).map_err(|e| {
-            TriggerError::Pipeline(format!("concurrency group `{}`: {e}", c.group))
-        })?;
+        let group = scarab_pipeline::cel::interpolate(&c.group, &interp_ctx)
+            .map_err(|e| TriggerError::Pipeline(format!("concurrency group `{}`: {e}", c.group)))?;
         // ADR-0032: a governed (environment-targeting) deploy still SERIALIZES
         // against its group, but must never silently cancel the current slot
         // holder — an in-flight production deploy is not disposable. So a governed

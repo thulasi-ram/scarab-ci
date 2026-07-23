@@ -223,5 +223,8 @@ async fn operator_cancel_emits_attributed_request_event() {
         .into_iter()
         .filter(|e| matches!(e.kind, EventPayload::RunCancelRequested { .. }))
         .count();
-    assert_eq!(requests, 1, "re-cancel of a terminal run emits no new event");
+    assert_eq!(
+        requests, 1,
+        "re-cancel of a terminal run emits no new event"
+    );
 }

@@ -3489,12 +3489,19 @@ mod tests {
         // DNS-1123 label safety + ≤63 for a pathological name and a huge Take.
         let long = "a-really-long-service-name-that-exceeds-the-slug-budget-considerably";
         let n = service_resource_name("some-run-id", long, i64::MAX);
-        assert!(n.len() <= 63, "name {n:?} exceeds the 63-char DNS label limit");
         assert!(
-            n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            n.len() <= 63,
+            "name {n:?} exceeds the 63-char DNS label limit"
+        );
+        assert!(
+            n.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
             "name {n:?} is not DNS-1123-label-safe"
         );
-        assert!(!n.starts_with('-') && !n.ends_with('-'), "name {n:?} has a dangling dash");
+        assert!(
+            !n.starts_with('-') && !n.ends_with('-'),
+            "name {n:?} has a dangling dash"
+        );
         // Even when the readable suffix is clipped, folding the Take into the hash
         // keeps different Takes distinct.
         assert_ne!(n, service_resource_name("some-run-id", long, i64::MAX - 1));
@@ -4041,9 +4048,9 @@ mod tests {
             .spec
             .unwrap()
             .containers[0]
-            .env
-            .clone()
-            .unwrap_or_default()
+                .env
+                .clone()
+                .unwrap_or_default()
         };
         let val = |env: &[EnvVar], k: &str| {
             env.iter()
@@ -4053,7 +4060,10 @@ mod tests {
 
         let on = env_of(true);
         assert_eq!(val(&on, "GIT_CONFIG_COUNT").as_deref(), Some("1"));
-        assert_eq!(val(&on, "GIT_CONFIG_KEY_0").as_deref(), Some("safe.directory"));
+        assert_eq!(
+            val(&on, "GIT_CONFIG_KEY_0").as_deref(),
+            Some("safe.directory")
+        );
         assert_eq!(val(&on, "GIT_CONFIG_VALUE_0").as_deref(), Some("*"));
 
         // No workspace flow => don't inject it.

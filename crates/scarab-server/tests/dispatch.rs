@@ -895,7 +895,10 @@ async fn dispatch_interpolates_concurrency_group_into_per_env_slots() {
     // template — so they are distinct and never collide.
     assert_eq!(
         db.run_concurrency(&staging).await.unwrap(),
-        Some(("deploy-staging".to_string(), ConcurrencyPolicy::CancelInProgress)),
+        Some((
+            "deploy-staging".to_string(),
+            ConcurrencyPolicy::CancelInProgress
+        )),
     );
     assert_eq!(
         db.run_concurrency(&production).await.unwrap(),
