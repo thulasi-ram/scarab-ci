@@ -64,6 +64,13 @@ export default function StepPane(props: {
   /** Viewing a closed Take: pin the strip's default to this frontier attempt
    * and mark attempts beyond it as from a later take. */
   frontierAttempt?: string | null;
+  /** The SELECTED take's attempt-id window (ADR-0056 amendment 2026-07-24) —
+   * the exact set of tries that belong to this take, scoping EVERY tab's
+   * evidence in every view (the latest/live take included). `[]` = the step was
+   * carried forward untouched (nothing ran here); `null`/absent = unscoped
+   * (fall back to the frontier filter). Keeps the pane consistent with the
+   * caller's already-windowed `tries` strip. */
+  window?: string[] | null;
   /** The run was dead-lettered — the step strip's terminal ⊘ marker. */
   deadLettered?: boolean;
   /** Open a Debug pod for this step. The Workspace tab offers it as the fallback
@@ -97,11 +104,17 @@ export default function StepPane(props: {
 
   const stepId = () => props.step?.id ?? null;
   const attemptN = (id: string) => parseInt(id.replace(/^a/, ""), 10) || 0;
-  // Tries to show in the strip. While viewing a past version (a frontier is
-  // pinned), hide tries AFTER the boundary — they belong to a later version and
-  // never existed in this snapshot (ADR-0056 snapshot-at-boundary honesty).
+  // The attempts this pane's tabs are scoped to. Take-windowed in EVERY view
+  // (ADR-0056 amendment 2026-07-24): when the caller hands a `window` (the
+  // selected take's attempt-id set), keep only those tries — so a step carried
+  // forward untouched (`[]`) reads as "didn't run in this version", and a
+  // re-run step shows only THIS take's tries, on the latest/live take too. The
+  // `frontierAttempt` ≤-filter stays as the fallback for callers that don't
+  // pass a window (snapshot-at-boundary honesty).
   const attemptsOf = (): Attempt[] => {
     const list = props.step?.attempt_list ?? [];
+    const w = props.window;
+    if (w) return list.filter((a) => w.includes(a.id));
     const f = props.frontierAttempt;
     return f ? list.filter((a) => attemptN(a.id) <= attemptN(f)) : list;
   };

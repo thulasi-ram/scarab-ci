@@ -110,11 +110,40 @@ export default function RunDetail() {
   };
   const timeTraveling = () => viewing() !== null;
   // Snapshot-at-boundary: a closed Take's view is a pure replay of the log up
-  // to the rerun press that closed it.
+  // to the rerun press that closed it. `takeView()` is CLOSED-take only (null on
+  // the latest) — it gates the time-travel-only affordances (read-only banner,
+  // artifact horizon, replayed DAG statuses).
   const takeView = (): TakeView | null => {
     const t = viewing();
     return t ? replayTake(events(), takes(), t) : null;
   };
+  // The take whose lens scopes the attempt-grain reads (tries strip, evidence
+  // pane, ×N badges) — the SELECTED take INCLUDING the latest/open one, unlike
+  // `viewing()`/`takeView()` which are null on the latest so the header can tell
+  // live from time-travel. Attempts are Take-scoped in EVERY view (ADR-0056
+  // amendment 2026-07-24): each Take shows only the attempts that belong to it,
+  // never tries carried over from prior Takes — the latest included.
+  const selectedTake = (): Take | null => {
+    const ts = takes();
+    if (!ts.length) return null;
+    const n = viewTake();
+    if (n === null) return ts[ts.length - 1];
+    return ts.find((t) => t.n === n) ?? ts[ts.length - 1];
+  };
+  // The scoped lens for the selected take — computed for the latest/open take
+  // too. The latest take's window runs from the last rerun boundary to now, so
+  // `replayTake` folds streaming attempts (AttemptStarted within the window)
+  // into `windowAttempts`/`frontier`/`attempts` live as the poll advances the
+  // log. Never null while there are events (deriveTakes always yields ≥1 take).
+  const scopedView = (): TakeView | null => {
+    const t = selectedTake();
+    return t ? replayTake(events(), takes(), t) : null;
+  };
+  // The selected take's window for a given step — the exact attempt-id set to
+  // render, `[]` for a step carried forward untouched (so it reads as "didn't
+  // run in this version", consistent across closed and latest takes).
+  const stepWindow = (stepId: string | null): string[] | null =>
+    stepId ? (scopedView()?.windowAttempts[stepId] ?? []) : null;
   // Events visible in the Activity rail: truncated at the boundary while
   // time-traveling — the rail shows what had happened AS OF that instant.
   const visibleEvents = () => {
@@ -186,19 +215,30 @@ export default function RunDetail() {
   const dagSteps = (): DagStep[] => {
     const timing = stepTiming();
     const tv = takeView();
+    const sv = scopedView();
     return stepList().map((s) => {
       const t = timing[s.id];
-      // Reused (ADR-0056 amendment): while time-traveling, a step with a known
-      // (carried-forward) status but ZERO attempts in THIS Take wasn't part of
-      // this rerun — render it muted, not as if it re-ran here.
+      // Status stays LIVE (backend-authoritative) on the latest take; a closed
+      // take replays it as of the boundary.
+      const status = tv ? (tv.status[s.id] ?? "pending") : s.status;
+      // Attempt count is Take-scoped in EVERY view now (ADR-0056 amendment):
+      // the ×N badge counts only THIS take's tries, not every take's summed. For
+      // a single-take run the window covers everything, so this equals
+      // `s.attempts` — no change to the common case.
+      const attempts = sv ? (sv.attempts[s.id] ?? 0) : s.attempts;
+      // Reused: a step with a known (carried-forward) verdict but ZERO attempts
+      // in THIS take's window wasn't part of this take's run (a partial rerun
+      // left it alone) — render it muted. Applies to the latest take too now,
+      // not only while time-traveling, so a carried-forward step reads the same
+      // in the live view as in the closed-take snapshot.
       const reused =
-        !!tv &&
-        (tv.attempts[s.id] ?? 0) === 0 &&
-        ["succeeded", "failed", "skipped"].includes(tv.status[s.id] ?? "");
+        !!sv &&
+        attempts === 0 &&
+        ["succeeded", "failed", "skipped"].includes(status ?? "");
       return {
         id: s.id,
-        status: tv ? (tv.status[s.id] ?? "pending") : s.status,
-        attempts: tv ? (tv.attempts[s.id] ?? 0) : s.attempts,
+        status,
+        attempts,
         reused,
         needs: s.needs ?? [],
         gate: s.gate,
@@ -225,10 +265,12 @@ export default function RunDetail() {
     const s = selectedStep();
     if (!s) return [];
     const list = s.attempt_list ?? [];
-    // While time-traveling, the tries strip shows only THIS Take's attempts
-    // (per-Take scoping, ADR-0056 amendment 2026-07-22) — a step carried
-    // forward untouched shows none. Live view shows the full history.
-    const win = timeTraveling() && sel() ? (takeView()?.windowAttempts[sel()!] ?? []) : null;
+    // The tries strip shows only the SELECTED Take's attempts in EVERY view —
+    // the latest/live take included (per-Take scoping, ADR-0056 amendment
+    // 2026-07-24). A step carried forward untouched shows none; a re-run step
+    // shows only this take's tries, numbered per-take. The latest take's window
+    // grows with the streaming log, so new attempts appear live.
+    const win = stepWindow(sel());
     const visible = win ? list.filter((a) => win.includes(a.id)) : list;
     const c = attemptCauses(visibleEvents(), s.id);
     return visible.map((a, i) => ({
@@ -252,7 +294,7 @@ export default function RunDetail() {
   const stripActiveAttempt = (): string | null => {
     const ts = stripTries();
     if (!ts.length) return null;
-    const want = selAttempt() ?? (sel() ? (takeView()?.frontier[sel()!] ?? null) : null);
+    const want = selAttempt() ?? (sel() ? (scopedView()?.frontier[sel()!] ?? null) : null);
     return ts.find((t) => t.id === want)?.id ?? ts[ts.length - 1].id;
   };
 
@@ -862,7 +904,8 @@ export default function RunDetail() {
                       activeAttempt={stripActiveAttempt()}
                       onAttemptSelect={setSelAttempt}
                       versionLabel={viewedLabel()}
-                      frontierAttempt={sel() ? takeView()?.frontier[sel()!] ?? null : null}
+                      window={stepWindow(sel())}
+                      frontierAttempt={sel() ? scopedView()?.frontier[sel()!] ?? null : null}
                       deadLettered={r().status === "dead_lettered"}
                       canDebug={canShell()}
                       onDebugPod={() => setShellOpen(true)}
