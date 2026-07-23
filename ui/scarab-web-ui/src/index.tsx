@@ -19,14 +19,22 @@ import "./styles.css";
 // its module is first evaluated, so the fetch/EventSource patch must be in
 // place before App (→ src/api/client.ts) loads. The dynamic imports also keep
 // src/mock.ts out of the production bundle when the flag is unset.
-if (import.meta.env.VITE_SCARAB_MOCK === "1") {
-  const { installMock } = await import("./mock");
-  installMock();
+//
+// Wrapped in an async IIFE (not top-level `await`) so the build target stays
+// broadly compatible — top-level await isn't available under Vite's default
+// target (es2020/chrome87) and fails the production build.
+async function start() {
+  if (import.meta.env.VITE_SCARAB_MOCK === "1") {
+    const { installMock } = await import("./mock");
+    installMock();
+  }
+
+  const { default: App } = await import("./App");
+
+  const root = document.getElementById("root");
+  if (root) {
+    render(() => <App />, root);
+  }
 }
 
-const { default: App } = await import("./App");
-
-const root = document.getElementById("root");
-if (root) {
-  render(() => <App />, root);
-}
+void start();
