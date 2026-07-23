@@ -1432,6 +1432,21 @@ export interface components {
             type_name: string;
             value: Record<string, never>;
         };
+        /**
+         * @description One of a step's co-located **sidecar services** (ADR-0058) — a throwaway
+         *     backing container in the step's own Pod, reachable at `localhost:<port>`.
+         *     Positional: identified by its `index` in the step's authored `services:`,
+         *     which is also its container ordinal (`service-{index}`) and the `?sidecar=`
+         *     selector for its logs. Not a `needs`-able DAG node.
+         */
+        StepServiceDto: {
+            /** @description The service OCI image (e.g. `postgres:16`). */
+            image: string;
+            /** @description Index in the step's `services:` list — the log selector and container ord. */
+            index: number;
+            /** @description Container ports the service listens on (all reachable at `localhost:<p>`). */
+            ports?: number[];
+        };
         StepStatusDto: {
             /**
              * @description Per-attempt detail (ADR-0047) — the rerun/retry history in append order.
@@ -1452,7 +1467,19 @@ export interface components {
              *     UI folds these into the run's graph view.
              */
             needs?: string[];
+            /**
+             * @description Co-located sidecar services (ADR-0058) this step declares — rendered as
+             *     sidecar nodes attached to the step, each with its own log stream (fetched
+             *     via `?sidecar=<index>` on the step-logs endpoint). Empty for a step with
+             *     no `services:`.
+             */
+            services?: components["schemas"]["StepServiceDto"][];
             status: string;
+            /**
+             * @description Names of pipeline-level shared services this step opts into via `uses:`
+             *     (ADR-0058) — the DAG's service edges. Empty for a step that uses none.
+             */
+            uses?: string[];
         };
         /**
          * @description One entry in a workspace directory listing — the merkle-tree children under a
@@ -2541,6 +2568,8 @@ export interface operations {
             query?: {
                 /** @description restrict to one attempt id (default = all) */
                 attempt?: string;
+                /** @description restrict to a sidecar service by its index in the step's services (default = the step's main container) */
+                sidecar?: number;
             };
             header?: never;
             path: {

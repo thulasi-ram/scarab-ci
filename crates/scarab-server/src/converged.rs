@@ -86,6 +86,20 @@ async fn ensure_log_tails(db: &Arc<dyn Db>, tailer: &LogTailer) -> Result<(), Sc
         for step in db.steps_of_run(&run).await? {
             if step.status == StepStatus::Running {
                 tailer.ensure(&step);
+                // Also tail each authored sidecar service (ADR-0058), co-located in
+                // the step's Pod as container `service-{i}`. Enumerating the step
+                // spec's `services:` and addressing `service-{i}` by index
+                // naturally excludes the framework sidecars (results-egress
+                // `scarab-results-egress`, workspace `scarab-workspace-*`), which
+                // carry distinct names — so their output never mixes into a step's
+                // sidecar streams. Best-effort + idempotent per fence (the tailer
+                // dedups), like `ensure` itself; a step with no stored spec (a gate)
+                // has no services.
+                if let Some(spec) = db.step_spec(&run, &step.step).await? {
+                    for i in 0..spec.services.len() {
+                        tailer.ensure_sidecar(&step, i);
+                    }
+                }
             }
         }
     }

@@ -207,6 +207,15 @@ impl Executor for SecretInjectingExecutor {
         self.inner.log_stream(step).await
     }
 
+    async fn sidecar_log_stream(
+        &self,
+        step: &StepRun,
+        container: &str,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        // Same forward-unchanged treatment as `log_stream` (ADR-0058 sidecar tail).
+        self.inner.sidecar_log_stream(step, container).await
+    }
+
     // ADR-0058 shared-service methods forward to the wrapped executor. Without
     // these, the trait's DEFAULT impls shadow the k8s executor's real ones — and
     // the default `launch_service` REJECTS, so any secrets-wired deployment would

@@ -1154,6 +1154,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "sidecar",
+            "in": "query",
+            "description": "restrict to a sidecar service by its index in the step's services (default = the step's main container)",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
@@ -2449,6 +2459,34 @@
           }
         }
       },
+      "StepServiceDto": {
+        "type": "object",
+        "description": "One of a step's co-located **sidecar services** (ADR-0058) — a throwaway\nbacking container in the step's own Pod, reachable at `localhost:<port>`.\nPositional: identified by its `index` in the step's authored `services:`,\nwhich is also its container ordinal (`service-{index}`) and the `?sidecar=`\nselector for its logs. Not a `needs`-able DAG node.",
+        "required": [
+          "index",
+          "image"
+        ],
+        "properties": {
+          "image": {
+            "type": "string",
+            "description": "The service OCI image (e.g. `postgres:16`)."
+          },
+          "index": {
+            "type": "integer",
+            "description": "Index in the step's `services:` list — the log selector and container ord.",
+            "minimum": 0
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "Container ports the service listens on (all reachable at `localhost:<p>`)."
+          }
+        }
+      },
       "StepStatusDto": {
         "type": "object",
         "required": [
@@ -2485,8 +2523,22 @@
             },
             "description": "Upstream step ids this step depends on — the DAG in-edges (ADR-0006). The\nUI folds these into the run's graph view."
           },
+          "services": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/StepServiceDto"
+            },
+            "description": "Co-located sidecar services (ADR-0058) this step declares — rendered as\nsidecar nodes attached to the step, each with its own log stream (fetched\nvia `?sidecar=<index>` on the step-logs endpoint). Empty for a step with\nno `services:`."
+          },
           "status": {
             "type": "string"
+          },
+          "uses": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of pipeline-level shared services this step opts into via `uses:`\n(ADR-0058) — the DAG's service edges. Empty for a step that uses none."
           }
         }
       },

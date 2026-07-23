@@ -1004,6 +1004,33 @@ impl Executor for K8sExecutor {
         })))
     }
 
+    /// Open a live tail of ONE of the step Pod's sidecar containers (ADR-0058
+    /// evidence) — identical to [`log_stream`](Self::log_stream) but pinned to
+    /// `container` (a `service-{i}` sidecar) instead of the main `step` container,
+    /// so a step's sidecar output is captured as its own stream. Same
+    /// deterministic `{run, step, attempt}` Pod (`pod_name`); best-effort like the
+    /// step tail (a Pod/container not yet started errors and is retried later).
+    async fn sidecar_log_stream(
+        &self,
+        step: &StepRun,
+        container: &str,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        let pods = self.pods()?;
+        let name = pod_name(step);
+        let params = LogParams {
+            follow: true,
+            container: Some(container.to_string()),
+            ..LogParams::default()
+        };
+        let reader = pods
+            .log_stream(&name, &params)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        Ok(Some(Box::new(PodLogChunks {
+            reader: Box::pin(reader),
+        })))
+    }
+
     /// Provision a shared service (ADR-0058): create the service Pod, the cluster
     /// DNS Service, and the opt-in-scoped NetworkPolicy. Idempotent — a 409 on any
     /// object means a prior launch created it, so we adopt rather than fail. The

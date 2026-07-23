@@ -731,6 +731,21 @@ pub trait Executor: Send + Sync {
         Ok(None)
     }
 
+    /// Open a best-effort **live tail** of one of `step`'s co-located sidecar
+    /// containers (ADR-0058 evidence): the same k8s log machinery as
+    /// [`log_stream`](Self::log_stream) and the same reliability class (a dropped
+    /// tail never fails the run), but pinned to `container` — a step sidecar
+    /// service (`service-{i}`) rather than the main step container — so a step's
+    /// sidecar output is captured as its own stream, distinct from the step's.
+    /// `Ok(None)` = this backend has no log source (the default), a clean no-op.
+    async fn sidecar_log_stream(
+        &self,
+        _step: &StepRun,
+        _container: &str,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        Ok(None)
+    }
+
     /// Provision (or re-attach to) the standalone **shared-service** unit for
     /// `{run, take, name}` (ADR-0058): a service Pod + a cluster-DNS Service +
     /// a NetworkPolicy scoping reachability to opt-in Pods. Returns a handle the

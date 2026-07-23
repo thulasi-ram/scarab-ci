@@ -204,6 +204,14 @@ impl Executor for CloneEnrichingExecutor {
         self.inner.log_stream(step).await
     }
 
+    async fn sidecar_log_stream(
+        &self,
+        step: &StepRun,
+        container: &str,
+    ) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
+        self.inner.sidecar_log_stream(step, container).await
+    }
+
     // ADR-0058 shared-service methods forward to the wrapped executor. Without
     // these, the trait's DEFAULT `launch_service` (which REJECTS) shadows the k8s
     // executor's real impl, so a clone-wired deployment would refuse every shared

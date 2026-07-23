@@ -161,6 +161,38 @@ impl LogTailer {
         );
     }
 
+    /// Ensure a best-effort tail is running for the `index`-th **sidecar service**
+    /// of `step` (ADR-0058 evidence): the `service-{index}` container co-located in
+    /// the step's Pod. Keyed on the synthetic `{step}::service-{index}` stream (see
+    /// [`crate::logs::sidecar_stream_key`]) under the step's REAL current attempt,
+    /// so it replays/tails through the exact same pipeline as step logs and a
+    /// per-attempt read scopes it like the step's own. Idempotent per fence; a step
+    /// with no current attempt (not launched yet) is a no-op. Call it every tick for
+    /// each running step that declares sidecars.
+    pub fn ensure_sidecar(&self, step: &StepRun, index: usize) {
+        let Some(attempt) = step.current_attempt() else {
+            return;
+        };
+        let attempt = attempt.id.clone();
+        let syn_step = crate::logs::sidecar_stream_key(&step.step, index);
+        let fence = fence_of(&step.run, &syn_step, &attempt);
+        let resource = format!(
+            "tail:{}:{}:sidecar-{index}:{}",
+            step.run.0, step.step.0, attempt.0
+        );
+        self.spawn_tail(
+            fence,
+            resource,
+            step.run.clone(),
+            syn_step,
+            attempt,
+            TailSource::Sidecar {
+                step: step.clone(),
+                index,
+            },
+        );
+    }
+
     /// The shared spawn/lease/backoff machinery behind [`ensure`](Self::ensure)
     /// and [`ensure_service`](Self::ensure_service): dedup by fence, claim the
     /// per-fence tail lease (ADR-0051), drain the `source` into the pipeline under
@@ -289,6 +321,11 @@ fn is_pod_not_ready(err: &str) -> bool {
 enum TailSource {
     Step(StepRun),
     Service(scarab_engine::ports::ExecHandle),
+    /// The `index`-th sidecar service of `step` (ADR-0058): a `service-{index}`
+    /// container in the step's OWN Pod, tailed distinctly from the main step. The
+    /// storage `{run, step, attempt}` keys the drive loop passes are already the
+    /// synthetic sidecar id + the step's real attempt (see [`LogTailer::ensure_sidecar`]).
+    Sidecar { step: StepRun, index: usize },
 }
 
 /// Open the executor's log source for `source` and pump it into the pipeline. A
@@ -305,6 +342,14 @@ async fn drain(
     let chunks = match source {
         TailSource::Step(step_run) => executor.log_stream(step_run).await?,
         TailSource::Service(handle) => executor.service_log_stream(handle).await?,
+        TailSource::Sidecar { step, index } => {
+            // The co-located `service-{index}` container in the step's own Pod. The
+            // `step`/`attempt` args below are already the SYNTHETIC sidecar id +
+            // the step's real attempt (the caller passed them), so the pump stores
+            // this under its own stream, keyed like the step's per-attempt logs.
+            let container = format!("service-{index}");
+            executor.sidecar_log_stream(step, &container).await?
+        }
     };
     match chunks {
         Some(chunks) => {

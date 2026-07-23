@@ -55,6 +55,20 @@ pub fn service_stream_key(name: &str, take: i64) -> (StepId, AttemptId) {
     (StepId(format!("service:{name}")), AttemptId(format!("t{take}")))
 }
 
+/// Map a **step sidecar** service (ADR-0058) — the `index`-th entry of a step's
+/// authored `services:`, co-located in the step's Pod as container
+/// `service-{index}` — onto the log pipeline's stream key. Like
+/// [`service_stream_key`] this reuses the one pipeline via a synthetic step id
+/// instead of a second channel: `{step}::service-{index}` cannot collide with a
+/// real step id (validated identifiers carry no `:`), and the sidecar's logs are
+/// stored under the step's REAL attempt id (a sidecar dies with + is re-created
+/// alongside the step's Pod on every Attempt), so a per-attempt read scopes them
+/// exactly like the step's own. Kept beside the step key so the tail source and
+/// the read endpoint agree.
+pub fn sidecar_stream_key(step: &StepId, index: usize) -> StepId {
+    StepId(format!("{}::service-{index}", step.0))
+}
+
 /// Persists and streams step logs.
 pub struct LogService {
     store: Arc<dyn ObjectStore>,
@@ -223,4 +237,29 @@ fn replace_bytes(haystack: &[u8], needle: &[u8], repl: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sidecar_stream_key;
+    use scarab_engine::StepId;
+
+    #[test]
+    fn sidecar_stream_key_namespaces_by_step_and_index() {
+        // Nests under the step id and is distinct per index; the `::` guards it
+        // from colliding with a real (colon-free) step id, so a sidecar's stream
+        // never overwrites the step's own or a sibling sidecar's.
+        assert_eq!(
+            sidecar_stream_key(&StepId("test".into()), 0).0,
+            "test::service-0"
+        );
+        assert_eq!(
+            sidecar_stream_key(&StepId("test".into()), 1).0,
+            "test::service-1"
+        );
+        assert_ne!(
+            sidecar_stream_key(&StepId("build".into()), 0).0,
+            sidecar_stream_key(&StepId("build".into()), 1).0,
+        );
+    }
 }

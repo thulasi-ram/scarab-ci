@@ -730,6 +730,32 @@ pub struct StepStatusDto {
     /// Gates launch no pod and suspend the run until released.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<String>,
+    /// Co-located sidecar services (ADR-0058) this step declares — rendered as
+    /// sidecar nodes attached to the step, each with its own log stream (fetched
+    /// via `?sidecar=<index>` on the step-logs endpoint). Empty for a step with
+    /// no `services:`.
+    #[serde(default)]
+    pub services: Vec<StepServiceDto>,
+    /// Names of pipeline-level shared services this step opts into via `uses:`
+    /// (ADR-0058) — the DAG's service edges. Empty for a step that uses none.
+    #[serde(default)]
+    pub uses: Vec<String>,
+}
+
+/// One of a step's co-located **sidecar services** (ADR-0058) — a throwaway
+/// backing container in the step's own Pod, reachable at `localhost:<port>`.
+/// Positional: identified by its `index` in the step's authored `services:`,
+/// which is also its container ordinal (`service-{index}`) and the `?sidecar=`
+/// selector for its logs. Not a `needs`-able DAG node.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct StepServiceDto {
+    /// Index in the step's `services:` list — the log selector and container ord.
+    pub index: usize,
+    /// The service OCI image (e.g. `postgres:16`).
+    pub image: String,
+    /// Container ports the service listens on (all reachable at `localhost:<p>`).
+    #[serde(default)]
+    pub ports: Vec<u16>,
 }
 
 /// One attempt at executing a step (ADR-0047) — the rerun unit. A step with more
@@ -1377,21 +1403,43 @@ async fn get_run(
     let trigger_title = st.db.run_trigger_title(&run).await?;
     let origin_pr_base = st.db.run_pr_base(&run).await?;
     let run_number = st.db.run_number(&run).await?;
+    // Enrich each step with its sidecar services + shared-service opt-ins (ADR-
+    // 0058) from the stored spec, so the FE can render sidecar nodes and `uses`
+    // edges and address per-sidecar logs by index. A step with no stored spec
+    // (e.g. a gate) carries empty vecs.
+    let mut step_dtos = Vec::with_capacity(steps.len());
+    for s in steps {
+        let (services, uses) = match st.db.step_spec(&run, &s.step).await? {
+            Some(spec) => (
+                spec.services
+                    .iter()
+                    .enumerate()
+                    .map(|(index, svc)| StepServiceDto {
+                        index,
+                        image: svc.image.clone(),
+                        ports: svc.ports.clone(),
+                    })
+                    .collect(),
+                spec.uses.clone(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        step_dtos.push(StepStatusDto {
+            id: s.step.0,
+            status: step_status_name(s.status).to_string(),
+            attempts: s.attempts.len(),
+            attempt_list: s.attempts.iter().map(attempt_dto).collect(),
+            needs: s.needs.into_iter().map(|n| n.0).collect(),
+            gate: s.gate_kind,
+            services,
+            uses,
+        });
+    }
     Ok(Json(RunStatusResponse {
         id: run.0,
         status: run_status_name(status).to_string(),
         run_number,
-        steps: steps
-            .into_iter()
-            .map(|s| StepStatusDto {
-                id: s.step.0,
-                status: step_status_name(s.status).to_string(),
-                attempts: s.attempts.len(),
-                attempt_list: s.attempts.iter().map(attempt_dto).collect(),
-                needs: s.needs.into_iter().map(|n| n.0).collect(),
-                gate: s.gate_kind,
-            })
-            .collect(),
+        steps: step_dtos,
         params,
         pipeline,
         trigger_title,
@@ -1525,6 +1573,12 @@ async fn get_logs(
 struct StepLogsQuery {
     #[serde(default)]
     attempt: Option<String>,
+    /// Restrict to one of the step's co-located sidecar services (ADR-0058), by
+    /// its index in the step's authored `services:` — reads the `service-{index}`
+    /// container's stream instead of the step's own main container. Combines with
+    /// `attempt` (a sidecar shares the step's attempts). Absent = the step's log.
+    #[serde(default)]
+    sidecar: Option<usize>,
 }
 
 /// SSE of ONE step's log bodies (ADR-0013), the source for the run detail's
@@ -1539,7 +1593,8 @@ struct StepLogsQuery {
     params(
         ("id" = String, Path, description = "run id"),
         ("step" = String, Path, description = "step id"),
-        ("attempt" = Option<String>, Query, description = "restrict to one attempt id (default = all)")
+        ("attempt" = Option<String>, Query, description = "restrict to one attempt id (default = all)"),
+        ("sidecar" = Option<usize>, Query, description = "restrict to a sidecar service by its index in the step's services (default = the step's main container)")
     ),
     responses((status = 200, description = "SSE stream of this step's log output"), (status = 404, description = "no such run or step"))
 )]
@@ -1574,13 +1629,22 @@ async fn get_step_logs(
         None => sr.attempts.iter().map(|a| a.id.clone()).collect(),
     };
 
+    // Sidecar logs (ADR-0058) are stored under a synthetic step id
+    // (`{step}::service-{i}`) but keyed on the step's REAL attempt ids (a sidecar
+    // shares the step's Pod + Attempt), so the attempt resolution above is
+    // unchanged — only the read key swaps to the sidecar's synthetic stream.
+    let read_step = match q.sidecar {
+        Some(i) => crate::logs::sidecar_stream_key(&step, i),
+        None => step.clone(),
+    };
+
     // Replay each selected attempt in order, remembering how far it was read.
     let mut replay: Vec<Result<Event, Infallible>> = Vec::new();
     let mut seen: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     for aid in &selected {
         let (body, next) = st
             .logs
-            .read_from(&run, &step, aid, 0)
+            .read_from(&run, &read_step, aid, 0)
             .await
             .unwrap_or_default();
         if !body.is_empty() {
@@ -1601,7 +1665,7 @@ async fn get_step_logs(
         return Ok(Sse::new(replay_stream.boxed()));
     }
     let live = futures::stream::unfold(
-        (st.clone(), run.clone(), step.clone(), selected, seen, false),
+        (st.clone(), run.clone(), read_step.clone(), selected, seen, false),
         |(st, run, step, attempts, mut seen, done)| async move {
             if done {
                 return None;
@@ -5439,6 +5503,7 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
         RunSummaryDto,
         RunStatusResponse,
         StepStatusDto,
+        StepServiceDto,
         AttemptDto,
         ServiceStatusDto,
         StepResultDto,
