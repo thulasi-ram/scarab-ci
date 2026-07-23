@@ -1367,14 +1367,17 @@ impl Db for PostgresDb {
     ) -> Result<(), DbError> {
         // Record the classification and the `Failed` outcome together so the two
         // columns never diverge (ADR-0056 amendment). Defense in depth: never
-        // downgrade a terminal `Superseded` — a rerun tore this attempt down on
-        // purpose, and the self-inflicted `Lost` its dying Pod reports must not
-        // clobber that verdict (`IS DISTINCT FROM` keeps NULL/other outcomes
-        // writable).
+        // downgrade a terminal-by-intent outcome — a rerun (`superseded`) or a
+        // run cancel (`cancelled`) tore this attempt down on purpose, and the
+        // self-inflicted `Lost` its dying Pod reports must not clobber that
+        // verdict. Two `IS DISTINCT FROM` clauses (not `NOT IN`) keep NULL/other
+        // outcomes writable — `outcome` is nullable and `NULL NOT IN (…)` is NULL,
+        // which would wrongly refuse the legitimate write to a pre-outcome row.
         sqlx::query(
             "UPDATE attempts SET failure = $4, outcome = $5
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
-               AND outcome IS DISTINCT FROM 'superseded'",
+               AND outcome IS DISTINCT FROM 'superseded'
+               AND outcome IS DISTINCT FROM 'cancelled'",
         )
         .bind(&run.0)
         .bind(&step.0)
@@ -1394,14 +1397,17 @@ impl Db for PostgresDb {
         attempt: &AttemptId,
         outcome: AttemptOutcome,
     ) -> Result<(), DbError> {
-        // Defense in depth (mirrors `set_attempt_failure`): a terminal
-        // `Superseded` is never overwritten — the intentional teardown verdict
-        // wins over any later observation. Setting `Superseded` itself is still
-        // fine (the row is `running` at that point).
+        // Defense in depth (mirrors `set_attempt_failure`): a terminal-by-intent
+        // outcome (`superseded` from a rerun, `cancelled` from a run cancel) is
+        // never overwritten — the intentional teardown verdict wins over any later
+        // observation. Setting `Superseded`/`Cancelled` itself is still fine (the
+        // row is `running` at that point). `IS DISTINCT FROM` (not `NOT IN`) keeps
+        // the nullable pre-outcome rows writable.
         sqlx::query(
             "UPDATE attempts SET outcome = $4
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
-               AND outcome IS DISTINCT FROM 'superseded'",
+               AND outcome IS DISTINCT FROM 'superseded'
+               AND outcome IS DISTINCT FROM 'cancelled'",
         )
         .bind(&run.0)
         .bind(&step.0)

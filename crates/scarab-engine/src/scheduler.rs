@@ -624,6 +624,21 @@ pub async fn cancel_run_request(
                     at: now,
                 })
                 .await?;
+                // Stamp the in-flight attempt `Cancelled` (mirrors the superseded
+                // fix). Only a `Running` step has a live Pod / frontier attempt;
+                // cancelling tears that Pod down, and the backend then reports the
+                // dying Pod `Lost`. Without a recorded terminal outcome that
+                // self-inflicted `Lost` would settle onto the attempt row as
+                // `failed`/`lost` and render an intentionally-cancelled attempt as
+                // a failure. No extra event: the `StepTransitioned`→Cancelled above
+                // and the `RunTransitioned`→Cancelled below already record the
+                // boundary in the immutable log.
+                if step.status == StepStatus::Running {
+                    if let Some(a) = step.attempts.last() {
+                        db.set_attempt_outcome(run, &step.step, &a.id, AttemptOutcome::Cancelled)
+                            .await?;
+                    }
+                }
             }
             Err(DbError::Conflict) => {}
             Err(e) => return Err(e.into()),
@@ -2029,18 +2044,23 @@ impl<'a> Scheduler<'a> {
         //   * it names an attempt that is no longer the step's frontier — a
         //     redelivered intent for an older generation whose successor already
         //     runs under a higher fence (the original stale-delivery guard), or
-        //   * that attempt is already `Superseded` — a rerun re-armed its
-        //     still-`Running` step and SIGTERMed its Pod, which the backend now
-        //     reports `Lost`. That `Lost` is self-inflicted and fenced, not a
-        //     verdict; recording it would downgrade the terminal `Superseded` to
-        //     `failed`/`lost` and render the torn-down attempt as a failure.
+        //   * that attempt already carries a terminal-by-intent outcome
+        //     (`Superseded` from a rerun, or `Cancelled` from a run cancel): its
+        //     still-`Running` step had its Pod SIGTERMed on purpose, which the
+        //     backend now reports `Lost`. That `Lost` is self-inflicted and
+        //     fenced, not a verdict; recording it would downgrade the terminal
+        //     outcome to `failed`/`lost` and render the torn-down attempt as a
+        //     failure. (A cancel keeps the same frontier attempt — no successor is
+        //     minted — so only the outcome check catches it.)
         let attempts = self.db.attempts_of_step(run, step).await?;
         let is_frontier = attempts.last().map(|a| &a.id) == Some(attempt);
-        let superseded = attempts
-            .iter()
-            .find(|a| &a.id == attempt)
-            .is_some_and(|a| a.outcome == AttemptOutcome::Superseded);
-        if !is_frontier || superseded {
+        let torn_down = attempts.iter().find(|a| &a.id == attempt).is_some_and(|a| {
+            matches!(
+                a.outcome,
+                AttemptOutcome::Superseded | AttemptOutcome::Cancelled
+            )
+        });
+        if !is_frontier || torn_down {
             return Ok(());
         }
 

@@ -1142,10 +1142,14 @@ impl Db for InMemoryDb {
         let mut st = self.state.lock().unwrap();
         if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
             if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
-                // Defense in depth: never downgrade a terminal `Superseded` — a
+                // Defense in depth: never downgrade a terminal-by-intent outcome
+                // (`Superseded` from a rerun, `Cancelled` from a run cancel) — a
                 // self-inflicted teardown `Lost` must not clobber it (mirrors the
-                // postgres `IS DISTINCT FROM 'superseded'` guard).
-                if a.outcome != AttemptOutcome::Superseded {
+                // postgres `IS DISTINCT FROM` guards).
+                if !matches!(
+                    a.outcome,
+                    AttemptOutcome::Superseded | AttemptOutcome::Cancelled
+                ) {
                     // Failure and outcome move together (ADR-0056 amendment).
                     a.failure = Some(failure);
                     a.outcome = AttemptOutcome::Failed;
@@ -1165,9 +1169,13 @@ impl Db for InMemoryDb {
         let mut st = self.state.lock().unwrap();
         if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
             if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
-                // Defense in depth (mirrors `set_attempt_failure`): a terminal
-                // `Superseded` is never overwritten by a later observation.
-                if a.outcome != AttemptOutcome::Superseded {
+                // Defense in depth (mirrors `set_attempt_failure`): a terminal-by-
+                // intent outcome (`Superseded`/`Cancelled`) is never overwritten by
+                // a later observation.
+                if !matches!(
+                    a.outcome,
+                    AttemptOutcome::Superseded | AttemptOutcome::Cancelled
+                ) {
                     a.outcome = outcome;
                 }
             }

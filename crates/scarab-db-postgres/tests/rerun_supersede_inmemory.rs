@@ -7,9 +7,9 @@
 
 use scarab_engine::ports::ExecHandle;
 use scarab_engine::{
-    rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db, EventPayload, OutboxId,
-    OutboxMessage, RestartError, RunId, RunStatus, Scheduler, StepId, StepSpec, StepStatus,
-    SupersedeTeardown, Timestamp, LAUNCH_STEP, SUPERSEDE_TEARDOWN,
+    cancel_run_request, rerun_step, retry_step, Attempt, AttemptId, AttemptOutcome, Db,
+    EventPayload, OutboxId, OutboxMessage, RestartError, RunId, RunStatus, Scheduler, StepId,
+    StepSpec, StepStatus, SupersedeTeardown, Timestamp, LAUNCH_STEP, SUPERSEDE_TEARDOWN,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 
@@ -611,4 +611,140 @@ async fn superseded_attempt_survives_teardown_induced_lost() {
         "frontier attempt a2 must be untouched"
     );
     assert!(a2_row.failure.is_none(), "frontier a2 carries no failure");
+}
+
+/// Regression — the CANCEL-path mirror of
+/// `superseded_attempt_survives_teardown_induced_lost`. Cancelling a run stamps
+/// its in-flight step `Cancelled` and SIGTERMs that step's Pod (the `CANCEL_RUN`
+/// teardown); the dying Pod is then reported `Lost`. `a1`'s launch intent was
+/// never dispatched, so it lingers on the outbox and `reconcile` re-polls it —
+/// observing `Lost`. Unlike a supersede, a cancel mints NO successor attempt, so
+/// the cancelled attempt is STILL the step's frontier — the "only the frontier
+/// may settle" guard does NOT catch it; only the recorded `Cancelled` outcome
+/// does. The engine PREVIOUSLY guarded only `Superseded`, so
+/// `settle_failed_attempt` recorded `failed·lost` on `a1`, DOWNGRADING the
+/// terminal `Cancelled` and rendering the intentionally-cancelled attempt as a
+/// failure. A self-inflicted `Lost` for an already-`Cancelled` attempt must be
+/// IGNORED — no row write, no event.
+#[tokio::test]
+async fn cancelled_attempt_survives_teardown_induced_lost() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-cancel-lost".into());
+    let b = StepId("b".into());
+    let c = StepId("c".into());
+    let a1 = AttemptId("a1".into());
+    let handle = "fake://run-cancel-lost/c/a1";
+
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
+        .await
+        .unwrap();
+    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
+        .await
+        .unwrap();
+
+    // b succeeded; c is in-flight (a1 with a launched Pod handle).
+    db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Succeeded)
+        .await
+        .unwrap();
+    db.record_attempt(
+        &run,
+        &c,
+        &Attempt {
+            id: a1.clone(),
+            started_at: Timestamp(0),
+            failure: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    db.set_attempt_handle(&run, &c, &a1, handle).await.unwrap();
+    db.record_step_transition(&run, &c, StepStatus::Pending, StepStatus::Running)
+        .await
+        .unwrap();
+    db.seed_run(&run, RunStatus::Running);
+
+    // The human cancels the run: c → Cancelled, a1 stamped Cancelled, run →
+    // Cancelled, and a CANCEL_RUN teardown is enqueued for a1's Pod.
+    let clock = FakeClock::new(1_000);
+    let cancelled = cancel_run_request(&db, &clock, &run)
+        .await
+        .expect("cancel_run_request");
+    assert!(cancelled, "an in-flight run is cancellable");
+
+    // Precondition (the stamp under test): cancel recorded a1 `Cancelled`.
+    let a1_stamped = db
+        .attempts_of_step(&run, &c)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|x| x.id == a1)
+        .expect("a1 present");
+    assert_eq!(
+        a1_stamped.outcome,
+        AttemptOutcome::Cancelled,
+        "cancel must stamp the in-flight attempt Cancelled"
+    );
+
+    // a1's launch intent is still on the outbox (never dispatched — a1 never
+    // terminally settled through the launch path). reconcile re-polls it; its
+    // SIGTERMed Pod polls `Lost`.
+    db.enqueue_outbox(&OutboxMessage {
+        id: OutboxId(0),
+        run: run.clone(),
+        kind: LAUNCH_STEP.to_string(),
+        payload: serde_json::json!({ "run": run.0, "step": c.0, "attempt": a1.0 }),
+        idempotency_key: format!("launch:{}/{}/{}", run.0, c.0, a1.0),
+        at: Timestamp(1_000),
+    })
+    .await
+    .unwrap();
+
+    let exec = FakeExecutor::new();
+    exec.kill(ExecHandle(handle.to_string())); // a1's Pod is gone → poll ⇒ Lost
+    let sched = Scheduler::new(&db, &clock, &exec, "drv");
+    sched
+        .reconcile()
+        .await
+        .expect("reconcile drains the stale a1 launch intent and observes Lost");
+
+    let c_attempts = db.attempts_of_step(&run, &c).await.unwrap();
+    let a1_row = c_attempts.iter().find(|x| x.id == a1).expect("a1 present");
+    // (a) a1's terminal Cancelled is intact — NOT downgraded to failed/lost.
+    assert_eq!(
+        a1_row.outcome,
+        AttemptOutcome::Cancelled,
+        "the teardown-induced Lost must not downgrade the cancelled attempt"
+    );
+    // (b) cancellation is not a failure — `failure` stays None.
+    assert!(
+        a1_row.failure.is_none(),
+        "cancelled attempt's `failure` must stay None, not `lost`"
+    );
+
+    // (c) it STAYS Cancelled after the Lost — a fresh read of the durable store
+    // (not the earlier snapshot) still shows the intentional verdict.
+    let a1_persisted = db
+        .attempts_of_step(&run, &c)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|x| x.id == a1)
+        .expect("a1 present");
+    assert_eq!(
+        a1_persisted.outcome,
+        AttemptOutcome::Cancelled,
+        "a1 stays Cancelled after the Lost is drained"
+    );
+    assert!(a1_persisted.failure.is_none());
+
+    // (d) no AttemptFinished was appended for a1 — the event log stays correct.
+    let events = db.events(&run).await.unwrap();
+    assert!(
+        !events.iter().any(|e| matches!(&e.kind,
+            EventPayload::AttemptFinished { step, attempt, .. }
+                if step == &c && attempt == &a1)),
+        "no spurious AttemptFinished event for the cancelled attempt"
+    );
 }
