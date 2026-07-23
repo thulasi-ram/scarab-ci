@@ -669,7 +669,7 @@ async fn cancelled_attempt_survives_teardown_induced_lost() {
     // The human cancels the run: c → Cancelled, a1 stamped Cancelled, run →
     // Cancelled, and a CANCEL_RUN teardown is enqueued for a1's Pod.
     let clock = FakeClock::new(1_000);
-    let cancelled = cancel_run_request(&db, &clock, &run)
+    let cancelled = cancel_run_request(&db, &clock, &run, Some("alice".to_string()))
         .await
         .expect("cancel_run_request");
     assert!(cancelled, "an in-flight run is cancellable");

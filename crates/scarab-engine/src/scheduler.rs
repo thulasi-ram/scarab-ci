@@ -129,6 +129,19 @@ pub enum RerunError {
     /// A non-failed step is reran (a Take fork), not retried.
     #[error("cannot retry {step:?}: not a failed step (is {status:?})")]
     NotFailed { step: StepId, status: StepStatus },
+    /// Gate approval rejected: the target step exists but is not a `manual`
+    /// gate (a timer/external gate, or a plain step). Distinct from
+    /// [`StepNotFound`](RerunError::StepNotFound) so the API returns 409 rather
+    /// than conflating it with an unknown step (404).
+    #[error("step {0:?} is not a manual gate")]
+    NotAManualGate(StepId),
+    /// Gate approval rejected: the manual gate is not currently awaiting
+    /// approval — it was skipped (upstream failed), cancelled, failed, or is
+    /// already released. A terminal gate cannot be reopened, so recording an
+    /// approval would only forge a phantom `GateApproved` audit fact (and, on a
+    /// governed environment, a false deployment record). Mapped to 409.
+    #[error("gate {step:?} is not awaiting approval (is {status:?})")]
+    GateNotPending { step: StepId, status: StepStatus },
 }
 
 /// Rerun a step (ADR-0027): re-arm `target` and every step that transitively
@@ -549,15 +562,27 @@ pub async fn record_gate_approval(
     step: &StepId,
     by: &str,
 ) -> Result<(), RerunError> {
-    // The target must be a known `manual` gate step (timer/external gates are
-    // released by other means, ADR-0034).
-    let is_manual_gate = db
-        .steps_of_run(run)
-        .await?
-        .iter()
-        .any(|s| &s.step == step && s.gate_kind.as_deref() == Some("manual"));
-    if !is_manual_gate {
+    // The target must be a known step (404 otherwise) ...
+    let steps = db.steps_of_run(run).await?;
+    let Some(gate) = steps.iter().find(|s| &s.step == step) else {
         return Err(RerunError::StepNotFound(step.clone()));
+    };
+    // ... that is a `manual` gate (timer/external gates are released by other
+    // means, ADR-0034). A step that exists but isn't a manual gate is a
+    // distinct 409, not a 404.
+    if gate.gate_kind.as_deref() != Some("manual") {
+        return Err(RerunError::NotAManualGate(step.clone()));
+    }
+    // ... and is currently awaiting approval. A skipped/cancelled/failed/
+    // already-released gate is terminal and cannot be reopened; recording an
+    // approval on it would forge a phantom `GateApproved` (and, on a governed
+    // environment, a false deployment record) while releasing nothing. Reject
+    // so the API returns 409 and the durable log stays honest.
+    if gate.status != StepStatus::Pending {
+        return Err(RerunError::GateNotPending {
+            step: step.clone(),
+            status: gate.status,
+        });
     }
 
     // Best-effort dedup: skip if this principal already approved this gate. The
@@ -596,6 +621,7 @@ pub async fn cancel_run_request(
     db: &dyn Db,
     clock: &dyn Clock,
     run: &RunId,
+    by: Option<String>,
 ) -> Result<bool, SchedulerError> {
     let Some(current) = db.run_status(run).await? else {
         return Ok(false);
@@ -604,6 +630,17 @@ pub async fn cancel_run_request(
         return Ok(false);
     }
     let now = clock.now().await;
+    // Attribution (ADR-0054): record the operator's cancel request FIRST, so an
+    // operator cancel carries the acting principal and is distinguishable in the
+    // durable log from the system's concurrency auto-cancel (which drives the
+    // internal `Scheduler::cancel_run` and emits no request event).
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::RunCancelRequested { by },
+        at: now,
+    })
+    .await?;
     for step in db.steps_of_run(run).await? {
         if step.status.is_terminal() {
             continue;

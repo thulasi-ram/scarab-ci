@@ -737,6 +737,15 @@ pub enum EventPayload {
     RunDeadLettered {
         reason: String,
     },
+    /// An operator requested a run cancel via the API (ADR-0054). Emitted
+    /// BEFORE the cancel transitions so an operator-initiated cancel is
+    /// attributable and distinguishable from the system's concurrency
+    /// auto-cancel (`CancelInProgress`, which emits no such event). `by` is the
+    /// acting principal's subject (`None` only when auth is off), mirroring
+    /// [`RunRerunRequested`](EventPayload::RunRerunRequested).
+    RunCancelRequested {
+        by: Option<String>,
+    },
     /// An unapproved gate outlived its opt-in `gate_expires_after` deadline and
     /// failed the run (ADR-0047).
     GateExpired {

@@ -1839,6 +1839,11 @@ fn rerun_outcome(res: Result<(), RerunError>) -> Result<StatusCode, ApiError> {
             Err(ApiError::Conflict(e.to_string()))
         }
         Err(e @ RerunError::NotFailed { .. }) => Err(ApiError::Conflict(e.to_string())),
+        // Gate-approval-only variants (never produced by rerun/retry); mapped to
+        // 409 for exhaustiveness.
+        Err(e @ (RerunError::NotAManualGate(_) | RerunError::GateNotPending { .. })) => {
+            Err(ApiError::Conflict(e.to_string()))
+        }
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
 }
@@ -1941,11 +1946,12 @@ async fn cancel_run(
 ) -> Result<StatusCode, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
-    authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
+    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
     let Some(status) = st.db.run_status(&run).await? else {
         return Err(ApiError::NotFound);
     };
-    match scarab_engine::cancel_run_request(&*st.db, &*st.clock, &run).await {
+    match scarab_engine::cancel_run_request(&*st.db, &*st.clock, &run, Some(principal.subject)).await
+    {
         Ok(true) => Ok(StatusCode::ACCEPTED),
         Ok(false) => {
             // Known run, nothing to cancel: already terminal.
@@ -4710,9 +4716,15 @@ async fn approve_gate(
     {
         Ok(()) => {}
         Err(RerunError::StepNotFound(_)) => return Err(ApiError::NotFound),
-        Err(e @ (RerunError::DependencyNotSatisfied { .. } | RerunError::NotFailed { .. })) => {
-            return Err(ApiError::Conflict(e.to_string()))
-        }
+        // The step exists but can't take an approval right now — not a manual
+        // gate, or a gate that is no longer awaiting approval (skipped/terminal/
+        // already released). 409, and NO phantom `GateApproved` was appended.
+        Err(
+            e @ (RerunError::DependencyNotSatisfied { .. }
+            | RerunError::NotFailed { .. }
+            | RerunError::NotAManualGate(_)
+            | RerunError::GateNotPending { .. }),
+        ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
 
@@ -4763,32 +4775,50 @@ async fn approve_gate(
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => {}
         Err(RerunError::StepNotFound(_)) => return Err(ApiError::NotFound),
-        Err(e @ (RerunError::DependencyNotSatisfied { .. } | RerunError::NotFailed { .. })) => {
-            return Err(ApiError::Conflict(e.to_string()))
-        }
+        Err(
+            e @ (RerunError::DependencyNotSatisfied { .. }
+            | RerunError::NotFailed { .. }
+            | RerunError::NotAManualGate(_)
+            | RerunError::GateNotPending { .. }),
+        ) => return Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => return Err(ApiError::Db(e)),
     }
 
-    // 5. Record the deployment in history (ADR-0024, 0037).
-    if let (Some(c), Some(store)) = (&ctx, st.environments.as_ref()) {
-        let now = st.clock.now().await.0;
-        store
-            .record_deployment(&scarab_project::Deployment {
-                org: c.org.clone(),
-                project: c.project.clone(),
-                environment: c.environment.clone(),
-                git_ref: c.git_ref.clone(),
-                run: run.0.clone(),
-                approved_by: approvers.clone(),
-                at: now,
-            })
-            .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // Derive `released` from the real post-release state rather than assuming:
+    // `release_gate` swallows a non-Pending CAS as an exactly-once no-op, so a
+    // bare `Ok(())` does not by itself prove a transition. The gate is released
+    // iff its step is now `Succeeded`.
+    let released = st
+        .db
+        .steps_of_run(&run)
+        .await
+        .map_err(ApiError::Db)?
+        .iter()
+        .any(|s| s.step == step && s.status == StepStatus::Succeeded);
+
+    // 5. Record the deployment in history (ADR-0024, 0037) — only on a real
+    //    release (a no-op re-release writes no duplicate history record).
+    if released {
+        if let (Some(c), Some(store)) = (&ctx, st.environments.as_ref()) {
+            let now = st.clock.now().await.0;
+            store
+                .record_deployment(&scarab_project::Deployment {
+                    org: c.org.clone(),
+                    project: c.project.clone(),
+                    environment: c.environment.clone(),
+                    git_ref: c.git_ref.clone(),
+                    run: run.0.clone(),
+                    approved_by: approvers.clone(),
+                    at: now,
+                })
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        }
     }
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "released": true, "approvals": approvers })),
+        Json(serde_json::json!({ "released": released, "approvals": approvers })),
     )
         .into_response())
 }
@@ -4847,9 +4877,12 @@ async fn release_gate_external(
     match scarab_engine::release_gate(st.db.as_ref(), st.clock.as_ref(), &run, &step).await {
         Ok(()) => Ok(StatusCode::ACCEPTED),
         Err(RerunError::StepNotFound(_)) => Err(ApiError::NotFound),
-        Err(e @ (RerunError::DependencyNotSatisfied { .. } | RerunError::NotFailed { .. })) => {
-            Err(ApiError::Conflict(e.to_string()))
-        }
+        Err(
+            e @ (RerunError::DependencyNotSatisfied { .. }
+            | RerunError::NotFailed { .. }
+            | RerunError::NotAManualGate(_)
+            | RerunError::GateNotPending { .. }),
+        ) => Err(ApiError::Conflict(e.to_string())),
         Err(RerunError::Db(e)) => Err(ApiError::Db(e)),
     }
 }
