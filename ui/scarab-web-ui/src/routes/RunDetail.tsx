@@ -37,7 +37,7 @@ import Dag, { type DagStep } from "../components/Dag";
 import VersionRail, { type VersionRow, type OutcomeCounts } from "../components/VersionRail";
 import ServicesPanel from "../components/ServicesPanel";
 import StepPane from "../components/StepPane";
-import { type FilmstripTry } from "../components/AttemptsFilmstrip";
+import { type FilmstripTry } from "../components/AttemptsDropdown";
 import DebugShell from "../components/DebugShell";
 import TriggerCell from "../components/TriggerCell";
 

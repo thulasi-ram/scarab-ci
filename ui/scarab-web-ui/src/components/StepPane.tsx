@@ -20,7 +20,7 @@ import {
 import type { RunEvent } from "../api/client";
 import { ofRecordAttemptId } from "../takes";
 import Icon from "./Icon";
-import AttemptsFilmstrip, { type FilmstripTry } from "./AttemptsFilmstrip";
+import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
 
 type Tab = "logs" | "results" | "outputs" | "workspace";
 
@@ -104,17 +104,6 @@ export default function StepPane(props: {
   // of record" line instead of a stale or empty-looking shell (ADR-0056 §3:
   // never render blank-that-reads-as-success).
   const notRun = (): boolean => !!props.step && props.tries.length === 0;
-
-  // The 1-based try number of the scoped attempt within this version's attempts
-  // — the coordinate stamp's "try N". Null when nothing ran here (not-run) so
-  // the stamp drops the try segment rather than naming a stale attempt.
-  const scopedTryN = (): number | null => {
-    if (notRun()) return null;
-    const a = scoped();
-    if (!a) return null;
-    const i = attemptsOf().findIndex((x) => x.id === a.id);
-    return i < 0 ? null : i + 1;
-  };
 
   // Of-record (ADR-0056 §3): the Outputs tab shows the latest SUCCESSFUL attempt
   // WITHIN THE VIEWED VERSION, not the selected try — so a failed/superseded/
@@ -316,27 +305,29 @@ export default function StepPane(props: {
         {(s) => (
           <>
             {/* Evidence header. A permanent coordinate stamp names WHERE you are
-                — step · try N · version — so the evidence below never floats
-                context-free (redesign stage 4). Beneath it the attempts filmstrip
-                (the try axis, moved out of the graph — ADR-0056 amendment) sits
-                above the tab row: its enlarged marker names the active try; the
-                tabs below scope to it. A spinner on the right is the only cue
-                that a switch took effect and fresh evidence is loading. Dead-
-                letter, being terminal + rare, keeps a badge here. */}
+                — step · [attempts] · version — so the evidence below never floats
+                context-free (redesign stage 4). The attempts dropdown occupies
+                the "try N" position of the stamp: it names the active try (the
+                one scoping every tab) and, when a step has more than one try,
+                opens a menu to switch between them (design feedback — the compact
+                dropdown replaced the noisier filmstrip). It renders nothing when
+                nothing ran here, so the stamp reads `step · version` for a
+                not-run step. A spinner on the right of the tab row is the only
+                cue that a switch took effect and fresh evidence is loading;
+                dead-letter, being terminal + rare, keeps a badge there. */}
             <div class="coord-stamp mono">
               <span class="cs-step">{s().id}</span>
-              <Show when={scopedTryN() != null}>
+              <Show when={props.tries.length > 0}>
                 <span class="cs-dot">·</span>
-                <span class="cs-try">try {scopedTryN()}</span>
+                <AttemptsDropdown
+                  tries={props.tries}
+                  active={props.activeAttempt}
+                  onSelect={props.onAttemptSelect}
+                />
               </Show>
               <span class="cs-dot">·</span>
               <span class="cs-ver">{props.versionLabel}</span>
             </div>
-            <AttemptsFilmstrip
-              tries={props.tries}
-              active={props.activeAttempt}
-              onSelect={props.onAttemptSelect}
-            />
             <div class="pane-tabbar">
               <div class="tabs">
                 <TabBtn id="logs" label="Logs" />

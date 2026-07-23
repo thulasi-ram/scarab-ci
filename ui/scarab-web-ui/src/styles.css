@@ -2508,56 +2508,97 @@ h1, .crumb-head, .run-title {
   .pane-load.on svg { animation: none; }
 }
 /* Permanent coordinate stamp (redesign stage 4): the pane's "you are here" —
-   step · try N · version — always visible above the filmstrip so the evidence
-   below never floats context-free. PAGE/theme chrome (not the dark DAG canvas),
-   so it reads the page tokens. The try segment drops when nothing ran here. */
+   step · [attempts] · version — so the evidence below never floats context-free.
+   PAGE/theme chrome (not the dark DAG canvas), so it reads the page tokens. The
+   middle segment is the attempts dropdown (below); it — and its separator dot —
+   drop out when nothing ran here, leaving `step · version`. `align-items:center`
+   so the inline dropdown pill sits level with the text segments. */
 .steppane .coord-stamp {
-  display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
   padding: 8px 12px 6px; font-size: 11px; color: var(--muted-sage);
 }
 .steppane .coord-stamp .cs-step { color: var(--soft-white); font-weight: 600; }
-.steppane .coord-stamp .cs-try { color: var(--sage); }
 .steppane .coord-stamp .cs-ver { color: var(--copper); }
 .steppane .coord-stamp .cs-dot { color: var(--muted-sage); opacity: 0.5; }
-/* ── Attempts filmstrip (redesign stage 3): the "which try" axis, in the pane
-   header — promoted from the former orphaned `.achip*` rules. PAGE/theme chrome
-   (NOT the always-dark DAG canvas), so it reads the page tokens. Outcome shape =
-   accent colour + border style: succeeded solid-emerald, failed dashed-danger,
-   superseded/cancelled dotted-copper, running solid-teal; a shadowed success
-   dims. The ACTIVE try enlarges + shows its full label; the rest are a glyph +
-   hover title, and a folded retry streak carries a `×N` badge. */
-.fstrip {
-  display: flex; align-items: center; gap: 6px;
-  padding: 8px 12px; overflow-x: auto;
-  border-bottom: 1px solid var(--border-soft);
-}
-.fmark {
-  display: inline-flex; align-items: center; gap: 5px; flex: none;
-  font-family: var(--font-mono); font-size: 11px; line-height: 1; cursor: pointer;
+
+/* ── Attempts dropdown (design feedback — replaced the redesign-stage-3
+   filmstrip): the "which try" axis, folded INTO the coordinate stamp as its
+   "try N" segment. One try → a static outcome chip; many tries → a compact
+   dropdown whose trigger names the active try and whose menu lists every try
+   (oldest → newest, the active one marked), scrolling when the streak is long.
+   PAGE/theme chrome → page tokens, both themes. Coloured by outcome via the tone
+   classes below (emerald/danger/copper/running), echoing the DAG ring and the
+   version-rail chips. */
+.adrop { position: relative; display: inline-flex; }
+/* Shared trigger/chip shell — a compact mono pill that sits inline in the stamp
+   between `step ·` and `· version`. A long label (a failure reason) ellipsizes
+   rather than blowing out the stamp. */
+.adrop-chip,
+.adrop-btn {
+  display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%;
+  font-family: var(--font-mono); font-size: 11px; line-height: 1;
   color: var(--muted-sage); background: transparent;
-  border: 1px solid var(--border); border-radius: 20px; padding: 4px 9px;
-  transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+  border: 1px solid var(--border); border-radius: 20px; padding: 3px 9px;
 }
-.fmark:hover { color: var(--sage); border-color: var(--muted-sage); }
-.fmark .fglyph { font-size: 11px; }
-/* Outcome shapes — accent tokens only (page-safe), mirroring the DAG ring. */
-.fmark.emerald { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
-.fmark.danger { color: var(--danger); border-style: dashed; border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); }
-.fmark.copper { color: var(--copper); border-style: dotted; border-color: var(--border-copper); }
-.fmark.running { color: var(--running); border-color: color-mix(in srgb, var(--running) 50%, var(--border)); }
-/* Shadowed: a finished-successful try no longer the of-record latest — dimmed. */
-.fmark.shadow { opacity: 0.55; }
-/* The active try: enlarged, full-strength tone border, faint tone wash, label.
-   Two classes so the tone border above (also two classes) loses on source order. */
-.fmark.fmark-active {
-  padding: 5px 11px; font-size: 12px; font-weight: 600;
-  border-color: currentColor;
-  background: color-mix(in srgb, currentColor 10%, transparent);
+.adrop-btn {
+  cursor: pointer;
+  transition: color 0.12s var(--ease-out), border-color 0.12s var(--ease-out),
+    background 0.12s var(--ease-out);
 }
-.fmark-active .flabel { white-space: nowrap; }
-/* The `×N` badge on a folded retry streak. */
-.fcount { color: var(--muted-sage); font-variant-numeric: tabular-nums; }
-.freadopt { color: var(--copper); font-size: 12px; }
+.adrop-btn:hover { border-color: var(--muted-sage); }
+/* Open: a faint tone wash + a full-strength tone border — the currentColor
+   treatment the filmstrip's active marker used. */
+.adrop-btn.open { border-color: currentColor; background: color-mix(in srgb, currentColor 10%, transparent); }
+.adrop-lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.adrop-caret { flex: none; font-size: 9px; opacity: 0.75; margin-left: 1px; }
+/* Crash re-adoption marker — same attempt, same fence, not a new execution. */
+.adrop-readopt { flex: none; color: var(--copper); font-size: 12px; }
+
+/* Outcome tone — accent colour on the text + a tinted border on the pill. */
+.adrop-chip.emerald, .adrop-btn.emerald, .adrop-row.emerald { color: var(--ok); }
+.adrop-chip.danger,  .adrop-btn.danger,  .adrop-row.danger  { color: var(--danger); }
+.adrop-chip.copper,  .adrop-btn.copper,  .adrop-row.copper  { color: var(--copper); }
+.adrop-chip.running, .adrop-btn.running, .adrop-row.running { color: var(--running); }
+.adrop-chip.emerald, .adrop-btn.emerald { border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+.adrop-chip.danger,  .adrop-btn.danger  { border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); }
+.adrop-chip.copper,  .adrop-btn.copper  { border-color: var(--border-copper); }
+.adrop-chip.running, .adrop-btn.running { border-color: color-mix(in srgb, var(--running) 50%, var(--border)); }
+/* A shadowed success (a newer success took over as of-record) dims. */
+.adrop-chip.shadow, .adrop-btn.shadow, .adrop-row.shadow { opacity: 0.5; }
+
+/* Backdrop: a transparent full-viewport click-catcher beneath the open menu. */
+.adrop-backdrop { position: fixed; inset: 0; z-index: 30; }
+
+/* Menu: hangs under the trigger; scrolls in place when there are many tries. */
+.adrop-menu {
+  position: absolute; top: calc(100% + 5px); left: 0; z-index: 31;
+  min-width: max(100%, 232px); max-width: min(420px, 88vw);
+  max-height: 300px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 2px; padding: 5px;
+  background: var(--emerald-elevated); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  transform-origin: top left;
+  transition: opacity 0.14s var(--ease-out), transform 0.14s var(--ease-out);
+}
+@starting-style { .adrop-menu { opacity: 0; transform: scale(0.97); } }
+/* A row: `try N · cause · outcome`, coloured by outcome; the active one is
+   highlighted (a faint emerald wash + a trailing dot), echoing the version-rail
+   selected row. */
+.adrop-row {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; cursor: pointer;
+  font-family: var(--font-mono); font-size: 11.5px; line-height: 1.3;
+  color: var(--muted-sage); background: transparent;
+  border: 1px solid transparent; border-radius: var(--radius-sm); padding: 6px 9px;
+  transition: background 0.12s var(--ease-out), border-color 0.12s var(--ease-out);
+}
+.adrop-row:hover { background: color-mix(in srgb, var(--sage) 14%, transparent); }
+.adrop-row.sel {
+  background: color-mix(in srgb, var(--emerald) 12%, transparent);
+  border-color: color-mix(in srgb, var(--emerald) 40%, transparent);
+}
+.adrop-row-lbl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Active-row marker: a small filled emerald dot (mirrors SearchSelect's dot). */
+.adrop-dot { flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--emerald); }
 .adeadletter {
   font-family: var(--font-mono); font-size: 10.5px; color: var(--danger);
   border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
