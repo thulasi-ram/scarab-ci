@@ -36,7 +36,7 @@ import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 import Dag, { type DagStep, type DagService } from "../components/Dag";
-import VersionRail, { type VersionRow, type OutcomeCounts } from "../components/VersionRail";
+import VersionDropdown, { type VersionRow, type OutcomeCounts } from "../components/VersionDropdown";
 import StepPane from "../components/StepPane";
 import ServicePane from "../components/ServicePane";
 import { type FilmstripTry } from "../components/AttemptsDropdown";
@@ -91,8 +91,8 @@ export default function RunDetail() {
   const [shellOpen, setShellOpen] = createSignal(false);
   // The viewed Take (1-based), or null = latest. Only a CLOSED take is a
   // time-travel view; selecting the latest take clears back to live. Driven by
-  // the always-present VersionRail (ADR-0056 amendment): a persistent left rail,
-  // a row per Rerun, replacing the former header dropdown (redesign stage 2).
+  // the VersionDropdown in the Pipeline band toolbar (Proposal B): a row per
+  // Rerun (ADR-0056 amendment), folded from the former persistent left rail.
   const [viewTake, setViewTake] = createSignal<number | null>(null);
 
   const stepList = (): StepStatus[] => run()?.steps ?? [];
@@ -770,34 +770,36 @@ export default function RunDetail() {
               </div>
             </div>
 
-            {/* Pipeline component (ADR-0056 amendment): DAG + the selected
-                step's evidence + a version-aware Artifacts footer, beside the
-                always-present VersionRail (redesign stage 2). Zoom out = which
-                whole-run version (the rail); zoom in = which try of a step (the
-                strip inside StepPane). An older version turns the whole
-                component read-only. On narrow viewports the rail collapses to a
-                horizontal strip above the panel (see .pipeline-with-rail). */}
-            <div class="pipeline-with-rail">
-              <VersionRail
-                rows={versions()}
-                live={live() && !timeTraveling()}
-                onSelect={(n) => {
-                  setViewTake(n);
-                  setFocusSidecar(null);
-                }}
-              />
+            {/* Pipeline component (Proposal B — stack): a full-width blueprint
+                band on TOP, with the selected step's (or service's) evidence
+                pinned full-width directly BELOW it — always visible, no drawer;
+                selecting a node just swaps the pinned evidence. The band toolbar
+                carries the version dropdown (folded from the former left rail):
+                zoom out = which whole-run version (the dropdown); zoom in = which
+                try of a step (the dropdown inside StepPane). Viewing an older
+                version turns the whole component read-only. */}
             <div class="panel pipeline-panel" classList={{ readonly: timeTraveling() }}>
-              <div class="panel-h">
-                <span>Pipeline</span>
-                <span class="subtle">
-                  {r().steps.length} steps
+              <div class="panel-h pipeline-toolbar">
+                {/* Versions rail folded into a compact toolbar dropdown
+                    (◈ latest ▾) — preserves the time-travel behavior; only the
+                    presentation changed from a left column to a dropdown. */}
+                <VersionDropdown
+                  rows={versions()}
+                  live={live() && !timeTraveling()}
+                  onSelect={(n) => {
+                    setViewTake(n);
+                    setFocusSidecar(null);
+                  }}
+                />
+                <span class="pt-label">Pipeline</span>
+                <span class="pt-count">
+                  · {r().steps.length} steps
                   {!timeTraveling() && runningCount() ? ` · ${runningCount()} running` : ""}
                 </span>
                 <span class="grow1" />
               </div>
-              {/* Read-only banner (redesign stage 2): while viewing an older
-                  version the whole component is a snapshot-at-boundary — say so
-                  explicitly, now that the dropdown's "👁" label is gone. */}
+              {/* Read-only banner: while viewing an older version the whole
+                  component is a snapshot-at-boundary — say so explicitly. */}
               <Show when={timeTraveling()}>
                 <div class="readonly-banner">
                   <span class="rb-eye">👁</span>
@@ -808,26 +810,29 @@ export default function RunDetail() {
                 </div>
               </Show>
 
-              <div class="rd-grid">
-                <div class="dag-wrap">
-                  <div class="dag-head">Steps</div>
-                  {/* Shared services + sidecars now live AS NODES in the graph
-                      (ADR-0058): shared services as copper peers in a lane at the
-                      top with dotted `uses` edges; a step's own sidecars as docked
-                      chips on its node. Selecting a service opens ServicePane
-                      below; the retired beside-DAG ServicesPanel is gone. */}
-                  <Dag
-                    steps={dagSteps()}
-                    services={dagServices()}
-                    selected={sel()}
-                    onSelect={selectNode}
-                    onSelectSidecar={selectSidecar}
-                    sidecarFocus={focusSidecar()}
-                  />
-                </div>
+              {/* Blueprint band (full-width, always-dark canvas): shared services
+                  + sidecars live AS NODES in the graph (ADR-0058) — shared
+                  services as copper peers in a lane at the top with dotted `uses`
+                  edges; a step's own sidecars as docked chips on its node.
+                  Selecting a service opens ServicePane in the pinned evidence
+                  area below. */}
+              <div class="dag-band">
+                <Dag
+                  steps={dagSteps()}
+                  services={dagServices()}
+                  selected={sel()}
+                  onSelect={selectNode}
+                  onSelectSidecar={selectSidecar}
+                  sidecarFocus={focusSidecar()}
+                />
+              </div>
 
-                {/* A shared-service node opens ServicePane (readiness + logs);
-                    every other selection is a step → StepPane (ADR-0058). */}
+              {/* Evidence pinned directly below the band, full-width, always
+                  visible (Proposal B). A shared-service node opens ServicePane
+                  (readiness + logs); every other selection is a step → StepPane
+                  (ADR-0058) — the same slot, switched by the `service:` selection
+                  id. */}
+              <div class="evidence-pinned">
                 <Show
                   when={isServiceSel()}
                   fallback={
@@ -850,7 +855,7 @@ export default function RunDetail() {
                 >
                   <ServicePane runId={id()} service={selectedService()!} />
                 </Show>
-            </div>
+              </div>
 
               {/* Artifacts — run-level files of record, immutable per try
                   (ADR-0056): version-aware footer of the Pipeline component; the
@@ -904,7 +909,6 @@ export default function RunDetail() {
                 </ul>
               </Show>
               </div>
-            </div>
             </div>
 
             <div class="panel activity-panel">
