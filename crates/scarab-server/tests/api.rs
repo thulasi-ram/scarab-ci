@@ -411,14 +411,25 @@ async fn shared_service_status_and_logs_are_exposed() {
     db.create_run_service(&run, 1, "db", Timestamp(1_000))
         .await
         .unwrap();
-    db.set_run_service(&run, 1, "db", ServiceStatus::Ready, Some("scarab-svc-db-abcd"))
-        .await
-        .unwrap();
+    db.set_run_service(
+        &run,
+        1,
+        "db",
+        ServiceStatus::Ready,
+        Some("scarab-svc-db-abcd"),
+    )
+    .await
+    .unwrap();
     // Some best-effort log output on that instance's stream.
     let (step, attempt) = scarab_server::logs::service_stream_key("db", 1);
-    logs.append(&run, &step, &attempt, b"postgres is ready to accept connections\n")
-        .await
-        .unwrap();
+    logs.append(
+        &run,
+        &step,
+        &attempt,
+        b"postgres is ready to accept connections\n",
+    )
+    .await
+    .unwrap();
 
     // Status list: the current Take's `db`, `ready`.
     let resp = app

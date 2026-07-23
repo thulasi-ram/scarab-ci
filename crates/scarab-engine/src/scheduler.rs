@@ -123,7 +123,9 @@ pub enum RerunError {
     /// Rerun/retry rejected: a prerequisite FAILED (ADR-0056 amendment), so the
     /// pipeline has a real upstream failure — rerun/retry that, not this. A
     /// Succeeded or Skipped prerequisite does not block.
-    #[error("cannot rerun/retry {step:?}: prerequisite {blocker:?} has not succeeded or been skipped")]
+    #[error(
+        "cannot rerun/retry {step:?}: prerequisite {blocker:?} has not succeeded or been skipped"
+    )]
     DependencyNotSatisfied { step: StepId, blocker: StepId },
     /// Retry rejected: retry is for **Failed** steps only (ADR-0056 amendment).
     /// A non-failed step is reran (a Take fork), not retried.
@@ -399,8 +401,10 @@ async fn rearm_invalidation_set(
             id: crate::OutboxId(0),
             run: run.clone(),
             kind: SUPERSEDE_TEARDOWN.to_string(),
-            payload: serde_json::to_value(SupersedeTeardown { attempts: superseded })
-                .unwrap_or(serde_json::Value::Null),
+            payload: serde_json::to_value(SupersedeTeardown {
+                attempts: superseded,
+            })
+            .unwrap_or(serde_json::Value::Null),
             idempotency_key: format!("supersede:{}:{}:{}", run.0, target.0, disc.join(",")),
             at: now,
         })
@@ -1468,20 +1472,13 @@ impl<'a> Scheduler<'a> {
                             upstream.dedup();
                             let mut consumed_attempts = BTreeMap::new();
                             for up in upstream {
-                                if let Some(a) =
-                                    self.db.step_evidence_attempt(&run, up).await?
-                                {
+                                if let Some(a) = self.db.step_evidence_attempt(&run, up).await? {
                                     consumed_attempts.insert(up.0.clone(), a.0);
                                 }
                             }
                             if !consumed_attempts.is_empty() {
                                 self.db
-                                    .set_attempt_consumed(
-                                        &run,
-                                        &step,
-                                        &attempt,
-                                        &consumed_attempts,
-                                    )
+                                    .set_attempt_consumed(&run, &step, &attempt, &consumed_attempts)
                                     .await?;
                             }
                         }
@@ -1546,7 +1543,9 @@ impl<'a> Scheduler<'a> {
                     // attempt's immutable evidence row and the step's
                     // latest-evidence denormalization.
                     if let Some(output) = self.executor.output(&handle).await? {
-                        self.db.set_step_output(&run, &step, &attempt, &output).await?;
+                        self.db
+                            .set_step_output(&run, &step, &attempt, &output)
+                            .await?;
                     }
                     // Capture the step's named results (ADR-0041) under the fence,
                     // so a dependent can read them via `${{ outputs.<step>.… }}`.
@@ -2544,7 +2543,9 @@ impl<'a> Scheduler<'a> {
         for r in &rows {
             if r.take < take && !r.status.is_terminal() {
                 if let Some(h) = &r.handle {
-                    self.executor.teardown_service(&ExecHandle(h.clone())).await?;
+                    self.executor
+                        .teardown_service(&ExecHandle(h.clone()))
+                        .await?;
                 }
                 self.db
                     .set_run_service(run, r.take, &r.name, crate::ServiceStatus::TornDown, None)
@@ -2565,8 +2566,11 @@ impl<'a> Scheduler<'a> {
                     // a launch that keeps erroring fails-closed at the deadline
                     // (git-bug 6825830). No `?` on the launch: a launch error must
                     // not abort the whole tick.
-                    self.db.create_run_service(run, take, &svc.name, now).await?;
-                    self.launch_service_bounded(run, take, svc, now, now).await?;
+                    self.db
+                        .create_run_service(run, take, &svc.name, now)
+                        .await?;
+                    self.launch_service_bounded(run, take, svc, now, now)
+                        .await?;
                 }
                 Some(r) if r.status == crate::ServiceStatus::Starting => {
                     // Resolve the handle (relaunch idempotently if a crash lost it).
@@ -2587,7 +2591,13 @@ impl<'a> Scheduler<'a> {
                     };
                     if self.executor.service_ready(&handle).await? {
                         self.db
-                            .set_run_service(run, take, &svc.name, crate::ServiceStatus::Ready, None)
+                            .set_run_service(
+                                run,
+                                take,
+                                &svc.name,
+                                crate::ServiceStatus::Ready,
+                                None,
+                            )
                             .await?;
                     } else if now.0 - r.created_at.0 > self.cfg.service_ready_timeout_ms {
                         // Startup flake, fail-closed (ADR-0058): nothing has been
@@ -2650,7 +2660,9 @@ impl<'a> Scheduler<'a> {
         for r in self.db.run_services(run).await? {
             if !r.status.is_terminal() {
                 if let Some(h) = &r.handle {
-                    self.executor.teardown_service(&ExecHandle(h.clone())).await?;
+                    self.executor
+                        .teardown_service(&ExecHandle(h.clone()))
+                        .await?;
                 }
                 self.db
                     .set_run_service(run, r.take, &r.name, crate::ServiceStatus::TornDown, None)

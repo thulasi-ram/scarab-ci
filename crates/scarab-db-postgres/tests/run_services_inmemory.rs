@@ -82,7 +82,11 @@ async fn a_rerun_take_gets_a_fresh_instance_beside_the_prior_take() {
     assert_eq!(services.len(), 2, "one row per {{take, name}}");
     assert_eq!(svc(&services, 1, "db").status, ServiceStatus::TornDown);
     let take2 = svc(&services, 2, "db");
-    assert_eq!(take2.status, ServiceStatus::Starting, "fresh, not the old row");
+    assert_eq!(
+        take2.status,
+        ServiceStatus::Starting,
+        "fresh, not the old row"
+    );
     assert_eq!(take2.handle, None);
     // The engine's "current take" is the max take across the run's services.
     let current = services.iter().map(|s| s.take).max().unwrap();

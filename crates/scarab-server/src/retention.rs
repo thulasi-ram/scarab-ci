@@ -158,7 +158,10 @@ pub async fn sweep_cas(
         if !marked.insert(format!("trees/{hash}")) {
             continue; // shared subtree already walked (the dedup win)
         }
-        let entries = match cas.tree_entries(&scarab_storage::TreeHash(hash.clone())).await {
+        let entries = match cas
+            .tree_entries(&scarab_storage::TreeHash(hash.clone()))
+            .await
+        {
             Ok(entries) => entries,
             // A MISSING tree is a dangling reference (e.g. a run recorded before
             // the object store was switched, whose blobs were wiped): the

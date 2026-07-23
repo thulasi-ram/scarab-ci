@@ -40,9 +40,9 @@ fn new_run_id() -> RunId {
 }
 
 use scarab_engine::{
-    AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RerunError,
-    RunId, RunStatus, StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION,
-    MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED,
+    AttemptId, Clock, ConcurrencyPolicy, Db, DbError, EventKind, EventPayload, RerunError, RunId,
+    RunStatus, StepId, StepSpec, StepStatus, Timestamp, EVENT_VERSION, MAX_DELIVERY_ATTEMPTS,
+    RUN_STATUS_CHANGED,
 };
 use scarab_identity::{Action, Principal, Session};
 
@@ -941,7 +941,11 @@ async fn create_run(
     // + stamped directly (the same cap `Event::trigger_title` applies). Stamped
     // only when supplied; no requiredness check here (thread D). Display/audit
     // only — never in the CEL/interpolation context.
-    if let Some(title) = req.reason.as_deref().and_then(scarab_forge::cap_trigger_title) {
+    if let Some(title) = req
+        .reason
+        .as_deref()
+        .and_then(scarab_forge::cap_trigger_title)
+    {
         st.db.set_run_trigger_title(&run, &title).await?;
     }
     st.db
@@ -1225,7 +1229,11 @@ async fn list_refs(
 
     // Branches before tags, each group name-sorted — a stable picker order.
     let rank = |k: &scarab_forge::RefKind| matches!(k, scarab_forge::RefKind::Tag) as u8;
-    refs.sort_by(|a, b| rank(&a.kind).cmp(&rank(&b.kind)).then_with(|| a.name.cmp(&b.name)));
+    refs.sort_by(|a, b| {
+        rank(&a.kind)
+            .cmp(&rank(&b.kind))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
     let refs = refs
         .into_iter()
@@ -1377,10 +1385,7 @@ async fn list_runs(
         runs = visible;
     }
     Ok(Json(RunListResponse {
-        runs: runs
-            .into_iter()
-            .map(RunSummaryDto::from)
-            .collect(),
+        runs: runs.into_iter().map(RunSummaryDto::from).collect(),
     }))
 }
 
@@ -1668,7 +1673,14 @@ async fn get_step_logs(
         return Ok(Sse::new(replay_stream.boxed()));
     }
     let live = futures::stream::unfold(
-        (st.clone(), run.clone(), read_step.clone(), selected, seen, false),
+        (
+            st.clone(),
+            run.clone(),
+            read_step.clone(),
+            selected,
+            seen,
+            false,
+        ),
         |(st, run, step, attempts, mut seen, done)| async move {
             if done {
                 return None;
@@ -1953,7 +1965,8 @@ async fn cancel_run(
     let Some(status) = st.db.run_status(&run).await? else {
         return Err(ApiError::NotFound);
     };
-    match scarab_engine::cancel_run_request(&*st.db, &*st.clock, &run, Some(principal.subject)).await
+    match scarab_engine::cancel_run_request(&*st.db, &*st.clock, &run, Some(principal.subject))
+        .await
     {
         Ok(true) => Ok(StatusCode::ACCEPTED),
         Ok(false) => {
@@ -2019,12 +2032,7 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
 /// on GitHub differs from the web host (`api.github.com` vs `github.com`; a GHES
 /// host carries an `/api/v3` suffix). Forgejo's `base_url` is already the web
 /// host (its API lives under `/api/v1`).
-fn web_repo_url(
-    kind: scarab_forge::ForgeKind,
-    base_url: &str,
-    owner: &str,
-    name: &str,
-) -> String {
+fn web_repo_url(kind: scarab_forge::ForgeKind, base_url: &str, owner: &str, name: &str) -> String {
     let base = base_url.trim_end_matches('/');
     let host = match kind {
         scarab_forge::ForgeKind::GitHub => {
@@ -2150,10 +2158,7 @@ async fn list_repo_runs(
     let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
     let runs = st.db.list_runs_for_tenant(&org, &repo, limit).await?;
     Ok(Json(RunListResponse {
-        runs: runs
-            .into_iter()
-            .map(RunSummaryDto::from)
-            .collect(),
+        runs: runs.into_iter().map(RunSummaryDto::from).collect(),
     }))
 }
 

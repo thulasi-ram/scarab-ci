@@ -47,7 +47,11 @@ fn status_of(steps: &[scarab_engine::StepRun], id: &str) -> StepStatus {
     steps.iter().find(|s| s.step.0 == id).unwrap().status
 }
 
-fn service<'a>(rows: &'a [scarab_engine::RunService], take: i64, name: &str) -> &'a scarab_engine::RunService {
+fn service<'a>(
+    rows: &'a [scarab_engine::RunService],
+    take: i64,
+    name: &str,
+) -> &'a scarab_engine::RunService {
     rows.iter()
         .find(|r| r.take == take && r.name == name)
         .unwrap_or_else(|| panic!("no service {name}@{take} in {rows:?}"))
@@ -60,12 +64,21 @@ async fn shared_service_is_born_and_launched_at_run_start() {
     let db = InMemoryDb::new();
     let run = RunId("run-1".into());
     db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
-    db.store_run_ir(&run, &ir_with_db_service(json!([{ "id": "test", "image": "busybox" }])))
-        .await
-        .unwrap();
-    db.create_step_run(&run, &StepId("test".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.store_run_ir(
+        &run,
+        &ir_with_db_service(json!([{ "id": "test", "image": "busybox" }])),
+    )
+    .await
+    .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("test".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.seed_run(&run, RunStatus::Running);
 
     let clock = FakeClock::new(0);
@@ -97,12 +110,24 @@ async fn opt_in_step_waits_for_readiness_then_promotes() {
     )
     .await
     .unwrap();
-    db.create_step_run(&run, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
-    db.create_step_run(&run, &StepId("lint".into()), Some(&spec(&[])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("migrate".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("lint".into()),
+        Some(&spec(&[])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.seed_run(&run, RunStatus::Running);
 
     let clock = FakeClock::new(0);
@@ -113,7 +138,11 @@ async fn opt_in_step_waits_for_readiness_then_promotes() {
     sched.reconcile_services(&run).await.unwrap();
     sched.admit(&run).await.unwrap();
     let steps = db.steps_of_run(&run).await.unwrap();
-    assert_eq!(status_of(&steps, "migrate"), StepStatus::Pending, "held on `db`");
+    assert_eq!(
+        status_of(&steps, "migrate"),
+        StepStatus::Pending,
+        "held on `db`"
+    );
     assert_ne!(
         status_of(&steps, "lint"),
         StepStatus::Pending,
@@ -149,9 +178,15 @@ async fn ready_timeout_fails_opt_in_steps_fail_closed() {
     )
     .await
     .unwrap();
-    db.create_step_run(&run, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("migrate".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.seed_run(&run, RunStatus::Running);
 
     let clock = FakeClock::new(0);
@@ -180,12 +215,12 @@ async fn ready_timeout_fails_opt_in_steps_fail_closed() {
         "opt-in step fails fail-closed on a ready-timeout"
     );
     // The unbound-dependency diagnostic is on the event log.
-    let has_diag = db
-        .events(&run)
-        .await
-        .unwrap()
-        .iter()
-        .any(|e| matches!(&e.kind, scarab_engine::EventPayload::StepServicesUnready { .. }));
+    let has_diag = db.events(&run).await.unwrap().iter().any(|e| {
+        matches!(
+            &e.kind,
+            scarab_engine::EventPayload::StepServicesUnready { .. }
+        )
+    });
     assert!(has_diag, "unbound-dependency diagnostic emitted");
 }
 
@@ -196,16 +231,27 @@ async fn rerun_provisions_fresh_take_and_tears_down_the_prior() {
     let db = InMemoryDb::new();
     let run = RunId("run-1".into());
     db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
-    db.store_run_ir(&run, &ir_with_db_service(json!([{ "id": "test", "image": "busybox" }])))
-        .await
-        .unwrap();
-    db.create_step_run(&run, &StepId("test".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.store_run_ir(
+        &run,
+        &ir_with_db_service(json!([{ "id": "test", "image": "busybox" }])),
+    )
+    .await
+    .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("test".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.seed_run(&run, RunStatus::Running);
 
     // Take 1's `db` is up and ready.
-    db.create_run_service(&run, 1, "db", Timestamp(0)).await.unwrap();
+    db.create_run_service(&run, 1, "db", Timestamp(0))
+        .await
+        .unwrap();
     let t1_handle = FakeExecutor::service_handle("run-1", 1, "db");
     db.set_run_service(&run, 1, "db", ServiceStatus::Ready, Some(&t1_handle.0))
         .await
@@ -215,22 +261,42 @@ async fn rerun_provisions_fresh_take_and_tears_down_the_prior() {
     let exec = FakeExecutor::new();
 
     // The human reruns `test` — a Take boundary → a fresh service generation.
-    rerun_step(&db, &clock, &run, &StepId("test".into()), Some("alice".into()))
-        .await
-        .unwrap();
+    rerun_step(
+        &db,
+        &clock,
+        &run,
+        &StepId("test".into()),
+        Some("alice".into()),
+    )
+    .await
+    .unwrap();
     let rows = db.run_services(&run).await.unwrap();
-    assert_eq!(service(&rows, 2, "db").status, ServiceStatus::Starting, "take 2 born");
+    assert_eq!(
+        service(&rows, 2, "db").status,
+        ServiceStatus::Starting,
+        "take 2 born"
+    );
 
     // Reconcile: take 1 is torn down, take 2 launched fresh.
     let sched = Scheduler::new(&db, &clock, &exec, "drv");
     sched.reconcile_services(&run).await.unwrap();
     let rows = db.run_services(&run).await.unwrap();
-    assert_eq!(service(&rows, 1, "db").status, ServiceStatus::TornDown, "prior Take torn down");
+    assert_eq!(
+        service(&rows, 1, "db").status,
+        ServiceStatus::TornDown,
+        "prior Take torn down"
+    );
     assert_eq!(service(&rows, 2, "db").status, ServiceStatus::Starting);
     assert_eq!(exec.torn_down_services(), vec![t1_handle.0]);
     let t2_handle = FakeExecutor::service_handle("run-1", 2, "db");
-    assert_eq!(service(&rows, 2, "db").handle.as_deref(), Some(t2_handle.0.as_str()));
-    assert!(exec.launched_services().contains(&t2_handle.0), "fresh take launched");
+    assert_eq!(
+        service(&rows, 2, "db").handle.as_deref(),
+        Some(t2_handle.0.as_str())
+    );
+    assert!(
+        exec.launched_services().contains(&t2_handle.0),
+        "fresh take launched"
+    );
 }
 
 /// When the run reaches terminal, its shared services are torn down (riding the
@@ -240,15 +306,28 @@ async fn run_terminal_tears_down_services() {
     let db = InMemoryDb::new();
     let run = RunId("run-1".into());
     db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &StepId("test".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("test".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     // The step already finished; a service is up.
-    db.record_step_transition(&run, &StepId("test".into()), StepStatus::Pending, StepStatus::Succeeded)
+    db.record_step_transition(
+        &run,
+        &StepId("test".into()),
+        StepStatus::Pending,
+        StepStatus::Succeeded,
+    )
+    .await
+    .unwrap();
+    db.seed_run(&run, RunStatus::Running);
+    db.create_run_service(&run, 1, "db", Timestamp(0))
         .await
         .unwrap();
-    db.seed_run(&run, RunStatus::Running);
-    db.create_run_service(&run, 1, "db", Timestamp(0)).await.unwrap();
     let handle = FakeExecutor::service_handle("run-1", 1, "db");
     db.set_run_service(&run, 1, "db", ServiceStatus::Ready, Some(&handle.0))
         .await
@@ -259,7 +338,10 @@ async fn run_terminal_tears_down_services() {
     let sched = Scheduler::new(&db, &clock, &exec, "drv");
     sched.advance(&run).await.unwrap();
 
-    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Succeeded));
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
+    );
     assert_eq!(
         service(&db.run_services(&run).await.unwrap(), 1, "db").status,
         ServiceStatus::TornDown

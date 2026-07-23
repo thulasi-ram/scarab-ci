@@ -128,8 +128,7 @@ async fn artifact_versions_are_immutable_per_attempt_and_resolve_of_record() {
     let run = RunId("r1".into());
     let step = StepId("test".into());
     db.seed_run(&run, RunStatus::Succeeded);
-    for (attempt, succeeded, body) in [("a1", false, "FAILED 3 tests"), ("a2", true, "all green")]
-    {
+    for (attempt, succeeded, body) in [("a1", false, "FAILED 3 tests"), ("a2", true, "all green")] {
         let key = format!("artifacts/r1/{attempt}/report.txt");
         store.put(&key, body.as_bytes().to_vec()).await.unwrap();
         db.put_artifacts(
@@ -216,7 +215,10 @@ async fn of_record_never_silently_serves_a_failed_version() {
 
     let run = RunId("r1".into());
     db.seed_run(&run, RunStatus::Failed);
-    store.put("artifacts/r1/a1/core.dump", b"x".to_vec()).await.unwrap();
+    store
+        .put("artifacts/r1/a1/core.dump", b"x".to_vec())
+        .await
+        .unwrap();
     db.put_artifacts(
         &run,
         &StepId("test".into()),
@@ -247,7 +249,11 @@ async fn of_record_never_silently_serves_a_failed_version() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no successful version");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "no successful version"
+    );
     let resp = app
         .clone()
         .oneshot(

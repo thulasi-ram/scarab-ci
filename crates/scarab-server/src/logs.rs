@@ -52,7 +52,10 @@ fn object_key(run: &RunId, step: &StepId, attempt: &AttemptId, seq: u64) -> Stri
 /// slot so a Rerun's fresh instance keeps its own stream. Kept in one place so
 /// the tail source and the read endpoint agree on the key.
 pub fn service_stream_key(name: &str, take: i64) -> (StepId, AttemptId) {
-    (StepId(format!("service:{name}")), AttemptId(format!("t{take}")))
+    (
+        StepId(format!("service:{name}")),
+        AttemptId(format!("t{take}")),
+    )
 }
 
 /// Map a **step sidecar** service (ADR-0058) — the `index`-th entry of a step's

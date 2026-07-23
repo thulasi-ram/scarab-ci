@@ -272,20 +272,10 @@ async fn scoped_writes_respect_role_and_tenant() {
             .unwrap()
     };
     // Write inside her tenant is allowed…
-    let resp = h
-        .app
-        .clone()
-        .oneshot(rerun(&acme_run, &amy))
-        .await
-        .unwrap();
+    let resp = h.app.clone().oneshot(rerun(&acme_run, &amy)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     // …a cross-tenant write is forbidden.
-    let resp = h
-        .app
-        .clone()
-        .oneshot(rerun(&evil_run, &amy))
-        .await
-        .unwrap();
+    let resp = h.app.clone().oneshot(rerun(&evil_run, &amy)).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
 

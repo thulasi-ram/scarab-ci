@@ -10,8 +10,8 @@
 
 use scarab_engine::ports::{ExecState, FailureClass};
 use scarab_engine::{
-    rerun_step, Clock, Db, EventKind, EventPayload, Executor, RunId, RunStatus, Scheduler,
-    StepId, StepSpec, StepStatus, Timestamp,
+    rerun_step, Clock, Db, EventKind, EventPayload, Executor, RunId, RunStatus, Scheduler, StepId,
+    StepSpec, StepStatus, Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 

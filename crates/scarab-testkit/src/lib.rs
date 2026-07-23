@@ -307,12 +307,11 @@ impl Default for InMemoryDb {
 /// / latest attempt) is stable and IDENTICAL to the postgres adapter, even when
 /// `started_at` ties (the `FakeClock` case, and same-millisecond real minting).
 fn attempt_order_key(a: &Attempt) -> (i64, u64) {
-    let seq = a
-        .id
-        .0
-        .strip_prefix('a')
-        .and_then(|n| n.parse::<u64>().ok())
-        .unwrap_or(u64::MAX);
+    let seq =
+        a.id.0
+            .strip_prefix('a')
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
     (a.started_at.0, seq)
 }
 
@@ -837,7 +836,10 @@ impl Db for InMemoryDb {
         handle: Option<&str>,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
-        if let Some(rec) = st.run_services.get_mut(&(run.clone(), take, name.to_string())) {
+        if let Some(rec) = st
+            .run_services
+            .get_mut(&(run.clone(), take, name.to_string()))
+        {
             rec.0 = status;
             // Preserve an already-recorded handle if this update carries none.
             if let Some(h) = handle {
@@ -1376,8 +1378,11 @@ impl Db for InMemoryDb {
             .map(|(_, a)| a.clone())
             .collect();
         out.sort_by(|a, b| {
-            (&a.meta.name, a.created_at.0, &a.attempt.0)
-                .cmp(&(&b.meta.name, b.created_at.0, &b.attempt.0))
+            (&a.meta.name, a.created_at.0, &a.attempt.0).cmp(&(
+                &b.meta.name,
+                b.created_at.0,
+                &b.attempt.0,
+            ))
         });
         Ok(out)
     }
@@ -1671,11 +1676,7 @@ impl FakeExecutor {
     /// its readiness probe now fails (ADR-0058 mid-run death). Drives the
     /// scheduler's fail-closed recovery path in tests.
     pub fn mark_service_unready(&self, handle: &ExecHandle) {
-        self.inner
-            .lock()
-            .unwrap()
-            .ready_services
-            .remove(&handle.0);
+        self.inner.lock().unwrap().ready_services.remove(&handle.0);
     }
 
     /// Make the next `n` `launch_service` calls return `Err` before any

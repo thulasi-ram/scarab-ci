@@ -569,7 +569,9 @@ pub struct ReadyProbe {
 impl ReadyProbe {
     /// How many probe forms this authored probe sets (must be exactly 1).
     fn forms_set(&self) -> usize {
-        self.tcp.is_some() as usize + (!self.exec.is_empty()) as usize + self.http.is_some() as usize
+        self.tcp.is_some() as usize
+            + (!self.exec.is_empty()) as usize
+            + self.http.is_some() as usize
     }
 }
 
@@ -2025,7 +2027,11 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                 svc.name
             ));
         }
-        validate_ready_probe(&svc.spec.ready, &format!("service `{}`", svc.name), &mut diagnostics);
+        validate_ready_probe(
+            &svc.spec.ready,
+            &format!("service `{}`", svc.name),
+            &mut diagnostics,
+        );
     }
 
     // Launch-parameter interface (ADR-0043): each declared param spec must be
@@ -2207,7 +2213,10 @@ mod tests {
                 image: ghcr.io/acme/build@sha256:aaaa
             "#,
         );
-        assert_eq!(unnamed.name, None, "absent name → caller falls back to the file name");
+        assert_eq!(
+            unnamed.name, None,
+            "absent name → caller falls back to the file name"
+        );
     }
 
     #[test]
@@ -4023,7 +4032,10 @@ mod tests {
               - { id: a, image: busybox }
             "#,
         );
-        assert!(errs.iter().any(|e| e.contains("must set a `name`")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("must set a `name`")),
+            "{errs:?}"
+        );
         assert!(
             errs.iter()
                 .any(|e| e.contains("service `cache`: a shared service must name an `image`")),
@@ -4059,7 +4071,10 @@ mod tests {
               - { id: a, image: busybox }
             "#,
         );
-        assert!(errs.iter().any(|e| e.contains("must be a DNS label")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("must be a DNS label")),
+            "{errs:?}"
+        );
     }
 
     #[test]
@@ -4114,16 +4129,25 @@ mod tests {
 
         // A few features must have survived compilation.
         assert!(ir.steps.iter().any(|s| s.is_clone()), "has a clone step");
-        assert!(!ir.services.is_empty(), "has pipeline-level shared services");
+        assert!(
+            !ir.services.is_empty(),
+            "has pipeline-level shared services"
+        );
         assert_eq!(ir.environment.as_deref(), Some("production"));
         assert!(ir.interface.inputs.iter().any(|p| p.name == "deploy_env"));
         // Matrix expanded (2 x 2 minus one exclude = 3 instances), invokes inlined.
         assert_eq!(
-            ir.steps.iter().filter(|s| s.id.starts_with("test[")).count(),
+            ir.steps
+                .iter()
+                .filter(|s| s.id.starts_with("test["))
+                .count(),
             3,
             "matrix expanded with the excluded combo dropped"
         );
         assert!(ir.steps.iter().all(|s| !s.is_invoke()), "invokes inlined");
-        assert!(ir.steps.iter().any(|s| s.id == "notify/post"), "library step inlined");
+        assert!(
+            ir.steps.iter().any(|s| s.id == "notify/post"),
+            "library step inlined"
+        );
     }
 }

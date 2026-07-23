@@ -775,12 +775,20 @@ async fn attempts_order_by_mint_sequence_on_started_at_tie() {
         failure: None,
         outcome: AttemptOutcome::Running,
     };
-    db.record_attempt(&run, &step, &running("a2")).await.unwrap();
-    db.record_attempt(&run, &step, &running("a1")).await.unwrap();
+    db.record_attempt(&run, &step, &running("a2"))
+        .await
+        .unwrap();
+    db.record_attempt(&run, &step, &running("a1"))
+        .await
+        .unwrap();
 
     let attempts = db.attempts_of_step(&run, &step).await.unwrap();
     let ids: Vec<&str> = attempts.iter().map(|a| a.id.0.as_str()).collect();
-    assert_eq!(ids, ["a1", "a2"], "equal started_at ties break on mint order");
+    assert_eq!(
+        ids,
+        ["a1", "a2"],
+        "equal started_at ties break on mint order"
+    );
     assert_eq!(
         attempts.last().unwrap().id,
         AttemptId("a2".into()),
@@ -862,7 +870,11 @@ async fn record_attempt_never_downgrades_recorded_evidence() {
     .unwrap();
 
     let attempts = db.attempts_of_step(&run, &step).await.unwrap();
-    assert_eq!(attempts.len(), 1, "re-record is idempotent — no duplicate row");
+    assert_eq!(
+        attempts.len(),
+        1,
+        "re-record is idempotent — no duplicate row"
+    );
     let a = &attempts[0];
     assert_eq!(
         a.outcome,
@@ -951,9 +963,9 @@ async fn supersede_teardown_retries_when_cancel_fails() {
     let clock = FakeClock::new(1_000);
     let exec = FakeExecutor::new();
     exec.fail_cancels(1); // the first cancel errors; the next succeeds
-    // visibility 0 ⇒ an un-dispatched (still-claimed) message is re-servable on
-    // the next reconcile, modelling the claim-lease lapse a production tick
-    // waits out before retrying.
+                          // visibility 0 ⇒ an un-dispatched (still-claimed) message is re-servable on
+                          // the next reconcile, modelling the claim-lease lapse a production tick
+                          // waits out before retrying.
     let sched = Scheduler::new(&db, &clock, &exec, "drv").with_outbox_visibility_ms(0);
 
     // First pass: the cancel fails, so the message is NOT retired.

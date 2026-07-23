@@ -21,8 +21,8 @@ use k8s_openapi::api::networking::v1::{
     NetworkPolicySpec,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, AttachParams, DeleteParams, LogParams, Patch, PatchParams, PostParams};
 use std::sync::Arc;
 
@@ -1097,10 +1097,7 @@ impl Executor for K8sExecutor {
         let ready = pod
             .status
             .and_then(|s| s.conditions)
-            .map(|cs| {
-                cs.iter()
-                    .any(|c| c.type_ == "Ready" && c.status == "True")
-            })
+            .map(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
             .unwrap_or(false);
         Ok(ready)
     }
@@ -2164,8 +2161,7 @@ fn service_sidecar(index: usize, svc: &scarab_pipeline::ServiceSpec) -> Containe
         image: Some(svc.image.clone()),
         command: (!svc.command.is_empty()).then(|| svc.command.clone()),
         args: (!svc.args.is_empty()).then(|| svc.args.clone()),
-        env: (!svc.env.is_empty())
-            .then(|| svc.env.iter().map(|(k, v)| env_var(k, v)).collect()),
+        env: (!svc.env.is_empty()).then(|| svc.env.iter().map(|(k, v)| env_var(k, v)).collect()),
         ports: (!svc.ports.is_empty()).then(|| {
             svc.ports
                 .iter()
@@ -3391,8 +3387,14 @@ mod tests {
         let meta = &pod.metadata;
         assert_eq!(meta.namespace.as_deref(), Some("ns"));
         let labels = meta.labels.as_ref().unwrap();
-        assert_eq!(labels.get("scarab.io/run").map(String::as_str), Some("run-1"));
-        assert_eq!(labels.get("scarab.io/service").map(String::as_str), Some("db"));
+        assert_eq!(
+            labels.get("scarab.io/run").map(String::as_str),
+            Some("run-1")
+        );
+        assert_eq!(
+            labels.get("scarab.io/service").map(String::as_str),
+            Some("db")
+        );
 
         let ps = pod.spec.unwrap();
         // Single standalone container (NOT an init/sidecar).
@@ -3424,7 +3426,11 @@ mod tests {
     #[test]
     fn shared_service_object_gives_dns_name_and_selects_the_pod() {
         let svc = build_service("run-1", "db", "ns", &[5432]);
-        assert_eq!(svc.metadata.name.as_deref(), Some("db"), "DNS name = service name");
+        assert_eq!(
+            svc.metadata.name.as_deref(),
+            Some("db"),
+            "DNS name = service name"
+        );
         let sp = svc.spec.unwrap();
         let sel = sp.selector.unwrap();
         assert_eq!(sel.get("scarab.io/service").map(String::as_str), Some("db"));
@@ -3443,8 +3449,14 @@ mod tests {
         let spec = np.spec.unwrap();
         // Target = the service Pod.
         let target = spec.pod_selector.unwrap().match_labels.unwrap();
-        assert_eq!(target.get("scarab.io/service").map(String::as_str), Some("db"));
-        assert_eq!(spec.policy_types.as_deref(), Some(&["Ingress".to_string()][..]));
+        assert_eq!(
+            target.get("scarab.io/service").map(String::as_str),
+            Some("db")
+        );
+        assert_eq!(
+            spec.policy_types.as_deref(),
+            Some(&["Ingress".to_string()][..])
+        );
         // Ingress source peer = same-run Pods with the db opt-in label.
         let rule = &spec.ingress.unwrap()[0];
         let peer_sel = rule.from.as_ref().unwrap()[0]
@@ -3454,13 +3466,19 @@ mod tests {
             .match_labels
             .as_ref()
             .unwrap();
-        assert_eq!(peer_sel.get("scarab.io/run").map(String::as_str), Some("run-1"));
+        assert_eq!(
+            peer_sel.get("scarab.io/run").map(String::as_str),
+            Some("run-1")
+        );
         assert_eq!(
             peer_sel.get("scarab.io/uses.db").map(String::as_str),
             Some("true"),
             "only Pods opted into `db` are admitted"
         );
-        assert_eq!(rule.ports.as_ref().unwrap()[0].port, Some(IntOrString::Int(5432)));
+        assert_eq!(
+            rule.ports.as_ref().unwrap()[0].port,
+            Some(IntOrString::Int(5432))
+        );
     }
 
     // ADR-0058 (Rerun collision fix): a shared service's Pod / NetworkPolicy name
@@ -3514,11 +3532,16 @@ mod tests {
         let mut spec = busybox();
         spec.uses = vec!["db".to_string()];
         let labels = pod_for(&spec).metadata.labels.unwrap();
-        assert_eq!(labels.get("scarab.io/uses.db").map(String::as_str), Some("true"));
+        assert_eq!(
+            labels.get("scarab.io/uses.db").map(String::as_str),
+            Some("true")
+        );
 
         let plain = busybox();
         let plain_labels = pod_for(&plain).metadata.labels.unwrap();
-        assert!(!plain_labels.keys().any(|k| k.starts_with("scarab.io/uses.")));
+        assert!(!plain_labels
+            .keys()
+            .any(|k| k.starts_with("scarab.io/uses.")));
     }
 
     #[test]

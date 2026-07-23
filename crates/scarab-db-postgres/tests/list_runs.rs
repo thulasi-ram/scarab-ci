@@ -55,12 +55,27 @@ async fn run_number_is_allocated_per_repo_over_real_postgres() {
             .await
             .unwrap();
     }
-    db.set_run_tenant(&RunId("r1".into()), "acme", "app").await.unwrap();
-    let n1 = db.allocate_run_number(&RunId("r1".into()), "acme", "app").await.unwrap();
-    db.set_run_tenant(&RunId("r2".into()), "acme", "app").await.unwrap();
-    let n2 = db.allocate_run_number(&RunId("r2".into()), "acme", "app").await.unwrap();
-    db.set_run_tenant(&RunId("r3".into()), "acme", "other").await.unwrap();
-    let n3 = db.allocate_run_number(&RunId("r3".into()), "acme", "other").await.unwrap();
+    db.set_run_tenant(&RunId("r1".into()), "acme", "app")
+        .await
+        .unwrap();
+    let n1 = db
+        .allocate_run_number(&RunId("r1".into()), "acme", "app")
+        .await
+        .unwrap();
+    db.set_run_tenant(&RunId("r2".into()), "acme", "app")
+        .await
+        .unwrap();
+    let n2 = db
+        .allocate_run_number(&RunId("r2".into()), "acme", "app")
+        .await
+        .unwrap();
+    db.set_run_tenant(&RunId("r3".into()), "acme", "other")
+        .await
+        .unwrap();
+    let n3 = db
+        .allocate_run_number(&RunId("r3".into()), "acme", "other")
+        .await
+        .unwrap();
     assert_eq!(
         (n1, n2, n3),
         (1, 2, 1),

@@ -325,7 +325,10 @@ enum TailSource {
     /// container in the step's OWN Pod, tailed distinctly from the main step. The
     /// storage `{run, step, attempt}` keys the drive loop passes are already the
     /// synthetic sidecar id + the step's real attempt (see [`LogTailer::ensure_sidecar`]).
-    Sidecar { step: StepRun, index: usize },
+    Sidecar {
+        step: StepRun,
+        index: usize,
+    },
 }
 
 /// Open the executor's log source for `source` and pump it into the pipeline. A

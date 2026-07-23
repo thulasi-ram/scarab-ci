@@ -115,9 +115,15 @@ async fn startup_flake_exhausts_budget_and_fails_the_run() {
     )
     .await
     .unwrap();
-    db.create_step_run(&run, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("migrate".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.seed_run(&run, RunStatus::Running);
 
     let clock = FakeClock::new(0);
@@ -186,9 +192,15 @@ async fn mid_run_death_fails_opt_in_step_and_cascades_no_rerun() {
     )
     .await
     .unwrap();
-    db.create_step_run(&run, &StepId("seed".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("seed".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.create_step_run(
         &run,
         &StepId("test".into()),
@@ -263,13 +275,13 @@ async fn mid_run_death_fails_opt_in_step_and_cascades_no_rerun() {
         StepStatus::Skipped,
         "the descendant cascades (ADR-0027)"
     );
-    assert_eq!(
-        db.run_status(&run).await.unwrap(),
-        Some(RunStatus::Failed)
-    );
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
     // NO engine auto-rerun / Take fork: only take 1 ever existed, and the
     // service was never relaunched after it died.
-    assert!(rows.iter().all(|r| r.take == 1), "no new Take minted: {rows:?}");
+    assert!(
+        rows.iter().all(|r| r.take == 1),
+        "no new Take minted: {rows:?}"
+    );
     assert_eq!(
         exec.launched_services(),
         vec![db_handle.0.clone()],
@@ -297,12 +309,24 @@ async fn non_opt_in_step_survives_service_death() {
     )
     .await
     .unwrap();
-    db.create_step_run(&run, &StepId("lint".into()), Some(&spec(&[])), &[], Timestamp(0))
-        .await
-        .unwrap();
-    db.create_step_run(&run, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("lint".into()),
+        Some(&spec(&[])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("migrate".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.seed_run(&run, RunStatus::Running);
 
     let clock = FakeClock::new(0);
@@ -348,9 +372,15 @@ async fn poison_launch_bounded_reaches_terminal_not_infinite_loop() {
     )
     .await
     .unwrap();
-    db.create_step_run(&run, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("migrate".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.seed_run(&run, RunStatus::Running);
 
     let clock = FakeClock::new(0);
@@ -416,9 +446,15 @@ async fn transient_launch_recovers_within_budget() {
     )
     .await
     .unwrap();
-    db.create_step_run(&run, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("migrate".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.seed_run(&run, RunStatus::Running);
 
     // The clock stays at 0 — well inside the 1_000ms budget for the whole test.
@@ -437,7 +473,10 @@ async fn transient_launch_recovers_within_budget() {
         ServiceStatus::Starting,
         "held Starting while the transient error is swallowed"
     );
-    assert!(exec.launched_services().is_empty(), "no launch has succeeded yet");
+    assert!(
+        exec.launched_services().is_empty(),
+        "no launch has succeeded yet"
+    );
 
     // Further ticks inside the window: fail #2 is swallowed, the third launch
     // succeeds, the service becomes Ready, and the opt-in step runs to success.
@@ -491,12 +530,20 @@ async fn reconcile_error_on_one_run_does_not_starve_another() {
     )
     .await
     .unwrap();
-    db.create_step_run(&run_a, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run_a,
+        &StepId("migrate".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.seed_run(&run_a, RunStatus::Running);
     let a_handle = FakeExecutor::service_handle("run-a", 1, "db");
-    db.create_run_service(&run_a, 1, "db", Timestamp(0)).await.unwrap();
+    db.create_run_service(&run_a, 1, "db", Timestamp(0))
+        .await
+        .unwrap();
     db.set_run_service(&run_a, 1, "db", ServiceStatus::Starting, Some(&a_handle.0))
         .await
         .unwrap();
@@ -512,9 +559,15 @@ async fn reconcile_error_on_one_run_does_not_starve_another() {
     )
     .await
     .unwrap();
-    db.create_step_run(&run_b, &StepId("migrate".into()), Some(&spec(&["db"])), &[], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run_b,
+        &StepId("migrate".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     db.seed_run(&run_b, RunStatus::Running);
     let b_handle = FakeExecutor::service_handle("run-b", 1, "db");
 
