@@ -286,7 +286,7 @@ impl K8sExecutor {
         pod: &Pod,
         spec: &StepSpec,
     ) -> Result<(), ExecError> {
-        let Some(config_json) = spec.build.as_ref().and_then(|b| registry_dockerconfig(b)) else {
+        let Some(config_json) = spec.build.as_ref().and_then(registry_dockerconfig) else {
             return Ok(());
         };
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;

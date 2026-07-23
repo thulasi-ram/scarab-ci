@@ -245,7 +245,7 @@ async fn unapproved_gate_expires_at_its_deadline_and_fails_the_run() {
     db.create_step_run(&run_id(), &build, Some(&spec()), &[], at)
         .await
         .unwrap();
-    db.create_step_run(&run_id(), &gate, None, &[build.clone()], at)
+    db.create_step_run(&run_id(), &gate, None, std::slice::from_ref(&build), at)
         .await
         .unwrap();
     db.set_step_gate(&run_id(), &gate, "manual", None)
@@ -475,7 +475,7 @@ async fn gate_with_a_dead_dependency_is_skipped_so_the_run_settles() {
     db.create_step_run(&run_id(), &build, Some(&spec()), &[], at)
         .await
         .unwrap();
-    db.create_step_run(&run_id(), &gate, None, &[build.clone()], at)
+    db.create_step_run(&run_id(), &gate, None, std::slice::from_ref(&build), at)
         .await
         .unwrap();
     db.set_step_gate(&run_id(), &gate, "manual", None)

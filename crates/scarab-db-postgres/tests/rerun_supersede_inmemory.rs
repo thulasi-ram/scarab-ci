@@ -54,9 +54,15 @@ async fn rerun_supersedes_in_flight_descendant_pod() {
     db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
-    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &c,
+        Some(&spec()),
+        std::slice::from_ref(&b),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
 
     // b succeeded; c is in-flight (attempt a1 with a launched Pod handle).
     db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Succeeded)
@@ -145,9 +151,15 @@ async fn rerun_without_in_flight_descendant_tears_down_nothing() {
     db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
-    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &c,
+        Some(&spec()),
+        std::slice::from_ref(&b),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     // Whole run finished: b and c both succeeded (c not in-flight).
     db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Succeeded)
         .await
@@ -183,9 +195,15 @@ async fn rerun_rejects_target_with_unsatisfied_dependency() {
     db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
-    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &c,
+        Some(&spec()),
+        std::slice::from_ref(&b),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     // b failed; c never ran (dead-dep skipped).
     db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Failed)
         .await
@@ -229,9 +247,15 @@ async fn rerun_allowed_when_dependency_was_skipped() {
     db.create_step_run(&run, &y, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
-    db.create_step_run(&run, &x, Some(&spec()), &[y.clone()], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &x,
+        Some(&spec()),
+        std::slice::from_ref(&y),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     // y was skipped (e.g. a `when:` guard); x cascade-skipped behind it.
     db.record_step_transition(&run, &y, StepStatus::Pending, StepStatus::Skipped)
         .await
@@ -289,9 +313,15 @@ async fn retry_reruns_in_take_without_forking() {
     db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
-    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &c,
+        Some(&spec()),
+        std::slice::from_ref(&b),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     // b failed; c dead-dep skipped; run settled Failed.
     db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Failed)
         .await
@@ -347,9 +377,15 @@ async fn rerun_captures_descendant_that_raced_into_running() {
     db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
-    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &c,
+        Some(&spec()),
+        std::slice::from_ref(&b),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
     // b succeeded; c is Ready (claimed, not yet launched) at snapshot time.
     db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Succeeded)
         .await
@@ -514,9 +550,15 @@ async fn superseded_attempt_survives_teardown_induced_lost() {
     db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
-    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &c,
+        Some(&spec()),
+        std::slice::from_ref(&b),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
 
     // b succeeded; c is in-flight (a1 with a launched Pod handle).
     db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Succeeded)
@@ -641,9 +683,15 @@ async fn cancelled_attempt_survives_teardown_induced_lost() {
     db.create_step_run(&run, &b, Some(&spec()), &[], Timestamp(0))
         .await
         .unwrap();
-    db.create_step_run(&run, &c, Some(&spec()), &[b.clone()], Timestamp(0))
-        .await
-        .unwrap();
+    db.create_step_run(
+        &run,
+        &c,
+        Some(&spec()),
+        std::slice::from_ref(&b),
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
 
     // b succeeded; c is in-flight (a1 with a launched Pod handle).
     db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Succeeded)
