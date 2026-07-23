@@ -588,29 +588,37 @@ export default function RunDetail() {
                 <Icon icon="rotate-ccw" size={13} />{" "}
                 {rerunning() ? "rerunning…" : "Rerun pipeline from this step"}
               </button>
-              <button
-                class="btn btn-ghost btn-sm"
-                onClick={() =>
-                  nav(`/${org()}/${repo()}/run`, { state: { prefillParams: runParams(r()) } })
+              {/* One contextual slot: while the run is ACTIVE (on latest) the
+                  useful lifecycle action is to STOP it → "Cancel run" (danger);
+                  once terminal — or while time-traveling an older version, where
+                  cancel is meaningless — it becomes "New run", minting a fresh run
+                  pre-filled with these params. Replaces the old always-present
+                  "New run" + a perpetually-greyed "Cancel". */}
+              <Show
+                when={run() && !isTerminal(run()!.status) && !timeTraveling()}
+                fallback={
+                  <button
+                    class="btn btn-ghost btn-sm"
+                    onClick={() =>
+                      nav(`/${org()}/${repo()}/run`, {
+                        state: { prefillParams: runParams(r()) },
+                      })
+                    }
+                    title="launch a NEW run of this pipeline, pre-filled with these parameters"
+                  >
+                    <Icon icon="play" size={13} /> New run
+                  </button>
                 }
-                title="launch a NEW run of this pipeline, pre-filled with these parameters"
               >
-                <Icon icon="play" size={13} /> New run
-              </button>
-              <button
-                class="btn btn-ghost btn-sm"
-                onClick={() => void onCancel()}
-                disabled={
-                  cancelling() || timeTraveling() || (run() ? isTerminal(run()!.status) : true)
-                }
-                title={
-                  timeTraveling()
-                    ? "read-only — back to latest to act"
-                    : "cancel this run and tear down its steps"
-                }
-              >
-                {cancelling() ? "cancelling…" : "Cancel"}
-              </button>
+                <button
+                  class="btn btn-danger btn-sm"
+                  onClick={() => void onCancel()}
+                  disabled={cancelling()}
+                  title="cancel this run and tear down its steps"
+                >
+                  {cancelling() ? "cancelling…" : "Cancel run"}
+                </button>
+              </Show>
               <button
                 class="btn btn-ghost btn-sm"
                 onClick={() => setShellOpen(true)}
