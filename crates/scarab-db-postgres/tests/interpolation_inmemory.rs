@@ -29,6 +29,7 @@ fn spec(command: Vec<&str>) -> StepSpec {
         oidc_token: None,
         services: Vec::new(),
         uses: Vec::new(),
+        matrix_values: Default::default(),
     }
 }
 
@@ -99,6 +100,48 @@ async fn a_named_result_flows_into_a_downstream_interpolation() {
         launched.command,
         vec!["echo".to_string(), "https://svc.example".to_string()],
         "reference resolved at launch, not left literal"
+    );
+}
+
+#[tokio::test]
+async fn a_matrix_coordinate_resolves_at_launch() {
+    // Regression: a matrix leg is expanded with `${{ matrix.<dim> }}` left in its
+    // command and its coordinate recorded in `matrix_values`. If launch-time
+    // interpolation omits `matrix` from its context, the leg fails before a Pod is
+    // ever created (a bare `step` failure with zero logs). It must resolve instead.
+    let db = InMemoryDb::new();
+    let run = RunId("run-m".into());
+    let step = StepId("test".into());
+    let mut s = spec(vec!["cargo", "test", "--features", "${{ matrix.features }}"]);
+    s.matrix_values = std::collections::BTreeMap::from([("features".to_string(), "all".to_string())]);
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.create_step_run(&run, &step, Some(&s), &[], Timestamp(0))
+        .await
+        .unwrap();
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.script_outcome(ExecState::Succeeded);
+    let sched = Scheduler::new(&db, &clock, &exec, "scheduler-1");
+    for _ in 0..4 {
+        sched.tick(&run).await.expect("tick");
+    }
+
+    let handle = ExecHandle("fake://run-m/test/a1".into());
+    let launched = exec.launched_spec(&handle).expect("matrix leg must launch");
+    assert_eq!(
+        launched.command,
+        vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "--features".to_string(),
+            "all".to_string()
+        ],
+        "matrix coordinate resolved at launch, not left literal"
+    );
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::Succeeded)
     );
 }
 

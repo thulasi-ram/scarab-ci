@@ -1493,6 +1493,11 @@ impl<'a> Scheduler<'a> {
                     // (not a scheduler error), so the run settles as Failed.
                     let spec = match self.interpolate_spec(&run, &step, spec).await? {
                         Ok(spec) => spec,
+                        // A bad `${{ … }}` reference fails the step before any Pod
+                        // is created (ADR-0041 fail-fast). NOTE: the reason is
+                        // currently dropped, so this surfaces as a bare `step`
+                        // failure with no logs — see follow-up to thread a failure
+                        // message out to the event/attempt grain.
                         Err(_reason) => {
                             self.finalize_step(
                                 &run,
@@ -1697,7 +1702,18 @@ impl<'a> Scheduler<'a> {
         // `inputs` exposes the resolved launch params (typed), so `${{ inputs.x }}`
         // resolves and a numeric guard like `inputs.n > 80` compares numerically.
         let inputs = serde_json::Value::Object(params.into_iter().collect());
-        let ctx = serde_json::json!({ "outputs": outputs, "inputs": inputs });
+        // `matrix` exposes this instance's concrete coordinate (ADR-0023). A matrix
+        // leg is expanded with `${{ matrix.<dim> }}` left in its image/command/env
+        // and its coordinate carried on `spec.matrix_values`; without binding it a
+        // matrixed step's `${{ matrix.* }}` fails to resolve and the leg dies at
+        // launch before a Pod is ever created.
+        let matrix = serde_json::Value::Object(
+            spec.matrix_values
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect(),
+        );
+        let ctx = serde_json::json!({ "outputs": outputs, "inputs": inputs, "matrix": matrix });
 
         let interp =
             |s: &str| scarab_pipeline::cel::interpolate(s, &ctx).map_err(|e| e.to_string());

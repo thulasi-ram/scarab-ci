@@ -32,6 +32,7 @@ fn spec() -> StepSpec {
         oidc_token: None,
         services: Vec::new(),
         uses: Vec::new(),
+        matrix_values: Default::default(),
     }
 }
 
@@ -180,6 +181,7 @@ async fn named_result_flows_into_a_downstream_interpolation() {
         oidc_token: None,
         services: Vec::new(),
         uses: Vec::new(),
+        matrix_values: Default::default(),
     };
     db.create_step_run(
         &run,

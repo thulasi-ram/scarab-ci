@@ -470,6 +470,14 @@ pub struct StepSpec {
     /// The scheduler readiness-gates this Step on those services becoming ready.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uses: Vec<String>,
+    /// The concrete matrix coordinate this instance was expanded from (ADR-0023),
+    /// e.g. `{features: all, toolchain: stable}`. Carried through from the compiled
+    /// pipeline spec (`scarab_pipeline::StepSpec::matrix_values`) so launch-time CEL
+    /// interpolation can resolve `${{ matrix.<dim> }}` in the image/command/env.
+    /// Empty for steps authored without a matrix. Backward-compatible on the wire
+    /// (absent in older stored specs → empty).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub matrix_values: std::collections::BTreeMap<String, String>,
 }
 
 /// The launch context of a `kind: build` step (ADR-0018): what to build

@@ -30,6 +30,7 @@ fn spec(uses: &[&str]) -> StepSpec {
         oidc_token: None,
         services: Vec::new(),
         uses: uses.iter().map(|s| s.to_string()).collect(),
+        matrix_values: Default::default(),
     }
 }
 

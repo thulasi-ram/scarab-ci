@@ -63,6 +63,7 @@ fn spec_with_secret() -> StepSpec {
         oidc_token: None,
         services: Vec::new(),
         uses: Vec::new(),
+        matrix_values: Default::default(),
     }
 }
 fn logs(db: Arc<dyn Db>) -> Arc<LogService> {
@@ -237,6 +238,7 @@ fn plain_spec() -> StepSpec {
         oidc_token: None,
         services: Vec::new(),
         uses: Vec::new(),
+        matrix_values: Default::default(),
     }
 }
 

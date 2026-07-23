@@ -79,6 +79,7 @@ fn interp_spec() -> StepSpec {
         oidc_token: None,
         services: Vec::new(),
         uses: Vec::new(),
+        matrix_values: Default::default(),
     }
 }
 

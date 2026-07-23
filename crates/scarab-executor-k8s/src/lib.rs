@@ -2946,6 +2946,7 @@ mod tests {
             oidc_token: None,
             services: vec![],
             uses: vec![],
+            matrix_values: Default::default(),
         }
     }
 
@@ -3158,6 +3159,7 @@ mod tests {
             oidc_token: None,
             services: vec![],
             uses: vec![],
+            matrix_values: Default::default(),
         };
         let pod = build_pod(
             "scarab-x",

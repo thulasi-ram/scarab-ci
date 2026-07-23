@@ -56,6 +56,7 @@ fn clone_spec(read_only: bool) -> StepSpec {
         oidc_token: None,
         services: Vec::new(),
         uses: Vec::new(),
+        matrix_values: Default::default(),
     }
 }
 
@@ -193,6 +194,7 @@ fn build_spec(image: &str) -> StepSpec {
         oidc_token: None,
         services: Vec::new(),
         uses: Vec::new(),
+        matrix_values: Default::default(),
     }
 }
 

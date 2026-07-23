@@ -994,6 +994,9 @@ async fn create_run(
             oidc_token: None,
             services: step.services.clone(),
             uses: step.uses.clone(),
+            // The inline `POST /v1/runs` escape hatch takes steps directly (no
+            // matrix expansion), so there is never a coordinate here.
+            matrix_values: Default::default(),
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
         st.db
@@ -3725,6 +3728,8 @@ async fn persist_run_from_ir(
                 // forbids `services` on it, so this is always empty.
                 services: Vec::new(),
                 uses: Vec::new(),
+                // Carried for uniformity; a clone step is never matrixed.
+                matrix_values: step.matrix_values.clone(),
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
@@ -3793,6 +3798,9 @@ async fn persist_run_from_ir(
                 // Shared-service opt-in (ADR-0058): the executor labels this Pod
                 // so each named service's NetworkPolicy admits it.
                 uses: step.uses.clone(),
+                // Matrix coordinate (ADR-0023): carried through so launch-time
+                // interpolation resolves this leg's `${{ matrix.<dim> }}`.
+                matrix_values: step.matrix_values.clone(),
             };
             db.create_step_run(run, &step_id, Some(&spec), &needs, now)
                 .await?;
