@@ -35,7 +35,7 @@ import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
-import Dag, { type DagStep, type DagService } from "../components/Dag";
+import Dag, { type DagStep, type DagService, type DagControls } from "../components/Dag";
 import VersionDropdown, { type VersionRow, type OutcomeCounts } from "../components/VersionDropdown";
 import StepPane from "../components/StepPane";
 import ServicePane from "../components/ServicePane";
@@ -85,6 +85,9 @@ export default function RunDetail() {
     setSel(stepId);
     setFocusSidecar(index);
   };
+  // The DAG's zoom controls (Proposal B, stage 3), handed up by <Dag> on mount
+  // so the band toolbar's fit / ＋ / － cluster can drive fit-to-view + zoom.
+  const [dagControls, setDagControls] = createSignal<DagControls | null>(null);
   const [rerunning, setRerunning] = createSignal<string | null>(null);
   const [retrying, setRetrying] = createSignal<string | null>(null);
   const [cancelling, setCancelling] = createSignal(false);
@@ -797,6 +800,19 @@ export default function RunDetail() {
                   {!timeTraveling() && runningCount() ? ` · ${runningCount()} running` : ""}
                 </span>
                 <span class="grow1" />
+                {/* Fit-to-view + manual zoom (Proposal B, stage 3) — driven
+                    through the controls <Dag> hands up on mount. */}
+                <span class="dag-zoomctl">
+                  <button type="button" title="fit to view" onClick={() => dagControls()?.fit()}>
+                    ⤢
+                  </button>
+                  <button type="button" title="zoom in" onClick={() => dagControls()?.zoomIn()}>
+                    ＋
+                  </button>
+                  <button type="button" title="zoom out" onClick={() => dagControls()?.zoomOut()}>
+                    －
+                  </button>
+                </span>
               </div>
               {/* Read-only banner: while viewing an older version the whole
                   component is a snapshot-at-boundary — say so explicitly. */}
@@ -824,6 +840,7 @@ export default function RunDetail() {
                   onSelect={selectNode}
                   onSelectSidecar={selectSidecar}
                   sidecarFocus={focusSidecar()}
+                  onControls={setDagControls}
                 />
               </div>
 

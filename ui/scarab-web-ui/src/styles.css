@@ -2436,6 +2436,17 @@ h1, .crumb-head, .run-title {
   text-transform: uppercase; letter-spacing: 1px; color: var(--muted-sage);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
 }
+/* Zoom control cluster (fit ⤢ / zoom ＋ / zoom －): page chrome — it sits on the
+   toolbar, not the dark canvas — so it reads page/theme tokens. */
+.dag-zoomctl { display: inline-flex; gap: 5px; flex: none; }
+.dag-zoomctl button {
+  width: 28px; height: 28px; display: grid; place-items: center;
+  font-family: var(--font-mono); font-size: 14px; line-height: 1; cursor: pointer;
+  color: var(--muted-sage); background: var(--emerald-surface);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  transition: color 0.12s var(--ease-out), border-color 0.12s var(--ease-out);
+}
+.dag-zoomctl button:hover { color: var(--soft-white); border-color: var(--emerald); }
 
 /* Blueprint band (Proposal B): the DAG canvas as a full-width band across the
    top of the component — always the dark terminal surface, like today. Stage 1
@@ -2443,13 +2454,21 @@ h1, .crumb-head, .run-title {
    fit-to-view zoom. The band spans the component edge-to-edge (no radius — the
    panel's own rounding + overflow clip the corners). */
 .dag-band { display: flex; flex-direction: column; }
+/* The band viewport: full-width, its HEIGHT driven by the fit (an inline style
+   from Dag — dynamic, capped at ~60vh), overflow CLIPPED. The fit-to-view zoom
+   scales the whole graph to sit inside, so there is no scrolling; drag-to-pan
+   takes over once zoomed in past fit. Always the dark terminal surface. */
 .pipeline-panel .dag-band .dag {
-  flex: 1; height: 340px; overflow: auto;
+  position: relative; overflow: hidden; padding: 0;
   border-radius: 0; background: var(--terminal);
-  /* Center the left→right flow vertically in the band; `safe` falls back to
-     start when a tall fan overflows, so scroll reaches it (stage 3 replaces this
-     with a fit-to-view zoom). */
-  display: flex; align-items: safe center;
+}
+.pipeline-panel .dag-band .dag.pannable { cursor: grab; }
+.pipeline-panel .dag-band .dag.dragging { cursor: grabbing; }
+/* Zoom/pan layer: sized to the graph, transformed from its top-left corner so
+   fit's translate + scale center it in the band. */
+.dag-zoom {
+  position: absolute; top: 0; left: 0; width: max-content;
+  transform-origin: 0 0; will-change: transform;
 }
 
 /* Section header for the Artifacts footer — caps, tracked, mono micro-label

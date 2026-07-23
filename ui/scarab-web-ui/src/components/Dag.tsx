@@ -77,6 +77,16 @@ function fmtDur(ms: number): string {
   return `${hh}h${String(mm % 60).padStart(2, "0")}m`;
 }
 
+/** Imperative zoom controls the Pipeline band toolbar drives (Proposal B, stage
+ * 3). Dag owns the zoom/pan state and hands these out on mount so the toolbar's
+ * fit / ＋ / － cluster (page chrome, outside the dark canvas) can call in. */
+export type DagControls = {
+  /** Fit the whole graph within the band and re-center (the auto-fit baseline). */
+  fit: () => void;
+  zoomIn: () => void;
+  zoomOut: () => void;
+};
+
 export default function Dag(props: {
   steps: DagStep[];
   /** Shared services (ADR-0058) — rendered as peer nodes in a lane at the top. */
@@ -90,12 +100,54 @@ export default function Dag(props: {
   /** The sidecar index whose logs are currently active on the SELECTED step —
    * drives the docked chip's selected outline. */
   sidecarFocus?: number | null;
+  /** Handed the zoom controls on mount (fit / zoom in / zoom out) so the band
+   * toolbar can drive them (Proposal B, stage 3). */
+  onControls?: (c: DagControls) => void;
 }) {
-  let container: HTMLDivElement | undefined;
+  let container: HTMLDivElement | undefined; // the band viewport (overflow clipped)
+  let graph: HTMLDivElement | undefined; // the unscaled graph content (fit/measure basis)
   const nodes = new Map<string, HTMLElement>();
   const [edges, setEdges] = createSignal<Edge[]>([]);
   // A 1s tick so running nodes' elapsed counters advance in place.
   const [now, setNow] = createSignal(Date.now());
+
+  // ── Fit-to-view zoom + pan (Proposal B, stage 3) ──────────────────────────
+  // The graph content is wrapped in a zoom layer transformed by `scale` +
+  // (`tx`,`ty`). `fit()` scales the whole graph to sit within the band (never
+  // upscaling past 1×) and centers it; the band's rendered height tracks the
+  // fitted content height, capped at a max. Edges are measured in UNSCALED
+  // content coordinates (offsetLeft/offsetTop, which CSS transforms don't
+  // touch), so the zoom transform never breaks where they land.
+  const [scale, setScale] = createSignal(1);
+  const [tx, setTx] = createSignal(0);
+  const [ty, setTy] = createSignal(0);
+  const [bandH, setBandH] = createSignal(320);
+  const [fitZ, setFitZ] = createSignal(1); // the last fit scale — pan unlocks above it
+  const [contentH, setContentH] = createSignal(0);
+  const [dragging, setDragging] = createSignal(false);
+
+  const PAD = 24; // inset (px) between the graph and the band edges, at scale 1
+  const MIN_Z = 0.2;
+  const MAX_Z = 1.5;
+  const clampZ = (z: number) => Math.min(MAX_Z, Math.max(MIN_Z, z));
+  // Band ceiling ~60vh (the DAG never eats more than that); floored so a tiny
+  // graph still gets a usable strip.
+  const maxBandH = () => Math.max(200, Math.round(window.innerHeight * 0.6));
+
+  // Cumulative unscaled offset of `el` up to `ancestor` (the graph). offsetLeft/
+  // offsetTop are LAYOUT coordinates — unaffected by the zoom layer's transform —
+  // so this yields the graph-space position regardless of the current scale/pan.
+  const offsetIn = (el: HTMLElement, ancestor: HTMLElement) => {
+    let x = 0;
+    let y = 0;
+    let n: HTMLElement | null = el;
+    while (n && n !== ancestor) {
+      x += n.offsetLeft;
+      y += n.offsetTop;
+      n = n.offsetParent as HTMLElement | null;
+    }
+    return { x, y };
+  };
 
   // Dependency layers: a step sits one column right of its deepest dependency.
   const layers = () => {
@@ -120,29 +172,33 @@ export default function Dag(props: {
     return cols.filter((c) => c && c.length);
   };
 
+  // A node's UNSCALED box in graph space (transform-invariant — see `offsetIn`).
+  const boxOf = (el: HTMLElement) => {
+    const { x, y } = offsetIn(el, graph!);
+    return { left: x, top: y, right: x + el.offsetWidth, bottom: y + el.offsetHeight, w: el.offsetWidth, h: el.offsetHeight };
+  };
+
   function measure() {
-    if (!container) return;
+    if (!graph) return;
     const byId = new Map(props.steps.map((s) => [s.id, s]));
-    const cbox = container.getBoundingClientRect();
     const es: Edge[] = [];
     for (const s of props.steps) {
       const to = nodes.get(s.id);
       if (!to) continue;
-      const tb = to.getBoundingClientRect();
+      const tb = boxOf(to);
       const hot = s.status === "running";
       for (const need of s.needs) {
         const from = nodes.get(need);
         if (!from) continue;
-        const fb = from.getBoundingClientRect();
+        const fb = boxOf(from);
         es.push({
           // Left→right flow: out the RIGHT edge of the dependency, into the LEFT
-          // edge of the dependent (endpoints are vertical mid-points). Coordinates
-          // are relative to the scroll container's content, so they stay correct
-          // as the canvas scrolls.
-          x1: fb.right - cbox.left + container.scrollLeft,
-          y1: fb.top - cbox.top + container.scrollTop + fb.height / 2,
-          x2: tb.left - cbox.left + container.scrollLeft,
-          y2: tb.top - cbox.top + container.scrollTop + tb.height / 2,
+          // edge of the dependent (endpoints are vertical mid-points). Unscaled
+          // graph-space coords, so the zoom transform scales them onto the nodes.
+          x1: fb.right,
+          y1: fb.top + fb.h / 2,
+          x2: tb.left,
+          y2: tb.top + tb.h / 2,
           // The edge glows when it feeds a running step (or a running dep).
           hot: hot || byId.get(need)?.status === "running",
           dashed: false,
@@ -159,16 +215,16 @@ export default function Dag(props: {
     for (const s of props.steps) {
       const to = nodes.get(s.id);
       if (!to) continue;
-      const tb = to.getBoundingClientRect();
+      const tb = boxOf(to);
       for (const name of s.uses ?? []) {
         const from = nodes.get(`service:${name}`);
         if (!from) continue;
-        const fb = from.getBoundingClientRect();
+        const fb = boxOf(from);
         es.push({
-          x1: fb.left - cbox.left + container.scrollLeft + fb.width / 2,
-          y1: fb.bottom - cbox.top + container.scrollTop,
-          x2: tb.left - cbox.left + container.scrollLeft + tb.width / 2,
-          y2: tb.top - cbox.top + container.scrollTop,
+          x1: fb.left + fb.w / 2,
+          y1: fb.bottom,
+          x2: tb.left + tb.w / 2,
+          y2: tb.top,
           hot: false,
           dashed: true,
           vertical: true,
@@ -178,26 +234,128 @@ export default function Dag(props: {
     setEdges(es);
   }
 
-  onMount(() => {
-    requestAnimationFrame(measure);
-    const ro = new ResizeObserver(() => measure());
-    if (container) {
-      ro.observe(container);
-      container.addEventListener("scroll", measure, { passive: true });
+  // Fit the whole graph within the band: scale so it fits both axes (never past
+  // 1×), center it, and shrink the band to the fitted content height (capped at
+  // the max — no wasted vertical space when the graph is small). Auto-fit runs on
+  // mount, on topology change, and on a width resize.
+  function fit() {
+    if (!container || !graph) return;
+    const bandW = container.clientWidth;
+    const cw = graph.offsetWidth;
+    const ch = graph.offsetHeight;
+    setContentH(ch);
+    if (cw <= 0 || ch <= 0 || bandW <= 0) return;
+    const availW = Math.max(1, bandW - PAD * 2);
+    const availH = Math.max(1, maxBandH() - PAD * 2);
+    const z = Math.min(availW / cw, availH / ch, 1);
+    const scaledW = cw * z;
+    const scaledH = ch * z;
+    const h = Math.round(scaledH + PAD * 2);
+    setScale(z);
+    setFitZ(z);
+    setTx((bandW - scaledW) / 2);
+    setTy((h - scaledH) / 2);
+    setBandH(h);
+  }
+
+  // Zoom to `nz`, keeping the focal point (band center by default) fixed, and
+  // grow the band up to the max so there's room to read/pan when zoomed in.
+  function zoomTo(nz: number, fx?: number, fy?: number) {
+    if (!container) return;
+    const z0 = scale();
+    const z = clampZ(nz);
+    const cx = fx ?? container.clientWidth / 2;
+    const cy = fy ?? bandH() / 2;
+    const contentX = (cx - tx()) / z0;
+    const contentY = (cy - ty()) / z0;
+    setScale(z);
+    setTx(cx - contentX * z);
+    setTy(cy - contentY * z);
+    setBandH(Math.min(Math.round(contentH() * z + PAD * 2), maxBandH()));
+  }
+  const zoomIn = () => zoomTo(scale() * 1.2);
+  const zoomOut = () => zoomTo(scale() / 1.2);
+
+  // Drag-to-pan, unlocked only once zoomed in past the fit scale (when the graph
+  // overflows the band). Starting on a node/chip is a select, not a pan.
+  let panStart: { x: number; y: number; tx: number; ty: number } | null = null;
+  const pannable = () => scale() > fitZ() + 0.001;
+  const onPointerDown = (e: PointerEvent) => {
+    if (!pannable() || !container) return;
+    if ((e.target as HTMLElement).closest("button, [role='button']")) return;
+    panStart = { x: e.clientX, y: e.clientY, tx: tx(), ty: ty() };
+    setDragging(true);
+    container.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  };
+  const onPointerMove = (e: PointerEvent) => {
+    if (!panStart) return;
+    setTx(panStart.tx + (e.clientX - panStart.x));
+    setTy(panStart.ty + (e.clientY - panStart.y));
+  };
+  const onPointerUp = (e: PointerEvent) => {
+    if (!panStart) return;
+    panStart = null;
+    setDragging(false);
+    try {
+      container?.releasePointerCapture(e.pointerId);
+    } catch {
+      /* pointer already released */
     }
+  };
+
+  // Fit + measure once the DOM is laid out (two rAFs: past insertion, past
+  // layout).
+  const fitAndMeasure = () =>
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        fit();
+        measure();
+      }),
+    );
+
+  onMount(() => {
+    // Hand the zoom controls up to the band toolbar (Proposal B, stage 3).
+    props.onControls?.({ fit, zoomIn, zoomOut });
+    fitAndMeasure();
+    // Re-fit on a WIDTH resize only — a height change is self-inflicted by fit
+    // (it sets the band height), so guarding on width avoids a feedback loop.
+    let lastW = container?.clientWidth ?? 0;
+    const ro = new ResizeObserver(() => {
+      const w = container?.clientWidth ?? 0;
+      if (Math.abs(w - lastW) < 1) return;
+      lastW = w;
+      requestAnimationFrame(fit);
+    });
+    if (container) ro.observe(container);
+    // The max band height tracks the viewport (~60vh), so re-fit on window resize.
+    const onWinResize = () => requestAnimationFrame(fit);
+    window.addEventListener("resize", onWinResize);
     const tick = setInterval(() => setNow(Date.now()), 1000);
     onCleanup(() => {
       ro.disconnect();
-      container?.removeEventListener("scroll", measure);
+      window.removeEventListener("resize", onWinResize);
       clearInterval(tick);
     });
   });
 
-  // Re-measure when topology changes (a fresh run replaces the whole set) —
-  // `.dag` has a fixed box + inner scroll, so a ResizeObserver on it never fires
-  // for content growth. Two rAFs: one past DOM insertion, one past layout.
+  // Auto-fit when the STEP SET / topology changes (a rerun re-arms steps, a
+  // fresh run replaces the whole set) — the fitted zoom + band height re-derive
+  // for the new shape. Keyed on the id set + service names, NOT status, so a
+  // live run's 1.2s status poll never yanks the view back to fit.
   createEffect(() => {
-    props.steps.length;
+    props.steps.map((s) => s.id).join(",");
+    (props.services ?? []).map((s) => s.name).join(",");
+    fitAndMeasure();
+  });
+
+  // Re-measure EDGES (only) when a node's box could have changed — topology or
+  // per-step status (a running scanline, a ×N badge, the finished duration each
+  // resize the node). Zoom/pan need no re-measure: edges are stored in unscaled
+  // graph coords, so the transform scales them onto the nodes for free.
+  createEffect(() => {
+    props.steps.map((s) => `${s.id}:${s.status}:${s.attempts}:${s.gate ?? ""}`).join(",");
+    (props.services ?? []).map((s) => `${s.name}:${s.status}`).join(",");
     requestAnimationFrame(() => requestAnimationFrame(measure));
   });
 
@@ -235,7 +393,24 @@ export default function Dag(props: {
   };
 
   return (
-    <div class="dag" ref={container}>
+    <div
+      class="dag"
+      classList={{ pannable: pannable(), dragging: dragging() }}
+      ref={container}
+      style={{ height: `${bandH()}px` }}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+    >
+      {/* Zoom/pan layer: the whole graph (edges + nodes) is transformed as one,
+          so a fit-to-view scale (or manual zoom + pan) never desyncs the edges
+          from the nodes. Edge coords are measured UNSCALED, so `scale()` here
+          scales them onto the nodes for free. */}
+      <div
+        class="dag-zoom"
+        style={{ transform: `translate(${tx()}px, ${ty()}px) scale(${scale()})` }}
+      >
       <svg class="dag-edges" aria-hidden="true">
         <For each={edges()}>
           {(e) => {
@@ -273,7 +448,7 @@ export default function Dag(props: {
           dependency layers flowing left→right below it. `.dag-cols` is now a ROW
           of depth layers and each `.dag-col` stacks its siblings vertically; the
           column wrapper keeps the lane spanning the width above that flow. */}
-      <div class="dag-graph">
+      <div class="dag-graph" ref={graph}>
         {/* Services lane (ADR-0058): shared services are PEERS, not steps — a
             band at the top, above dependency layer 0, with dotted `uses` edges
             dropping to each consuming step. They carry no `needs` depth, so the
@@ -388,6 +563,7 @@ export default function Dag(props: {
           )}
         </For>
         </div>
+      </div>
       </div>
     </div>
   );
