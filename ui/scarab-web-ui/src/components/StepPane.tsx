@@ -57,10 +57,12 @@ export default function StepPane(props: {
   activeAttempt: string | null;
   /** Pick a try in the filmstrip — scopes every tab to `(step, attempt)`. */
   onAttemptSelect: (id: string | null) => void;
-  /** The viewed version's label ("latest" or a rerun label). The third
-   * coordinate in the pane's permanent stamp (`step · try N · version`) — the
-   * caller passes its `viewedLabel()`. */
-  versionLabel: string;
+  /** The viewed version's label — the trailing coordinate in the pane's stamp.
+   * Only carries a value while TIME-TRAVELLING (a rerun label like "you reran
+   * b"); the caller passes `null` on the live/latest view so the stamp doesn't
+   * tag every attempt with a redundant "latest" (the toolbar version dropdown
+   * already says so). */
+  versionLabel: string | null;
   /** Viewing a closed Take: pin the strip's default to this frontier attempt
    * and mark attempts beyond it as from a later take. */
   frontierAttempt?: string | null;
@@ -367,17 +369,24 @@ export default function StepPane(props: {
                 cue that a switch took effect and fresh evidence is loading;
                 dead-letter, being terminal + rare, keeps a badge there. */}
             <div class="coord-stamp mono">
-              <span class="cs-step">{s().id}</span>
+              {/* The attempts dropdown leads the stamp (left-most), sitting under
+                  the toolbar's version dropdown so the two run-detail dropdowns
+                  align into one column. The step id follows, then the version
+                  segment — shown ONLY while time-travelling (a redundant
+                  "latest" on the live view is dropped). */}
               <Show when={props.tries.length > 0}>
-                <span class="cs-dot">·</span>
                 <AttemptsDropdown
                   tries={props.tries}
                   active={props.activeAttempt}
                   onSelect={props.onAttemptSelect}
                 />
+                <span class="cs-dot">·</span>
               </Show>
-              <span class="cs-dot">·</span>
-              <span class="cs-ver">{props.versionLabel}</span>
+              <span class="cs-step">{s().id}</span>
+              <Show when={props.versionLabel}>
+                <span class="cs-dot">·</span>
+                <span class="cs-ver">{props.versionLabel}</span>
+              </Show>
             </div>
             <div class="pane-tabbar">
               <div class="tabs">

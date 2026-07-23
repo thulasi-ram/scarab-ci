@@ -119,7 +119,12 @@ export default function AttemptsDropdown(props: {
           classList={{ shadow: props.tries[0].shadowed }}
           aria-label="attempt"
         >
-          try {props.tries[0].index + 1} · {tryOutcome(props.tries[0])}
+          <span class="adrop-emblem" aria-hidden="true">
+            ⟳
+          </span>
+          <span class="adrop-lbl">
+            try {props.tries[0].index + 1} · {tryOutcome(props.tries[0])}
+          </span>
           <Show when={props.tries[0].readopted}>
             <Readopt />
           </Show>
@@ -137,6 +142,9 @@ export default function AttemptsDropdown(props: {
             aria-expanded={open()}
             onClick={() => setOpen((v) => !v)}
           >
+            <span class="adrop-emblem" aria-hidden="true">
+              ⟳
+            </span>
             <span class="adrop-lbl">
               try {activeTry().index + 1} · {tryOutcome(activeTry())}
             </span>

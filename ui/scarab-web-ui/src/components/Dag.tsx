@@ -9,7 +9,7 @@
 // elsewhere now — the attempts filmstrip in the evidence-pane header — so the
 // graph answers "what shape, and where does each step stand", not "which try".
 // Clicking a node selects it.
-import { createSignal, onMount, onCleanup, createEffect, For, Show } from "solid-js";
+import { createSignal, onMount, onCleanup, createEffect, createMemo, For, Show } from "solid-js";
 import Icon from "./Icon";
 
 export type DagStep = {
@@ -271,7 +271,10 @@ export default function Dag(props: {
     setScale(z);
     setTx(cx - contentX * z);
     setTy(cy - contentY * z);
-    setBandH(Math.min(Math.round(contentH() * z + PAD * 2), maxBandH()));
+    // NB: manual zoom scales the INNER canvas only — it must NOT resize the band
+    // container. Growing `bandH` here made the whole component jump on every
+    // ＋/－; the band is a fixed viewport (set by `fit()` on topology change),
+    // and zooming past the fit just overflows it (clipped) and unlocks panning.
   }
   const zoomIn = () => zoomTo(scale() * 1.2);
   const zoomOut = () => zoomTo(scale() / 1.2);
@@ -343,9 +346,19 @@ export default function Dag(props: {
   // fresh run replaces the whole set) — the fitted zoom + band height re-derive
   // for the new shape. Keyed on the id set + service names, NOT status, so a
   // live run's 1.2s status poll never yanks the view back to fit.
+  //
+  // The key is a createMemo so the fit effect only re-runs when the id/name set
+  // actually CHANGES value — a poll that hands us a fresh `steps` array of the
+  // same shape recomputes the string but the memo's === guard swallows it, so
+  // the user's manual zoom/pan survives a running pipeline's polls.
+  const topologyKey = createMemo(
+    () =>
+      props.steps.map((s) => s.id).join(",") +
+      "|" +
+      (props.services ?? []).map((s) => s.name).join(","),
+  );
   createEffect(() => {
-    props.steps.map((s) => s.id).join(",");
-    (props.services ?? []).map((s) => s.name).join(",");
+    topologyKey();
     fitAndMeasure();
   });
 

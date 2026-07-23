@@ -914,7 +914,7 @@ export default function RunDetail() {
                       tries={stripTries()}
                       activeAttempt={stripActiveAttempt()}
                       onAttemptSelect={setSelAttempt}
-                      versionLabel={viewedLabel()}
+                      versionLabel={timeTraveling() ? viewedLabel() : null}
                       window={stepWindow(sel())}
                       frontierAttempt={sel() ? scopedView()?.frontier[sel()!] ?? null : null}
                       deadLettered={r().status === "dead_lettered"}
@@ -993,7 +993,14 @@ export default function RunDetail() {
                 </span>
               </div>
               <div class="tl">
-                <For each={visibleEvents()} fallback={<div class="tl-empty">no events yet</div>}>
+                {/* Newest-first: the rail reads top-down as most-recent → oldest,
+                    so a live run's latest activity is always in view without
+                    scrolling. `visibleEvents()` stays chronological for StepPane;
+                    only this display copy is reversed. */}
+                <For
+                  each={[...visibleEvents()].reverse()}
+                  fallback={<div class="tl-empty">no events yet</div>}
+                >
                   {(e) => {
                     const cat = eventCategory(e);
                     const parts = eventParts(e);

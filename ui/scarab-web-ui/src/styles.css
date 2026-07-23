@@ -2687,15 +2687,17 @@ h1, .crumb-head, .run-title {
    classes below (emerald/danger/copper/running), echoing the DAG ring and the
    version-rail chips. */
 .adrop { position: relative; display: inline-flex; }
-/* Shared trigger/chip shell — a compact mono pill that sits inline in the stamp
-   between `step ·` and `· version`. A long label (a failure reason) ellipsizes
-   rather than blowing out the stamp. */
+/* Shared trigger/chip shell — modelled on the version/take dropdown (`.vdrop-btn`)
+   so the two run-detail dropdowns read as one control family: same squared
+   surface, emblem, label and caret. Outcome tone (below) recolours the text +
+   border. A long label (a failure reason) ellipsizes rather than blowing out the
+   stamp. */
 .adrop-chip,
 .adrop-btn {
-  display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: 100%;
-  font-family: var(--font-mono); font-size: 11px; line-height: 1;
-  color: var(--muted-sage); background: transparent;
-  border: 1px solid var(--border); border-radius: 20px; padding: 3px 9px;
+  display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%;
+  font-family: var(--font-mono); font-size: 12px; line-height: 1;
+  color: var(--muted-sage); background: var(--emerald-surface);
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 5px 10px;
 }
 .adrop-btn {
   cursor: pointer;
@@ -2706,7 +2708,10 @@ h1, .crumb-head, .run-title {
 /* Open: a faint tone wash + a full-strength tone border — the currentColor
    treatment the filmstrip's active marker used. */
 .adrop-btn.open { border-color: currentColor; background: color-mix(in srgb, currentColor 10%, transparent); }
-.adrop-lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Attempts emblem — the ⟳ that mirrors the version dropdown's ◈; inherits the
+   outcome tone via currentColor. */
+.adrop-emblem { flex: none; font-size: 11px; opacity: 0.9; }
+.adrop-lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
 .adrop-caret { flex: none; font-size: 9px; opacity: 0.75; margin-left: 1px; }
 /* Crash re-adoption marker — same attempt, same fence, not a new execution. */
 .adrop-readopt { flex: none; color: var(--copper); font-size: 12px; }
