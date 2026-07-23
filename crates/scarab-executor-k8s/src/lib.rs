@@ -1036,14 +1036,16 @@ impl Executor for K8sExecutor {
     /// object means a prior launch created it, so we adopt rather than fail. The
     /// handle is the service Pod name (what readiness/teardown address).
     ///
-    /// NOTE: this uses the executor's single namespace. Per-Take isolation
-    /// (a Rerun's fresh instance) relies on the namespace-per-run substrate the
-    /// ADR assumes; the durable per-Take instancing is enforced at the engine
-    /// layer regardless (`RunService` keyed `{run, take}`).
+    /// NOTE: this executor uses ONE fixed namespace for every Take (there is no
+    /// namespace-per-Take substrate here). Per-Take isolation is therefore carried
+    /// by the resource NAME: `service_resource_name` folds the `take`, so a
+    /// Rerun's fresh instance is a distinct Pod/NetworkPolicy that never collides
+    /// with the prior Take's still-terminating one. The durable per-Take instancing
+    /// is mirrored at the engine layer (`RunService` keyed `{run, take}`).
     async fn launch_service(
         &self,
         run: &RunId,
-        _take: i64,
+        take: i64,
         name: &str,
         spec: &scarab_pipeline::ServiceSpec,
     ) -> Result<ExecHandle, ExecError> {
@@ -1052,7 +1054,13 @@ impl Executor for K8sExecutor {
         let services: Api<Service> = Api::namespaced(client.clone(), &self.namespace);
         let netpols: Api<NetworkPolicy> = Api::namespaced(client, &self.namespace);
 
-        let pod = build_service_pod(&run.0, name, &self.namespace, spec);
+        // Take-scope the Pod / NetworkPolicy so a Rerun's fresh Take never collides
+        // with the prior (still-terminating) Take in this single-namespace executor
+        // (see `service_resource_name`). The k8s Service keeps the stable declared
+        // DNS name (`<name>:<port>`) — it is deliberately NOT Take-scoped, and its
+        // `{run, name}` selector converges on whichever Take's Pod is currently
+        // live as the stale one drains.
+        let pod = build_service_pod(&run.0, name, take, &self.namespace, spec);
         let handle = pod.metadata.name.clone().unwrap_or_default();
         // Ignore 409 (adopt existing) on every object — launch is idempotent.
         adopt_conflict(pods.create(&PostParams::default(), &pod).await)?;
@@ -1068,7 +1076,7 @@ impl Executor for K8sExecutor {
             netpols
                 .create(
                     &PostParams::default(),
-                    &build_network_policy(&run.0, name, &self.namespace, &spec.ports),
+                    &build_network_policy(&run.0, name, take, &self.namespace, &spec.ports),
                 )
                 .await,
         )?;
@@ -2273,14 +2281,25 @@ fn ignore_missing<T>(r: Result<T, kube::Error>) -> Result<(), ExecError> {
     }
 }
 
-/// The k8s object name for a shared service's resources (Pod / Service /
-/// NetworkPolicy) in a run's namespace: `scarab-svc-<name>-<runhash>`. Keyed on
-/// `{run, name}` (not the Take) because a Take opens a fresh namespace — within
-/// one namespace `{run, name}` is unique. DNS-1123-safe, ≤63 chars.
-fn service_resource_name(run: &str, name: &str) -> String {
-    let hash = fnv1a(run);
-    let slug = truncate(&sanitize_dns(name), 40);
-    format!("scarab-svc-{slug}-{hash:08x}")
+/// The k8s object name for a shared service's Pod / NetworkPolicy in a run's
+/// namespace: `scarab-svc-<name>-<runhash>-t<take>`. Keyed on `{run, name, take}`
+/// — the ADR-0058 instance key. This executor pins ONE fixed namespace for every
+/// Take (not a namespace-per-Take substrate), so a human Rerun advances the Take
+/// while the prior Take's Pod is still terminating in the SAME namespace. A
+/// Take-agnostic name would collide: `pods.create` for the fresh Take would 409
+/// onto the terminating prior Pod, `adopt_conflict` would swallow it, no fresh
+/// Pod would be born, and readiness would never resolve → the service fails-closed
+/// on a Rerun even though it ran fine earlier. Folding the Take in makes each
+/// generation's resources distinct so the races never touch.
+///
+/// The `take` is folded into the hash (so distinctness holds for ANY i64) AND a
+/// human-readable `-t<take>` suffix is appended; the whole thing is truncated to
+/// the 63-char DNS-1123 label limit (the hash guarantees uniqueness even if the
+/// suffix is clipped for an absurdly large take). DNS-1123-safe, ≤63 chars.
+fn service_resource_name(run: &str, name: &str, take: i64) -> String {
+    let hash = fnv1a(&format!("{run}\u{0}{take}"));
+    let slug = truncate(&sanitize_dns(name), 30);
+    truncate(&format!("scarab-svc-{slug}-{hash:08x}-t{take}"), 63)
 }
 
 /// The opt-in label key a Step's Pod carries for shared service `name` (ADR-0058)
@@ -2314,6 +2333,7 @@ fn service_labels(run: &str, name: &str) -> std::collections::BTreeMap<String, S
 pub fn build_service_pod(
     run: &str,
     name: &str,
+    take: i64,
     namespace: &str,
     svc: &scarab_pipeline::ServiceSpec,
 ) -> Pod {
@@ -2338,7 +2358,7 @@ pub fn build_service_pod(
     };
     Pod {
         metadata: ObjectMeta {
-            name: Some(service_resource_name(run, name)),
+            name: Some(service_resource_name(run, name, take)),
             namespace: Some(namespace.to_string()),
             labels: Some(service_labels(run, name)),
             ..Default::default()
@@ -2367,6 +2387,13 @@ pub fn build_service_pod(
 /// Build the **k8s Service** for a shared service (ADR-0058): a stable cluster
 /// DNS name equal to the declared service `name`, so opt-in Pods reach it at
 /// `<name>:<port>`. Its selector targets the service Pod's labels.
+///
+/// Deliberately NOT Take-scoped (unlike the Pod / NetworkPolicy): the object name
+/// is the declared DNS name and MUST stay stable across Reruns or `<name>:<port>`
+/// would stop resolving for consuming steps. Its `{run, name}` selector matches
+/// every Take's service Pod, so as a stale Take's Pod drains the Service simply
+/// converges on the live Take's Pod. Recreation across Takes is idempotent
+/// (`adopt_conflict`).
 pub fn build_service(run: &str, name: &str, namespace: &str, ports: &[u16]) -> Service {
     Service {
         metadata: ObjectMeta {
@@ -2400,7 +2427,13 @@ pub fn build_service(run: &str, name: &str, namespace: &str, ports: &[u16]) -> S
 /// same run** that carry the service's opt-in label ([`service_uses_label`]).
 /// Non-opt-in Pods (and Pods of other runs) cannot reach it — the least-privilege
 /// hole `uses:` scopes.
-pub fn build_network_policy(run: &str, name: &str, namespace: &str, ports: &[u16]) -> NetworkPolicy {
+pub fn build_network_policy(
+    run: &str,
+    name: &str,
+    take: i64,
+    namespace: &str,
+    ports: &[u16],
+) -> NetworkPolicy {
     let peer = NetworkPolicyPeer {
         pod_selector: Some(LabelSelector {
             match_labels: Some(std::collections::BTreeMap::from([
@@ -2413,7 +2446,7 @@ pub fn build_network_policy(run: &str, name: &str, namespace: &str, ports: &[u16
     };
     NetworkPolicy {
         metadata: ObjectMeta {
-            name: Some(service_resource_name(run, name)),
+            name: Some(service_resource_name(run, name, take)),
             namespace: Some(namespace.to_string()),
             labels: Some(service_labels(run, name)),
             ..Default::default()
@@ -3287,7 +3320,7 @@ mod tests {
             run_as_user: Some(999),
             ..Default::default()
         };
-        let pod = build_service_pod("run-1", "db", "ns", &non_root);
+        let pod = build_service_pod("run-1", "db", 1, "ns", &non_root);
         let ps = pod.spec.unwrap();
         let sc = ps.containers[0].security_context.as_ref().unwrap();
         assert_eq!(sc.run_as_non_root, Some(true));
@@ -3302,7 +3335,7 @@ mod tests {
             run_as_root: true,
             ..Default::default()
         };
-        let pod = build_service_pod("run-1", "db", "ns", &root);
+        let pod = build_service_pod("run-1", "db", 1, "ns", &root);
         let ps = pod.spec.unwrap();
         let sc = ps.containers[0].security_context.as_ref().unwrap();
         assert_eq!(sc.run_as_non_root, Some(false));
@@ -3330,7 +3363,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let pod = build_service_pod("run-1", "db", "ns", &svc);
+        let pod = build_service_pod("run-1", "db", 1, "ns", &svc);
         let meta = &pod.metadata;
         assert_eq!(meta.namespace.as_deref(), Some("ns"));
         let labels = meta.labels.as_ref().unwrap();
@@ -3382,7 +3415,7 @@ mod tests {
     // hole `uses:` scopes. A Pod that opts into nothing is denied.
     #[test]
     fn shared_service_network_policy_admits_only_opt_in_pods() {
-        let np = build_network_policy("run-1", "db", "ns", &[5432]);
+        let np = build_network_policy("run-1", "db", 1, "ns", &[5432]);
         let spec = np.spec.unwrap();
         // Target = the service Pod.
         let target = spec.pod_selector.unwrap().match_labels.unwrap();
@@ -3404,6 +3437,43 @@ mod tests {
             "only Pods opted into `db` are admitted"
         );
         assert_eq!(rule.ports.as_ref().unwrap()[0].port, Some(IntOrString::Int(5432)));
+    }
+
+    // ADR-0058 (Rerun collision fix): a shared service's Pod / NetworkPolicy name
+    // is Take-scoped (`{run, name, take}`), so a Rerun's fresh Take never reuses
+    // the prior (still-terminating) Take's name in this single-namespace executor.
+    // Distinct Takes -> distinct names; same Take -> stable name (launch re-attach);
+    // the name stays DNS-1123-safe and ≤63 chars even for a long service name and
+    // a large Take.
+    #[test]
+    fn service_resource_name_is_take_scoped_and_dns_safe() {
+        // Same {run, name} but different Take must NOT collide.
+        let t1 = service_resource_name("run-1", "postgres", 1);
+        let t2 = service_resource_name("run-1", "postgres", 2);
+        assert_ne!(t1, t2, "a Rerun's Take must get a distinct resource name");
+
+        // Same {run, name, take} is stable (idempotent launch re-attaches).
+        assert_eq!(t1, service_resource_name("run-1", "postgres", 1));
+
+        // The Pod and NetworkPolicy builders agree on the Take-scoped name so
+        // teardown-by-handle targets the right instance.
+        let pod = build_service_pod("run-1", "postgres", 2, "ns", &Default::default());
+        let np = build_network_policy("run-1", "postgres", 2, "ns", &[5432]);
+        assert_eq!(pod.metadata.name.as_deref(), Some(t2.as_str()));
+        assert_eq!(np.metadata.name.as_deref(), Some(t2.as_str()));
+
+        // DNS-1123 label safety + ≤63 for a pathological name and a huge Take.
+        let long = "a-really-long-service-name-that-exceeds-the-slug-budget-considerably";
+        let n = service_resource_name("some-run-id", long, i64::MAX);
+        assert!(n.len() <= 63, "name {n:?} exceeds the 63-char DNS label limit");
+        assert!(
+            n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "name {n:?} is not DNS-1123-label-safe"
+        );
+        assert!(!n.starts_with('-') && !n.ends_with('-'), "name {n:?} has a dangling dash");
+        // Even when the readable suffix is clipped, folding the Take into the hash
+        // keeps different Takes distinct.
+        assert_ne!(n, service_resource_name("some-run-id", long, i64::MAX - 1));
     }
 
     // ADR-0058: an opt-in step's Pod carries the per-service `uses` label so the
