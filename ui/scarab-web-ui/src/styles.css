@@ -956,27 +956,38 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   stroke-width: 1.5;
 }
 
-.dag-cols {
+/* Graph body: a column stacking the services lane (a band on top) over the
+   left→right flow. Sized to its content (`min-content`) so a small graph is
+   compact and a big one grows past the canvas — the band's fit-to-view zoom
+   (stage 3) scales it to fit; before that it scrolls in `.dag`. */
+.dag-graph {
   position: relative;
   z-index: 1;
   display: flex;
-  flex-direction: column; /* dependency layers stack top → bottom */
-  gap: 40px;
-  /* `safe center` keeps a narrow graph centered but never clips a wide fan on
-     the leading edge; `min-content` lets the cols grow past the canvas so the
-     wide row scrolls in `.dag` (overflow:auto) instead of wrapping. */
+  flex-direction: column;
+  gap: 0;
+  min-width: min-content;
+  min-height: min-content;
+}
+
+.dag-cols {
+  display: flex;
+  flex-direction: row; /* dependency layers flow left → right */
+  gap: 48px;
+  /* `safe center` keeps a short graph vertically centered in the band but never
+     clips a tall fan on the top edge. */
   align-items: safe center;
   min-width: min-content;
-  min-height: max-content;
+  min-height: min-content;
 }
 
 .dag-col {
   display: flex;
-  flex-direction: row; /* peers within a layer sit side by side */
-  gap: 16px;
+  flex-direction: column; /* siblings within a layer stack vertically */
+  gap: 18px;
   justify-content: safe center;
-  /* A wide sibling fan (e.g. dogfood `checkout → {lint, test…, version}`) stays
-     ONE row and scrolls horizontally — never wraps to stacked rows. */
+  /* A tall sibling fan (e.g. dogfood `checkout → {lint, test…, version}`) stays
+     ONE column — never wraps to side-by-side. */
   flex-wrap: nowrap;
 }
 
@@ -2052,7 +2063,7 @@ h1, .crumb-head, .run-title {
 
 /* ── Services in the DAG (ADR-0058): shared services as peer nodes + dotted
    `uses` edges; sidecars as docked chips on their step. Canvas tokens ONLY
-   (--terminal*/status accents) — never page/surface tokens inside the graph. ── */
+   (the terminal + status accents) — never page/surface tokens in the graph. ── */
 
 /* Services lane: a band above dependency layer 0, holding the shared-service
    peers. `align-self: stretch` + the hairline divider make it read as its own
@@ -2435,6 +2446,10 @@ h1, .crumb-head, .run-title {
 .pipeline-panel .dag-band .dag {
   flex: 1; height: 340px; overflow: auto;
   border-radius: 0; background: var(--terminal);
+  /* Center the left→right flow vertically in the band; `safe` falls back to
+     start when a tall fan overflows, so scroll reaches it (stage 3 replaces this
+     with a fit-to-view zoom). */
+  display: flex; align-items: safe center;
 }
 
 /* Section header for the Artifacts footer — caps, tracked, mono micro-label

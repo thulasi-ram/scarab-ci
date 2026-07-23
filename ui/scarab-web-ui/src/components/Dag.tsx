@@ -47,7 +47,17 @@ export type DagService = {
 
 // A `needs` edge is solid; a `uses` edge (shared service → consumer) is dashed
 // and never "hot" (a service is not part of the running-flow highlight).
-type Edge = { x1: number; y1: number; x2: number; y2: number; hot: boolean; dashed: boolean };
+// `vertical` picks the routing: `needs` flow left→right (horizontal-first),
+// while a `uses` edge drops from the top services lane (vertical-first).
+type Edge = {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  hot: boolean;
+  dashed: boolean;
+  vertical: boolean;
+};
 
 /** m:ss (or h:mm:ss) elapsed since `since`, ticking off the caller's `now`. */
 function elapsed(since: number, now: number): string {
@@ -125,23 +135,27 @@ export default function Dag(props: {
         if (!from) continue;
         const fb = from.getBoundingClientRect();
         es.push({
-          // Top-to-bottom flow: out the BOTTOM of the dependency, into the TOP
-          // of the dependent (endpoints are horizontal mid-points). Coordinates
+          // Left→right flow: out the RIGHT edge of the dependency, into the LEFT
+          // edge of the dependent (endpoints are vertical mid-points). Coordinates
           // are relative to the scroll container's content, so they stay correct
           // as the canvas scrolls.
-          x1: fb.left - cbox.left + container.scrollLeft + fb.width / 2,
-          y1: fb.bottom - cbox.top + container.scrollTop,
-          x2: tb.left - cbox.left + container.scrollLeft + tb.width / 2,
-          y2: tb.top - cbox.top + container.scrollTop,
+          x1: fb.right - cbox.left + container.scrollLeft,
+          y1: fb.top - cbox.top + container.scrollTop + fb.height / 2,
+          x2: tb.left - cbox.left + container.scrollLeft,
+          y2: tb.top - cbox.top + container.scrollTop + tb.height / 2,
           // The edge glows when it feeds a running step (or a running dep).
           hot: hot || byId.get(need)?.status === "running",
           dashed: false,
+          vertical: false,
         });
       }
     }
     // Dashed `uses` edges (ADR-0058): from each shared-service peer node down to
     // every step that opts into it. A service edge is never "hot" — a service is
-    // infra, not part of the running-step flow highlight.
+    // infra, not part of the running-step flow highlight. The services lane stays
+    // a band at the TOP, so this edge drops from the service node's BOTTOM into
+    // the consuming step's TOP (vertical), distinct from the left→right `needs`
+    // connectors.
     for (const s of props.steps) {
       const to = nodes.get(s.id);
       if (!to) continue;
@@ -157,6 +171,7 @@ export default function Dag(props: {
           y2: tb.top - cbox.top + container.scrollTop,
           hot: false,
           dashed: true,
+          vertical: true,
         });
       }
     }
@@ -224,28 +239,46 @@ export default function Dag(props: {
       <svg class="dag-edges" aria-hidden="true">
         <For each={edges()}>
           {(e) => {
-            // Orthogonal "circuit" routing, top-to-bottom: out the bottom, a mid
-            // horizontal, into the top — the engineering-blueprint identity.
-            const my = (e.y1 + e.y2) / 2;
             const r = 8;
-            const dir = e.x2 >= e.x1 ? 1 : -1;
-            const d =
-              Math.abs(e.x2 - e.x1) < 2
-                ? `M ${e.x1} ${e.y1} V ${e.y2}`
-                : `M ${e.x1} ${e.y1} V ${my - r} Q ${e.x1} ${my} ${e.x1 + r * dir} ${my} ` +
-                  `H ${e.x2 - r * dir} Q ${e.x2} ${my} ${e.x2} ${my + r} V ${e.y2}`;
+            let d: string;
+            if (e.vertical) {
+              // Vertical-first "circuit" (the `uses` drop from the top services
+              // lane): out the bottom, a mid HORIZONTAL jog, into the top.
+              const my = (e.y1 + e.y2) / 2;
+              const dir = e.x2 >= e.x1 ? 1 : -1;
+              d =
+                Math.abs(e.x2 - e.x1) < 2
+                  ? `M ${e.x1} ${e.y1} V ${e.y2}`
+                  : `M ${e.x1} ${e.y1} V ${my - r} Q ${e.x1} ${my} ${e.x1 + r * dir} ${my} ` +
+                    `H ${e.x2 - r * dir} Q ${e.x2} ${my} ${e.x2} ${my + r} V ${e.y2}`;
+            } else {
+              // Horizontal-first "circuit" (the left→right `needs` flow): out the
+              // right, a mid VERTICAL jog, into the left — the engineering-
+              // blueprint identity, re-oriented so depth runs along the wide axis.
+              const mx = (e.x1 + e.x2) / 2;
+              const dir = e.y2 >= e.y1 ? 1 : -1;
+              d =
+                Math.abs(e.y2 - e.y1) < 2
+                  ? `M ${e.x1} ${e.y1} H ${e.x2}`
+                  : `M ${e.x1} ${e.y1} H ${mx - r} Q ${mx} ${e.y1} ${mx} ${e.y1 + r * dir} ` +
+                    `V ${e.y2 - r * dir} Q ${mx} ${e.y2} ${mx + r} ${e.y2} H ${e.x2}`;
+            }
             return (
               <path d={d} class={e.dashed ? "dashed" : e.hot ? "hot" : ""} fill="none" />
             );
           }}
         </For>
       </svg>
-      <div class="dag-cols">
+      {/* The graph body: the services lane as a horizontal band on TOP, then the
+          dependency layers flowing left→right below it. `.dag-cols` is now a ROW
+          of depth layers and each `.dag-col` stacks its siblings vertically; the
+          column wrapper keeps the lane spanning the width above that flow. */}
+      <div class="dag-graph">
         {/* Services lane (ADR-0058): shared services are PEERS, not steps — a
             band at the top, above dependency layer 0, with dotted `uses` edges
-            fanning down to each consuming step. They carry no `needs` depth, so
-            the lane holds them all. Registered in `nodes` (keyed `service:<name>`)
-            so `measure()` can route edges to them. */}
+            dropping to each consuming step. They carry no `needs` depth, so the
+            lane holds them all. Registered in `nodes` (keyed `service:<name>`) so
+            `measure()` can route edges to them. */}
         <Show when={(props.services?.length ?? 0) > 0}>
           <div class="dag-lane">
             <span class="dag-lane-label">services</span>
@@ -276,6 +309,7 @@ export default function Dag(props: {
             </div>
           </div>
         </Show>
+        <div class="dag-cols">
         <For each={layers()}>
           {(col) => (
             <div class="dag-col">
@@ -353,6 +387,7 @@ export default function Dag(props: {
             </div>
           )}
         </For>
+        </div>
       </div>
     </div>
   );
