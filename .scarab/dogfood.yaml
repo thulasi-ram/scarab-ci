@@ -118,14 +118,12 @@ steps:
     # alpine is USER root, so opt into the self-service run-as-root grant (like
     # lint/test above) — without it the kubelet refuses the container under the
     # non-root baseline (CreateContainerConfigError). Base alpine ships no git,
-    # so install it before `git describe`.
-    #
-    # The clone step writes /workspace as its own (non-root) uid, but this step
-    # runs as root — so git refuses the differently-owned worktree with "detected
-    # dubious ownership". Whitelist it before any git command runs.
+    # so install it before `git describe`. (No `safe.directory` dance needed even
+    # though this step runs as a different uid than the clone: the executor marks
+    # the provisioned workspace git-trusted for every step.)
     security:
       run_as_root: true
-    command: [sh, -c, "apk add --no-cache git && git config --global --add safe.directory /workspace && git describe --tags --always > /scarab/results/tag"]
+    command: [sh, -c, "apk add --no-cache git && git describe --tags --always > /scarab/results/tag"]
 
   # --- build step (ADR-0018): rootless BuildKit image build -----------------
   # + placement_profiles + resources (ADR-0055). The author names no

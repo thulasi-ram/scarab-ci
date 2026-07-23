@@ -1610,6 +1610,28 @@ pub fn build_pod(
             value: Some(ARTIFACTS_MOUNT_PATH.to_string()),
             value_from: None,
         });
+        // The clone step provisions `/workspace` as its own (non-root) uid, but
+        // downstream steps run as whatever uid their image/grant dictates — often
+        // a different one. Since git 2.35.2 (CVE-2022-24765) git refuses a repo
+        // whose worktree is owned by another uid ("detected dubious ownership"),
+        // which would make every git command in a consuming step fail unless the
+        // author remembered a `safe.directory` incantation. The workspace is
+        // executor-provisioned and the Pod is single-tenant and ephemeral, so the
+        // shared-machine threat that check guards against doesn't apply here —
+        // mark it trusted for the whole container via git's env-based config
+        // (no gitconfig file, no HOME dependency). `*` covers nested paths like
+        // submodules, which each get their own ownership check.
+        for (k, v) in [
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "safe.directory"),
+            ("GIT_CONFIG_VALUE_0", "*"),
+        ] {
+            env.push(EnvVar {
+                name: k.to_string(),
+                value: Some(v.to_string()),
+                value_from: None,
+            });
+        }
     }
 
     let mut step_mounts: Vec<VolumeMount> = Vec::new();
@@ -3994,6 +4016,47 @@ mod tests {
             DEFAULT_CLONE_IMAGE,
         );
         assert!(pod.spec.as_ref().unwrap().volumes.is_none());
+    }
+
+    #[test]
+    fn workspace_pods_trust_the_provisioned_workspace_for_git() {
+        // The clone step provisions /workspace as a different uid than most
+        // consuming steps; git would refuse it ("dubious ownership"). The
+        // executor marks it trusted via env-based git config so no pipeline
+        // author has to — present iff the workspace flow is on.
+        let step = step_with_attempt("run-1", "version", "a1");
+        let env_of = |workspace: bool| {
+            build_pod(
+                "scarab-x",
+                "ns",
+                &step,
+                &busybox(),
+                None,
+                DEFAULT_STEP_TIMEOUT_SECS,
+                workspace,
+                DEFAULT_CLONE_IMAGE,
+            )
+            .spec
+            .unwrap()
+            .containers[0]
+            .env
+            .clone()
+            .unwrap_or_default()
+        };
+        let val = |env: &[EnvVar], k: &str| {
+            env.iter()
+                .find(|e| e.name == k)
+                .and_then(|e| e.value.clone())
+        };
+
+        let on = env_of(true);
+        assert_eq!(val(&on, "GIT_CONFIG_COUNT").as_deref(), Some("1"));
+        assert_eq!(val(&on, "GIT_CONFIG_KEY_0").as_deref(), Some("safe.directory"));
+        assert_eq!(val(&on, "GIT_CONFIG_VALUE_0").as_deref(), Some("*"));
+
+        // No workspace flow => don't inject it.
+        let off = env_of(false);
+        assert!(val(&off, "GIT_CONFIG_COUNT").is_none());
     }
 
     #[test]
