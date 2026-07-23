@@ -34,6 +34,7 @@ import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 import Dag, { type DagStep, type DagTry } from "../components/Dag";
+import VersionRail, { type VersionRow, type OutcomeCounts } from "../components/VersionRail";
 import ServicesPanel from "../components/ServicesPanel";
 import StepPane from "../components/StepPane";
 import DebugShell from "../components/DebugShell";
@@ -68,12 +69,10 @@ export default function RunDetail() {
   const [cancelling, setCancelling] = createSignal(false);
   const [shellOpen, setShellOpen] = createSignal(false);
   // The viewed Take (1-based), or null = latest. Only a CLOSED take is a
-  // time-travel view; selecting the latest take clears back to live.
+  // time-travel view; selecting the latest take clears back to live. Driven by
+  // the always-present VersionRail (ADR-0056 amendment): a persistent left rail,
+  // a row per Rerun, replacing the former header dropdown (redesign stage 2).
   const [viewTake, setViewTake] = createSignal<number | null>(null);
-  // The version dropdown (ADR-0056 amendment): the run-history control, always
-  // present on the Pipeline component header — collapsed to "latest · live"
-  // when there's only one version, expanding into a row per Rerun.
-  const [histOpen, setHistOpen] = createSignal(false);
 
   const stepList = (): StepStatus[] => run()?.steps ?? [];
 
@@ -401,6 +400,61 @@ export default function RunDetail() {
     return v ? rowLabel(v) : "latest";
   };
 
+  // Map a step status into an outcome bucket for the rail's mini-summary. Only
+  // the five named statuses get their own accent; everything else (pending,
+  // skipped, ready, waiting, cancelled, …) falls to `other`.
+  const bucketOf = (status: string): keyof OutcomeCounts => {
+    switch (status) {
+      case "succeeded":
+        return "succeeded";
+      case "failed":
+        return "failed";
+      case "superseded":
+        return "superseded";
+      case "not_run":
+        return "notRun";
+      case "running":
+        return "running";
+      default:
+        return "other";
+    }
+  };
+  const tally = (statuses: string[]): OutcomeCounts => {
+    const c: OutcomeCounts = {
+      succeeded: 0,
+      failed: 0,
+      superseded: 0,
+      notRun: 0,
+      running: 0,
+      other: 0,
+    };
+    for (const s of statuses) c[bucketOf(s)] += 1;
+    return c;
+  };
+  // The version rail's rows (ADR-0056 amendment): one per Take, newest-first in
+  // the rail. The latest/open Take tallies live `run().steps[].status`; a closed
+  // Take tallies its snapshot-at-boundary replay. Takes are few — re-replaying
+  // per closed row each render is cheap. Reuses the dropdown's label/sub helpers.
+  const versions = (): VersionRow[] => {
+    const ts = takes();
+    const latest = latestTakeN();
+    const selN = viewTake() ?? latest;
+    return ts.map((t) => {
+      const isLatest = t.n === latest;
+      const statuses = isLatest
+        ? stepList().map((s) => s.status)
+        : Object.values(replayTake(events(), ts, t).status);
+      return {
+        n: t.n,
+        label: isLatest ? "latest" : rowLabel(t),
+        sub: rowSub(t),
+        summary: tally(statuses),
+        isLatest,
+        isSelected: selN === t.n,
+      };
+    });
+  };
+
   return (
     <section class="page">
       <Doodle icon="container" size={230} rotate={14} opacity={0.16} top="52px" right="48px" />
@@ -641,11 +695,18 @@ export default function RunDetail() {
             </div>
 
             {/* Pipeline component (ADR-0056 amendment): DAG + the selected
-                step's evidence + a version-aware Artifacts footer, under ONE
-                header carrying the always-present version dropdown. Zoom out =
-                which whole-run version (the dropdown); zoom in = which try of a
-                step (the strip inside StepPane). An older version turns the
-                whole component read-only. */}
+                step's evidence + a version-aware Artifacts footer, beside the
+                always-present VersionRail (redesign stage 2). Zoom out = which
+                whole-run version (the rail); zoom in = which try of a step (the
+                strip inside StepPane). An older version turns the whole
+                component read-only. On narrow viewports the rail collapses to a
+                horizontal strip above the panel (see .pipeline-with-rail). */}
+            <div class="pipeline-with-rail">
+              <VersionRail
+                rows={versions()}
+                live={live() && !timeTraveling()}
+                onSelect={(n) => setViewTake(n)}
+              />
             <div class="panel pipeline-panel" classList={{ readonly: timeTraveling() }}>
               <div class="panel-h">
                 <span>Pipeline</span>
@@ -654,60 +715,19 @@ export default function RunDetail() {
                   {!timeTraveling() && runningCount() ? ` · ${runningCount()} running` : ""}
                 </span>
                 <span class="grow1" />
-                {/* Version dropdown — always present. Collapsed label = the
-                    current version; open, it lists a row per Rerun. */}
-                <div class="verdrop" classList={{ open: histOpen() }}>
-                  <button
-                    class="verdrop-btn"
-                    classList={{ traveling: timeTraveling() }}
-                    onClick={() => setHistOpen((v) => !v)}
-                    title="run history — a row per rerun"
-                  >
-                    <Icon icon="history" size={16} />
-                    <span class="vd-label">{timeTraveling() ? `👁 ${viewedLabel()}` : "latest"}</span>
-                    <Show when={live() && !timeTraveling()}>
-                      <span class="vd-live">· live</span>
-                    </Show>
-                    <Icon icon="chevron-down" size={16} class="vd-caret" />
-                  </button>
-                  <Show when={histOpen()}>
-                    <div class="verdrop-backdrop" onClick={() => setHistOpen(false)} />
-                    <ul class="verdrop-list">
-                      <For each={[...takes()].reverse()}>
-                        {(t) => {
-                          const isSel = () => (viewTake() ?? latestTakeN()) === t.n;
-                          const isLatest = () => t.n === latestTakeN();
-                          return (
-                            <li>
-                              <button
-                                class="verdrop-row"
-                                classList={{ sel: isSel() }}
-                                onClick={() => {
-                                  setViewTake(isLatest() ? null : t.n);
-                                  setHistOpen(false);
-                                }}
-                              >
-                                <span class="vr-dot">{isSel() ? "●" : "○"}</span>
-                                <span class="vr-main">
-                                  <span class="vr-label">
-                                    {isLatest() ? "latest" : rowLabel(t)}
-                                  </span>
-                                  <Show when={rowSub(t)}>
-                                    <span class="vr-sub">{rowSub(t)}</span>
-                                  </Show>
-                                </span>
-                                <Show when={isLatest() && live()}>
-                                  <span class="vr-live">live</span>
-                                </Show>
-                              </button>
-                            </li>
-                          );
-                        }}
-                      </For>
-                    </ul>
-                  </Show>
-                </div>
               </div>
+              {/* Read-only banner (redesign stage 2): while viewing an older
+                  version the whole component is a snapshot-at-boundary — say so
+                  explicitly, now that the dropdown's "👁" label is gone. */}
+              <Show when={timeTraveling()}>
+                <div class="readonly-banner">
+                  <span class="rb-eye">👁</span>
+                  <span>
+                    Viewing <b>{viewedLabel()}</b> — read-only
+                    <span class="rb-hint"> · return to latest to act</span>
+                  </span>
+                </div>
+              </Show>
 
               <div class="rd-grid">
                 <div class="dag-wrap">
@@ -791,6 +811,7 @@ export default function RunDetail() {
                 </ul>
               </Show>
               </div>
+            </div>
             </div>
 
             <div class="panel activity-panel">

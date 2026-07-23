@@ -2408,52 +2408,103 @@ h1, .crumb-head, .run-title {
 /* The selected tab fills the leftover height and scrolls in place. */
 .pipeline-panel .steppane .tabpane { flex: 1; min-height: 0; overflow: auto; }
 
-/* Read-only (an older version): no banner, no edge, no shadow — a faint wash +
-   gently desaturated body. The "👁 …" dropdown label carries the state. */
+/* Read-only (an older version): no edge, no shadow — a faint wash + gently
+   desaturated body. The `.readonly-banner` below the header names the state
+   (the "👁 …" dropdown label that used to carry it is gone). */
 .pipeline-panel.readonly { background: color-mix(in srgb, var(--emerald) 4%, transparent); }
 .pipeline-panel.readonly .rd-grid { filter: saturate(0.72); opacity: 0.9; }
 
-/* The version dropdown — a row per Rerun. Green-tinted to match the panel; its
-   height and the list rows align with the header's controls. */
-.verdrop { position: relative; }
-.verdrop-btn {
-  display: inline-flex; align-items: center; gap: 8px; cursor: pointer; height: 34px;
-  font-family: var(--font-mono); font-size: 13.5px; color: var(--sage);
-  background: var(--emerald-surface); border: 1px solid var(--border);
-  border-radius: var(--radius-sm); padding: 0 13px;
+/* Read-only banner (redesign stage 2): a full-width strip under the panel header
+   while time-travelling — copper-washed so it reads as a caution, not chrome. */
+.readonly-banner {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--copper) 12%, var(--emerald-surface));
+  font-family: var(--font-mono); font-size: 12px; color: var(--sage);
 }
-.verdrop-btn:hover { border-color: var(--emerald); color: var(--soft-white); }
-.verdrop-btn.traveling { color: var(--emerald); border-color: var(--emerald); font-style: italic; }
-.verdrop-btn .vd-live { color: var(--emerald); }
-.verdrop-btn .vd-caret { opacity: 0.7; }
-.verdrop.open .vd-caret { transform: rotate(180deg); }
-.verdrop-backdrop { position: fixed; inset: 0; z-index: 30; }
-.verdrop-list {
-  position: absolute; right: 0; top: calc(100% + 6px); z-index: 31;
-  min-width: 328px; margin: 0; padding: 6px; list-style: none;
-  background: var(--pine-deep); border: 1px solid var(--border);
-  border-radius: var(--radius); box-shadow: 0 8px 30px rgba(0, 0, 0, 0.28);
+.readonly-banner .rb-eye { font-size: 13px; line-height: 1; }
+.readonly-banner b { color: var(--soft-white); font-weight: 600; }
+.readonly-banner .rb-hint { color: var(--muted-sage); }
+
+/* ── Version rail (redesign stage 2) — the run-history control, a persistent
+   left column beside the Pipeline component (replaces the header dropdown). This
+   is PAGE chrome (not the dark DAG canvas), so it reads the page/theme tokens;
+   the tokens re-point per theme, so both light + dark are covered. ──────────── */
+.pipeline-with-rail { display: flex; gap: 16px; align-items: stretch; margin-bottom: 16px; }
+.pipeline-with-rail > .pipeline-panel { flex: 1; min-width: 0; margin-bottom: 0; }
+
+.version-rail {
+  flex: 0 0 220px; display: flex; flex-direction: column; overflow: hidden;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--emerald-surface);
 }
-/* Line items (versions AND tries): grouped label + sub, no side border — the
-   dot + a soft fill carry selection. */
-.verdrop-row {
-  display: flex; align-items: center; gap: 11px; width: 100%; cursor: pointer;
-  font-family: var(--font-mono); font-size: 13px; color: var(--sage);
-  background: transparent; border: none;
-  border-radius: var(--radius-sm); padding: 10px 13px; text-align: left;
+.vr-head {
+  padding: 10px 14px; background: var(--pine-deep); border-bottom: 1px solid var(--border);
+  font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1.2px; color: var(--muted-sage);
 }
-.verdrop-row:hover { background: var(--emerald-surface); color: var(--soft-white); }
-.verdrop-row.sel { color: var(--soft-white); background: var(--emerald-surface); }
-.verdrop-row .vr-dot { color: var(--emerald); font-size: 10px; line-height: 1; }
-.verdrop-row.sel .vr-dot { color: var(--emerald-bright); }
-.verdrop-row .vr-main { flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.verdrop-row .vr-sub { color: var(--muted-sage); font-size: 11px; }
-.verdrop-row .vr-live { color: var(--emerald); font-size: 11px; }
-.verdrop-row .vr-tag {
-  font-size: 9px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted-sage);
-  border: 1px solid var(--border); border-radius: 20px; padding: 1px 6px;
+.vr-list {
+  list-style: none; margin: 0; padding: 6px;
+  display: flex; flex-direction: column; gap: 4px; overflow-y: auto;
 }
-.verdrop-row .areadopt { color: var(--copper); font-size: 12px; }
+/* A row: a slim selection pip down the left edge + a stacked body
+   (label · sub · outcome chips). No dot glyph — the pip + fill carry selection. */
+.vr-row {
+  display: flex; align-items: stretch; gap: 10px; width: 100%; cursor: pointer; text-align: left;
+  background: transparent; border: 1px solid transparent; border-radius: var(--radius-sm);
+  padding: 9px 10px; color: var(--sage); font-family: var(--font-ui);
+  transition: background 0.12s var(--ease-out), border-color 0.12s var(--ease-out);
+}
+.vr-row:hover { background: var(--emerald-surface); border-color: var(--border); color: var(--soft-white); }
+.vr-row.sel {
+  background: color-mix(in srgb, var(--emerald) 10%, transparent);
+  border-color: var(--emerald); color: var(--soft-white);
+}
+.vr-pip { flex: 0 0 3px; border-radius: 2px; background: transparent; }
+.vr-row.sel .vr-pip { background: var(--emerald); }
+.vr-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.vr-top { display: flex; align-items: center; gap: 8px; }
+.vr-label {
+  font-size: 13px; font-weight: 600; color: inherit;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.vr-live {
+  margin-left: auto; flex: none; display: inline-flex; align-items: center; gap: 5px;
+  font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.8px;
+  color: var(--running);
+}
+.vr-live .dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--running);
+  box-shadow: 0 0 0 1px var(--border-copper); animation: pulse 1.4s ease-in-out infinite;
+}
+.vr-sub {
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--muted-sage);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Outcome mini-summary: one colored count chip per non-empty status bucket,
+   using the shared status accent tokens. */
+.vr-sum { display: flex; flex-wrap: wrap; gap: 5px 7px; }
+.vr-chip {
+  display: inline-flex; align-items: center; gap: 2px;
+  font-family: var(--font-mono); font-size: 11px; line-height: 1; color: var(--muted-sage);
+}
+.vr-chip .vr-glyph { font-size: 10.5px; }
+.vr-chip.ok { color: var(--ok); }
+.vr-chip.danger { color: var(--danger); }
+.vr-chip.running { color: var(--running); }
+.vr-chip.copper { color: var(--copper); }
+.vr-chip.sage,
+.vr-chip.other { color: var(--muted-sage); }
+
+/* Narrow viewports: the rail drops below the header row of the two-column body
+   and becomes a full-width horizontal strip above the Pipeline component (its
+   rows scroll sideways). Sits just above the DAG/Logs reflow at 860px. */
+@media (max-width: 1075px) {
+  .pipeline-with-rail { flex-direction: column; }
+  .version-rail { flex: 0 0 auto; }
+  .version-rail .vr-list { flex-direction: row; overflow-x: auto; overflow-y: hidden; }
+  .version-rail .vr-row { flex: 0 0 auto; min-width: 190px; }
+}
 
 /* Status moved into the top metadata bar (was on the breadcrumb). */
 .prov-status { display: inline-flex; align-items: center; gap: 10px; }
