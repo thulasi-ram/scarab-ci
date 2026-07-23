@@ -157,7 +157,10 @@ export default function RunDetail() {
       // Reused (ADR-0056 amendment): while time-traveling, a step with a known
       // (carried-forward) status but ZERO attempts in THIS Take wasn't part of
       // this rerun — render it muted, not as if it re-ran here.
-      const reused = !!tv && !!tv.status[s.id] && (tv.attempts[s.id] ?? 0) === 0;
+      const reused =
+        !!tv &&
+        (tv.attempts[s.id] ?? 0) === 0 &&
+        ["succeeded", "failed", "skipped"].includes(tv.status[s.id] ?? "");
       return {
         id: s.id,
         status: tv ? (tv.status[s.id] ?? "pending") : s.status,

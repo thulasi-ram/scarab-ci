@@ -4,8 +4,8 @@
 // view is a pure replay of the log up to its closing boundary, so a closed
 // Take shows the run exactly as it stood the instant Rerun was pressed
 // (snapshot-at-boundary). An attempt that straddles a boundary — started in
-// Take N, finished later — honestly shows as running in Take N, with a
-// "finished in Take M" affordance from `finishedInTake`.
+// Take N, still in flight when Rerun was pressed — shows as `superseded` when
+// that Rerun re-armed its step (it was cut short), else honestly as `running`.
 import type { RunEvent } from "./api/client";
 
 /** The tag + payload of a structured event, or null for unit variants. */
@@ -71,10 +71,6 @@ export type TakeView = {
    * exact set the tries strip renders (so a carried-forward step shows none,
    * and a re-run step shows only THIS Take's tries, numbered per-Take). */
   windowAttempts: Record<string, string[]>;
-  /** Steps that were mid-flight at the boundary, mapped to the take number in
-   * which their straddling attempt finished (the "finished in Take M →"
-   * affordance), or 0 if it never finished. */
-  finishedInTake: Record<string, number>;
 };
 
 /** Replay the event log up to `take`'s boundary. Pure function of the log —
@@ -123,25 +119,46 @@ export function replayTake(events: RunEvent[], takes: Take[], take: Take): TakeV
     }
   }
 
-  // Straddling attempts: still in flight at the boundary. Find the take in
-  // which each one's AttemptFinished eventually landed.
-  const finishedInTake: Record<string, number> = {};
-  for (const [step, attempt] of inFlight) {
-    finishedInTake[step] = 0;
-    for (let i = take.endIdx; i < events.length; i++) {
-      const k = kindOf(events[i]);
-      if (
-        k?.tag === "AttemptFinished" &&
-        (k.v.step as string) === step &&
-        String(k.v.attempt ?? "") === attempt
-      ) {
-        finishedInTake[step] = takes.find((t) => i < t.endIdx)?.n ?? takes.length;
-        break;
+  // Closed take: the boundary event that closed it (a RunRerunRequested) re-arms
+  // some steps for the NEXT take. From THIS take's snapshot: a re-armed step that
+  // was still in flight was cut short → `superseded`; a re-armed step that never
+  // ran in this window (and carries no succeeded/failed verdict) simply never ran
+  // → `not_run`; a re-armed step it DID run keeps its verdict. An in-flight step
+  // NOT re-armed genuinely straddles the boundary and stays `running`. On
+  // pre-amendment logs (no `invalidated`/`target`) skip this → today's behavior.
+  if (take.endIdx < events.length) {
+    const bk = kindOf(events[take.endIdx]);
+    const target = bk?.v.target as string | undefined;
+    const invalidated = bk?.v.invalidated as string[] | undefined;
+    if (typeof target === "string" && Array.isArray(invalidated)) {
+      const rearmed = new Set<string>([target, ...invalidated]);
+      for (const step of rearmed) {
+        if (inFlight.has(step)) status[step] = "superseded";
+        else if ((attempts[step] ?? 0) === 0 && !["succeeded", "failed"].includes(status[step] ?? ""))
+          status[step] = "not_run";
+        // else: keep the step's carried verdict.
       }
     }
   }
 
-  return { status, frontier, attempts, windowAttempts, finishedInTake };
+  return { status, frontier, attempts, windowAttempts };
+}
+
+/** The "of-record" attempt id for a step from its ordered attempt list: the one
+ * whose Outputs/Artifacts a consumer should see. Prefers the LAST succeeded
+ * attempt; failing that, the last attempt with a real verdict (not superseded /
+ * running / cancelled); null when nothing is worth showing of-record. */
+export function ofRecordAttemptId(
+  list: { id: string; outcome: string; failed: boolean }[],
+): string | null {
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i].outcome === "succeeded") return list[i].id;
+  }
+  for (let i = list.length - 1; i >= 0; i--) {
+    const a = list[i];
+    if (!a.failed && !["superseded", "running", "cancelled"].includes(a.outcome)) return a.id;
+  }
+  return null;
 }
 
 /** Why one try (Attempt) of a step exists (ADR-0056 amendment):
