@@ -37,8 +37,8 @@ import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 import Dag, { type DagStep, type DagService } from "../components/Dag";
 import VersionRail, { type VersionRow, type OutcomeCounts } from "../components/VersionRail";
-import ServicesPanel from "../components/ServicesPanel";
 import StepPane from "../components/StepPane";
+import ServicePane from "../components/ServicePane";
 import { type FilmstripTry } from "../components/AttemptsDropdown";
 import DebugShell from "../components/DebugShell";
 import TriggerCell from "../components/TriggerCell";
@@ -117,6 +117,17 @@ export default function RunDetail() {
   const visibleEvents = () => {
     const t = viewing();
     return t ? events().slice(0, t.endIdx) : events();
+  };
+
+  // Selection id space (ADR-0058): a step is `"<stepId>"`; a shared service is
+  // `"service:<name>"`. A service selection routes to ServicePane, not StepPane,
+  // and disables the step-only mutations (rerun/retry/debug).
+  const SERVICE_PREFIX = "service:";
+  const isServiceSel = () => sel()?.startsWith(SERVICE_PREFIX) ?? false;
+  const selectedService = (): DagService | null => {
+    if (!isServiceSel()) return null;
+    const name = sel()!.slice(SERVICE_PREFIX.length);
+    return dagServices().find((s) => s.name === name) ?? { name, status: "pending" };
   };
 
   const selectedStep = () => stepList().find((s) => s.id === sel()) ?? null;
@@ -553,11 +564,12 @@ export default function RunDetail() {
               </Show>
               <button
                 class="btn btn-ghost btn-sm"
-                onClick={() => sel() && onRerun(sel()!)}
+                onClick={() => sel() && !isServiceSel() && onRerun(sel()!)}
                 disabled={
                   rerunning() !== null ||
                   retrying() !== null ||
                   !sel() ||
+                  isServiceSel() ||
                   timeTraveling() ||
                   !!prereqBlocker(sel())
                 }
@@ -566,9 +578,11 @@ export default function RunDetail() {
                     ? "read-only — back to latest to rerun"
                     : !sel()
                       ? "select a step"
-                      : prereqBlocker(sel())
-                        ? `blocked — prerequisite ${prereqBlocker(sel())} failed; rerun that first`
-                        : `rerun ${sel()} and everything downstream — forks a new version`
+                      : isServiceSel()
+                        ? "a shared service isn't a step — select a step to rerun"
+                        : prereqBlocker(sel())
+                          ? `blocked — prerequisite ${prereqBlocker(sel())} failed; rerun that first`
+                          : `rerun ${sel()} and everything downstream — forks a new version`
                 }
               >
                 <Icon icon="rotate-ccw" size={13} />{" "}
@@ -789,6 +803,11 @@ export default function RunDetail() {
               <div class="rd-grid">
                 <div class="dag-wrap">
                   <div class="dag-head">Steps</div>
+                  {/* Shared services + sidecars now live AS NODES in the graph
+                      (ADR-0058): shared services as copper peers in a lane at the
+                      top with dotted `uses` edges; a step's own sidecars as docked
+                      chips on its node. Selecting a service opens ServicePane
+                      below; the retired beside-DAG ServicesPanel is gone. */}
                   <Dag
                     steps={dagSteps()}
                     services={dagServices()}
@@ -797,28 +816,32 @@ export default function RunDetail() {
                     onSelectSidecar={selectSidecar}
                     sidecarFocus={focusSidecar()}
                   />
-                  {/* Shared services (ADR-0058) live BESIDE the DAG, never as
-                      nodes in it — a compact evidence section beneath the graph
-                      in the same left column. Renders nothing when there are
-                      none (the common case). */}
-                  <ServicesPanel runId={id()} live={live() && !timeTraveling()} />
                 </div>
 
-                <StepPane
-                runId={id()}
-                step={selectedStep()}
-                events={visibleEvents()}
-                attempt={selAttempt()}
-                tries={stripTries()}
-                activeAttempt={stripActiveAttempt()}
-                onAttemptSelect={setSelAttempt}
-                versionLabel={viewedLabel()}
-                frontierAttempt={sel() ? takeView()?.frontier[sel()!] ?? null : null}
-                deadLettered={r().status === "dead_lettered"}
-                canDebug={canShell()}
-                onDebugPod={() => setShellOpen(true)}
-                focusSidecar={focusSidecar()}
-              />
+                {/* A shared-service node opens ServicePane (readiness + logs);
+                    every other selection is a step → StepPane (ADR-0058). */}
+                <Show
+                  when={isServiceSel()}
+                  fallback={
+                    <StepPane
+                      runId={id()}
+                      step={selectedStep()}
+                      events={visibleEvents()}
+                      attempt={selAttempt()}
+                      tries={stripTries()}
+                      activeAttempt={stripActiveAttempt()}
+                      onAttemptSelect={setSelAttempt}
+                      versionLabel={viewedLabel()}
+                      frontierAttempt={sel() ? takeView()?.frontier[sel()!] ?? null : null}
+                      deadLettered={r().status === "dead_lettered"}
+                      canDebug={canShell()}
+                      onDebugPod={() => setShellOpen(true)}
+                      focusSidecar={focusSidecar()}
+                    />
+                  }
+                >
+                  <ServicePane runId={id()} service={selectedService()!} />
+                </Show>
             </div>
 
               {/* Artifacts — run-level files of record, immutable per try
