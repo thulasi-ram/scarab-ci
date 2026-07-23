@@ -16,7 +16,9 @@ import solid from "vite-plugin-solid";
 // which is why the throw is scoped to `serve`.
 export default defineConfig(({ command }) => {
   let proxy;
-  if (command === "serve") {
+  // Fixture/demo mode (`just ui-mock`): with VITE_SCARAB_MOCK=1 the app serves
+  // its own fixtures, so no server/proxy/API URL is needed — skip the guard.
+  if (command === "serve" && process.env.VITE_SCARAB_MOCK !== "1") {
     const apiTarget = process.env.SCARAB_API_URL;
     if (!apiTarget) {
       throw new Error(
