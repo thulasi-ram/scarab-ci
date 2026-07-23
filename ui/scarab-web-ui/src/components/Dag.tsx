@@ -210,6 +210,15 @@ export default function Dag(props: {
   const svcMeta = (sv: DagService): string =>
     sv.ports?.length ? `port ${sv.ports.join(", ")} · ${sv.status}` : sv.status;
 
+  // A sidecar chip's short label: drop the registry/repo path and the `:tag`.
+  // `redis:7.4` → `redis`; `ghcr.io/org/cache:1` → `cache`.
+  const shortImage = (image: string): string => {
+    const lastSlash = image.lastIndexOf("/");
+    const seg = lastSlash >= 0 ? image.slice(lastSlash + 1) : image;
+    const colon = seg.indexOf(":");
+    return colon >= 0 ? seg.slice(0, colon) : seg;
+  };
+
   return (
     <div class="dag" ref={container}>
       <svg class="dag-edges" aria-hidden="true">
@@ -297,6 +306,45 @@ export default function Dag(props: {
                       </Show>
                       <Show when={s.status === "running"}>
                         <span class="dnode-prog" />
+                      </Show>
+                      {/* Docked SIDECARS (ADR-0058): each of the step's own
+                          `services:` as a small copper chip INSIDE the node —
+                          honest to Pod containment (they die with the step), so
+                          never a floated peer with an edge. A chip is its own
+                          clickable target (stopPropagation, so it doesn't just
+                          select the step); a `<span role=button>` because it
+                          nests inside the step's own `<button>`. */}
+                      <Show when={s.services && s.services.length > 0}>
+                        <span class="dnode-sidecars">
+                          <For each={s.services}>
+                            {(svc) => {
+                              const scSel = () =>
+                                props.selected === s.id && props.sidecarFocus === svc.index;
+                              const pick = (e: Event) => {
+                                e.stopPropagation();
+                                props.onSelectSidecar?.(s.id, svc.index);
+                              };
+                              return (
+                                <span
+                                  class={`dnode-sidecar ${scSel() ? "sel" : ""}`}
+                                  role="button"
+                                  tabindex="0"
+                                  title={`sidecar · ${svc.image} (service-${svc.index}) — logs inside ${s.id}`}
+                                  onClick={pick}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter" || e.key === " ") {
+                                      e.preventDefault();
+                                      pick(e);
+                                    }
+                                  }}
+                                >
+                                  <span class="sc-hex">⬡</span>
+                                  <span class="sc-name">{shortImage(svc.image)}</span>
+                                </span>
+                              );
+                            }}
+                          </For>
+                        </span>
                       </Show>
                     </button>
                   );

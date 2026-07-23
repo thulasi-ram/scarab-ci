@@ -14,6 +14,7 @@ import {
   listWorkspace,
   workspaceFileUrl,
   streamStepLogs,
+  streamStepSidecarLogs,
   type StepStatus,
   type Attempt,
 } from "../api/client";
@@ -71,11 +72,28 @@ export default function StepPane(props: {
    * attempt's immutable bytes). Absent/`canDebug:false` ⇒ the affordance hides. */
   onDebugPod?: () => void;
   canDebug?: boolean;
+  /** A sidecar container index to focus in the Logs tab on selection (ADR-0058)
+   * — set when the user clicked this step's docked sidecar chip in the DAG.
+   * `null`/absent = the step's main container. */
+  focusSidecar?: number | null;
 }) {
   const [tab, setTab] = createSignal<Tab>("logs");
   const [wsPath, setWsPath] = createSignal("");
   const [openFile, setOpenFile] = createSignal<string | null>(null);
   const [wrap, setWrap] = createSignal(true);
+  // Which container's logs the Logs tab shows: `null` = the step's main
+  // container (default); a number = the sidecar at that `services:` index
+  // (ADR-0058). Reset per selection from `focusSidecar` below.
+  const [container, setContainer] = createSignal<number | null>(null);
+
+  // A sidecar chip's short label, matching the DAG chip: `redis:7.4` → `redis`.
+  const shortImage = (image: string): string => {
+    const lastSlash = image.lastIndexOf("/");
+    const seg = lastSlash >= 0 ? image.slice(lastSlash + 1) : image;
+    const colon = seg.indexOf(":");
+    return colon >= 0 ? seg.slice(0, colon) : seg;
+  };
+  const sidecars = () => props.step?.services ?? [];
 
   const stepId = () => props.step?.id ?? null;
   const attemptN = (id: string) => parseInt(id.replace(/^a/, ""), 10) || 0;
@@ -124,6 +142,18 @@ export default function StepPane(props: {
     setOpenFile(null);
   });
 
+  // The Logs container follows the selection (ADR-0058): a clicked sidecar chip
+  // (`focusSidecar` set) opens that sidecar's container in the Logs tab; any
+  // other step selection resets to the main container. Tracks stepId so
+  // re-selecting a step returns to `step`, and focusSidecar so clicking a chip
+  // on the current step re-focuses it.
+  createEffect(() => {
+    void stepId();
+    const f = props.focusSidecar ?? null;
+    setContainer(f);
+    if (f != null) setTab("logs");
+  });
+
   // A brief "changed / loading" pulse whenever the scoped (step, try) or tab
   // moves. The evidence pane no longer repeats the step name or try in a header
   // (the graph shows both, and highlights the active try in the fan) — this
@@ -138,7 +168,7 @@ export default function StepPane(props: {
   // Tracking the reactive props objects directly made the log skeleton flicker
   // on every poll while a step was running.
   const selKey = createMemo(
-    () => `${stepId() ?? ""} ${scoped()?.id ?? ""} ${tab()}`,
+    () => `${stepId() ?? ""} ${scoped()?.id ?? ""} ${tab()} ${container() ?? "main"}`,
   );
   createEffect(
     on(selKey, () => {
@@ -153,20 +183,28 @@ export default function StepPane(props: {
   // buffer renders. Historical attempts replay and close; the live one tails. ---
   const [buffers, setBuffers] = createSignal<Record<string, string>>({});
   const streams = new Map<string, () => void>();
-  const logKey = (step: string, attempt: string) => `${step} ${attempt}`;
+  // Keyed by (step, attempt, container) — the container axis (main vs a sidecar
+  // index) keeps each container's tail in its own buffer/stream (ADR-0058).
+  const logKey = (step: string, attempt: string, c: number | null) =>
+    `${step} ${attempt} ${c ?? "main"}`;
 
   createEffect(() => {
     const s = stepId();
     const a = scoped();
+    const c = container();
     // A not-run step's `scoped()` may resolve to a stale attempt from a LATER
     // version — never stream it; the Logs tab shows the not-run line instead.
     if (!s || !a || notRun() || tab() !== "logs") return;
-    const key = logKey(s, a.id);
+    const key = logKey(s, a.id, c);
     if (streams.has(key)) return;
-    const close = streamStepLogs(props.runId, s, {
-      attempt: a.id,
-      onChunk: (t) => setBuffers((prev) => ({ ...prev, [key]: (prev[key] ?? "") + t + "\n" })),
-    });
+    const onChunk = (t: string) =>
+      setBuffers((prev) => ({ ...prev, [key]: (prev[key] ?? "") + t + "\n" }));
+    // Sidecar logs share the step's real attempt ids, so the attempt scoping is
+    // identical — only the endpoint (`?sidecar=<index>`) differs.
+    const close =
+      c == null
+        ? streamStepLogs(props.runId, s, { attempt: a.id, onChunk })
+        : streamStepSidecarLogs(props.runId, s, c, { attempt: a.id, onChunk });
     streams.set(key, close);
   });
   onCleanup(() => streams.forEach((close) => close()));
@@ -174,7 +212,7 @@ export default function StepPane(props: {
   const logText = () => {
     const s = stepId();
     const a = scoped();
-    return s && a ? (buffers()[logKey(s, a.id)] ?? "waiting for output…") : "";
+    return s && a ? (buffers()[logKey(s, a.id, container())] ?? "waiting for output…") : "";
   };
   const logRows = () => {
     const all = logText().split("\n");
@@ -358,6 +396,32 @@ export default function StepPane(props: {
               >
               <div class="tabpane logpane">
                 <div class="steplogs-tools">
+                  {/* Container selector (ADR-0058): when the step declares
+                      sidecars, choose whose logs the pane tails — the step's
+                      main container (default) or one sidecar. Same (step,
+                      attempt) scope; only the streamed container changes. */}
+                  <Show when={sidecars().length > 0}>
+                    <div class="logsrc-seg" role="group" aria-label="log source">
+                      <button
+                        class={`lseg ${container() == null ? "on" : ""}`}
+                        onClick={() => setContainer(null)}
+                        title="the step's main container"
+                      >
+                        step
+                      </button>
+                      <For each={sidecars()}>
+                        {(svc) => (
+                          <button
+                            class={`lseg ${container() === svc.index ? "on" : ""}`}
+                            onClick={() => setContainer(svc.index)}
+                            title={`${svc.image} · service-${svc.index}`}
+                          >
+                            {shortImage(svc.image)}
+                          </button>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
                   <span class="grow1" />
                   <button class={`lgtog ${wrap() ? "on" : ""}`} onClick={() => setWrap((v) => !v)}>
                     wrap

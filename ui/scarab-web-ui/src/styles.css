@@ -2139,6 +2139,23 @@ h1, .crumb-head, .run-title {
   border-radius: var(--radius-sm); padding: 4px 9px; cursor: pointer;
 }
 .lgtog.on { color: var(--running); border-color: color-mix(in srgb, var(--running) 50%, transparent); }
+/* Log-source selector (ADR-0058): a segmented control in the dark log-tools row
+   — step (main) | one segment per sidecar. Canvas/terminal tokens; the active
+   segment reads emerald, matching the selection language of the DAG nodes. */
+.logsrc-seg {
+  display: inline-flex; align-items: stretch; overflow: hidden;
+  border: 1px solid var(--terminal-line); border-radius: var(--radius-sm);
+}
+.lseg {
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .4px;
+  color: var(--muted-sage); background: transparent; border: none;
+  border-right: 1px solid var(--terminal-line);
+  padding: 4px 9px; cursor: pointer; max-width: 130px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lseg:last-child { border-right: none; }
+.lseg:hover { color: var(--terminal-ink); }
+.lseg.on { color: var(--emerald-bright); background: color-mix(in srgb, var(--emerald-bright) 12%, transparent); }
 .lgerr {
   display: inline-flex; align-items: center; gap: 5px; font-family: var(--font-mono); font-size: 11px;
   color: var(--danger); border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);

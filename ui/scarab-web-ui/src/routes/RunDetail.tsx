@@ -67,6 +67,24 @@ export default function RunDetail() {
   const [live, setLive] = createSignal(true);
   const [sel, setSel] = createSignal<string | null>(null);
   const [selAttempt, setSelAttempt] = createSignal<string | null>(null);
+  // A step's docked sidecar the user clicked (ADR-0058): its `services:` index,
+  // or null. Focuses that container in the StepPane Logs tab. Cleared whenever
+  // the selection moves to a node (a plain step/service click) or the version
+  // changes — so a stale sidecar focus never carries across.
+  const [focusSidecar, setFocusSidecar] = createSignal<number | null>(null);
+
+  // Selecting a node (step OR shared service) clears any sidecar focus; clicking
+  // a docked sidecar chip selects its step AND focuses that container. Keeping
+  // the clear here (not in the sel-tracking effect below) avoids clobbering the
+  // focus we set in the same handler.
+  const selectNode = (target: string) => {
+    setSel(target);
+    setFocusSidecar(null);
+  };
+  const selectSidecar = (stepId: string, index: number) => {
+    setSel(stepId);
+    setFocusSidecar(index);
+  };
   const [rerunning, setRerunning] = createSignal<string | null>(null);
   const [retrying, setRetrying] = createSignal<string | null>(null);
   const [cancelling, setCancelling] = createSignal(false);
@@ -741,7 +759,10 @@ export default function RunDetail() {
               <VersionRail
                 rows={versions()}
                 live={live() && !timeTraveling()}
-                onSelect={(n) => setViewTake(n)}
+                onSelect={(n) => {
+                  setViewTake(n);
+                  setFocusSidecar(null);
+                }}
               />
             <div class="panel pipeline-panel" classList={{ readonly: timeTraveling() }}>
               <div class="panel-h">
@@ -772,7 +793,9 @@ export default function RunDetail() {
                     steps={dagSteps()}
                     services={dagServices()}
                     selected={sel()}
-                    onSelect={setSel}
+                    onSelect={selectNode}
+                    onSelectSidecar={selectSidecar}
+                    sidecarFocus={focusSidecar()}
                   />
                   {/* Shared services (ADR-0058) live BESIDE the DAG, never as
                       nodes in it — a compact evidence section beneath the graph
@@ -794,6 +817,7 @@ export default function RunDetail() {
                 deadLettered={r().status === "dead_lettered"}
                 canDebug={canShell()}
                 onDebugPod={() => setShellOpen(true)}
+                focusSidecar={focusSidecar()}
               />
             </div>
 
