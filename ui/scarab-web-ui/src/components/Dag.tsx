@@ -3,15 +3,13 @@
 // roots); `needs` in-edges are drawn as measured orthogonal connectors on an SVG
 // under the nodes, and the edge feeding a running step animates a dashed flow.
 //
-// A step that took more than one try renders as a DECK (ADR-0056): offset
-// shadow-cards behind the node + a `×N` badge — the at-a-glance "this step was
-// retried/rerun N times" signal, right in the graph. Selecting such a node FANS
-// its tries out beneath it as a compact in-rail stack (`try 1 ✓`, `try 2 ·
-// auto-retry`, …); picking a try scopes the evidence pane. Attempt selection
-// lives HERE, in the graph — there is no separate attempt dropdown. Clicking a
-// node selects it.
+// This is a PURE STATUS MAP (redesign stage 3): one node per step showing its
+// status ring, id, a short meta line, a `×N` badge when the step took more than
+// one try, a gate icon, and a running scanline. The "which try" axis lives
+// elsewhere now — the attempts filmstrip in the evidence-pane header — so the
+// graph answers "what shape, and where does each step stand", not "which try".
+// Clicking a node selects it.
 import { createSignal, onMount, onCleanup, createEffect, For, Show } from "solid-js";
-import type { AttemptCause } from "../takes";
 import Icon from "./Icon";
 
 export type DagStep = {
@@ -30,73 +28,7 @@ export type DagStep = {
   durationMs?: number | null;
 };
 
-/** One try of the SELECTED step, resolved from the event log by the caller —
- * the fan renders these beneath the node (ADR-0056 amendment). */
-export type DagTry = {
-  id: string;
-  /** 0-based order; the label is `try {index + 1}`. */
-  index: number;
-  cause?: AttemptCause;
-  /** The backend's authoritative per-attempt verdict (AttemptDto.outcome):
-   * `running | succeeded | failed | superseded | cancelled`. Preferred over the
-   * `failed` bool so a running/superseded/cancelled try never renders green. */
-  outcome: string;
-  failed: boolean;
-  failure?: string;
-  /** Cut short by a rerun of an ancestor (started, never finished). */
-  superseded: boolean;
-  /** A success that a newer success replaced as of-record. */
-  shadowed: boolean;
-  /** Re-adopted after a control-plane restart (visibility marker, not a re-run). */
-  readopted: boolean;
-};
-
 type Edge = { x1: number; y1: number; x2: number; y2: number; hot: boolean };
-
-/** Deck depth: shadow-cards drawn behind a node, capped so a very hot step
- * doesn't grow an unbounded stack. */
-const MAX_DECK = 3;
-
-/** Plain-english cause suffix (ADR-0056 amendment) — the machine's own retry vs
- * a human rerun of this step vs a rerun of an ancestor that dragged it along. */
-const causeSuffix = (c?: AttemptCause): string =>
-  c === "rerun" ? " · you reran" : c === "cascade" ? " · ⟵ rerun" : c === "retry" ? " · auto-retry" : "";
-const tryTitle = (t: DagTry): string => `try ${t.index + 1}${causeSuffix(t.cause)}`;
-// Prefer the backend's authoritative `outcome` (AttemptDto.outcome) so a
-// still-running / superseded / cancelled try is never mislabelled green. Fall
-// back to the pre-fix superseded→failed→green derivation only when `outcome` is
-// absent (an old server), so nothing regresses.
-const tryOutcome = (t: DagTry): string => {
-  switch (t.outcome) {
-    case "running":
-      return "● running";
-    case "succeeded":
-      return "✓ succeeded";
-    case "failed":
-      return `✗ failed${t.failure ? ` · ${t.failure}` : ""}`;
-    case "superseded":
-      return "⊘ superseded";
-    case "cancelled":
-      return "⊘ cancelled";
-  }
-  if (t.superseded) return "⊘ superseded";
-  if (t.failed) return `✗ failed${t.failure ? ` · ${t.failure}` : ""}`;
-  return "✓ succeeded";
-};
-const tryTone = (t: DagTry): string => {
-  switch (t.outcome) {
-    case "running":
-      return "running";
-    case "succeeded":
-      return "emerald";
-    case "failed":
-      return "danger";
-    case "superseded":
-    case "cancelled":
-      return "copper";
-  }
-  return t.superseded ? "copper" : t.failed ? "danger" : "emerald";
-};
 
 /** m:ss (or h:mm:ss) elapsed since `since`, ticking off the caller's `now`. */
 function elapsed(since: number, now: number): string {
@@ -120,20 +52,12 @@ export default function Dag(props: {
   steps: DagStep[];
   selected: string | null;
   onSelect: (id: string) => void;
-  /** Tries of the SELECTED step (the fan). Empty unless a decked step is picked. */
-  tries?: DagTry[];
-  /** The try currently scoping the evidence pane (highlighted in the fan). */
-  activeAttempt?: string | null;
-  /** Pick a try — scopes the evidence pane to `(selected step, attempt)`. */
-  onAttemptSelect?: (id: string | null) => void;
 }) {
   let container: HTMLDivElement | undefined;
   const nodes = new Map<string, HTMLElement>();
   const [edges, setEdges] = createSignal<Edge[]>([]);
   // A 1s tick so running nodes' elapsed counters advance in place.
   const [now, setNow] = createSignal(Date.now());
-
-  const tries = () => props.tries ?? [];
 
   // Dependency layers: a step sits one column right of its deepest dependency.
   const layers = () => {
@@ -176,7 +100,7 @@ export default function Dag(props: {
           // Top-to-bottom flow: out the BOTTOM of the dependency, into the TOP
           // of the dependent (endpoints are horizontal mid-points). Coordinates
           // are relative to the scroll container's content, so they stay correct
-          // as the fan grows the column and the rail scrolls.
+          // as the canvas scrolls.
           x1: fb.left - cbox.left + container.scrollLeft + fb.width / 2,
           y1: fb.bottom - cbox.top + container.scrollTop,
           x2: tb.left - cbox.left + container.scrollLeft + tb.width / 2,
@@ -204,14 +128,11 @@ export default function Dag(props: {
     });
   });
 
-  // Re-measure when topology changes (a fresh run replaces the whole set) OR the
-  // selection/fan changes the column's height (`.dag` has a fixed box + inner
-  // scroll, so a ResizeObserver on it never fires for content growth). Two rAFs:
-  // one past the fan's DOM insertion, one past layout settling.
+  // Re-measure when topology changes (a fresh run replaces the whole set) —
+  // `.dag` has a fixed box + inner scroll, so a ResizeObserver on it never fires
+  // for content growth. Two rAFs: one past DOM insertion, one past layout.
   createEffect(() => {
     props.steps.length;
-    props.selected;
-    tries().length;
     requestAnimationFrame(() => requestAnimationFrame(measure));
   });
 
@@ -228,13 +149,10 @@ export default function Dag(props: {
       const mark = s.status === "succeeded" ? "✓" : "✕";
       return `${mark} ${fmtDur(s.durationMs)}`;
     }
+    // Time-travel display statuses (ADR-0056): prettify the underscore form.
+    if (s.status === "superseded") return "superseded";
+    if (s.status === "not_run") return "not run";
     return s.status;
-  };
-
-  const activeTry = () => {
-    const ts = tries();
-    if (!ts.length) return null;
-    return ts.find((t) => t.id === props.activeAttempt)?.id ?? ts[ts.length - 1].id;
   };
 
   return (
@@ -263,81 +181,32 @@ export default function Dag(props: {
               <For each={col}>
                 {(s) => {
                   const sel = () => props.selected === s.id;
-                  const deck = () => Math.min(Math.max(0, s.attempts - 1), MAX_DECK);
-                  const fanned = () => sel() && tries().length > 1;
                   return (
-                    <div class="dcell" classList={{ fanned: fanned() }}>
-                      {/* Deck: shadow-cards behind the node, one per extra try. */}
-                      <div class="ddeck">
-                        <For each={Array.from({ length: deck() })}>
-                          {(_, i) => (
-                            <span
-                              class="ddeck-layer"
-                              style={{ transform: `translate(${(i() + 1) * 3}px, ${(i() + 1) * 4}px)` }}
-                            />
-                          )}
-                        </For>
-                        <button
-                          class={`dnode ${s.status} ${sel() ? "sel" : ""}`}
-                          classList={{ reused: !!s.reused }}
-                          ref={(el) => nodes.set(s.id, el)}
-                          onClick={() => props.onSelect(s.id)}
-                        >
-                          <span class={`dring ${s.status}`}>
-                            <span class="dring-core" />
-                          </span>
-                          <span class="dnode-main" title={s.id}>
-                            <span class="dnode-id">{s.id}</span>
-                            <span class="dnode-meta">{meta(s)}</span>
-                          </span>
-                          <Show when={s.attempts > 1}>
-                            <span class="dnode-count" title={`${s.attempts} tries`}>
-                              ×{s.attempts}
-                            </span>
-                          </Show>
-                          <Show when={s.gate}>
-                            <Icon icon="timer" size={12} class="dnode-gate" />
-                          </Show>
-                          <Show when={s.status === "running"}>
-                            <span class="dnode-prog" />
-                          </Show>
-                        </button>
-                      </div>
-
-                      {/* Fan: the selected step's tries, a compact in-rail stack.
-                          Picking one scopes the evidence pane. */}
-                      <Show when={fanned()}>
-                        <div class="dfan">
-                          <For each={tries()}>
-                            {(t, i) => (
-                              <button
-                                class={`dfan-card ${tryTone(t)}`}
-                                classList={{
-                                  on: activeTry() === t.id,
-                                  shadow: t.shadowed,
-                                }}
-                                style={{ "animation-delay": `${i() * 30}ms` }}
-                                onClick={() => props.onAttemptSelect?.(t.id)}
-                                title={`${tryTitle(t)} — ${tryOutcome(t)}`}
-                              >
-                                <span class="dfan-t">
-                                  {tryTitle(t)}
-                                  <Show when={t.readopted}>
-                                    <span class="dfan-readopt" title="re-adopted after control-plane restart">
-                                      {" "}⟲
-                                    </span>
-                                  </Show>
-                                </span>
-                                <span class="dfan-o">
-                                  {tryOutcome(t)}
-                                  {t.shadowed ? " · shadowed" : ""}
-                                </span>
-                              </button>
-                            )}
-                          </For>
-                        </div>
+                    <button
+                      class={`dnode ${s.status} ${sel() ? "sel" : ""}`}
+                      classList={{ reused: !!s.reused }}
+                      ref={(el) => nodes.set(s.id, el)}
+                      onClick={() => props.onSelect(s.id)}
+                    >
+                      <span class={`dring ${s.status}`}>
+                        <span class="dring-core" />
+                      </span>
+                      <span class="dnode-main" title={s.id}>
+                        <span class="dnode-id">{s.id}</span>
+                        <span class="dnode-meta">{meta(s)}</span>
+                      </span>
+                      <Show when={s.attempts > 1}>
+                        <span class="dnode-count" title={`${s.attempts} tries`}>
+                          ×{s.attempts}
+                        </span>
                       </Show>
-                    </div>
+                      <Show when={s.gate}>
+                        <Icon icon="timer" size={12} class="dnode-gate" />
+                      </Show>
+                      <Show when={s.status === "running"}>
+                        <span class="dnode-prog" />
+                      </Show>
+                    </button>
                   );
                 }}
               </For>

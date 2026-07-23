@@ -2016,61 +2016,6 @@ h1, .crumb-head, .run-title {
 }
 @keyframes dnode-scan { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
 
-/* ── Deck + fan: a step's tries in the graph (ADR-0056) ───────────────────── */
-/* Each step is a cell: the node (as a DECK when it took >1 try) and, when
-   selected, its tries FANNED beneath as a compact in-rail stack. */
-.dcell { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
-/* Deck: offset shadow-cards peeking behind the node — the "retried N times"
-   signal at a glance. The node paints on top (later in DOM). */
-.ddeck { position: relative; display: inline-block; }
-.ddeck-layer {
-  position: absolute; inset: 0; z-index: 0;
-  border: 1px solid var(--terminal-line); border-radius: 3px;
-  background: var(--terminal);
-}
-.dcell.fanned .ddeck-layer { border-color: color-mix(in srgb, var(--emerald) 30%, var(--terminal-line)); }
-.ddeck .dnode { position: relative; z-index: 1; }
-
-/* Fan: the selected step's tries, full rail-width, stacked. Picking one scopes
-   the evidence pane; the active try is filled, shadowed dimmed. Text + surfaces
-   use the always-dark TERMINAL palette (like `.dnode`), not the theme-flipping
-   page tokens — the fan lives on the dark graph canvas in both light and dark. */
-.dfan {
-  display: flex; flex-direction: column; gap: 5px;
-  width: 190px; padding-left: 11px;
-  border-left: 1px solid var(--terminal-line);
-  margin-left: 10px;
-}
-.dfan-card {
-  display: flex; flex-direction: column; gap: 2px; text-align: left; cursor: pointer;
-  padding: 6px 9px; border-radius: 3px;
-  border: 1px solid var(--terminal-line); border-left-width: 3px;
-  background: var(--terminal-elev);
-  transition: border-color 0.12s ease, background 0.12s ease;
-  animation: dfan-in 0.18s ease-out both;
-}
-@keyframes dfan-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
-.dfan-card.emerald { border-left-color: var(--emerald-bright); }
-.dfan-card.danger { border-left-color: var(--danger); }
-.dfan-card.copper { border-left-color: var(--copper); }
-/* running: a running try — the cool token the node ring/logs use, so an
-   in-flight attempt reads as "in motion", not green. (--running is dark-safe;
-   the DAG canvas is always-dark, so these terminal tokens don't flip.) */
-.dfan-card.running { border-left-color: var(--running); }
-.dfan-card:hover { border-color: var(--emerald-bright); }
-.dfan-card.on {
-  background: color-mix(in srgb, var(--emerald) 22%, var(--terminal-elev));
-  border-color: var(--emerald-bright);
-}
-.dfan-card.shadow { opacity: 0.72; }
-.dfan-t { font-family: var(--font-mono); font-size: 11px; color: var(--terminal-ink); }
-.dfan-card.on .dfan-t { color: #f4f8f4; }
-.dfan-o { font-family: var(--font-mono); font-size: 9.5px; color: var(--muted-sage); }
-.dfan-readopt { color: var(--copper); }
-@media (prefers-reduced-motion: reduce) {
-  .dfan-card { animation: none; }
-}
-
 /* status ring (conic gauge) */
 .dring { width: 22px; height: 22px; border-radius: 50%; position: relative; display: grid; place-items: center; }
 .dring::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: var(--terminal-elev); }
@@ -2083,6 +2028,20 @@ h1, .crumb-head, .run-title {
 .dring.failed .dring-core { background: var(--danger); }
 .dring.skipped { background: repeating-conic-gradient(var(--terminal-line) 0 10deg, transparent 10deg 20deg); }
 .dring.skipped .dring-core { background: transparent; box-shadow: inset 0 0 0 1px var(--muted-sage); }
+/* Superseded (time-travel display status, ADR-0056): a step cut short by a
+   rerun of an ancestor — a copper ring with a dotted inset + a copper core.
+   TERMINAL/status tokens only (the DAG canvas is always-dark). */
+.dring.superseded { background: conic-gradient(var(--copper) 100%, var(--terminal-line) 0); }
+.dring.superseded::after { border: 1px dotted var(--copper); }
+.dring.superseded .dring-core { background: var(--copper); }
+/* Not run (time-travel display status, ADR-0056): a step that never started in
+   the viewed version — a hollow, dashed muted ring with an empty core, the
+   whole node dimmed. Distinct from skipped (hatched), pending (grey core), and
+   reused (dim-green). */
+.dring.not_run { background: transparent; border: 1px dashed var(--muted-sage); }
+.dring.not_run::after { background: transparent; }
+.dring.not_run .dring-core { background: transparent; }
+.dnode.not_run { opacity: 0.4; }
 @keyframes dring-spin { to { transform: rotate(360deg); } }
 
 /* ── Logs: folding by step → attempt ──────────────────────────────────────── */

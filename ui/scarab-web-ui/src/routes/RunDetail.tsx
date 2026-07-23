@@ -33,10 +33,11 @@ import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
-import Dag, { type DagStep, type DagTry } from "../components/Dag";
+import Dag, { type DagStep } from "../components/Dag";
 import VersionRail, { type VersionRow, type OutcomeCounts } from "../components/VersionRail";
 import ServicesPanel from "../components/ServicesPanel";
 import StepPane from "../components/StepPane";
+import { type FilmstripTry } from "../components/AttemptsFilmstrip";
 import DebugShell from "../components/DebugShell";
 import TriggerCell from "../components/TriggerCell";
 
@@ -182,7 +183,7 @@ export default function RunDetail() {
   // belong to a later version and never existed in this snapshot), and causes
   // are derived over the truncated log to match. Mirrors StepPane's
   // `attemptsOf()`/`scoped()`.
-  const stripTries = (): DagTry[] => {
+  const stripTries = (): FilmstripTry[] => {
     const s = selectedStep();
     if (!s) return [];
     const list = s.attempt_list ?? [];
@@ -733,14 +734,7 @@ export default function RunDetail() {
               <div class="rd-grid">
                 <div class="dag-wrap">
                   <div class="dag-head">Steps</div>
-                  <Dag
-                    steps={dagSteps()}
-                    selected={sel()}
-                    onSelect={setSel}
-                    tries={stripTries()}
-                    activeAttempt={stripActiveAttempt()}
-                    onAttemptSelect={setSelAttempt}
-                  />
+                  <Dag steps={dagSteps()} selected={sel()} onSelect={setSel} />
                   {/* Shared services (ADR-0058) live BESIDE the DAG, never as
                       nodes in it — a compact evidence section beneath the graph
                       in the same left column. Renders nothing when there are
