@@ -193,16 +193,27 @@ export default function RunDetail() {
   const runningCount = () => stepList().filter((s) => s.status === "running").length;
 
   // Per-step wall-clock from the event log: first AttemptStarted → last
-  // AttemptFinished. While time-traveling, computed over the truncated log so
-  // a closed Take never shows timing from its future.
+  // AttemptFinished — Take-scoped (ADR-0056). Only THIS take's attempts count,
+  // so a step's duration is the current take's wall-clock, not summed across
+  // takes (a rerun must not keep growing the displayed step time). Scoped via
+  // the take's `windowAttempts` so it matches the ×N attempt badge; while
+  // time-traveling, `visibleEvents()` is already truncated to the boundary too.
   const stepTiming = (): Record<string, { start?: number; end?: number }> => {
     const m: Record<string, { start?: number; end?: number }> = {};
+    const sv = scopedView();
     for (const e of visibleEvents()) {
       const k = e.kind;
       if (typeof k === "string") continue;
       const tag = Object.keys(k)[0];
       const step = (k[tag]?.step as string | undefined) ?? undefined;
       if (!step) continue;
+      // Restrict to the selected take's attempts: skip an AttemptStarted/
+      // AttemptFinished whose attempt belongs to another take.
+      const attempt = (k[tag]?.attempt as string | undefined) ?? undefined;
+      if (sv && attempt !== undefined) {
+        const win = sv.windowAttempts[step];
+        if (win && !win.includes(attempt)) continue;
+      }
       const t = (m[step] ??= {});
       if (tag === "AttemptStarted" && (t.start === undefined || e.at < t.start)) t.start = e.at;
       if (tag === "AttemptFinished" && (t.end === undefined || e.at > t.end)) t.end = e.at;
