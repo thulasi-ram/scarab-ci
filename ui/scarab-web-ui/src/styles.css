@@ -2548,27 +2548,45 @@ h1, .crumb-head, .run-title {
 @media (prefers-reduced-motion: reduce) {
   .pane-load.on svg { animation: none; }
 }
-.achip {
-  display: inline-flex; align-items: center; gap: 5px;
-  font-family: var(--font-mono); font-size: 11px; cursor: pointer;
+/* ── Attempts filmstrip (redesign stage 3): the "which try" axis, in the pane
+   header — promoted from the former orphaned `.achip*` rules. PAGE/theme chrome
+   (NOT the always-dark DAG canvas), so it reads the page tokens. Outcome shape =
+   accent colour + border style: succeeded solid-emerald, failed dashed-danger,
+   superseded/cancelled dotted-copper, running solid-teal; a shadowed success
+   dims. The ACTIVE try enlarges + shows its full label; the rest are a glyph +
+   hover title, and a folded retry streak carries a `×N` badge. */
+.fstrip {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 12px; overflow-x: auto;
+  border-bottom: 1px solid var(--border-soft);
+}
+.fmark {
+  display: inline-flex; align-items: center; gap: 5px; flex: none;
+  font-family: var(--font-mono); font-size: 11px; line-height: 1; cursor: pointer;
   color: var(--muted-sage); background: transparent;
-  border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px;
+  border: 1px solid var(--border); border-radius: 20px; padding: 4px 9px;
+  transition: color 0.12s ease, border-color 0.12s ease, background 0.12s ease;
 }
-.achip:hover { color: var(--sage); border-color: var(--muted-sage); }
-.achip.sel { color: var(--soft-white); border-color: var(--emerald); }
-.achip.failed { border-style: dashed; }
-.achip.failed.sel { border-color: var(--danger); }
-/* Superseded: cut short by a rerun — dotted (distinct from failed's dashed). */
-.achip.superseded { border-style: dotted; color: var(--copper); }
-.achip.superseded.sel { border-color: var(--copper); }
-/* Shadowed: finished-successful but no longer the of-record latest. */
-.achip.shadowed { opacity: 0.68; }
-.achip .ashadow {
-  font-size: 9.5px; color: var(--muted-sage); text-transform: uppercase;
-  letter-spacing: 0.04em; border: 1px solid var(--border);
-  border-radius: 20px; padding: 0 5px;
+.fmark:hover { color: var(--sage); border-color: var(--muted-sage); }
+.fmark .fglyph { font-size: 11px; }
+/* Outcome shapes — accent tokens only (page-safe), mirroring the DAG ring. */
+.fmark.emerald { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, var(--border)); }
+.fmark.danger { color: var(--danger); border-style: dashed; border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); }
+.fmark.copper { color: var(--copper); border-style: dotted; border-color: var(--border-copper); }
+.fmark.running { color: var(--running); border-color: color-mix(in srgb, var(--running) 50%, var(--border)); }
+/* Shadowed: a finished-successful try no longer the of-record latest — dimmed. */
+.fmark.shadow { opacity: 0.55; }
+/* The active try: enlarged, full-strength tone border, faint tone wash, label.
+   Two classes so the tone border above (also two classes) loses on source order. */
+.fmark.fmark-active {
+  padding: 5px 11px; font-size: 12px; font-weight: 600;
+  border-color: currentColor;
+  background: color-mix(in srgb, currentColor 10%, transparent);
 }
-.achip .areadopt { color: var(--copper); font-size: 12px; }
+.fmark-active .flabel { white-space: nowrap; }
+/* The `×N` badge on a folded retry streak. */
+.fcount { color: var(--muted-sage); font-variant-numeric: tabular-nums; }
+.freadopt { color: var(--copper); font-size: 12px; }
 .adeadletter {
   font-family: var(--font-mono); font-size: 10.5px; color: var(--danger);
   border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);

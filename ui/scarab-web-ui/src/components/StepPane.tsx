@@ -19,6 +19,7 @@ import {
 } from "../api/client";
 import type { RunEvent } from "../api/client";
 import Icon from "./Icon";
+import AttemptsFilmstrip, { type FilmstripTry } from "./AttemptsFilmstrip";
 
 type Tab = "logs" | "results" | "outputs" | "workspace";
 
@@ -45,8 +46,15 @@ export default function StepPane(props: {
   step: StepStatus | null;
   /** Full event log — the attempt-cause and re-adoption source. */
   events: RunEvent[];
-  /** The try scoping every tab — chosen in the graph fan; null = latest. */
+  /** The try scoping every tab — chosen in the header filmstrip; null = latest. */
   attempt: string | null;
+  /** The selected step's tries, resolved by the caller from the event log — the
+   * header filmstrip renders these (the try axis, ADR-0056 amendment). */
+  tries: FilmstripTry[];
+  /** The try the filmstrip highlights as active (resolved to a concrete id). */
+  activeAttempt: string | null;
+  /** Pick a try in the filmstrip — scopes every tab to `(step, attempt)`. */
+  onAttemptSelect: (id: string | null) => void;
   /** Viewing a closed Take: pin the strip's default to this frontier attempt
    * and mark attempts beyond it as from a later take. */
   frontierAttempt?: string | null;
@@ -247,11 +255,17 @@ export default function StepPane(props: {
       >
         {(s) => (
           <>
-            {/* Evidence header = just the tabs (which step + try you're viewing
-                is shown in the graph and its fan, so the pane no longer repeats
-                the step name / try). A spinner on the right is the only cue that
-                a switch took effect and fresh evidence is loading. Dead-letter,
-                being terminal + rare, keeps a badge here. */}
+            {/* Evidence header = the attempts filmstrip (the try axis, moved out
+                of the graph — ADR-0056 amendment) above the tab row. The strip's
+                enlarged marker names the active try; the tabs below scope to it.
+                A spinner on the right is the only cue that a switch took effect
+                and fresh evidence is loading. Dead-letter, being terminal + rare,
+                keeps a badge here. */}
+            <AttemptsFilmstrip
+              tries={props.tries}
+              active={props.activeAttempt}
+              onSelect={props.onAttemptSelect}
+            />
             <div class="pane-tabbar">
               <div class="tabs">
                 <TabBtn id="logs" label="Logs" />

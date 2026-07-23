@@ -176,12 +176,13 @@ export default function RunDetail() {
     });
   };
 
-  // The selected step's tries, resolved from the event log — the fan the DAG
-  // renders beneath the selected node (ADR-0056 amendment). While viewing a
-  // closed Take, tries after the boundary are hidden (they belong to a later
-  // version and never existed in this snapshot), and causes are derived over the
-  // truncated log to match. Mirrors StepPane's `attemptsOf()`/`scoped()`.
-  const dagTries = (): DagTry[] => {
+  // The selected step's tries, resolved from the event log — the markers the
+  // attempts filmstrip renders in the evidence-pane header (ADR-0056 amendment).
+  // While viewing a closed Take, tries after the boundary are hidden (they
+  // belong to a later version and never existed in this snapshot), and causes
+  // are derived over the truncated log to match. Mirrors StepPane's
+  // `attemptsOf()`/`scoped()`.
+  const stripTries = (): DagTry[] => {
     const s = selectedStep();
     if (!s) return [];
     const list = s.attempt_list ?? [];
@@ -208,9 +209,9 @@ export default function RunDetail() {
   };
   // The try scoping the evidence pane: explicit selection, else the Take
   // frontier, else the latest — the same resolution StepPane's `scoped()` uses,
-  // so the fan's highlight and the pane always agree.
-  const dagActiveAttempt = (): string | null => {
-    const ts = dagTries();
+  // so the filmstrip's highlight and the pane always agree.
+  const stripActiveAttempt = (): string | null => {
+    const ts = stripTries();
     if (!ts.length) return null;
     const want = selAttempt() ?? (sel() ? (takeView()?.frontier[sel()!] ?? null) : null);
     return ts.find((t) => t.id === want)?.id ?? ts[ts.length - 1].id;
@@ -736,8 +737,8 @@ export default function RunDetail() {
                     steps={dagSteps()}
                     selected={sel()}
                     onSelect={setSel}
-                    tries={dagTries()}
-                    activeAttempt={dagActiveAttempt()}
+                    tries={stripTries()}
+                    activeAttempt={stripActiveAttempt()}
                     onAttemptSelect={setSelAttempt}
                   />
                   {/* Shared services (ADR-0058) live BESIDE the DAG, never as
@@ -752,6 +753,9 @@ export default function RunDetail() {
                 step={selectedStep()}
                 events={visibleEvents()}
                 attempt={selAttempt()}
+                tries={stripTries()}
+                activeAttempt={stripActiveAttempt()}
+                onAttemptSelect={setSelAttempt}
                 frontierAttempt={sel() ? takeView()?.frontier[sel()!] ?? null : null}
                 deadLettered={r().status === "dead_lettered"}
                 canDebug={canShell()}
