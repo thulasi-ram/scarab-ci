@@ -205,6 +205,11 @@ export default function Dag(props: {
     return s.status;
   };
 
+  // A shared-service node's meta line: ports (when the projection carries them)
+  // then its lifecycle status — e.g. `port 5432 · ready`, or just `ready`.
+  const svcMeta = (sv: DagService): string =>
+    sv.ports?.length ? `port ${sv.ports.join(", ")} · ${sv.status}` : sv.status;
+
   return (
     <div class="dag" ref={container}>
       <svg class="dag-edges" aria-hidden="true">
@@ -220,11 +225,48 @@ export default function Dag(props: {
                 ? `M ${e.x1} ${e.y1} V ${e.y2}`
                 : `M ${e.x1} ${e.y1} V ${my - r} Q ${e.x1} ${my} ${e.x1 + r * dir} ${my} ` +
                   `H ${e.x2 - r * dir} Q ${e.x2} ${my} ${e.x2} ${my + r} V ${e.y2}`;
-            return <path d={d} class={e.hot ? "hot" : ""} fill="none" />;
+            return (
+              <path d={d} class={e.dashed ? "dashed" : e.hot ? "hot" : ""} fill="none" />
+            );
           }}
         </For>
       </svg>
       <div class="dag-cols">
+        {/* Services lane (ADR-0058): shared services are PEERS, not steps — a
+            band at the top, above dependency layer 0, with dotted `uses` edges
+            fanning down to each consuming step. They carry no `needs` depth, so
+            the lane holds them all. Registered in `nodes` (keyed `service:<name>`)
+            so `measure()` can route edges to them. */}
+        <Show when={(props.services?.length ?? 0) > 0}>
+          <div class="dag-lane">
+            <span class="dag-lane-label">services</span>
+            <div class="dag-lane-nodes">
+              <For each={props.services}>
+                {(sv) => {
+                  const selId = `service:${sv.name}`;
+                  const sel = () => props.selected === selId;
+                  return (
+                    <button
+                      class={`dnode service ${sel() ? "sel" : ""}`}
+                      ref={(el) => nodes.set(selId, el)}
+                      onClick={() => props.onSelect(selId)}
+                      title={`${sv.name} — shared service · ${sv.status}`}
+                    >
+                      <span class={`dring service ${sv.status}`}>
+                        <span class="dring-core" />
+                      </span>
+                      <span class="dnode-main" title={sv.name}>
+                        <span class="dnode-id">{sv.name}</span>
+                        <span class="dnode-meta">{svcMeta(sv)}</span>
+                      </span>
+                      <Icon icon="database" size={14} class="dnode-svc-ico" />
+                    </button>
+                  );
+                }}
+              </For>
+            </div>
+          </div>
+        </Show>
         <For each={layers()}>
           {(col) => (
             <div class="dag-col">

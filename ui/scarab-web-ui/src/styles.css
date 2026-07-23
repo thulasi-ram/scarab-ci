@@ -962,7 +962,11 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   display: flex;
   flex-direction: column; /* dependency layers stack top → bottom */
   gap: 40px;
-  align-items: center;
+  /* `safe center` keeps a narrow graph centered but never clips a wide fan on
+     the leading edge; `min-content` lets the cols grow past the canvas so the
+     wide row scrolls in `.dag` (overflow:auto) instead of wrapping. */
+  align-items: safe center;
+  min-width: min-content;
   min-height: max-content;
 }
 
@@ -970,8 +974,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   display: flex;
   flex-direction: row; /* peers within a layer sit side by side */
   gap: 16px;
-  justify-content: center;
-  flex-wrap: wrap;
+  justify-content: safe center;
+  /* A wide sibling fan (e.g. dogfood `checkout → {lint, test…, version}`) stays
+     ONE row and scrolls horizontally — never wraps to stacked rows. */
+  flex-wrap: nowrap;
 }
 
 .dnode {
@@ -2043,6 +2049,76 @@ h1, .crumb-head, .run-title {
 .dring.not_run .dring-core { background: transparent; }
 .dnode.not_run { opacity: 0.4; }
 @keyframes dring-spin { to { transform: rotate(360deg); } }
+
+/* ── Services in the DAG (ADR-0058): shared services as peer nodes + dotted
+   `uses` edges; sidecars as docked chips on their step. Canvas tokens ONLY
+   (--terminal*/status accents) — never page/surface tokens inside the graph. ── */
+
+/* Services lane: a band above dependency layer 0, holding the shared-service
+   peers. `align-self: stretch` + the hairline divider make it read as its own
+   zone spanning the canvas width; the nodes inside stay centered. */
+.dag-lane {
+  align-self: stretch;
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding-bottom: 20px;
+  border-bottom: 1px dashed var(--terminal-line);
+  min-width: min-content;
+}
+.dag-lane-label {
+  font-family: var(--font-mono); font-size: 9px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1.6px; color: var(--muted-sage);
+}
+.dag-lane-nodes {
+  display: flex; flex-direction: row; gap: 16px;
+  justify-content: safe center; flex-wrap: nowrap;
+}
+
+/* Dotted `uses` edge (shared service → consumer): a dimmed copper dash, distinct
+   from a solid `needs` connector and the animated running-flow `.hot`. */
+.dag-edges path.dashed {
+  stroke: color-mix(in srgb, var(--copper) 70%, transparent);
+  stroke-width: 1.5;
+  stroke-dasharray: 4 4;
+}
+
+/* Shared-service PEER node: a copper stadium/pill — a distinct SHAPE + colour
+   from a step's rounded-rect, so it never reads as a `needs`-able step. The node
+   border + database glyph carry the "shared service" identity; the ring carries
+   lifecycle (below). */
+.dnode.service { border-radius: 999px; border-color: var(--border-copper); }
+.dnode.service:hover { border-color: var(--copper); }
+.dnode.service.sel { border-color: var(--copper); box-shadow: inset 0 0 0 1px var(--copper); }
+.dnode-svc-ico { color: var(--copper); }
+
+/* Service ring = SERVICE lifecycle, not a step outcome: starting/pending → grey
+   core; ready/running → ok/running fill; torn-down → dim; failed → danger.
+   Reuses the base .dring / .dring::after / .dring-core geometry. */
+.dring.service .dring-core { background: var(--muted-sage); }
+.dring.service.ready { background: conic-gradient(var(--ok) 100%, var(--terminal-line) 0); }
+.dring.service.ready .dring-core { background: var(--ok); }
+.dring.service.running { background: conic-gradient(var(--running) 100%, var(--terminal-line) 0); }
+.dring.service.running .dring-core { background: var(--running); }
+.dring.service.failed { background: conic-gradient(var(--danger) 100%, var(--terminal-line) 0); }
+.dring.service.failed .dring-core { background: var(--danger); }
+.dring.service.torn-down { opacity: 0.55; }
+.dring.service.torn-down .dring-core { background: color-mix(in srgb, var(--muted-sage) 55%, transparent); }
+
+/* Docked SIDECAR chips (stage 3): small copper pills INSIDE the step node
+   (honest to Pod containment — never floated peers with edges). Span the node's
+   full width on a second grid row. */
+.dnode-sidecars { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 5px; margin-top: 2px; }
+.dnode-sidecar {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 7px; border-radius: 999px;
+  border: 1px solid var(--border-copper); background: transparent;
+  color: var(--copper); font-family: var(--font-mono); font-size: 10px;
+  cursor: pointer; max-width: 100%;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.dnode-sidecar:hover { border-color: var(--copper); background: color-mix(in srgb, var(--copper) 10%, transparent); }
+.dnode-sidecar.sel { border-color: var(--emerald-bright); box-shadow: inset 0 0 0 1px var(--emerald-bright); }
+.dnode-sidecar .sc-hex { line-height: 1; }
+.dnode-sidecar .sc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ── Logs: folding by step → attempt ──────────────────────────────────────── */
 .logs-panel .steplogs { flex: 1; display: flex; flex-direction: column; min-height: 54vh; }
