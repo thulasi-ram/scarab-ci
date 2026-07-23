@@ -26,9 +26,28 @@ export type DagStep = {
   runningSince?: number | null;
   /** Wall-clock a finished step took (ms), derived from the event log. */
   durationMs?: number | null;
+  /** This step's co-located SIDECAR services (ADR-0058), rendered as docked
+   * chips ON the node (they live inside the step's Pod — never floated peers). */
+  services?: { index: number; image: string }[];
+  /** Names of pipeline-level SHARED services this step opts into via `uses:`
+   * (ADR-0058) — the source of the dotted service→step edges. */
+  uses?: string[];
 };
 
-type Edge = { x1: number; y1: number; x2: number; y2: number; hot: boolean };
+/** A pipeline-level SHARED service (ADR-0058) — a PEER node in the services lane
+ * at the top of the DAG, with its own lifecycle. Distinct from a step's docked
+ * sidecars: a shared service is one instance many steps reach via `uses:`. */
+export type DagService = {
+  name: string;
+  /** Lifecycle: `starting` | `ready` | `running` | `torn-down` | `failed`. */
+  status: string;
+  /** Ports it listens on, when known (the /services projection omits them). */
+  ports?: number[];
+};
+
+// A `needs` edge is solid; a `uses` edge (shared service → consumer) is dashed
+// and never "hot" (a service is not part of the running-flow highlight).
+type Edge = { x1: number; y1: number; x2: number; y2: number; hot: boolean; dashed: boolean };
 
 /** m:ss (or h:mm:ss) elapsed since `since`, ticking off the caller's `now`. */
 function elapsed(since: number, now: number): string {
@@ -50,8 +69,17 @@ function fmtDur(ms: number): string {
 
 export default function Dag(props: {
   steps: DagStep[];
+  /** Shared services (ADR-0058) — rendered as peer nodes in a lane at the top. */
+  services?: DagService[];
+  /** Selection id: a step is `"<stepId>"`; a shared service is `"service:<name>"`. */
   selected: string | null;
   onSelect: (id: string) => void;
+  /** Click a step's docked sidecar chip — selects the step + focuses that
+   * sidecar's container in the Logs tab (ADR-0058). */
+  onSelectSidecar?: (stepId: string, index: number) => void;
+  /** The sidecar index whose logs are currently active on the SELECTED step —
+   * drives the docked chip's selected outline. */
+  sidecarFocus?: number | null;
 }) {
   let container: HTMLDivElement | undefined;
   const nodes = new Map<string, HTMLElement>();
@@ -107,6 +135,28 @@ export default function Dag(props: {
           y2: tb.top - cbox.top + container.scrollTop,
           // The edge glows when it feeds a running step (or a running dep).
           hot: hot || byId.get(need)?.status === "running",
+          dashed: false,
+        });
+      }
+    }
+    // Dashed `uses` edges (ADR-0058): from each shared-service peer node down to
+    // every step that opts into it. A service edge is never "hot" — a service is
+    // infra, not part of the running-step flow highlight.
+    for (const s of props.steps) {
+      const to = nodes.get(s.id);
+      if (!to) continue;
+      const tb = to.getBoundingClientRect();
+      for (const name of s.uses ?? []) {
+        const from = nodes.get(`service:${name}`);
+        if (!from) continue;
+        const fb = from.getBoundingClientRect();
+        es.push({
+          x1: fb.left - cbox.left + container.scrollLeft + fb.width / 2,
+          y1: fb.bottom - cbox.top + container.scrollTop,
+          x2: tb.left - cbox.left + container.scrollLeft + tb.width / 2,
+          y2: tb.top - cbox.top + container.scrollTop,
+          hot: false,
+          dashed: true,
         });
       }
     }

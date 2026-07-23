@@ -21,10 +21,12 @@ import {
   listArtifacts,
   artifactUrl,
   repoForgeUrl,
+  listServices,
   type RunStatus,
   type RunEvent,
   type StepStatus,
   type Artifact,
+  type Service,
 } from "../api/client";
 import { eventParts, eventCategory, EVENT_GLYPH } from "../events";
 import { deriveTakes, replayTake, attemptCauses, type Take, type TakeView } from "../takes";
@@ -33,7 +35,7 @@ import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
-import Dag, { type DagStep } from "../components/Dag";
+import Dag, { type DagStep, type DagService } from "../components/Dag";
 import VersionRail, { type VersionRow, type OutcomeCounts } from "../components/VersionRail";
 import ServicesPanel from "../components/ServicesPanel";
 import StepPane from "../components/StepPane";
@@ -173,6 +175,10 @@ export default function RunDetail() {
             ? s.attempt_list?.[s.attempt_list.length - 1]?.started_at ?? null
             : null,
         durationMs: t?.start != null && t?.end != null ? t.end - t.start : null,
+        // Sidecars dock ON the node; `uses` names source the dotted service edges
+        // (ADR-0058). Both come straight off the step's live status projection.
+        services: s.services,
+        uses: s.uses,
       };
     });
   };
@@ -227,6 +233,34 @@ export default function RunDetail() {
   const [artifacts, { refetch: refetchArtifacts }] = createResource(id, (rid) =>
     listArtifacts(rid).catch(() => [] as Artifact[]),
   );
+
+  // Shared services (ADR-0058) now render as PEER NODES in the DAG (a lane at the
+  // top) rather than a panel beside it. Poll alongside a live run for lifecycle
+  // updates; a terminal run's set is fixed. Empty (the common case) → no lane.
+  const [svcTick, setSvcTick] = createSignal(0);
+  createEffect(() => {
+    if (!(live() && !timeTraveling())) return;
+    const t = setInterval(() => setSvcTick((n) => n + 1), 2000);
+    onCleanup(() => clearInterval(t));
+  });
+  const [services] = createResource(
+    () => [id(), svcTick()] as const,
+    ([rid]) => listServices(rid).catch(() => [] as Service[]),
+  );
+
+  // The DAG's shared-service nodes: the `/services` projection (name → lifecycle
+  // status) UNION every name any step declares in `uses:` — so a service that is
+  // declared but not yet started still renders as a pending peer node. The
+  // /services shape carries no ports, so the node's meta reads status only.
+  const dagServices = (): DagService[] => {
+    const fromApi = services() ?? [];
+    const byName = new Map(fromApi.map((s) => [s.name, s]));
+    const names: string[] = fromApi.map((s) => s.name);
+    for (const s of stepList()) {
+      for (const u of s.uses ?? []) if (!names.includes(u)) names.push(u);
+    }
+    return names.map((name) => ({ name, status: byName.get(name)?.status ?? "pending" }));
+  };
 
   // Artifact versions visible in the current view: while time-traveling, only
   // versions from attempts that existed as of the boundary — and of-record is
@@ -734,7 +768,12 @@ export default function RunDetail() {
               <div class="rd-grid">
                 <div class="dag-wrap">
                   <div class="dag-head">Steps</div>
-                  <Dag steps={dagSteps()} selected={sel()} onSelect={setSel} />
+                  <Dag
+                    steps={dagSteps()}
+                    services={dagServices()}
+                    selected={sel()}
+                    onSelect={setSel}
+                  />
                   {/* Shared services (ADR-0058) live BESIDE the DAG, never as
                       nodes in it — a compact evidence section beneath the graph
                       in the same left column. Renders nothing when there are

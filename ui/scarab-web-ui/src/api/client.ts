@@ -490,6 +490,40 @@ export function streamStepLogs(
 }
 
 /**
+ * Live-stream ONE of a step's co-located SIDECAR containers' log output
+ * (`GET …/steps/{step}/logs?sidecar=<index>`, ADR-0058), optionally scoped to a
+ * single `attempt`. A sidecar lives inside the step's Pod, so its logs are
+ * stored under the step's REAL attempt ids — the same attempt scoping as the
+ * step's main container applies unchanged (`?sidecar=` composes with
+ * `?attempt=`). Same buffered-SSE contract as `streamStepLogs`; returns a
+ * cleanup fn.
+ */
+export function streamStepSidecarLogs(
+  id: string,
+  step: string,
+  index: number,
+  opts: { attempt?: string; onChunk: (text: string) => void; onEnd?: () => void },
+): () => void {
+  const base = `/v1/runs/${encodeURIComponent(id)}/steps/${encodeURIComponent(step)}/logs`;
+  const q = new URLSearchParams({ sidecar: String(index) });
+  if (opts.attempt) q.set("attempt", opts.attempt);
+  const es = new EventSource(`${base}?${q.toString()}`);
+  let closed = false;
+  const close = () => {
+    if (!closed) {
+      closed = true;
+      es.close();
+    }
+  };
+  es.onmessage = (e) => opts.onChunk(e.data);
+  es.onerror = () => {
+    close();
+    opts.onEnd?.();
+  };
+  return close;
+}
+
+/**
  * List a run's shared services (`GET /v1/runs/{id}/services`) — the current
  * Take's instances + lifecycle status, for the Services panel beside the DAG
  * (ADR-0058). Empty when the pipeline declares no shared services.
