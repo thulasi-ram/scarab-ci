@@ -3161,7 +3161,7 @@ async fn admit_and_create_run(
 
     let now = clock.now().await;
     let run = new_run_id();
-    persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, now).await?;
+    persist_run_from_ir(db, &run, ir, event, path, &gov, excluded, params, now).await?;
     // Freeze the resolved launch parameters on the run so every step's
     // interpolation (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive
     // deterministically (ADR-0043 §5).
@@ -3534,6 +3534,7 @@ async fn persist_run_from_ir(
     pipeline: &str,
     gov: &RunGovernance,
     excluded: &[String],
+    params: Option<&std::collections::BTreeMap<String, serde_json::Value>>,
     now: Timestamp,
 ) -> Result<(), TriggerError> {
     let locked_out = gov.locked_out();
@@ -3609,12 +3610,32 @@ async fn persist_run_from_ir(
         .await?;
     }
     // Concurrency group (ADR-0011, 0032): serialize this run against others in the
-    // same group under its policy. `${{ … }}` interpolation of the group against
-    // the event context is a later slice (kept literal here, matching where step
-    // interpolation stands). Only the engine wiring is exercised now.
+    // same group under its policy. The `group` is interpolated here against the
+    // run's launch inputs and trigger event (the same CEL machinery as step
+    // `${{ … }}`, ADR-0009/0043), so `deploy-${{ inputs.deploy_env }}` resolves to
+    // a *distinct* key per environment (`deploy-staging` vs `deploy-production`)
+    // rather than colliding on the literal template. A `${{ … }}` that cannot be
+    // resolved fails closed — never store a literal template as the slot key.
     if let Some(c) = &ir.concurrency {
-        db.set_run_concurrency(run, &c.group, ConcurrencyPolicy::from_wire(&c.policy))
-            .await?;
+        let inputs = params
+            .map(|p| serde_json::Value::Object(p.clone().into_iter().collect()))
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        let interp_ctx = serde_json::json!({ "inputs": inputs, "event": event.context() });
+        let group = scarab_pipeline::cel::interpolate(&c.group, &interp_ctx).map_err(|e| {
+            TriggerError::Pipeline(format!("concurrency group `{}`: {e}", c.group))
+        })?;
+        // ADR-0032: a governed (environment-targeting) deploy still SERIALIZES
+        // against its group, but must never silently cancel the current slot
+        // holder — an in-flight production deploy is not disposable. So a governed
+        // run always takes the queue-and-wait policy regardless of the pipeline's
+        // declared `cancel-in-progress`; only ungoverned CI runs keep newest-wins
+        // cancel. (Mirrors the supersede opt-out below.)
+        let policy = if matches!(gov, RunGovernance::Ungoverned) {
+            ConcurrencyPolicy::from_wire(&c.policy)
+        } else {
+            ConcurrencyPolicy::Queue
+        };
+        db.set_run_concurrency(run, &group, policy).await?;
     }
     // Newest-wins auto-cancel (ADR-0032): key non-deploy runs by (repo, ref,
     // pipeline) so a newer run supersedes older in-flight ones. A pipeline that

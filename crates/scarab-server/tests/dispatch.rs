@@ -19,7 +19,8 @@ use tower::ServiceExt;
 
 use scarab_engine::ports::{ExecHandle, ExecState, Executor};
 use scarab_engine::{
-    Clock, Db, EventPayload, ExecError, RunId, RunStatus, Scheduler, StepRun, StepSpec,
+    Clock, ConcurrencyPolicy, Db, EventPayload, ExecError, RunId, RunStatus, Scheduler, StepRun,
+    StepSpec,
 };
 use scarab_forge::RepoRef;
 use scarab_project::{Deployment, Environment, EnvironmentStore, ProjectError, ProtectionRules};
@@ -828,5 +829,188 @@ async fn dispatch_endpoint_accepts_a_reason_and_surfaces_it_on_the_read_dto() {
     assert_eq!(
         run["trigger_title"], "manual prod deploy",
         "the dispatch reason surfaces as the run Headline on GET /v1/runs/{{id}}"
+    );
+}
+
+// --- concurrency group interpolation + governed serialize-not-cancel ----------
+// Regression for the QA finding: a `concurrency.group` carrying `${{ … }}` was
+// stored LITERALLY, so a `deploy-${{ inputs.deploy_env }}` group collapsed to one
+// slot across every environment — and the `cancel-in-progress` slot-cancel path
+// ignored governance, so a manual production deploy would cancel an unrelated
+// in-flight staging deploy. Both defects are fixed at admission
+// (`persist_run_from_ir`).
+
+// An ungoverned pipeline whose concurrency group interpolates a launch input.
+const CONCURRENCY_YAML: &str = r#"
+on:
+  manual: {}
+interface:
+  inputs:
+    - { name: deploy_env, type: string }
+concurrency:
+  group: "deploy-${{ inputs.deploy_env }}"
+  policy: cancel-in-progress
+steps:
+  - { id: ship, image: busybox, command: ["true"] }
+"#;
+
+/// The `group` is interpolated against the run's launch inputs at admission, so
+/// two dispatches with different `deploy_env` resolve to DISTINCT slot keys —
+/// they neither share a slot nor cancel each other.
+#[tokio::test]
+async fn dispatch_interpolates_concurrency_group_into_per_env_slots() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/rollout.yaml", CONCURRENCY_YAML)
+        .with_commit("refs/heads/main", "sha-cafe");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+
+    let dispatch = |env: &'static str| {
+        let forge = &forge;
+        let db = db.clone();
+        let clock = clock.clone();
+        async move {
+            dispatch_run(
+                forge,
+                db.as_ref(),
+                clock.as_ref(),
+                None,
+                "alice".into(),
+                repo(),
+                "refs/heads/main".into(),
+                "rollout".into(),
+                std::collections::BTreeMap::from([("deploy_env".to_string(), json!(env))]),
+                DispatchKind::Manual,
+                None,
+            )
+            .await
+            .expect("dispatch")
+        }
+    };
+
+    let staging = dispatch("staging").await;
+    let production = dispatch("production").await;
+
+    // The stored slot keys are the RESOLVED per-env groups, not the literal
+    // template — so they are distinct and never collide.
+    assert_eq!(
+        db.run_concurrency(&staging).await.unwrap(),
+        Some(("deploy-staging".to_string(), ConcurrencyPolicy::CancelInProgress)),
+    );
+    assert_eq!(
+        db.run_concurrency(&production).await.unwrap(),
+        Some((
+            "deploy-production".to_string(),
+            ConcurrencyPolicy::CancelInProgress
+        )),
+    );
+
+    // End-to-end: both admit to Running — different slots, so the production
+    // dispatch does NOT cancel the in-flight staging run.
+    let exec = FakeExecutor::new();
+    let sched = Scheduler::new(db.as_ref(), clock.as_ref() as &dyn Clock, &exec, "sched");
+    sched.admit(&staging).await.unwrap();
+    sched.admit(&production).await.unwrap();
+    assert_eq!(
+        db.run_status(&staging).await.unwrap(),
+        Some(RunStatus::Running),
+        "staging keeps running; a different-env deploy must not cancel it"
+    );
+    assert_eq!(
+        db.run_status(&production).await.unwrap(),
+        Some(RunStatus::Running),
+        "production takes its own slot"
+    );
+}
+
+// A governed (environment-targeting) deploy sharing one concurrency group, under
+// the same `cancel-in-progress` policy.
+const GOVERNED_CONCURRENCY_YAML: &str = r#"
+on:
+  manual: {}
+environment: prod
+concurrency:
+  group: "deploy-prod"
+  policy: cancel-in-progress
+steps:
+  - { id: ship, image: busybox, command: ["true"] }
+"#;
+
+/// A governed deploy under `cancel-in-progress` SERIALIZES against its group but
+/// must NOT cancel the in-flight slot holder (ADR-0032: an in-flight production
+/// deploy is not disposable). The declared `cancel-in-progress` is downgraded to
+/// queue-and-wait for governed runs; ungoverned CI keeps newest-wins cancel.
+#[tokio::test]
+async fn governed_deploy_serializes_without_cancelling_the_holder() {
+    let forge = scarab_testkit::FakeForge::new()
+        .with_file(".scarab/deploy.yaml", GOVERNED_CONCURRENCY_YAML)
+        .with_commit("refs/heads/main", "sha-1");
+    let db = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let envs = Arc::new(FakeEnvironments::default());
+    envs.put_environment(
+        "acme",
+        "web",
+        &Environment {
+            name: "prod".into(),
+            protection: prod_rules(&[], &["refs/heads/main"]),
+        },
+    )
+    .await
+    .unwrap();
+
+    let dispatch = || {
+        let forge = &forge;
+        let db = db.clone();
+        let clock = clock.clone();
+        let envs = envs.clone();
+        async move {
+            dispatch_run(
+                forge,
+                db.as_ref(),
+                clock.as_ref(),
+                Some(envs.as_ref()),
+                "bob".into(),
+                repo(),
+                "refs/heads/main".into(),
+                "deploy".into(),
+                std::collections::BTreeMap::new(),
+                DispatchKind::Manual,
+                None,
+            )
+            .await
+            .expect("dispatch a governed deploy")
+        }
+    };
+
+    let a = dispatch().await;
+    let b = dispatch().await;
+
+    // Despite the pipeline declaring `cancel-in-progress`, a governed run stores
+    // the queue-and-wait policy so the slot-cancel path can never fire.
+    assert_eq!(
+        db.run_concurrency(&a).await.unwrap(),
+        Some(("deploy-prod".to_string(), ConcurrencyPolicy::Queue)),
+        "governed deploy is queue-and-wait, not cancel-in-progress"
+    );
+
+    let exec = FakeExecutor::new();
+    let sched = Scheduler::new(db.as_ref(), clock.as_ref() as &dyn Clock, &exec, "sched");
+
+    // A takes the slot and runs.
+    sched.admit(&a).await.unwrap();
+    assert_eq!(db.run_status(&a).await.unwrap(), Some(RunStatus::Running));
+
+    // B contends for the same slot: A is NOT cancelled, and B waits (Pending).
+    sched.admit(&b).await.unwrap();
+    assert_eq!(
+        db.run_status(&a).await.unwrap(),
+        Some(RunStatus::Running),
+        "the in-flight governed deploy is not cancelled by a newer one"
+    );
+    assert_eq!(
+        db.run_status(&b).await.unwrap(),
+        Some(RunStatus::Pending),
+        "the newer governed deploy serializes behind the holder"
     );
 }
