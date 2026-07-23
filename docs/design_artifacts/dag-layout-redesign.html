@@ -137,7 +137,22 @@
     font-family:var(--mono);font-size:11.5px;color:#9fc6b2;line-height:1.7}
   .term .ln{white-space:pre-wrap}.term .warn{color:#e0b072}
 
-  /* callouts over the proposal */
+  /* ─── proposal B — stack (blueprint band on top, evidence pinned below) ── */
+  .stage-b{height:300px}
+  .canvas-b{padding:20px 26px;overflow:hidden}
+  .lane-b{margin-bottom:16px}
+  .lr{display:flex;align-items:center;gap:44px;padding-top:4px}
+  .lr .col{display:flex;flex-direction:column;gap:14px;position:relative}
+  .lr .col:not(:last-child)::after{content:"";position:absolute;right:-34px;top:calc(50% - 1px);width:28px;height:1px;background:var(--t-line)}
+  .lr .node{min-width:124px}
+  .evidence-b{background:var(--t-bg);border-top:1px solid var(--t-line)}
+  .evidence-b .dh{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--t-line)}
+  .evidence-b .dh .id{font-size:14px;font-weight:600;color:var(--t-ink)}
+  .evidence-b .dh .chip{font-family:var(--mono);font-size:10px;color:var(--danger);border:1px solid color-mix(in srgb,var(--danger) 45%,transparent);padding:1px 7px;border-radius:999px}
+  .tabs-inline{padding:0;margin-left:14px}
+  .evidence-b .term{height:92px;margin:8px 16px 14px}
+
+  /* callouts over the proposals */
   .callouts{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
   .call{display:flex;gap:9px;align-items:flex-start;font-size:13px;color:var(--muted);flex:1 1 240px;
     padding:11px 13px;border:1px solid var(--line);border-radius:10px;background:var(--card)}
@@ -166,7 +181,7 @@
     <div><div class="kicker">Design artifact · run detail</div>
     <h1>Blueprint-first layout</h1></div>
   </header>
-  <p class="sub">The DAG is Scarab's differentiator, but today it's boxed into a third of the run-detail width and a fixed height — a real 10-step pipeline with a services lane can't be seen at once. This proposes making the blueprint the primary, pannable canvas with evidence in an on-demand drawer. <b style="color:var(--emerald)">Recommendation A</b>, ready to build once approved.</p>
+  <p class="sub">The DAG is Scarab's differentiator, but today it's boxed into a third of the run-detail width and a fixed height — a real 10-step pipeline with a services lane can't be seen at once. This proposes making the blueprint the primary, pannable canvas with evidence in an on-demand drawer. <b style="color:var(--emerald)">Recommendation A</b> — with <b>B</b> rendered below for a side-by-side comparison.</p>
 
   <h2><span class="n">1</span> The problem</h2>
   <p class="lede">The run detail crams <b>three</b> things across one row — the versions rail, the blueprint, and the evidence pane. The blueprint, the one view that's inherently 2-D and unbounded, loses: ~⅓ width and a capped height, so fans scroll sideways and the services lane sits off the top.</p>
@@ -243,20 +258,76 @@
     <div class="call"><span class="m">▫</span><div><b>Minimap.</b> Orientation for big DAGs; the emerald box is your viewport.</div></div>
   </div>
 
-  <h2><span class="n">3</span> Why A</h2>
+  <h2><span class="n">3</span> Proposal B — stack (blueprint on top, evidence pinned below)</h2>
+  <p class="lede">Both surfaces get the full width and stay visible — no drawer to toggle (the GitHub-Actions shape). It only pays off if the blueprint is <b>re-oriented left→right</b> so depth runs along the wide axis and the fan stacks within the band's height. That re-orientation — flipping the flow + the edge routing — is the real cost, and it's bigger than A's additive drawer.</p>
+
+  <div class="frame">
+    <div class="bar">
+      <span class="crumb"><span class="dim">scarab-ci ›</span> run #5</span>
+      <span class="pill run">running</span>
+      <span class="spacer"></span>
+      <button class="btn">↻ Rerun from step</button>
+      <button class="btn danger">Cancel run</button>
+      <button class="btn">›_ Debug</button>
+    </div>
+    <div class="toolbar">
+      <span class="vdrop">◈ latest ▾</span>
+      <span style="font-family:var(--mono);font-size:11px;color:var(--muted)">PIPELINE · 10 steps · blueprint ↑ / evidence ↓</span>
+      <span class="cc"><button title="fit to view">⤢</button></span>
+    </div>
+    <div class="stage stage-b">
+      <div class="canvas canvas-b">
+        <div class="lane lane-b">
+          <span class="lbl">SERVICES</span>
+          <span class="svc"><span class="dot"></span><span class="nm">postgres</span><span class="mt">:5432 · ready</span><span class="ico">🛢</span></span>
+        </div>
+        <div class="lr">
+          <div class="col"><div class="node ok"><div class="top"><span class="ring"></span><span class="id">checkout</span></div><span class="meta">✓ 12s</span></div></div>
+          <div class="col fan">
+            <div class="node ok"><div class="top"><span class="ring"></span><span class="id">lint</span></div><span class="meta">✓ 2m01s</span></div>
+            <div class="node running sel"><div class="top"><span class="ring"></span><span class="id">test ·stable</span></div><span class="meta">running · 1m</span><span class="sidecar">⬡ redis</span></div>
+            <div class="node ok"><div class="top"><span class="ring"></span><span class="id">version</span></div><span class="meta">✓ 8s</span></div>
+          </div>
+          <div class="col"><div class="node"><div class="top"><span class="ring"></span><span class="id">build</span></div><span class="meta">pending</span></div></div>
+          <div class="col"><div class="node gate"><div class="top"><span class="ring"></span><span class="id">approve</span></div><span class="meta">gate · manual</span></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="evidence-b">
+      <div class="dh"><span class="id">test ·stable</span><span class="chip">try 1 · running</span>
+        <span class="tabs tabs-inline"><span class="tb on">Logs</span><span class="tb">Results</span><span class="tb">Outputs</span><span class="tb">Workspace</span></span></div>
+      <div class="csel"><button>step</button><button class="on">redis</button></div>
+      <div class="term">
+        <div class="ln">1:C 23 Jul 2026 10:57:06 * Redis is starting · version=7.4.9</div>
+        <div class="ln">1:M * Running mode=standalone, port=6379.</div>
+        <div class="ln">1:M * Ready to accept connections tcp</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="callouts">
+    <div class="call"><span class="m">▭</span><div><b>Left→right flow.</b> Depth runs along the wide axis; the fan (lint / test / version) stacks within the band height.</div></div>
+    <div class="call"><span class="m">▤</span><div><b>Evidence pinned below.</b> Always visible — best for watching a run without a click.</div></div>
+    <div class="call"><span class="m">↻</span><div><b>Re-orientation cost.</b> Flipping the DAG flow + edge routing is real work, vs A's additive drawer.</div></div>
+  </div>
+
+  <h2><span class="n">4</span> A vs B — the call</h2>
+  <div class="cols">
+    <div class="card"><h3>A · canvas + drawer <span class="tag rec">recommended</span></h3>
+      <p>Blueprint is the hero (full canvas + pan/zoom); evidence on demand in a wide drawer. Additive change. Cost: logs aren't pinned — mitigated by auto-opening for the running step.</p></div>
+    <div class="card"><h3>B · stack</h3>
+      <p>Both pinned, full-width, no toggle. Cost: only worth it with the DAG re-oriented left→right (flow + edge-routing rework).</p></div>
+  </div>
   <ul class="why">
-    <li>It matches Scarab's identity — the blueprint <b>is</b> the product's differentiator, so it should be the hero surface, not a squeezed panel.</li>
-    <li>Pan/zoom/fit future-proofs it: a 30-step monorepo pipeline is as navigable as a 3-step one.</li>
-    <li>Logs get a genuinely wide, focused column on demand — and auto-opening the drawer for the running step keeps the live-watch flow.</li>
-    <li>Minimal new concepts: a drawer and canvas controls are patterns people already know.</li>
+    <li><b>I still lean A.</b> The blueprint <b>is</b> Scarab's differentiator — it earns the hero surface, and pan / zoom / fit future-proofs any pipeline size.</li>
+    <li>A is the smaller, additive change (a drawer + canvas controls) vs B's flow re-orientation.</li>
+    <li>Reach for <b>B</b> only if pinned-always logs during live runs matter more to you than a big, uncluttered graph.</li>
   </ul>
 
-  <div class="note"><h3>Alternative B — stack (DAG on top, evidence below)</h3>
-    <p>Both always-visible, full-width, no toggling (the GitHub-Actions shape). Its catch: it wants the DAG <b>re-oriented left→right</b> so depth spreads along the wide axis; today's top→bottom flow makes deep pipelines tall, so a wide-but-short band alone wouldn't fix "can't reach the top". A bigger change than A. I'd keep B in reserve if you decide always-pinned logs matter more than a big graph.</p></div>
   <div class="note" style="border-left-color:var(--muted)"><h3>Rejected — modal / Miller columns</h3>
     <p>A <b>modal</b> fully occludes the graph (the point of a blueprint is keeping the shape in view). <b>Miller columns</b> model hierarchies (folder→file); a DAG isn't one, so column-1 would flatten the graph into a step list and throw away the 2-D layout.</p></div>
 
-  <div class="q"><b>Two open calls for you:</b> (1) build <b>A</b> as shown, or want me to also render <b>B</b> here first? (2) keep the <b>versions rail</b> as its own column, or fold it into the <code>◈ latest ▾</code> dropdown shown in the toolbar to reclaim width?</div>
+  <div class="q"><b>Your call:</b> A or B? (I lean <b>A</b>.) And: keep the <b>versions rail</b> as its own column, or fold it into the <code>◈ latest ▾</code> toolbar dropdown to reclaim width? Say the word and I'll build it.</div>
 
   <footer>Scarab · docs/design_artifacts/dag-layout-redesign.html · mockup, not production · shape drawn from dogfood run #5 (checkout → lint · test⬡ · version → build → approve · postgres shared service)</footer>
 </div>
@@ -265,13 +336,13 @@
   const drawer=document.getElementById('drawer'), canvas=document.getElementById('canvas'), dName=document.getElementById('dName');
   let selected=null;
   function open_(name,svc){
-    document.querySelectorAll('.node,.svc').forEach(n=>n.classList.remove('sel'));
+    document.querySelectorAll('#canvas .node,#canvas .svc').forEach(n=>n.classList.remove('sel'));
     if(event&&event.currentTarget) event.currentTarget.classList.add('sel');
     dName.textContent = svc ? (name+'  · shared service') : name;
     drawer.classList.add('open'); canvas.classList.add('pushed'); selected=name;
   }
   function close_(){ drawer.classList.remove('open'); canvas.classList.remove('pushed');
-    document.querySelectorAll('.node,.svc').forEach(n=>n.classList.remove('sel')); selected=null; }
+    document.querySelectorAll('#canvas .node,#canvas .svc').forEach(n=>n.classList.remove('sel')); selected=null; }
   function fit(){ close_(); canvas.animate([{outline:'2px solid var(--emerald)'},{outline:'2px solid transparent'}],{duration:600}); }
 </script>
 </body>
