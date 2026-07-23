@@ -2190,7 +2190,30 @@ impl<'a> Scheduler<'a> {
             .set_attempt_failure(run, step, attempt, kind)
             .await?;
 
-        let used = attempts.len() as u32;
+        // The author `retry:` budget is per-Take (ADR-0056): a Rerun opens a new
+        // Take and re-arms this step with a fresh attempt, so its retries reset.
+        // Count only the CURRENT Take's attempts by replaying the event log in
+        // order (clock-independent, mirroring the FE's `deriveTakes`): each
+        // `RunRerunRequested` that re-armed this step resets the count, and each of
+        // this step's `AttemptStarted` increments it. Without this the budget is
+        // billed against the flat cross-Take history, so a step that exhausted its
+        // retries in an earlier Take would never retry again after a Rerun. (A
+        // `StepRetryRequested` is NOT a Take boundary — manual in-Take retries
+        // still consume the budget.)
+        let mut used = 0u32;
+        for e in self.db.events(run).await? {
+            match &e.kind {
+                EventPayload::RunRerunRequested { invalidated, .. }
+                    if invalidated.contains(step) =>
+                {
+                    used = 0;
+                }
+                EventPayload::AttemptStarted { step: s, .. } if s == step => {
+                    used += 1;
+                }
+                _ => {}
+            }
+        }
 
         let configured = self.step_retry(run, step).await?.map(|r| 1 + r.max);
         let allowed = match kind {

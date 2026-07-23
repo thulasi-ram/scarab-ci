@@ -250,6 +250,57 @@ async fn configured_retry_exhausts_and_fails() {
 }
 
 #[tokio::test]
+async fn author_retry_budget_resets_per_take_on_rerun() {
+    // Regression (ADR-0056): the `retry:` budget is per-Take. A step that
+    // exhausted its retries in Take 1 must retry AGAIN when a Rerun opens Take 2 —
+    // the budget must not be billed against the flat cross-Take attempt history.
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    seed(&db, Some(2)).await; // 1 + max(2) = 3 attempts allowed PER TAKE
+    for _ in 0..6 {
+        exec.script_outcome(failed(FailureClass::Step));
+    }
+
+    // Take 1: initial + 2 retries = 3 attempts, then the step (and run) Failed.
+    for _ in 0..6 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed)
+    );
+    assert_eq!(attempts(&db).await.len(), 3, "take 1: initial + 2 retries");
+
+    // Rerun opens Take 2 and re-arms the step with a fresh attempt.
+    scarab_engine::rerun_step(
+        &db as &dyn Db,
+        &clock as &dyn Clock,
+        &run_id(),
+        &step_id(),
+        Some("op".into()),
+    )
+    .await
+    .unwrap();
+
+    // Take 2: the budget RESETS — 3 more attempts (a4..a6), not zero.
+    for _ in 0..6 {
+        tick(&db, &clock, &exec).await;
+    }
+    assert_eq!(
+        attempts(&db).await.len(),
+        6,
+        "take 2 retries reset: 3 more attempts, not a single doomed one"
+    );
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed)
+    );
+}
+
+#[tokio::test]
 async fn lost_without_the_assertion_is_terminal_and_never_relaunched() {
     let (db, clock, exec) = (
         InMemoryDb::new(),
