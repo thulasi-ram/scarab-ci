@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Run detail — blueprint-first layout</title>
+<style>
+  /* ─── palette ─────────────────────────────────────────────────────────
+     Page chrome is theme-aware. The blueprint canvas is ALWAYS dark — it is
+     Scarab's terminal surface, exactly as the real DAG renders today. */
+  :root{
+    --page:#f5f6f3; --ink:#18211d; --muted:#5d6a63; --card:#ffffff;
+    --line:#e2e6e1; --line-2:#d3d9d3;
+    --emerald:#0f9d6b; --emerald-bright:#12b47c; --copper:#bd6a44;
+    /* terminal (canvas) tokens — dark in both themes */
+    --t-bg:#0b120f; --t-elev:#141d18; --t-line:#2b3d34; --t-ink:#d6e6dc;
+    --t-muted:#7f9488; --ok:#34d399; --running:#2dd4bf; --danger:#f0776b;
+    --t-copper:#d18a63;
+    --shadow:0 1px 2px rgba(20,40,30,.06),0 8px 24px rgba(20,40,30,.06);
+    --font:"Space Grotesk",system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+    --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --page:#0d1310; --ink:#dce6e0; --muted:#8b9a91; --card:#131b16;
+           --line:#222d27; --line-2:#2c3831; --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 30px rgba(0,0,0,.35); }
+  }
+  :root[data-theme="light"]{ --page:#f5f6f3; --ink:#18211d; --muted:#5d6a63; --card:#fff; --line:#e2e6e1; --line-2:#d3d9d3; --shadow:0 1px 2px rgba(20,40,30,.06),0 8px 24px rgba(20,40,30,.06); }
+  :root[data-theme="dark"]{ --page:#0d1310; --ink:#dce6e0; --muted:#8b9a91; --card:#131b16; --line:#222d27; --line-2:#2c3831; --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 30px rgba(0,0,0,.35); }
+
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--page);color:var(--ink);font-family:var(--font);
+    line-height:1.55;-webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(circle at 1px 1px,color-mix(in srgb,var(--muted) 22%,transparent) 1px,transparent 0);
+    background-size:22px 22px;}
+  .wrap{max-width:1120px;margin:0 auto;padding:56px 28px 96px}
+  header.top{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  .emblem{width:26px;height:26px;border-radius:6px;background:
+     conic-gradient(from 210deg,var(--emerald),var(--emerald-bright),#c79a3e,var(--emerald));
+     box-shadow:inset 0 0 0 1px rgba(255,255,255,.15);flex:0 0 auto;transform:translateY(4px)}
+  h1{font-size:29px;font-weight:600;letter-spacing:-.02em;margin:0;text-wrap:balance}
+  .kicker{font-family:var(--mono);font-size:11.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--emerald);font-weight:600}
+  .sub{color:var(--muted);font-size:15px;max-width:68ch;margin:10px 0 0}
+  h2{font-size:13px;font-family:var(--mono);letter-spacing:.15em;text-transform:uppercase;color:var(--muted);
+     font-weight:600;margin:52px 0 16px;padding-bottom:9px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+  h2 .n{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:5px;background:var(--emerald);color:#fff;font-size:11px}
+  p.lede{font-size:15.5px;max-width:72ch;color:var(--ink)}
+  p.lede b{color:var(--emerald)}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}
+  @media(max-width:720px){.cols{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;box-shadow:var(--shadow)}
+  .card h3{margin:0 0 6px;font-size:14.5px}
+  .card p{margin:0;color:var(--muted);font-size:13.5px}
+  .tag{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:5px;border:1px solid var(--line-2);color:var(--muted)}
+  .tag.rec{color:var(--emerald);border-color:color-mix(in srgb,var(--emerald) 45%,transparent);background:color-mix(in srgb,var(--emerald) 10%,transparent)}
+
+  /* ─── the mock run-detail frame ──────────────────────────────────────── */
+  .frame{border:1px solid var(--line);border-radius:14px;overflow:hidden;box-shadow:var(--shadow);background:var(--card);margin-top:6px}
+  .frame .bar{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .crumb{font-size:14px;font-weight:600}.crumb .dim{color:var(--muted);font-weight:500}
+  .pill{font-family:var(--mono);font-size:11px;padding:3px 9px;border-radius:999px;font-weight:600}
+  .pill.run{background:color-mix(in srgb,var(--running) 16%,transparent);color:var(--running)}
+  .spacer{flex:1}
+  .btn{font-family:var(--mono);font-size:12px;padding:5px 11px;border-radius:7px;border:1px solid var(--line-2);
+    background:transparent;color:var(--muted);cursor:pointer;transition:.14s}
+  .btn:hover{border-color:var(--emerald);color:var(--ink)}
+  .btn.danger{color:var(--danger);border-color:transparent}
+  .btn.danger:hover{border-color:var(--danger)}
+
+  .toolbar{display:flex;align-items:center;gap:10px;padding:9px 16px;border-bottom:1px solid var(--line);background:color-mix(in srgb,var(--muted) 5%,transparent)}
+  .vdrop{font-family:var(--mono);font-size:12px;padding:5px 10px;border:1px solid var(--line-2);border-radius:7px;color:var(--ink);cursor:pointer}
+  .cc{margin-left:auto;display:flex;gap:6px}
+  .cc button{width:30px;height:30px;border-radius:7px;border:1px solid var(--line-2);background:transparent;color:var(--muted);cursor:pointer;font-size:14px;display:grid;place-items:center;transition:.14s}
+  .cc button:hover{border-color:var(--emerald);color:var(--ink)}
+
+  /* the stage: canvas + sliding drawer */
+  .stage{position:relative;height:430px;overflow:hidden;background:var(--t-bg)}
+  .canvas{position:absolute;inset:0;padding:26px;overflow:auto;transition:margin-right .32s cubic-bezier(.4,0,.2,1)}
+  .canvas.pushed{margin-right:396px}
+  .canvas::before{content:"";position:absolute;inset:0;pointer-events:none;
+    background-image:radial-gradient(circle at 1px 1px,rgba(120,160,140,.14) 1px,transparent 0);background-size:20px 20px}
+
+  /* services lane */
+  .lane{position:relative;display:flex;align-items:center;gap:12px;padding-bottom:14px;margin-bottom:14px;border-bottom:1px dashed var(--t-line)}
+  .lane .lbl{font-family:var(--mono);font-size:9.5px;letter-spacing:.18em;color:var(--t-muted);writing-mode:horizontal-tb}
+  .svc{display:inline-flex;align-items:center;gap:9px;padding:7px 14px;border-radius:999px;
+    border:1px solid var(--t-copper);background:color-mix(in srgb,var(--t-copper) 12%,var(--t-elev));color:var(--t-ink);cursor:pointer}
+  .svc .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .svc .nm{font-size:13px;font-weight:600}.svc .mt{font-family:var(--mono);font-size:10px;color:var(--t-muted)}
+  .svc .ico{margin-left:2px;opacity:.7}
+
+  /* step rows (left→right depth, wraps for demo) */
+  .flow{position:relative;display:flex;align-items:flex-start;gap:34px;flex-wrap:wrap}
+  .node{position:relative;display:inline-flex;flex-direction:column;gap:2px;min-width:118px;padding:10px 13px;border-radius:9px;
+    border:1px solid var(--t-line);background:var(--t-elev);color:var(--t-ink);cursor:pointer;transition:.14s}
+  .node:hover{border-color:var(--emerald-bright)}
+  .node.sel{border-color:var(--emerald-bright);box-shadow:inset 0 0 0 1px var(--emerald-bright)}
+  .node .top{display:flex;align-items:center;gap:8px}
+  .node .ring{width:12px;height:12px;border-radius:50%;border:2px solid var(--t-muted);flex:0 0 auto}
+  .node.ok .ring{border-color:var(--ok);background:color-mix(in srgb,var(--ok) 30%,transparent)}
+  .node.running .ring{border-color:var(--running);animation:pulse 1.4s infinite}
+  .node.gate .ring{border-color:var(--copper)}
+  @keyframes pulse{50%{box-shadow:0 0 0 4px color-mix(in srgb,var(--running) 22%,transparent)}}
+  .node .id{font-size:13px;font-weight:600}
+  .node .meta{font-family:var(--mono);font-size:10px;color:var(--t-muted)}
+  .sidecar{margin-top:7px;display:inline-flex;align-items:center;gap:5px;align-self:flex-start;
+    padding:2px 8px;border-radius:6px;border:1px solid color-mix(in srgb,var(--t-copper) 55%,transparent);
+    background:color-mix(in srgb,var(--t-copper) 12%,transparent);color:var(--t-copper);font-family:var(--mono);font-size:10.5px}
+  /* connective arrows (pseudo) */
+  .flow .node:not(:last-child)::after{content:"";position:absolute;right:-30px;top:20px;width:22px;height:1px;
+    background:var(--t-line)}
+  .flow .node.hot::after{background:var(--running)}
+
+  /* dotted uses edge, drawn as an absolutely placed connector */
+  .uses{position:absolute;left:78px;top:40px;width:1px;height:34px;
+    background:repeating-linear-gradient(var(--t-copper) 0 4px,transparent 4px 8px);opacity:.8}
+
+  .minimap{position:absolute;right:14px;bottom:14px;width:120px;height:66px;border:1px solid var(--t-line);border-radius:7px;
+    background:color-mix(in srgb,var(--t-bg) 70%,#000);display:grid;place-items:center;color:var(--t-muted);font-family:var(--mono);font-size:9px;overflow:hidden}
+  .minimap .box{position:absolute;border:1px solid var(--emerald);width:44px;height:26px;left:10px;top:12px;border-radius:2px}
+
+  /* drawer */
+  .drawer{position:absolute;top:0;right:0;height:100%;width:396px;transform:translateX(100%);
+    transition:transform .32s cubic-bezier(.4,0,.2,1);background:var(--t-bg);border-left:1px solid var(--t-line);display:flex;flex-direction:column}
+  .drawer.open{transform:translateX(0)}
+  .drawer .dh{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--t-line)}
+  .drawer .dh .id{font-size:14px;font-weight:600;color:var(--t-ink)}
+  .drawer .dh .chip{font-family:var(--mono);font-size:10px;color:var(--danger);border:1px solid color-mix(in srgb,var(--danger) 45%,transparent);padding:1px 7px;border-radius:999px}
+  .drawer .x{margin-left:auto;background:transparent;border:0;color:var(--t-muted);cursor:pointer;font-size:17px}
+  .drawer .grip{position:absolute;left:-3px;top:0;height:100%;width:6px;cursor:col-resize}
+  .tabs{display:flex;gap:2px;padding:8px 12px 0}
+  .tabs .tb{font-family:var(--mono);font-size:11px;padding:5px 10px;border-radius:6px 6px 0 0;color:var(--t-muted);cursor:pointer}
+  .tabs .tb.on{color:var(--t-ink);background:var(--t-elev)}
+  .csel{display:flex;gap:4px;margin:8px 12px}
+  .csel button{font-family:var(--mono);font-size:10.5px;padding:3px 9px;border-radius:6px;border:1px solid var(--t-line);background:transparent;color:var(--t-muted);cursor:pointer}
+  .csel button.on{color:var(--t-ink);border-color:var(--emerald);background:color-mix(in srgb,var(--emerald) 12%,transparent)}
+  .term{flex:1;margin:4px 12px 12px;background:#070c09;border-radius:8px;padding:12px 14px;overflow:auto;
+    font-family:var(--mono);font-size:11.5px;color:#9fc6b2;line-height:1.7}
+  .term .ln{white-space:pre-wrap}.term .warn{color:#e0b072}
+
+  /* callouts over the proposal */
+  .callouts{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
+  .call{display:flex;gap:9px;align-items:flex-start;font-size:13px;color:var(--muted);flex:1 1 240px;
+    padding:11px 13px;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+  .call b{color:var(--ink);font-weight:600}
+  .call .m{font-family:var(--mono);color:var(--emerald);font-size:12px;flex:0 0 auto}
+
+  .hint{text-align:center;color:var(--muted);font-family:var(--mono);font-size:11.5px;margin:12px 0 0}
+  .hint kbd{border:1px solid var(--line-2);border-radius:5px;padding:1px 6px;color:var(--ink)}
+
+  ul.why{list-style:none;padding:0;margin:12px 0 0;display:grid;gap:9px}
+  ul.why li{display:flex;gap:11px;align-items:flex-start;font-size:14.5px}
+  ul.why li::before{content:"›";color:var(--emerald);font-weight:700;flex:0 0 auto}
+  .note{margin-top:22px;padding:16px 18px;border:1px solid var(--line);border-left:3px solid var(--copper);border-radius:10px;background:var(--card)}
+  .note h3{margin:0 0 6px;font-size:14.5px}.note p{margin:0;color:var(--muted);font-size:13.5px}
+  .q{margin-top:20px;padding:16px 18px;border:1px dashed color-mix(in srgb,var(--emerald) 40%,var(--line));border-radius:10px;background:color-mix(in srgb,var(--emerald) 5%,transparent)}
+  .q b{color:var(--emerald)}
+  footer{margin-top:52px;color:var(--muted);font-size:12px;font-family:var(--mono);border-top:1px solid var(--line);padding-top:16px}
+  .toggle{position:fixed;top:16px;right:16px;z-index:9}
+</style>
+</head>
+<body>
+<button class="btn toggle" onclick="document.documentElement.dataset.theme=(document.documentElement.dataset.theme==='dark'?'light':'dark')">◑ theme</button>
+<div class="wrap">
+
+  <header class="top"><span class="emblem"></span>
+    <div><div class="kicker">Design artifact · run detail</div>
+    <h1>Blueprint-first layout</h1></div>
+  </header>
+  <p class="sub">The DAG is Scarab's differentiator, but today it's boxed into a third of the run-detail width and a fixed height — a real 10-step pipeline with a services lane can't be seen at once. This proposes making the blueprint the primary, pannable canvas with evidence in an on-demand drawer. <b style="color:var(--emerald)">Recommendation A</b>, ready to build once approved.</p>
+
+  <h2><span class="n">1</span> The problem</h2>
+  <p class="lede">The run detail crams <b>three</b> things across one row — the versions rail, the blueprint, and the evidence pane. The blueprint, the one view that's inherently 2-D and unbounded, loses: ~⅓ width and a capped height, so fans scroll sideways and the services lane sits off the top.</p>
+  <div class="cols">
+    <div class="card"><h3>Today <span class="tag">cramped</span></h3>
+      <p>rail&nbsp;│&nbsp;<b style="color:var(--copper)">dag (½)</b>&nbsp;│&nbsp;logs — the graph shows ~2 nodes before it scrolls; the postgres node is unreachable without fighting the scroll.</p></div>
+    <div class="card"><h3>Goal</h3>
+      <p>The blueprint reads at a glance (services + fans + gates), and evidence gets a wide, focused column exactly when you want it.</p></div>
+  </div>
+
+  <h2><span class="n">2</span> Proposal A — full-width canvas + evidence drawer <span class="tag rec">recommended</span></h2>
+  <p class="lede">The blueprint takes the full content width and becomes a proper graph canvas (pan / zoom / fit-to-view / minimap). Click a step and a resizable drawer slides in from the right with its evidence; dismiss it and the whole graph is back.</p>
+
+  <div class="frame">
+    <div class="bar">
+      <span class="crumb"><span class="dim">scarab-ci ›</span> run #5</span>
+      <span class="pill run">running</span>
+      <span class="spacer"></span>
+      <button class="btn">↻ Rerun from step</button>
+      <button class="btn danger">Cancel run</button>
+      <button class="btn">›_ Debug</button>
+    </div>
+    <div class="toolbar">
+      <span class="vdrop">◈ latest ▾</span>
+      <span style="font-family:var(--mono);font-size:11px;color:var(--muted)">PIPELINE · 10 steps</span>
+      <span class="cc">
+        <button title="fit to view" onclick="fit()">⤢</button>
+        <button title="zoom in">＋</button>
+        <button title="zoom out">－</button>
+        <button title="minimap">▫</button>
+      </span>
+    </div>
+    <div class="stage">
+      <div class="canvas" id="canvas">
+        <div class="lane">
+          <span class="lbl">SERVICES</span>
+          <span class="svc" onclick="open_('postgres',true)"><span class="dot"></span><span class="nm">postgres</span><span class="mt">:5432 · ready</span><span class="ico">🛢</span></span>
+        </div>
+        <div class="flow">
+          <span class="uses"></span>
+          <div class="node ok" onclick="open_('checkout')"><div class="top"><span class="ring"></span><span class="id">checkout</span></div><span class="meta">✓ 12s</span></div>
+          <div class="node ok" onclick="open_('lint')"><div class="top"><span class="ring"></span><span class="id">lint</span></div><span class="meta">✓ 2m01s</span></div>
+          <div class="node running hot" onclick="open_('test')"><div class="top"><span class="ring"></span><span class="id">test ·stable</span></div><span class="meta">running · 1m</span><span class="sidecar">⬡ redis</span></div>
+          <div class="node ok" onclick="open_('version')"><div class="top"><span class="ring"></span><span class="id">version</span></div><span class="meta">✓ 8s</span></div>
+          <div class="node" onclick="open_('build')"><div class="top"><span class="ring"></span><span class="id">build</span></div><span class="meta">pending</span></div>
+          <div class="node gate" onclick="open_('approve')"><div class="top"><span class="ring"></span><span class="id">approve</span></div><span class="meta">gate · manual</span></div>
+        </div>
+        <div class="minimap"><div class="box"></div>minimap</div>
+      </div>
+
+      <aside class="drawer" id="drawer">
+        <div class="grip" title="drag to resize"></div>
+        <div class="dh"><span class="id" id="dName">test ·stable</span><span class="chip">try 1 · running</span>
+          <button class="x" onclick="close_()">✕</button></div>
+        <div class="tabs"><span class="tb on">Logs</span><span class="tb">Results</span><span class="tb">Outputs</span><span class="tb">Workspace</span></div>
+        <div class="csel"><button>step</button><button class="on">redis</button></div>
+        <div class="term">
+          <div class="ln">1:C 23 Jul 2026 10:57:06 * Redis is starting</div>
+          <div class="ln">1:C * Redis version=7.4.9, bits=64, pid=1</div>
+          <div class="ln warn"># Warning: no config file specified, using default</div>
+          <div class="ln">1:M * Running mode=standalone, port=6379.</div>
+          <div class="ln">1:M * Server initialized</div>
+          <div class="ln">1:M * Ready to accept connections tcp</div>
+        </div>
+      </aside>
+    </div>
+  </div>
+  <p class="hint">This mockup is live — <kbd>click any node</kbd> to open the drawer, the <kbd>postgres</kbd> pill for a service, <kbd>✕</kbd> or <kbd>⤢ fit</kbd> to close.</p>
+
+  <div class="callouts">
+    <div class="call"><span class="m">◱</span><div><b>Full-width canvas.</b> The whole pipeline + services lane fit without side-scroll — the blueprint earns the room.</div></div>
+    <div class="call"><span class="m">⤢</span><div><b>Pan / zoom / fit.</b> Standard graph-canvas kit, so any node is always reachable at any pipeline size.</div></div>
+    <div class="call"><span class="m">▍</span><div><b>Evidence drawer.</b> Slides in on select, resizable, auto-opens for the running step so "watch it run" still works.</div></div>
+    <div class="call"><span class="m">▫</span><div><b>Minimap.</b> Orientation for big DAGs; the emerald box is your viewport.</div></div>
+  </div>
+
+  <h2><span class="n">3</span> Why A</h2>
+  <ul class="why">
+    <li>It matches Scarab's identity — the blueprint <b>is</b> the product's differentiator, so it should be the hero surface, not a squeezed panel.</li>
+    <li>Pan/zoom/fit future-proofs it: a 30-step monorepo pipeline is as navigable as a 3-step one.</li>
+    <li>Logs get a genuinely wide, focused column on demand — and auto-opening the drawer for the running step keeps the live-watch flow.</li>
+    <li>Minimal new concepts: a drawer and canvas controls are patterns people already know.</li>
+  </ul>
+
+  <div class="note"><h3>Alternative B — stack (DAG on top, evidence below)</h3>
+    <p>Both always-visible, full-width, no toggling (the GitHub-Actions shape). Its catch: it wants the DAG <b>re-oriented left→right</b> so depth spreads along the wide axis; today's top→bottom flow makes deep pipelines tall, so a wide-but-short band alone wouldn't fix "can't reach the top". A bigger change than A. I'd keep B in reserve if you decide always-pinned logs matter more than a big graph.</p></div>
+  <div class="note" style="border-left-color:var(--muted)"><h3>Rejected — modal / Miller columns</h3>
+    <p>A <b>modal</b> fully occludes the graph (the point of a blueprint is keeping the shape in view). <b>Miller columns</b> model hierarchies (folder→file); a DAG isn't one, so column-1 would flatten the graph into a step list and throw away the 2-D layout.</p></div>
+
+  <div class="q"><b>Two open calls for you:</b> (1) build <b>A</b> as shown, or want me to also render <b>B</b> here first? (2) keep the <b>versions rail</b> as its own column, or fold it into the <code>◈ latest ▾</code> dropdown shown in the toolbar to reclaim width?</div>
+
+  <footer>Scarab · docs/design_artifacts/dag-layout-redesign.html · mockup, not production · shape drawn from dogfood run #5 (checkout → lint · test⬡ · version → build → approve · postgres shared service)</footer>
+</div>
+
+<script>
+  const drawer=document.getElementById('drawer'), canvas=document.getElementById('canvas'), dName=document.getElementById('dName');
+  let selected=null;
+  function open_(name,svc){
+    document.querySelectorAll('.node,.svc').forEach(n=>n.classList.remove('sel'));
+    if(event&&event.currentTarget) event.currentTarget.classList.add('sel');
+    dName.textContent = svc ? (name+'  · shared service') : name;
+    drawer.classList.add('open'); canvas.classList.add('pushed'); selected=name;
+  }
+  function close_(){ drawer.classList.remove('open'); canvas.classList.remove('pushed');
+    document.querySelectorAll('.node,.svc').forEach(n=>n.classList.remove('sel')); selected=null; }
+  function fit(){ close_(); canvas.animate([{outline:'2px solid var(--emerald)'},{outline:'2px solid transparent'}],{duration:600}); }
+</script>
+</body>
+</html>
