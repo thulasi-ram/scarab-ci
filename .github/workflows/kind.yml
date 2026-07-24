@@ -50,6 +50,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # dorny/paths-filter lists the PR's changed files via the API.
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
 
