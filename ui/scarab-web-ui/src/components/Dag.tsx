@@ -10,6 +10,7 @@
 // graph answers "what shape, and where does each step stand", not "which try".
 // Clicking a node selects it.
 import { createSignal, onMount, onCleanup, createEffect, createMemo, For, Show } from "solid-js";
+import { layerSteps } from "../dag-layout";
 import Icon from "./Icon";
 
 export type DagStep = {
@@ -150,27 +151,8 @@ export default function Dag(props: {
   };
 
   // Dependency layers: a step sits one column right of its deepest dependency.
-  const layers = () => {
-    const byId = new Map(props.steps.map((s) => [s.id, s]));
-    const memo = new Map<string, number>();
-    const depth = (id: string, seen: Set<string>): number => {
-      if (memo.has(id)) return memo.get(id)!;
-      if (seen.has(id)) return 0; // cycle guard (validated away server-side)
-      seen.add(id);
-      const s = byId.get(id);
-      const d =
-        !s || s.needs.length === 0 ? 0 : 1 + Math.max(...s.needs.map((n) => depth(n, seen)));
-      seen.delete(id);
-      memo.set(id, d);
-      return d;
-    };
-    const cols: DagStep[][] = [];
-    for (const s of props.steps) {
-      const d = depth(s.id, new Set());
-      (cols[d] ||= []).push(s);
-    }
-    return cols.filter((c) => c && c.length);
-  };
+  // Pure longest-path layering, extracted to dag-layout.ts.
+  const layers = () => layerSteps(props.steps);
 
   // A node's UNSCALED box in graph space (transform-invariant — see `offsetIn`).
   const boxOf = (el: HTMLElement) => {
