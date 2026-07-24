@@ -1,0 +1,73 @@
+# Monthly mutation-testing audit (test-strategy: docs/audits/2026-07-24-test-strategy.md).
+#
+# REPORT-ONLY, never a PR gate: cargo-mutants runs the suite once per mutant
+# (hours-long) and equivalent mutants produce false alarms. Surviving mutants
+# are automated red-first evidence — the test-orchestrator's work queue.
+#
+# No Postgres service on purpose: PG-backed tests loud-skip per mutant run;
+# adding PG would multiply an already hours-long job per mutant for coverage
+# the functional tier's InMemoryDb path mostly duplicates.
+name: mutants
+
+on:
+  schedule:
+    - cron: "0 3 1 * *" # monthly, 1st at 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Single crate to mutate (empty = all three core crates)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [scarab-engine, scarab-db-postgres, scarab-executor-k8s]
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants,cargo-nextest
+      - name: Skip if a single package was requested and this isn't it
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.package != '' && inputs.package != matrix.package }}
+        run: echo "skip=1" >> "$GITHUB_ENV"
+      - name: Mutate ${{ matrix.package }}
+        if: ${{ env.skip != '1' }}
+        # Report-only: swallow the exit code; the artifact + summary are the output.
+        run: |
+          cargo mutants --package "${{ matrix.package }}" --timeout 300 --no-shuffle \
+            --output "mutants-out/${{ matrix.package }}" || true
+      - name: Summarize survivors
+        if: ${{ env.skip != '1' }}
+        run: |
+          out="mutants-out/${{ matrix.package }}/mutants.out"
+          {
+            echo "## cargo-mutants: ${{ matrix.package }}"
+            for f in missed.txt timeout.txt unviable.txt; do
+              if [ -f "$out/$f" ]; then
+                echo "### ${f%.txt} ($(wc -l < "$out/$f"))"
+                echo '```'
+                head -100 "$out/$f"
+                echo '```'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload full report
+        if: ${{ env.skip != '1' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-${{ matrix.package }}
+          path: mutants-out/
+          retention-days: 90

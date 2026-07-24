@@ -923,40 +923,11 @@ async fn create_run(
         }
     }
 
-    let now = st.clock.now().await;
-    let run = new_run_id();
-
-    st.db
-        .create_run(&run, req.pipeline.ir_version, EVENT_VERSION, now)
-        .await?;
-    // Store the compiled IR on the run — self-describing (ADR-0022).
-    let ir = serde_json::to_value(&req.pipeline)
-        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
-    st.db.store_run_ir(&run, &ir).await?;
-    // Freeze the resolved params on the run so every step's interpolation
-    // (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive deterministically.
-    st.db.set_run_params(&run, &resolved).await?;
-    // The Headline (ADR-0057 §3): an optional dispatch reason for this inline
-    // `api`-style run. This path builds no forge `Event`, so the reason is capped
-    // + stamped directly (the same cap `Event::trigger_title` applies). Stamped
-    // only when supplied; no requiredness check here (thread D). Display/audit
-    // only — never in the CEL/interpolation context.
-    if let Some(title) = req
-        .reason
-        .as_deref()
-        .and_then(scarab_forge::cap_trigger_title)
-    {
-        st.db.set_run_trigger_title(&run, &title).await?;
-    }
-    st.db
-        .append_event(&EventKind {
-            version: EVENT_VERSION,
-            run: run.clone(),
-            kind: EventPayload::RunCreated,
-            at: now,
-        })
-        .await?;
-
+    // Admit + translate EVERY step before persisting anything: a request the
+    // API rejects (4xx) must create **no** run. Admitting inside the persist
+    // loop used to leave a rejected multi-step request half-created — its
+    // already-persisted steps schedulable despite the caller's 400.
+    let mut admitted_steps: Vec<(StepId, StepSpec, Vec<StepId>)> = Vec::new();
     for step in &req.pipeline.steps {
         // Admit the step's privilege request (ADR-0039), same as the trigger path.
         // An inline API run carries no Environment, so governed grants
@@ -1003,8 +974,46 @@ async fn create_run(
             matrix_values: Default::default(),
         };
         let needs: Vec<StepId> = step.needs.iter().map(|n| StepId(n.clone())).collect();
+        admitted_steps.push((StepId(step.id.clone()), spec, needs));
+    }
+
+    let now = st.clock.now().await;
+    let run = new_run_id();
+
+    st.db
+        .create_run(&run, req.pipeline.ir_version, EVENT_VERSION, now)
+        .await?;
+    // Store the compiled IR on the run — self-describing (ADR-0022).
+    let ir = serde_json::to_value(&req.pipeline)
+        .map_err(|e| ApiError::Db(DbError::Other(e.to_string())))?;
+    st.db.store_run_ir(&run, &ir).await?;
+    // Freeze the resolved params on the run so every step's interpolation
+    // (`${{ inputs.… }}`) and `SCARAB_PARAM_*` env re-derive deterministically.
+    st.db.set_run_params(&run, &resolved).await?;
+    // The Headline (ADR-0057 §3): an optional dispatch reason for this inline
+    // `api`-style run. This path builds no forge `Event`, so the reason is capped
+    // + stamped directly (the same cap `Event::trigger_title` applies). Stamped
+    // only when supplied; no requiredness check here (thread D). Display/audit
+    // only — never in the CEL/interpolation context.
+    if let Some(title) = req
+        .reason
+        .as_deref()
+        .and_then(scarab_forge::cap_trigger_title)
+    {
+        st.db.set_run_trigger_title(&run, &title).await?;
+    }
+    st.db
+        .append_event(&EventKind {
+            version: EVENT_VERSION,
+            run: run.clone(),
+            kind: EventPayload::RunCreated,
+            at: now,
+        })
+        .await?;
+
+    for (id, spec, needs) in &admitted_steps {
         st.db
-            .create_step_run(&run, &StepId(step.id.clone()), Some(&spec), &needs, now)
+            .create_step_run(&run, id, Some(spec), needs, now)
             .await?;
     }
 

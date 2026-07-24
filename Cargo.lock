@@ -2682,6 +2682,7 @@ dependencies = [
  "scarab-pipeline",
  "scarab-storage",
  "scarab-storage-s3",
+ "scarab-testkit",
  "serde",
  "serde_json",
  "tar",
