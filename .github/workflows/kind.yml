@@ -152,8 +152,17 @@ jobs:
       - name: Resolve host IP reachable from Pods
         id: hostip
         run: |
-          ip="$(docker network inspect kind -f '{{(index .IPAM.Config 0).Gateway}}')"
-          echo "host ip on the kind network: $ip"
+          # The kind network's IPv4 gateway = this host, as seen from the
+          # cluster. The IPAM config may list IPv6 first (or omit Gateway),
+          # so scan all entries; fall back to the default-route source IP.
+          ip="$(docker network inspect kind \
+                  -f '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+          if [ -z "$ip" ]; then
+            ip="$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)"
+          fi
+          echo "host ip reachable from Pods: $ip"
+          test -n "$ip" # fail loud here, not as a silent test hang
           echo "ip=$ip" >> "$GITHUB_OUTPUT"
 
       # Everything is a normal test; `#[ignore]` + the SCARAB_TEST_* gates are
@@ -167,6 +176,9 @@ jobs:
           # A SHA this event guarantees exists on the forge: the PR head, or
           # the pushed main commit (the clone tests fetch it anonymously).
           SCARAB_TEST_CLONE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The clone tests fetch THIS repo, which may be private: hand them
+          # the ambient read-only token (delivered via tmpfs + GIT_ASKPASS).
+          SCARAB_TEST_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SCARAB_TEST_SIDECAR_IMAGE: ${{ env.SIDECAR_IMAGE }}
           SCARAB_TEST_REGISTRY: registry.default.svc.cluster.local:5000
           SCARAB_TEST_HOST_IP: ${{ steps.hostip.outputs.ip }}
