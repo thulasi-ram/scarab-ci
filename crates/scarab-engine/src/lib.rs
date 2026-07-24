@@ -878,34 +878,52 @@ pub enum TransitionError {
 // A caller wires these into the [`Db`] port; the machine itself is I/O-free so
 // it can be exhaustively unit-tested with no infra (ADR-0002 / ADR-0017).
 
+/// The dependencies a step actually consumes: its explicit `inputs:` subset when
+/// declared, else all of its `needs` (implicit-by-default). `workspace_inputs`
+/// and `input_signature` MUST resolve consumption through this one function, so
+/// the workspace a step materializes and the signature that decides whether it
+/// re-runs are always computed over *exactly* the same set (ADR-0007).
+fn consumed<'a>(needs: &'a [StepId], inputs: Option<&'a [StepId]>) -> &'a [StepId] {
+    inputs.unwrap_or(needs)
+}
+
 /// Resolve a step's **input workspace** from its dependencies.
 ///
-/// Implicit-by-default (ADR-0007, 0029): a step inherits the output workspace of
-/// each of its `needs`. Returns those needs' output snapshots (CAS merkle-root
-/// hashes), in `needs` order, skipping any dependency that produced no
-/// workspace. Explicit `inputs:`/`outputs:` selection is TODO(slice-2) — it
-/// needs the fields on the pipeline IR first.
+/// A step consumes its explicit `inputs:` subset when declared, else all of its
+/// `needs` (implicit-by-default — ADR-0007, 0029). Returns those dependencies'
+/// output snapshots (CAS merkle-root hashes), in dependency order, skipping any
+/// that produced no workspace. `inputs = None` is the inherit-all default;
+/// `Some(subset)` restricts the workspace to just the named needs.
+///
+/// (The sibling `outputs:` per-path publishing selection is deliberately
+/// unimplemented — see the CAS snapshot site and `docs/followups.md`.)
 pub fn workspace_inputs(
     needs: &[StepId],
+    inputs: Option<&[StepId]>,
     output_of: &std::collections::HashMap<StepId, String>,
 ) -> Vec<String> {
-    needs
+    consumed(needs, inputs)
         .iter()
         .filter_map(|n| output_of.get(n).cloned())
         .collect()
 }
 
-/// A deterministic signature of the workspace a step will consume: its `needs`'
-/// output snapshots, in sorted-by-need order. Two runs of a step with the same
-/// upstream outputs produce the same signature — the basis for restart
-/// skip-if-unchanged (ADR-0027). A need that has produced no output contributes
-/// an empty slot, so "an upstream that gained/lost an output" also changes the
-/// signature.
+/// A deterministic signature of the workspace a step will consume: the output
+/// snapshots of the dependencies it consumes (its explicit `inputs:` subset, or
+/// all `needs` — resolved identically to [`workspace_inputs`]), in sorted order.
+/// Two runs of a step with the same upstream outputs produce the same signature —
+/// the basis for restart skip-if-unchanged (ADR-0027). A consumed need that has
+/// produced no output contributes an empty slot, so "an upstream that gained/lost
+/// an output" also changes the signature. Because the subset is resolved the same
+/// way as the materialized workspace, the signature covers *exactly* the inputs
+/// the step consumes: a change in a need it does not consume does not force a
+/// re-run (ADR-0007).
 pub fn input_signature(
     needs: &[StepId],
+    inputs: Option<&[StepId]>,
     output_of: &std::collections::HashMap<StepId, String>,
 ) -> String {
-    let mut parts: Vec<String> = needs
+    let mut parts: Vec<String> = consumed(needs, inputs)
         .iter()
         .map(|n| {
             format!(
@@ -1213,7 +1231,11 @@ mod tests {
             (StepId("b".into()), "hash-b".to_string()),
         ]);
         let needs = vec![StepId("a".into()), StepId("b".into())];
-        assert_eq!(workspace_inputs(&needs, &outputs), vec!["hash-a", "hash-b"]);
+        // `None` = implicit-by-default: inherit every need's output workspace.
+        assert_eq!(
+            workspace_inputs(&needs, None, &outputs),
+            vec!["hash-a", "hash-b"]
+        );
     }
 
     #[test]
@@ -1221,7 +1243,41 @@ mod tests {
         // `b` never produced a workspace → it contributes no input.
         let outputs = HashMap::from([(StepId("a".into()), "hash-a".to_string())]);
         let needs = vec![StepId("a".into()), StepId("b".into())];
-        assert_eq!(workspace_inputs(&needs, &outputs), vec!["hash-a"]);
+        assert_eq!(workspace_inputs(&needs, None, &outputs), vec!["hash-a"]);
+    }
+
+    #[test]
+    fn workspace_inputs_explicit_subset_selects_only_named_needs() {
+        // D needs [a, b] but declares `inputs: [b]` — only B's output workspace
+        // flows in, in declared order, and A's is excluded.
+        let outputs = HashMap::from([
+            (StepId("a".into()), "hash-a".to_string()),
+            (StepId("b".into()), "hash-b".to_string()),
+        ]);
+        let needs = vec![StepId("a".into()), StepId("b".into())];
+        let inputs = vec![StepId("b".into())];
+        assert_eq!(
+            workspace_inputs(&needs, Some(&inputs), &outputs),
+            vec!["hash-b"],
+            "explicit inputs: [b] excludes A's workspace"
+        );
+    }
+
+    #[test]
+    fn workspace_inputs_explicit_subset_preserves_order_and_skips_empty() {
+        // Declared order is honored (c before a), and a selected need that
+        // produced nothing is skipped — same skip-empty rule as the None path.
+        let outputs = HashMap::from([
+            (StepId("a".into()), "hash-a".to_string()),
+            (StepId("c".into()), "hash-c".to_string()),
+        ]);
+        let needs = vec![StepId("a".into()), StepId("b".into()), StepId("c".into())];
+        let inputs = vec![StepId("c".into()), StepId("b".into()), StepId("a".into())];
+        assert_eq!(
+            workspace_inputs(&needs, Some(&inputs), &outputs),
+            vec!["hash-c", "hash-a"],
+            "c then a in declared order; b skipped (no output)"
+        );
     }
 
     #[test]
@@ -1231,8 +1287,8 @@ mod tests {
             (StepId("b".into()), "hash-b".to_string()),
         ]);
         // Order of `needs` does not change the signature (it is sorted).
-        let ab = input_signature(&[StepId("a".into()), StepId("b".into())], &outputs);
-        let ba = input_signature(&[StepId("b".into()), StepId("a".into())], &outputs);
+        let ab = input_signature(&[StepId("a".into()), StepId("b".into())], None, &outputs);
+        let ba = input_signature(&[StepId("b".into()), StepId("a".into())], None, &outputs);
         assert_eq!(ab, ba);
 
         // A changed upstream output changes the signature (→ cascade on rerun).
@@ -1242,7 +1298,7 @@ mod tests {
         ]);
         assert_ne!(
             ab,
-            input_signature(&[StepId("a".into()), StepId("b".into())], &changed)
+            input_signature(&[StepId("a".into()), StepId("b".into())], None, &changed)
         );
 
         // A need that produced no output contributes an empty slot, so gaining an
@@ -1250,7 +1306,50 @@ mod tests {
         let missing = HashMap::from([(StepId("b".into()), "hash-b".to_string())]);
         assert_ne!(
             ab,
-            input_signature(&[StepId("a".into()), StepId("b".into())], &missing)
+            input_signature(&[StepId("a".into()), StepId("b".into())], None, &missing)
+        );
+    }
+
+    #[test]
+    fn input_signature_reflects_only_selected_inputs() {
+        let needs = [StepId("a".into()), StepId("b".into())];
+        // A step declaring `inputs: [b]` signs over B only — its signature is
+        // computed over exactly the selected subset (ADR-0007), so it is
+        // independent of A's output entirely.
+        let base = HashMap::from([
+            (StepId("a".into()), "hash-a".to_string()),
+            (StepId("b".into()), "hash-b".to_string()),
+        ]);
+        let selected = [StepId("b".into())];
+        let sig = input_signature(&needs, Some(&selected), &base);
+
+        // Change A's output: a signature over `inputs: [b]` MUST NOT move.
+        let a_changed = HashMap::from([
+            (StepId("a".into()), "hash-a2".to_string()),
+            (StepId("b".into()), "hash-b".to_string()),
+        ]);
+        assert_eq!(
+            sig,
+            input_signature(&needs, Some(&selected), &a_changed),
+            "a need outside the `inputs:` subset must not affect the signature"
+        );
+
+        // Change B's output: the signature MUST move (B is consumed).
+        let b_changed = HashMap::from([
+            (StepId("a".into()), "hash-a".to_string()),
+            (StepId("b".into()), "hash-b2".to_string()),
+        ]);
+        assert_ne!(
+            sig,
+            input_signature(&needs, Some(&selected), &b_changed),
+            "a change in the consumed input must change the signature"
+        );
+
+        // And the subset signature differs from the inherit-all signature.
+        assert_ne!(
+            sig,
+            input_signature(&needs, None, &base),
+            "signing over [b] differs from signing over all needs"
         );
     }
 

@@ -214,7 +214,7 @@ async fn diamond_workspace_flows_to_d_which_sees_both() {
         std::fs::create_dir_all(&work).unwrap();
 
         // init-container: materialize every inherited input workspace.
-        for snap in scarab_engine::workspace_inputs(&needs, &output_of) {
+        for snap in scarab_engine::workspace_inputs(&needs, None, &output_of) {
             cas.materialize(&scarab_storage::TreeHash(snap), work.to_str().unwrap())
                 .await
                 .expect("materialize input");
@@ -242,7 +242,7 @@ async fn diamond_workspace_flows_to_d_which_sees_both() {
     // A's, B's and C's files.
     let d_needs = vec![StepId("B".into()), StepId("C".into())];
     let d_in = temp_dir("work-D-in");
-    for snap in scarab_engine::workspace_inputs(&d_needs, &output_of) {
+    for snap in scarab_engine::workspace_inputs(&d_needs, None, &output_of) {
         cas.materialize(&scarab_storage::TreeHash(snap), d_in.to_str().unwrap())
             .await
             .unwrap();

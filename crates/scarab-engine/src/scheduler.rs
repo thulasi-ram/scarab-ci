@@ -1149,13 +1149,14 @@ impl<'a> Scheduler<'a> {
                 // a side-effecting step (no output) has no stored output, so it
                 // never skips.
                 // Signature over the step's *consumed* inputs: its explicit
-                // `inputs:` if declared, else all its needs (implicit default).
-                let sig_inputs = self
-                    .db
-                    .step_inputs(run, &step.step)
-                    .await?
-                    .unwrap_or_else(|| step.needs.clone());
-                let cur = crate::input_signature(&sig_inputs, &output_of);
+                // `inputs:` if declared, else all its needs (implicit default) —
+                // resolved inside `input_signature`.
+                let explicit_inputs = self.db.step_inputs(run, &step.step).await?;
+                let cur = crate::input_signature(
+                    &step.needs,
+                    explicit_inputs.as_deref(),
+                    &output_of,
+                );
                 let prev = self.db.step_input(run, &step.step).await?;
                 let unchanged =
                     output_of.contains_key(&step.step) && prev.as_deref() == Some(cur.as_str());
@@ -1450,18 +1451,24 @@ impl<'a> Scheduler<'a> {
                     {
                         let all = self.db.steps_of_run(&run).await?;
                         if let Some(me) = all.iter().find(|s| s.step == step) {
-                            let consumed = self
-                                .db
-                                .step_inputs(&run, &step)
-                                .await?
-                                .unwrap_or_else(|| me.needs.clone());
+                            // The explicit `inputs:` subset (if declared) or all
+                            // needs (None). `workspace_inputs` resolves the same
+                            // way as the skip-signature, so the materialized
+                            // workspace and the signature always agree (ADR-0007).
+                            let explicit_inputs = self.db.step_inputs(&run, &step).await?;
+                            let consumed: &[StepId] =
+                                explicit_inputs.as_deref().unwrap_or(&me.needs);
                             let mut output_of = HashMap::new();
                             for s in &all {
                                 if let Some(o) = self.db.step_output(&run, &s.step).await? {
                                     output_of.insert(s.step.clone(), o);
                                 }
                             }
-                            spec.workspace_inputs = crate::workspace_inputs(&consumed, &output_of);
+                            spec.workspace_inputs = crate::workspace_inputs(
+                                &me.needs,
+                                explicit_inputs.as_deref(),
+                                &output_of,
+                            );
 
                             // Consumption provenance (ADR-0056): stamp which
                             // upstream ATTEMPT this attempt builds on — the

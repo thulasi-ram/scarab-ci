@@ -1016,6 +1016,19 @@ async fn create_run(
             .create_step_run(&run, id, Some(spec), needs, now)
             .await?;
     }
+    // Explicit input workspaces (ADR-0007): thread the authored `inputs:` subset
+    // so the scheduler honors it at launch (workspace materialization) and in the
+    // skip-if-unchanged signature — the same threading the trigger path does in
+    // `persist_run_from_ir`. Absent = implicit-by-default (all needs). Without
+    // this the inline `POST /v1/runs` path silently dropped the selection.
+    for step in &req.pipeline.steps {
+        if let Some(inputs) = &step.inputs {
+            let inputs: Vec<StepId> = inputs.iter().map(|i| StepId(i.clone())).collect();
+            st.db
+                .set_step_inputs(&run, &StepId(step.id.clone()), &inputs)
+                .await?;
+        }
+    }
 
     Ok((
         StatusCode::CREATED,

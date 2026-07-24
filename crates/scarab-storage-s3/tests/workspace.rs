@@ -61,7 +61,7 @@ async fn output_workspace_flows_to_dependent_input() {
     if let Some(h) = db.step_output(&run, &a).await.unwrap() {
         outputs.insert(a.clone(), h);
     }
-    let inputs = workspace_inputs(std::slice::from_ref(&a), &outputs);
+    let inputs = workspace_inputs(std::slice::from_ref(&a), None, &outputs);
     assert_eq!(inputs.len(), 1, "B inherits A's one output workspace");
     cas.materialize(&TreeHash(inputs[0].clone()), b_work.to_str().unwrap())
         .await
