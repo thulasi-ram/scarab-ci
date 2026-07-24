@@ -13,6 +13,101 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Test gate (test-strategy Phase 0): the whole workspace suite runs against a
+  # real Postgres (ADR-0017 — PG is a real collaborator, not a mock).
+  # SCARAB_TEST_REQUIRE_PG=1 turns the harnesses' silent skip-without-PG into a
+  # panic, so CI can never go green while quietly skipping the DB-backed tests.
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scarab
+          POSTGRES_PASSWORD: scarab
+          POSTGRES_DB: scarab
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U scarab -d scarab"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      SCARAB_TEST_DATABASE_URL: postgres://scarab:scarab@127.0.0.1:55432/scarab
+      SCARAB_TEST_REQUIRE_PG: "1"
+      # Debuginfo is the bulk of target/ and worthless in CI — without this the
+      # workspace build exhausts the runner's disk (ENOSPC on first run).
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Run the suite
+        run: cargo nextest run --workspace --cargo-quiet
+
+  # Coverage + ratchet (sibling of `test` so the plain gate stays fast): lcov
+  # via cargo-llvm-cov, per-crate summary in the step summary, and a fail if
+  # any crate drops >0.5pp below docs/audits/coverage-baseline.toml.
+  coverage:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scarab
+          POSTGRES_PASSWORD: scarab
+          POSTGRES_DB: scarab
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U scarab -d scarab"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      SCARAB_TEST_DATABASE_URL: postgres://scarab:scarab@127.0.0.1:55432/scarab
+      SCARAB_TEST_REQUIRE_PG: "1"
+      # Coverage mapping comes from -C instrument-coverage, not DWARF — safe to
+      # drop debuginfo here too (disk, see the test job).
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-llvm-cov
+      - name: Run the suite under coverage
+        # scarab-testkit is test scaffolding and tests/ dirs are harness code —
+        # neither is product code we want in the coverage signal.
+        run: >-
+          cargo llvm-cov nextest --workspace
+          --ignore-filename-regex 'crates/scarab-testkit/|/tests/'
+          --lcov --output-path lcov.info
+      - name: Per-crate summary + ratchet against baseline
+        # The script also appends its table to $GITHUB_STEP_SUMMARY itself.
+        run: python3 scripts/coverage_ratchet.py lcov.info docs/audits/coverage-baseline.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+
   openapi-drift:
     runs-on: ubuntu-latest
     steps:

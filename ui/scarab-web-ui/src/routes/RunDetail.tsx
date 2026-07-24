@@ -29,14 +29,24 @@ import {
   type Service,
 } from "../api/client";
 import { eventParts, eventCategory, EVENT_GLYPH } from "../events";
-import { deriveTakes, replayTake, attemptCauses, type Take, type TakeView } from "../takes";
+import {
+  deriveTakes,
+  replayTake,
+  rowLabel,
+  versionRows,
+  stepTiming,
+  visibleArtifacts as visibleArtifactsIn,
+  type Take,
+  type TakeView,
+} from "../takes";
+import { stripTries as stripTriesOf } from "../attempts";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
 import Icon from "../components/Icon";
 import Doodle from "../components/Doodle";
 import Dag, { type DagStep, type DagService, type DagControls } from "../components/Dag";
-import VersionDropdown, { type VersionRow, type OutcomeCounts } from "../components/VersionDropdown";
+import VersionDropdown, { type VersionRow } from "../components/VersionDropdown";
 import StepPane from "../components/StepPane";
 import ServicePane from "../components/ServicePane";
 import { type FilmstripTry } from "../components/AttemptsDropdown";
@@ -51,9 +61,6 @@ function fmtSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
-
-/** Numeric part of an attempt id (`a3` → 3) for as-of-boundary comparisons. */
-const attemptN = (id: string) => parseInt(id.replace(/^a/, ""), 10) || 0;
 
 export default function RunDetail() {
   const params = useParams();
@@ -198,33 +205,14 @@ export default function RunDetail() {
   // takes (a rerun must not keep growing the displayed step time). Scoped via
   // the take's `windowAttempts` so it matches the ×N attempt badge; while
   // time-traveling, `visibleEvents()` is already truncated to the boundary too.
-  const stepTiming = (): Record<string, { start?: number; end?: number }> => {
-    const m: Record<string, { start?: number; end?: number }> = {};
-    const sv = scopedView();
-    for (const e of visibleEvents()) {
-      const k = e.kind;
-      if (typeof k === "string") continue;
-      const tag = Object.keys(k)[0];
-      const step = (k[tag]?.step as string | undefined) ?? undefined;
-      if (!step) continue;
-      // Restrict to the selected take's attempts: skip an AttemptStarted/
-      // AttemptFinished whose attempt belongs to another take.
-      const attempt = (k[tag]?.attempt as string | undefined) ?? undefined;
-      if (sv && attempt !== undefined) {
-        const win = sv.windowAttempts[step];
-        if (win && !win.includes(attempt)) continue;
-      }
-      const t = (m[step] ??= {});
-      if (tag === "AttemptStarted" && (t.start === undefined || e.at < t.start)) t.start = e.at;
-      if (tag === "AttemptFinished" && (t.end === undefined || e.at > t.end)) t.end = e.at;
-    }
-    return m;
-  };
+  // Pure derivation, extracted to takes.ts.
+  const timingOf = (): Record<string, { start?: number; end?: number }> =>
+    stepTiming(visibleEvents(), scopedView()?.windowAttempts ?? null);
 
   // DAG nodes: the graph shape + status. Live: the run object. Time-traveling:
   // the replayed statuses/attempt-counts as of the boundary.
   const dagSteps = (): DagStep[] => {
-    const timing = stepTiming();
+    const timing = timingOf();
     const tv = takeView();
     const sv = scopedView();
     return stepList().map((s) => {
@@ -275,29 +263,13 @@ export default function RunDetail() {
   const stripTries = (): FilmstripTry[] => {
     const s = selectedStep();
     if (!s) return [];
-    const list = s.attempt_list ?? [];
     // The tries strip shows only the SELECTED Take's attempts in EVERY view —
     // the latest/live take included (per-Take scoping, ADR-0056 amendment
     // 2026-07-24). A step carried forward untouched shows none; a re-run step
     // shows only this take's tries, numbered per-take. The latest take's window
-    // grows with the streaming log, so new attempts appear live.
-    const win = stepWindow(sel());
-    const visible = win ? list.filter((a) => win.includes(a.id)) : list;
-    const c = attemptCauses(visibleEvents(), s.id);
-    return visible.map((a, i) => ({
-      id: a.id,
-      index: i,
-      cause: c.causes[a.id],
-      // The backend's authoritative verdict (running/succeeded/failed/
-      // superseded/cancelled) — the fan reads this so it never shows an
-      // abandoned attempt green; the derived flags below stay as fallback.
-      outcome: a.outcome,
-      failed: a.failed,
-      failure: a.failure ?? undefined,
-      superseded: c.superseded.has(a.id),
-      shadowed: c.shadowed.has(a.id),
-      readopted: c.readopted.has(a.id),
-    }));
+    // grows with the streaming log, so new attempts appear live. Pure
+    // derivation, extracted to attempts.ts.
+    return stripTriesOf(visibleEvents(), s.id, s.attempt_list ?? [], stepWindow(sel()));
   };
   // The try scoping the evidence pane: explicit selection, else the Take
   // frontier, else the latest — the same resolution StepPane's `scoped()` uses,
@@ -349,22 +321,9 @@ export default function RunDetail() {
 
   // Artifact versions visible in the current view: while time-traveling, only
   // versions from attempts that existed as of the boundary — and of-record is
-  // recomputed within that horizon (the server's flag is latest-global).
-  const visibleArtifacts = (): Artifact[] => {
-    const all = artifacts() ?? [];
-    const tv = takeView();
-    if (!tv) return all;
-    const rows = all.filter((a) => {
-      if (!a.step) return true; // pre-ADR-0056 row: no provenance to judge
-      const frontier = tv.frontier[a.step];
-      return frontier !== undefined && attemptN(a.attempt) <= attemptN(frontier);
-    });
-    const ofRecord = new Map<string, number>();
-    rows.forEach((a, i) => {
-      if (a.succeeded) ofRecord.set(a.name, i);
-    });
-    return rows.map((a, i) => ({ ...a, of_record: ofRecord.get(a.name) === i }));
-  };
+  // recomputed within that horizon (the server's flag is latest-global). Pure
+  // derivation, extracted to takes.ts.
+  const visibleArtifacts = (): Artifact[] => visibleArtifactsIn(artifacts() ?? [], takeView());
 
   let poll: ReturnType<typeof setInterval> | undefined;
 
@@ -493,88 +452,23 @@ export default function RunDetail() {
     return null;
   };
 
-  const openedBy = (t: Take): string | null =>
-    t.n <= 1 ? null : (takes()[t.n - 2]?.closedByTarget ?? null);
-  const rowLabel = (t: Take): string => {
-    const by = openedBy(t);
-    return by ? `you reran ${by}` : "original run";
-  };
-  const rowTime = (t: Take): number | null =>
-    t.n <= 1 ? startedAt() : (takes()[t.n - 2]?.closedAt ?? null);
-  // Who pressed the Rerun that opened this Take (the acting principal, `null`
-  // when auth is off or for the original run).
-  const rowActor = (t: Take): string | null =>
-    t.n <= 1 ? null : (takes()[t.n - 2]?.closedBy ?? null);
-  // The row's second line: on the latest row show what opened it ("you reran b"),
-  // then the actor and time — enough provenance without a banner.
-  const rowSub = (t: Take): string => {
-    const parts: string[] = [];
-    if (t.n === latestTakeN() && t.n > 1) parts.push(rowLabel(t));
-    const who = rowActor(t);
-    if (who) parts.push(`by ${who}`);
-    const at = rowTime(t);
-    if (at) parts.push(relTime(at));
-    return parts.join(" · ");
-  };
   const viewedLabel = (): string => {
     const v = viewing();
-    return v ? rowLabel(v) : "latest";
+    return v ? rowLabel(takes(), v) : "latest";
   };
 
-  // Map a step status into an outcome bucket for the rail's mini-summary. Only
-  // the five named statuses get their own accent; everything else (pending,
-  // skipped, ready, waiting, cancelled, …) falls to `other`.
-  const bucketOf = (status: string): keyof OutcomeCounts => {
-    switch (status) {
-      case "succeeded":
-        return "succeeded";
-      case "failed":
-        return "failed";
-      case "superseded":
-        return "superseded";
-      case "not_run":
-        return "notRun";
-      case "running":
-        return "running";
-      default:
-        return "other";
-    }
-  };
-  const tally = (statuses: string[]): OutcomeCounts => {
-    const c: OutcomeCounts = {
-      succeeded: 0,
-      failed: 0,
-      superseded: 0,
-      notRun: 0,
-      running: 0,
-      other: 0,
-    };
-    for (const s of statuses) c[bucketOf(s)] += 1;
-    return c;
-  };
-  // The version rail's rows (ADR-0056 amendment): one per Take, newest-first in
-  // the rail. The latest/open Take tallies live `run().steps[].status`; a closed
-  // Take tallies its snapshot-at-boundary replay. Takes are few — re-replaying
-  // per closed row each render is cheap. Reuses the dropdown's label/sub helpers.
-  const versions = (): VersionRow[] => {
-    const ts = takes();
-    const latest = latestTakeN();
-    const selN = viewTake() ?? latest;
-    return ts.map((t) => {
-      const isLatest = t.n === latest;
-      const statuses = isLatest
-        ? stepList().map((s) => s.status)
-        : Object.values(replayTake(events(), ts, t).status);
-      return {
-        n: t.n,
-        label: isLatest ? "latest" : rowLabel(t),
-        sub: rowSub(t),
-        summary: tally(statuses),
-        isLatest,
-        isSelected: selN === t.n,
-      };
-    });
-  };
+  // The version rail's rows (ADR-0056 amendment): one per Take. The latest/open
+  // Take tallies live `run().steps[].status`; a closed Take tallies its
+  // snapshot-at-boundary replay. Pure derivation (row copy, outcome tallies,
+  // selection flags), extracted to takes.ts.
+  const versions = (): VersionRow[] =>
+    versionRows(
+      events(),
+      takes(),
+      stepList().map((s) => s.status),
+      viewTake(),
+      startedAt(),
+    );
 
   return (
     <section class="page">

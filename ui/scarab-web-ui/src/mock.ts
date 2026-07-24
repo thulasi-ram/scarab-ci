@@ -11,10 +11,24 @@
 // to the URL to pin the theme (used for deterministic capture); otherwise the
 // normal stored/toggle theme applies.
 
+// Type-only imports — erased at compile time, so the install-before-App-loads
+// ordering in index.tsx is unaffected. The fixtures typecheck against the
+// generated OpenAPI types (the same contract the real server serves).
+import type { components } from "./api/schema";
+
+type RunStatusDto = components["schemas"]["RunStatusResponse"];
+type ArtifactDto = components["schemas"]["ArtifactDto"];
+type ServiceStatusDto = components["schemas"]["ServiceStatusDto"];
+
 const now = Date.now();
 const ago = (ms: number) => now - ms;
+const min = 60000;
 
 const RUN_ID = "0190f8a2000071fb8c0011223344aabb";
+// The RICH run — the Playwright walkthrough fixture: two versions (a
+// RunRerunRequested boundary with superseded/shadowed attempts), a shared
+// service + a docked sidecar (ADR-0058), a pending manual gate, an artifact.
+const RICH_RUN_ID = "0190f8a2000071fb8c0099887766ccdd";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
 const me = { subject: "a.kim", display_name: "Avery Kim", roles: ["Owner"] };
@@ -82,7 +96,7 @@ const repoRuns: Record<string, ReturnType<typeof strip>> = {
 // original: recompute deterministically by fixed strings above (close enough).
 
 // ── run detail ──────────────────────────────────────────────────────────────
-const runStatus = {
+const runStatus: RunStatusDto = {
   id: RUN_ID,
   status: "running",
   run_number: 142,
@@ -96,7 +110,7 @@ const runStatus = {
       status: "succeeded",
       attempts: 1,
       needs: [],
-      attempt_list: [{ id: "a1", started_at: ago(325000), failed: false }],
+      attempt_list: [{ id: "a1", started_at: ago(325000), failed: false, outcome: "succeeded" }],
     },
     {
       id: "build",
@@ -104,8 +118,8 @@ const runStatus = {
       attempts: 2,
       needs: ["clone"],
       attempt_list: [
-        { id: "a1", started_at: ago(297000), failed: true, failure: "step" },
-        { id: "a2", started_at: ago(250000), failed: false },
+        { id: "a1", started_at: ago(297000), failed: true, failure: "step", outcome: "failed" },
+        { id: "a2", started_at: ago(250000), failed: false, outcome: "succeeded" },
       ],
     },
     {
@@ -113,14 +127,15 @@ const runStatus = {
       status: "running",
       attempts: 1,
       needs: ["build"],
-      attempt_list: [{ id: "a1", started_at: ago(190000), failed: false }],
+      attempt_list: [{ id: "a1", started_at: ago(190000), failed: false, outcome: "running" }],
     },
   ],
 };
 
 // events (text/event-stream body) — trigger provenance + step timing.
-const ev = (at: number, kind: unknown) =>
-  `data: ${JSON.stringify({ version: 1, run: RUN_ID, at, kind })}\n\n`;
+const sse = (run: string) => (at: number, kind: unknown) =>
+  `data: ${JSON.stringify({ version: 1, run, at, kind })}\n\n`;
+const ev = sse(RUN_ID);
 const eventsBody = [
   ev(ago(330000), {
     Raw: {
@@ -145,6 +160,138 @@ const eventsBody = [
   ev(ago(190000), { AttemptFinished: { step: "build", attempt: "a2" } }),
   ev(ago(190000), { AttemptStarted: { step: "test", attempt: "a1" } }),
 ].join("");
+
+// ── the RICH run (Playwright walkthrough fixture) ───────────────────────────
+// One run exercising every multi-take surface at once. Timeline:
+//
+//   version 1 (original run): clone@a1 ok → build@a1 ok → test@a1 in flight
+//   ── a.kim reruns build (cascade: test, approve) at T-15m ─────────────────
+//   version 2 (latest):       build@a2 failed → build@a3 ok (auto-retry)
+//                             → test@a2 ok → approve gate waiting (manual)
+//
+// Evidence baked in: test@a1 is SUPERSEDED (in flight at the boundary, re-armed
+// by the rerun); build@a1 is SHADOWED (an earlier success no longer of record);
+// the latest take's build window is [a2, a3] → the attempts dropdown shows a
+// failed try followed by a succeeding one; `postgres` is a SHARED service
+// (peer node in the DAG services lane, dotted `uses` edge to test); `redis` is
+// test's docked SIDECAR chip; the run is suspended on the manual `approve`
+// gate; `build@a3` published one artifact of record.
+const richRunStatus: RunStatusDto = {
+  id: RICH_RUN_ID,
+  status: "suspended",
+  run_number: 147,
+  pipeline: "release",
+  trigger_title: "Wire shared postgres into the integration suite",
+  origin_pr_base: null,
+  params: {},
+  steps: [
+    {
+      id: "clone",
+      status: "succeeded",
+      attempts: 1,
+      needs: [],
+      attempt_list: [
+        { id: "a1", started_at: ago(25 * min), failed: false, outcome: "succeeded" },
+      ],
+    },
+    {
+      id: "build",
+      status: "succeeded",
+      attempts: 3,
+      needs: ["clone"],
+      attempt_list: [
+        { id: "a1", started_at: ago(24 * min + 30000), failed: false, outcome: "succeeded" },
+        { id: "a2", started_at: ago(14 * min + 55000), failed: true, failure: "step", outcome: "failed" },
+        { id: "a3", started_at: ago(13 * min + 40000), failed: false, outcome: "succeeded" },
+      ],
+    },
+    {
+      id: "test",
+      status: "succeeded",
+      attempts: 2,
+      needs: ["build"],
+      services: [{ index: 0, image: "redis:7.4", ports: [6379] }],
+      uses: ["postgres"],
+      attempt_list: [
+        { id: "a1", started_at: ago(23 * min + 15000), failed: false, outcome: "superseded" },
+        { id: "a2", started_at: ago(12 * min + 25000), failed: false, outcome: "succeeded" },
+      ],
+    },
+    {
+      id: "approve",
+      status: "waiting",
+      attempts: 0,
+      needs: ["test"],
+      gate: "manual",
+      attempt_list: [],
+    },
+  ],
+};
+
+const rev = sse(RICH_RUN_ID);
+const richEventsBody = [
+  rev(ago(25 * min + 5000), {
+    Raw: {
+      trigger: {
+        event: {
+          kind: "pull_request",
+          actor: "a.kim",
+          branch: "main",
+          ref: "refs/heads/feature/shared-postgres",
+          sha: "7c2e91d04b8a3f5e6d1c0b9a87654321",
+          repo: { owner: "acme", name: "scarab" },
+          pr: 131,
+        },
+      },
+    },
+  }),
+  // ── version 1 (original run) ──
+  rev(ago(25 * min), { AttemptStarted: { step: "clone", attempt: "a1" } }),
+  rev(ago(24 * min + 45000), { AttemptFinished: { step: "clone", attempt: "a1" } }),
+  rev(ago(24 * min + 44000), { StepTransitioned: { step: "clone", from: "running", to: "succeeded" } }),
+  rev(ago(24 * min + 30000), { AttemptStarted: { step: "build", attempt: "a1" } }),
+  rev(ago(23 * min + 20000), { AttemptFinished: { step: "build", attempt: "a1" } }),
+  rev(ago(23 * min + 19000), { StepTransitioned: { step: "build", from: "running", to: "succeeded" } }),
+  rev(ago(23 * min + 15000), { AttemptStarted: { step: "test", attempt: "a1" } }),
+  // ── the boundary: a human reran build; test (in flight) + approve cascade ──
+  rev(ago(15 * min), {
+    RunRerunRequested: { target: "build", invalidated: ["test", "approve"], by: "a.kim" },
+  }),
+  // ── version 2 (latest) ──
+  rev(ago(14 * min + 55000), { AttemptStarted: { step: "build", attempt: "a2" } }),
+  rev(ago(13 * min + 50000), { AttemptFinished: { step: "build", attempt: "a2", failure: "step" } }),
+  rev(ago(13 * min + 49000), { StepTransitioned: { step: "build", from: "running", to: "failed" } }),
+  rev(ago(13 * min + 40000), { AttemptStarted: { step: "build", attempt: "a3" } }),
+  rev(ago(12 * min + 30000), { AttemptFinished: { step: "build", attempt: "a3" } }),
+  rev(ago(12 * min + 29000), { StepTransitioned: { step: "build", from: "running", to: "succeeded" } }),
+  rev(ago(12 * min + 25000), { AttemptStarted: { step: "test", attempt: "a2" } }),
+  rev(ago(10 * min), { AttemptFinished: { step: "test", attempt: "a2" } }),
+  rev(ago(10 * min - 1000), { StepTransitioned: { step: "test", from: "running", to: "succeeded" } }),
+  rev(ago(9 * min + 50000), { StepTransitioned: { step: "approve", from: "pending", to: "waiting" } }),
+].join("");
+
+const richArtifacts: ArtifactDto[] = [
+  {
+    name: "scarab-dist.tar.gz",
+    step: "build",
+    attempt: "a3",
+    of_record: true,
+    succeeded: true,
+    size: 4718592,
+    content_type: "application/gzip",
+  },
+];
+
+const richServices: ServiceStatusDto[] = [
+  { name: "postgres", status: "ready", take: 2, created_at: ago(14 * min + 58000) },
+];
+
+const serviceLogLines = [
+  "PostgreSQL init process complete; ready for start up.",
+  "LOG:  starting PostgreSQL 16.3 on x86_64-pc-linux-musl",
+  "LOG:  listening on IPv4 address \"0.0.0.0\", port 5432",
+  "LOG:  database system is ready to accept connections",
+];
 
 const testResults = [
   { name: "tests_passed", type_name: "number", value: 214 },
@@ -280,6 +427,16 @@ function route(pathname: string, search: string): Response | null {
     });
   if (p === `/v1/runs/${RUN_ID}/artifacts`) return json([]);
   if (p === `/v1/runs/${RUN_ID}/services`) return json([]);
+
+  // the RICH run (Playwright walkthrough fixture)
+  if (p === `/v1/runs/${RICH_RUN_ID}`) return json(richRunStatus);
+  if (p === `/v1/runs/${RICH_RUN_ID}/events`)
+    return new Response(richEventsBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  if (p === `/v1/runs/${RICH_RUN_ID}/artifacts`) return json(richArtifacts);
+  if (p === `/v1/runs/${RICH_RUN_ID}/services`) return json(richServices);
   if (/\/steps\/[^/]+\/results$/.test(p)) return json(testResults);
   if (/\/steps\/[^/]+\/consumed$/.test(p)) return json(testConsumed);
   if (/\/steps\/[^/]+\/workspace$/.test(p))
@@ -346,9 +503,15 @@ export function installMock() {
           return this.url;
         }
       })();
-      if (/\/steps\/[^/]+\/logs$/.test(path)) {
+      const replay =
+        /\/steps\/[^/]+\/logs$/.test(path)
+          ? testLogLines
+          : /\/services\/[^/]+\/logs$/.test(path)
+            ? serviceLogLines
+            : null;
+      if (replay) {
         queueMicrotask(() => {
-          for (const line of testLogLines) {
+          for (const line of replay) {
             const e = new MessageEvent("message", { data: line });
             this.onmessage?.(e);
             this.dispatchEvent(e);
