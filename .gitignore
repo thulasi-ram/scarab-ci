@@ -18,9 +18,6 @@
 # Front-end projects (TS, not cargo members): scarab-web-ui, scarab-docs-ui
 /ui/**/node_modules
 /ui/**/dist
-# Playwright runtime artifacts (scarab-web-ui e2e tier)
-/ui/**/test-results
-/ui/**/playwright-report
 # Astro build output
 /ui/**/.astro
 

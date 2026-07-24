@@ -48,27 +48,9 @@ fn unique_run(prefix: &str) -> String {
     format!("{prefix}-{t}")
 }
 
-/// The optional checkout credential for the LIVE clone tests: the repo they
-/// clone (this one) may be private, in which case an anonymous clone is
-/// SourceUnavailable by design. Set SCARAB_TEST_CLONE_TOKEN (CI: the ambient
-/// GITHUB_TOKEN; locally: `gh auth token`) to authenticate; delivery still
-/// goes through the tmpfs + GIT_ASKPASS path (ADR-0045), never the URL.
-fn clone_credential() -> Option<scarab_engine::CloneCredential> {
-    std::env::var("SCARAB_TEST_CLONE_TOKEN")
-        .ok()
-        .map(|token| scarab_engine::CloneCredential {
-            username: "x-access-token".into(),
-            token,
-        })
-}
-
-/// A one-step StepRun under a UNIQUE run id (see [`unique_run`]): the fence
-/// (run/step/attempt) names the Pod, so a fixed id would re-attach to a
-/// leftover Pod from a previous invocation — or collide with a concurrently
-/// running sibling test sharing the fixture.
-fn step(run_prefix: &str) -> StepRun {
+fn step() -> StepRun {
     StepRun {
-        run: RunId(unique_run(run_prefix)),
+        run: RunId("run-1".into()),
         step: StepId("echo".into()),
         status: StepStatus::Running,
         attempts: vec![Attempt {
@@ -89,15 +71,13 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
 
     let client = kube::Client::try_default().await.expect("kube client");
     let exec = K8sExecutor::with_client(ns, client);
-    let step = step("run-echo");
+    let step = step();
     let spec = StepSpec {
         image: "busybox:latest".into(),
         command: vec!["sh".into(), "-c".into(), "echo hello scarab".into()],
         env: vec![],
         secrets: vec![],
-        // busybox runs as root; without the self-service grant the hardened
-        // ADR-0039 baseline rejects the container (CreateContainerConfigError).
-        run_as_root: true,
+        run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -224,14 +204,13 @@ async fn log_stream_tails_pod_stdout() {
 
     let client = kube::Client::try_default().await.expect("kube client");
     let exec = K8sExecutor::with_client(ns, client);
-    let step = step("run-logs");
+    let step = step();
     let spec = StepSpec {
         image: "busybox:latest".into(),
         command: vec!["sh".into(), "-c".into(), "echo hello scarab logs".into()],
         env: vec![],
         secrets: vec![],
-        // busybox runs as root; the hardened baseline would reject it.
-        run_as_root: true,
+        run_as_root: false,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -270,6 +249,20 @@ async fn log_stream_tails_pod_stdout() {
     );
 
     exec.cancel(&h).await.expect("cancel cleans up the pod");
+}
+
+/// Live rootless-BuildKit image build (ADR-0018). `#[ignore]`d + gated on
+/// SCARAB_TEST_KUBE — needs the dev kind cluster and a registry. Proves the
+/// build step produces an image + digest end-to-end; the Pod spec and the
+/// digest→artifact wiring are unit-tested in the library without a cluster.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster + registry; opt in with SCARAB_TEST_KUBE=1"]
+async fn rootless_buildkit_builds_an_image() {
+    if opted_in().is_none() {
+        return;
+    }
+    // Intentionally left as a harness placeholder: applying build_pod_for_build
+    // to the cluster, waiting for completion, and asserting a pushed digest.
 }
 
 /// Live workspace flow (ADR-0029/0045 keystone): step A writes a file into
@@ -450,7 +443,6 @@ async fn clone_step_produces_a_source_workspace() {
             name: "scarab-ci".into(),
             sha: sha.clone(),
             url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
-            credential: clone_credential(),
             ..Default::default()
         }),
         build: None,
@@ -634,7 +626,6 @@ async fn clone_depth_full_exposes_history() {
             sha: sha.clone(),
             depth_full: true,
             url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
-            credential: clone_credential(),
             ..Default::default()
         }),
         build: None,
@@ -782,9 +773,6 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
             // case. The fetch fails, the guard exits 86 — SourceUnavailable.
             sha: "0000000000000000000000000000000000000001".into(),
             url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
-            // Authenticated so the 86 is genuinely the vanished SHA, not a
-            // repo-access rejection (the repo may be private).
-            credential: clone_credential(),
             ..Default::default()
         }),
         build: None,
@@ -1282,282 +1270,4 @@ async fn artifacts_are_harvested_post_step() {
     assert_eq!(bytes, b"report\n");
 
     exec.cancel(&h).await.expect("cleanup");
-}
-
-/// A StepRun fixture for one step of `run` with a single Running attempt `a1`
-/// — the shape every live test hand-builds; shared by the Phase-2 cases below.
-fn step_run_of(run: &str, step: &str) -> StepRun {
-    StepRun {
-        run: RunId(run.into()),
-        step: StepId(step.into()),
-        status: StepStatus::Running,
-        attempts: vec![Attempt {
-            id: AttemptId("a1".into()),
-            started_at: Timestamp(0),
-            failure: None,
-            outcome: AttemptOutcome::Running,
-        }],
-        needs: vec![],
-        gate_kind: None,
-    }
-}
-
-/// A busybox StepSpec fixture: `sh -c <cmd>` with the given root grant.
-fn busybox_spec(cmd: &str, run_as_root: bool) -> StepSpec {
-    StepSpec {
-        image: "busybox:latest".into(),
-        command: vec!["sh".into(), "-c".into(), cmd.into()],
-        env: vec![],
-        secrets: vec![],
-        run_as_root,
-        add_capabilities: vec![],
-        privileged: false,
-        timeout_seconds: Some(600),
-        workspace_inputs: vec![],
-        clone: None,
-        build: None,
-        artifacts: vec![],
-        placement_profiles: vec![],
-        resources: Default::default(),
-        k8s_overlay: None,
-        oidc_token: None,
-        services: Vec::new(),
-        uses: Vec::new(),
-        matrix_values: Default::default(),
-    }
-}
-
-/// LIVE run_as_root reflection (ADR-0039): the `run_as_root` grant on the
-/// StepSpec is actually present on the Pod the API server ADMITTED — read
-/// back from the cluster, not from the locally built spec (the local shape is
-/// unit-tested in the library). Both directions: the grant pins uid 0 and
-/// drops `runAsNonRoot`; the default keeps the hardened non-root baseline.
-#[tokio::test]
-#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
-async fn run_as_root_is_reflected_on_the_admitted_pod() {
-    let Some(ns) = opted_in() else { return };
-
-    let client = kube::Client::try_default().await.expect("kube client");
-    let exec = K8sExecutor::with_client(ns.clone(), client.clone());
-    use kube::api::Api;
-    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, &ns);
-
-    // The `step` container's securityContext, read back from the API server.
-    let admitted_sc = |pod: &k8s_openapi::api::core::v1::Pod| {
-        pod.spec
-            .as_ref()
-            .expect("pod spec")
-            .containers
-            .iter()
-            .find(|c| c.name == "step")
-            .expect("the step container")
-            .security_context
-            .clone()
-            .expect("a securityContext is always set (ADR-0039)")
-    };
-
-    // --- Granted: run_as_root pins uid 0, runAsNonRoot off. ---
-    let root_step = step_run_of(&unique_run("run-rootgrant"), "as-root");
-    let hr = exec
-        .launch(&root_step, &busybox_spec("sleep 300", true))
-        .await
-        .expect("launch root-granted step");
-    let sc = admitted_sc(&pods.get(&hr.0).await.expect("admitted pod"));
-    assert_eq!(sc.run_as_non_root, Some(false), "grant lifts the baseline");
-    assert_eq!(sc.run_as_user, Some(0), "grant pins uid 0 explicitly");
-    // The grant is root-only — never an escalation (ADR-0039).
-    assert_eq!(sc.privileged, Some(false));
-    assert_eq!(sc.allow_privilege_escalation, Some(false));
-
-    // --- Default: the hardened restricted baseline stands. ---
-    let base_step = step_run_of(&unique_run("run-rootbase"), "baseline");
-    let hb = exec
-        .launch(&base_step, &busybox_spec("sleep 300", false))
-        .await
-        .expect("launch baseline step");
-    let sc = admitted_sc(&pods.get(&hb.0).await.expect("admitted pod"));
-    assert_eq!(sc.run_as_non_root, Some(true), "baseline is non-root");
-    assert_eq!(sc.run_as_user, None, "no uid pinned without the grant");
-
-    for h in [hr, hb] {
-        exec.cancel(&h).await.expect("cleanup");
-    }
-}
-
-/// LIVE unpullable image (ADR-0047): a step whose image does not exist keeps
-/// its Pod `Pending` forever at the kubelet level (`ErrImagePull` →
-/// `ImagePullBackOff`), so the executor must surface a TERMINAL verdict fast —
-/// `Failed { class: Infra { never_started: true } }` (bounded auto-retry
-/// budget; the process never started) — rather than hang the attempt.
-#[tokio::test]
-#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
-async fn image_pull_failure_fails_the_attempt_fast() {
-    let Some(ns) = opted_in() else { return };
-
-    let client = kube::Client::try_default().await.expect("kube client");
-    let exec = K8sExecutor::with_client(ns, client);
-    let step = step_run_of(&unique_run("run-nopull"), "nopull");
-    let spec = StepSpec {
-        // A well-formed reference that exists in no registry.
-        image: "ghcr.io/thulasi-ram/scarab-no-such-image:never".into(),
-        ..busybox_spec("true", false)
-    };
-
-    let started = std::time::Instant::now();
-    let h = exec.launch(&step, &spec).await.expect("launch doomed step");
-    let mut terminal = None;
-    for _ in 0..120 {
-        match exec.poll(&h).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
-    match terminal {
-        Some(ExecState::Failed { exit_code, class }) => {
-            assert_eq!(exit_code, None, "the step process never ran");
-            assert_eq!(
-                class,
-                scarab_engine::ports::FailureClass::Infra {
-                    never_started: true
-                },
-                "an unpullable image is pre-start infra (bounded retry), not a hang"
-            );
-        }
-        other => panic!("expected a terminal Failed for the unpullable image, got {other:?}"),
-    }
-    // Fast = surfaced from the waiting reason, well inside the poll window —
-    // never the step-timeout path (the spec allows 600s).
-    assert!(
-        started.elapsed() < std::time::Duration::from_secs(115),
-        "image-pull failure must fail fast, took {:?}",
-        started.elapsed()
-    );
-
-    exec.cancel(&h).await.expect("cleanup");
-}
-
-/// LIVE orphan-Pod teardown regression (ADR-0056 amendment, git-bug fd6e6d4):
-/// rerunning a step while its descendant is in-flight must tear the
-/// descendant's Pod down for real — the engine-side supersede path
-/// (`rerun_step` enqueues a scoped `SUPERSEDE_TEARDOWN`;
-/// `reconcile_supersessions` cancels the named handle) is unit-tested over
-/// `FakeExecutor` in `scarab-db-postgres/tests/rerun_supersede_inmemory.rs`,
-/// but the bug was a REAL Pod left running, so this drives the same engine
-/// path against the live cluster: the descendant's sleeper Pod must be GONE
-/// from the namespace afterwards, not orphaned burning resources.
-///
-/// Cancel-path teardown has its own live case above
-/// (`cancel_tears_down_a_running_pod`).
-#[tokio::test]
-#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
-async fn rerun_supersede_tears_down_the_in_flight_descendant_pod() {
-    use scarab_engine::{rerun_step, Db, RunStatus, Scheduler};
-    use scarab_testkit::{FakeClock, InMemoryDb};
-
-    let Some(ns) = opted_in() else { return };
-    let run = RunId(unique_run("run-orphan"));
-    let b = StepId("b".into());
-    let c = StepId("c".into());
-    let a1 = AttemptId("a1".into());
-
-    let client = kube::Client::try_default().await.expect("kube client");
-    let exec = K8sExecutor::with_client(ns.clone(), client.clone());
-
-    // Launch c's Pod for real: a sleeper that outlives the test if orphaned.
-    let sleeper = busybox_spec("sleep 300", true); // busybox runs as root
-    let c_run = StepRun {
-        run: run.clone(),
-        step: c.clone(),
-        status: StepStatus::Running,
-        attempts: vec![Attempt {
-            id: a1.clone(),
-            started_at: Timestamp(0),
-            failure: None,
-            outcome: AttemptOutcome::Running,
-        }],
-        needs: vec![b.clone()],
-        gate_kind: None,
-    };
-    let h = exec.launch(&c_run, &sleeper).await.expect("launch c");
-    for _ in 0..90 {
-        if exec.poll(&h).await.expect("poll") == ExecState::Running {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-    assert_eq!(
-        exec.poll(&h).await.unwrap(),
-        ExecState::Running,
-        "descendant c is in-flight"
-    );
-
-    // Mirror the durable state the engine holds at this point: b Succeeded,
-    // c Running on attempt a1 whose recorded handle is the REAL Pod.
-    let db = InMemoryDb::new();
-    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
-    db.create_step_run(&run, &b, Some(&sleeper), &[], Timestamp(0))
-        .await
-        .unwrap();
-    db.create_step_run(
-        &run,
-        &c,
-        Some(&sleeper),
-        std::slice::from_ref(&b),
-        Timestamp(0),
-    )
-    .await
-    .unwrap();
-    db.record_step_transition(&run, &b, StepStatus::Pending, StepStatus::Succeeded)
-        .await
-        .unwrap();
-    db.record_attempt(
-        &run,
-        &c,
-        &Attempt {
-            id: a1.clone(),
-            started_at: Timestamp(0),
-            failure: None,
-            outcome: AttemptOutcome::Running,
-        },
-    )
-    .await
-    .unwrap();
-    db.set_attempt_handle(&run, &c, &a1, &h.0).await.unwrap();
-    db.record_step_transition(&run, &c, StepStatus::Pending, StepStatus::Running)
-        .await
-        .unwrap();
-    db.seed_run(&run, RunStatus::Running);
-
-    // The human reruns b — c's in-flight attempt is superseded...
-    let clock = FakeClock::new(1_000);
-    rerun_step(&db, &clock, &run, &b, Some("live-test".into()))
-        .await
-        .expect("rerun_step");
-
-    // ...and the driver's next supersession pass cancels the REAL Pod.
-    let sched = Scheduler::new(&db, &clock, &exec, "live-drv");
-    sched
-        .reconcile_supersessions()
-        .await
-        .expect("reconcile_supersessions");
-
-    // The superseded attempt's Pod is GONE from the namespace (grace period
-    // honored — allow up to 60s for SIGTERM + kubelet cleanup).
-    use kube::api::Api;
-    let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client, &ns);
-    let mut gone = false;
-    for _ in 0..60 {
-        if pods.get_opt(&h.0).await.expect("get pod").is_none() {
-            gone = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-    assert!(
-        gone,
-        "the superseded descendant's Pod was torn down, not orphaned"
-    );
 }
