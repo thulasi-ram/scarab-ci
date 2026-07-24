@@ -133,7 +133,9 @@ New test cases, in priority order:
    Several already exist; the matrix makes the holes visible (see
    "Visibility" below).
 4. **Fake/real parity — two layers.** (a) **`db_contract.rs` in
-   scarab-testkit** (precedent: `forge_contract.rs`): trait-level contract
+   scarab-db-postgres/tests** (placed there, not in testkit, so testkit
+   never dev-depends on the PG crate; precedent: `forge_contract.rs`):
+   trait-level contract
    tests for the load-bearing `Db` port semantics — transition OCC,
    `record_attempt` idempotency + non-downgrade, lease grant/expiry/steal,
    outbox claim/poison bounds, attempt-ordering determinism — run against
