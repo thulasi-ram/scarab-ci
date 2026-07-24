@@ -35,7 +35,7 @@ resumable state machine**, the following are *derived* properties rather than bo
 features:
 
 - **Resume** a pipeline after a control-plane crash/failover — from the last durable state.
-- **Rerun** a single step — it is a re-creatable, individually-addressable object.
+- **Restart** a single step — it is a re-creatable, individually-addressable object.
 - **Time-travel** — inspect the DAG/logs as they were at any point.
 - **Suspend** indefinitely on a `gate` (human approval, timer, external event) — for
   seconds or for weeks — at nearly zero cost, because state lives in Postgres.
@@ -220,10 +220,6 @@ the adapter boundary. **Minimal in v1** — enough integration tests to catch gl
 genuine cross-layer e2e. Exception: 2–3 targeted crash/resume tests guard the durability
 wedge. Don't fight test infra; keep velocity.
 
-Canonical tier names (rules in ADR-0017's addendum): **unit**, **functional** (real
-router + engine in-process, fakes at ports), **kind** (executor layer against a real
-apiserver), **stack e2e** (cross-layer, nightly); UI pyramid: **no-DOM ≫ DOM ≫ browser**.
-
 ## 9. Roadmap (tracer-bullet vertical slices)
 
 1. **Durable core skeleton** — `POST /runs` (inline 1-step) → admit → k8s Pod → logs
@@ -232,5 +228,5 @@ apiserver), **stack e2e** (cross-layer, nightly); UI pyramid: **no-DOM ≫ DOM �
 3. GitHub adapter + identity: webhook → in-repo `.scarab` → run → checks back; OAuth login.
 4. Scheduler richness + gates: concurrency groups, auto-cancel, fairness, priority; Environments/approvals.
 5. Secrets + OIDC issuer + BuildKit: encrypted secrets, keyless federation, fork-PR lockout, image builds.
-6. UI (SolidJS): live DAG, logs, rerun/resume, time-travel timeline.
+6. UI (SolidJS): live DAG, logs, restart/resume, time-travel timeline.
 7. Local exec + CLI polish + provenance/signing fast-follow.
