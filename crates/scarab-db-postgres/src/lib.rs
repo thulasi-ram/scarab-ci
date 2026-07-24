@@ -1786,13 +1786,7 @@ impl Db for PostgresDb {
     }
 
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
-        // Acquire or renew, taking over only an expired lease. The holder's own
-        // re-request is a RENEWAL and must EXTEND `expires_at` (the port
-        // contract: the scheduler's `is_leader` re-leases every tick to keep
-        // leadership) — hence the `owner = EXCLUDED.owner` arm; without it a
-        // constantly-renewing leader still expired after one TTL and a peer
-        // could steal leadership at the boundary. A different owner only gets
-        // the DO UPDATE once the incumbent lease has expired. RETURNING yields
+        // Acquire or renew, taking over only an expired lease. RETURNING yields
         // the winning holder; if the incumbent lease is still valid the DO
         // UPDATE is skipped and we read back the current holder instead.
         let row = sqlx::query(
@@ -1800,8 +1794,7 @@ impl Db for PostgresDb {
              VALUES ($1, $2, (extract(epoch from now()) * 1000)::bigint + $3)
              ON CONFLICT (resource) DO UPDATE
                SET owner = EXCLUDED.owner, expires_at = EXCLUDED.expires_at
-               WHERE leases.owner = EXCLUDED.owner
-                  OR leases.expires_at < (extract(epoch from now()) * 1000)::bigint
+               WHERE leases.expires_at < (extract(epoch from now()) * 1000)::bigint
              RETURNING owner, expires_at",
         )
         .bind(resource)

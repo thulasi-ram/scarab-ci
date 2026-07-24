@@ -66,10 +66,7 @@ impl Clock for FakeClock {
 /// One outbox row: the message plus its claim/dispatch flags.
 struct OutboxEntry {
     msg: OutboxMessage,
-    /// Claim-lease expiry (mirrors the postgres `claimed_until` column):
-    /// `None` = never claimed; while set and in the future the row is hidden
-    /// from every drainer. Wall-clock via `Instant`, like `leases` below.
-    claimed_until: Option<std::time::Instant>,
+    claimed: bool,
     dispatched: bool,
     /// Failed-delivery count (ADR-0047 poison handling).
     delivery_attempts: u32,
@@ -1255,7 +1252,7 @@ impl Db for InMemoryDb {
         msg.id = id;
         st.outbox.push(OutboxEntry {
             msg,
-            claimed_until: None,
+            claimed: false,
             dispatched: false,
             delivery_attempts: 0,
             dead_lettered: false,
@@ -1272,23 +1269,21 @@ impl Db for InMemoryDb {
     ) -> Result<Vec<OutboxMessage>, DbError> {
         let mut st = self.state.lock().unwrap();
         let mut out = Vec::new();
-        // Claim-lease expiry is a property of the STORED claim (mirrors the
-        // postgres `claimed_until` column), not of the reclaiming call: a
-        // message claimed with a positive visibility window is hidden from
-        // every drainer until that instant; a zero (or negative) window
-        // writes an already-expired claim, so the message is immediately
-        // reclaimable — how tests drive crash/restart re-polls of in-flight
-        // work (ADR-0047).
-        let now = std::time::Instant::now();
+        // A zero (or negative) visibility window models an already-expired
+        // claim lease: the message is immediately reclaimable — how tests
+        // drive crash/restart re-polls of in-flight work (ADR-0047).
+        let reclaimable = visibility_ms <= 0;
         for entry in st.outbox.iter_mut() {
             if out.len() as u32 >= limit {
                 break;
             }
             let kind_ok = kind.is_none_or(|k| entry.msg.kind == k);
-            let claim_free = entry.claimed_until.is_none_or(|until| now >= until);
-            if !entry.dispatched && !entry.dead_lettered && claim_free && kind_ok {
-                entry.claimed_until =
-                    Some(now + std::time::Duration::from_millis(visibility_ms.max(0) as u64));
+            if !entry.dispatched
+                && !entry.dead_lettered
+                && (!entry.claimed || reclaimable)
+                && kind_ok
+            {
+                entry.claimed = true;
                 out.push(entry.msg.clone());
             }
         }
