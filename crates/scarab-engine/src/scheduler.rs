@@ -1553,6 +1553,18 @@ impl<'a> Scheduler<'a> {
                     // Attempt-grain (ADR-0056): the write lands on both the
                     // attempt's immutable evidence row and the step's
                     // latest-evidence denormalization.
+                    //
+                    // DEFERRED — the sibling `outputs:` per-PATH publishing
+                    // selection (scarab_pipeline::StepSpec::outputs) is NOT honored
+                    // here. This records the merkle root of the WHOLE workspace
+                    // (shipped behavior). Restricting the published snapshot to an
+                    // authored path subset needs CAS *sub-tree* addressing — the
+                    // ability to snapshot/materialize a path prefix of a tree — which
+                    // scarab-storage-s3 does not have (it is whole-file / whole-tree
+                    // only). Until that lands, `outputs:` is authored + validated in
+                    // the pipeline spec but deliberately not consumed: it is a no-op,
+                    // NOT silently narrowing. Blocked on CAS sub-tree addressing; see
+                    // docs/followups.md. Do not wire this half without that support.
                     if let Some(output) = self.executor.output(&handle).await? {
                         self.db
                             .set_step_output(&run, &step, &attempt, &output)

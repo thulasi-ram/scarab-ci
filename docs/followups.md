@@ -59,6 +59,12 @@ Two buckets:
 | Git submodule support for vendored libs (pinned SHA in tree, resolved at the ref) | Teams want to vendor without copying bytes, at scale | Needs `ForgePort` to resolve submodule content at a ref (it doesn't today). The only *reproducible* "don't copy bytes" variant. |
 | Blessed, total `data → IR` generation frontend (Starlark / CUE) | A real workload needs **variable graph *shape*** per input (not just N instances of a fixed subgraph — `matrix × invoke` already covers that) | ADR-0009 pt 4 reserved this ("multi-frontend by construction"). A frontend, **never** an AST-mutating plugin. |
 
+### Workspace inputs/outputs (ADR-0007 / ADR-0029)
+
+| Feature | Trigger to build | Notes |
+|---|---|---|
+| Per-PATH `outputs:` publishing (a step publishes only named workspace paths downstream) | A pipeline whose steps produce large workspaces where dependents need a precise slice, or want a stable output hash unaffected by unrelated files | **Blocked on CAS sub-tree addressing.** `scarab-storage-s3` snapshots/materializes whole trees only; restricting a published snapshot to an authored path subset needs sub-tree (path-prefix) addressing it lacks. The `outputs:` field is parsed + validated in `scarab_pipeline::StepSpec` but deliberately **not consumed** — a no-op, not a silent narrowing (see the output-snapshot site in `scarab-engine/src/scheduler.rs`). The sibling **`inputs:` selection IS shipped** (per-need input scoping + sharpened rerun invalidation, 2026-07-24 sweep item 4a). |
+
 ### Identity & access (ADR-0049 / ADR-0060)
 
 | Feature | Trigger to build | Notes |
