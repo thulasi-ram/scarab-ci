@@ -104,8 +104,10 @@ async fn crash_resume_completes_exactly_once() {
         &base,
         serde_json::json!([
             { "id": "slow", "image": "busybox:latest",
+              "security": { "run_as_root": true },
               "command": ["sh", "-c", "sleep 20 && echo slow step done"] },
             { "id": "second", "image": "busybox:latest", "needs": ["slow"],
+              "security": { "run_as_root": true },
               "command": ["sh", "-c", "echo second step done"] }
         ]),
     )

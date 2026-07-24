@@ -24,6 +24,7 @@ async fn cancel_mid_run_tears_down_the_pod() {
         &base,
         serde_json::json!([
             { "id": "slow", "image": "busybox:latest",
+              "security": { "run_as_root": true },
               "command": ["sh", "-c", "sleep 600"] }
         ]),
     )

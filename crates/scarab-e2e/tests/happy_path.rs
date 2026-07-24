@@ -22,12 +22,17 @@ use support::*;
 
 const SHA: &str = "e2e0000000000000000000000000000000000000";
 
+// busybox runs as root, so the step takes the self-service `run_as_root`
+// grant (ADR-0039) — the hardened baseline's `runAsNonRoot` rejects the image
+// otherwise (CreateContainerConfigError on the cluster).
 const PIPELINE_YAML: &str = r#"
 on:
   manual: {}
 steps:
   - id: hello
     image: busybox:latest
+    security:
+      run_as_root: true
     command: ["sh", "-c", "echo hello from scarab e2e"]
 "#;
 

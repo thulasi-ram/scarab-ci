@@ -24,6 +24,7 @@ async fn rerun_creates_a_new_take_with_fresh_attempt_evidence() {
         &base,
         serde_json::json!([
             { "id": "hello", "image": "busybox:latest",
+              "security": { "run_as_root": true },
               "command": ["sh", "-c", "echo take output"] }
         ]),
     )
