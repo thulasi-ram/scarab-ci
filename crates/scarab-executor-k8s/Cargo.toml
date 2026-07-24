@@ -27,5 +27,8 @@ futures = { workspace = true }
 
 [dev-dependencies]
 scarab-storage-s3 = { workspace = true }
+# The live orphan-Pod teardown regression (tests/cluster.rs) drives the REAL
+# executor through the engine's supersede-teardown path over the in-memory Db.
+scarab-testkit = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }

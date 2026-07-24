@@ -1,0 +1,194 @@
+# kind-in-CI tier (test-strategy Phase 2): run the live-cluster executor tests
+# (`crates/scarab-executor-k8s/tests/cluster.rs`, all `#[ignore]`d + gated on
+# SCARAB_TEST_KUBE) against a throwaway kind cluster on every PR/push that
+# touches the execution path.
+#
+# ADVISORY PROBATION: this job is intentionally NOT a required check. Live
+# k8s runs carry inherent flake surface (registry pulls, kubelet timing); it
+# reports, humans read it. Promote it to required only once it has a track
+# record of being quiet.
+#
+# Images: the clone + results-sidecar step images are pulled from the GHCR
+# `edge` tags image.yml publishes off main and `kind load`ed; when the PR
+# itself changes `docker/**` they are instead built fresh from the tree so
+# the run exercises the PR's Dockerfiles.
+name: kind
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/scarab-executor-k8s/**'
+      - 'crates/scarab-engine/**'
+      - 'crates/scarab-server/**'
+      - 'crates/scarab-storage*/**'
+      - 'docker/**'
+      - '.github/workflows/kind.yml'
+  pull_request:
+    paths:
+      - 'crates/scarab-executor-k8s/**'
+      - 'crates/scarab-engine/**'
+      - 'crates/scarab-server/**'
+      - 'crates/scarab-storage*/**'
+      - 'docker/**'
+      - '.github/workflows/kind.yml'
+
+concurrency:
+  group: kind-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # This repo's debug builds exhaust runner disk with full debuginfo.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CLONE_IMAGE: ghcr.io/thulasi-ram/scarab-clone:edge
+  SIDECAR_IMAGE: ghcr.io/thulasi-ram/scarab-results-sidecar:edge
+
+jobs:
+  cluster-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+      # dorny/paths-filter lists the PR's changed files via the API.
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner ships ~14GB free; a workspace debug build + kind + images
+      # need more. Drop the unused toolchains up front.
+      - name: Free runner disk
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # Did this change touch the image build contexts? If so, build the step
+      # images from the tree instead of pulling the (pre-change) `edge` tags.
+      - name: Detect docker/ changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docker:
+              - 'docker/**'
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: scarab-ci
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull step images (GHCR edge)
+        if: steps.changes.outputs.docker != 'true'
+        run: |
+          docker pull "$CLONE_IMAGE"
+          docker pull "$SIDECAR_IMAGE"
+
+      - name: Build step images from the tree (docker/ changed)
+        if: steps.changes.outputs.docker == 'true'
+        run: |
+          docker build -t "$CLONE_IMAGE" docker/clone
+          docker build -t "$SIDECAR_IMAGE" docker/sidecar
+
+      # Preload busybox too: nearly every live case runs it, and pulling it
+      # once here dodges Docker Hub anonymous-pull throttling on the kubelet.
+      - name: Load step images into kind
+        run: |
+          docker pull busybox:latest
+          kind load docker-image --name scarab-ci "$CLONE_IMAGE" "$SIDECAR_IMAGE" busybox:latest
+
+      # The `kind: build` live test pushes to an in-cluster plain-HTTP registry
+      # (SCARAB_TEST_REGISTRY) and verifies its tag list from a Pod.
+      - name: Deploy an in-cluster registry
+        run: |
+          kubectl apply -f - <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: registry
+            namespace: default
+          spec:
+            replicas: 1
+            selector:
+              matchLabels: { app: registry }
+            template:
+              metadata:
+                labels: { app: registry }
+              spec:
+                containers:
+                  - name: registry
+                    image: registry:2
+                    ports:
+                      - containerPort: 5000
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: registry
+            namespace: default
+          spec:
+            selector: { app: registry }
+            ports:
+              - port: 5000
+                targetPort: 5000
+          EOF
+          kubectl rollout status deployment/registry -n default --timeout=120s
+
+      # The results-sidecar test POSTs from a Pod to a stub listener in the
+      # test process on this runner: the host is the kind docker network's
+      # gateway from inside the cluster.
+      - name: Resolve host IP reachable from Pods
+        id: hostip
+        run: |
+          # The kind network's IPv4 gateway = this host, as seen from the
+          # cluster. The IPAM config may list IPv6 first (or omit Gateway),
+          # so scan all entries; fall back to the default-route source IP.
+          ip="$(docker network inspect kind \
+                  -f '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+          if [ -z "$ip" ]; then
+            ip="$(ip -4 route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)"
+          fi
+          echo "host ip reachable from Pods: $ip"
+          test -n "$ip" # fail loud here, not as a silent test hang
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+
+      # Everything is a normal test; `#[ignore]` + the SCARAB_TEST_* gates are
+      # the opt-in, so run the ignored set explicitly. --no-fail-fast: one
+      # flaky live case must not mask the rest of the tier's signal.
+      - name: Run live cluster tests
+        env:
+          SCARAB_TEST_KUBE: '1'
+          SCARAB_TEST_KUBE_NS: default
+          SCARAB_TEST_CLONE_IMAGE: ${{ env.CLONE_IMAGE }}
+          # A SHA this event guarantees exists on the forge: the PR head, or
+          # the pushed main commit (the clone tests fetch it anonymously).
+          SCARAB_TEST_CLONE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # The clone tests fetch THIS repo, which may be private: hand them
+          # the ambient read-only token (delivered via tmpfs + GIT_ASKPASS).
+          SCARAB_TEST_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCARAB_TEST_SIDECAR_IMAGE: ${{ env.SIDECAR_IMAGE }}
+          SCARAB_TEST_REGISTRY: registry.default.svc.cluster.local:5000
+          SCARAB_TEST_HOST_IP: ${{ steps.hostip.outputs.ip }}
+        run: |
+          cargo nextest run -p scarab-executor-k8s --test cluster \
+            --run-ignored all --no-fail-fast
+
+      - name: Cluster diagnostics (on failure)
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
+          kubectl describe pods -n default | tail -200 || true
