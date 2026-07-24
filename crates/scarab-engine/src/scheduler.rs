@@ -155,11 +155,15 @@ pub enum RerunError {
 /// Needs only the [`Db`] and [`Clock`] ports (no executor), so the API role can
 /// call it directly without an execution backend.
 ///
-/// Content-addressed *skip*-if-unchanged (skip a descendant when the rerun
-/// step's new output hash equals its old one — ADR-0027's optimization over a
-/// plain cascade) is a fast-follow (TODO(slice-2)); the per-step output-snapshot
-/// substrate it needs is already in place. The re-armed descendants therefore
-/// re-run (the safe cascade branch) until that lands.
+/// ACCEPTED INEFFICIENCY — deliberately not built (see ADR-0027 amendment
+/// 2026-07-24). Content-addressed *skip*-if-unchanged (skip a descendant when
+/// the rerun step's new output hash equals its old one) would spare downstream
+/// steps whose inputs did not actually change. We do NOT do this: every
+/// re-armed descendant re-runs — the always-cascade branch. That is correct
+/// (downstream never sees stale inputs), merely wasteful when a rerun
+/// reproduces an identical output. Left unbuilt on purpose; revisit only if
+/// identical-rebuild waste becomes a real, measured pain — the per-step
+/// output-snapshot substrate it would need is already in place.
 pub async fn rerun_step(
     db: &dyn Db,
     clock: &dyn Clock,

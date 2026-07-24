@@ -33,3 +33,20 @@ happens downstream? This is where content-addressing ([0004](0004-execution-topo
 
 - **Cascade always** — simple/safe, but wastes content-addressing (re-deploys on identical builds).
 - **Isolated re-run** — fast, but leaves incoherent downstream state; footgun as a default.
+
+## Amendment (2026-07-24) — skip-if-unchanged deferred; cascade-always is the shipped behavior
+
+The **skip-if-unchanged** half of the decision above is **deliberately not
+built**. The engine ships the "cascade always" alternative: a rerun re-arms and
+re-runs *every* downstream descendant, without comparing the rerun step's new
+output hash to its old one (`rerun_step`, `scarab-engine/src/scheduler.rs`).
+Likewise `force-skip` and the "inputs unchanged" UI surface are unbuilt;
+`force-cascade` is the *de facto* behavior.
+
+This is an **accepted inefficiency, not a bug**. Cascade-always is always
+correct — downstream never sees stale inputs; it only does redundant work when a
+rerun reproduces an identical output (e.g. "rerun the build with no real
+change"). We accept that cost rather than carry a half-built optimization.
+Revisit **only** when identical-rebuild waste is a measured, real pain — the
+per-step output-snapshot substrate it needs is already in place, so it can be
+added later without new groundwork.
