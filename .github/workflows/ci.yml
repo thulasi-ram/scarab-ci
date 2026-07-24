@@ -36,7 +36,15 @@ jobs:
     env:
       SCARAB_TEST_DATABASE_URL: postgres://scarab:scarab@127.0.0.1:55432/scarab
       SCARAB_TEST_REQUIRE_PG: "1"
+      # Debuginfo is the bulk of target/ and worthless in CI — without this the
+      # workspace build exhausts the runner's disk (ENOSPC on first run).
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -44,7 +52,7 @@ jobs:
         with:
           tool: cargo-nextest
       - name: Run the suite
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --cargo-quiet
 
   # Coverage + ratchet (sibling of `test` so the plain gate stays fast): lcov
   # via cargo-llvm-cov, per-crate summary in the step summary, and a fail if
@@ -68,7 +76,15 @@ jobs:
     env:
       SCARAB_TEST_DATABASE_URL: postgres://scarab:scarab@127.0.0.1:55432/scarab
       SCARAB_TEST_REQUIRE_PG: "1"
+      # Coverage mapping comes from -C instrument-coverage, not DWARF — safe to
+      # drop debuginfo here too (disk, see the test job).
+      CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:

@@ -2,25 +2,20 @@
 # scripts/coverage_ratchet.py: CI fails if any crate drops more than
 # 0.5 percentage points below its value here. Regenerate
 # deliberately with `just coverage` and commit the result.
-#
-# PLACEHOLDER: all crates pinned at 0.0 so the ratchet passes trivially
-# until the first real generation — regenerate with `just coverage`.
-# (scarab-testkit is excluded from coverage entirely.)
 
 [crates]
-scarab-cli = 0.0
-scarab-db-postgres = 0.0
-scarab-engine = 0.0
-scarab-executor-k8s = 0.0
-scarab-executor-local = 0.0
-scarab-forge = 0.0
-scarab-forge-forgejo = 0.0
-scarab-forge-github = 0.0
-scarab-identity = 0.0
-scarab-pipeline = 0.0
-scarab-project = 0.0
-scarab-secrets = 0.0
-scarab-secrets-postgres = 0.0
-scarab-server = 0.0
-scarab-storage = 0.0
-scarab-storage-s3 = 0.0
+scarab-cli = 25.8
+scarab-db-postgres = 85.4
+scarab-engine = 89.1
+scarab-executor-k8s = 75.3
+scarab-executor-local = 80.0
+scarab-forge = 95.3
+scarab-forge-forgejo = 64.1
+scarab-forge-github = 65.8
+scarab-identity = 100.0
+scarab-pipeline = 96.2
+scarab-project = 96.9
+scarab-secrets = 85.6
+scarab-secrets-postgres = 70.7
+scarab-server = 75.6
+scarab-storage-s3 = 69.5
