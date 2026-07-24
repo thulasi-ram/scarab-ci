@@ -362,6 +362,13 @@ pub struct StepDto {
     pub secrets: Vec<String>,
     #[serde(default)]
     pub needs: Vec<String>,
+    /// Explicit input workspaces (ADR-0007): the subset of `needs` whose output
+    /// workspace this step consumes. Absent = implicit-by-default (inherit every
+    /// need's workspace). Naming a subset both restricts what flows in and
+    /// sharpens restart invalidation — the skip-if-unchanged signature is then
+    /// computed over exactly these inputs (mirrors `scarab_pipeline::StepSpec`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<Vec<String>>,
     /// Privilege escalation requested above the hardened baseline (ADR-0039).
     /// On an inline API run only the self-service `run_as_root` grant is admitted
     /// (it stays inside the sandbox); governed grants (add-capabilities /
@@ -3837,6 +3844,12 @@ async fn persist_run_from_ir(
             let inputs: Vec<StepId> = inputs.iter().map(|i| StepId(i.clone())).collect();
             db.set_step_inputs(run, &step_id, &inputs).await?;
         }
+        // NOTE: the sibling `step.outputs` (per-PATH output publishing, ADR-0007)
+        // is intentionally NOT threaded into the IR here. Whole-workspace
+        // publishing is the shipped behavior; a path subset needs CAS sub-tree
+        // addressing that scarab-storage-s3 lacks (whole-tree only). The field is
+        // parsed + validated but a no-op — see the output-snapshot site in
+        // scarab-engine/src/scheduler.rs and docs/followups.md. Not a silent drop.
 
         // A `when:`-excluded step is kept in the DAG (edges intact) but starts
         // Skipped, so the scheduler transitively skips its descendants (ADR-0033).
