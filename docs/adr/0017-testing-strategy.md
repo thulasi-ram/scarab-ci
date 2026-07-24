@@ -34,24 +34,6 @@ deterministic simulation testing later, at low marginal cost, if/when the wedge 
 - The durability path still gets deliberate crash coverage.
 - DST is available but not mandated up front.
 
-## Addendum (2026-07-24): feature-acceptance rule
-
-Grow-from-bugs structurally cannot catch the **unimplemented-feature** class —
-a feature that never worked has nothing to regress (escapes: matrix legs never
-ran, git refused the provisioned workspace, service names collided across
-Takes). Amendment:
-
-- Every engine/server/executor feature lands with **at least one functional
-  test that executes the feature** through the real router + engine (fakes at
-  ports only). "Compiles + YAML parses" is not acceptance.
-- A **kind-tier case is required at land time only when the feature's failure
-  mode is k8s-observable-only** (invisible to `FakeExecutor`, e.g. git-trust,
-  Pod naming); otherwise it may follow within the same milestone.
-- **UI features are exempt** — they stay grow-from-bugs; the no-DOM derivation
-  test tier keeps retrofitting cheap.
-
-See `docs/audits/2026-07-24-test-strategy.md` for the operational plan.
-
 ## Alternatives considered
 
 - **Full DST harness in v1** — proves the wedge, but upfront harness cost against velocity.

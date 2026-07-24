@@ -20,13 +20,6 @@ import {
 } from "../api/client";
 import type { RunEvent } from "../api/client";
 import { ofRecordAttemptId } from "../takes";
-import {
-  windowAttemptList,
-  scopedAttempt,
-  stepNotRun,
-  ofRecordIndexOf,
-} from "../attempts";
-import { levelOf } from "../logs";
 import Icon from "./Icon";
 import AttemptsDropdown, { type FilmstripTry } from "./AttemptsDropdown";
 
@@ -34,6 +27,15 @@ type Tab = "logs" | "results" | "outputs" | "workspace";
 
 // Cap rendered lines so a giant attempt can't blow up the DOM (windowing v1).
 const MAX_LINES = 1500;
+
+type Level = "err" | "warn" | "ok" | "cmd" | "";
+function levelOf(line: string): Level {
+  if (/^\s*\$ /.test(line)) return "cmd";
+  if (/\b(error|panic|fatal)\b/i.test(line) || /^error(\[|:)/i.test(line)) return "err";
+  if (/\bwarn(ing)?\b/i.test(line)) return "warn";
+  if (/\b(finished|passed|ok|success(ful)?)\b/i.test(line)) return "ok";
+  return "";
+}
 
 /** A compact display of a result value — scalars inline, structures as JSON. */
 function showValue(v: unknown): string {
@@ -103,6 +105,7 @@ export default function StepPane(props: {
   const sidecars = () => props.step?.services ?? [];
 
   const stepId = () => props.step?.id ?? null;
+  const attemptN = (id: string) => parseInt(id.replace(/^a/, ""), 10) || 0;
   // The attempts this pane's tabs are scoped to. Take-windowed in EVERY view
   // (ADR-0056 amendment 2026-07-24): when the caller hands a `window` (the
   // selected take's attempt-id set), keep only those tries — so a step carried
@@ -110,13 +113,22 @@ export default function StepPane(props: {
   // re-run step shows only THIS take's tries, on the latest/live take too. The
   // `frontierAttempt` ≤-filter stays as the fallback for callers that don't
   // pass a window (snapshot-at-boundary honesty).
-  const attemptsOf = (): Attempt[] =>
-    windowAttemptList(props.step?.attempt_list ?? [], props.window, props.frontierAttempt);
+  const attemptsOf = (): Attempt[] => {
+    const list = props.step?.attempt_list ?? [];
+    const w = props.window;
+    if (w) return list.filter((a) => w.includes(a.id));
+    const f = props.frontierAttempt;
+    return f ? list.filter((a) => attemptN(a.id) <= attemptN(f)) : list;
+  };
 
   // The attempt every tab is scoped to: explicit selection, else the Take
   // frontier (closed-take view), else the latest attempt.
-  const scoped = (): Attempt | null =>
-    scopedAttempt(attemptsOf(), props.attempt ?? props.frontierAttempt ?? null);
+  const scoped = (): Attempt | null => {
+    const list = attemptsOf();
+    if (!list.length) return null;
+    const want = props.attempt ?? props.frontierAttempt ?? null;
+    return list.find((a) => a.id === want) ?? list[list.length - 1];
+  };
 
   // The selected step didn't run in the viewed version — the caller's filmstrip
   // (already windowed to this version's tries) is empty. Both a time-travel
@@ -124,7 +136,7 @@ export default function StepPane(props: {
   // not-yet-launched step land here. Its tabs read a short "didn't run / nothing
   // of record" line instead of a stale or empty-looking shell (ADR-0056 §3:
   // never render blank-that-reads-as-success).
-  const notRun = (): boolean => stepNotRun(props.step, props.tries);
+  const notRun = (): boolean => !!props.step && props.tries.length === 0;
 
   // Of-record (ADR-0056 §3): the Outputs tab shows the latest SUCCESSFUL attempt
   // WITHIN THE VIEWED VERSION, not the selected try — so a failed/superseded/
@@ -133,7 +145,10 @@ export default function StepPane(props: {
   // with no success here) has nothing of record.
   const ofRecordTry = (): string | null =>
     notRun() ? null : ofRecordAttemptId(attemptsOf());
-  const ofRecordIndex = (): number => ofRecordIndexOf(attemptsOf());
+  const ofRecordIndex = (): number => {
+    const rec = ofRecordTry();
+    return rec ? attemptsOf().findIndex((a) => a.id === rec) : -1;
+  };
 
   // Reset per-step view state when the DAG selection moves.
   createEffect(() => {
