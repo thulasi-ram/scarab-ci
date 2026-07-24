@@ -7,7 +7,9 @@ export type Level = "err" | "warn" | "ok" | "cmd" | "";
  * a success-ish line, or plain output. */
 export function levelOf(line: string): Level {
   if (/^\s*\$ /.test(line)) return "cmd";
-  if (/\b(error|panic|fatal)\b/i.test(line) || /^error(\[|:)/i.test(line)) return "err";
+  // `panic(ked)?`: a real Rust panic prints "thread '…' panicked at …" —
+  // `\bpanic\b` alone missed it (bug found by the no-DOM test tier).
+  if (/\b(error|panic(ked)?|fatal)\b/i.test(line) || /^error(\[|:)/i.test(line)) return "err";
   if (/\bwarn(ing)?\b/i.test(line)) return "warn";
   if (/\b(finished|passed|ok|success(ful)?)\b/i.test(line)) return "ok";
   return "";
