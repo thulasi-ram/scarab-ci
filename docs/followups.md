@@ -59,6 +59,12 @@ Two buckets:
 | Git submodule support for vendored libs (pinned SHA in tree, resolved at the ref) | Teams want to vendor without copying bytes, at scale | Needs `ForgePort` to resolve submodule content at a ref (it doesn't today). The only *reproducible* "don't copy bytes" variant. |
 | Blessed, total `data → IR` generation frontend (Starlark / CUE) | A real workload needs **variable graph *shape*** per input (not just N instances of a fixed subgraph — `matrix × invoke` already covers that) | ADR-0009 pt 4 reserved this ("multi-frontend by construction"). A frontend, **never** an AST-mutating plugin. |
 
+### Identity & access (ADR-0049 / ADR-0060)
+
+| Feature | Trigger to build | Notes |
+|---|---|---|
+| Org **RBAC / member management** UI — the third global-Settings section (view/grant/revoke `Principal × scope × Role`) | Committed for "sometime" per the ADR-0060 grill; build when multi-user access needs hands-on management beyond forge-import bootstrap | The `/v1/orgs/{org}/bindings` API + native binding model already exist (ADR-0049); this is a management surface, not new model. Deferred out of ADR-0060 to keep that work to forge/secrets. |
+
 ---
 
 ## Planned, *not* demand-gated
@@ -66,13 +72,7 @@ Two buckets:
 These are committed roadmap work, listed here only to keep them off the "deferred"
 mental bucket:
 
-- ~~**Build `invoke`** (ADR-0038)~~ — **SHIPPED** (2026-07-24 sweep:
-  `inline_invokes` compile-time flattening + local-only validation in
-  scarab-pipeline). Only the demand-gated remainders above (remote invoke,
-  submodule vendoring, data→IR frontend) are still open.
+- **Build `invoke`** (ADR-0038) — the reuse primitive is decided but does not exist
+  in code (`StepSpec` has only image-steps + `gate`). This is real planned work,
+  not demand-gated. Break down with `to-issues`.
 - **Slice 7** (CONTEXT §9.7) — local executor + CLI + provenance/signing fast-follow.
-- **ADR-0059 tick fault isolation** — Proposed, unbuilt (only the
-  `reconcile_services` collect-and-continue landed). One poison run can still
-  abort a whole scheduler tick in `admit`/`advance`/other `reconcile*`, and
-  swallowed service-reconcile errors lack a bounded dead-letter. The one open
-  engine-correctness item (2026-07-24 sweep).

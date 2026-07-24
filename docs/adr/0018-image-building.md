@@ -30,13 +30,8 @@ Secure-by-default for the most common job.
 
 ## Amendment (2026-07-17) — registry authentication
 
-> **Status note (2026-07-24 sweep):** the gap below is closed — `build_pod`
-> is wired and `ensure_registry_secret` implements both the explicit-secret
-> and forge-derived auth paths in scarab-executor-k8s. The decision text
-> stands as the record of *how* it was designed.
-
-At the time of writing, `build_pod_for_build` existed but was unwired, with
-**no registry auth** (no push/pull credentials). Decision:
+`build_pod_for_build` exists but is unwired, and there is **no registry auth**
+(no push/pull credentials). Decision:
 
 - **Registry credentials are a generic scoped secret** (ADR-0037) — a
   `dockerconfigjson`-shaped secret in the Project/Environment scope, injected
