@@ -16,7 +16,17 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "error: '$1' not found on PAT
 need docker; need kind; need kubectl
 
 echo "==> starting Postgres + MinIO (docker compose)"
-docker compose -f "$here/compose.yaml" up -d
+# Same tolerance as `just test`: something already serving 55432 (an earlier
+# stack, or an ad-hoc dev container) is reused — compose then only provides
+# MinIO — instead of failing the port bind.
+if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then
+  echo "    reusing the Postgres already listening on 127.0.0.1:55432"
+  pg_managed=0
+  docker compose -f "$here/compose.yaml" up -d minio createbuckets
+else
+  pg_managed=1
+  docker compose -f "$here/compose.yaml" up -d
+fi
 
 echo "==> creating kind cluster '$cluster' (kubeconfig: $kubeconfig)"
 if ! kind get clusters 2>/dev/null | grep -qx "$cluster"; then
@@ -29,13 +39,15 @@ echo "==> ensuring namespace 'scarab'"
 KUBECONFIG="$kubeconfig" kubectl create namespace scarab \
   --dry-run=client -o yaml | KUBECONFIG="$kubeconfig" kubectl apply -f -
 
-echo "==> waiting for Postgres to be healthy"
-for _ in $(seq 1 30); do
-  if docker compose -f "$here/compose.yaml" exec -T postgres pg_isready -U scarab -d scarab >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+if [ "$pg_managed" = 1 ]; then
+  echo "==> waiting for Postgres to be healthy"
+  for _ in $(seq 1 30); do
+    if docker compose -f "$here/compose.yaml" exec -T postgres pg_isready -U scarab -d scarab >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+fi
 
 echo "==> building scarab-server"
 ( cd "$root" && cargo build -p scarab-server )
@@ -54,9 +66,13 @@ nohup "$root/target/debug/scarab-server" --role converged --serve \
 echo $! > "$here/server.pid"
 
 echo "==> waiting for the API (/healthz)"
+# Probe the address the server actually binds (from .env — e.g. a dev machine
+# whose :8080 is taken sets SCARAB_ADDR to another port); 0.0.0.0 via loopback.
+addr="${SCARAB_ADDR:-127.0.0.1:8080}"
+base="http://${addr/0.0.0.0/127.0.0.1}"
 for _ in $(seq 1 30); do
-  if curl -sf http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
-    echo "==> scarab-server is up on http://127.0.0.1:8080 (logs: deploy/local-proc/server.log)"
+  if curl -sf "$base/healthz" >/dev/null 2>&1; then
+    echo "==> scarab-server is up on $base (logs: deploy/local-proc/server.log)"
     echo "    run 'just demo' to submit a pipeline and watch it complete."
     exit 0
   fi

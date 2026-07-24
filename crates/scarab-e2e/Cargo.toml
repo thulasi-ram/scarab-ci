@@ -1,0 +1,28 @@
+# Full-stack E2E tier (test-strategy Phase 2): a pure HTTP driver for the
+# proc-mode harness (`deploy/local-proc/` — compose PG+MinIO, kind, the server
+# as a host process). The crate assumes a RUNNING stack; `just e2e` owns the
+# lifecycle (up.sh → nextest → down.sh). Every test is env-gated behind
+# `SCARAB_E2E=1` and skips loudly otherwise, so the default `just test` /
+# workspace run never depends on a cluster. Zero auto-retries — a red run is a
+# real timing bug (grow-from-bugs applies to the harness too).
+[package]
+name = "scarab-e2e"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Registry seeding for the dispatch-driven scenario + carving throwaway
+# databases (the crash/resume test's isolated server) from the stack Postgres.
+sqlx = { workspace = true }
+scarab-db-postgres = { workspace = true }
+scarab-forge = { workspace = true }
+# The in-test fake Forgejo the dispatch scenario points a connection at.
+axum = { workspace = true }
+tempfile = { workspace = true }

@@ -141,6 +141,30 @@ coverage:
       --lcov --output-path target/lcov.info
     python3 scripts/coverage_ratchet.py target/lcov.info docs/audits/coverage-baseline.toml --write
 
+# Full-stack E2E (test-strategy Phase 2): own the proc-mode stack for the
+# scarab-e2e suite — up.sh → nextest → down.sh. The crate is a pure HTTP
+# driver gated on SCARAB_E2E=1 (skips loudly in a plain `just test`); the
+# crash/resume scenario additionally spawns its OWN server from
+# SCARAB_E2E_SERVER_BIN so its SIGKILLs never poison the shared stack.
+# Zero auto-retries: a red run is a real bug, not flake to mask.
+e2e:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bash deploy/local-proc/up.sh
+    # Tear the stack down even when the suite fails; keep the suite's exit
+    # code, and surface the server log first on a red run (down.sh removes it).
+    trap 'code=$?; if [ "$code" -ne 0 ]; then echo "==> scarab-server log (suite failed):"; tail -n 200 deploy/local-proc/server.log 2>/dev/null || true; fi; bash deploy/local-proc/down.sh; exit "$code"' EXIT
+    cargo build -p scarab-server -p scarab-cli
+    # The same env file the stack booted from — SCARAB_ADDR names the server.
+    set -a && source deploy/local-proc/.env && set +a
+    export SCARAB_E2E=1
+    export SCARAB_E2E_URL="http://${SCARAB_ADDR/0.0.0.0/127.0.0.1}"
+    export SCARAB_E2E_DATABASE_URL="$SCARAB_DATABASE_URL"
+    export SCARAB_E2E_SERVER_BIN="$PWD/target/debug/scarab-server"
+    export SCARAB_E2E_CLI_BIN="$PWD/target/debug/scarab"
+    export SCARAB_E2E_KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
+    cargo nextest run -p scarab-e2e --no-fail-fast
+
 # Compile-check everything.
 check:
     cargo check --workspace

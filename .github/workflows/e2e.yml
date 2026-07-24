@@ -1,0 +1,46 @@
+# Full-stack E2E, nightly + on-demand (test-strategy Phase 2): the proc-mode
+# harness (compose Postgres+MinIO, a kind cluster, scarab-server as a host
+# process) driven by the env-gated `scarab-e2e` crate — CI parity with
+# `just e2e`. Deliberately NOT per-PR: it is the slowest tier, and a red
+# nightly is triaged as a real timing bug (zero auto-retries).
+name: e2e
+
+on:
+  schedule:
+    - cron: "23 2 * * *" # nightly
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Debuginfo is the bulk of target/ and worthless in CI — without this the
+      # workspace build exhausts the runner's disk (see ci.yml).
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,just
+      # up.sh needs the kind binary; kubectl and docker compose ship on the
+      # runner. install_only — the recipe creates + owns its own cluster.
+      - uses: helm/kind-action@v1
+        with:
+          install_only: true
+      # The one canonical entrypoint (CLAUDE.md): compose up + kind + server,
+      # build the server/CLI binaries, run the suite, tear down even on red
+      # (the recipe tails the server log before teardown when the suite fails).
+      - name: Run the full-stack E2E suite
+        run: just e2e

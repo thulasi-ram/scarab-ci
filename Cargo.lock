@@ -2642,6 +2642,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "scarab-e2e"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "reqwest",
+ "scarab-db-postgres",
+ "scarab-forge",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "scarab-engine"
 version = "0.1.0"
 dependencies = [
@@ -2667,7 +2682,6 @@ dependencies = [
  "scarab-pipeline",
  "scarab-storage",
  "scarab-storage-s3",
- "scarab-testkit",
  "serde",
  "serde_json",
  "tar",
