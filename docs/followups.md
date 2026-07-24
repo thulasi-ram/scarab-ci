@@ -72,7 +72,13 @@ Two buckets:
 These are committed roadmap work, listed here only to keep them off the "deferred"
 mental bucket:
 
-- **Build `invoke`** (ADR-0038) — the reuse primitive is decided but does not exist
-  in code (`StepSpec` has only image-steps + `gate`). This is real planned work,
-  not demand-gated. Break down with `to-issues`.
+- ~~**Build `invoke`** (ADR-0038)~~ — **SHIPPED** (2026-07-24 sweep:
+  `inline_invokes` compile-time flattening + local-only validation in
+  scarab-pipeline). Only the demand-gated remainders above (remote invoke,
+  submodule vendoring, data→IR frontend) are still open.
 - **Slice 7** (CONTEXT §9.7) — local executor + CLI + provenance/signing fast-follow.
+- **ADR-0059 tick fault isolation** — Proposed, unbuilt (only the
+  `reconcile_services` collect-and-continue landed). One poison run can still
+  abort a whole scheduler tick in `admit`/`advance`/other `reconcile*`, and
+  swallowed service-reconcile errors lack a bounded dead-letter. The one open
+  engine-correctness item (2026-07-24 sweep).

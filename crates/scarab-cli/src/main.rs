@@ -4,7 +4,9 @@
 //! **same** dispatch API the UI does (invariant #5, one validator) — it sends
 //! each `--param k=v` as a raw string and lets the server's
 //! `resolve_params`/`coerce` do the typing, so there is no second, client-side
-//! validator to drift. The other subcommands remain compiling stubs.
+//! validator to drift. `lint` and `validate` are offline compile/semantic
+//! checks over a pipeline file; `logs` replays + tails a run's logs over SSE;
+//! `rerun` reruns a step and its dependents — all wired, not stubs.
 
 use clap::{Args, Parser, Subcommand};
 
