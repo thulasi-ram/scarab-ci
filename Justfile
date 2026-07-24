@@ -102,9 +102,44 @@ serve:
     export KUBECONFIG=deploy/local-proc/.kubeconfig
     cargo run -p scarab-server -- --role converged --serve
 
-# Build + test the workspace. Set SCARAB_TEST_DATABASE_URL to run PG-backed tests.
+# Run the workspace suite against the compose Postgres (brought up on demand),
+# so the PG-backed tests actually run — mirroring the CI `test` job. Uses
+# nextest when installed, plain `cargo test` otherwise.
 test:
-    cargo test --workspace
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Reuse whatever already serves 55432 (a `just up` stack, or an ad-hoc dev
+    # container); otherwise bring up just the compose Postgres.
+    if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then
+      echo "==> reusing the Postgres already listening on 127.0.0.1:55432"
+    else
+      docker compose -f deploy/local-proc/compose.yaml up -d --wait postgres
+    fi
+    export SCARAB_TEST_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab
+    if command -v cargo-nextest >/dev/null 2>&1; then
+      cargo nextest run --workspace
+    else
+      echo "warning: cargo-nextest not installed (https://nexte.st) — falling back to cargo test" >&2
+      cargo test --workspace
+    fi
+
+# Coverage run (mirrors the CI `coverage` job): suite under cargo-llvm-cov
+# against the compose Postgres, per-crate summary, and REGENERATES
+# docs/audits/coverage-baseline.toml — review + commit the baseline deliberately.
+# Requires cargo-nextest + cargo-llvm-cov.
+coverage:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then
+      echo "==> reusing the Postgres already listening on 127.0.0.1:55432"
+    else
+      docker compose -f deploy/local-proc/compose.yaml up -d --wait postgres
+    fi
+    export SCARAB_TEST_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab
+    cargo llvm-cov nextest --workspace \
+      --ignore-filename-regex 'crates/scarab-testkit/|/tests/' \
+      --lcov --output-path target/lcov.info
+    python3 scripts/coverage_ratchet.py target/lcov.info docs/audits/coverage-baseline.toml --write
 
 # Compile-check everything.
 check:
