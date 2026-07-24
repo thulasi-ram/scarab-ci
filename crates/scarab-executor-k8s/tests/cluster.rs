@@ -48,9 +48,27 @@ fn unique_run(prefix: &str) -> String {
     format!("{prefix}-{t}")
 }
 
-fn step() -> StepRun {
+/// The optional checkout credential for the LIVE clone tests: the repo they
+/// clone (this one) may be private, in which case an anonymous clone is
+/// SourceUnavailable by design. Set SCARAB_TEST_CLONE_TOKEN (CI: the ambient
+/// GITHUB_TOKEN; locally: `gh auth token`) to authenticate; delivery still
+/// goes through the tmpfs + GIT_ASKPASS path (ADR-0045), never the URL.
+fn clone_credential() -> Option<scarab_engine::CloneCredential> {
+    std::env::var("SCARAB_TEST_CLONE_TOKEN")
+        .ok()
+        .map(|token| scarab_engine::CloneCredential {
+            username: "x-access-token".into(),
+            token,
+        })
+}
+
+/// A one-step StepRun under a UNIQUE run id (see [`unique_run`]): the fence
+/// (run/step/attempt) names the Pod, so a fixed id would re-attach to a
+/// leftover Pod from a previous invocation — or collide with a concurrently
+/// running sibling test sharing the fixture.
+fn step(run_prefix: &str) -> StepRun {
     StepRun {
-        run: RunId("run-1".into()),
+        run: RunId(unique_run(run_prefix)),
         step: StepId("echo".into()),
         status: StepStatus::Running,
         attempts: vec![Attempt {
@@ -71,13 +89,15 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
 
     let client = kube::Client::try_default().await.expect("kube client");
     let exec = K8sExecutor::with_client(ns, client);
-    let step = step();
+    let step = step("run-echo");
     let spec = StepSpec {
         image: "busybox:latest".into(),
         command: vec!["sh".into(), "-c".into(), "echo hello scarab".into()],
         env: vec![],
         secrets: vec![],
-        run_as_root: false,
+        // busybox runs as root; without the self-service grant the hardened
+        // ADR-0039 baseline rejects the container (CreateContainerConfigError).
+        run_as_root: true,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -204,13 +224,14 @@ async fn log_stream_tails_pod_stdout() {
 
     let client = kube::Client::try_default().await.expect("kube client");
     let exec = K8sExecutor::with_client(ns, client);
-    let step = step();
+    let step = step("run-logs");
     let spec = StepSpec {
         image: "busybox:latest".into(),
         command: vec!["sh".into(), "-c".into(), "echo hello scarab logs".into()],
         env: vec![],
         secrets: vec![],
-        run_as_root: false,
+        // busybox runs as root; the hardened baseline would reject it.
+        run_as_root: true,
         add_capabilities: vec![],
         privileged: false,
         timeout_seconds: None,
@@ -443,6 +464,7 @@ async fn clone_step_produces_a_source_workspace() {
             name: "scarab-ci".into(),
             sha: sha.clone(),
             url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
+            credential: clone_credential(),
             ..Default::default()
         }),
         build: None,
@@ -626,6 +648,7 @@ async fn clone_depth_full_exposes_history() {
             sha: sha.clone(),
             depth_full: true,
             url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
+            credential: clone_credential(),
             ..Default::default()
         }),
         build: None,
@@ -773,6 +796,9 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
             // case. The fetch fails, the guard exits 86 — SourceUnavailable.
             sha: "0000000000000000000000000000000000000001".into(),
             url: "https://github.com/thulasi-ram/scarab-ci.git".into(),
+            // Authenticated so the 86 is genuinely the vanished SHA, not a
+            // repo-access rejection (the repo may be private).
+            credential: clone_credential(),
             ..Default::default()
         }),
         build: None,
