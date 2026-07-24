@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use support::*;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn cancel_mid_run_tears_down_the_pod() {
     require_e2e!();
 

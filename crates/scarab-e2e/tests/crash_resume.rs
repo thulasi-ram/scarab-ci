@@ -66,7 +66,7 @@ fn free_port() -> u16 {
         .port()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn crash_resume_completes_exactly_once() {
     require_e2e!();
 

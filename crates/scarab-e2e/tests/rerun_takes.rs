@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use support::*;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn rerun_creates_a_new_take_with_fresh_attempt_evidence() {
     require_e2e!();
 

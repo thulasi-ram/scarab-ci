@@ -10,7 +10,7 @@
 
 mod support;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "todo: scenario 6 — CAS loss on restart must fail fast, not hang at Init (helm-dogfood escape)"]
 async fn rerun_after_cas_loss_fails_fast() {
     require_e2e!();

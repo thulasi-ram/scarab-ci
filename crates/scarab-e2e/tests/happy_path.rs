@@ -75,7 +75,7 @@ async fn fake_forgejo() -> String {
     format!("http://{addr}")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn happy_path_cli_dispatch_to_succeeded_with_logs() {
     require_e2e!();
 

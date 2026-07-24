@@ -9,7 +9,7 @@
 
 mod support;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "todo: scenario 5 — signed webhook ingest → run → status posted back to the fake forge"]
 async fn webhook_creates_run_and_posts_status_back() {
     require_e2e!();
