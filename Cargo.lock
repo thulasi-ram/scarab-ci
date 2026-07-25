@@ -2715,6 +2715,8 @@ name = "scarab-forge-forgejo"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "base64",
  "hmac",
  "reqwest",
  "scarab-forge",

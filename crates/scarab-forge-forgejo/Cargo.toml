@@ -12,3 +12,12 @@ serde_json = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+
+# The LIVE verification tier (tests/live.rs, git-bug 3863d5e) — env-gated behind
+# SCARAB_TEST_FORGEJO=1, so none of this is on the default test path.
+[dev-dependencies]
+# The listener that records what a real Forgejo actually posts to a hook.
+axum = { workspace = true }
+# The contents API takes base64 — how the test makes a real commit (and so a
+# real push delivery) without needing a clone or an SSH key.
+base64 = { workspace = true }
