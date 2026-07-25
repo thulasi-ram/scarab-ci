@@ -67,11 +67,30 @@ spec:
             # the run. A dedicated emptyDir keeps /tmp writable.
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.secrets.githubAppPemSecret.name }}
+            # GitHub App private key projected from a Secret you manage
+            # out-of-band (enh 245a99c) — SCARAB_GITHUB_APP_PEM_FILE points at
+            # the file inside. Read at boot; a bad path fails the boot loudly.
+            - name: github-app-pem
+              mountPath: {{ include "scarab.githubAppPemDir" . | quote }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: scratch
           emptyDir: {}
         - name: tmp
           emptyDir: {}
+        {{- if .Values.secrets.githubAppPemSecret.name }}
+        - name: github-app-pem
+          secret:
+            secretName: {{ .Values.secrets.githubAppPemSecret.name | quote }}
+            items:
+              - key: {{ .Values.secrets.githubAppPemSecret.key | quote }}
+                path: {{ .Values.secrets.githubAppPemSecret.key | quote }}
+            # Group-readable only: Secret files are owned root:fsGroup, and the
+            # container runs as the unprivileged podSecurityContext.fsGroup.
+            defaultMode: 0440
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

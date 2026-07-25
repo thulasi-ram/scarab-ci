@@ -22,7 +22,8 @@ cp deploy/local-helm/.env.example deploy/local-helm/.env
 # fill in: SCARAB_MASTER_KEY (keep it STABLE across deploys, or stored secrets
 #   become undecryptable), SCARAB_GITHUB_WEBHOOK_SECRET,
 # SCARAB_RESULTS_TOKEN_SECRET, SCARAB_GITHUB_APP_ID, SCARAB_PUBLIC_URL (tunnel),
-# and the reseed inputs (SCARAB_APP_PEM / INSTALL_ID / ORG / REPO).
+# SCARAB_APP_PEM (mounted at boot — see below), and the reseed inputs
+#   (SCARAB_INSTALL_ID / ORG / REPO).
 ```
 Context **must** be `colima` (deploy.sh refuses otherwise — never target EKS).
 
@@ -70,7 +71,7 @@ Or drive the script directly (image source then comes from `.env`):
 ```sh
 deploy/local-helm/deploy.sh [image-tag]         # postgres + helm upgrade --install
 just local-helm-ui 8899                             # persistent forward (reconnects across deploys); cloudflared -> :8899
-deploy/local-helm/reseed.sh                     # fresh DB only: store PEM + register
+deploy/local-helm/reseed.sh                     # fresh DB only: register the installation
 ```
 > **Every deploy rolls a fresh Pod.** Our tags are mutable — `edge` and
 > `dogfood-local` never change string-wise — so a plain `helm upgrade` would
@@ -90,6 +91,15 @@ deploy/local-helm/reseed.sh                     # fresh DB only: store PEM + reg
 secrets on the CLI or on disk). `reseed.sh` reads the webhook secret from the
 deployed Secret, so it isn't written down anywhere.
 
+### The App PEM is mounted, not seeded
+`deploy.sh` puts `SCARAB_APP_PEM` into a k8s Secret (`scarab-github-app`) and the
+chart mounts it at `/etc/scarab/forge/github-app.pem`, so the server has the App
+credential **at boot** — no `POST /v1/secrets`, and it survives a DB wipe. It
+overrides any DB-stored `_forge` credential, so `reseed.sh` detects the mount and
+skips its PUT; what a fresh DB still needs from `reseed.sh` is the **installation
+registration**, which is durable state, not a credential. Rotating the key is
+`deploy.sh` again (the Secret is re-applied and the Pod rolls every deploy).
+
 ## Clean slate
 ```sh
 helm uninstall scarab -n scarab
@@ -97,7 +107,8 @@ kubectl delete -n scarab -f deploy/local-helm/postgres.yaml   # drops the PVC =>
 kubectl delete -n scarab -f deploy/local-helm/minio.yaml      # drops the PVC => wipes the CAS
 # next deploy.sh + reseed.sh starts fresh (deploy.sh recreates the bucket)
 ```
-Because the App PEM lives in Postgres (encrypted under `SCARAB_MASTER_KEY`), wiping the
-PVC means re-running `reseed.sh`. Keep `SCARAB_MASTER_KEY` stable or previously-stored
-secrets become undecryptable. Wiping the MinIO PVC drops all logs/artifacts/workspace
+Wiping the DB PVC means re-running `reseed.sh` to re-register the installation. The App
+PEM itself is unaffected — it is mounted from a Secret, not stored in Postgres (above).
+Keep `SCARAB_MASTER_KEY` stable anyway, or any *other* previously-stored secret (org/env
+secrets) becomes undecryptable. Wiping the MinIO PVC drops all logs/artifacts/workspace
 snapshots — old runs stay in the DB but their content (and rerun inputs) is gone.

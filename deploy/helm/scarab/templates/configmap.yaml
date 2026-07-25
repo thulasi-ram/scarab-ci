@@ -36,6 +36,11 @@ data:
   {{- with .Values.scarab.stepTimeoutSecs }}
   SCARAB_STEP_TIMEOUT_SECS: {{ . | quote }}
   {{- end }}
+  {{- if .Values.secrets.githubAppPemSecret.name }}
+  {{- /* File-mounted App PEM (enh 245a99c): the path is not sensitive — only
+         the mounted Secret is — so it belongs in the ConfigMap. */}}
+  SCARAB_GITHUB_APP_PEM_FILE: {{ include "scarab.githubAppPemPath" . | quote }}
+  {{- end }}
   {{- if .Values.secrets.resultsTokenSecret }}
   SCARAB_SIDECAR_IMAGE: {{ .Values.scarab.sidecarImage | quote }}
   SCARAB_RESULTS_API_URL: {{ .Values.scarab.resultsApiUrl | default (printf "http://%s.%s.svc" (include "scarab.fullname" .) .Release.Namespace) | quote }}

@@ -103,6 +103,16 @@ secrets:
   # NB: connection/installation registration is separate state — still seeded
   # via reseed.sh's synthetic webhook or a real GitHub delivery.
   githubAppPem: ""
+  # The same credential mounted as a FILE — the GitOps-native shape, since the
+  # PEM stays in a Secret you manage out-of-band (external-secrets /
+  # sealed-secrets / SOPS) and no key material passes through Helm values at
+  # all. The chart projects `key` from `name` read-only and points
+  # SCARAB_GITHUB_APP_PEM_FILE at it. Independent of existingSecret (that is
+  # envFrom; this is a volume), and an inline githubAppPem wins if both are set.
+  # An unreadable path is a boot failure (ADR-0048), not a silent downgrade.
+  githubAppPemSecret:
+    name: ""                # Secret to mount; empty => no mount, no env var
+    key: github-app.pem     # key within that Secret holding the PEM
 
 # RBAC the k8s executor needs to run one Pod per step in scarab.namespace.
 rbac:

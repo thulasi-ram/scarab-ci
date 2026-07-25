@@ -76,6 +76,21 @@ S3_REGION="${SCARAB_S3_REGION:-us-east-1}"
 S3_ACCESS_KEY="${SCARAB_S3_ACCESS_KEY:-scarab}"
 S3_SECRET_KEY="${SCARAB_S3_SECRET_KEY:-scarabsecret}"
 
+# GitHub App PEM at BOOT (enh 245a99c) rather than a post-boot PUT /v1/secrets:
+# the PEM is mounted from a k8s Secret this script maintains from the SAME
+# .env path reseed.sh used, so a wiped/recreated DB no longer loses the App
+# credential — only the installation registration has to be replayed. Skipped
+# entirely when SCARAB_APP_PEM is unset (token mode / no App).
+APP_PEM_SECRET="${APP_PEM_SECRET:-scarab-github-app}"
+APP_PEM_KEY=github-app.pem
+PEM_VALUES=""
+if [ -n "${SCARAB_APP_PEM:-}" ]; then
+  [ -f "$SCARAB_APP_PEM" ] || { echo "SCARAB_APP_PEM not found: $SCARAB_APP_PEM" >&2; exit 1; }
+  PEM_VALUES="  githubAppPemSecret:
+    name: \"${APP_PEM_SECRET}\"
+    key: \"${APP_PEM_KEY}\""
+fi
+
 # Render a transient values file from .env (deleted on exit — no secrets on the
 # CLI, none left on disk).
 VALUES="$(mktemp)"
@@ -112,10 +127,20 @@ secrets:
   resultsTokenSecret: "${SCARAB_RESULTS_TOKEN_SECRET:-}"
   s3AccessKey: "${S3_ACCESS_KEY}"
   s3SecretKey: "${S3_SECRET_KEY}"
+${PEM_VALUES}
 YAML
 
 echo "==> namespace"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
+# The App PEM Secret the chart mounts (see PEM_VALUES above). Re-applied every
+# deploy so rotating the file in .env is one `deploy.sh` away.
+if [ -n "${SCARAB_APP_PEM:-}" ]; then
+  echo "==> GitHub App PEM secret ($APP_PEM_SECRET)"
+  kubectl create secret generic "$APP_PEM_SECRET" -n "$NS" \
+    --from-file="$APP_PEM_KEY=$SCARAB_APP_PEM" \
+    --dry-run=client -o yaml | kubectl apply -f -
+fi
 
 echo "==> in-cluster Postgres"
 kubectl apply -n "$NS" -f "$ROOT/deploy/local-helm/postgres.yaml"
@@ -138,5 +163,5 @@ cat <<EOF
 
 Deployed. Next:
   kubectl port-forward -n $NS svc/scarab 8899:80   # leave running; cloudflared -> :8899
-  deploy/local-helm/reseed.sh                      # fresh DB only: store PEM + register
+  deploy/local-helm/reseed.sh                      # fresh DB only: register the installation
 EOF

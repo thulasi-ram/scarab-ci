@@ -40,6 +40,44 @@ helm upgrade --install scarab deploy/helm/scarab -n scarab \
   --set secrets.existingSecret=scarab-env --set scarab.s3.bucket=scarab-logs
 ```
 
+## The GitHub App credential (bootstrap-free)
+
+In App mode (`scarab.githubAppId`) the credential a GitHub connection
+authenticates with is the App's private-key PEM. It can be stored in Postgres at
+the reserved `_forge` scope via `POST /v1/secrets` (ADR-0046), but that has a
+bootstrap ordering problem for a cluster: the server must already be up to
+accept the credential it needs, and the credential dies with the database. So the
+chart can also hand the PEM to the server **at boot**, which survives a database
+recreate and needs no API call:
+
+```sh
+# GitOps-native: the PEM stays in a Secret you manage out-of-band
+# (external-secrets / sealed-secrets / SOPS), mounted as a file.
+kubectl -n scarab create secret generic scarab-github-app \
+  --from-file=github-app.pem=./my-app.private-key.pem
+
+helm upgrade --install scarab deploy/helm/scarab -n scarab \
+  --set scarab.githubAppId=123456 \
+  --set secrets.githubAppPemSecret.name=scarab-github-app
+```
+
+The chart projects that key read-only at `/etc/scarab/forge/<key>` and sets
+`SCARAB_GITHUB_APP_PEM_FILE`; an unreadable path is a boot failure (ADR-0048),
+never a silent downgrade. A boot-supplied PEM **overrides** the DB-stored
+`_forge` credential for GitHub App-mode connections, so an absent one is expected
+and not reported as degraded.
+
+Two other shapes reach the same place — `secrets.githubAppPem` (inline value,
+rendered into the chart Secret as `SCARAB_GITHUB_APP_PEM`) and a
+`SCARAB_GITHUB_APP_PEM` key in your own `secrets.existingSecret`. Inline wins
+over the mounted file. Prefer the mounted file: no key material passes through
+Helm values.
+
+**This is the credential only.** Which installations and repos exist is separate
+durable state, registered by the App's `installation` /
+`installation_repositories` webhook deliveries (or `deploy/local-helm/reseed.sh`
+for a local loop) — a fresh database still needs one delivery.
+
 ## Key values
 
 | Key | Default | Notes |
@@ -50,6 +88,7 @@ helm upgrade --install scarab deploy/helm/scarab -n scarab \
 | `scarab.namespace` | release ns | namespace step Pods launch into (RBAC granted there) |
 | `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
 | `secrets.*` / `secrets.existingSecret` | — | sensitive `SCARAB_*` env |
+| `secrets.githubAppPemSecret.name` / `.key` | — / `github-app.pem` | mount the App PEM from your own Secret (above) |
 | `rbac.create` | `true` | Role/RoleBinding for Pod execution |
 | `ingress.enabled` | `false` | expose the HTTP API |
 

@@ -42,6 +42,21 @@ helm upgrade --install scarab deploy/helm/scarab \
 For production, keep credentials out of `--set`: create a Secret whose keys are the `SCARAB_*`
 environment-variable names and reference it with `secrets.existingSecret`.
 
+The GitHub App private key is the one credential with a bootstrap ordering problem — storing it
+through the API needs a server that is already running, and it dies with the database. So the chart
+can mount it from a Secret you manage out-of-band instead, and the server reads it at boot:
+
+```sh
+kubectl -n scarab create secret generic scarab-github-app \
+  --from-file=github-app.pem=./my-app.private-key.pem
+# then: --set scarab.githubAppId=123456 \
+#       --set secrets.githubAppPemSecret.name=scarab-github-app
+```
+
+A boot-supplied key overrides any stored `_forge` credential and survives a database recreate. The
+*installations* it authenticates as are separate durable state, registered from the App's
+`installation` webhook deliveries.
+
 ## Key values
 
 Only keys that exist in `values.yaml`:
@@ -54,6 +69,7 @@ Only keys that exist in `values.yaml`:
 | `scarab.namespace` | release ns | namespace step Pods launch into (RBAC granted there) |
 | `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
 | `secrets.*` / `secrets.existingSecret` | — | sensitive `SCARAB_*` env (DB URL, S3 keys, master key, webhook secrets) |
+| `secrets.githubAppPemSecret.name` / `.key` | — / `github-app.pem` | mount the GitHub App private key from your own Secret |
 | `rbac.create` | `true` | Role/RoleBinding for Pod execution |
 | `ingress.enabled` | `false` | expose the HTTP API |
 

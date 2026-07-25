@@ -47,6 +47,18 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- default .Release.Namespace .Values.scarab.namespace -}}
 {{- end -}}
 
+{{/* Directory the file-mounted GitHub App PEM is projected into (enh 245a99c). */}}
+{{- define "scarab.githubAppPemDir" -}}
+/etc/scarab/forge
+{{- end -}}
+
+{{/* Absolute path of the file-mounted GitHub App PEM — the value of
+     SCARAB_GITHUB_APP_PEM_FILE, and the mount the Pod projects it at. One
+     definition so the ConfigMap and the Deployment can never disagree. */}}
+{{- define "scarab.githubAppPemPath" -}}
+{{- printf "%s/%s" (include "scarab.githubAppPemDir" .) .Values.secrets.githubAppPemSecret.key -}}
+{{- end -}}
+
 {{/* Name of the Secret holding sensitive env (existing or chart-managed). */}}
 {{- define "scarab.secretName" -}}
 {{- if .Values.secrets.existingSecret -}}
