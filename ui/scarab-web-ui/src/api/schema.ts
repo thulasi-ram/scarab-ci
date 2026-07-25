@@ -156,8 +156,52 @@ export interface paths {
          */
         get: operations["list_connections"];
         put?: never;
-        post?: never;
+        /**
+         * Create a forge connection, writing its credential through to the secret store (ADR-0060)
+         * @description This is the manual/UI half of part D and the reason Forgejo can be onboarded
+         *     at all: GitHub registers itself when the App is installed, but a Forgejo
+         *     instance has no such event, so without this endpoint its only route into the
+         *     registry was a hand-written database row.
+         *
+         *     The credential is **write-only** in the strong sense — it is written before
+         *     the connection row exists, never read back by any endpoint, and the response
+         *     carries only the generated handle. Order matters: writing the secret first
+         *     means a failure leaves an orphan secret (harmless, overwritten on retry)
+         *     rather than a connection whose credential never landed (a live row that
+         *     silently cannot authenticate).
+         */
+        post: operations["create_connection"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/connections/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a forge connection and its unreferenced credential (ADR-0060)
+         * @description Two deliberate safeties:
+         *
+         *      1. **Bound repos block the delete** unless `unbind_repos=true`. A Project
+         *         *is* a repo binding (ADR-0046), so deleting a connection deletes
+         *         governance — the same reasoning that stops `resync` from ever unbinding.
+         *         A one-word query parameter is cheap; a silently deleted Environment is
+         *         not recoverable from the UI.
+         *      2. **A shared credential survives.** Every GitHub App installation points at
+         *         the one `github-app` handle, so deleting one installation must not pull
+         *         the material out from under the others. The secret is removed only when
+         *         no remaining connection references that handle.
+         */
+        delete: operations["delete_connection"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1138,6 +1182,29 @@ export interface components {
             };
         };
         /**
+         * @description `POST /v1/connections` body (ADR-0060 part D, manual path): the forge to
+         *     connect and the credential to reach it with.
+         *
+         *     `credential` is **write-only** — it is written through to `SecretProvider`
+         *     under a server-generated handle and never appears in any response. There is
+         *     deliberately no "update the credential" field on the read DTO: a secret you
+         *     can read back is a secret you have leaked.
+         */
+        CreateConnectionRequest: {
+            /**
+             * @description The instance root Scarab talks to (e.g. `https://codeberg.org`). A
+             *     trailing slash is normalized away.
+             */
+            base_url: string;
+            /** @description The forge access token. Write-only (see the struct docs). */
+            credential: string;
+            /**
+             * @description `forgejo`. GitHub is not creatable here — installing the App *is* its
+             *     registration (ADR-0060 part C), so a create form for it could not work.
+             */
+            kind: string;
+        };
+        /**
          * @description `POST /v1/runs` body: an inline pipeline to run immediately, plus any launch
          *     parameters (ADR-0043) declared by the pipeline's `interface`.
          */
@@ -1160,6 +1227,18 @@ export interface components {
         CreateRunResponse: {
             id: string;
             status: string;
+        };
+        /**
+         * @description `POST /v1/connections` response: the created connection's id and the
+         *     generated handle its credential now lives under. Not the credential.
+         */
+        CreatedConnectionDto: {
+            /**
+             * @description The server-generated `_forge`-scoped handle. Echoed so an operator can
+             *     correlate the row with its secret; it is a name, not a value.
+             */
+            credential_ref: string;
+            id: string;
         };
         /**
          * @description Which trigger a dispatch opts into: a human [`Manual`](DispatchKind::Manual)
@@ -1962,6 +2041,102 @@ export interface operations {
             };
             /** @description no connection registry wired */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateConnectionRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreatedConnectionDto"];
+                };
+            };
+            /** @description unknown kind, non-creatable kind, or a malformed base URL */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description requires Administer on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no connection registry or secret store wired */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description a connection to that forge and base URL already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_connection: {
+        parameters: {
+            query?: {
+                /** @description acknowledge that the connection's Projects go with it */
+                unbind_repos?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description connection id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description connection deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description requires Administer on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such connection, or no registry wired */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description the connection still has bound repos (Projects) */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

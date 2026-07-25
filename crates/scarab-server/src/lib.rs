@@ -5669,6 +5669,35 @@ pub struct ConnectionProjectDto {
     pub name: String,
 }
 
+/// `POST /v1/connections` body (ADR-0060 part D, manual path): the forge to
+/// connect and the credential to reach it with.
+///
+/// `credential` is **write-only** — it is written through to `SecretProvider`
+/// under a server-generated handle and never appears in any response. There is
+/// deliberately no "update the credential" field on the read DTO: a secret you
+/// can read back is a secret you have leaked.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateConnectionRequest {
+    /// `forgejo`. GitHub is not creatable here — installing the App *is* its
+    /// registration (ADR-0060 part C), so a create form for it could not work.
+    pub kind: String,
+    /// The instance root Scarab talks to (e.g. `https://codeberg.org`). A
+    /// trailing slash is normalized away.
+    pub base_url: String,
+    /// The forge access token. Write-only (see the struct docs).
+    pub credential: String,
+}
+
+/// `POST /v1/connections` response: the created connection's id and the
+/// generated handle its credential now lives under. Not the credential.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CreatedConnectionDto {
+    pub id: String,
+    /// The server-generated `_forge`-scoped handle. Echoed so an operator can
+    /// correlate the row with its secret; it is a name, not a value.
+    pub credential_ref: String,
+}
+
 /// `POST /v1/connections/{id}/resync` body: what reconciliation changed.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ResyncResultDto {
@@ -5684,6 +5713,24 @@ pub struct ResyncResultDto {
 /// within this scope; the material (GitHub App PEM / Forgejo token) is fetched
 /// here at use-time and never persisted on the connection.
 pub const FORGE_CREDENTIALS_ORG: &str = "_forge";
+
+/// The gate every `/v1/connections*` endpoint shares: `Administer` on the Org.
+///
+/// A connection spans every Project it serves, so administering it is an
+/// org-level act, not a per-repo one — and there is no org in the path (one
+/// implicit Org, ADR-0060), so the check is "may this caller administer *an*
+/// org?". A globally-`Administer` role passes outright; anyone else needs an
+/// `Admin`+ binding on some `Scope::Org`. On a virgin install no org exists yet
+/// (an org is the coordinate of a bound Project), so bootstrapping the first
+/// connection necessarily needs the global role — the same asymmetry `/v1/me`
+/// already reports via `can_administer` + an empty `admin_orgs`.
+async fn authorize_org_administer(st: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let principal = authenticate(st, headers, Action::Administer).await?;
+    if !principal.can(Action::Administer) && administrable_orgs(st, &principal).await?.is_empty() {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(())
+}
 
 /// The registered forge connections and their health (ADR-0060 part C) — what
 /// the global Settings **Connections** section renders.
@@ -5705,14 +5752,8 @@ async fn list_connections(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ConnectionDto>>, ApiError> {
-    let principal = authenticate(&st, &headers, Action::Administer).await?;
+    authorize_org_administer(&st, &headers).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    // Org-level surface with no org in the path: the caller must administer at
-    // least one org (the single implicit Org, ADR-0060) — the same gate that
-    // decides whether Settings renders at all.
-    if !principal.can(Action::Administer) && administrable_orgs(&st, &principal).await?.is_empty() {
-        return Err(ApiError::Forbidden);
-    }
 
     let conns = connections
         .list_connections()
@@ -5802,10 +5843,7 @@ async fn resync_connection(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ResyncResultDto>, ApiError> {
-    let principal = authenticate(&st, &headers, Action::Administer).await?;
-    if !principal.can(Action::Administer) && administrable_orgs(&st, &principal).await?.is_empty() {
-        return Err(ApiError::Forbidden);
-    }
+    authorize_org_administer(&st, &headers).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
     let forge = st.forge.as_ref().ok_or(ApiError::NotFound)?;
     let conn = connections
@@ -5848,6 +5886,227 @@ async fn resync_connection(
         bound.push(format!("{}/{}", repo.owner, repo.name));
     }
     Ok(Json(ResyncResultDto { bound, confirmed }))
+}
+
+/// Mint the ids for a manually-created connection: `(connection_id,
+/// credential_ref)`.
+///
+/// Both are **server-generated** and correlated by construction, so a
+/// connection can never be pointed at another connection's credential by an
+/// operator typo — the handle is not an input. The random suffix keeps two
+/// connections to the same host distinct (and their credentials separate),
+/// which a host-derived name could not.
+fn mint_connection_ids(kind: scarab_forge::ForgeKind) -> (String, String) {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let id = format!("{}-{}", kind.as_str(), &suffix[..8]);
+    let credential_ref = format!("{id}-credential");
+    (id, credential_ref)
+}
+
+/// Create a forge connection with a **credential write-through** (ADR-0060 part
+/// D): the token in the request body is stored in `SecretProvider` under a
+/// server-generated handle in the reserved [`FORGE_CREDENTIALS_ORG`] scope, and
+/// the connection row records only that handle.
+///
+/// This is the manual/UI half of part D and the reason Forgejo can be onboarded
+/// at all: GitHub registers itself when the App is installed, but a Forgejo
+/// instance has no such event, so without this endpoint its only route into the
+/// registry was a hand-written database row.
+///
+/// The credential is **write-only** in the strong sense — it is written before
+/// the connection row exists, never read back by any endpoint, and the response
+/// carries only the generated handle. Order matters: writing the secret first
+/// means a failure leaves an orphan secret (harmless, overwritten on retry)
+/// rather than a connection whose credential never landed (a live row that
+/// silently cannot authenticate).
+#[utoipa::path(
+    post,
+    path = "/v1/connections",
+    summary = "Create a forge connection, writing its credential through to the secret store (ADR-0060)",
+    request_body = CreateConnectionRequest,
+    responses(
+        (status = 201, body = CreatedConnectionDto),
+        (status = 400, description = "unknown kind, non-creatable kind, or a malformed base URL"),
+        (status = 403, description = "requires Administer on the org"),
+        (status = 404, description = "no connection registry or secret store wired"),
+        (status = 409, description = "a connection to that forge and base URL already exists")
+    )
+)]
+async fn create_connection(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateConnectionRequest>,
+) -> Result<(StatusCode, Json<CreatedConnectionDto>), ApiError> {
+    authorize_org_administer(&st, &headers).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    // No secret store means no write-through target. Refusing is the only honest
+    // answer: a connection row with an unresolvable credential is a row that
+    // cannot serve a single call.
+    let secrets = st.secrets.as_ref().ok_or(ApiError::NotFound)?;
+
+    let kind = scarab_forge::ForgeKind::from_str_token(req.kind.trim())
+        .ok_or_else(|| ApiError::BadRequest(format!("unknown forge kind `{}`", req.kind)))?;
+    // GitHub's registration IS the App installation (ADR-0060 part C) — Scarab
+    // cannot install an App, so a row created here would be a connection to an
+    // installation that may not exist. Say so instead of accepting a lie.
+    if kind == scarab_forge::ForgeKind::GitHub {
+        return Err(ApiError::BadRequest(
+            "GitHub connections register themselves when the Scarab App is installed — \
+             install it on the account instead of creating a connection here"
+                .into(),
+        ));
+    }
+    let base_url = req.base_url.trim().trim_end_matches('/').to_string();
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Err(ApiError::BadRequest(
+            "base_url must be an http(s) URL, e.g. https://codeberg.org".into(),
+        ));
+    }
+    if req.credential.trim().is_empty() {
+        return Err(ApiError::BadRequest("credential is required".into()));
+    }
+
+    // One connection per (kind, base URL). Two rows for one host would each
+    // carry their own credential and each claim to serve it — an ambiguity with
+    // no upside, and the shape an accidental double-submit produces.
+    let existing = connections
+        .list_connections()
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if let Some(dupe) = existing
+        .iter()
+        .find(|c| c.kind == kind && c.base_url == base_url)
+    {
+        return Err(ApiError::Conflict(format!(
+            "connection `{}` already serves {base_url}",
+            dupe.id
+        )));
+    }
+
+    let (id, credential_ref) = mint_connection_ids(kind);
+    secrets
+        .put(
+            &scarab_secrets::SecretScope::Org {
+                org: FORGE_CREDENTIALS_ORG.to_string(),
+            },
+            scarab_secrets::Secret {
+                key: credential_ref.clone(),
+                value: req.credential.trim().as_bytes().to_vec(),
+            },
+        )
+        .await
+        .map_err(secret_err)?;
+    connections
+        .put_connection(&scarab_forge::ForgeConnection {
+            id: id.clone(),
+            kind,
+            base_url,
+            credential_ref: credential_ref.clone(),
+        })
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedConnectionDto { id, credential_ref }),
+    ))
+}
+
+/// Query for [`delete_connection`]: the acknowledgement that removing a
+/// connection removes the Projects it serves.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct DeleteConnectionQuery {
+    /// Confirm that the connection's repo bindings — i.e. its **Projects**, and
+    /// the Environments, secrets and RBAC hanging off them — go with it.
+    /// Without it, a connection that still has bindings is refused.
+    #[serde(default)]
+    pub unbind_repos: bool,
+}
+
+/// Delete a forge connection (ADR-0060 part D) and, when it is no longer
+/// referenced, its write-through credential.
+///
+/// Two deliberate safeties:
+///
+///  1. **Bound repos block the delete** unless `unbind_repos=true`. A Project
+///     *is* a repo binding (ADR-0046), so deleting a connection deletes
+///     governance — the same reasoning that stops `resync` from ever unbinding.
+///     A one-word query parameter is cheap; a silently deleted Environment is
+///     not recoverable from the UI.
+///  2. **A shared credential survives.** Every GitHub App installation points at
+///     the one `github-app` handle, so deleting one installation must not pull
+///     the material out from under the others. The secret is removed only when
+///     no remaining connection references that handle.
+#[utoipa::path(
+    delete,
+    path = "/v1/connections/{id}",
+    summary = "Delete a forge connection and its unreferenced credential (ADR-0060)",
+    params(
+        ("id" = String, Path, description = "connection id"),
+        ("unbind_repos" = Option<bool>, Query, description = "acknowledge that the connection's Projects go with it")
+    ),
+    responses(
+        (status = 204, description = "connection deleted"),
+        (status = 403, description = "requires Administer on the org"),
+        (status = 404, description = "no such connection, or no registry wired"),
+        (status = 409, description = "the connection still has bound repos (Projects)")
+    )
+)]
+async fn delete_connection(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<DeleteConnectionQuery>,
+) -> Result<StatusCode, ApiError> {
+    authorize_org_administer(&st, &headers).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let conn = connections
+        .get_connection(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+
+    let bound = connections
+        .repos_of(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if !bound.is_empty() && !q.unbind_repos {
+        let names: Vec<String> = bound
+            .iter()
+            .map(|r| format!("{}/{}", r.owner, r.name))
+            .collect();
+        return Err(ApiError::Conflict(format!(
+            "connection `{id}` still serves {} project(s): {} — pass unbind_repos=true to remove them with it",
+            names.len(),
+            names.join(", ")
+        )));
+    }
+
+    connections
+        .delete_connection(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    // The credential outlives the row only if something else still points at it.
+    if let Some(secrets) = st.secrets.as_ref() {
+        let still_referenced = connections
+            .list_connections()
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?
+            .iter()
+            .any(|c| c.credential_ref == conn.credential_ref);
+        if !still_referenced {
+            secrets
+                .delete(
+                    &scarab_secrets::SecretScope::Org {
+                        org: FORGE_CREDENTIALS_ORG.to_string(),
+                    },
+                    &conn.credential_ref,
+                )
+                .await
+                .map_err(secret_err)?;
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Resolve a [`scarab_forge::ForgeConnection`]'s credential material at
@@ -6192,6 +6451,8 @@ impl utoipa::Modify for TagGroups {
         silence_secret_cell,
         unsilence_secret_cell,
         list_connections,
+        create_connection,
+        delete_connection,
         resync_connection,
         ingest_step_results,
         create_run,
@@ -6256,6 +6517,8 @@ impl utoipa::Modify for TagGroups {
         SilenceCellRequest,
         ConnectionDto,
         ConnectionProjectDto,
+        CreateConnectionRequest,
+        CreatedConnectionDto,
         ResyncResultDto,
         MeResponse
     ))
@@ -6357,7 +6620,14 @@ fn router_inner(state: AppState) -> Router {
             "/v1/repos/{org}/{repo}/environments/{name}/deployments",
             get(list_deployments),
         )
-        .route("/v1/connections", get(list_connections))
+        .route(
+            "/v1/connections",
+            get(list_connections).post(create_connection),
+        )
+        .route(
+            "/v1/connections/{id}",
+            axum::routing::delete(delete_connection),
+        )
         .route("/v1/connections/{id}/resync", post(resync_connection))
         .route("/v1/repos/{org}/{repo}/secrets/matrix", get(secret_matrix))
         .route(

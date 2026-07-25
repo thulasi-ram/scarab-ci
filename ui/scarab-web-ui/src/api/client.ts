@@ -656,11 +656,16 @@ export async function deleteSecret(scope: SecretScope, name: string): Promise<vo
   }
 }
 
-// --- Forge connections (ADR-0060 part C). Read-only + a re-sync heal action.
-// Credential material is never in these payloads — only whether it resolves. ---
+// --- Forge connections (ADR-0060 parts C + D). Read + a re-sync heal action,
+// plus the manual create/delete path that makes Forgejo onboardable.
+//
+// The credential is **write-only** end to end: it goes up in a create body and
+// is never in a response — `Connection` reports only whether the handle
+// resolves, so there is nothing here to render a token from even by accident. ---
 
 export type Connection = components["schemas"]["ConnectionDto"];
 export type ResyncResult = components["schemas"]["ResyncResultDto"];
+export type CreatedConnection = components["schemas"]["CreatedConnectionDto"];
 
 /** The registered forge connections with their bound Projects and health. */
 export async function listConnections(): Promise<Connection[]> {
@@ -683,6 +688,38 @@ export async function resyncConnection(id: string): Promise<ResyncResult> {
   }
   if (error || !data) throw new Error("re-sync failed");
   return data;
+}
+
+/**
+ * Create a forge connection (`POST /v1/connections`), writing its credential
+ * through to the secret store. The token leaves the browser once and never comes
+ * back — the response is only the new id and the generated handle.
+ */
+export async function createConnection(body: {
+  kind: string;
+  base_url: string;
+  credential: string;
+}): Promise<CreatedConnection> {
+  const { data, error, response } = await api.POST("/v1/connections", { body });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not create the connection (${response.status})`);
+  }
+  return data;
+}
+
+/**
+ * Delete a connection (`DELETE /v1/connections/{id}`). `unbindRepos` is the
+ * server's required acknowledgement that the connection's Projects — and the
+ * Environments, secrets and RBAC on them — go with it; without it a connection
+ * that still has bindings answers 409.
+ */
+export async function deleteConnection(id: string, unbindRepos = false): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/connections/{id}", {
+    params: { path: { id }, query: { unbind_repos: unbindRepos } },
+  });
+  if (error) {
+    throw new Error(errorText(error) || `could not delete the connection (${response.status})`);
+  }
 }
 
 // --- Secret coverage matrix (ADR-0037) — and, since ADR-0060, the read model
