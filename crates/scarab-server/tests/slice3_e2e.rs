@@ -111,6 +111,7 @@ async fn push_webhook_runs_pipeline_posts_checks_and_login_authorizes() {
     }
     let exec_dyn: Arc<dyn Executor> = exec.clone();
     let supervision = scarab_engine::Supervision::new();
+    let health = scarab_engine::TickHealth::new();
     for _ in 0..10 {
         converged::tick_once(
             &db_dyn,
@@ -123,6 +124,7 @@ async fn push_webhook_runs_pipeline_posts_checks_and_login_authorizes() {
             3_600_000,
             "http://scarab.test",
             &supervision,
+            &health,
         )
         .await
         .unwrap();

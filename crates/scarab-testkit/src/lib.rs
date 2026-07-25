@@ -214,6 +214,10 @@ struct InMemoryState {
     /// attempt — modelling a concurrent admission that claimed the step between
     /// a rerun's snapshot and its guarded re-arm. See [`InMemoryDb::arm_toctou_race`].
     toctou_race: Option<(StepId, AttemptId)>,
+    /// Test-only fault injector (ADR-0059 tick isolation): runs whose per-run
+    /// reads fail with a backend error, modelling a "poison run" — one whose
+    /// tick work cannot complete. See [`InMemoryDb::poison_run`].
+    poisoned_runs: std::collections::HashSet<RunId>,
 }
 
 /// An in-memory [`Db`] for tests: an append-only event log, run/step state
@@ -293,6 +297,22 @@ impl InMemoryDb {
     /// raced into `Running` between a rerun's snapshot and its guarded re-arm.
     pub fn arm_toctou_race(&self, step: &StepId, attempt: &AttemptId) {
         self.state.lock().unwrap().toctou_race = Some((step.clone(), attempt.clone()));
+    }
+
+    /// Make `run` a **poison run** (test seam for ADR-0059 tick isolation): its
+    /// per-run reads — `run_project` (on the admit leg) and `steps_of_run` (on
+    /// the advance leg) — fail with a backend error until
+    /// [`heal_run`](Self::heal_run) clears it. Models the class of fault the
+    /// tick must isolate: one run that cannot be driven forward, for a reason
+    /// that has nothing to do with any other run.
+    pub fn poison_run(&self, run: &RunId) {
+        self.state.lock().unwrap().poisoned_runs.insert(run.clone());
+    }
+
+    /// Clear a [`poison_run`](Self::poison_run) injection — the transient case,
+    /// where a later tick simply succeeds.
+    pub fn heal_run(&self, run: &RunId) {
+        self.state.lock().unwrap().poisoned_runs.remove(run);
     }
 }
 
@@ -675,7 +695,14 @@ impl Db for InMemoryDb {
     }
 
     async fn run_project(&self, run: &RunId) -> Result<Option<String>, DbError> {
-        Ok(self.state.lock().unwrap().run_project.get(run).cloned())
+        let st = self.state.lock().unwrap();
+        if st.poisoned_runs.contains(run) {
+            return Err(DbError::Other(format!(
+                "injected: run {} is poisoned (admit leg)",
+                run.0
+            )));
+        }
+        Ok(st.run_project.get(run).cloned())
     }
 
     async fn set_run_tenant(&self, run: &RunId, org: &str, project: &str) -> Result<(), DbError> {
@@ -1037,6 +1064,12 @@ impl Db for InMemoryDb {
 
     async fn steps_of_run(&self, run: &RunId) -> Result<Vec<StepRun>, DbError> {
         let st = self.state.lock().unwrap();
+        if st.poisoned_runs.contains(run) {
+            return Err(DbError::Other(format!(
+                "injected: run {} is poisoned (advance leg)",
+                run.0
+            )));
+        }
         let mut out: Vec<StepRun> = st
             .steps
             .iter()

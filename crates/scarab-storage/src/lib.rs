@@ -99,3 +99,101 @@ pub trait Cas: Send + Sync {
     /// already present is uploaded (dedup).
     async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError>;
 }
+
+/// A path selection that could not be honored when pruning a tree.
+#[derive(Debug, thiserror::Error)]
+pub enum PruneError {
+    #[error("declared output path not produced by the step: {0}")]
+    MissingPath(String),
+    #[error("declared output path must be workspace-relative with no `..` segment: {0}")]
+    UnsafePath(String),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+}
+
+/// Restrict `root` to exactly `paths`, returning the root of a new tree that
+/// contains only those paths (ADR-0007 `outputs:`).
+///
+/// **This is what "CAS sub-tree addressing" turned out to require: nothing new.**
+/// A tree is already a hashed list of `name -> blob|tree` entries, so selecting
+/// a path subset is a walk with [`Cas::tree_entries`] and a bottom-up rebuild
+/// with [`Cas::put_tree`]. Every blob is shared with the full snapshot — nothing
+/// is re-uploaded, and the pruned root is a normal snapshot that
+/// [`Cas::materialize`] handles with no special case.
+///
+/// Fail-closed by design: a declared path the step did not produce is
+/// [`PruneError::MissingPath`], never a quietly narrower publish. Paths are
+/// workspace-relative, `/`-separated; `.`/empty segments are ignored, `..` and
+/// absolute paths are rejected (a published path must stay inside the
+/// workspace). Selecting a directory keeps its whole subtree; selecting a file
+/// keeps just that file. Nested selections merge (`a/b` + `a/c` → one `a`).
+pub async fn prune_tree(
+    cas: &dyn Cas,
+    root: &TreeHash,
+    paths: &[String],
+) -> Result<TreeHash, PruneError> {
+    // Group the selection by first segment, so each sub-tree is visited once
+    // however many paths reach into it. `None` in the value = "take all of it".
+    let mut wanted: Vec<(String, Option<Vec<String>>)> = Vec::new();
+    for path in paths {
+        let mut segments = Vec::new();
+        for seg in path.split('/') {
+            match seg {
+                "" | "." => continue,
+                ".." => return Err(PruneError::UnsafePath(path.clone())),
+                s => segments.push(s.to_string()),
+            }
+        }
+        if path.starts_with('/') || segments.is_empty() {
+            return Err(PruneError::UnsafePath(path.clone()));
+        }
+        let (head, rest) = segments.split_first().expect("non-empty");
+        let slot = match wanted.iter_mut().find(|(name, _)| name == head) {
+            Some(slot) => slot,
+            None => {
+                wanted.push((head.clone(), Some(Vec::new())));
+                wanted.last_mut().expect("just pushed")
+            }
+        };
+        if rest.is_empty() {
+            // The whole entry was selected; any deeper selection is subsumed.
+            slot.1 = None;
+        } else if let Some(deeper) = &mut slot.1 {
+            deeper.push(rest.join("/"));
+        }
+    }
+
+    let entries = cas.tree_entries(root).await?;
+    let mut kept = Vec::new();
+    for (name, deeper) in wanted {
+        let entry = entries
+            .iter()
+            .find(|e| e.name == name)
+            .ok_or_else(|| PruneError::MissingPath(name.clone()))?;
+        match (&entry.target, deeper) {
+            // Whole entry (file or directory) selected — keep it as-is.
+            (_, None) => kept.push(entry.clone()),
+            // Deeper selection into a directory — recurse.
+            (TreeTarget::Tree(sub), Some(deeper)) => {
+                let pruned = Box::pin(prune_tree(cas, sub, &deeper)).await.map_err(|e| {
+                    // Re-root the diagnostic on the authored path.
+                    match e {
+                        PruneError::MissingPath(p) => PruneError::MissingPath(format!("{name}/{p}")),
+                        other => other,
+                    }
+                })?;
+                kept.push(TreeEntry {
+                    name,
+                    target: TreeTarget::Tree(pruned),
+                });
+            }
+            // A path reaches *through* something that is a file.
+            (TreeTarget::Blob(_), Some(deeper)) => {
+                return Err(PruneError::MissingPath(format!("{name}/{}", deeper.join(","))));
+            }
+        }
+    }
+    // Deterministic order — the tree hash must not depend on authoring order.
+    kept.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(cas.put_tree(kept).await?)
+}

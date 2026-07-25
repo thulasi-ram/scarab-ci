@@ -1,0 +1,31 @@
+# The required-check set — the single source of truth for "may this merge?".
+#
+# WHY A FILE: GitHub's own required-status-checks live in branch protection /
+# rulesets, and BOTH are 403 on this repo (private on a free plan:
+# "Upgrade to GitHub Pro or make this repository public to enable this
+# feature"). So there is no server-side gate to configure. This file plus
+# `just pr-gate <n>` (scripts/pr_gate.py) is the gate: run it before merging.
+# The moment protection becomes available, the `required*` lines below are
+# exactly the list to paste into it — no re-derivation.
+#
+# Format:  <tier>  <workflow>/<job>   [# note]
+#   required         must exist and pass
+#   required-if-run  must pass IF it ran — for PATH-FILTERED jobs, whose
+#                    absence is correct on an unrelated PR (the same case that
+#                    makes path-filtered required checks hang a real ruleset)
+#   advisory         reported, never blocks — a tier serving probation
+
+required         ci/test                # workspace nextest against real Postgres
+required         ci/coverage            # llvm-cov + the ratchet
+required         ci/openapi-drift       # committed spec + generated client
+required         ci/ui-tests            # UI no-DOM vitest suites
+
+# Promoted off probation 2026-07-25. Nine runs, one failure — and that failure
+# was the harness `.expect()`ing a transient poll error the engine is designed
+# to retry ("workspace: broken pipe"), fixed in the same commit. No product
+# flake was ever observed, so it graduates.
+required-if-run  kind/cluster-tests     # live-cluster executor tier
+
+# Probation until ~2026-08-08 (wired 2026-07-25 — needs a track record first).
+# Promote by moving this line up and deleting `continue-on-error` in ci.yml.
+advisory         ci/ui-e2e              # 2 Playwright specs over mock mode

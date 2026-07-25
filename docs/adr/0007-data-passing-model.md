@@ -33,6 +33,26 @@ merged content-addressed workspace of its `needs` (GHA ergonomics). It *may* dec
 - Workspace mechanism is per-file merkle CAS ([0029](0029-workspace-cas.md)).
 - More concepts to learn than a 2-concept minimal model — deemed worth it.
 
+## Amendment (2026-07-25) — explicit workspace I/O is fully built
+
+Both halves of "explicit-on-demand" now ship:
+
+- **`inputs:`** (2026-07-24) — a subset of `needs` whose workspaces flow in; also sharpens the
+  rerun invalidation signature (`workspace_inputs` / `input_signature`).
+- **`outputs:`** (2026-07-25) — the workspace-relative paths a step publishes downstream.
+  Authored paths ride the step Pod (`scarab.io/workspace-outputs`), and the egress leg prunes the
+  post-step snapshot to exactly those paths via `scarab_storage::prune_tree`. **Fail-closed:** a
+  declared path the step did not produce fails the step with a permanent, author-fixable verdict
+  (`FailureClass::Config`) — never a quietly narrower publish.
+
+`remap` (the third Concourse-style affordance named above) is **not** built and has no demand.
+
+Note for anyone re-reading old notes: the `outputs:` half was deferred for months as "blocked on
+CAS sub-tree addressing". That was a mistaken premise. [0029](0029-workspace-cas.md)'s CAS is a
+per-file merkle store, so a tree *is* a hashed list of `name -> blob|tree` entries; restricting a
+snapshot to a path subset is a walk plus a bottom-up rebuild over primitives that already existed,
+sharing every blob with the full snapshot. No new storage capability was required.
+
 ## Alternatives considered
 
 - **Workspace + Result only** — folds artifacts/caches into "DIY object store"; users rebuild

@@ -165,6 +165,28 @@ e2e:
     export SCARAB_E2E_KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
     cargo nextest run -p scarab-e2e --no-fail-fast
 
+# UI no-DOM suite (test-strategy Phase 3, base of the UI pyramid): vitest over
+# the run-detail derivations — event folding, Takes, attempts, logs, DAG layout.
+# No jsdom, no browser, no server; runs in under a second.
+ui-test:
+    npm --prefix ui/scarab-web-ui ci
+    npm --prefix ui/scarab-web-ui test
+
+# UI browser suite (top of the UI pyramid): the 2 Playwright specs against mock
+# mode. Playwright boots its own Vite dev server on :4173 — nothing else needed.
+# First run downloads Chromium.
+ui-e2e:
+    npm --prefix ui/scarab-web-ui ci
+    npx --prefix ui/scarab-web-ui playwright install chromium
+    npm --prefix ui/scarab-web-ui run test:e2e
+
+# Merge gate: are PR <n>'s REQUIRED checks green? Run this before merging.
+# Branch protection and rulesets are both unavailable on this repo (private,
+# free plan → 403), so this is the enforcement, not a convenience: the required
+# set lives in .github/required-checks.txt. Exits 8 while checks still run.
+pr-gate n:
+    python3 scripts/pr_gate.py {{n}}
+
 # Compile-check everything.
 check:
     cargo check --workspace
