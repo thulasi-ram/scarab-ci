@@ -378,54 +378,6 @@ pub trait EnvironmentStore: Send + Sync {
     ) -> Result<Vec<Deployment>, ProjectError>;
 }
 
-/// Which column of a Project's secret-coverage view a marker sits in: one of its
-/// Environments, or the Project's own repo-scope default (`None`).
-///
-/// Deliberately *not* [`crate`]-external scope machinery — it addresses a cell of
-/// an advisory view, not a place a value can be stored. Secret storage scoping
-/// lives in `scarab-secrets`.
-pub type CoverageColumn<'a> = Option<&'a str>;
-
-/// Markers saying a key is **deliberately** absent at a scope (ADR-0037 D).
-///
-/// Cross-environment secret parity is advisory UI only: it can show a gap that
-/// is a real mistake or a considered decision, and nothing in the data
-/// distinguishes them — so a reviewer re-litigates the same cell forever. A
-/// marker silences one cell, recording "we meant this."
-///
-/// It has **no runtime effect**: it never blocks a deploy, never changes
-/// resolution, and is not consulted on the run path. Separate from
-/// [`EnvironmentStore`] so a deployment that cannot store markers still runs
-/// governance — the matrix simply shows no silenced cells.
-#[async_trait]
-pub trait SecretCoverageStore: Send + Sync {
-    /// Mark `key` as intentionally unset in `column`. Idempotent.
-    async fn silence(
-        &self,
-        org: &str,
-        project: &str,
-        column: CoverageColumn<'_>,
-        key: &str,
-    ) -> Result<(), ProjectError>;
-
-    /// Drop the marker for `key` in `column`. Idempotent.
-    async fn unsilence(
-        &self,
-        org: &str,
-        project: &str,
-        column: CoverageColumn<'_>,
-        key: &str,
-    ) -> Result<(), ProjectError>;
-
-    /// Every marker in a Project, as `(column, key)` — `None` column is the
-    /// repo-scope default.
-    async fn silenced(
-        &self,
-        org: &str,
-        project: &str,
-    ) -> Result<Vec<(Option<String>, String)>, ProjectError>;
-}
-
 /// Minimal glob match supporting `*` (matches any run of characters). Used for
 /// `allowed_refs` patterns like `refs/heads/*`.
 fn glob_match(pattern: &str, text: &str) -> bool {

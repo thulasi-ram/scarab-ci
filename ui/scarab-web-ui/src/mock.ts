@@ -385,50 +385,12 @@ const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"]
 // Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
 // Settings page's Org Secrets section (ADR-0060).
 const orgSecretNames = { names: ["GHCR_TOKEN", "SENTRY_DSN"] };
-
-// One healthy GitHub connection covering the acme repos (ADR-0060 part C).
-const connections = [
-  {
-    id: "gh-acme",
-    kind: "github",
-    base_url: "https://api.github.com",
-    web_url: "https://github.com",
-    credential_ref: "github-app",
-    credential_present: true,
-    last_delivery_at: ago(240000),
-    projects: ["scarab", "web", "api"].map((project) => ({
-      org: "acme",
-      project,
-      owner: "acme",
-      name: project,
-    })),
-    supports_resync: true,
-    managed_by_config: false,
-  },
-];
-// The coverage matrix is now the repo/environment secret EDITOR (ADR-0060), so
-// the fixture carries the repo-default column ("") and inheritance origins:
-// GHCR_TOKEN comes from the org, DATABASE_URL is a repo default overridden in
-// both environments, SLACK_WEBHOOK_URL is production-only with staging silenced.
 const secretMatrix = {
-  columns: ["", "staging", "production"],
   environments: ["staging", "production"],
   keys: [
-    {
-      key: "GHCR_TOKEN",
-      status: { "": "inherited", staging: "inherited", production: "inherited" },
-      inherited_from: { "": "org", staging: "org", production: "org" },
-    },
-    {
-      key: "DATABASE_URL",
-      status: { "": "set", staging: "set", production: "set" },
-      inherited_from: {},
-    },
-    {
-      key: "SLACK_WEBHOOK_URL",
-      status: { "": "unset", staging: "silenced", production: "set" },
-      inherited_from: {},
-    },
+    { key: "GHCR_TOKEN", status: { staging: "inherited", production: "inherited" } },
+    { key: "DATABASE_URL", status: { staging: "set", production: "set" } },
+    { key: "SLACK_WEBHOOK_URL", status: { staging: "unset", production: "set" } },
   ],
 };
 
@@ -464,7 +426,6 @@ function route(pathname: string, search: string): Response | null {
   // /v1/repos/{org}/{repo}/refs  (ref picker — not on the shot screens)
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) return json({ refs: [] });
 
-  if (p === "/v1/connections") return json(connections);
   // Secret names are scope-addressed: no `repo=` is the org scope (ADR-0060).
   if (p === "/v1/secrets") {
     const scoped = new URLSearchParams(search).has("repo");

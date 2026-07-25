@@ -52,6 +52,7 @@ pub mod converged;
 pub mod forge_router;
 pub mod log_tail;
 pub mod logs;
+pub mod metrics;
 pub mod oauth;
 pub mod oidc;
 pub mod retention;
@@ -104,10 +105,6 @@ pub struct AppState {
     /// Environments + deployment history store. `None` disables the environment
     /// endpoints.
     pub environments: Option<Arc<dyn scarab_project::EnvironmentStore>>,
-    /// "Intentionally unset" markers for the secret coverage matrix (ADR-0037 D).
-    /// Advisory annotations only — `None` disables marking, and the matrix simply
-    /// reports nothing silenced. Never consulted on a run path.
-    pub secret_coverage: Option<Arc<dyn scarab_project::SecretCoverageStore>>,
     /// The OIDC issuer. When set, serves JWKS + discovery for keyless federation.
     pub oidc: Option<Arc<oidc::Rs256Issuer>>,
     /// HMAC secret for external-gate release tokens (ADR-0034). `None` disables
@@ -165,7 +162,6 @@ impl AppState {
             auth: None,
             sessions: None,
             environments: None,
-            secret_coverage: None,
             oidc: None,
             gate_token_secret: None,
             secrets: None,
@@ -211,15 +207,6 @@ impl AppState {
         environments: Arc<dyn scarab_project::EnvironmentStore>,
     ) -> Self {
         self.environments = Some(environments);
-        self
-    }
-
-    /// Enable "intentionally unset" coverage annotations (ADR-0037 D).
-    pub fn with_secret_coverage(
-        mut self,
-        store: Arc<dyn scarab_project::SecretCoverageStore>,
-    ) -> Self {
-        self.secret_coverage = Some(store);
         self
     }
 
@@ -721,25 +708,12 @@ pub struct SecretListResponse {
     pub names: Vec<String>,
 }
 
-/// The column id of the repo-scope default in the coverage matrix (ADR-0060).
-///
-/// A reserved id rather than a separate field, so a row is one flat
-/// `column -> status` map that the UI can index uniformly. An environment named
-/// `""` is impossible, so it cannot collide.
-pub const REPO_DEFAULT_COLUMN: &str = "";
-
-/// `GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory coverage view
-/// (ADR-0037 D) and — since ADR-0060 — the model behind the *editor* for repo-
-/// and environment-scoped values. For each key, its **effective** status per
-/// column after inheritance; never a value.
+/// `GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory parity view
+/// (ADR-0037). For each secret key, its **effective** status per environment
+/// after inheritance — never a value. `unset` where the key resolves to nothing.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SecretMatrix {
-    /// Column ids in render order: [`REPO_DEFAULT_COLUMN`] first (the repo-scope
-    /// default that the environments fall through to), then each environment.
-    pub columns: Vec<String>,
-    /// The repo's environments, in column order. A subset of `columns` — kept
-    /// separate so a client can tell an environment column from the repo one
-    /// without reasoning about the reserved id.
+    /// The repo's environments, in the order the columns should render.
     pub environments: Vec<String>,
     pub keys: Vec<SecretMatrixRow>,
 }
@@ -747,28 +721,8 @@ pub struct SecretMatrix {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SecretMatrixRow {
     pub key: String,
-    /// `column id -> "set" | "inherited" | "unset" | "silenced"`.
-    ///
-    /// `set` = a value lives at exactly that scope · `inherited` = none here, but
-    /// it resolves from a broader scope · `unset` = resolves to nothing ·
-    /// `silenced` = unset **on purpose** (an ADR-0037 marker). Only a genuinely
-    /// unset cell can be silenced: a marker never hides a real value.
+    /// `environment name -> "set" | "inherited" | "unset"`.
     pub status: std::collections::BTreeMap<String, String>,
-    /// For each `inherited` cell, the scope it resolves from — `"repo"` or
-    /// `"org"`. Lets a cell say *what* it would be overriding, so an edit reads
-    /// as "override the repo default" rather than an unexplained write.
-    pub inherited_from: std::collections::BTreeMap<String, String>,
-}
-
-/// `PUT …/secrets/matrix/silenced` body — and, as a query, the `DELETE`
-/// selector: the one cell to annotate. Omitting `environment` addresses the
-/// repo-scope default column. The Project is in the path, so unlike
-/// [`SecretScopeQuery`] this carries no org/repo.
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct SilenceCellRequest {
-    pub key: String,
-    #[serde(default)]
-    pub environment: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -905,10 +859,6 @@ pub enum ApiError {
     /// The request conflicts with the resource's current state (e.g. rerunning a
     /// step whose dependency has not succeeded, or retrying a non-failed step).
     Conflict(String),
-    /// The request is well-formed but the capability does not exist here — e.g. a
-    /// forge adapter that cannot enumerate its repos (ADR-0060). Distinct from
-    /// `NotFound` (wrong resource) and `BadRequest` (wrong request).
-    NotImplemented(String),
     Db(DbError),
 }
 
@@ -940,7 +890,6 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "insufficient role").into_response(),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m).into_response(),
-            ApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m).into_response(),
             ApiError::Db(e) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response()
             }
@@ -2195,15 +2144,8 @@ async fn administrable_orgs(
 /// host carries an `/api/v3` suffix). Forgejo's `base_url` is already the web
 /// host (its API lives under `/api/v1`).
 fn web_repo_url(kind: scarab_forge::ForgeKind, base_url: &str, owner: &str, name: &str) -> String {
-    format!("{}/{owner}/{name}", forge_web_host(kind, base_url))
-}
-
-/// The forge's **web** host derived from a connection's API `base_url` — what a
-/// deep link out of the UI is built on (a repo page, or a GitHub App's
-/// installation settings).
-fn forge_web_host(kind: scarab_forge::ForgeKind, base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    match kind {
+    let host = match kind {
         scarab_forge::ForgeKind::GitHub => {
             if base.contains("api.github.com") {
                 "https://github.com".to_string()
@@ -2212,7 +2154,8 @@ fn forge_web_host(kind: scarab_forge::ForgeKind, base_url: &str) -> String {
             }
         }
         scarab_forge::ForgeKind::Forgejo => base.to_string(),
-    }
+    };
+    format!("{host}/{owner}/{name}")
 }
 
 /// List the registered projects (ADR-0046 registry — what the dashboard's
@@ -4073,6 +4016,7 @@ pub async fn drain_forge_statuses(
             }
             Err(e) => {
                 let failures = db.record_outbox_failure(msg.id).await?;
+                crate::metrics::record_forge_status_failure();
                 tracing::warn!(
                     run = %msg.run.0,
                     repo = %format!("{}/{}", repo.owner, repo.name),
@@ -4083,6 +4027,7 @@ pub async fn drain_forge_statuses(
                 );
                 if failures >= MAX_DELIVERY_ATTEMPTS {
                     db.dead_letter_outbox(msg.id).await?;
+                    crate::metrics::record_forge_status_dead_lettered();
                     tracing::error!(
                         run = %msg.run.0,
                         repo = %format!("{}/{}", repo.owner, repo.name),
@@ -5414,17 +5359,12 @@ async fn list_deployments(
     Ok(Json(history))
 }
 
-/// The secret coverage matrix for a repo (ADR-0037 D, editable since ADR-0060):
-/// each key's effective status in the **repo default** column and in each
-/// environment column — `set` (a value at exactly that scope), `inherited`
-/// (resolves from a broader scope, with `inherited_from` naming which),
-/// `silenced` (unset on purpose), or `unset`. Post-inheritance, so a key defined
-/// once at repo scope never reads as missing anywhere.
-///
-/// Names + status only, never values — the same `Administer` capability as
-/// listing secrets. This is the read model behind the Project Secrets editor,
-/// which writes through the scoped `/v1/secrets` endpoints.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/secrets/matrix", summary = "The secret coverage matrix (ADR-0037) - names + status, never values", responses((status = 200, body = SecretMatrix)))]
+/// The advisory secret parity matrix for a repo (ADR-0037): each key's effective
+/// status per environment — `set` (defined at that env's scope), `inherited`
+/// (resolves from repo/org scope), or `unset`. Post-inheritance, so a shared key
+/// defined once at repo scope never reads as missing. Names + status only, never
+/// values — same `Administer` capability as listing secrets.
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/secrets/matrix", summary = "The secret parity matrix (ADR-0037) - names + status, never values", responses((status = 200, body = SecretMatrix)))]
 async fn secret_matrix(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -5441,239 +5381,62 @@ async fn secret_matrix(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let env_names: Vec<String> = environments.iter().map(|e| e.name.clone()).collect();
 
-    // The two broader scopes, kept apart (not merged as "inherited") so a cell
-    // can name where it falls through FROM — the difference between overriding
-    // the repo default and overriding an org-wide value.
-    let keys_at = |scope: scarab_secrets::SecretScope| async move {
-        secrets
-            .list_scoped(&scope)
-            .await
-            .map(|v| v.into_iter().collect::<std::collections::BTreeSet<_>>())
-            .map_err(secret_err)
-    };
-    let org_keys = keys_at(scarab_secrets::SecretScope::Org { org: org.clone() }).await?;
-    let repo_keys = keys_at(scarab_secrets::SecretScope::Repo {
-        org: org.clone(),
-        repo: repo.clone(),
-    })
-    .await?;
+    // Keys resolvable by *any* environment via inheritance (repo + org scope).
+    let mut inherited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for scope in [
+        scarab_secrets::SecretScope::Org { org: org.clone() },
+        scarab_secrets::SecretScope::Repo {
+            org: org.clone(),
+            repo: repo.clone(),
+        },
+    ] {
+        inherited.extend(secrets.list_scoped(&scope).await.map_err(secret_err)?);
+    }
 
     // Keys defined directly at each environment's scope.
     let mut env_keys: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
-    let mut all_keys: std::collections::BTreeSet<String> =
-        org_keys.union(&repo_keys).cloned().collect();
+    let mut all_keys: std::collections::BTreeSet<String> = inherited.clone();
     for name in &env_names {
-        let keys = keys_at(scarab_secrets::SecretScope::Environment {
+        let scope = scarab_secrets::SecretScope::Environment {
             org: org.clone(),
             repo: repo.clone(),
             environment: name.clone(),
-        })
-        .await?;
+        };
+        let keys: std::collections::BTreeSet<String> = secrets
+            .list_scoped(&scope)
+            .await
+            .map_err(secret_err)?
+            .into_iter()
+            .collect();
         all_keys.extend(keys.iter().cloned());
         env_keys.insert(name.clone(), keys);
     }
 
-    // Advisory annotations. A deployment with no coverage store still gets a
-    // matrix — it just has nothing marked (the markers are not correctness).
-    let mut silenced: std::collections::BTreeSet<(String, String)> =
-        std::collections::BTreeSet::new();
-    if let Some(store) = st.secret_coverage.as_ref() {
-        for (column, key) in store
-            .silenced(&org, &repo)
-            .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        {
-            silenced.insert((column.unwrap_or_default(), key));
-        }
-    }
-    // A marker on a key that no longer exists anywhere would otherwise be
-    // invisible; surface those rows so the annotation can be cleaned up.
-    all_keys.extend(silenced.iter().map(|(_, key)| key.clone()));
-
-    let mut columns = vec![REPO_DEFAULT_COLUMN.to_string()];
-    columns.extend(env_names.iter().cloned());
-
     let keys = all_keys
         .into_iter()
         .map(|key| {
-            let mut status = std::collections::BTreeMap::new();
-            let mut inherited_from = std::collections::BTreeMap::new();
-            for column in &columns {
-                // Where a value sits at *exactly* this column's scope.
-                let set_here = if column == REPO_DEFAULT_COLUMN {
-                    repo_keys.contains(&key)
-                } else {
-                    env_keys.get(column).is_some_and(|k| k.contains(&key))
-                };
-                // What it falls through to, nearest broader scope first.
-                let from = if set_here {
-                    None
-                } else if column != REPO_DEFAULT_COLUMN && repo_keys.contains(&key) {
-                    Some("repo")
-                } else if org_keys.contains(&key) {
-                    Some("org")
-                } else {
-                    None
-                };
-                let s = match (set_here, from) {
-                    (true, _) => "set",
-                    (false, Some(origin)) => {
-                        inherited_from.insert(column.clone(), origin.to_string());
+            let status = env_names
+                .iter()
+                .map(|env| {
+                    let s = if env_keys.get(env).is_some_and(|k| k.contains(&key)) {
+                        "set"
+                    } else if inherited.contains(&key) {
                         "inherited"
-                    }
-                    // Only a genuinely empty cell can be silenced.
-                    (false, None) if silenced.contains(&(column.clone(), key.clone())) => {
-                        "silenced"
-                    }
-                    (false, None) => "unset",
-                };
-                status.insert(column.clone(), s.to_string());
-            }
-            SecretMatrixRow {
-                key,
-                status,
-                inherited_from,
-            }
+                    } else {
+                        "unset"
+                    };
+                    (env.clone(), s.to_string())
+                })
+                .collect();
+            SecretMatrixRow { key, status }
         })
         .collect();
 
     Ok(Json(SecretMatrix {
-        columns,
         environments: env_names,
         keys,
     }))
-}
-
-/// Mark a coverage cell as **intentionally unset** (ADR-0037 D). Purely
-/// advisory: it silences one cell of the matrix and has no effect on secret
-/// resolution, admission, or any run. Idempotent. `Administer`, like the rest of
-/// the secret surface.
-#[utoipa::path(
-    put,
-    path = "/v1/repos/{org}/{repo}/secrets/matrix/silenced",
-    summary = "Mark a coverage cell intentionally unset (ADR-0037, advisory)",
-    request_body = SilenceCellRequest,
-    responses(
-        (status = 204, description = "marked (idempotent)"),
-        (status = 404, description = "coverage annotations not configured")
-    )
-)]
-async fn silence_secret_cell(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((org, repo)): Path<(String, String)>,
-    Json(req): Json<SilenceCellRequest>,
-) -> Result<StatusCode, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let store = st.secret_coverage.as_ref().ok_or(ApiError::NotFound)?;
-    if req.key.is_empty() {
-        return Err(ApiError::BadRequest("key is required".into()));
-    }
-    store
-        .silence(&org, &repo, coverage_column(&req.environment), &req.key)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Drop an "intentionally unset" marker (ADR-0037 D). Idempotent.
-#[utoipa::path(
-    delete,
-    path = "/v1/repos/{org}/{repo}/secrets/matrix/silenced",
-    summary = "Drop an intentionally-unset marker (ADR-0037, advisory)",
-    params(
-        ("key" = String, Query, description = "secret key"),
-        ("environment" = Option<String>, Query, description = "environment column; omitted = the repo default")
-    ),
-    responses(
-        (status = 204, description = "cleared (idempotent)"),
-        (status = 404, description = "coverage annotations not configured")
-    )
-)]
-async fn unsilence_secret_cell(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((org, repo)): Path<(String, String)>,
-    Query(q): Query<SilenceCellRequest>,
-) -> Result<StatusCode, ApiError> {
-    let scope = rbac_scope(&org, Some(&repo));
-    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
-    let store = st.secret_coverage.as_ref().ok_or(ApiError::NotFound)?;
-    if q.key.is_empty() {
-        return Err(ApiError::BadRequest("key is required".into()));
-    }
-    store
-        .unsilence(&org, &repo, coverage_column(&q.environment), &q.key)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// An optional environment name as a coverage column: `None` (or an empty
-/// string, which no environment can be named) is the repo-default column.
-fn coverage_column(environment: &Option<String>) -> scarab_project::CoverageColumn<'_> {
-    environment.as_deref().filter(|e| !e.is_empty())
-}
-
-/// One registered forge connection, as global Settings renders it (ADR-0060).
-///
-/// Carries the credential's **handle and whether it resolves** — never the
-/// material. A connection is the unit an operator reasons about ("is my GitHub
-/// App still wired up?"), so the DTO answers that without becoming a way to read
-/// a secret back.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ConnectionDto {
-    pub id: String,
-    /// `github` | `forgejo`.
-    pub kind: String,
-    /// The API base URL the adapter talks to (GHES / a self-hosted Forgejo).
-    pub base_url: String,
-    /// The forge's own web host, for deep links out of the UI.
-    pub web_url: String,
-    /// The `_forge`-scoped handle the credential lives under. An opaque name,
-    /// not the secret.
-    pub credential_ref: String,
-    /// Does `credential_ref` actually resolve to material right now? The single
-    /// most common breakage (a DB restored without its secrets, a reseed that
-    /// never happened) is invisible until a run fails — this surfaces it.
-    pub credential_present: bool,
-    /// Unix-ms of the most recent accepted webhook delivery from this **forge
-    /// kind**, if any. Deliveries are recorded per kind (the ADR-0046 replay
-    /// guard is keyed that way), so with two connections of one kind this is a
-    /// per-kind liveness signal, not a per-connection one.
-    pub last_delivery_at: Option<i64>,
-    /// The Projects this connection serves, from its repo bindings — a Project
-    /// *is* a binding (ADR-0046), so this is the connection's whole footprint.
-    pub projects: Vec<ConnectionProjectDto>,
-    /// Can the forge enumerate what this credential reaches? Gates the re-sync
-    /// affordance: GitHub can, so a drifted registry is healable; an adapter that
-    /// cannot should not offer a button that always errors.
-    pub supports_resync: bool,
-    /// Is this connection managed declaratively (config-owned) and therefore
-    /// read-only here? Always `false` until the IaC path lands (ADR-0060 part D);
-    /// present now so the UI can render the distinction from the start.
-    pub managed_by_config: bool,
-}
-
-/// A Project a connection serves, plus the forge coordinate it came from.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ConnectionProjectDto {
-    pub org: String,
-    pub project: String,
-    pub owner: String,
-    pub name: String,
-}
-
-/// `POST /v1/connections/{id}/resync` body: what reconciliation changed.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ResyncResultDto {
-    /// Repos the forge reports that Scarab did not have bound — now bound.
-    pub bound: Vec<String>,
-    /// How many bindings the forge confirms. Reported rather than acted on:
-    /// see the handler's note on why re-sync never unbinds.
-    pub confirmed: usize,
 }
 
 /// The reserved secret-scope org under which forge-connection credentials live
@@ -5681,171 +5444,6 @@ pub struct ResyncResultDto {
 /// within this scope; the material (GitHub App PEM / Forgejo token) is fetched
 /// here at use-time and never persisted on the connection.
 pub const FORGE_CREDENTIALS_ORG: &str = "_forge";
-
-/// The registered forge connections and their health (ADR-0060 part C) — what
-/// the global Settings **Connections** section renders.
-///
-/// Read-only, and `Administer` on the Org: a connection spans every Project it
-/// serves, so seeing the fleet is an org-level act, not a per-repo one. No
-/// credential material is ever returned — only whether the handle resolves.
-#[utoipa::path(
-    get,
-    path = "/v1/connections",
-    summary = "Registered forge connections + their bound Projects and health (ADR-0060)",
-    responses(
-        (status = 200, body = [ConnectionDto]),
-        (status = 403, description = "requires Administer on the org"),
-        (status = 404, description = "no connection registry wired")
-    )
-)]
-async fn list_connections(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<ConnectionDto>>, ApiError> {
-    let principal = authenticate(&st, &headers, Action::Administer).await?;
-    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    // Org-level surface with no org in the path: the caller must administer at
-    // least one org (the single implicit Org, ADR-0060) — the same gate that
-    // decides whether Settings renders at all.
-    if !principal.can(Action::Administer) && administrable_orgs(&st, &principal).await?.is_empty() {
-        return Err(ApiError::Forbidden);
-    }
-
-    let conns = connections
-        .list_connections()
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let mut out = Vec::with_capacity(conns.len());
-    for conn in conns {
-        let mut projects = Vec::new();
-        for repo in connections
-            .repos_of(&conn.id)
-            .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        {
-            if let Some(resolved) = connections
-                .resolve(&repo)
-                .await
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?
-            {
-                projects.push(ConnectionProjectDto {
-                    org: resolved.org,
-                    project: resolved.project,
-                    owner: repo.owner,
-                    name: repo.name,
-                });
-            }
-        }
-        projects.sort_by(|a, b| (&a.org, &a.project).cmp(&(&b.org, &b.project)));
-        // Presence, not the value. A missing provider means we cannot tell, which
-        // reads the same as absent here — either way the adapter cannot authenticate.
-        let credential_present = match st.secrets.as_ref() {
-            Some(secrets) => connection_credential(secrets.as_ref(), &conn).await.is_ok(),
-            None => false,
-        };
-        let last_delivery_at = connections
-            .last_delivery_at(conn.kind)
-            .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        // Which adapters implement `list_accessible_repos`. Decided from the kind
-        // rather than probed: probing means a live forge round-trip per connection
-        // on every render of the Settings page. This only decides whether a button
-        // is offered — `POST …/resync` is the authority and answers 501 if an
-        // adapter really cannot.
-        let supports_resync = st.forge.is_some()
-            && matches!(conn.kind, scarab_forge::ForgeKind::GitHub);
-        out.push(ConnectionDto {
-            web_url: forge_web_host(conn.kind, &conn.base_url),
-            id: conn.id,
-            kind: conn.kind.as_str().to_string(),
-            base_url: conn.base_url,
-            credential_ref: conn.credential_ref,
-            credential_present,
-            last_delivery_at,
-            projects,
-            supports_resync,
-            managed_by_config: false,
-        });
-    }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(Json(out))
-}
-
-/// Re-sync a connection against the forge (ADR-0060 part C): ask the forge which
-/// repos this credential reaches and bind any Scarab does not have yet.
-///
-/// This is the **healing** path for GitHub, where installing the App *is*
-/// registration and the registry is therefore only as current as the last
-/// `installation_repositories` delivery. A dropped delivery leaves a repo the App
-/// covers with no Project; re-sync notices.
-///
-/// It deliberately **only binds**. Unbinding on a forge's say-so would let one
-/// failed API page delete governance — Environments, secrets and RBAC hang off a
-/// Project — so removal stays an explicit human act. `confirmed` reports the
-/// overlap so a stale binding is still visible.
-#[utoipa::path(
-    post,
-    path = "/v1/connections/{id}/resync",
-    summary = "Re-bind repos the forge reports for this connection (ADR-0060)",
-    params(("id" = String, Path, description = "connection id")),
-    responses(
-        (status = 200, body = ResyncResultDto),
-        (status = 404, description = "no such connection, or no registry/forge wired"),
-        (status = 501, description = "this forge adapter cannot enumerate repos")
-    )
-)]
-async fn resync_connection(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<ResyncResultDto>, ApiError> {
-    let principal = authenticate(&st, &headers, Action::Administer).await?;
-    if !principal.can(Action::Administer) && administrable_orgs(&st, &principal).await?.is_empty() {
-        return Err(ApiError::Forbidden);
-    }
-    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    let forge = st.forge.as_ref().ok_or(ApiError::NotFound)?;
-    let conn = connections
-        .get_connection(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .ok_or(ApiError::NotFound)?;
-
-    let reported = match forge.list_accessible_repos().await {
-        Ok(repos) => repos,
-        Err(scarab_forge::ForgeError::Unsupported(what)) => {
-            return Err(ApiError::NotImplemented(format!(
-                "{} cannot enumerate repos ({what})",
-                conn.kind.as_str()
-            )))
-        }
-        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
-    };
-    let known: std::collections::BTreeSet<scarab_forge::RepoRef> = connections
-        .repos_of(&id)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?
-        .into_iter()
-        .collect();
-
-    let mut bound = Vec::new();
-    let mut confirmed = 0usize;
-    for repo in reported {
-        if known.contains(&repo) {
-            confirmed += 1;
-            continue;
-        }
-        // Project name = repo name, org = repo owner — the same 1:1 mapping
-        // `apply_installation_sync` uses, so a re-synced Project is
-        // indistinguishable from a webhook-registered one.
-        connections
-            .bind_repo(&id, &repo, &repo.owner, &repo.name)
-            .await
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        bound.push(format!("{}/{}", repo.owner, repo.name));
-    }
-    Ok(Json(ResyncResultDto { bound, confirmed }))
-}
 
 /// Resolve a [`scarab_forge::ForgeConnection`]'s credential material at
 /// use-time (ADR-0046): the bytes an adapter authenticates with, fetched from
@@ -5935,7 +5533,9 @@ pub fn fork_policy(event: &scarab_forge::Event, target_env: &str) -> ForkPolicy 
 
 /// `GET /metrics` (ADR-0053): Prometheus text exposition of the key gauges —
 /// runs by status and outbox backlog, read live from the durable store on
-/// each scrape (pull-model, always consistent, no in-process drift).
+/// each scrape (pull-model, always consistent, no in-process drift) — plus the
+/// process-lifetime counters from [`crate::metrics`] for failures the store
+/// cannot distinguish after the fact.
 #[utoipa::path(get, path = "/metrics", summary = "Prometheus gauges (ADR-0053)", responses((status = 200, description = "Prometheus text exposition")))]
 async fn metrics(State(st): State<AppState>) -> Result<Response, ApiError> {
     let mut out = String::new();
@@ -5960,6 +5560,10 @@ async fn metrics(State(st): State<AppState>) -> Result<Response, ApiError> {
 ",
         st.db.outbox_depth().await?
     ));
+    // Process-lifetime counters for failures that leave no distinguishing state
+    // in the store — a rejected commit-status post looks like an untried one
+    // (ba921db). See `crate::metrics`.
+    crate::metrics::render(&mut out);
     let mut resp = out.into_response();
     resp.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
@@ -6053,11 +5657,6 @@ const TAG_GROUPS: &[(&str, &str)] = &[
          verifies its own signature.",
     ),
     (
-        "Forge Connections",
-        "The ForgeConnections Scarab authenticates to a forge with, and the \
-         reconciliation that refreshes what they can see (ADR-0046).",
-    ),
-    (
         "Auth & Identity",
         "Login/session, the current principal, OIDC discovery and JWKS, and \
          RBAC role bindings.",
@@ -6077,8 +5676,6 @@ const TAG_GROUPS: &[(&str, &str)] = &[
 fn tag_for_path(path: &str) -> Option<&'static str> {
     let group = if path.starts_with("/webhooks/") {
         "Webhooks"
-    } else if path.starts_with("/v1/connections") {
-        "Forge Connections"
     } else if path.starts_with("/.well-known/")
         || path.starts_with("/v1/auth/")
         || path == "/v1/me"
@@ -6180,10 +5777,6 @@ impl utoipa::Modify for TagGroups {
         delete_environment,
         list_deployments,
         secret_matrix,
-        silence_secret_cell,
-        unsilence_secret_cell,
-        list_connections,
-        resync_connection,
         ingest_step_results,
         create_run,
         dispatch,
@@ -6242,12 +5835,6 @@ impl utoipa::Modify for TagGroups {
         WorkspaceListing,
         PutSecretRequest,
         SecretListResponse,
-        SecretMatrix,
-        SecretMatrixRow,
-        SilenceCellRequest,
-        ConnectionDto,
-        ConnectionProjectDto,
-        ResyncResultDto,
         MeResponse
     ))
 )]
@@ -6348,13 +5935,7 @@ fn router_inner(state: AppState) -> Router {
             "/v1/repos/{org}/{repo}/environments/{name}/deployments",
             get(list_deployments),
         )
-        .route("/v1/connections", get(list_connections))
-        .route("/v1/connections/{id}/resync", post(resync_connection))
         .route("/v1/repos/{org}/{repo}/secrets/matrix", get(secret_matrix))
-        .route(
-            "/v1/repos/{org}/{repo}/secrets/matrix/silenced",
-            axum::routing::put(silence_secret_cell).delete(unsilence_secret_cell),
-        )
         .route("/v1/repos/{org}/{repo}/refs", get(list_refs))
         .route("/v1/repos/{org}/{repo}/pipelines", get(list_pipelines))
         .route(
