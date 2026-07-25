@@ -84,7 +84,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
      scarab.validateAuth instead of silently rendering nothing. */}}
 {{- define "scarab.oauthConfigured" -}}
 {{- $o := .Values.scarab.oauth -}}
-{{- if or $o.clientId $o.authorizeUrl $o.tokenUrl $o.userinfoUrl .Values.secrets.oauthClientSecret.name -}}
+{{- if or $o.clientId $o.authorizeUrl $o.tokenUrl $o.userinfoUrl $o.issuer .Values.secrets.oauthClientSecret.name -}}
 true
 {{- end -}}
 {{- end -}}

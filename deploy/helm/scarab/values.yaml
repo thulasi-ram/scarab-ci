@@ -117,9 +117,18 @@ scarab:
     userinfoUrl: ""     # e.g. https://api.github.com/user
     # Space-separated scopes for the authorize redirect. May be empty.
     scopes: ""
+    # OIDC issuer URL (ADR-0049 amendment). Empty => plain OAuth2: the provider
+    # returns no id_token and the Principal comes from userinfoUrl (GitHub,
+    # Forgejo). Set => OIDC mode: the id_token is verified against this
+    # issuer's discovery/JWKS and its claims are authoritative (Dex, Keycloak,
+    # Google). Only meaningful alongside the four knobs above — setting it
+    # alone makes the server refuse to boot, so the chart refuses to render it.
+    issuer: ""          # e.g. https://dex.example.com
     # Subjects granted Owner at login (bootstrap until scoped RBAC, ADR-0049
     # C2); everyone else authenticates as Viewer. Rendered comma-separated into
     # SCARAB_OAUTH_OWNERS. Leave empty and nobody can administer the install.
+    # An entry matches the provider subject OR a verified email claim — with an
+    # OIDC issuer, `sub` is usually an opaque id, so prefer the email there.
     owners: []
 
   # ⚠ Dev-only (ADR-0048): boots without an authenticator/KEK, with loud

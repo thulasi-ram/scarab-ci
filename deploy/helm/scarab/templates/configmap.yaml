@@ -39,6 +39,9 @@ data:
   {{- with .Values.scarab.oauth.owners }}
   SCARAB_OAUTH_OWNERS: {{ join "," . | quote }}
   {{- end }}
+  {{- with .Values.scarab.oauth.issuer }}
+  SCARAB_OAUTH_ISSUER: {{ . | quote }}
+  {{- end }}
   {{- end }}
   {{- if .Values.scarab.devInsecure }}
   SCARAB_DEV_INSECURE: "1"

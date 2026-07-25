@@ -75,7 +75,28 @@ For a Forgejo host the same four point at `/login/oauth/authorize`,
 `scarab.oauth.owners` are the provider subjects granted **Owner** at login
 (bootstrap until scoped RBAC, ADR-0049 C2); everyone else authenticates as
 **Viewer**. An empty list means nobody can administer the install — the chart says
-so on install.
+so on install. An entry matches the subject **or** a verified email claim.
+
+### Plain OAuth2 vs OIDC (`scarab.oauth.issuer`)
+
+Leaving `scarab.oauth.issuer` empty is **plain OAuth2**: the provider returns no
+`id_token` and the Principal comes from `userinfoUrl`. That is the GitHub and
+Forgejo shape, and it is the default.
+
+Setting it turns on **OIDC mode** — the `id_token` is verified against that
+issuer's discovery document and JWKS (`iss`, `aud`, `exp`, `nonce`, RS256) and
+its claims become authoritative, with userinfo as fallback only when no
+`id_token` comes back. Use it for Dex, Keycloak, or Google:
+
+```bash
+  --set scarab.oauth.issuer=https://dex.example.com \
+  --set 'scarab.oauth.owners={alice@example.com}'
+```
+
+With an OIDC issuer, `sub` is typically an opaque per-client id, so prefer the
+**verified email** in `owners` — an unverified email never grants Owner. Setting
+`issuer` *without* the four endpoints is a render error, same as any other
+partial provider.
 
 **All five or none.** The server refuses to boot on a partially configured
 provider, so the chart refuses to render one: a missing endpoint, or a login
@@ -171,7 +192,7 @@ mechanism, applied kind-wide to GitHub App-mode connections.
 | `scarab.executor` | `k8s` | `k8s` (prod) or `local` (dev only) |
 | `scarab.namespace` | release ns | namespace step Pods launch into (RBAC granted there) |
 | `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
-| `scarab.oauth.*` | — | OAuth/OIDC login: `clientId`, `authorizeUrl`, `tokenUrl`, `userinfoUrl`, `scopes`, `owners` (above) |
+| `scarab.oauth.*` | — | OAuth/OIDC login: `clientId`, `authorizeUrl`, `tokenUrl`, `userinfoUrl`, `scopes`, `owners`, `issuer` (above) |
 | `scarab.devInsecure` | `false` | ⚠ dev/eval only — no auth; mutually exclusive with `scarab.oauth` |
 | `secrets.*` / `secrets.existingSecret` | — | sensitive `SCARAB_*` env |
 | `secrets.oauthClientSecret.name` / `.key` | — / `oauth-client-secret` | OAuth client secret by reference from your own Secret (above) |
