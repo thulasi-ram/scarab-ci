@@ -11,10 +11,25 @@ every "HUMAN VERIFY" comment left on the closed tickets in one loop.
 1. **GitHub App** (github.com → Settings → Developer settings → GitHub Apps → New):
    - Webhook URL: your tunnel URL (step 2) + `/webhooks/github`; set a
      **webhook secret** (keep it).
-   - Permissions: Contents **read & write**, Checks/Commit statuses **write**,
-     Metadata read, Pull requests read. (Packages **write** too if you want the
-     GHCR derived-credential path.)
-   - Subscribe to events: Push, Pull request, Installation, Installation repositories.
+   - **Subscribe to events (REQUIRED — an empty list fails silently):** check
+     **Push** and **Pull request** (optionally **Status**). *Permissions & events
+     → Subscribe to events.* With the boxes unchecked, `push`/`pull_request` are
+     **never delivered**, so nothing ever runs — but `installation` and
+     `installation_repositories` still arrive (App-management events are
+     independent of the subscription list), so the connection registers and
+     `GET /v1/repos` looks healthy. The symptom is the confusing *"the repo is
+     registered but no run ever starts"*, with no error anywhere.
+   - **Permissions (REQUIRED — `statuses:write` fails silently too):** Contents
+     **read** (clone; **read & write** only if a step pushes), Metadata **read**,
+     Pull requests **read**, and **Commit statuses: read & write**. Without
+     `statuses:write` every status post is rejected `403 Resource not accessible
+     by integration`: the run still goes green locally while the PR shows no
+     status at all. Add **Checks: read & write** only if using checks; Packages
+     **write** only for the GHCR derived-credential path.
+   - **Verify both before debugging anything downstream.** The App's *Permissions
+     & events* page is the source of truth, and after a permission change GitHub
+     emails an installation owner to **approve the new access** — the grant is
+     not live until approved.
    - Generate a **private key** (PEM) and note the **App ID**.
    - **Install** the App on `thulasi-ram/scarab-ci`.
 2. **Webhook tunnel** to your laptop: `smee.io` channel or

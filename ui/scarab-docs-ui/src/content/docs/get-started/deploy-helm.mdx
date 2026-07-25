@@ -57,6 +57,24 @@ A boot-supplied key overrides any stored `_forge` credential and survives a data
 *installations* it authenticates as are separate durable state, registered from the App's
 `installation` webhook deliveries.
 
+:::caution[Two App settings that fail silently]
+A correct webhook URL and secret are not enough. Both of these produce a loop that *looks* healthy
+and has no error anywhere:
+
+- **Subscribe to events** (App → *Permissions & events → Subscribe to events*): check **Push** and
+  **Pull request**. With the list empty, `push`/`pull_request` are never delivered so nothing ever
+  runs — yet `installation` and `installation_repositories` still arrive (App-management events are
+  independent of the subscription list), so the connection registers and `GET /v1/repos` looks
+  fine. The symptom reads as *"the repo is registered but no run ever starts."*
+- **Commit statuses: read & write** (App → *Permissions → Repository*): without `statuses:write`
+  every status post is rejected `403 Resource not accessible by integration`. The run itself still
+  succeeds, so the only visible effect is a pull request that never shows a Scarab status. Add
+  **Checks: read & write** only if you use checks; **Contents: read** is what a `clone` step needs.
+
+Verify both on the App's own *Permissions & events* page, and note that a permission change is not
+live until an installation owner **approves the new access** (GitHub emails them).
+:::
+
 ## Key values
 
 Only keys that exist in `values.yaml`:
