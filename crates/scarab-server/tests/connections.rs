@@ -60,9 +60,24 @@ impl Harness {
     }
 }
 
+/// The `SCARAB_PUBLIC_URL` dev default — what a stack that configured none
+/// registers its hooks against.
+const DEV_PUBLIC_URL: &str = "http://localhost:8080";
+
 /// A stack with one GitHub connection, auth+RBAC on, and a forge that either can
-/// or cannot enumerate repos.
+/// or cannot enumerate repos. Public URL = the dev default.
 async fn harness(bound: &[(&str, &str)], forge: Arc<FakeForge>, seed_credential: bool) -> Harness {
+    harness_at(DEV_PUBLIC_URL, bound, forge, seed_credential).await
+}
+
+/// The same stack, reached by the outside world at `public_url` — i.e. every
+/// deployment where Scarab and the forge are not on one loopback.
+async fn harness_at(
+    public_url: &str,
+    bound: &[(&str, &str)],
+    forge: Arc<FakeForge>,
+    seed_credential: bool,
+) -> Harness {
     let db = Arc::new(InMemoryDb::new());
     db.put_connection(&ForgeConnection {
         id: "gh".into(),
@@ -136,6 +151,10 @@ async fn harness(bound: &[(&str, &str)], forge: Arc<FakeForge>, seed_credential:
     let rbac = Arc::new(InMemoryRbac::new());
     let app = router(
         AppState::new(db.clone(), Arc::new(FakeClock::new(0)), logs)
+            // Note what is NOT here: `with_oauth_login`. Browser login is off in
+            // every test on this harness, which used to mean the public URL was
+            // lost — see `a_webhook_registers_against_the_configured_public_url`.
+            .with_public_url(public_url)
             .with_auth(auth, Arc::new(InMemorySessions::new()))
             .with_rbac(rbac.clone())
             .with_secrets(secrets.clone())
@@ -1417,6 +1436,102 @@ async fn a_failed_webhook_leaves_the_project_and_says_so() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// **Regression: the dead-on-arrival hook.** `SCARAB_PUBLIC_URL` reached
+/// `AppState` through exactly one door — `with_oauth_login` — so a deployment
+/// with browser login off (the Helm chart's default, and every dev stack) kept
+/// the `http://localhost:8080` fallback. Registration reported success, the
+/// forge dutifully delivered to *its own* loopback, and no Run ever appeared.
+/// A silent misconfiguration in every deployment where the forge is not on
+/// Scarab's host — which is all of them.
+///
+/// This harness wires only credential-exchange auth, never `with_oauth_login`:
+/// precisely the shape that used to drop the public URL on the floor.
+#[tokio::test]
+async fn a_webhook_registers_against_the_configured_public_url() {
+    const PUBLIC_URL: &str = "https://scarab.acme.test";
+    let h = harness_at(
+        PUBLIC_URL,
+        &[],
+        Arc::new(FakeForge::new().with_accessible_repos(&[("acme", "web")])),
+        true,
+    )
+    .await;
+    let root = login(&h.app, "root-code").await;
+    let (id, _) = add_forgejo(&h, &root, "https://git.acme.test").await;
+
+    // Browser login really is unconfigured — the OAuth redirect is a 404. So
+    // nothing on the auth path could have smuggled the public URL in.
+    let resp = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/auth/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the OAuth login flow must be off for this test to mean anything"
+    );
+
+    let bound: serde_json::Value = serde_json::from_str(
+        &body_bytes(
+            bind(
+                &h,
+                &root,
+                &id,
+                serde_json::json!({ "owner": "acme", "name": "web" }),
+            )
+            .await,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(bound["webhook_registered"], true);
+
+    // The hook the forge actually recorded points at where the forge can reach
+    // Scarab — not at loopback.
+    assert_eq!(
+        h.forge.webhooks(),
+        vec![(
+            RepoRef {
+                owner: "acme".into(),
+                name: "web".into()
+            },
+            format!("{PUBLIC_URL}/webhooks/forgejo")
+        )],
+        "a hook registered against {DEV_PUBLIC_URL} is delivered to the forge's \
+         own host and never arrives"
+    );
+
+    // And the re-register retry cannot regress independently — it is the same
+    // path an admin hits after fixing a forge token.
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/connections/{id}/repos/acme/web/webhook"),
+            &root,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        h.forge
+            .webhooks()
+            .iter()
+            .all(|(_, url)| url.starts_with(PUBLIC_URL)),
+        "{:?}",
+        h.forge.webhooks()
+    );
 }
 
 /// Binding a repo another connection already governs is a conflict, not a move.

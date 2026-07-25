@@ -156,8 +156,13 @@ pub struct AppState {
     /// The browser OAuth login flow (ADR-0049): redirect + callback. `None`
     /// leaves only the credential-exchange `POST /v1/auth/login` (API/CLI).
     pub oauth_login: Option<Arc<oauth::OAuthAuthenticator>>,
-    /// Scarab's public base URL — the OAuth callback `redirect_uri` is
-    /// `{public_url}/v1/auth/callback`.
+    /// Scarab's public base URL — where the outside world reaches this server.
+    /// Two things are built from it, and **neither depends on login being on**:
+    /// the OAuth callback `redirect_uri` (`{public_url}/v1/auth/callback`) and
+    /// the forge-webhook callback every registered hook posts to
+    /// (`{public_url}/webhooks/{forge}`, ADR-0046). Set it with
+    /// [`with_public_url`](AppState::with_public_url); the dev default only
+    /// works when the forge shares this host's loopback.
     pub public_url: String,
     /// Deployment-supplied forge-connection credentials (ADR-0060 part D): the
     /// env-override half of the one credential-resolution path. The API needs
@@ -340,16 +345,29 @@ impl AppState {
         self
     }
 
+    /// Set Scarab's public base URL (`SCARAB_PUBLIC_URL`) — the one place the
+    /// server learns how the outside world reaches it.
+    ///
+    /// Deliberately **independent of authn**: it used to ride along on
+    /// [`with_oauth_login`](AppState::with_oauth_login), so a deployment with
+    /// login off silently kept the `http://localhost:8080` dev default and every
+    /// webhook it registered was dead on arrival — the forge accepted the
+    /// registration and then delivered to its own loopback. Wire this
+    /// unconditionally.
+    pub fn with_public_url(mut self, public_url: impl Into<String>) -> Self {
+        self.public_url = public_url.into();
+        self
+    }
+
     /// Enable the browser OAuth login flow (ADR-0049): `GET /v1/auth/login`
     /// redirects to the provider; the callback lands on
     /// `{public_url}/v1/auth/callback`.
-    pub fn with_oauth_login(
-        mut self,
-        login: Arc<oauth::OAuthAuthenticator>,
-        public_url: impl Into<String>,
-    ) -> Self {
+    ///
+    /// Auth only — the public URL comes from
+    /// [`with_public_url`](AppState::with_public_url), because webhook
+    /// registration needs it whether or not login is configured.
+    pub fn with_oauth_login(mut self, login: Arc<oauth::OAuthAuthenticator>) -> Self {
         self.oauth_login = Some(login);
-        self.public_url = public_url.into();
         self
     }
 }
@@ -5806,6 +5824,35 @@ fn forge_webhook_url(public_url: &str, kind: scarab_forge::ForgeKind) -> String 
     )
 }
 
+/// Can only a forge running on *this very host* deliver to `url`?
+///
+/// The dev default for `SCARAB_PUBLIC_URL` is loopback, and a forge will happily
+/// register a hook pointing at it — so the deployment looks healthy and the
+/// deliveries go to the forge's own localhost forever. Worth a warning at the
+/// moment the hook is created, which is the last point anyone is watching.
+fn is_loopback_callback(url: &str) -> bool {
+    let authority = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    // Strip userinfo, then the port — but not the colons inside a bracketed v6
+    // literal (`[::1]:8080`).
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("ip6-localhost")
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// The registered forge connections and their health (ADR-0060 part C) — what
 /// the global Settings **Connections** section renders.
 ///
@@ -6677,6 +6724,15 @@ async fn try_register_webhook(
         .await
         .map_err(|_| "no forge adapter is wired for this connection".to_string())?;
     let callback = forge_webhook_url(&st.public_url, conn.kind);
+    if is_loopback_callback(&callback) {
+        tracing::warn!(
+            callback = %callback,
+            repo = %format!("{}/{}", repo.owner, repo.name),
+            "registering a webhook whose callback is loopback: only a forge on \
+             this host can ever deliver to it. Set SCARAB_PUBLIC_URL to the URL \
+             the forge reaches Scarab on."
+        );
+    }
     forge
         .register_webhook(repo, &callback)
         .await

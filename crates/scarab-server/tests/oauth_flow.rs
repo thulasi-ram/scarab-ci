@@ -68,8 +68,9 @@ fn app_with_oauth(provider: &str, owners: Vec<String>) -> axum::Router {
     }));
     router(
         AppState::new(db, clock, logs)
+            .with_public_url("https://scarab.example.com")
             .with_auth(login.clone(), Arc::new(InMemorySessions::new()))
-            .with_oauth_login(login, "https://scarab.example.com"),
+            .with_oauth_login(login),
     )
 }
 

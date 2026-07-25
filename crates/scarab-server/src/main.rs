@@ -402,6 +402,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut state = AppState::new(db, clock, logs)
+        // How the outside world reaches this server (SCARAB_PUBLIC_URL).
+        // UNCONDITIONAL, and it must stay that way: every webhook Scarab
+        // registers posts to `{public_url}/webhooks/{forge}`, so gating this on
+        // any other feature (it used to ride on `with_oauth_login`) makes every
+        // hook in a login-less deployment point at localhost and die silently.
+        .with_public_url(config.public_url.clone())
         // Environments + deployment history: the Postgres adapter is the store.
         // Enables /v1/environments/* and admission enforcement for
         // env-targeting runs (ADR-0024).
@@ -470,7 +476,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let login = Arc::new(scarab_server::oauth::OAuthAuthenticator::new(oauth_cfg));
         state = state
             .with_auth(login.clone(), pg.clone())
-            .with_oauth_login(login, config.public_url.clone())
+            .with_oauth_login(login)
             // Scoped RBAC (ADR-0049 C2): per-request role-in-Org/Project from
             // the native bindings in Postgres.
             .with_rbac(pg.clone());
