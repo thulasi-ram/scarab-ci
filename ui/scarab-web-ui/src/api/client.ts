@@ -690,34 +690,6 @@ export async function resyncConnection(id: string): Promise<ResyncResult> {
   return data;
 }
 
-export type ConnectionPreflight = components["schemas"]["ConnectionPreflightDto"];
-export type CapabilityRequirement = components["schemas"]["CapabilityRequirementDto"];
-
-/**
- * Check a connection's forge app against what Scarab needs
- * (`GET /v1/connections/{id}/preflight`) — granted permissions and subscribed
- * events, diffed.
- *
- * This is the deeper cut of the credential health line: an App whose event
- * subscription is empty, or which lacks `statuses:write`, looks perfectly
- * healthy from everywhere else in the product while no run triggers and no check
- * is ever posted.
- *
- * A live forge round-trip, so it is fetched per connection rather than folded
- * into the list. It never 501s: an adapter that cannot look answers
- * `status: "unknown"`, which the caller must render as *unchecked*, not as
- * healthy.
- */
-export async function connectionPreflight(id: string): Promise<ConnectionPreflight> {
-  const { data, error, response } = await api.GET("/v1/connections/{id}/preflight", {
-    params: { path: { id } },
-  });
-  if (error || !data) {
-    throw new Error(errorText(error) || `could not check the connection (${response.status})`);
-  }
-  return data;
-}
-
 /**
  * Create a forge connection (`POST /v1/connections`), writing its credential
  * through to the secret store. The token leaves the browser once and never comes

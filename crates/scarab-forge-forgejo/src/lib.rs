@@ -221,6 +221,23 @@ fn hook_create_body(callback_url: &str, secret: Option<&str>) -> Value {
     })
 }
 
+/// The callback URL of a hook as returned by `GET /repos/{owner}/{name}/hooks`.
+/// Pure, and read from BOTH spellings on purpose.
+///
+/// Forgejo's published API schema (`swagger.v1.json`, v16 —
+/// `16.0.0-dev-626-32363b81+gitea-1.22.0`) declares `Hook.url` at the top level
+/// and annotates `Hook.config` with *"Deprecated: use Metadata instead"*. Reading
+/// only `config.url` — the shape this adapter originally guessed — means that on
+/// an instance which has stopped populating the deprecated map the idempotency
+/// check never matches, and every bind/re-bind silently stacks another hook on
+/// the repo (each push then fans out into duplicate runs).
+fn hook_callback_url(hook: &Value) -> Option<&str> {
+    hook.get("url")
+        .and_then(Value::as_str)
+        .or_else(|| hook.pointer("/config/url").and_then(Value::as_str))
+        .filter(|u| !u.is_empty())
+}
+
 /// One page of `/user/repos` as forge coordinates. Pure. Entries missing an owner
 /// or name are skipped rather than failing the page — one odd row must not hide
 /// every other repo from the pick-list.
@@ -273,9 +290,25 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 const CHECKOUT_CRED_TTL_SECS: i64 = 55 * 60;
 
 /// The page size the adapter requests when walking a paginated collection.
-/// Forgejo's default cap is 50; asking for more is silently clamped, so a short
-/// page is the reliable end-of-collection signal.
+/// Forgejo's default `MAX_RESPONSE_ITEMS` is 50 and every list endpoint clamps
+/// `limit` to it.
 const PAGE: usize = 50;
+
+/// Stop condition for a paged walk: an **empty** page, never a *short* one.
+///
+/// A short page is not end-of-collection on Forgejo — `limit` is clamped to the
+/// instance's `[api] MAX_RESPONSE_ITEMS`, so an operator who lowered it below
+/// [`PAGE`] makes page 1 come back short while more pages exist. Treating that as
+/// the end truncates the bind pick-list to the first page with no error anywhere.
+/// The extra request an empty-page walk costs is worth a pick-list that is whole.
+const MAX_PAGES: usize = 500;
+
+/// Whether to fetch page `page + 1` after a page that returned `returned` items.
+/// The page ceiling is a runaway guard: an instance that ignored `page=` would
+/// otherwise serve the same first page forever.
+fn more_pages(page: usize, returned: usize) -> bool {
+    returned > 0 && page < MAX_PAGES
+}
 
 /// A Forgejo/Codeberg-backed [`ForgePort`] over real HTTP.
 pub struct ForgejoForge {
@@ -461,8 +494,10 @@ impl ForgePort for ForgejoForge {
         query: Option<&str>,
     ) -> Result<Vec<ForgeRef>, ForgeError> {
         // Forgejo has no name-search param and paginates at `limit=50`; page each
-        // collection until a short page. Branch tips live at `commit.id`, tag
-        // tips at `commit.sha` — accept either. Filter by `query` after fetch.
+        // collection until an EMPTY page (see [`more_pages`]). Branch tips live at
+        // `commit.id`, tag tips at `commit.sha` — accept either (the published
+        // schema types `Branch.commit` as `PayloadCommit` with `id`, and
+        // `Tag.commit` as `CommitMeta` with `sha`). Filter by `query` after fetch.
         let mut refs = Vec::new();
         for (kind, coll) in [(RefKind::Branch, "branches"), (RefKind::Tag, "tags")] {
             let mut page = 1;
@@ -489,7 +524,7 @@ impl ForgePort for ForgejoForge {
                         });
                     }
                 }
-                if n < PAGE {
+                if !more_pages(page, n) {
                     break;
                 }
                 page += 1;
@@ -513,7 +548,7 @@ impl ForgePort for ForgejoForge {
             .as_array()
             .map(|arr| {
                 arr.iter()
-                    .any(|h| h.pointer("/config/url").and_then(Value::as_str) == Some(callback_url))
+                    .any(|h| hook_callback_url(h) == Some(callback_url))
             })
             .unwrap_or(false);
         if exists {
@@ -543,7 +578,7 @@ impl ForgePort for ForgejoForge {
             let body = ok_json(resp).await?;
             let n = body.as_array().map(Vec::len).unwrap_or(0);
             out.extend(repos_from_page(&body));
-            if n < PAGE {
+            if !more_pages(page, n) {
                 break;
             }
             page += 1;
@@ -806,6 +841,54 @@ mod tests {
         );
         // A non-array body (an error object) yields nothing, not a panic.
         assert!(repos_from_page(&json!({ "message": "unauthorized" })).is_empty());
+    }
+
+    /// Pins the `Hook` shape against Forgejo's PUBLISHED schema
+    /// (`https://codeberg.org/swagger.v1.json`, reported version
+    /// `16.0.0-dev-626-32363b81+gitea-1.22.0`), where `Hook` carries `url` at the
+    /// top level and `config` is documented as *"Deprecated: use Metadata
+    /// instead"*. Reading only the deprecated map is how re-binding a repo ends up
+    /// stacking duplicate hooks — the idempotency check silently never matches.
+    #[test]
+    fn a_listed_hook_is_matched_by_either_url_spelling() {
+        let modern = json!({
+            "id": 7,
+            "type": "forgejo",
+            "url": "https://scarab.example/webhooks/forgejo",
+            "active": true,
+        });
+        let legacy = json!({
+            "id": 8,
+            "type": "gitea",
+            "config": { "url": "https://scarab.example/webhooks/forgejo", "content_type": "json" },
+        });
+        for hook in [&modern, &legacy] {
+            assert_eq!(
+                hook_callback_url(hook),
+                Some("https://scarab.example/webhooks/forgejo"),
+                "both spellings must match, or bind stacks duplicate hooks: {hook}"
+            );
+        }
+        // A hook with neither (or an empty url) matches nothing rather than
+        // matching everything — a false positive would SKIP registration.
+        assert_eq!(hook_callback_url(&json!({ "id": 9 })), None);
+        assert_eq!(hook_callback_url(&json!({ "url": "" })), None);
+    }
+
+    /// Pins the paging stop condition. `GET /user/repos` takes `page` + `limit`
+    /// (both in the published schema), and every Forgejo list endpoint clamps
+    /// `limit` to `[api] MAX_RESPONSE_ITEMS` (50 by default). So a SHORT page is
+    /// not proof of the end — only an empty one is.
+    #[test]
+    fn paging_stops_on_an_empty_page_not_a_short_one() {
+        // A clamped instance (MAX_RESPONSE_ITEMS below our PAGE) hands back a
+        // short first page while more repos exist; stopping there would truncate
+        // the bind pick-list with no error anywhere.
+        assert!(more_pages(1, 30), "a short page must not end the walk");
+        assert!(more_pages(1, PAGE));
+        assert!(!more_pages(1, 0), "an empty page is the end");
+        // Runaway guard: an instance ignoring `page=` would serve page 1 forever.
+        assert!(!more_pages(MAX_PAGES, PAGE));
     }
 
     #[test]

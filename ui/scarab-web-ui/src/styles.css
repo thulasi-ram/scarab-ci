@@ -1699,33 +1699,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .conn-facts > span { display: inline-flex; align-items: center; gap: 5px; }
 .conn-ok { color: var(--muted-sage); }
 .conn-bad { color: var(--danger); }
-/* App preflight (git-bug 90644c6): the health line for what the forge app is
-   ALLOWED to do, under the credential line it deepens. The gap list is dotted
-   rather than boxed — it is a diagnosis being read out, not a panel. */
-.conn-preflight {
-  display: grid; gap: 5px;
-  font-size: 12px;
-}
-.conn-preflight > span { display: inline-flex; align-items: center; gap: 5px; }
-.preflight-gaps {
-  list-style: none; margin: 0; padding: 0 0 0 3px;
-  display: grid; gap: 4px;
-  border-left: 1px dotted var(--border);
-}
-.preflight-gap {
-  display: flex; align-items: baseline; gap: 7px; flex-wrap: wrap;
-  padding-left: 9px; font-size: 11.5px;
-}
-.preflight-gap-muted { opacity: 0.72; }
-.preflight-gap code { font-size: 11.5px; color: var(--sage); }
-.preflight-sev {
-  font-family: var(--font-mono); font-size: 9.5px;
-  text-transform: uppercase; letter-spacing: 0.7px;
-  color: var(--muted-sage); border: 1px dotted var(--border); border-radius: 3px;
-  padding: 0 4px;
-}
-.preflight-sev.req { color: var(--danger); border-color: var(--danger); }
-
 .conn-projects { display: flex; gap: 7px; flex-wrap: wrap; }
 .conn-proj {
   font-size: 12px; padding: 1px 7px; border-radius: 4px;

@@ -7,8 +7,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-pub mod preflight;
-
 /// A **forge coordinate** — `{owner, name}` as the forge addresses a
 /// repository (ADR-0046, CONTEXT §4.5). External and mutable (a forge
 /// rename/transfer changes it); carried by `Event`/`Status`; the *only*
@@ -601,26 +599,6 @@ pub trait ForgePort: Send + Sync {
     /// re-sync look like it succeeded at unbinding everything.
     async fn list_accessible_repos(&self) -> Result<Vec<RepoRef>, ForgeError> {
         Err(ForgeError::Unsupported("listing accessible repos".into()))
-    }
-
-    /// What this connection's credential is **actually** granted and subscribed
-    /// to, as the forge reports it now — the *actual* half of the connection
-    /// preflight ([`preflight`]).
-    ///
-    /// Only the forge knows; Scarab's side of the diff is the static
-    /// [`preflight::required`] table, so this port stays a pure observation and
-    /// carries no opinion about what is enough.
-    ///
-    /// Never returns credential material: the answer is a description of an
-    /// authorization, not the thing that authorizes.
-    ///
-    /// Defaults to [`Unsupported`](ForgeError::Unsupported) — a forge whose
-    /// grants are not introspectable must read as *unknown*, never as an empty
-    /// grant set, which the diff would report as "everything is missing".
-    async fn describe_capabilities(&self) -> Result<preflight::ForgeCapabilities, ForgeError> {
-        Err(ForgeError::Unsupported(
-            "introspecting granted permissions and subscribed events".into(),
-        ))
     }
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError>;
