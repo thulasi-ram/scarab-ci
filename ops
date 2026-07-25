@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1785003554,"nonce":"36QMEkoyPd3MwQ7ZJsga8EIrDbU=","message":"Shipped and merged to main via PR #75 (merge b370fcf), including ADR-0037's previously-unbuilt 'intentionally unset' marker (migration 0037_secret_coverage_markers). Closing.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1785003554,"nonce":"KcbowRO7nbpdINR6j3hvXT31hn4=","status":2}]}
