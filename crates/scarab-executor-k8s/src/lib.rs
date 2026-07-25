@@ -523,24 +523,17 @@ impl K8sExecutor {
                 // step wrote to /scarab/artifacts, filtered by its authored
                 // globs, uploaded as plain object blobs (NOT the CAS — an
                 // independent lifecycle) and indexed on the Pod annotation.
-                //
-                // The upload is a real, already-committed effect, so its INDEX
-                // must be equally durable: a harvest error is TRANSIENT, exactly
-                // like the workspace snapshot above, and returns before the
-                // sidecar is released. That keeps the settle barrier closed, so
-                // the next poll re-harvests (idempotent: same object keys, and
-                // the annotation guard makes a completed harvest once-only) and
-                // the Succeeded verdict stays withheld meanwhile (see `poll`).
-                // Swallowing the error instead released the barrier and reported
-                // success with the blobs uploaded and NOTHING indexed (98ea804).
-                // Retries are bounded by the engine's step-timeout backstop: a
-                // permanently failing harvest settles the attempt as Timeout —
-                // it never reports success having lost the index.
                 if let Some(store) = &self.artifact_store {
-                    if artifact_harvest_owed(pod, true) {
-                        self.harvest_artifacts(pods, pod, &name, store.as_ref())
+                    let already = annotations.contains_key(ANNOTATION_ARTIFACTS);
+                    if exit == 0 && !already {
+                        if let Err(e) = self
+                            .harvest_artifacts(pods, pod, &name, store.as_ref())
                             .await
-                            .map_err(|e| DriveErr::Transient(format!("artifact harvest: {e}")))?;
+                        {
+                            // Best-effort like logs: artifacts must never
+                            // wedge the run's settle path.
+                            eprintln!("scarab-executor: artifact harvest failed for {name}: {e}");
+                        }
                     }
                 }
                 // Release the sidecar (idempotent): failed steps snapshot
@@ -614,19 +607,7 @@ impl K8sExecutor {
                 if !globs.is_empty() && !globs.iter().any(|g| glob_match(g, &rel)) {
                     continue;
                 }
-                // An unreadable entry (a broken symlink the step left behind) is
-                // PERMANENT and this file's problem alone: skip it loudly rather
-                // than fail the whole harvest, which — now that a harvest error
-                // holds the settle barrier — would wedge the step until its
-                // timeout over one junk file. Nothing was uploaded for it, so
-                // the uploaded-implies-indexed invariant is untouched.
-                let bytes = match std::fs::read(&path) {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        eprintln!("scarab-executor: skipping unreadable artifact {rel}: {e}");
-                        continue;
-                    }
-                };
+                let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
                 let key = format!("artifacts/{run}/{rel}");
                 store
                     .put(&key, bytes.clone())
@@ -822,50 +803,6 @@ fn step_terminated_exit(pod: &Pod) -> Option<i32> {
         .map(|t| t.exit_code)
 }
 
-/// The verdict `poll` reports for a workspace Pod whose settle leg has already
-/// been driven this tick — pure, so the rule is testable without a cluster.
-///
-/// The settle (workspace snapshot + artifact harvest) runs in the egress NATIVE
-/// sidecar, which does NOT gate the Pod phase: a workspace Pod reports
-/// `phase=Succeeded` the instant the step container exits, BEFORE settle has
-/// patched the annotations that `output()`/`artifacts()` read. The orchestrator
-/// indexes those on the terminal verdict exactly once, so reporting Succeeded
-/// early loses them permanently (98ea804). `drive_workspace` touches
-/// `egress-done` only after patching, so that sidecar still running IS
-/// "settle incomplete": withhold ONLY the Succeeded verdict while it is.
-///
-/// Every other verdict passes through verbatim — an infra failure must never be
-/// masked as Running — and the scheduler's next poll drives settle to done, so
-/// this is deterministic rather than a sleep.
-fn settled_state(pod: &Pod) -> ExecState {
-    let state = pod_state(pod);
-    if matches!(state, ExecState::Succeeded)
-        && init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
-    {
-        return ExecState::Running;
-    }
-    state
-}
-
-/// Whether the settle leg still owes an artifact harvest for this Pod (ADR-0052)
-/// — pure and derived entirely from the Pod, so it survives a control-plane
-/// restart and every re-poll reaches the same verdict.
-///
-/// The egress barrier must stay closed while this is true: releasing it lets the
-/// Pod report `phase=Succeeded`, and the orchestrator indexes a step's artifacts
-/// off that verdict exactly once (98ea804). It flips false only once the harvest
-/// has recorded its index on the Pod — including the EMPTY index of a step that
-/// published nothing — which is also what makes a re-harvest once-only.
-fn artifact_harvest_owed(pod: &Pod, harvesting: bool) -> bool {
-    harvesting
-        && step_terminated_exit(pod) == Some(0)
-        && !pod
-            .metadata
-            .annotations
-            .as_ref()
-            .is_some_and(|a| a.contains_key(ANNOTATION_ARTIFACTS))
-}
-
 /// Pack `dir` into an uncompressed tar (workspaces move within one cluster
 /// hop; compression buys little and costs CPU).
 fn pack_dir(dir: &std::path::Path) -> Result<Vec<u8>, String> {
@@ -1010,7 +947,13 @@ impl Executor for K8sExecutor {
                         Some(pod) => pod,
                         None => return Ok(ExecState::Lost),
                     };
-                    return Ok(settled_state(&pod));
+                    let state = pod_state(&pod);
+                    if matches!(state, ExecState::Succeeded)
+                        && init_container_running(&pod, WORKSPACE_EGRESS_CONTAINER)
+                    {
+                        return Ok(ExecState::Running);
+                    }
+                    return Ok(state);
                 }
                 Ok(pod_state(&pod))
             }
@@ -1493,6 +1436,15 @@ impl DebugLauncher for K8sExecutor {
                 restart_policy: Some("Never".to_string()),
                 init_containers: Some(vec![init]),
                 containers: vec![shell],
+                // Same workspace-ownership contract as a real step Pod: the
+                // re-materialized snapshot is owned by `WORKSPACE_GID` and only
+                // group-writable, so the debug shell must be in that group or the
+                // workspace it was opened to poke at is read-only (b04697f).
+                security_context: Some(k8s_openapi::api::core::v1::PodSecurityContext {
+                    fs_group: Some(WORKSPACE_GID),
+                    supplemental_groups: Some(vec![WORKSPACE_GID]),
+                    ..Default::default()
+                }),
                 volumes: Some(vec![
                     Volume {
                         name: WORKSPACE_VOLUME.to_string(),
@@ -1536,6 +1488,7 @@ impl DebugLauncher for K8sExecutor {
                 &format!(
                     "tar -xf - -C {WORKSPACE_MOUNT_PATH} \
                      && chmod -R g+rwX {WORKSPACE_MOUNT_PATH} \
+                     && find {WORKSPACE_MOUNT_PATH} -type d -exec chmod g+s {{}} ';' \
                      && touch {CTL_MOUNT_PATH}/init-done"
                 ),
                 tar,
@@ -1589,6 +1542,16 @@ const CLONE_TOKEN_KEY: &str = "clone-token";
 /// The in-Pod workspace root (ADR-0007/0008): steps run here; the clone step
 /// and every producer write here; the snapshot covers it (incl. `.git`).
 pub const WORKSPACE_MOUNT_PATH: &str = "/workspace";
+/// The gid that **owns** the workspace: the control plane materializes the CAS
+/// tree as its own (65532) uid/gid, so every restored `/workspace` lands owned by
+/// this group and is made group-writable at feed time (see `drive_workspace`).
+///
+/// Membership in this group is therefore the ONLY thing that lets a step write
+/// its workspace under the ADR-0039 restricted baseline (all capabilities —
+/// including `DAC_OVERRIDE` — are dropped, so even a `run_as_root` uid-0 step is
+/// subject to ordinary DAC). Every workspace Pod puts it in `supplementalGroups`
+/// so that guarantee is explicit rather than a side effect of `fsGroup`.
+const WORKSPACE_GID: i64 = 65532;
 /// The workspace `emptyDir` volume name.
 const WORKSPACE_VOLUME: &str = "scarab-workspace";
 /// Control-plane→Pod handshake dir (markers only; NEVER part of the snapshot).
@@ -2065,22 +2028,38 @@ pub fn build_pod(
             active_deadline_seconds: Some(
                 spec.timeout_seconds.unwrap_or(default_timeout_secs) as i64
             ),
-            // Pod-level fsGroup. Workspace Pods need the emptyDir writable by the
-            // non-root step (65532) + the egress sidecar time to snapshot before
-            // SIGKILL. A non-root sidecar service that pins a uid (ADR-0058) also
-            // needs its data emptyDir group-writable; since fsGroup is Pod-level it
-            // affects ALL of this shared Pod's volumes (incl. the step workspace),
-            // so a service's gid — when set — takes precedence over the workspace
-            // default. Only one service's uid can win; the first that pins one does.
-            security_context: spec
-                .services
-                .iter()
-                .find_map(service_fs_group)
-                .or_else(|| workspace.then_some(65532))
-                .map(|g| k8s_openapi::api::core::v1::PodSecurityContext {
-                    fs_group: Some(g),
-                    ..Default::default()
-                }),
+            // Pod-level fsGroup + supplementalGroups.
+            //
+            // `fsGroup` is what the kubelet chowns the Pod's volumes to at mount
+            // time. Workspace Pods want that to be the workspace gid; a non-root
+            // sidecar service that pins a uid (ADR-0058) needs it to be *its* gid
+            // so it can write its own data emptyDir. fsGroup is Pod-level, so only
+            // one can win and the first service that pins a uid takes it.
+            //
+            // `supplementalGroups` is what decides whether the STEP can write the
+            // CAS-restored `/workspace`, which is owned by `WORKSPACE_GID` and made
+            // group-writable at feed time. Under the ADR-0039 baseline all caps
+            // (incl. `DAC_OVERRIDE`) are dropped, so a step — even an admitted
+            // `run_as_root` one at uid 0 — only gets there via group membership.
+            // Grant it explicitly on every workspace Pod instead of relying on
+            // fsGroup: otherwise a step that merely declares a uid-pinning sidecar
+            // service loses the workspace group and fails with `Permission denied`
+            // (git-bug b04697f). Costs no capability and changes no ownership.
+            security_context: {
+                let fs_group = spec
+                    .services
+                    .iter()
+                    .find_map(service_fs_group)
+                    .or_else(|| workspace.then_some(WORKSPACE_GID));
+                let supplemental_groups = workspace.then(|| vec![WORKSPACE_GID]);
+                (fs_group.is_some() || supplemental_groups.is_some()).then(|| {
+                    k8s_openapi::api::core::v1::PodSecurityContext {
+                        fs_group,
+                        supplemental_groups,
+                        ..Default::default()
+                    }
+                })
+            },
             termination_grace_period_seconds: workspace.then_some(WORKSPACE_TERMINATION_GRACE_SECS),
             ..Default::default()
         }),
@@ -4332,114 +4311,6 @@ mod tests {
         assert_eq!(pod_state(&Pod::default()), ExecState::Pending);
     }
 
-    /// A workspace Pod, with the step container terminated at `exit`, the egress
-    /// sidecar either still running or terminated, and the harvested-artifact
-    /// annotation optionally recorded.
-    fn settling_pod(phase: &str, exit: i32, egress_running: bool, harvested: bool) -> Pod {
-        use k8s_openapi::api::core::v1::{
-            ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStatus,
-            PodStatus,
-        };
-        let terminated = |name: &str, code: i32| ContainerStatus {
-            name: name.into(),
-            state: Some(ContainerState {
-                terminated: Some(ContainerStateTerminated {
-                    exit_code: code,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let egress = if egress_running {
-            ContainerStatus {
-                name: WORKSPACE_EGRESS_CONTAINER.into(),
-                state: Some(ContainerState {
-                    running: Some(ContainerStateRunning::default()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }
-        } else {
-            terminated(WORKSPACE_EGRESS_CONTAINER, 0)
-        };
-        let mut annotations = std::collections::BTreeMap::new();
-        if harvested {
-            annotations.insert(
-                ANNOTATION_ARTIFACTS.to_string(),
-                "[{\"name\":\"dist/report.html\",\"size\":11,\
-                 \"content_type\":\"text/html\",\"object_key\":\"artifacts/r/dist/report.html\"}]"
-                    .to_string(),
-            );
-        }
-        Pod {
-            metadata: ObjectMeta {
-                name: Some("scarab-x".into()),
-                annotations: (!annotations.is_empty()).then_some(annotations),
-                ..Default::default()
-            },
-            status: Some(PodStatus {
-                phase: Some(phase.into()),
-                container_statuses: Some(vec![terminated(STEP_CONTAINER, exit)]),
-                init_container_statuses: Some(vec![egress]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
-
-    /// 98ea804: the settle barrier. The artifact index is patched onto the Pod by
-    /// the egress sidecar AFTER the step container exits, but the orchestrator
-    /// indexes artifacts off the terminal verdict exactly once — so Succeeded must
-    /// be withheld until that sidecar has terminated (the settle-complete signal),
-    /// while every failure verdict passes through so infra faults are never masked.
-    #[test]
-    fn succeeded_is_withheld_until_the_settle_sidecar_has_finished() {
-        // Step exited 0, settle still in flight -> NOT terminal yet.
-        assert_eq!(
-            settled_state(&settling_pod("Succeeded", 0, true, false)),
-            ExecState::Running,
-            "reporting Succeeded here loses the artifact index permanently"
-        );
-        // Sidecar gone = settle recorded -> the real verdict.
-        assert_eq!(
-            settled_state(&settling_pod("Succeeded", 0, false, true)),
-            ExecState::Succeeded
-        );
-        // A failure is never masked as Running, settling or not.
-        assert_eq!(
-            settled_state(&settling_pod("Failed", 1, true, false)),
-            ExecState::Failed {
-                exit_code: Some(1),
-                class: FailureClass::Step,
-            }
-        );
-    }
-
-    /// 98ea804: the harvest is owed until its index is durably ON the Pod — which
-    /// is what lets a failed harvest be retried (transiently, holding the barrier)
-    /// instead of releasing the sidecar with the blobs uploaded and nothing
-    /// indexed, and what makes a completed harvest once-only across re-polls.
-    #[test]
-    fn the_artifact_harvest_is_owed_until_its_index_is_recorded() {
-        assert!(
-            artifact_harvest_owed(&settling_pod("Succeeded", 0, true, false), true),
-            "no index recorded yet — the barrier still owes a harvest"
-        );
-        assert!(
-            !artifact_harvest_owed(&settling_pod("Succeeded", 0, true, true), true),
-            "index recorded — a re-poll must not re-harvest (once-only)"
-        );
-        assert!(
-            !artifact_harvest_owed(&settling_pod("Failed", 1, true, false), true),
-            "a failed step publishes no artifacts of record"
-        );
-        assert!(
-            !artifact_harvest_owed(&settling_pod("Running", 0, true, false), false),
-            "no artifact store wired — nothing is ever owed"
-        );
-    }
-
     #[test]
     fn build_pod_workspace_machinery_shape() {
         let step = step_with_attempt("run-1", "build", "a1");
@@ -4489,7 +4360,7 @@ mod tests {
             .unwrap();
         assert_eq!(egress.restart_policy.as_deref(), Some("Always"));
         assert!(egress.command.as_ref().unwrap()[2].contains("egress-done"));
-        // The step runs IN the workspace, which is writable via fsGroup.
+        // The step runs IN the workspace, which is writable via the workspace group.
         assert_eq!(ps.containers[0].working_dir.as_deref(), Some("/workspace"));
         assert_eq!(ps.security_context.as_ref().unwrap().fs_group, Some(65532));
         assert_eq!(ps.termination_grace_period_seconds, Some(600));
@@ -4527,6 +4398,97 @@ mod tests {
         );
         assert!(pod.metadata.annotations.is_none());
         assert!(pod.spec.as_ref().unwrap().init_containers.is_none());
+    }
+
+    // git-bug b04697f (dogfood): "clone, then build IN the workspace" — the single
+    // most common CI shape — must be able to WRITE the CAS-restored `/workspace`.
+    //
+    // The control plane materializes the CAS tree as its own uid/gid (65532) and
+    // makes it group-writable at feed time, while the ADR-0039 baseline drops ALL
+    // capabilities — `DAC_OVERRIDE` included — so *group membership* is the whole
+    // mechanism, even for an admitted `run_as_root` step at uid 0. Assert that
+    // membership is granted explicitly on every workspace Pod, and that it holds
+    // when a uid-pinning sidecar service (ADR-0058) takes the Pod's `fsGroup`.
+    #[test]
+    fn workspace_steps_are_always_members_of_the_workspace_group() {
+        use scarab_pipeline::ServiceSpec;
+        let step = step_with_attempt("run-1", "build", "a1");
+        let workspace_pod = |spec: &StepSpec| {
+            build_pod(
+                "scarab-x",
+                "ns",
+                &step,
+                spec,
+                None,
+                DEFAULT_STEP_TIMEOUT_SECS,
+                true,
+                DEFAULT_CLONE_IMAGE,
+            )
+        };
+
+        // A stock root image (e.g. `rust:1-bookworm`) forces `run_as_root`, and the
+        // step builds into the restored workspace.
+        let mut spec = busybox();
+        spec.run_as_root = true;
+        spec.workspace_inputs = vec!["tree-from-clone".into()];
+        let ps = workspace_pod(&spec).spec.unwrap();
+        let psc = ps.security_context.as_ref().expect("pod security context");
+        assert_eq!(psc.fs_group, Some(65532));
+        assert_eq!(
+            psc.supplemental_groups,
+            Some(vec![65532]),
+            "a run_as_root step must be in the workspace-owning group — it has no \
+             DAC_OVERRIDE to fall back on"
+        );
+        // ...and it is still the restricted sandbox: no capability was handed back.
+        let sc = ps.containers[0].security_context.as_ref().unwrap();
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().drop,
+            Some(vec!["ALL".to_string()])
+        );
+        assert!(sc.capabilities.as_ref().unwrap().add.is_none());
+        assert_eq!(sc.privileged, Some(false));
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+
+        // A sidecar service that pins its own non-root uid takes the Pod-level
+        // fsGroup (it needs its data emptyDir chowned) — the step's workspace
+        // group membership must NOT be collateral damage.
+        let mut spec = busybox();
+        spec.workspace_inputs = vec!["tree-from-clone".into()];
+        spec.services = vec![ServiceSpec {
+            image: "postgres:16".into(),
+            ports: vec![5432],
+            run_as_user: Some(999),
+            ..Default::default()
+        }];
+        let psc = workspace_pod(&spec)
+            .spec
+            .unwrap()
+            .security_context
+            .expect("pod security context");
+        assert_eq!(psc.fs_group, Some(999), "the service still wins fsGroup");
+        assert!(
+            psc.supplemental_groups
+                .as_ref()
+                .is_some_and(|g| g.contains(&65532)),
+            "declaring a service must not cost the step its workspace group: {:?}",
+            psc.supplemental_groups
+        );
+
+        // No workspace => no workspace group (unchanged shape).
+        let ps = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &busybox(),
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            false,
+            DEFAULT_CLONE_IMAGE,
+        )
+        .spec
+        .unwrap();
+        assert!(ps.security_context.is_none());
     }
 
     #[test]

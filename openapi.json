@@ -162,76 +162,6 @@
         }
       }
     },
-    "/v1/connections": {
-      "get": {
-        "tags": [
-          "Forge Connections"
-        ],
-        "summary": "Registered forge connections + their bound Projects and health (ADR-0060)",
-        "description": "Read-only, and `Administer` on the Org: a connection spans every Project it\nserves, so seeing the fleet is an org-level act, not a per-repo one. No\ncredential material is ever returned — only whether the handle resolves.",
-        "operationId": "list_connections",
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ConnectionDto"
-                  }
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "requires Administer on the org"
-          },
-          "404": {
-            "description": "no connection registry wired"
-          }
-        }
-      }
-    },
-    "/v1/connections/{id}/resync": {
-      "post": {
-        "tags": [
-          "Forge Connections"
-        ],
-        "summary": "Re-bind repos the forge reports for this connection (ADR-0060)",
-        "description": "This is the **healing** path for GitHub, where installing the App *is*\nregistration and the registry is therefore only as current as the last\n`installation_repositories` delivery. A dropped delivery leaves a repo the App\ncovers with no Project; re-sync notices.\n\nIt deliberately **only binds**. Unbinding on a forge's say-so would let one\nfailed API page delete governance — Environments, secrets and RBAC hang off a\nProject — so removal stays an explicit human act. `confirmed` reports the\noverlap so a stale binding is still visible.",
-        "operationId": "resync_connection",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "connection id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ResyncResultDto"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "no such connection, or no registry/forge wired"
-          },
-          "501": {
-            "description": "this forge adapter cannot enumerate repos"
-          }
-        }
-      }
-    },
     "/v1/me": {
       "get": {
         "tags": [
@@ -697,8 +627,7 @@
         "tags": [
           "Secrets"
         ],
-        "summary": "The secret coverage matrix (ADR-0037) - names + status, never values",
-        "description": "Names + status only, never values — the same `Administer` capability as\nlisting secrets. This is the read model behind the Project Secrets editor,\nwhich writes through the scoped `/v1/secrets` endpoints.",
+        "summary": "The secret parity matrix (ADR-0037) - names + status, never values",
         "operationId": "secret_matrix",
         "responses": {
           "200": {
@@ -710,68 +639,6 @@
                 }
               }
             }
-          }
-        }
-      }
-    },
-    "/v1/repos/{org}/{repo}/secrets/matrix/silenced": {
-      "put": {
-        "tags": [
-          "Secrets"
-        ],
-        "summary": "Mark a coverage cell intentionally unset (ADR-0037, advisory)",
-        "operationId": "silence_secret_cell",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SilenceCellRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "marked (idempotent)"
-          },
-          "404": {
-            "description": "coverage annotations not configured"
-          }
-        }
-      },
-      "delete": {
-        "tags": [
-          "Secrets"
-        ],
-        "summary": "Drop an intentionally-unset marker (ADR-0037, advisory)",
-        "operationId": "unsilence_secret_cell",
-        "parameters": [
-          {
-            "name": "key",
-            "in": "query",
-            "description": "secret key",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "environment",
-            "in": "query",
-            "description": "environment column; omitted = the repo default",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "cleared (idempotent)"
-          },
-          "404": {
-            "description": "coverage annotations not configured"
           }
         }
       }
@@ -1975,93 +1842,6 @@
           }
         }
       },
-      "ConnectionDto": {
-        "type": "object",
-        "description": "One registered forge connection, as global Settings renders it (ADR-0060).\n\nCarries the credential's **handle and whether it resolves** — never the\nmaterial. A connection is the unit an operator reasons about (\"is my GitHub\nApp still wired up?\"), so the DTO answers that without becoming a way to read\na secret back.",
-        "required": [
-          "id",
-          "kind",
-          "base_url",
-          "web_url",
-          "credential_ref",
-          "credential_present",
-          "projects",
-          "supports_resync",
-          "managed_by_config"
-        ],
-        "properties": {
-          "base_url": {
-            "type": "string",
-            "description": "The API base URL the adapter talks to (GHES / a self-hosted Forgejo)."
-          },
-          "credential_present": {
-            "type": "boolean",
-            "description": "Does `credential_ref` actually resolve to material right now? The single\nmost common breakage (a DB restored without its secrets, a reseed that\nnever happened) is invisible until a run fails — this surfaces it."
-          },
-          "credential_ref": {
-            "type": "string",
-            "description": "The `_forge`-scoped handle the credential lives under. An opaque name,\nnot the secret."
-          },
-          "id": {
-            "type": "string"
-          },
-          "kind": {
-            "type": "string",
-            "description": "`github` | `forgejo`."
-          },
-          "last_delivery_at": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Unix-ms of the most recent accepted webhook delivery from this **forge\nkind**, if any. Deliveries are recorded per kind (the ADR-0046 replay\nguard is keyed that way), so with two connections of one kind this is a\nper-kind liveness signal, not a per-connection one."
-          },
-          "managed_by_config": {
-            "type": "boolean",
-            "description": "Is this connection managed declaratively (config-owned) and therefore\nread-only here? Always `false` until the IaC path lands (ADR-0060 part D);\npresent now so the UI can render the distinction from the start."
-          },
-          "projects": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ConnectionProjectDto"
-            },
-            "description": "The Projects this connection serves, from its repo bindings — a Project\n*is* a binding (ADR-0046), so this is the connection's whole footprint."
-          },
-          "supports_resync": {
-            "type": "boolean",
-            "description": "Can the forge enumerate what this credential reaches? Gates the re-sync\naffordance: GitHub can, so a drifted registry is healable; an adapter that\ncannot should not offer a button that always errors."
-          },
-          "web_url": {
-            "type": "string",
-            "description": "The forge's own web host, for deep links out of the UI."
-          }
-        }
-      },
-      "ConnectionProjectDto": {
-        "type": "object",
-        "description": "A Project a connection serves, plus the forge coordinate it came from.",
-        "required": [
-          "org",
-          "project",
-          "owner",
-          "name"
-        ],
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "org": {
-            "type": "string"
-          },
-          "owner": {
-            "type": "string"
-          },
-          "project": {
-            "type": "string"
-          }
-        }
-      },
       "ConsumedDto": {
         "type": "object",
         "description": "What an attempt consumed (ADR-0056): the map `upstream step id → attempt\nid` stamped at its launch — the durable answer to \"which generation of\n`build` did `test` actually build on?\" after a mid-run restart leaves the\nrun a patchwork of attempt generations. `attempt` names the attempt the\nmap belongs to; empty map = nothing recorded (no upstream evidence, or a\npre-ADR-0056 attempt).",
@@ -2425,28 +2205,6 @@
           }
         }
       },
-      "ResyncResultDto": {
-        "type": "object",
-        "description": "`POST /v1/connections/{id}/resync` body: what reconciliation changed.",
-        "required": [
-          "bound",
-          "confirmed"
-        ],
-        "properties": {
-          "bound": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Repos the forge reports that Scarab did not have bound — now bound."
-          },
-          "confirmed": {
-            "type": "integer",
-            "description": "How many bindings the forge confirms. Reported rather than acted on:\nsee the handler's note on why re-sync never unbinds.",
-            "minimum": 0
-          }
-        }
-      },
       "RunListResponse": {
         "type": "object",
         "description": "`GET /v1/runs` body: the most recent runs, newest first.",
@@ -2640,26 +2398,18 @@
       },
       "SecretMatrix": {
         "type": "object",
-        "description": "`GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory coverage view\n(ADR-0037 D) and — since ADR-0060 — the model behind the *editor* for repo-\nand environment-scoped values. For each key, its **effective** status per\ncolumn after inheritance; never a value.",
+        "description": "`GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory parity view\n(ADR-0037). For each secret key, its **effective** status per environment\nafter inheritance — never a value. `unset` where the key resolves to nothing.",
         "required": [
-          "columns",
           "environments",
           "keys"
         ],
         "properties": {
-          "columns": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Column ids in render order: [`REPO_DEFAULT_COLUMN`] first (the repo-scope\ndefault that the environments fall through to), then each environment."
-          },
           "environments": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "The repo's environments, in column order. A subset of `columns` — kept\nseparate so a client can tell an environment column from the repo one\nwithout reasoning about the reserved id."
+            "description": "The repo's environments, in the order the columns should render."
           },
           "keys": {
             "type": "array",
@@ -2673,26 +2423,15 @@
         "type": "object",
         "required": [
           "key",
-          "status",
-          "inherited_from"
+          "status"
         ],
         "properties": {
-          "inherited_from": {
-            "type": "object",
-            "description": "For each `inherited` cell, the scope it resolves from — `\"repo\"` or\n`\"org\"`. Lets a cell say *what* it would be overriding, so an edit reads\nas \"override the repo default\" rather than an unexplained write.",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "propertyNames": {
-              "type": "string"
-            }
-          },
           "key": {
             "type": "string"
           },
           "status": {
             "type": "object",
-            "description": "`column id -> \"set\" | \"inherited\" | \"unset\" | \"silenced\"`.\n\n`set` = a value lives at exactly that scope · `inherited` = none here, but\nit resolves from a broader scope · `unset` = resolves to nothing ·\n`silenced` = unset **on purpose** (an ADR-0037 marker). Only a genuinely\nunset cell can be silenced: a marker never hides a real value.",
+            "description": "`environment name -> \"set\" | \"inherited\" | \"unset\"`.",
             "additionalProperties": {
               "type": "string"
             },
@@ -2729,24 +2468,6 @@
             "type": "integer",
             "format": "int64",
             "description": "The Take generation this instance belongs to (a Rerun opens a new one)."
-          }
-        }
-      },
-      "SilenceCellRequest": {
-        "type": "object",
-        "description": "`PUT …/secrets/matrix/silenced` body — and, as a query, the `DELETE`\nselector: the one cell to annotate. Omitting `environment` addresses the\nrepo-scope default column. The Project is in the path, so unlike\n[`SecretScopeQuery`] this carries no org/repo.",
-        "required": [
-          "key"
-        ],
-        "properties": {
-          "environment": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "key": {
-            "type": "string"
           }
         }
       },
@@ -3024,10 +2745,6 @@
     {
       "name": "Webhooks",
       "description": "Forge delivery endpoints. Called by the forge, not by clients; each verifies its own signature."
-    },
-    {
-      "name": "Forge Connections",
-      "description": "The ForgeConnections Scarab authenticates to a forge with, and the reconciliation that refreshes what they can see (ADR-0046)."
     },
     {
       "name": "Auth & Identity",

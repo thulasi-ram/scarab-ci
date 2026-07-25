@@ -715,15 +715,6 @@ pub trait Executor: Send + Sync {
     /// The **artifacts** a finished execution published to `/scarab/artifacts/`
     /// (ADR-0052): collected post-step by the backend, blobs already in the
     /// object store; the orchestrator persists the metadata. Default empty.
-    ///
-    /// The blobs are uploaded BEFORE this is read, so a backend must not report
-    /// an incomplete harvest as an empty one: "not settled yet" and "published
-    /// nothing" are the same value here, and the orchestrator indexes on a
-    /// terminal verdict exactly once. A backend whose harvest lands after the
-    /// unit's exit (the k8s egress sidecar) therefore withholds the *Succeeded*
-    /// verdict from [`poll`](Self::poll) until the harvest is durably recorded.
-    /// A **decorator** MUST forward this: the empty default silently unindexes
-    /// every uploaded artifact of the executor it wraps (98ea804).
     async fn artifacts(&self, _handle: &ExecHandle) -> Result<Vec<crate::ArtifactMeta>, ExecError> {
         Ok(Vec::new())
     }

@@ -1583,10 +1583,6 @@ struct FakeExecState {
     outputs: HashMap<String, String>,
     /// Named results (ADR-0041) each *step* emits on success, keyed by step id.
     results: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
-    /// Artifacts of record (ADR-0052) each *step* published, keyed by step id —
-    /// the harvest the backend reports back once the blobs are in the object
-    /// store, which the orchestrator must durably index.
-    artifacts: HashMap<String, Vec<scarab_engine::ArtifactMeta>>,
     /// The most recent spec each handle was launched with — lets a test assert
     /// launch-time interpolation (ADR-0041) rewrote `${{ … }}` before launch.
     launched_specs: HashMap<String, StepSpec>,
@@ -1665,16 +1661,6 @@ impl FakeExecutor {
             .unwrap()
             .results
             .insert(step.to_string(), results);
-    }
-
-    /// Set the artifacts of record `step` (by id) published (ADR-0052) — what a
-    /// backend reports from its post-step harvest, blobs already uploaded.
-    pub fn set_artifacts(&self, step: &str, artifacts: Vec<scarab_engine::ArtifactMeta>) {
-        self.inner
-            .lock()
-            .unwrap()
-            .artifacts
-            .insert(step.to_string(), artifacts);
     }
 
     /// The deterministic handle a step's fence maps to.
@@ -1838,19 +1824,6 @@ impl Executor for FakeExecutor {
             .unwrap_or_default())
     }
 
-    async fn artifacts(
-        &self,
-        handle: &ExecHandle,
-    ) -> Result<Vec<scarab_engine::ArtifactMeta>, ExecError> {
-        let step = handle
-            .0
-            .strip_prefix("fake://")
-            .and_then(|rest| rest.split('/').nth(1));
-        Ok(step
-            .and_then(|s| self.inner.lock().unwrap().artifacts.get(s).cloned())
-            .unwrap_or_default())
-    }
-
     async fn launch_service(
         &self,
         run: &RunId,
@@ -2002,11 +1975,6 @@ pub struct FakeForge {
     /// Seeded branches/tags for [`list_refs`](ForgePort::list_refs) — the ref
     /// picker's source. Empty (default) models a repo with nothing to list.
     refs: Mutex<Vec<ForgeRef>>,
-    /// What the forge reports this credential reaches (ADR-0060 re-sync).
-    /// `None` (default) models an adapter that **cannot enumerate** — the port's
-    /// `Unsupported` answer, deliberately distinct from `Some(vec![])`
-    /// ("enumerable, reaches nothing").
-    accessible: Mutex<Option<Vec<RepoRef>>>,
 }
 
 impl FakeForge {
@@ -2064,23 +2032,6 @@ impl FakeForge {
             name: name.into(),
             sha: sha.into(),
         });
-        self
-    }
-
-    /// Make this forge **enumerable** (ADR-0060): `list_accessible_repos` reports
-    /// exactly `repos` instead of answering `Unsupported`. Pass an empty slice to
-    /// model a credential that reaches nothing — which is not the same as an
-    /// adapter that cannot look.
-    pub fn with_accessible_repos(self, repos: &[(&str, &str)]) -> Self {
-        *self.accessible.lock().unwrap() = Some(
-            repos
-                .iter()
-                .map(|(owner, name)| RepoRef {
-                    owner: (*owner).into(),
-                    name: (*name).into(),
-                })
-                .collect(),
-        );
         self
     }
 
@@ -2297,13 +2248,6 @@ impl ForgePort for FakeForge {
         query: Option<&str>,
     ) -> Result<Vec<ForgeRef>, ForgeError> {
         Ok(filter_refs(self.refs.lock().unwrap().clone(), query))
-    }
-
-    async fn list_accessible_repos(&self) -> Result<Vec<RepoRef>, ForgeError> {
-        match self.accessible.lock().unwrap().clone() {
-            Some(repos) => Ok(repos),
-            None => Err(ForgeError::Unsupported("listing accessible repos".into())),
-        }
     }
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError> {
