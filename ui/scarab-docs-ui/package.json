@@ -6,9 +6,8 @@
   "description": "Scarab documentation site (Astro Starlight; ADR-0040). Operator-primary docs; sources docs/adr + openapi.json in place. DESIGN.md-branded with an offline rough.js doodle generator.",
   "scripts": {
     "gen:content": "node scripts/sync-content.mjs",
-    "gen:openapi": "node scripts/gen-openapi.mjs",
     "gen:doodles": "npm --prefix ../brand/ascii run bake",
-    "gen": "npm run gen:content && npm run gen:openapi",
+    "gen": "npm run gen:content",
     "predev": "npm run gen",
     "prebuild": "npm run gen",
     "dev": "astro dev",

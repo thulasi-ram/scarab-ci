@@ -5530,9 +5530,137 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
     Json(ApiDoc::openapi())
 }
 
+/// The curated operation groups carried by the spec, in sidebar display order.
+///
+/// The doc renderer (`starlight-openapi`) builds a page per operation and groups
+/// them by tag, so an untagged spec renders as a bare overview with no operation
+/// pages at all. Tagging happens here rather than on 53 `#[utoipa::path]`
+/// annotations so the grouping is one curated list a reviewer can read, and a
+/// newly-added route inherits its group from its path instead of silently
+/// landing untagged (`operation_tags_cover_every_operation` asserts that).
+const TAG_GROUPS: &[(&str, &str)] = &[
+    (
+        "Runs",
+        "Launch, read, cancel, rerun and retry Runs; their events, logs, \
+         results, workspace, artifacts and gates.",
+    ),
+    (
+        "Repositories",
+        "The governed repos Scarab knows about, their pipeline catalog, refs, \
+         launch interface and manual dispatch.",
+    ),
+    (
+        "Environments",
+        "Environments and their protection rules, plus deployment history.",
+    ),
+    (
+        "Secrets",
+        "Scoped secrets (org / repo / environment) and the effective-status \
+         matrix that resolves them.",
+    ),
+    (
+        "Webhooks",
+        "Forge delivery endpoints. Called by the forge, not by clients; each \
+         verifies its own signature.",
+    ),
+    (
+        "Auth & Identity",
+        "Login/session, the current principal, OIDC discovery and JWKS, and \
+         RBAC role bindings.",
+    ),
+    (
+        "System",
+        "Liveness, readiness and Prometheus metrics (ADR-0053).",
+    ),
+];
+
+/// Which [`TAG_GROUPS`] entry an operation belongs to, decided by its path.
+///
+/// First match wins, so the order is load-bearing: `/…/bindings/import` is
+/// access control rather than a repo operation, and `/…/repos/…/runs` is a Run
+/// listing rather than a repo one. Returns `None` for a path no rule claims —
+/// a test turns that into a build failure rather than an untagged operation.
+fn tag_for_path(path: &str) -> Option<&'static str> {
+    let group = if path.starts_with("/webhooks/") {
+        "Webhooks"
+    } else if path.starts_with("/.well-known/")
+        || path.starts_with("/v1/auth/")
+        || path == "/v1/me"
+        || path.contains("bindings")
+    {
+        "Auth & Identity"
+    } else if matches!(path, "/healthz" | "/readyz" | "/metrics") {
+        "System"
+    } else if path.contains("/environments") {
+        "Environments"
+    } else if path.contains("/secrets") {
+        "Secrets"
+    } else if path.contains("/runs") {
+        "Runs"
+    } else if path.starts_with("/v1/repos") {
+        "Repositories"
+    } else {
+        return None;
+    };
+    Some(group)
+}
+
+/// Every operation a `PathItem` actually declares. `utoipa` models the methods
+/// as separate `Option` fields rather than a map, so walking them needs this.
+fn path_item_operations(
+    item: &mut utoipa::openapi::path::PathItem,
+) -> impl Iterator<Item = &mut utoipa::openapi::path::Operation> {
+    [
+        &mut item.get,
+        &mut item.put,
+        &mut item.post,
+        &mut item.delete,
+        &mut item.options,
+        &mut item.head,
+        &mut item.patch,
+        &mut item.trace,
+    ]
+    .into_iter()
+    .flatten()
+}
+
+/// Stamps the curated group onto every operation and declares the groups
+/// top-level, so the canonical `openapi.json` carries its own grouping.
+struct TagGroups;
+
+impl utoipa::Modify for TagGroups {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let mut used = std::collections::HashSet::new();
+        for (path, item) in &mut openapi.paths.paths {
+            let Some(group) = tag_for_path(path) else {
+                continue;
+            };
+            for op in path_item_operations(item) {
+                op.tags = Some(vec![group.to_owned()]);
+            }
+            used.insert(group);
+        }
+        // Declare only the groups actually in use, in TAG_GROUPS order — an
+        // empty group would render as an empty sidebar section.
+        openapi.tags = Some(
+            TAG_GROUPS
+                .iter()
+                .filter(|(name, _)| used.contains(name))
+                .map(|(name, description)| {
+                    utoipa::openapi::tag::TagBuilder::new()
+                        .name(*name)
+                        .description(Some(*description))
+                        .build()
+                })
+                .collect(),
+        );
+    }
+}
+
 /// The generated OpenAPI document. The pipeline request schema is the IR subset.
 #[derive(OpenApi)]
 #[openapi(
+    modifiers(&TagGroups),
     paths(
         healthz,
         readyz,
