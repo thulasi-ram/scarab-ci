@@ -216,8 +216,11 @@ Two layers, both new (there is nothing today):
   RunDetail take/attempt-window closures and StepPane scoping →
   `takes.ts`/`attempts.ts`, taking explicit args instead of closing over
   signals; components keep thin wrappers (`tsc` guards the refactor).
-  Vitest joins the typecheck job in ci.yml — **required from day one**,
-  path-filtered to `ui/**`.
+  Vitest joins ci.yml — **required from day one**.
+  > **Shipped 2026-07-25** as its own `ui-tests` job (72 cases, ~0.5s) rather
+  > than folded into `openapi-drift`, and **not** path-filtered: the suite is
+  > cheaper than the filter machinery (`dorny/paths-filter` + an API call), and
+  > a check that sometimes doesn't run can't be a clean required check.
 - **Strict pyramid — no-DOM ≫ DOM ≫ Playwright.** The bulk of UI testing is
   the no-DOM tier above; total vitest+playwright footprint stays small.
   - **DOM tier (few):** only where rendering *is* the logic and extraction
@@ -232,8 +235,9 @@ Two layers, both new (there is nothing today):
     language, activity rail order, browse tabs reachable. Extend the acme
     fixture only as far as this one scenario needs — not a fixture per
     state. In UI tests the server *is* the external, so mocking it is
-    classical, not mockist. In CI: path-filtered to `ui/**`, advisory for
-    two weeks (new toolchain), then required. **Text/role-based assertions
+    classical, not mockist. In CI: advisory for two weeks (new toolchain),
+    then required — shipped 2026-07-25 as the `ui-e2e` job, probation
+    expressed as `continue-on-error: true`. **Text/role-based assertions
     only — no pixel/screenshot snapshots ever** (highest-flake, lowest-
     signal genre; fails the cynical bar).
 - One nightly Playwright smoke against the real E2E stack (happy path +
