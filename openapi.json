@@ -2381,6 +2381,16 @@
           "image": {
             "type": "string"
           },
+          "inputs": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Explicit input workspaces (ADR-0007): the subset of `needs` whose output\nworkspace this step consumes. Absent = implicit-by-default (inherit every\nneed's workspace). Naming a subset both restricts what flows in and\nsharpens restart invalidation — the skip-if-unchanged signature is then\ncomputed over exactly these inputs (mirrors `scarab_pipeline::StepSpec`)."
+          },
           "k8s_overlay": {
             "type": "object",
             "description": "Governed raw pod-spec overlay (ADR-0055). Carries no authority; an inline\nAPI run targets no Environment, so any overlay is rejected fail-closed."
