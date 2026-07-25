@@ -1647,6 +1647,65 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .secret-matrix .m-unset {
   color: var(--muted-sage);
 }
+/* `silenced` is a deliberate gap (ADR-0037): dimmer than `unset`, because the
+   whole point of the marker is that this cell should stop asking for attention. */
+.secret-matrix .m-silenced {
+  color: var(--muted-sage);
+  opacity: 0.55;
+}
+/* Editable variant (ADR-0060): each cell is a click target that writes AT its
+   column's scope. The repo-default column is separated by a rule — everything
+   right of it falls through to it, so the boundary is meaningful, not decorative. */
+.secret-matrix.editable .mcell {
+  cursor: pointer;
+  transition: background 0.12s var(--ease-out);
+}
+.secret-matrix.editable .mcell:hover {
+  background: var(--emerald-surface);
+}
+.secret-matrix.editable th.mdefault,
+.secret-matrix.editable tr > td:nth-child(2) {
+  border-right: 1px solid var(--border);
+}
+
+/* Forge connections (ADR-0060). One block per connection: identity line with its
+   actions, a health line, then the Projects it serves. */
+.conn-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.conn {
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 7px;
+}
+.conn-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.conn-kind {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.8px;
+  color: var(--emerald); border: 1px solid var(--border); border-radius: 4px;
+  padding: 1px 6px;
+}
+.conn-base { font-size: 12px; color: var(--muted-sage); }
+/* A config-owned connection is read-only here; the tag is the explanation, so it
+   reads as deliberate rather than as a missing edit button. */
+.conn-tag {
+  font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--copper); border: 1px dashed var(--copper); border-radius: 4px;
+  padding: 1px 6px;
+}
+.conn-facts {
+  display: flex; gap: 18px; flex-wrap: wrap;
+  font-size: 12px; align-items: center;
+}
+.conn-facts > span { display: inline-flex; align-items: center; gap: 5px; }
+.conn-ok { color: var(--muted-sage); }
+.conn-bad { color: var(--danger); }
+.conn-projects { display: flex; gap: 7px; flex-wrap: wrap; }
+.conn-proj {
+  font-size: 12px; padding: 1px 7px; border-radius: 4px;
+  background: var(--emerald-surface); border: 1px solid var(--border-soft);
+  color: var(--sage); text-decoration: none;
+}
+.conn-proj:hover { border-color: var(--emerald); color: var(--emerald); }
 
 /* ════════════════════════════════════════════════════════════════════════
    Dashboard (engineer landing): action inbox · activity · all-clear

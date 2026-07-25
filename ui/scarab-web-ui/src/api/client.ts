@@ -656,21 +656,96 @@ export async function deleteSecret(scope: SecretScope, name: string): Promise<vo
   }
 }
 
-// --- Secret parity matrix (ADR-0037). Advisory: each key's *effective* status
-// per environment after inheritance — never a value. Not yet in the generated
-// OpenAPI client, so plain-fetched (as the events snapshot is). ---
+// --- Forge connections (ADR-0060 part C). Read-only + a re-sync heal action.
+// Credential material is never in these payloads — only whether it resolves. ---
 
-export type SecretCellStatus = "set" | "inherited" | "unset";
+export type Connection = components["schemas"]["ConnectionDto"];
+export type ResyncResult = components["schemas"]["ResyncResultDto"];
+
+/** The registered forge connections with their bound Projects and health. */
+export async function listConnections(): Promise<Connection[]> {
+  const { data, error } = await api.GET("/v1/connections");
+  if (error || !data) throw new Error("failed to load connections");
+  return data;
+}
+
+/**
+ * Ask the forge which repos this connection reaches and bind any that are
+ * missing (`POST /v1/connections/{id}/resync`). Heals a registry left stale by a
+ * dropped installation webhook. Never unbinds.
+ */
+export async function resyncConnection(id: string): Promise<ResyncResult> {
+  const { data, error, response } = await api.POST("/v1/connections/{id}/resync", {
+    params: { path: { id } },
+  });
+  if (response.status === 501) {
+    throw new Error("this forge can't list its repositories, so there's nothing to re-sync");
+  }
+  if (error || !data) throw new Error("re-sync failed");
+  return data;
+}
+
+// --- Secret coverage matrix (ADR-0037) — and, since ADR-0060, the read model
+// behind the repo/environment secret EDITOR. Each key's *effective* status per
+// column after inheritance; never a value. Not in the generated OpenAPI client
+// (plain-fetched, as the events snapshot is). ---
+
+/** The column id of the repo-scope default — reserved, so no env can collide. */
+export const REPO_DEFAULT_COLUMN = "";
+
+export type SecretCellStatus = "set" | "inherited" | "unset" | "silenced";
 export type SecretMatrix = {
+  /** Render order: the repo default first, then each environment. */
+  columns: string[];
   environments: string[];
-  keys: { key: string; status: Record<string, SecretCellStatus> }[];
+  keys: {
+    key: string;
+    status: Record<string, SecretCellStatus>;
+    /** For `inherited` cells: `"repo"` or `"org"` — what an edit would override. */
+    inherited_from: Record<string, "repo" | "org">;
+  }[];
 };
 
-/** Fetch a repo's advisory secret parity matrix (`GET …/secrets/matrix`). */
+const matrixUrl = (org: string, repo: string) =>
+  `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/secrets/matrix`;
+
+/** Fetch a repo's secret coverage matrix (`GET …/secrets/matrix`). */
 export async function fetchSecretMatrix(org: string, repo: string): Promise<SecretMatrix> {
-  const res = await fetch(
-    `/v1/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo)}/secrets/matrix`,
-  );
+  const res = await fetch(matrixUrl(org, repo));
   if (!res.ok) throw new Error("failed to load secret matrix");
   return (await res.json()) as SecretMatrix;
+}
+
+/**
+ * The secret scope a matrix column addresses. The repo-default column is the
+ * `Repo` scope; every other column is that named `Environment`.
+ */
+export function columnScope(org: string, repo: string, column: string): SecretScope {
+  return column === REPO_DEFAULT_COLUMN ? { org, repo } : { org, repo, environment: column };
+}
+
+/**
+ * Mark/unmark a cell as **intentionally unset** (ADR-0037). Advisory only — it
+ * silences a gap in the matrix and changes nothing about resolution or deploys.
+ */
+export async function setSecretCellSilenced(
+  org: string,
+  repo: string,
+  column: string,
+  key: string,
+  silenced: boolean,
+): Promise<void> {
+  const env = column === REPO_DEFAULT_COLUMN ? undefined : column;
+  const res = silenced
+    ? await fetch(`${matrixUrl(org, repo)}/silenced`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ key, environment: env }),
+      })
+    : await fetch(
+        `${matrixUrl(org, repo)}/silenced?key=${encodeURIComponent(key)}` +
+          (env ? `&environment=${encodeURIComponent(env)}` : ""),
+        { method: "DELETE" },
+      );
+  if (!res.ok) throw new Error("failed to update the coverage marker");
 }

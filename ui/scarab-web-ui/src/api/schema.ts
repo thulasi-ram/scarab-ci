@@ -141,6 +141,56 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/connections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Registered forge connections + their bound Projects and health (ADR-0060)
+         * @description Read-only, and `Administer` on the Org: a connection spans every Project it
+         *     serves, so seeing the fleet is an org-level act, not a per-repo one. No
+         *     credential material is ever returned — only whether the handle resolves.
+         */
+        get: operations["list_connections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/connections/{id}/resync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-bind repos the forge reports for this connection (ADR-0060)
+         * @description This is the **healing** path for GitHub, where installing the App *is*
+         *     registration and the registry is therefore only as current as the last
+         *     `installation_repositories` delivery. A dropped delivery leaves a repo the App
+         *     covers with no Project; re-sync notices.
+         *
+         *     It deliberately **only binds**. Unbinding on a forge's say-so would let one
+         *     failed API page delete governance — Environments, secrets and RBAC hang off a
+         *     Project — so removal stays an explicit human act. `confirmed` reports the
+         *     overlap so a stale binding is still visible.
+         */
+        post: operations["resync_connection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/me": {
         parameters: {
             query?: never;
@@ -398,11 +448,34 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The secret parity matrix (ADR-0037) - names + status, never values */
+        /**
+         * The secret coverage matrix (ADR-0037) - names + status, never values
+         * @description Names + status only, never values — the same `Administer` capability as
+         *     listing secrets. This is the read model behind the Project Secrets editor,
+         *     which writes through the scoped `/v1/secrets` endpoints.
+         */
         get: operations["secret_matrix"];
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/repos/{org}/{repo}/secrets/matrix/silenced": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Mark a coverage cell intentionally unset (ADR-0037, advisory) */
+        put: operations["silence_secret_cell"];
+        post?: never;
+        /** Drop an intentionally-unset marker (ADR-0037, advisory) */
+        delete: operations["unsilence_secret_cell"];
         options?: never;
         head?: never;
         patch?: never;
@@ -991,6 +1064,66 @@ export interface components {
             name: string;
         };
         /**
+         * @description One registered forge connection, as global Settings renders it (ADR-0060).
+         *
+         *     Carries the credential's **handle and whether it resolves** — never the
+         *     material. A connection is the unit an operator reasons about ("is my GitHub
+         *     App still wired up?"), so the DTO answers that without becoming a way to read
+         *     a secret back.
+         */
+        ConnectionDto: {
+            /** @description The API base URL the adapter talks to (GHES / a self-hosted Forgejo). */
+            base_url: string;
+            /**
+             * @description Does `credential_ref` actually resolve to material right now? The single
+             *     most common breakage (a DB restored without its secrets, a reseed that
+             *     never happened) is invisible until a run fails — this surfaces it.
+             */
+            credential_present: boolean;
+            /**
+             * @description The `_forge`-scoped handle the credential lives under. An opaque name,
+             *     not the secret.
+             */
+            credential_ref: string;
+            id: string;
+            /** @description `github` | `forgejo`. */
+            kind: string;
+            /**
+             * Format: int64
+             * @description Unix-ms of the most recent accepted webhook delivery from this **forge
+             *     kind**, if any. Deliveries are recorded per kind (the ADR-0046 replay
+             *     guard is keyed that way), so with two connections of one kind this is a
+             *     per-kind liveness signal, not a per-connection one.
+             */
+            last_delivery_at?: number | null;
+            /**
+             * @description Is this connection managed declaratively (config-owned) and therefore
+             *     read-only here? Always `false` until the IaC path lands (ADR-0060 part D);
+             *     present now so the UI can render the distinction from the start.
+             */
+            managed_by_config: boolean;
+            /**
+             * @description The Projects this connection serves, from its repo bindings — a Project
+             *     *is* a binding (ADR-0046), so this is the connection's whole footprint.
+             */
+            projects: components["schemas"]["ConnectionProjectDto"][];
+            /**
+             * @description Can the forge enumerate what this credential reaches? Gates the re-sync
+             *     affordance: GitHub can, so a drifted registry is healable; an adapter that
+             *     cannot should not offer a button that always errors.
+             */
+            supports_resync: boolean;
+            /** @description The forge's own web host, for deep links out of the UI. */
+            web_url: string;
+        };
+        /** @description A Project a connection serves, plus the forge coordinate it came from. */
+        ConnectionProjectDto: {
+            name: string;
+            org: string;
+            owner: string;
+            project: string;
+        };
+        /**
          * @description What an attempt consumed (ADR-0056): the map `upstream step id → attempt
          *     id` stamped at its launch — the durable answer to "which generation of
          *     `build` did `test` actually build on?" after a mid-run restart leaves the
@@ -1234,6 +1367,16 @@ export interface components {
             /** @description Branches first, then tags; each group name-sorted. */
             refs: components["schemas"]["RefDto"][];
         };
+        /** @description `POST /v1/connections/{id}/resync` body: what reconciliation changed. */
+        ResyncResultDto: {
+            /** @description Repos the forge reports that Scarab did not have bound — now bound. */
+            bound: string[];
+            /**
+             * @description How many bindings the forge confirms. Reported rather than acted on:
+             *     see the handler's note on why re-sync never unbinds.
+             */
+            confirmed: number;
+        };
         /** @description `GET /v1/runs` body: the most recent runs, newest first. */
         RunListResponse: {
             runs: components["schemas"]["RunSummaryDto"][];
@@ -1348,18 +1491,43 @@ export interface components {
             names: string[];
         };
         /**
-         * @description `GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory parity view
-         *     (ADR-0037). For each secret key, its **effective** status per environment
-         *     after inheritance — never a value. `unset` where the key resolves to nothing.
+         * @description `GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory coverage view
+         *     (ADR-0037 D) and — since ADR-0060 — the model behind the *editor* for repo-
+         *     and environment-scoped values. For each key, its **effective** status per
+         *     column after inheritance; never a value.
          */
         SecretMatrix: {
-            /** @description The repo's environments, in the order the columns should render. */
+            /**
+             * @description Column ids in render order: [`REPO_DEFAULT_COLUMN`] first (the repo-scope
+             *     default that the environments fall through to), then each environment.
+             */
+            columns: string[];
+            /**
+             * @description The repo's environments, in column order. A subset of `columns` — kept
+             *     separate so a client can tell an environment column from the repo one
+             *     without reasoning about the reserved id.
+             */
             environments: string[];
             keys: components["schemas"]["SecretMatrixRow"][];
         };
         SecretMatrixRow: {
+            /**
+             * @description For each `inherited` cell, the scope it resolves from — `"repo"` or
+             *     `"org"`. Lets a cell say *what* it would be overriding, so an edit reads
+             *     as "override the repo default" rather than an unexplained write.
+             */
+            inherited_from: {
+                [key: string]: string;
+            };
             key: string;
-            /** @description `environment name -> "set" | "inherited" | "unset"`. */
+            /**
+             * @description `column id -> "set" | "inherited" | "unset" | "silenced"`.
+             *
+             *     `set` = a value lives at exactly that scope · `inherited` = none here, but
+             *     it resolves from a broader scope · `unset` = resolves to nothing ·
+             *     `silenced` = unset **on purpose** (an ADR-0037 marker). Only a genuinely
+             *     unset cell can be silenced: a marker never hides a real value.
+             */
             status: {
                 [key: string]: string;
             };
@@ -1386,6 +1554,16 @@ export interface components {
              * @description The Take generation this instance belongs to (a Rerun opens a new one).
              */
             take: number;
+        };
+        /**
+         * @description `PUT …/secrets/matrix/silenced` body — and, as a query, the `DELETE`
+         *     selector: the one cell to annotate. Omitting `environment` addresses the
+         *     repo-scope default column. The Project is in the path, so unlike
+         *     [`SecretScopeQuery`] this carries no org/repo.
+         */
+        SilenceCellRequest: {
+            environment?: string | null;
+            key: string;
         };
         /** @description One step (IR subset): the step contract is an OCI `image` + `command`. */
         StepDto: {
@@ -1751,6 +1929,75 @@ export interface operations {
         responses: {
             /** @description session revoked; cookies expired */
             204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_connections: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionDto"][];
+                };
+            };
+            /** @description requires Administer on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no connection registry wired */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    resync_connection: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description connection id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ResyncResultDto"];
+                };
+            };
+            /** @description no such connection, or no registry/forge wired */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description this forge adapter cannot enumerate repos */
+            501: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2153,6 +2400,65 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SecretMatrix"];
                 };
+            };
+        };
+    };
+    silence_secret_cell: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SilenceCellRequest"];
+            };
+        };
+        responses: {
+            /** @description marked (idempotent) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description coverage annotations not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unsilence_secret_cell: {
+        parameters: {
+            query: {
+                /** @description secret key */
+                key: string;
+                /** @description environment column; omitted = the repo default */
+                environment?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description cleared (idempotent) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description coverage annotations not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
