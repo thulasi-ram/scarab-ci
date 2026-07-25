@@ -905,6 +905,10 @@ pub enum ApiError {
     /// The request conflicts with the resource's current state (e.g. rerunning a
     /// step whose dependency has not succeeded, or retrying a non-failed step).
     Conflict(String),
+    /// The request is well-formed but the capability does not exist here — e.g. a
+    /// forge adapter that cannot enumerate its repos (ADR-0060). Distinct from
+    /// `NotFound` (wrong resource) and `BadRequest` (wrong request).
+    NotImplemented(String),
     Db(DbError),
 }
 
@@ -936,6 +940,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "insufficient role").into_response(),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m).into_response(),
+            ApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m).into_response(),
             ApiError::Db(e) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")).into_response()
             }
@@ -2190,8 +2195,15 @@ async fn administrable_orgs(
 /// host carries an `/api/v3` suffix). Forgejo's `base_url` is already the web
 /// host (its API lives under `/api/v1`).
 fn web_repo_url(kind: scarab_forge::ForgeKind, base_url: &str, owner: &str, name: &str) -> String {
+    format!("{}/{owner}/{name}", forge_web_host(kind, base_url))
+}
+
+/// The forge's **web** host derived from a connection's API `base_url` — what a
+/// deep link out of the UI is built on (a repo page, or a GitHub App's
+/// installation settings).
+fn forge_web_host(kind: scarab_forge::ForgeKind, base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    let host = match kind {
+    match kind {
         scarab_forge::ForgeKind::GitHub => {
             if base.contains("api.github.com") {
                 "https://github.com".to_string()
@@ -2200,8 +2212,7 @@ fn web_repo_url(kind: scarab_forge::ForgeKind, base_url: &str, owner: &str, name
             }
         }
         scarab_forge::ForgeKind::Forgejo => base.to_string(),
-    };
-    format!("{host}/{owner}/{name}")
+    }
 }
 
 /// List the registered projects (ADR-0046 registry — what the dashboard's
@@ -5606,11 +5617,235 @@ fn coverage_column(environment: &Option<String>) -> scarab_project::CoverageColu
     environment.as_deref().filter(|e| !e.is_empty())
 }
 
+/// One registered forge connection, as global Settings renders it (ADR-0060).
+///
+/// Carries the credential's **handle and whether it resolves** — never the
+/// material. A connection is the unit an operator reasons about ("is my GitHub
+/// App still wired up?"), so the DTO answers that without becoming a way to read
+/// a secret back.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConnectionDto {
+    pub id: String,
+    /// `github` | `forgejo`.
+    pub kind: String,
+    /// The API base URL the adapter talks to (GHES / a self-hosted Forgejo).
+    pub base_url: String,
+    /// The forge's own web host, for deep links out of the UI.
+    pub web_url: String,
+    /// The `_forge`-scoped handle the credential lives under. An opaque name,
+    /// not the secret.
+    pub credential_ref: String,
+    /// Does `credential_ref` actually resolve to material right now? The single
+    /// most common breakage (a DB restored without its secrets, a reseed that
+    /// never happened) is invisible until a run fails — this surfaces it.
+    pub credential_present: bool,
+    /// Unix-ms of the most recent accepted webhook delivery from this **forge
+    /// kind**, if any. Deliveries are recorded per kind (the ADR-0046 replay
+    /// guard is keyed that way), so with two connections of one kind this is a
+    /// per-kind liveness signal, not a per-connection one.
+    pub last_delivery_at: Option<i64>,
+    /// The Projects this connection serves, from its repo bindings — a Project
+    /// *is* a binding (ADR-0046), so this is the connection's whole footprint.
+    pub projects: Vec<ConnectionProjectDto>,
+    /// Can the forge enumerate what this credential reaches? Gates the re-sync
+    /// affordance: GitHub can, so a drifted registry is healable; an adapter that
+    /// cannot should not offer a button that always errors.
+    pub supports_resync: bool,
+    /// Is this connection managed declaratively (config-owned) and therefore
+    /// read-only here? Always `false` until the IaC path lands (ADR-0060 part D);
+    /// present now so the UI can render the distinction from the start.
+    pub managed_by_config: bool,
+}
+
+/// A Project a connection serves, plus the forge coordinate it came from.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConnectionProjectDto {
+    pub org: String,
+    pub project: String,
+    pub owner: String,
+    pub name: String,
+}
+
+/// `POST /v1/connections/{id}/resync` body: what reconciliation changed.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ResyncResultDto {
+    /// Repos the forge reports that Scarab did not have bound — now bound.
+    pub bound: Vec<String>,
+    /// How many bindings the forge confirms. Reported rather than acted on:
+    /// see the handler's note on why re-sync never unbinds.
+    pub confirmed: usize,
+}
+
 /// The reserved secret-scope org under which forge-connection credentials live
 /// (ADR-0046). A `ForgeConnection` row carries only `credential_ref` — the key
 /// within this scope; the material (GitHub App PEM / Forgejo token) is fetched
 /// here at use-time and never persisted on the connection.
 pub const FORGE_CREDENTIALS_ORG: &str = "_forge";
+
+/// The registered forge connections and their health (ADR-0060 part C) — what
+/// the global Settings **Connections** section renders.
+///
+/// Read-only, and `Administer` on the Org: a connection spans every Project it
+/// serves, so seeing the fleet is an org-level act, not a per-repo one. No
+/// credential material is ever returned — only whether the handle resolves.
+#[utoipa::path(
+    get,
+    path = "/v1/connections",
+    summary = "Registered forge connections + their bound Projects and health (ADR-0060)",
+    responses(
+        (status = 200, body = [ConnectionDto]),
+        (status = 403, description = "requires Administer on the org"),
+        (status = 404, description = "no connection registry wired")
+    )
+)]
+async fn list_connections(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ConnectionDto>>, ApiError> {
+    let principal = authenticate(&st, &headers, Action::Administer).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    // Org-level surface with no org in the path: the caller must administer at
+    // least one org (the single implicit Org, ADR-0060) — the same gate that
+    // decides whether Settings renders at all.
+    if !principal.can(Action::Administer) && administrable_orgs(&st, &principal).await?.is_empty() {
+        return Err(ApiError::Forbidden);
+    }
+
+    let conns = connections
+        .list_connections()
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let mut out = Vec::with_capacity(conns.len());
+    for conn in conns {
+        let mut projects = Vec::new();
+        for repo in connections
+            .repos_of(&conn.id)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        {
+            if let Some(resolved) = connections
+                .resolve(&repo)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?
+            {
+                projects.push(ConnectionProjectDto {
+                    org: resolved.org,
+                    project: resolved.project,
+                    owner: repo.owner,
+                    name: repo.name,
+                });
+            }
+        }
+        projects.sort_by(|a, b| (&a.org, &a.project).cmp(&(&b.org, &b.project)));
+        // Presence, not the value. A missing provider means we cannot tell, which
+        // reads the same as absent here — either way the adapter cannot authenticate.
+        let credential_present = match st.secrets.as_ref() {
+            Some(secrets) => connection_credential(secrets.as_ref(), &conn).await.is_ok(),
+            None => false,
+        };
+        let last_delivery_at = connections
+            .last_delivery_at(conn.kind)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        // Which adapters implement `list_accessible_repos`. Decided from the kind
+        // rather than probed: probing means a live forge round-trip per connection
+        // on every render of the Settings page. This only decides whether a button
+        // is offered — `POST …/resync` is the authority and answers 501 if an
+        // adapter really cannot.
+        let supports_resync = st.forge.is_some()
+            && matches!(conn.kind, scarab_forge::ForgeKind::GitHub);
+        out.push(ConnectionDto {
+            web_url: forge_web_host(conn.kind, &conn.base_url),
+            id: conn.id,
+            kind: conn.kind.as_str().to_string(),
+            base_url: conn.base_url,
+            credential_ref: conn.credential_ref,
+            credential_present,
+            last_delivery_at,
+            projects,
+            supports_resync,
+            managed_by_config: false,
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(Json(out))
+}
+
+/// Re-sync a connection against the forge (ADR-0060 part C): ask the forge which
+/// repos this credential reaches and bind any Scarab does not have yet.
+///
+/// This is the **healing** path for GitHub, where installing the App *is*
+/// registration and the registry is therefore only as current as the last
+/// `installation_repositories` delivery. A dropped delivery leaves a repo the App
+/// covers with no Project; re-sync notices.
+///
+/// It deliberately **only binds**. Unbinding on a forge's say-so would let one
+/// failed API page delete governance — Environments, secrets and RBAC hang off a
+/// Project — so removal stays an explicit human act. `confirmed` reports the
+/// overlap so a stale binding is still visible.
+#[utoipa::path(
+    post,
+    path = "/v1/connections/{id}/resync",
+    summary = "Re-bind repos the forge reports for this connection (ADR-0060)",
+    params(("id" = String, Path, description = "connection id")),
+    responses(
+        (status = 200, body = ResyncResultDto),
+        (status = 404, description = "no such connection, or no registry/forge wired"),
+        (status = 501, description = "this forge adapter cannot enumerate repos")
+    )
+)]
+async fn resync_connection(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<ResyncResultDto>, ApiError> {
+    let principal = authenticate(&st, &headers, Action::Administer).await?;
+    if !principal.can(Action::Administer) && administrable_orgs(&st, &principal).await?.is_empty() {
+        return Err(ApiError::Forbidden);
+    }
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let forge = st.forge.as_ref().ok_or(ApiError::NotFound)?;
+    let conn = connections
+        .get_connection(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+
+    let reported = match forge.list_accessible_repos().await {
+        Ok(repos) => repos,
+        Err(scarab_forge::ForgeError::Unsupported(what)) => {
+            return Err(ApiError::NotImplemented(format!(
+                "{} cannot enumerate repos ({what})",
+                conn.kind.as_str()
+            )))
+        }
+        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+    };
+    let known: std::collections::BTreeSet<scarab_forge::RepoRef> = connections
+        .repos_of(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .into_iter()
+        .collect();
+
+    let mut bound = Vec::new();
+    let mut confirmed = 0usize;
+    for repo in reported {
+        if known.contains(&repo) {
+            confirmed += 1;
+            continue;
+        }
+        // Project name = repo name, org = repo owner — the same 1:1 mapping
+        // `apply_installation_sync` uses, so a re-synced Project is
+        // indistinguishable from a webhook-registered one.
+        connections
+            .bind_repo(&id, &repo, &repo.owner, &repo.name)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        bound.push(format!("{}/{}", repo.owner, repo.name));
+    }
+    Ok(Json(ResyncResultDto { bound, confirmed }))
+}
 
 /// Resolve a [`scarab_forge::ForgeConnection`]'s credential material at
 /// use-time (ADR-0046): the bytes an adapter authenticates with, fetched from
@@ -5818,6 +6053,11 @@ const TAG_GROUPS: &[(&str, &str)] = &[
          verifies its own signature.",
     ),
     (
+        "Forge Connections",
+        "The ForgeConnections Scarab authenticates to a forge with, and the \
+         reconciliation that refreshes what they can see (ADR-0046).",
+    ),
+    (
         "Auth & Identity",
         "Login/session, the current principal, OIDC discovery and JWKS, and \
          RBAC role bindings.",
@@ -5837,6 +6077,8 @@ const TAG_GROUPS: &[(&str, &str)] = &[
 fn tag_for_path(path: &str) -> Option<&'static str> {
     let group = if path.starts_with("/webhooks/") {
         "Webhooks"
+    } else if path.starts_with("/v1/connections") {
+        "Forge Connections"
     } else if path.starts_with("/.well-known/")
         || path.starts_with("/v1/auth/")
         || path == "/v1/me"
@@ -5940,6 +6182,8 @@ impl utoipa::Modify for TagGroups {
         secret_matrix,
         silence_secret_cell,
         unsilence_secret_cell,
+        list_connections,
+        resync_connection,
         ingest_step_results,
         create_run,
         dispatch,
@@ -6001,6 +6245,9 @@ impl utoipa::Modify for TagGroups {
         SecretMatrix,
         SecretMatrixRow,
         SilenceCellRequest,
+        ConnectionDto,
+        ConnectionProjectDto,
+        ResyncResultDto,
         MeResponse
     ))
 )]
@@ -6101,6 +6348,8 @@ fn router_inner(state: AppState) -> Router {
             "/v1/repos/{org}/{repo}/environments/{name}/deployments",
             get(list_deployments),
         )
+        .route("/v1/connections", get(list_connections))
+        .route("/v1/connections/{id}/resync", post(resync_connection))
         .route("/v1/repos/{org}/{repo}/secrets/matrix", get(secret_matrix))
         .route(
             "/v1/repos/{org}/{repo}/secrets/matrix/silenced",

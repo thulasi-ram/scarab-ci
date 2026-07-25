@@ -1979,6 +1979,15 @@ impl ForgeConnectionStore for PostgresDb {
         .map_err(reg_err)?;
         Ok(result.rows_affected() == 1)
     }
+
+    async fn last_delivery_at(&self, forge: ForgeKind) -> Result<Option<i64>, RegistryError> {
+        let row = sqlx::query("SELECT max(at) AS at FROM webhook_deliveries WHERE forge = $1")
+            .bind(forge.as_str())
+            .fetch_one(self.pool())
+            .await
+            .map_err(reg_err)?;
+        Ok(row.get::<Option<i64>, _>("at"))
+    }
 }
 
 fn connection_from_row(r: sqlx::postgres::PgRow) -> Result<ForgeConnection, RegistryError> {

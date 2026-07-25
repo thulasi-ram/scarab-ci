@@ -656,6 +656,35 @@ export async function deleteSecret(scope: SecretScope, name: string): Promise<vo
   }
 }
 
+// --- Forge connections (ADR-0060 part C). Read-only + a re-sync heal action.
+// Credential material is never in these payloads — only whether it resolves. ---
+
+export type Connection = components["schemas"]["ConnectionDto"];
+export type ResyncResult = components["schemas"]["ResyncResultDto"];
+
+/** The registered forge connections with their bound Projects and health. */
+export async function listConnections(): Promise<Connection[]> {
+  const { data, error } = await api.GET("/v1/connections");
+  if (error || !data) throw new Error("failed to load connections");
+  return data;
+}
+
+/**
+ * Ask the forge which repos this connection reaches and bind any that are
+ * missing (`POST /v1/connections/{id}/resync`). Heals a registry left stale by a
+ * dropped installation webhook. Never unbinds.
+ */
+export async function resyncConnection(id: string): Promise<ResyncResult> {
+  const { data, error, response } = await api.POST("/v1/connections/{id}/resync", {
+    params: { path: { id } },
+  });
+  if (response.status === 501) {
+    throw new Error("this forge can't list its repositories, so there's nothing to re-sync");
+  }
+  if (error || !data) throw new Error("re-sync failed");
+  return data;
+}
+
 // --- Secret coverage matrix (ADR-0037) — and, since ADR-0060, the read model
 // behind the repo/environment secret EDITOR. Each key's *effective* status per
 // column after inheritance; never a value. Not in the generated OpenAPI client
