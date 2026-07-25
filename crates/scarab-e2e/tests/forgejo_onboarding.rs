@@ -52,6 +52,88 @@ async fn json_ok(resp: reqwest::Response, what: &str) -> serde_json::Value {
     serde_json::from_str(&body).unwrap_or_else(|e| panic!("{what}: bad JSON ({e}): {body}"))
 }
 
+/// The ids currently listed under a Project. Used to snapshot what a previous
+/// run of the tier left behind — Runs are durable and outlive the connection.
+async fn run_ids(
+    client: &reqwest::Client,
+    base: &str,
+    org: &str,
+    project: &str,
+) -> std::collections::BTreeSet<String> {
+    let listed = json_ok(
+        client
+            .get(format!("{base}/v1/repos/{org}/{project}/runs"))
+            .send()
+            .await
+            .expect("GET project runs"),
+        "project runs",
+    )
+    .await;
+    listed["runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Delete any connection already serving `forgejo`, so this scenario can create
+/// its own. **Not cleanup after a bug — a property of the tier.**
+///
+/// `just forgejo-verify` destroys the Forgejo and its volume on every run, but the
+/// Scarab Postgres it borrows from the proc stack OUTLIVES it. So the second run
+/// meets a connection row from the first, and `POST /v1/connections` correctly
+/// answers 409: ADR-0060 part D allows one connection per base URL.
+///
+/// Reclaim by **delete-then-create**, never by reusing the row. The proc stack
+/// runs with no `SCARAB_MASTER_KEY`, so its KEK is ephemeral per boot: a surviving
+/// connection's write-through credential cannot be decrypted after a restart
+/// (visible as `startup: DEGRADED — forge connection credential unavailable`).
+/// Reusing it would authenticate every forge call with a dead secret.
+///
+/// `unbind_repos=true` is required, not optional: the previous run left the repo
+/// BOUND, and the delete handler refuses a connection that still serves Projects
+/// unless the caller acknowledges they go with it.
+async fn reclaim_connections_for(client: &reqwest::Client, base: &str, forgejo: &str) {
+    let existing = json_ok(
+        client
+            .get(format!("{base}/v1/connections"))
+            .send()
+            .await
+            .expect("GET /v1/connections"),
+        "list connections",
+    )
+    .await;
+    let want = forgejo.trim_end_matches('/');
+    for conn in existing.as_array().into_iter().flatten() {
+        let (Some(id), Some(url)) = (conn["id"].as_str(), conn["base_url"].as_str()) else {
+            continue;
+        };
+        if url.trim_end_matches('/') != want {
+            continue;
+        }
+        // A config-owned connection is read-only and answers 409 here; that is a
+        // misconfigured tier, not a leftover, so say so rather than looping.
+        assert_eq!(
+            conn["managed_by_config"], false,
+            "connection `{id}` for {want} is declared in config and cannot be \
+             reclaimed — unset it from SCARAB_CONNECTIONS before running the tier"
+        );
+        eprintln!("reclaiming connection `{id}` left by an earlier run of the tier");
+        let resp = client
+            .delete(format!("{base}/v1/connections/{id}?unbind_repos=true"))
+            .send()
+            .await
+            .expect("DELETE /v1/connections/{id}");
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        assert!(
+            status.is_success(),
+            "could not reclaim connection `{id}` ({status}): {body}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
     require_e2e!();
@@ -68,6 +150,9 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(57);
+
+    // --- 0. the tier is re-runnable: the Postgres outlives the Forgejo -------
+    reclaim_connections_for(&http, &base, &forgejo).await;
 
     // --- 1. add the connection (the admin's form) ----------------------------
     let created = json_ok(
@@ -163,6 +248,12 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
         "exactly one Scarab hook on the repo: {hooks:#}"
     );
 
+    // Runs are durable and survive the connection delete in `reclaim_…`, so an
+    // earlier run of the tier can leave one under this same Project. Snapshot
+    // them: the assertion below must be satisfied by a NEW run, or a delivery
+    // that never arrived (the 401 failure mode) would read as a pass.
+    let before: std::collections::BTreeSet<String> = run_ids(&http, &base, &org, &project).await;
+
     // --- 4. a REAL push ------------------------------------------------------
     // Committing through the contents API produces a genuine commit on `main`,
     // and so a genuine signed delivery — no clone, no SSH key in the test.
@@ -188,7 +279,7 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
     let body = resp.text().await.unwrap_or_default();
     assert!(status.is_success(), "the push failed ({status}): {body}");
 
-    // --- 5. …becomes a Run on the Project the bind created -------------------
+    // --- 5. …becomes a NEW Run on the Project the bind created ---------------
     let deadline = Instant::now() + Duration::from_secs(120);
     let run = loop {
         let listed: serde_json::Value = json_ok(
@@ -199,14 +290,21 @@ async fn a_real_forgejo_repo_onboards_and_its_push_becomes_a_run() {
             "project runs",
         )
         .await;
-        if let Some(first) = listed["runs"].as_array().and_then(|r| r.first()) {
-            break first.clone();
+        let fresh = listed["runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["id"].as_str().is_some_and(|id| !before.contains(id)));
+        if let Some(run) = fresh {
+            break run.clone();
         }
         assert!(
             Instant::now() < deadline,
-            "no Run appeared for {org}/{project} after a real push. A delivery that \
-             was rejected shows up as a 401 in deploy/local-proc/server.log — that is \
-             the `config.secret` failure mode this tier exists to catch."
+            "no NEW Run appeared for {org}/{project} after a real push ({} pre-existing). \
+             A delivery that was rejected shows up as a 401 in \
+             deploy/local-proc/server.log — that is the `config.secret` failure mode \
+             this tier exists to catch.",
+            before.len()
         );
         tokio::time::sleep(Duration::from_secs(2)).await;
     };

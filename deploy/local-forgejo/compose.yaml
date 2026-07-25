@@ -21,7 +21,11 @@ services:
       # No install wizard: boot straight into a usable instance.
       FORGEJO__security__INSTALL_LOCK: "true"
       FORGEJO__database__DB_TYPE: sqlite3
-      FORGEJO__database__PATH: /data/forgejo/forgejo.db
+      # MUST live under /data/gitea: that is the only subtree the image
+      # entrypoint creates and chowns to USER_UID. A path beside it (e.g.
+      # /data/forgejo) is unwritable, and the server dies in a DB-init retry
+      # loop without ever binding the API — which looks like a slow boot.
+      FORGEJO__database__PATH: /data/gitea/forgejo.db
       FORGEJO__server__HTTP_PORT: "3000"
       # Must match the published port: Forgejo builds clone URLs and webhook
       # payload links from ROOT_URL.

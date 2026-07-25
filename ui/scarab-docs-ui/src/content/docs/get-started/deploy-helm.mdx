@@ -71,11 +71,8 @@ and has no error anywhere:
   succeeds, so the only visible effect is a pull request that never shows a Scarab status. Add
   **Checks: read & write** only if you use checks; **Contents: read** is what a `clone` step needs.
 
-You do not have to verify these by eye: **Settings → Connections** runs a preflight against the
-App and names whatever is missing (`GET /v1/connections/{id}/preflight`), so a misconfigured App
-reads as *unhealthy* rather than as silence. Note that a permission change is not live until an
-installation owner **approves the new access** (GitHub emails them) — until they do, the preflight
-keeps reporting the gap.
+Verify both on the App's own *Permissions & events* page, and note that a permission change is not
+live until an installation owner **approves the new access** (GitHub emails them).
 :::
 
 ## Key values

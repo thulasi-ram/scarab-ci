@@ -25,14 +25,12 @@ import { createResource, createSignal, For, Show } from "solid-js";
 import {
   availableRepos,
   bindRepo,
-  connectionPreflight,
   createConnection,
   deleteConnection,
   listConnections,
   registerRepoWebhook,
   resyncConnection,
   unbindRepo,
-  type CapabilityRequirement,
   type Connection,
 } from "../api/client";
 import { relTime } from "../fmt";
@@ -335,10 +333,6 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
         </span>
       </div>
 
-      <Show when={c().supports_preflight}>
-        <AppPreflight conn={c()} />
-      </Show>
-
       <div class="conn-projects">
         <Show
           when={c().projects.length > 0}
@@ -403,112 +397,6 @@ function ConnectionRow(props: { conn: Connection; onChanged: () => void }) {
           }}
         />
       </Show>
-    </li>
-  );
-}
-
-/**
- * App preflight (git-bug 90644c6) — the credential health line, one level
- * deeper: not "does the credential resolve" but "is the app it belongs to
- * *allowed* to do what Scarab will ask of it".
- *
- * It sits here, next to the credential line, because both failures it catches
- * are otherwise **invisible**. An App subscribed to no events still delivers
- * `installation`/`installation_repositories`, so the connection registers
- * itself, the projects list fills in, and nothing ever builds. An App without
- * `statuses:write` runs pipelines happily and silently never posts a check. In
- * both cases the operator's only signal today is an absence.
- *
- * One live forge round-trip per GitHub connection, fired on render: the whole
- * point is that a misconfigured App shows as unhealthy *without* being asked, so
- * a button behind which the truth hides would defeat it. The row renders
- * immediately and this line fills in.
- *
- * Three states, never two — `unknown` (an adapter that cannot introspect, a
- * credential that does not resolve, a forge that errored) must not render as
- * "you are fine". When we could not look, the requirement list is shown instead,
- * so the answer is still actionable.
- */
-function AppPreflight(props: { conn: Connection }) {
-  const [report] = createResource(() => props.conn.id, connectionPreflight);
-  const required = () => report()?.missing.filter((g) => g.severity === "required") ?? [];
-  const recommended = () => report()?.missing.filter((g) => g.severity === "recommended") ?? [];
-
-  return (
-    <div class="conn-preflight">
-      <Show when={report.loading}>
-        <span class="subtle">
-          <small>checking the app's permissions and event subscription…</small>
-        </span>
-      </Show>
-      <Show when={report.error}>
-        <span class="subtle">
-          <small>could not check the app's configuration.</small>
-        </span>
-      </Show>
-      <Show when={report()}>
-        {(r) => (
-          <>
-            <Show when={r().status === "ok"}>
-              <span class="conn-ok">
-                <Icon icon="shield-check" size={12} /> app configuration matches what Scarab needs
-              </span>
-            </Show>
-            <Show when={r().status === "unknown"}>
-              <span class="subtle">
-                <Icon icon="circle-dot" size={12} /> app configuration not checked —{" "}
-                {r().unavailable_reason ?? "the forge could not be asked"}
-              </span>
-            </Show>
-            <Show when={r().status === "degraded"}>
-              <span class="conn-bad">
-                <Icon icon="alert-triangle" size={12} />{" "}
-                {required().length > 0
-                  ? `app is missing ${required().length} setting${required().length === 1 ? "" : "s"} Scarab needs`
-                  : "app configuration is incomplete"}
-              </span>
-            </Show>
-            {/* The gap list is the actionable half: what to change, and what is
-                silently broken until it is. Recommended gaps are listed on a
-                degraded connection too — an operator fixing one setting on
-                GitHub should fix them all in the same visit — but never on
-                their own, or the line cries wolf. */}
-            <Show when={r().status === "degraded"}>
-              <ul class="preflight-gaps">
-                <For each={[...required(), ...recommended()]}>
-                  {(gap) => <PreflightGap gap={gap} />}
-                </For>
-              </ul>
-            </Show>
-            {/* Nothing could be checked: say what Scarab needs, so the answer is
-                still worth having. */}
-            <Show when={r().status === "unknown" && r().required.length > 0}>
-              <ul class="preflight-gaps">
-                <For each={r().required.filter((g) => g.severity === "required")}>
-                  {(gap) => <PreflightGap gap={gap} muted />}
-                </For>
-              </ul>
-            </Show>
-          </>
-        )}
-      </Show>
-    </div>
-  );
-}
-
-/** One capability: what to turn on, and what stays broken until it is. */
-function PreflightGap(props: { gap: CapabilityRequirement; muted?: boolean }) {
-  const label = () =>
-    props.gap.kind === "event"
-      ? `${props.gap.name} event`
-      : `${props.gap.name}: ${props.gap.level ?? "read"}`;
-  return (
-    <li classList={{ "preflight-gap": true, "preflight-gap-muted": props.muted }}>
-      <span classList={{ "preflight-sev": true, req: props.gap.severity === "required" }}>
-        {props.gap.severity}
-      </span>
-      <code class="mono">{label()}</code>
-      <span class="subtle">{props.gap.why}</span>
     </li>
   );
 }
