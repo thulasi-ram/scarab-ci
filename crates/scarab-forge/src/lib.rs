@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// concept named "Repo". Resolved to a governed `Project` via a
 /// `ForgeConnection`. The forge it lives on is bound by the connection
 /// (registry ticket), not carried here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RepoRef {
     pub owner: String,
     pub name: String,
@@ -535,6 +535,12 @@ pub enum ForgeError {
     UnsupportedEvent(String),
     #[error("malformed webhook payload: {0}")]
     Malformed(String),
+    /// This adapter cannot offer the capability at all — distinct from
+    /// [`Api`](ForgeError::Api), which is a call that *could* have worked. A
+    /// caller can degrade gracefully on this (hide an action) instead of
+    /// reporting a forge outage.
+    #[error("unsupported by this forge adapter: {0}")]
+    Unsupported(String),
 }
 
 /// Outbound port to a code forge, expressed as **forge-agnostic capabilities**
@@ -577,6 +583,23 @@ pub trait ForgePort: Send + Sync {
     ) -> Result<Vec<ForgeRef>, ForgeError>;
 
     async fn register_webhook(&self, repo: &RepoRef, callback_url: &str) -> Result<(), ForgeError>;
+
+    /// Every repo this connection's credential can reach, as the forge reports
+    /// it *now* (ADR-0060).
+    ///
+    /// The forge, not Scarab, is the authority on what a connection covers —
+    /// which makes this the healing path for a registry that drifted: a repo
+    /// added while a webhook delivery was missed shows up here. It is also how a
+    /// forge without installation-style auto-registration offers a pick-list
+    /// instead of asking an admin to type `owner/name`.
+    ///
+    /// Defaults to [`Unsupported`](ForgeError::Unsupported) rather than an empty
+    /// list: "this adapter cannot enumerate" and "this credential reaches
+    /// nothing" are different answers, and silently conflating them would make a
+    /// re-sync look like it succeeded at unbinding everything.
+    async fn list_accessible_repos(&self) -> Result<Vec<RepoRef>, ForgeError> {
+        Err(ForgeError::Unsupported("listing accessible repos".into()))
+    }
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError>;
 
@@ -734,6 +757,16 @@ pub trait ForgeConnectionStore: Send + Sync {
         forge: ForgeKind,
         delivery_id: &str,
     ) -> Result<bool, RegistryError>;
+
+    /// Unix-ms of the most recent delivery recorded for `forge`, if any — a
+    /// liveness signal for the Settings connection health readout (ADR-0060).
+    ///
+    /// Defaults to `None` = *unknown*, which is what a store that keeps no
+    /// delivery history can honestly say. `None` therefore never means "the
+    /// webhook is broken"; the UI must render it as unknown, not as a fault.
+    async fn last_delivery_at(&self, _forge: ForgeKind) -> Result<Option<i64>, RegistryError> {
+        Ok(None)
+    }
 }
 
 /// The shared **`ForgePort` contract-test suite** (ADR-0046): the behavioural
