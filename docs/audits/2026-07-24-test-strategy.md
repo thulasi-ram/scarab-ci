@@ -163,7 +163,14 @@ The product is k8s-only; this is where confidence is missing.
   + `docker/**` — UI/docs-only PRs never pay it. **Advisory for its first
   ~2 weeks, promoted to a required check once demonstrably non-flaky** (the
   nextest+PG job, by contrast, is required from day one — no cluster, no
-  flake excuse). Cases,
+  flake excuse).
+  > **Promoted 2026-07-25** — see "Required checks" below. Nine runs, one
+  > failure, and the failure was the harness, not the cluster: the wait loops
+  > `.expect()`ed a poll the executor is *designed* to fail transiently
+  > (`workspace: broken pipe` → `DriveErr::Transient`, which the scheduler
+  > simply re-polls). `poll_to_terminal` now rides transients out with a
+  > bounded consecutive-error budget. Zero product flake was ever observed.
+  Cases,
   extending what's there: launch→succeed, exit-code mapping, cancel kills
   Pod, image-pull failure fails fast (terminal waiting reason), log stream →
   LogService with dedup, sidecar result capture through the fence, clone step
@@ -282,6 +289,31 @@ Two layers, both new (there is nothing today):
 4. **Escape ratio** — every git-bug fix must reference a regression test
    (grow-from-bugs, already the philosophy; the orchestrator enforces it).
 5. **Flake rate** — nextest retry stats surfaced in the job summary.
+
+## Required checks (added 2026-07-25)
+
+This doc kept saying "required check" as if it were a setting to flip. It
+isn't, here: **branch protection and rulesets are both 403 on this repo** —
+private on a free plan ("Upgrade to GitHub Pro or make this repository public
+to enable this feature"). There is no server-side gate to configure, so until
+the repo goes public or the plan changes, *nothing* GitHub-side stops a merge
+over red checks. That is not hypothetical: PR #72 merged with `openapi-drift`
+red, and main shipped a spec missing `StepDto.inputs` until it was noticed.
+
+The substitute is deliberately boring and lives in the repo:
+
+- **`.github/required-checks.txt`** — the required set as data, one
+  `<tier> <workflow>/<job>` line each. Tiers: `required`,
+  `required-if-run` (path-filtered jobs, whose clean absence is correct — the
+  same case that makes path-filtered required checks hang a real ruleset), and
+  `advisory` (probation; reported, never blocks).
+- **`just pr-gate <n>`** (`scripts/pr_gate.py`) — reads that file, asks
+  `gh pr checks`, exits non-zero unless every required check passed (8 while
+  pending). Run it before merging; it also lists any check the file doesn't
+  mention, so a newly added job can't stay silently ungated.
+
+When protection does become available, the `required*` lines are the list to
+paste in — no re-derivation, and the file stays the human-readable record.
 
 ## Test-case orchestrator & enforcement
 

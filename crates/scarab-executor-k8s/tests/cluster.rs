@@ -29,6 +29,74 @@ async fn drain_to_end(mut chunks: Box<dyn scarab_engine::LogChunks>) -> Vec<u8> 
     out
 }
 
+/// How many *consecutive* failed polls this harness will ride out before it
+/// calls the error permanent. One blip is a retryable fault; a wall of them is
+/// a broken executor and must still fail the test.
+const MAX_TRANSIENT_POLL_ERRS: u32 = 10;
+
+/// Poll `h` to a terminal state, tolerating transient poll errors **the way the
+/// scheduler does**.
+///
+/// `K8sExecutor::poll` legitimately returns `Err` mid-flight: it drives the
+/// workspace legs (ADR-0029/0045) as a side effect, and those can hit a
+/// retryable apiserver/exec-stream fault — `workspace: broken pipe` was
+/// observed 1-in-9 on the CI kind tier. The engine classifies that as
+/// `DriveErr::Transient`, yields no verdict, and re-polls next tick; a test
+/// that `.expect()`s the poll instead converts a retryable blip into a red
+/// build. That mismatch was this tier's only observed flake, and the reason it
+/// could not be promoted off advisory probation (git-bug a0b42ad).
+///
+/// Returns `None` if `ticks` seconds elapse with no terminal state.
+async fn poll_to_terminal(exec: &K8sExecutor, h: &ExecHandle, ticks: u32) -> Option<ExecState> {
+    let mut consecutive = 0;
+    for _ in 0..ticks {
+        match exec.poll(h).await {
+            Ok(s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost)) => {
+                return Some(s)
+            }
+            Ok(_) => consecutive = 0,
+            Err(e) => {
+                consecutive += 1;
+                assert!(
+                    consecutive <= MAX_TRANSIENT_POLL_ERRS,
+                    "poll failed {consecutive}x consecutively — not a transient fault: {e}"
+                );
+                eprintln!("poll: riding out transient error #{consecutive}: {e}");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    None
+}
+
+/// Wait for `h` to reach `Running` with the same transient tolerance as
+/// [`poll_to_terminal`], and return the last state observed — so the caller
+/// asserts on one reading instead of re-polling (which could catch a *later*
+/// state and fail for the wrong reason).
+async fn poll_until_running(exec: &K8sExecutor, h: &ExecHandle, ticks: u32) -> ExecState {
+    let mut consecutive = 0;
+    let mut last = ExecState::Pending;
+    for _ in 0..ticks {
+        match exec.poll(h).await {
+            Ok(ExecState::Running) => return ExecState::Running,
+            Ok(s) => {
+                consecutive = 0;
+                last = s;
+            }
+            Err(e) => {
+                consecutive += 1;
+                assert!(
+                    consecutive <= MAX_TRANSIENT_POLL_ERRS,
+                    "poll failed {consecutive}x consecutively — not a transient fault: {e}"
+                );
+                eprintln!("poll: riding out transient error #{consecutive}: {e}");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    last
+}
+
 fn opted_in() -> Option<String> {
     if std::env::var("SCARAB_TEST_KUBE").is_err() {
         eprintln!("skipping: set SCARAB_TEST_KUBE=1 to run against a dev cluster");
@@ -124,16 +192,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
     assert_eq!(h1, ExecHandle(pod_name(&step)));
 
     // Poll to a terminal state.
-    let mut terminal = None;
-    for _ in 0..60 {
-        match exec.poll(&h1).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &h1, 60).await;
     assert_eq!(terminal, Some(ExecState::Succeeded), "busybox echo exits 0");
 
     exec.cancel(&h1).await.expect("cancel cleans up the pod");
@@ -190,16 +249,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
     let h = exec.launch(&step, &spec).await.expect("launch");
 
     // The kubelet enforces the deadline; DeadlineExceeded classifies Timeout.
-    let mut terminal = None;
-    for _ in 0..90 {
-        match exec.poll(&h).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &h, 90).await;
     match terminal {
         Some(ExecState::Failed { class, .. }) => assert_eq!(
             class,
@@ -329,15 +379,9 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         matrix_values: Default::default(),
     };
     async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
-        for _ in 0..90 {
-            match exec.poll(h).await.expect("poll") {
-                s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                    return s;
-                }
-                _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-            }
-        }
-        panic!("pod did not settle");
+        poll_to_terminal(exec, h, 90)
+            .await
+            .expect("pod did not settle")
     }
 
     // --- Step A: produce a file in /workspace. ---
@@ -465,16 +509,7 @@ async fn clone_step_produces_a_source_workspace() {
     };
 
     let h = exec.launch(&step, &spec).await.expect("launch clone");
-    let mut terminal = None;
-    for _ in 0..120 {
-        match exec.poll(&h).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &h, 120).await;
     assert_eq!(terminal, Some(ExecState::Succeeded), "clone step succeeds");
 
     // The workspace snapshot is the run's source tree — WITH .git (ADR-0045).
@@ -561,16 +596,7 @@ async fn clone_step_produces_a_source_workspace() {
         .launch(&build, &build_spec)
         .await
         .expect("launch downstream");
-    let mut terminal = None;
-    for _ in 0..120 {
-        match exec.poll(&bh).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &bh, 120).await;
     assert_eq!(
         terminal,
         Some(ExecState::Succeeded),
@@ -648,16 +674,7 @@ async fn clone_depth_full_exposes_history() {
         matrix_values: Default::default(),
     };
     let h = exec.launch(&step, &spec).await.expect("launch full clone");
-    let mut terminal = None;
-    for _ in 0..180 {
-        match exec.poll(&h).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &h, 180).await;
     assert_eq!(terminal, Some(ExecState::Succeeded), "full clone succeeds");
     let root = exec
         .output(&h)
@@ -710,16 +727,7 @@ async fn clone_depth_full_exposes_history() {
         .launch(&count, &count_spec)
         .await
         .expect("launch history check");
-    let mut terminal = None;
-    for _ in 0..120 {
-        match exec.poll(&ch).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &ch, 120).await;
     assert_eq!(
         terminal,
         Some(ExecState::Succeeded),
@@ -803,16 +811,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         .launch(&step, &spec)
         .await
         .expect("launch doomed clone");
-    let mut terminal = None;
-    for _ in 0..120 {
-        match exec.poll(&h).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &h, 120).await;
     match terminal {
         Some(ExecState::Failed { exit_code, .. }) => {
             assert_eq!(exit_code, Some(86), "SourceUnavailable is exit 86");
@@ -911,16 +910,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         matrix_values: Default::default(),
     };
     let h = exec.launch(&step, &spec).await.expect("launch build");
-    let mut terminal = None;
-    for _ in 0..300 {
-        match exec.poll(&h).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &h, 300).await;
     assert_eq!(terminal, Some(ExecState::Succeeded), "build step succeeds");
 
     // The push is observable: a verification step reads the registry's tag
@@ -971,16 +961,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         .launch(&verify, &verify_spec)
         .await
         .expect("launch verify");
-    let mut terminal = None;
-    for _ in 0..120 {
-        match exec.poll(&vh).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &vh, 120).await;
     assert_eq!(
         terminal,
         Some(ExecState::Succeeded),
@@ -1089,16 +1070,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         matrix_values: Default::default(),
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
-    let mut terminal = None;
-    for _ in 0..120 {
-        match exec.poll(&h).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &h, 120).await;
     assert_eq!(terminal, Some(ExecState::Succeeded), "step succeeds");
 
     // The kubelet SIGTERMs the sidecar after the step exits; the drain POST
@@ -1170,14 +1142,8 @@ async fn cancel_tears_down_a_running_pod() {
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
     // Wait until it is actually Running (the interesting teardown case).
-    for _ in 0..90 {
-        if exec.poll(&h).await.expect("poll") == ExecState::Running {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
     assert_eq!(
-        exec.poll(&h).await.unwrap(),
+        poll_until_running(&exec, &h, 90).await,
         ExecState::Running,
         "step reached Running"
     );
@@ -1260,16 +1226,7 @@ async fn artifacts_are_harvested_post_step() {
         matrix_values: Default::default(),
     };
     let h = exec.launch(&step, &spec).await.expect("launch");
-    let mut terminal = None;
-    for _ in 0..120 {
-        match exec.poll(&h).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &h, 120).await;
     assert_eq!(terminal, Some(ExecState::Succeeded), "step succeeds");
 
     // The glob-selected artifact was harvested; the .tmp was not.
@@ -1405,16 +1362,7 @@ async fn image_pull_failure_fails_the_attempt_fast() {
 
     let started = std::time::Instant::now();
     let h = exec.launch(&step, &spec).await.expect("launch doomed step");
-    let mut terminal = None;
-    for _ in 0..120 {
-        match exec.poll(&h).await.expect("poll") {
-            s @ (ExecState::Succeeded | ExecState::Failed { .. } | ExecState::Lost) => {
-                terminal = Some(s);
-                break;
-            }
-            _ => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-        }
-    }
+    let terminal = poll_to_terminal(&exec, &h, 120).await;
     match terminal {
         Some(ExecState::Failed { exit_code, class }) => {
             assert_eq!(exit_code, None, "the step process never ran");
@@ -1482,14 +1430,8 @@ async fn rerun_supersede_tears_down_the_in_flight_descendant_pod() {
         gate_kind: None,
     };
     let h = exec.launch(&c_run, &sleeper).await.expect("launch c");
-    for _ in 0..90 {
-        if exec.poll(&h).await.expect("poll") == ExecState::Running {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
     assert_eq!(
-        exec.poll(&h).await.unwrap(),
+        poll_until_running(&exec, &h, 90).await,
         ExecState::Running,
         "descendant c is in-flight"
     );
