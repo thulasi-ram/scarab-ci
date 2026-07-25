@@ -28,6 +28,20 @@ use crate::logs::{LogError, LogService};
 /// Pod that finally starts.
 const RETRY_BACKOFF: Duration = Duration::from_secs(3);
 
+/// How long a step Pod may sit in a benign pre-start state (`PodInitializing` /
+/// `ContainerCreating`) before the quiet retry loop is itself treated as a
+/// problem. Generous, because a cold image pull on a fresh node legitimately
+/// takes minutes (c653742) and the step's own timeout is the real deadline. Past
+/// this bound, "not ready" almost always means *wedged* — an init container that
+/// never completes, a volume that never mounts — and a tail that never starts
+/// must stay visible instead of being silent forever.
+const NOT_READY_GRACE: Duration = Duration::from_secs(180);
+
+/// Once past [`NOT_READY_GRACE`], re-state a stuck tail at WARN at most this
+/// often: present in any log window an operator looks at, without going back to
+/// a line every [`RETRY_BACKOFF`].
+const STUCK_WARN_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Errors from draining a log tail. Both arms are best-effort at the call site —
 /// the tail is logged and dropped, never failing the run (ADR-0013).
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +116,18 @@ pub struct LogTailer {
     /// Earliest instant a fence whose last tail errored may be retried — a
     /// per-fence backoff so a Pod with no log yet isn't re-tailed every tick.
     retry_at: Arc<Mutex<HashMap<Fence, Instant>>>,
+    /// Fences whose tail keeps failing with a benign pre-start reason, and how
+    /// loudly we've reported it. Lets a legitimately-slow start stay quiet while
+    /// a Pod stuck in `PodInitializing` forever still surfaces (c653742).
+    not_ready: Arc<Mutex<HashMap<Fence, NotReady>>>,
+}
+
+/// Per-fence bookkeeping for a tail parked in a benign pre-start state: when the
+/// fence FIRST reported one, and when we last escalated it to WARN.
+#[derive(Clone, Copy)]
+struct NotReady {
+    since: Instant,
+    last_warn: Option<Instant>,
 }
 
 impl LogTailer {
@@ -113,6 +139,7 @@ impl LogTailer {
             active: Arc::new(Mutex::new(HashSet::new())),
             drained: Arc::new(Mutex::new(HashSet::new())),
             retry_at: Arc::new(Mutex::new(HashMap::new())),
+            not_ready: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -227,6 +254,7 @@ impl LogTailer {
         let active = self.active.clone();
         let drained = self.drained.clone();
         let retry_at = self.retry_at.clone();
+        let not_ready = self.not_ready.clone();
         let lease = self.lease.clone();
 
         tokio::spawn(async move {
@@ -278,20 +306,59 @@ impl LogTailer {
                 Ok(()) => {
                     drained.lock().unwrap().insert(fence.clone());
                     retry_at.lock().unwrap().remove(&fence);
+                    not_ready.lock().unwrap().remove(&fence);
                 }
                 // Best-effort: a lost tail never fails the run (ADR-0013). The
                 // common benign case is a step Pod that hasn't started its
                 // container yet (Pending / PodInitializing / ContainerCreating) —
                 // an expected pre-start state, not a failure. On a cold image
                 // pull that can last minutes, so log it at debug and back off
-                // quietly; only WARN on a genuine tail error. Either way, back
-                // off before retrying so we don't hammer the API each tick.
+                // quietly; only WARN on a genuine tail error, or on a pre-start
+                // state that has outlasted NOT_READY_GRACE (a tail that never
+                // starts must still be visible). Either way, back off before
+                // retrying so we don't hammer the API each tick.
                 Err(e) => {
                     let msg = e.to_string();
-                    if is_pod_not_ready(&msg) {
-                        tracing::debug!(run = %run.0, step = %step_id.0, error = %msg, "log tail: step Pod not ready yet, backing off");
-                    } else {
-                        tracing::warn!(run = %run.0, step = %step_id.0, error = %msg, "log tail ended with error");
+                    let now = Instant::now();
+                    let (class, stuck_for) = {
+                        let mut nr = not_ready.lock().unwrap();
+                        if is_pod_not_ready(&msg) {
+                            let entry = nr.entry(fence.clone()).or_insert(NotReady {
+                                since: now,
+                                last_warn: None,
+                            });
+                            let stuck_for = now.duration_since(entry.since);
+                            let class = classify_tail_error(
+                                &msg,
+                                stuck_for,
+                                entry.last_warn.map(|w| now.duration_since(w)),
+                            );
+                            if class == TailErrorClass::StuckNotReady {
+                                entry.last_warn = Some(now);
+                            }
+                            (class, stuck_for)
+                        } else {
+                            // A different (real) failure supersedes any pre-start
+                            // streak — start clean if it goes back to waiting.
+                            nr.remove(&fence);
+                            (TailErrorClass::Failed, Duration::ZERO)
+                        }
+                    };
+                    match class {
+                        TailErrorClass::Quiet => {
+                            tracing::debug!(run = %run.0, step = %step_id.0, error = %msg, "log tail: step Pod not ready yet, backing off");
+                        }
+                        TailErrorClass::StuckNotReady => {
+                            tracing::warn!(
+                                run = %run.0, step = %step_id.0,
+                                not_ready_for_s = stuck_for.as_secs(), error = %msg,
+                                "log tail: step Pod still has not started its container — \
+                                 no logs will appear; check its init containers / image pull"
+                            );
+                        }
+                        TailErrorClass::Failed => {
+                            tracing::warn!(run = %run.0, step = %step_id.0, error = %msg, "log tail ended with error");
+                        }
                     }
                     retry_at
                         .lock()
@@ -301,6 +368,44 @@ impl LogTailer {
             }
             active.lock().unwrap().remove(&fence);
         });
+    }
+}
+
+/// How loudly a log-tail error should be reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailErrorClass {
+    /// Expected and unremarkable — the container isn't up yet and we're still
+    /// inside the grace window (or we warned about it very recently). Debug.
+    Quiet,
+    /// A pre-start state that has outlasted [`NOT_READY_GRACE`]: the Pod is very
+    /// likely wedged and this step's logs will never arrive. Warn.
+    StuckNotReady,
+    /// A genuine tail failure — RBAC, connectivity, `ImagePullBackOff`. Warn.
+    Failed,
+}
+
+/// Decide how loudly to report a log-tail error (c653742). Pure, so the policy is
+/// unit-testable without asserting on log output.
+///
+/// `not_ready_for` is how long this fence has been reporting a benign pre-start
+/// state; `since_last_warn` how long since we last escalated it to WARN (`None` =
+/// never). The rate limit is what keeps a wedged Pod visible without restoring
+/// the every-[`RETRY_BACKOFF`] flood the ticket was about.
+fn classify_tail_error(
+    err: &str,
+    not_ready_for: Duration,
+    since_last_warn: Option<Duration>,
+) -> TailErrorClass {
+    if !is_pod_not_ready(err) {
+        return TailErrorClass::Failed;
+    }
+    if not_ready_for < NOT_READY_GRACE {
+        return TailErrorClass::Quiet;
+    }
+    match since_last_warn {
+        None => TailErrorClass::StuckNotReady,
+        Some(d) if d >= STUCK_WARN_INTERVAL => TailErrorClass::StuckNotReady,
+        Some(_) => TailErrorClass::Quiet,
     }
 }
 
@@ -365,15 +470,20 @@ async fn drain(
 
 #[cfg(test)]
 mod tests {
-    use super::is_pod_not_ready;
+    use std::time::Duration;
+
+    use super::{
+        classify_tail_error, is_pod_not_ready, TailErrorClass, NOT_READY_GRACE, STUCK_WARN_INTERVAL,
+    };
+
+    /// The real dogfood message: a tail against a Pod still initializing.
+    const INITIALIZING: &str = "executor error: exec error: ApiError: container \"step\" in pod \
+                                \"scarab-check-a1-7893ca80\" is waiting to start: PodInitializing: \
+                                BadRequest";
 
     #[test]
     fn pre_start_states_are_quiet() {
-        // The real dogfood message: kube exec against a Pod still initializing.
-        assert!(is_pod_not_ready(
-            "executor error: exec error: ApiError: container \"step\" in pod \
-             \"scarab-check-a1-7893ca80\" is waiting to start: PodInitializing: BadRequest"
-        ));
+        assert!(is_pod_not_ready(INITIALIZING));
         assert!(is_pod_not_ready(
             "container \"step\" is waiting to start: ContainerCreating"
         ));
@@ -389,5 +499,68 @@ mod tests {
         assert!(!is_pod_not_ready(
             "container \"step\" is waiting to start: ImagePullBackOff"
         ));
+    }
+
+    /// c653742: a normal cold start (image pull, init containers) must not warn —
+    /// that is the whole spam complaint.
+    #[test]
+    fn a_slow_start_stays_quiet_inside_the_grace_window() {
+        assert_eq!(
+            classify_tail_error(INITIALIZING, Duration::ZERO, None),
+            TailErrorClass::Quiet
+        );
+        assert_eq!(
+            classify_tail_error(INITIALIZING, NOT_READY_GRACE - Duration::from_secs(1), None),
+            TailErrorClass::Quiet
+        );
+    }
+
+    /// …but the warning is not simply deleted: a tail that NEVER starts has to
+    /// surface, so past the grace window the pre-start state escalates to WARN.
+    #[test]
+    fn a_pod_stuck_past_the_grace_window_warns() {
+        assert_eq!(
+            classify_tail_error(INITIALIZING, NOT_READY_GRACE, None),
+            TailErrorClass::StuckNotReady
+        );
+    }
+
+    /// The escalation is rate-limited, so a wedged Pod is one line a minute — not
+    /// one line every RETRY_BACKOFF, which is the bug we're fixing.
+    #[test]
+    fn a_stuck_pod_is_warned_about_periodically_not_every_retry() {
+        let stuck = NOT_READY_GRACE + Duration::from_secs(600);
+        assert_eq!(
+            classify_tail_error(INITIALIZING, stuck, Some(Duration::from_secs(3))),
+            TailErrorClass::Quiet,
+            "just warned — the next retry stays quiet"
+        );
+        assert_eq!(
+            classify_tail_error(INITIALIZING, stuck, Some(STUCK_WARN_INTERVAL)),
+            TailErrorClass::StuckNotReady,
+            "still stuck a minute later — restate it so it stays visible"
+        );
+    }
+
+    /// A real failure is loud immediately, however long it has been waiting; the
+    /// grace window is only for the benign pre-start reasons.
+    #[test]
+    fn a_genuine_failure_warns_immediately() {
+        assert_eq!(
+            classify_tail_error(
+                "ApiError: pods \"x\" is forbidden: cannot get pods/log",
+                Duration::ZERO,
+                None
+            ),
+            TailErrorClass::Failed
+        );
+        assert_eq!(
+            classify_tail_error(
+                "container \"step\" is waiting to start: ImagePullBackOff",
+                Duration::ZERO,
+                Some(Duration::from_secs(1))
+            ),
+            TailErrorClass::Failed
+        );
     }
 }
