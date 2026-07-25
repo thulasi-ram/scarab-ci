@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use scarab_engine::{
     Clock, Db, Executor, Scheduler, SchedulerError, ServiceStatus, StepStatus, Supervision,
+    TickHealth,
 };
 use scarab_forge::ForgePort;
 
@@ -34,23 +35,31 @@ pub async fn tick_once(
     step_timeout_ms: i64,
     public_url: &str,
     supervision: &Supervision,
+    health: &TickHealth,
 ) -> Result<(), SchedulerError> {
     // The Scheduler is per-cycle; the Supervision memory is per-PROCESS
     // (ADR-0056) — that is what lets a resumed control plane recognise the
     // attempts it did NOT launch and emit `AttemptReadopted` exactly once.
-    // Per-run reconcile errors the engine swallowed for tick isolation
-    // (git-bug 6825830) come back here — the pure engine does not log; the
-    // driver (which owns tracing) surfaces them without aborting the tick.
-    let skipped = Scheduler::new(&**db, &**clock, &**executor, owner)
+    // TickHealth is per-PROCESS for the same reason (ADR-0059): it dates each
+    // run's current failure streak, and a per-cycle map would never reach the
+    // dead-letter bound.
+    //
+    // Per-run tick errors the engine isolated (ADR-0059; originally git-bug
+    // 6825830 for reconcile_services alone) come back here — the pure engine
+    // does not log; the driver, which owns tracing, surfaces them without
+    // aborting the tick.
+    let isolated = Scheduler::new(&**db, &**clock, &**executor, owner)
         .with_outbox_visibility_ms(visibility_ms)
         .with_default_step_timeout_ms(step_timeout_ms)
         .with_supervision(supervision.clone())
+        .with_tick_health(health.clone())
         .tick_all()
         .await?;
-    for (run, e) in &skipped {
+    for (run, e) in &isolated {
         tracing::warn!(
             run = %run.0, error = %e,
-            "reconcile_services failed for run; skipped this tick, retried next (git-bug 6825830)"
+            "per-run tick leg failed; run skipped this cycle, retried next \
+             (dead-letters if it keeps failing — ADR-0059)"
         );
     }
     // Log tail (ADR-0013): pull each running step's stdout/stderr into the log
@@ -163,6 +172,8 @@ pub fn spawn_driver(
         .map(|logs| LogTailer::new(executor.clone(), logs).with_lease(db.clone(), owner.clone()));
     // One Supervision per driver process (ADR-0056) — see `tick_once`.
     let supervision = Supervision::new();
+    // Likewise one TickHealth per driver process (ADR-0059).
+    let health = TickHealth::new();
     tokio::spawn(async move {
         loop {
             if let Err(e) = tick_once(
@@ -176,6 +187,7 @@ pub fn spawn_driver(
                 step_timeout_ms,
                 &public_url,
                 &supervision,
+                &health,
             )
             .await
             {

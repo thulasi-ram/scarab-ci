@@ -23,8 +23,8 @@ pub mod scheduler;
 pub use ports::{Clock, Db, Executor, LogChunks};
 pub use scheduler::{
     cancel_run_request, record_gate_approval, release_gate, rerun_step, retry_step, RerunError,
-    Scheduler, SchedulerError, SupersedeTeardown, SupersededAttempt, Supervision, CANCEL_RUN,
-    LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
+    Scheduler, SchedulerError, SupersedeTeardown, SupersededAttempt, Supervision, TickHealth,
+    CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
 use serde::{Deserialize, Serialize};

@@ -83,8 +83,9 @@ mental bucket:
   scarab-pipeline). Only the demand-gated remainders above (remote invoke,
   submodule vendoring, data→IR frontend) are still open.
 - **Slice 7** (CONTEXT §9.7) — local executor + CLI + provenance/signing fast-follow.
-- **ADR-0059 tick fault isolation** — Proposed, unbuilt (only the
-  `reconcile_services` collect-and-continue landed). One poison run can still
-  abort a whole scheduler tick in `admit`/`advance`/other `reconcile*`, and
-  swallowed service-reconcile errors lack a bounded dead-letter. The one open
-  engine-correctness item (2026-07-24 sweep).
+- ~~**ADR-0059 tick fault isolation**~~ — **SHIPPED 2026-07-25.** Per-run
+  isolation now covers `admit`/`advance` (plus per-*message* isolation in the
+  teardown drains, where a malformed payload could wedge the fleet
+  permanently), bounded by a wall-clock deadline that dead-letters a
+  persistently un-tickable run. See the ADR's 2026-07-25 amendment for how the
+  open questions resolved.
