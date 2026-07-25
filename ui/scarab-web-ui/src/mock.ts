@@ -403,6 +403,7 @@ const connections = [
       name: project,
     })),
     supports_resync: true,
+    supports_preflight: true,
     managed_by_config: false,
   },
   // A self-hosted Forgejo connection — the manually-onboarded kind (ADR-0060
@@ -417,9 +418,31 @@ const connections = [
     last_delivery_at: ago(3_600_000),
     projects: [{ org: "acme", project: "infra", owner: "acme", name: "infra" }],
     supports_resync: true,
+    // Forgejo tokens are not introspectable, so the preflight line is not
+    // offered for them at all (the endpoint would only answer "unknown").
+    supports_preflight: false,
     managed_by_config: false,
   },
 ];
+
+// A correctly-configured App (git-bug 90644c6). The interesting fixture is the
+// degraded one, but the demo stack shows a healthy install — the gap list is
+// exercised by the server tests, not by screenshots.
+const connectionPreflight = {
+  id: "gh-acme",
+  kind: "github",
+  status: "ok",
+  checked: true,
+  unavailable_reason: null,
+  required: [],
+  missing: [],
+  granted_permissions: [
+    { name: "contents", level: "read" },
+    { name: "metadata", level: "read" },
+    { name: "statuses", level: "write" },
+  ],
+  subscribed_events: ["push", "pull_request"],
+};
 
 // What the Forgejo credential reaches — the bind pick-list (ADR-0060 slice 5).
 const availableRepos = [
@@ -487,6 +510,7 @@ function route(pathname: string, search: string): Response | null {
 
   if (p === "/v1/connections") return json(connections);
   if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);
+  if (/^\/v1\/connections\/[^/]+\/preflight$/.test(p)) return json(connectionPreflight);
   // Secret names are scope-addressed: no `repo=` is the org scope (ADR-0060).
   if (p === "/v1/secrets") {
     const scoped = new URLSearchParams(search).has("repo");
