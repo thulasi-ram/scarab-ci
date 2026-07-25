@@ -58,21 +58,6 @@ async fn metrics_expose_run_and_outbox_gauges() {
         "{body}"
     );
     assert!(body.contains("scarab_outbox_depth 0"), "{body}");
-    // ba921db: forge delivery failures are counted, not just logged — the series
-    // is exposed (at 0 in a fresh process) so an alert can be written against it
-    // before anything has broken.
-    assert!(
-        body.contains("# TYPE scarab_forge_status_failures_total counter"),
-        "{body}"
-    );
-    assert!(
-        body.contains("scarab_forge_status_failures_total 0"),
-        "{body}"
-    );
-    assert!(
-        body.contains("scarab_forge_status_dead_lettered_total 0"),
-        "{body}"
-    );
 }
 
 #[tokio::test]

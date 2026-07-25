@@ -1979,15 +1979,6 @@ impl ForgeConnectionStore for PostgresDb {
         .map_err(reg_err)?;
         Ok(result.rows_affected() == 1)
     }
-
-    async fn last_delivery_at(&self, forge: ForgeKind) -> Result<Option<i64>, RegistryError> {
-        let row = sqlx::query("SELECT max(at) AS at FROM webhook_deliveries WHERE forge = $1")
-            .bind(forge.as_str())
-            .fetch_one(self.pool())
-            .await
-            .map_err(reg_err)?;
-        Ok(row.get::<Option<i64>, _>("at"))
-    }
 }
 
 fn connection_from_row(r: sqlx::postgres::PgRow) -> Result<ForgeConnection, RegistryError> {
@@ -2147,77 +2138,6 @@ impl EnvironmentStore for PostgresDb {
                 })
             })
             .collect()
-    }
-}
-
-/// "Intentionally unset" markers for the advisory coverage matrix (ADR-0037 D).
-/// The repo-default column is stored as `environment = ''` (see migration 0037).
-#[async_trait]
-impl scarab_project::SecretCoverageStore for PostgresDb {
-    async fn silence(
-        &self,
-        org: &str,
-        project: &str,
-        column: scarab_project::CoverageColumn<'_>,
-        key: &str,
-    ) -> Result<(), ProjectError> {
-        sqlx::query(
-            "INSERT INTO secret_unset_markers (org, project, environment, key)
-             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-        )
-        .bind(org)
-        .bind(project)
-        .bind(column.unwrap_or(""))
-        .bind(key)
-        .execute(self.pool())
-        .await
-        .map_err(|e| ProjectError::Store(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn unsilence(
-        &self,
-        org: &str,
-        project: &str,
-        column: scarab_project::CoverageColumn<'_>,
-        key: &str,
-    ) -> Result<(), ProjectError> {
-        sqlx::query(
-            "DELETE FROM secret_unset_markers
-             WHERE org = $1 AND project = $2 AND environment = $3 AND key = $4",
-        )
-        .bind(org)
-        .bind(project)
-        .bind(column.unwrap_or(""))
-        .bind(key)
-        .execute(self.pool())
-        .await
-        .map_err(|e| ProjectError::Store(e.to_string()))?;
-        Ok(())
-    }
-
-    async fn silenced(
-        &self,
-        org: &str,
-        project: &str,
-    ) -> Result<Vec<(Option<String>, String)>, ProjectError> {
-        let rows = sqlx::query(
-            "SELECT environment, key FROM secret_unset_markers
-             WHERE org = $1 AND project = $2",
-        )
-        .bind(org)
-        .bind(project)
-        .fetch_all(self.pool())
-        .await
-        .map_err(|e| ProjectError::Store(e.to_string()))?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let env = r.get::<String, _>("environment");
-                let column = (!env.is_empty()).then_some(env);
-                (column, r.get::<String, _>("key"))
-            })
-            .collect())
     }
 }
 

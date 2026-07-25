@@ -28,6 +28,19 @@ its file name is the default display name (`ci.yaml` reads as `ci`, overridable 
 [`invoke`](#reuse-invoke). Start from
 [Run locally](/scarab-ci/get-started/run-locally/) to submit your first pipeline.
 
+:::caution[Commit `.scarab/`, and never blanket-ignore it]
+`.scarab/` is **tracked source**: it is read from the triggering commit, so an ignored pipeline file
+is a pipeline that does not exist. The trap is that a local `scarab-server` also writes its
+development object store *inside* that directory — `SCARAB_OBJECT_DIR` defaults to
+`./.scarab/objects` — which tempts a blanket `/.scarab` ignore rule that then silently swallows
+`git add .scarab/ci.yaml`. Ignore the runtime path specifically instead:
+
+```gitignore
+# runtime state only — the pipeline configs beside it are tracked source
+/.scarab/objects/
+```
+:::
+
 A minimal pipeline is an `on:` block and a list of `steps`:
 
 ```yaml

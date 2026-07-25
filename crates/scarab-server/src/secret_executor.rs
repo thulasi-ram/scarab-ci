@@ -201,20 +201,6 @@ impl Executor for SecretInjectingExecutor {
         self.inner.results(handle).await
     }
 
-    async fn artifacts(
-        &self,
-        handle: &ExecHandle,
-    ) -> Result<Vec<scarab_engine::ArtifactMeta>, ExecError> {
-        // Forward the harvested artifact index (ADR-0052) — same forward-or-drop
-        // hazard as `results` above, and the one that actually bit: the trait
-        // default returns EMPTY, so a secrets-wired deployment (i.e. every real
-        // one) made the scheduler see "this step published nothing" for every
-        // step. The blobs were uploaded and the Pod annotation written, but
-        // `put_artifacts` was never called and `GET /v1/runs/{id}/artifacts`
-        // returned `[]` forever (98ea804).
-        self.inner.artifacts(handle).await
-    }
-
     async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         // Forward the log tail unchanged (ADR-0013); redaction happens downstream
         // in the pipeline, not here.
