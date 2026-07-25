@@ -30,6 +30,24 @@ owner="$FORGEJO_ADMIN_USER"
 hook_repo="verify-hook"
 onboard_repo="verify-onboard"
 
+# Same rule as deploy/local-proc/up.sh: never seed, or grade, an instance this
+# script did not start. Here the port bind would normally fail loudly inside
+# `compose up -d`, but if a FOREIGN Forgejo already holds the port we would
+# happily mint tokens and repos in someone else's instance — and the tier would
+# report on it. Refuse instead, unless the listener is our own compose service
+# (re-running this script is meant to be idempotent). /dev/tcp, not lsof: no new
+# tool dependency beyond docker/curl/python3.
+if (exec 3<>"/dev/tcp/127.0.0.1/$FORGEJO_HTTP_PORT") 2>/dev/null \
+   && [ -z "$($compose ps -q forgejo 2>/dev/null)" ]; then
+  {
+    echo "error: something is already listening on 127.0.0.1:$FORGEJO_HTTP_PORT and it is not"
+    echo "  this compose project's Forgejo (project: scarab-forgejo-verify)."
+    echo "  Find it with:  lsof -nP -iTCP:$FORGEJO_HTTP_PORT -sTCP:LISTEN"
+    echo "  Then stop it, or set FORGEJO_HTTP_PORT in deploy/local-forgejo/.env."
+  } >&2
+  exit 1
+fi
+
 echo "==> starting Forgejo ($FORGEJO_IMAGE) on $base"
 $compose up -d
 
