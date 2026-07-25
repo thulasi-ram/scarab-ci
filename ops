@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1784996442,"nonce":"luDKTmRxfrHVJmseKedJvpG9/ZM=","title":"helm: chart has no first-class forgejoWebhookSecret value (asymmetric vs GitHub)","was":"Symptom"}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1784996442,"nonce":"IAzm8AGUTIOnffnD2+ILLzF6ojo=","added":["ready-for-agent"],"removed":null}]}
