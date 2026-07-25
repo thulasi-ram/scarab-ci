@@ -215,13 +215,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // resolves its repo through the ForgeConnection registry, constructs the
     // vendor adapter (GitHub App/token, Forgejo token) with credentials
     // fetched from SecretProvider at use-time, and caches it per connection.
-    let forge: Arc<dyn scarab_forge::ForgePort> =
-        Arc::new(scarab_server::forge_router::RegistryForge::new(
+    // One instance, two ports: the repo-routed `ForgePort` every run path uses,
+    // and the connection-scoped `ForgeAdapters` the ADR-0060 onboarding endpoints
+    // need (a connection with nothing bound yet has no repo to route through).
+    // They share the adapter cache by construction.
+    let registry_forge = Arc::new(
+        scarab_server::forge_router::RegistryForge::new(
             pg.clone(),
             secrets.clone(),
             config.github_app_id.clone(),
             github_app_pem.clone(),
-        ));
+        )
+        // Hooks this server registers must be signed with the secret its own
+        // `/webhooks/forgejo` verifies, or every delivery comes back 401.
+        .with_forgejo_webhook_secret(config.forgejo_webhook_secret.clone()),
+    );
+    let forge: Arc<dyn scarab_forge::ForgePort> = registry_forge.clone();
     // Startup validation (ADR-0046): every registered connection's credential
     // handle must resolve. Missing material is a loud DEGRADED warning — the
     // connection cannot serve until the secret is registered. When a boot-time
@@ -364,6 +373,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The acting forge (no more forge=None): webhook-triggered runs read
         // in-repo `.scarab` config through it for real.
         .with_forge(forge.clone())
+        // The same wiring, connection-scoped: repo enumeration for the bind
+        // pick-list and per-repo webhook registration (ADR-0060).
+        .with_forge_adapters(registry_forge.clone())
         // /v1/secrets management with the secrets store built above (ADR-0014).
         .with_secrets(secrets.clone())
         // Artifact list/download (ADR-0052), served from the object store.

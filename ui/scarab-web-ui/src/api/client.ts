@@ -722,6 +722,74 @@ export async function deleteConnection(id: string, unbindRepos = false): Promise
   }
 }
 
+// --- Repo binding = Project onboarding (ADR-0060 part C). There is no
+// `projects` table: a Project IS a `forge_repos` binding (ADR-0046), so these
+// calls are what bring a repo into existence as a governed Project. ---
+
+export type AvailableRepo = components["schemas"]["AvailableRepoDto"];
+export type BindRepoResult = components["schemas"]["BindRepoResultDto"];
+
+/**
+ * The repos a connection's credential can reach (`GET …/available-repos`) — the
+ * pick-list, so nobody has to type `owner/name`. Returns `null` when the adapter
+ * cannot enumerate (501), which is NOT the same as "reaches nothing": the caller
+ * falls back to a manual entry field instead of claiming the token is empty.
+ */
+export async function availableRepos(id: string): Promise<AvailableRepo[] | null> {
+  const { data, error, response } = await api.GET("/v1/connections/{id}/available-repos", {
+    params: { path: { id } },
+  });
+  if (response.status === 501) return null;
+  if (error || !data) throw new Error("failed to list the connection's repositories");
+  return data;
+}
+
+/**
+ * Bind a repo to a connection (`POST …/repos`) — **this creates the Project**,
+ * and by default registers the forge-side webhook so pushes actually arrive. A
+ * webhook that fails does not undo the binding; the result says so and
+ * `registerRepoWebhook` retries.
+ */
+export async function bindRepo(
+  id: string,
+  repo: { owner: string; name: string; register_webhook?: boolean },
+): Promise<BindRepoResult> {
+  const { data, error, response } = await api.POST("/v1/connections/{id}/repos", {
+    params: { path: { id } },
+    body: repo,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not add the repository (${response.status})`);
+  }
+  return data;
+}
+
+/** Retry the forge-side webhook for a bound repo (`POST …/repos/{owner}/{name}/webhook`). */
+export async function registerRepoWebhook(
+  id: string,
+  owner: string,
+  name: string,
+): Promise<BindRepoResult> {
+  const { data, error, response } = await api.POST(
+    "/v1/connections/{id}/repos/{owner}/{name}/webhook",
+    { params: { path: { id, owner, name } } },
+  );
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not register the webhook (${response.status})`);
+  }
+  return data;
+}
+
+/** Unbind a repo (`DELETE …/repos/{owner}/{name}`) — removes its Project. */
+export async function unbindRepo(id: string, owner: string, name: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/connections/{id}/repos/{owner}/{name}", {
+    params: { path: { id, owner, name } },
+  });
+  if (error) {
+    throw new Error(errorText(error) || `could not remove the repository (${response.status})`);
+  }
+}
+
 // --- Secret coverage matrix (ADR-0037) — and, since ADR-0060, the read model
 // behind the repo/environment secret EDITOR. Each key's *effective* status per
 // column after inheritance; never a value. Not in the generated OpenAPI client

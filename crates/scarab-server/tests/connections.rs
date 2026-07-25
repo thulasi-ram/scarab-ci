@@ -20,6 +20,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
+use scarab_engine::Db;
 use scarab_forge::{ForgeConnection, ForgeConnectionStore, ForgeKind, RepoRef};
 use scarab_identity::{Binding, BindingOrigin, Principal, RbacStore, Role, Scope};
 use scarab_secrets::{Secret, SecretProvider, SecretScope};
@@ -30,12 +31,15 @@ use scarab_testkit::{
 };
 
 const CRED_REF: &str = "github-app";
+/// The secret `/webhooks/forgejo` verifies deliveries with (ADR-0046).
+const FORGEJO_WEBHOOK_SECRET: &[u8] = b"forgejo-hook-secret";
 
 struct Harness {
     app: axum::Router,
     db: Arc<InMemoryDb>,
     rbac: Arc<InMemoryRbac>,
     secrets: Arc<FakeSecrets>,
+    forge: Arc<FakeForge>,
 }
 
 impl Harness {
@@ -58,7 +62,7 @@ impl Harness {
 
 /// A stack with one GitHub connection, auth+RBAC on, and a forge that either can
 /// or cannot enumerate repos.
-async fn harness(bound: &[(&str, &str)], forge: FakeForge, seed_credential: bool) -> Harness {
+async fn harness(bound: &[(&str, &str)], forge: Arc<FakeForge>, seed_credential: bool) -> Harness {
     let db = Arc::new(InMemoryDb::new());
     db.put_connection(&ForgeConnection {
         id: "gh".into(),
@@ -135,7 +139,10 @@ async fn harness(bound: &[(&str, &str)], forge: FakeForge, seed_credential: bool
             .with_auth(auth, Arc::new(InMemorySessions::new()))
             .with_rbac(rbac.clone())
             .with_secrets(secrets.clone())
-            .with_forge(Arc::new(forge))
+            .with_forge(forge.clone())
+            // The Forgejo ingest endpoint's own verification secret (ADR-0046) —
+            // wired so an onboarding test can drive a real signed delivery.
+            .with_forgejo_webhook_secret(FORGEJO_WEBHOOK_SECRET.to_vec())
             .with_forge_connections(db.clone()),
     );
     Harness {
@@ -143,6 +150,7 @@ async fn harness(bound: &[(&str, &str)], forge: FakeForge, seed_credential: bool
         db,
         rbac,
         secrets,
+        forge,
     }
 }
 
@@ -198,7 +206,7 @@ fn authed_json(method: &str, uri: &str, session: &str, body: serde_json::Value) 
 async fn the_list_reports_bound_projects_and_health_without_the_credential() {
     let h = harness(
         &[("acme", "web"), ("acme", "api")],
-        FakeForge::new().with_accessible_repos(&[("acme", "web")]),
+        Arc::new(FakeForge::new().with_accessible_repos(&[("acme", "web")])),
         true,
     )
     .await;
@@ -248,7 +256,7 @@ async fn a_missing_credential_is_reported_not_hidden() {
     // The DB was restored without its secrets: the connection row survives, the
     // material does not. Runs will fail at the first forge call; this is the one
     // place that says so before then.
-    let h = harness(&[("acme", "web")], FakeForge::new(), false).await;
+    let h = harness(&[("acme", "web")], Arc::new(FakeForge::new()), false).await;
     let root = login(&h.app, "root-code").await;
 
     let conns: serde_json::Value = serde_json::from_str(
@@ -267,7 +275,7 @@ async fn a_missing_credential_is_reported_not_hidden() {
 
 #[tokio::test]
 async fn listing_needs_administer_on_the_org() {
-    let h = harness(&[("acme", "web")], FakeForge::new(), true).await;
+    let h = harness(&[("acme", "web")], Arc::new(FakeForge::new()), true).await;
 
     // An Org-scoped Admin (no global role) may look.
     h.rbac
@@ -310,7 +318,11 @@ async fn resync_binds_a_repo_whose_webhook_was_missed() {
     // dropped `installation_repositories` delivery.
     let h = harness(
         &[("acme", "web")],
-        FakeForge::new().with_accessible_repos(&[("acme", "web"), ("acme", "api"), ("acme", "ops")]),
+        Arc::new(FakeForge::new().with_accessible_repos(&[
+            ("acme", "web"),
+            ("acme", "api"),
+            ("acme", "ops"),
+        ])),
         true,
     )
     .await;
@@ -384,7 +396,7 @@ async fn resync_never_unbinds_what_the_forge_omits() {
     // strength of one API response. Removal stays a human act.
     let h = harness(
         &[("acme", "web"), ("acme", "legacy")],
-        FakeForge::new().with_accessible_repos(&[("acme", "web")]),
+        Arc::new(FakeForge::new().with_accessible_repos(&[("acme", "web")])),
         true,
     )
     .await;
@@ -413,7 +425,7 @@ async fn resync_on_an_adapter_that_cannot_enumerate_says_so() {
     // The default FakeForge cannot enumerate — the Forgejo situation today.
     // A 501 is the honest answer; a silent empty list would read as "your forge
     // has no repos" and, if re-sync ever unbound, as "delete everything".
-    let h = harness(&[("acme", "web")], FakeForge::new(), true).await;
+    let h = harness(&[("acme", "web")], Arc::new(FakeForge::new()), true).await;
     let root = login(&h.app, "root-code").await;
 
     let resp = h
@@ -456,7 +468,7 @@ fn create_forgejo(base_url: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn creating_a_connection_writes_the_credential_through_and_never_echoes_it() {
-    let h = harness(&[("acme", "web")], FakeForge::new(), true).await;
+    let h = harness(&[("acme", "web")], Arc::new(FakeForge::new()), true).await;
     let root = login(&h.app, "root-code").await;
 
     // A trailing slash on the base URL is normalized away — the adapter appends
@@ -480,12 +492,11 @@ async fn creating_a_connection_writes_the_credential_through_and_never_echoes_it
     assert!(id.starts_with("forgejo-"), "id names its forge: {id}");
 
     // The row persisted, pointing at the generated handle — not at a value.
-    let conn = h
-        .db
-        .get_connection(&id)
-        .await
-        .unwrap()
-        .expect("connection persisted");
+    let conn =
+        h.db.get_connection(&id)
+            .await
+            .unwrap()
+            .expect("connection persisted");
     assert_eq!(conn.kind, ForgeKind::Forgejo);
     assert_eq!(conn.base_url, "https://git.acme.test");
     assert_eq!(conn.credential_ref, credential_ref);
@@ -536,7 +547,7 @@ async fn github_connections_are_not_creatable_by_hand() {
     // Installing the App IS registration (ADR-0060 part C). Accepting a create
     // here would persist a connection to an installation that may not exist —
     // and Scarab has no API to create one.
-    let h = harness(&[], FakeForge::new(), true).await;
+    let h = harness(&[], Arc::new(FakeForge::new()), true).await;
     let root = login(&h.app, "root-code").await;
 
     let resp = h
@@ -563,7 +574,7 @@ async fn github_connections_are_not_creatable_by_hand() {
 
 #[tokio::test]
 async fn a_malformed_create_is_refused_before_anything_is_stored() {
-    let h = harness(&[], FakeForge::new(), true).await;
+    let h = harness(&[], Arc::new(FakeForge::new()), true).await;
     let root = login(&h.app, "root-code").await;
 
     let cases = [
@@ -583,14 +594,18 @@ async fn a_malformed_create_is_refused_before_anything_is_stored() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
     }
-    assert_eq!(h.db.list_connections().await.unwrap().len(), 1, "nothing stored");
+    assert_eq!(
+        h.db.list_connections().await.unwrap().len(),
+        1,
+        "nothing stored"
+    );
 }
 
 #[tokio::test]
 async fn a_second_connection_to_the_same_host_is_refused() {
     // Two rows for one host would each carry their own credential and each claim
     // to serve it — the shape a double-submitted form produces.
-    let h = harness(&[], FakeForge::new(), true).await;
+    let h = harness(&[], Arc::new(FakeForge::new()), true).await;
     let root = login(&h.app, "root-code").await;
 
     let first = h
@@ -624,7 +639,7 @@ async fn a_second_connection_to_the_same_host_is_refused() {
 
 #[tokio::test]
 async fn deleting_a_connection_removes_it_and_its_unreferenced_credential() {
-    let h = harness(&[], FakeForge::new(), true).await;
+    let h = harness(&[], Arc::new(FakeForge::new()), true).await;
     let root = login(&h.app, "root-code").await;
 
     let created: serde_json::Value = serde_json::from_str(
@@ -677,7 +692,7 @@ async fn deleting_a_connection_with_projects_needs_an_acknowledgement() {
     // secrets and RBAC with it. The same reasoning that stops re-sync from ever
     // unbinding applies here — except a human asked, so the answer is "confirm",
     // not "never".
-    let h = harness(&[("acme", "web")], FakeForge::new(), true).await;
+    let h = harness(&[("acme", "web")], Arc::new(FakeForge::new()), true).await;
     let root = login(&h.app, "root-code").await;
 
     // A SECOND GitHub connection sharing the one App credential handle — exactly
@@ -699,7 +714,10 @@ async fn deleting_a_connection_with_projects_needs_an_acknowledgement() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let msg = body_bytes(resp).await;
-    assert!(msg.contains("acme/web"), "the refusal names what it would delete: {msg}");
+    assert!(
+        msg.contains("acme/web"),
+        "the refusal names what it would delete: {msg}"
+    );
     assert!(h.db.get_connection("gh").await.unwrap().is_some());
 
     // With the acknowledgement, the connection AND its Project go.
@@ -733,7 +751,7 @@ async fn deleting_a_connection_with_projects_needs_an_acknowledgement() {
 
 #[tokio::test]
 async fn create_and_delete_need_administer_on_the_org() {
-    let h = harness(&[], FakeForge::new(), true).await;
+    let h = harness(&[], Arc::new(FakeForge::new()), true).await;
     let viewer = login(&h.app, "viewer-code").await;
 
     let resp = h
@@ -758,4 +776,549 @@ async fn create_and_delete_need_administer_on_the_org() {
     // No connection created, and the seeded one is still there.
     assert_eq!(h.db.list_connections().await.unwrap().len(), 1);
     assert!(h.db.get_connection("gh").await.unwrap().is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Repo binding → Project onboarding + webhook registration (ADR-0060 slice 5).
+//
+// The load-bearing fact: there is no `projects` table. A Project **is** a
+// `forge_repos` binding (ADR-0046), so binding a repo is not a step towards
+// onboarding — it *is* the onboarding. Until this endpoint existed, only the
+// GitHub `installation` webhook ever called `bind_repo`, which is exactly why
+// Forgejo shipped in ADR-0046 and remained unusable.
+// ---------------------------------------------------------------------------
+
+/// A `.scarab/ci.yaml` that runs one step on any push — the config the Forgejo
+/// repo serves, so a delivery has something to trigger.
+const CI_YAML: &str = r#"
+on:
+  push: {}
+steps:
+  - { id: build, image: busybox, command: ["true"] }
+"#;
+
+/// Create a Forgejo connection and return `(id, credential_ref)`.
+async fn add_forgejo(h: &Harness, session: &str, base_url: &str) -> (String, String) {
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            "/v1/connections",
+            session,
+            create_forgejo(base_url),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_str(&body_bytes(resp).await).unwrap();
+    (
+        created["id"].as_str().unwrap().to_string(),
+        created["credential_ref"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Bind `owner/name` on `id`, returning the raw response body.
+async fn bind(
+    h: &Harness,
+    session: &str,
+    id: &str,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    h.app
+        .clone()
+        .oneshot(authed_json(
+            "POST",
+            &format!("/v1/connections/{id}/repos"),
+            session,
+            body,
+        ))
+        .await
+        .unwrap()
+}
+
+/// A signed Forgejo push delivery for `owner/name`.
+fn forgejo_push(owner: &str, name: &str, delivery: &str) -> Request<Body> {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "ref": "refs/heads/main",
+        "after": "c0ffee1",
+        "head_commit": { "message": "feat: onboard via Scarab" },
+        // Forgejo's `username` spelling — the variant GitHub never sends.
+        "repository": { "name": name, "owner": { "username": owner } },
+        "sender": { "username": "pusher" }
+    }))
+    .unwrap();
+    let sig = scarab_forge_forgejo::sign_hex(FORGEJO_WEBHOOK_SECRET, &body);
+    Request::builder()
+        .method("POST")
+        .uri("/webhooks/forgejo")
+        .header("content-type", "application/json")
+        .header("x-forgejo-event", "push")
+        .header("x-forgejo-delivery", delivery)
+        .header("x-forgejo-signature", sig)
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// **The slice's whole claim, end to end**: an admin adds a Forgejo connection,
+/// picks a repo off the list the credential reaches, binds it — and a push to that
+/// repo starts a Run. This is the path GitHub has had since ADR-0046 and Forgejo
+/// never did, because nothing but the `installation` webhook called `bind_repo`.
+#[tokio::test]
+async fn onboarding_a_forgejo_repo_creates_a_project_whose_pushes_run() {
+    let h = harness(
+        &[],
+        Arc::new(
+            FakeForge::new()
+                .with_file(".scarab/ci.yaml", CI_YAML)
+                .with_accessible_repos(&[("acme", "web"), ("acme", "docs")]),
+        ),
+        true,
+    )
+    .await;
+    let root = login(&h.app, "root-code").await;
+    let (id, credential_ref) = add_forgejo(&h, &root, "https://git.acme.test").await;
+
+    // 1. The pick-list: what the credential reaches, and what is already governed.
+    //    An admin choosing from this cannot mistype `owner/name`.
+    let available_raw = body_bytes(
+        h.app
+            .clone()
+            .oneshot(authed(
+                "GET",
+                &format!("/v1/connections/{id}/available-repos"),
+                &root,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let available: serde_json::Value = serde_json::from_str(&available_raw).unwrap();
+    assert_eq!(
+        available,
+        serde_json::json!([
+            { "owner": "acme", "name": "docs", "bound": false },
+            { "owner": "acme", "name": "web", "bound": false },
+        ]),
+        "sorted, nothing bound yet"
+    );
+
+    // 2. Bind — which CREATES the Project (there is no projects table).
+    let bind_raw = body_bytes(
+        bind(
+            &h,
+            &root,
+            &id,
+            serde_json::json!({ "owner": "acme", "name": "web" }),
+        )
+        .await,
+    )
+    .await;
+    let bound: serde_json::Value = serde_json::from_str(&bind_raw).unwrap();
+    assert_eq!(bound["org"], "acme");
+    assert_eq!(bound["project"], "web");
+    assert_eq!(
+        bound["webhook_registered"], true,
+        "registration is part of binding, not a second chore"
+    );
+    assert!(bound["webhook_error"].is_null());
+
+    // The hook points at THIS forge's ingest endpoint (ADR-0046: one endpoint per
+    // forge, each with its own verification secret — no payload sniffing).
+    assert_eq!(
+        h.forge.webhooks(),
+        vec![(
+            RepoRef {
+                owner: "acme".into(),
+                name: "web".into()
+            },
+            "http://localhost:8080/webhooks/forgejo".to_string()
+        )]
+    );
+
+    // 3. The Project is real: it appears on the Repos page and resolves to its
+    //    serving connection.
+    let repos = body_bytes(
+        h.app
+            .clone()
+            .oneshot(authed("GET", "/v1/repos", &root))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(repos.contains("\"project\":\"web\""), "{repos}");
+    // Its repo deep-link is the Forgejo host, not github.com.
+    assert!(repos.contains("https://git.acme.test/acme/web"), "{repos}");
+    let resolved =
+        h.db.resolve(&RepoRef {
+            owner: "acme".into(),
+            name: "web".into(),
+        })
+        .await
+        .unwrap()
+        .expect("the binding IS the Project");
+    assert_eq!(resolved.connection.id, id);
+
+    // 4. The payoff: a signed push on that repo starts a Run, attributed to the
+    //    Project the bind created.
+    let resp = h
+        .app
+        .clone()
+        .oneshot(forgejo_push("acme", "web", "fj-onboard-1"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let ingested: serde_json::Value = serde_json::from_str(&body_bytes(resp).await).unwrap();
+    assert_eq!(ingested["trigger"], "push");
+    let run_id = ingested["run_ids"][0].as_str().unwrap().to_string();
+    assert!(h
+        .db
+        .run_status(&scarab_engine::RunId(run_id.clone()))
+        .await
+        .unwrap()
+        .is_some());
+    let project_runs = body_bytes(
+        h.app
+            .clone()
+            .oneshot(authed("GET", "/v1/repos/acme/web/runs", &root))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let listed: serde_json::Value = serde_json::from_str(&project_runs).unwrap();
+    assert_eq!(
+        listed["runs"][0]["id"].as_str(),
+        Some(run_id.as_str()),
+        "the run is listed under the Project the bind created: {project_runs}"
+    );
+    assert_eq!(listed["runs"][0]["org"], "acme");
+    assert_eq!(listed["runs"][0]["project"], "web");
+    assert_eq!(listed["runs"][0]["trigger_kind"], "push");
+
+    // 5. Not one of these responses carries the credential.
+    for (what, raw) in [
+        ("available-repos", &available_raw),
+        ("bind", &bind_raw),
+        ("repos", &repos),
+        ("project runs", &project_runs),
+    ] {
+        assert!(
+            !raw.contains(FORGEJO_TOKEN),
+            "the credential leaked into the {what} response: {raw}"
+        );
+    }
+    // The material is still exactly where the write-through put it — nothing on
+    // the bind path moved or copied it.
+    assert_eq!(
+        h.stored_credential(&credential_ref).await.as_deref(),
+        Some(FORGEJO_TOKEN.as_bytes())
+    );
+}
+
+#[tokio::test]
+async fn unbinding_removes_the_project() {
+    let h = harness(
+        &[],
+        Arc::new(FakeForge::new().with_accessible_repos(&[("acme", "web")])),
+        true,
+    )
+    .await;
+    let root = login(&h.app, "root-code").await;
+    let (id, _) = add_forgejo(&h, &root, "https://git.acme.test").await;
+    bind(
+        &h,
+        &root,
+        &id,
+        serde_json::json!({ "owner": "acme", "name": "web" }),
+    )
+    .await;
+
+    // Now bound, the pick-list says so — so the form can show "already added"
+    // instead of offering a re-bind that would re-home a live Project.
+    let available: serde_json::Value = serde_json::from_str(
+        &body_bytes(
+            h.app
+                .clone()
+                .oneshot(authed(
+                    "GET",
+                    &format!("/v1/connections/{id}/available-repos"),
+                    &root,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(available[0]["bound"], true);
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed(
+            "DELETE",
+            &format!("/v1/connections/{id}/repos/acme/web"),
+            &root,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let repos = body_bytes(
+        h.app
+            .clone()
+            .oneshot(authed("GET", "/v1/repos", &root))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(!repos.contains("\"project\":\"web\""), "{repos}");
+    // Unbinding again is a 404, not a silent success: an unbind aimed at the
+    // wrong connection must not read as "already gone".
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed(
+            "DELETE",
+            &format!("/v1/connections/{id}/repos/acme/web"),
+            &root,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A hook the forge refuses does NOT undo the binding — and the failure is
+/// reported, not swallowed. Rolling back would delete a Project an admin just
+/// asked for because a remote system was briefly unreachable; hiding the error
+/// would leave a Project that silently never builds.
+#[tokio::test]
+async fn a_failed_webhook_leaves_the_project_and_says_so() {
+    let h = harness(
+        &[],
+        Arc::new(
+            FakeForge::new()
+                .with_accessible_repos(&[("acme", "web")])
+                .failing_webhook("403: token lacks write:repository_hook"),
+        ),
+        true,
+    )
+    .await;
+    let root = login(&h.app, "root-code").await;
+    let (id, _) = add_forgejo(&h, &root, "https://git.acme.test").await;
+
+    let result: serde_json::Value = serde_json::from_str(
+        &body_bytes(
+            bind(
+                &h,
+                &root,
+                &id,
+                serde_json::json!({ "owner": "acme", "name": "web" }),
+            )
+            .await,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(result["webhook_registered"], false);
+    assert!(
+        result["webhook_error"]
+            .as_str()
+            .unwrap()
+            .contains("write:repository_hook"),
+        "the forge's own reason reaches the admin: {result}"
+    );
+    // The governance fact stands: the Project exists and can be configured while
+    // the token gets fixed.
+    assert!(h
+        .db
+        .resolve(&RepoRef {
+            owner: "acme".into(),
+            name: "web".into()
+        })
+        .await
+        .unwrap()
+        .is_some());
+
+    // …and the retry endpoint is the way out. It surfaces the forge's refusal as
+    // a 4xx rather than pretending.
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/connections/{id}/repos/acme/web/webhook"),
+            &root,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Registering a hook for a repo this connection does NOT govern is a 404:
+    // deliveries for an unbound repo resolve to nothing.
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/connections/{id}/repos/acme/nope/webhook"),
+            &root,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Binding a repo another connection already governs is a conflict, not a move.
+/// `bind_repo` upserts, so accepting it would silently re-home a live Project —
+/// its runs, Environments and secrets — onto a different forge account.
+#[tokio::test]
+async fn a_repo_bound_elsewhere_cannot_be_rebound() {
+    let h = harness(
+        &[("acme", "web")],
+        Arc::new(FakeForge::new().with_accessible_repos(&[("acme", "web")])),
+        true,
+    )
+    .await;
+    let root = login(&h.app, "root-code").await;
+    let (id, _) = add_forgejo(&h, &root, "https://git.acme.test").await;
+
+    let resp = bind(
+        &h,
+        &root,
+        &id,
+        serde_json::json!({ "owner": "acme", "name": "web" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let msg = body_bytes(resp).await;
+    assert!(msg.contains("gh"), "the refusal names the owner: {msg}");
+    // Still the GitHub installation's Project — nothing was re-homed.
+    assert_eq!(
+        h.db.resolve(&RepoRef {
+            owner: "acme".into(),
+            name: "web".into()
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .connection
+        .id,
+        "gh"
+    );
+
+    // Re-binding to the SAME connection is idempotent, though — a pick-list may
+    // legitimately be double-clicked.
+    let repo = RepoRef {
+        owner: "acme".into(),
+        name: "api".into(),
+    };
+    for _ in 0..2 {
+        let resp = bind(
+            &h,
+            &root,
+            &id,
+            serde_json::json!({ "owner": "acme", "name": "api", "register_webhook": false }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        h.db.resolve(&repo).await.unwrap().unwrap().connection.id,
+        id
+    );
+    // `register_webhook: false` was honored — no hook was created.
+    assert!(h.forge.webhooks().is_empty());
+}
+
+#[tokio::test]
+async fn binding_endpoints_need_administer_on_the_org() {
+    let h = harness(
+        &[("acme", "web")],
+        Arc::new(FakeForge::new().with_accessible_repos(&[("acme", "web")])),
+        true,
+    )
+    .await;
+    let viewer = login(&h.app, "viewer-code").await;
+
+    let resp = bind(
+        &h,
+        &viewer,
+        "gh",
+        serde_json::json!({ "owner": "acme", "name": "api" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    for (method, uri) in [
+        ("GET", "/v1/connections/gh/available-repos"),
+        ("DELETE", "/v1/connections/gh/repos/acme/web"),
+        ("POST", "/v1/connections/gh/repos/acme/web/webhook"),
+    ] {
+        let resp = h
+            .app
+            .clone()
+            .oneshot(authed(method, uri, &viewer))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+    // Nothing changed: acme/web is still the GitHub installation's Project.
+    assert!(h
+        .db
+        .resolve(&RepoRef {
+            owner: "acme".into(),
+            name: "web".into()
+        })
+        .await
+        .unwrap()
+        .is_some());
+}
+
+/// A Forgejo connection now advertises re-sync, because its adapter can
+/// enumerate — the same `/user/repos` capability the pick-list rides on.
+#[tokio::test]
+async fn a_forgejo_connection_offers_resync_too() {
+    let h = harness(
+        &[],
+        Arc::new(FakeForge::new().with_accessible_repos(&[("acme", "web")])),
+        true,
+    )
+    .await;
+    let root = login(&h.app, "root-code").await;
+    let (id, _) = add_forgejo(&h, &root, "https://git.acme.test").await;
+
+    let conns: serde_json::Value = serde_json::from_str(
+        &body_bytes(
+            h.app
+                .clone()
+                .oneshot(authed("GET", "/v1/connections", &root))
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    let fj = conns
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == serde_json::json!(id))
+        .unwrap();
+    assert_eq!(fj["supports_resync"], true);
+
+    // And it works: re-sync binds what the credential reaches.
+    let resp = h
+        .app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/v1/connections/{id}/resync"),
+            &root,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let result: serde_json::Value = serde_json::from_str(&body_bytes(resp).await).unwrap();
+    assert_eq!(result["bound"], serde_json::json!(["acme/web"]));
 }

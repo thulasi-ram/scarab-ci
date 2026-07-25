@@ -2007,6 +2007,14 @@ pub struct FakeForge {
     /// `Unsupported` answer, deliberately distinct from `Some(vec![])`
     /// ("enumerable, reaches nothing").
     accessible: Mutex<Option<Vec<RepoRef>>>,
+    /// Webhooks registered through [`register_webhook`](ForgePort::register_webhook)
+    /// as `(repo, callback_url)` — the record onboarding tests assert against
+    /// (ADR-0060): a bound repo with no hook is a Project that never builds.
+    webhooks: Mutex<Vec<(RepoRef, String)>>,
+    /// When set, `register_webhook` fails with this message — models a token
+    /// without hook-administration scope, the one onboarding step that depends on
+    /// the forge being reachable and sufficiently privileged right now.
+    fail_webhook: Mutex<Option<String>>,
 }
 
 impl FakeForge {
@@ -2082,6 +2090,18 @@ impl FakeForge {
                 .collect(),
         );
         self
+    }
+
+    /// Make [`register_webhook`](ForgePort::register_webhook) fail — models a
+    /// credential the forge will not let administer hooks.
+    pub fn failing_webhook(self, message: impl Into<String>) -> Self {
+        *self.fail_webhook.lock().unwrap() = Some(message.into());
+        self
+    }
+
+    /// The webhooks registered so far, as `(repo, callback_url)`.
+    pub fn webhooks(&self) -> Vec<(RepoRef, String)> {
+        self.webhooks.lock().unwrap().clone()
     }
 
     /// Statuses pushed back via [`set_status`](ForgePort::set_status).
@@ -2283,11 +2303,14 @@ impl ForgePort for FakeForge {
         Ok(out)
     }
 
-    async fn register_webhook(
-        &self,
-        _repo: &RepoRef,
-        _callback_url: &str,
-    ) -> Result<(), ForgeError> {
+    async fn register_webhook(&self, repo: &RepoRef, callback_url: &str) -> Result<(), ForgeError> {
+        if let Some(msg) = self.fail_webhook.lock().unwrap().clone() {
+            return Err(ForgeError::Api(msg));
+        }
+        self.webhooks
+            .lock()
+            .unwrap()
+            .push((repo.clone(), callback_url.to_string()));
         Ok(())
     }
 

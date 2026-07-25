@@ -1706,6 +1706,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   color: var(--sage); text-decoration: none;
 }
 .conn-proj:hover { border-color: var(--emerald); color: var(--emerald); }
+/* A bound repo plus its per-repo actions (webhook / remove) on a connection
+   whose repos Scarab manages — Forgejo. Kept on one line so the chip reads as a
+   single unit rather than three loose controls. */
+.conn-proj-row { display: inline-flex; align-items: center; gap: 5px; }
 
 /* ════════════════════════════════════════════════════════════════════════
    Dashboard (engineer landing): action inbox · activity · all-clear

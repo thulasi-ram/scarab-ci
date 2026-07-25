@@ -96,6 +96,13 @@ pub struct AppState {
     /// means the webhook ingest can verify+normalize but not start config-driven
     /// runs.
     pub forge: Option<Arc<dyn scarab_forge::ForgePort>>,
+    /// Builds the adapter for a **specific connection** (ADR-0060) — what the
+    /// onboarding endpoints need, because enumerating a credential's repos and
+    /// registering a hook both apply to a connection with nothing bound yet, so
+    /// `forge`'s repo-routed resolution has nothing to route on. `None` falls back
+    /// to [`forge`](AppState::forge), which is what a test wiring a single fake
+    /// adapter wants.
+    pub forge_adapters: Option<Arc<dyn scarab_forge::ForgeAdapters>>,
     /// Login provider (OAuth/OIDC). `None` leaves `/v1/auth/login` disabled.
     pub auth: Option<Arc<dyn scarab_identity::Authenticator>>,
     /// Session store. When `None`, API authz is **disabled** (dev/test default —
@@ -163,6 +170,7 @@ impl AppState {
             forgejo_webhook_secret: None,
             connections: None,
             forge: None,
+            forge_adapters: None,
             auth: None,
             sessions: None,
             environments: None,
@@ -248,6 +256,14 @@ impl AppState {
     /// Set the forge port used to read in-repo config on a trigger.
     pub fn with_forge(mut self, forge: Arc<dyn scarab_forge::ForgePort>) -> Self {
         self.forge = Some(forge);
+        self
+    }
+
+    /// Set the connection-scoped adapter factory (ADR-0060) used by the
+    /// onboarding endpoints — repo enumeration and webhook registration on a
+    /// connection that has no bindings yet.
+    pub fn with_forge_adapters(mut self, adapters: Arc<dyn scarab_forge::ForgeAdapters>) -> Self {
+        self.forge_adapters = Some(adapters);
         self
     }
 
@@ -5732,6 +5748,38 @@ async fn authorize_org_administer(st: &AppState, headers: &HeaderMap) -> Result<
     Ok(())
 }
 
+/// The forge adapter for **one connection** (ADR-0060) — the port the onboarding
+/// endpoints act through.
+///
+/// Not `st.forge`: that port routes each call by resolving its repo through the
+/// registry, and every question here is asked of a connection that may have
+/// nothing bound yet ("what can this credential reach?", "put a hook on this repo
+/// I am about to bind"). Falls back to `st.forge` when no factory is wired, which
+/// is exactly what a test with one fake adapter means.
+async fn connection_adapter(
+    st: &AppState,
+    conn: &scarab_forge::ForgeConnection,
+) -> Result<Arc<dyn scarab_forge::ForgePort>, ApiError> {
+    match st.forge_adapters.as_ref() {
+        Some(factory) => factory
+            .adapter_for_connection(conn)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string())),
+        None => st.forge.clone().ok_or(ApiError::NotFound),
+    }
+}
+
+/// Where a forge's deliveries land — the callback URL a registered hook posts to
+/// (ADR-0046: separate endpoints per forge, each bound to its adapter and
+/// verification secret, so there is no payload-sniffing on a shared path).
+fn forge_webhook_url(public_url: &str, kind: scarab_forge::ForgeKind) -> String {
+    format!(
+        "{}/webhooks/{}",
+        public_url.trim_end_matches('/'),
+        kind.as_str()
+    )
+}
+
 /// The registered forge connections and their health (ADR-0060 part C) — what
 /// the global Settings **Connections** section renders.
 ///
@@ -5795,9 +5843,17 @@ async fn list_connections(
         // rather than probed: probing means a live forge round-trip per connection
         // on every render of the Settings page. This only decides whether a button
         // is offered — `POST …/resync` is the authority and answers 501 if an
-        // adapter really cannot.
-        let supports_resync = st.forge.is_some()
-            && matches!(conn.kind, scarab_forge::ForgeKind::GitHub);
+        // adapter really cannot. Both shipped adapters can enumerate as of
+        // ADR-0060 slice 5 (`/user/repos` on Forgejo), which is also what lets the
+        // bind pick-list exist.
+        // Listed per kind rather than as "anything wired", so a future adapter
+        // that cannot enumerate has to be added here deliberately instead of
+        // inheriting a button that always errors.
+        let supports_resync = (st.forge.is_some() || st.forge_adapters.is_some())
+            && matches!(
+                conn.kind,
+                scarab_forge::ForgeKind::GitHub | scarab_forge::ForgeKind::Forgejo
+            );
         out.push(ConnectionDto {
             web_url: forge_web_host(conn.kind, &conn.base_url),
             id: conn.id,
@@ -5845,12 +5901,15 @@ async fn resync_connection(
 ) -> Result<Json<ResyncResultDto>, ApiError> {
     authorize_org_administer(&st, &headers).await?;
     let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
-    let forge = st.forge.as_ref().ok_or(ApiError::NotFound)?;
     let conn = connections
         .get_connection(&id)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?
         .ok_or(ApiError::NotFound)?;
+    // THIS connection's adapter, not the repo-routed port: enumeration is a
+    // connection-scoped question, and a connection whose registry drifted to
+    // empty has no repo left to route through.
+    let forge = connection_adapter(&st, &conn).await?;
 
     let reported = match forge.list_accessible_repos().await {
         Ok(repos) => repos,
@@ -6106,6 +6165,321 @@ async fn delete_connection(
                 .map_err(secret_err)?;
         }
     }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /v1/connections/{id}/available-repos`: what the connection's credential
+/// reaches, and which of those Scarab already governs.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AvailableRepoDto {
+    pub owner: String,
+    pub name: String,
+    /// Already a Project on this connection — the bind form renders it as done
+    /// rather than offering a no-op that silently re-homes a live binding.
+    pub bound: bool,
+}
+
+/// `POST /v1/connections/{id}/repos` body: the repo to bring under governance.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BindRepoRequest {
+    pub owner: String,
+    pub name: String,
+    /// Also create the forge-side webhook, so a push actually reaches Scarab.
+    /// Defaults to **true**: a bound repo with no hook is a Project that silently
+    /// never builds, which is not a state anyone asks for on purpose.
+    #[serde(default = "default_true")]
+    pub register_webhook: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The outcome of binding a repo: the Project it created, and what happened to
+/// the webhook.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BindRepoResultDto {
+    /// The governed Project's natural key — `(owner, name)` in v1 (1 Project : 1
+    /// RepoRef), the same mapping installation auto-registration uses.
+    pub org: String,
+    pub project: String,
+    /// Did a forge-side webhook get registered (or already exist)?
+    pub webhook_registered: bool,
+    /// Why it did not, when it did not. The binding still stands — see the
+    /// handler's note on why a hook failure is reported rather than rolled back.
+    pub webhook_error: Option<String>,
+}
+
+/// The repos a connection's credential can reach (ADR-0060) — the **pick-list**
+/// the bind form offers instead of asking an admin to type `owner/name` and get
+/// it right.
+///
+/// The forge is the authority on what a connection covers, so this is a live
+/// call, not a cached view. An adapter that cannot enumerate answers 501 rather
+/// than an empty list: "I cannot look" and "there is nothing there" must not read
+/// the same, or an admin concludes their token is scoped wrong.
+#[utoipa::path(
+    get,
+    path = "/v1/connections/{id}/available-repos",
+    summary = "Repos this connection's credential can reach, for the bind pick-list (ADR-0060)",
+    params(("id" = String, Path, description = "connection id")),
+    responses(
+        (status = 200, body = [AvailableRepoDto]),
+        (status = 403, description = "requires Administer on the org"),
+        (status = 404, description = "no such connection, or no registry/forge wired"),
+        (status = 501, description = "this forge adapter cannot enumerate repos")
+    )
+)]
+async fn available_repos(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<AvailableRepoDto>>, ApiError> {
+    authorize_org_administer(&st, &headers).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let conn = connections
+        .get_connection(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    let forge = connection_adapter(&st, &conn).await?;
+
+    let reported = match forge.list_accessible_repos().await {
+        Ok(repos) => repos,
+        Err(scarab_forge::ForgeError::Unsupported(what)) => {
+            return Err(ApiError::NotImplemented(format!(
+                "{} cannot enumerate repos ({what})",
+                conn.kind.as_str()
+            )))
+        }
+        Err(e) => return Err(ApiError::BadRequest(e.to_string())),
+    };
+    let bound: std::collections::BTreeSet<scarab_forge::RepoRef> = connections
+        .repos_of(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .into_iter()
+        .collect();
+    let mut out: Vec<AvailableRepoDto> = reported
+        .into_iter()
+        .map(|repo| AvailableRepoDto {
+            bound: bound.contains(&repo),
+            owner: repo.owner,
+            name: repo.name,
+        })
+        .collect();
+    out.sort_by(|a, b| (&a.owner, &a.name).cmp(&(&b.owner, &b.name)));
+    Ok(Json(out))
+}
+
+/// Bind a repo to this connection — **which is how a Project comes into being**
+/// (ADR-0060 part C).
+///
+/// There is no `projects` table: a Project *is* a `forge_repos` binding
+/// (ADR-0046), so this endpoint is the repo→Project onboarding flow for any forge
+/// without installation-style auto-registration. After it, the repo appears on
+/// `GET /v1/repos`, can hold Environments and secrets, and its pushes resolve to
+/// a tenant. GitHub keeps binding itself from the `installation` webhook; this is
+/// the Forgejo path.
+///
+/// Registration is attempted **after** the binding lands and its failure is
+/// *reported, not rolled back*: the binding is the durable governance fact, a
+/// hook is a remote side effect on a system that may be momentarily unreachable,
+/// and unbinding on a failed hook call would delete a Project an admin just
+/// asked for. `POST …/repos/{owner}/{name}/webhook` retries.
+#[utoipa::path(
+    post,
+    path = "/v1/connections/{id}/repos",
+    summary = "Bind a repo to a connection, creating its Project, and register its webhook (ADR-0060)",
+    params(("id" = String, Path, description = "connection id")),
+    request_body = BindRepoRequest,
+    responses(
+        (status = 200, body = BindRepoResultDto),
+        (status = 400, description = "missing owner/name"),
+        (status = 403, description = "requires Administer on the org"),
+        (status = 404, description = "no such connection, or no registry wired"),
+        (status = 409, description = "the repo is already bound to a different connection")
+    )
+)]
+async fn bind_repo(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(req): Json<BindRepoRequest>,
+) -> Result<Json<BindRepoResultDto>, ApiError> {
+    authorize_org_administer(&st, &headers).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let conn = connections
+        .get_connection(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    let repo = scarab_forge::RepoRef {
+        owner: req.owner.trim().to_string(),
+        name: req.name.trim().to_string(),
+    };
+    if repo.owner.is_empty() || repo.name.is_empty() {
+        return Err(ApiError::BadRequest("owner and name are required".into()));
+    }
+
+    // `bind_repo` upserts, so re-binding a repo owned by ANOTHER connection would
+    // silently re-home a live Project onto a different forge account. A v1
+    // `RepoRef` is globally unique across connections (ADR-0046), so this is a
+    // conflict, not a move.
+    if let Some(existing) = connections
+        .resolve(&repo)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+    {
+        if existing.connection.id != id {
+            return Err(ApiError::Conflict(format!(
+                "{}/{} is already bound to connection `{}`",
+                repo.owner, repo.name, existing.connection.id
+            )));
+        }
+    }
+
+    // Project name = repo name, org = repo owner — identical to the mapping
+    // `apply_installation_sync` and re-sync use, so a manually-bound Project is
+    // indistinguishable from an auto-registered one.
+    connections
+        .bind_repo(&id, &repo, &repo.owner, &repo.name)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    let (webhook_registered, webhook_error) = if req.register_webhook {
+        match try_register_webhook(&st, &conn, &repo).await {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e)),
+        }
+    } else {
+        (false, None)
+    };
+    Ok(Json(BindRepoResultDto {
+        org: repo.owner,
+        project: repo.name,
+        webhook_registered,
+        webhook_error,
+    }))
+}
+
+/// Register the forge-side webhook for `repo` on `conn`, returning the failure as
+/// a human string. Idempotent by adapter contract (Forgejo skips a hook that
+/// already points at the same callback URL); a documented no-op on GitHub, where
+/// the App receives every installation's events on one endpoint.
+async fn try_register_webhook(
+    st: &AppState,
+    conn: &scarab_forge::ForgeConnection,
+    repo: &scarab_forge::RepoRef,
+) -> Result<(), String> {
+    let forge = connection_adapter(st, conn)
+        .await
+        .map_err(|_| "no forge adapter is wired for this connection".to_string())?;
+    let callback = forge_webhook_url(&st.public_url, conn.kind);
+    forge
+        .register_webhook(repo, &callback)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Register (or re-register) a bound repo's webhook — the retry for the one step
+/// of onboarding that depends on the forge being reachable *right now*.
+///
+/// Only for a repo this connection already governs: registering a hook that
+/// points at Scarab for a repo Scarab has no Project for would produce deliveries
+/// that resolve to nothing.
+#[utoipa::path(
+    post,
+    path = "/v1/connections/{id}/repos/{owner}/{name}/webhook",
+    summary = "Register the forge-side webhook for a bound repo (ADR-0046 register_webhook)",
+    params(
+        ("id" = String, Path, description = "connection id"),
+        ("owner" = String, Path, description = "repo owner"),
+        ("name" = String, Path, description = "repo name")
+    ),
+    responses(
+        (status = 200, body = BindRepoResultDto),
+        (status = 400, description = "the forge rejected the registration"),
+        (status = 403, description = "requires Administer on the org"),
+        (status = 404, description = "no such connection, or the repo is not bound to it")
+    )
+)]
+async fn register_repo_webhook(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, owner, name)): Path<(String, String, String)>,
+) -> Result<Json<BindRepoResultDto>, ApiError> {
+    authorize_org_administer(&st, &headers).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let conn = connections
+        .get_connection(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    let repo = scarab_forge::RepoRef { owner, name };
+    let resolved = connections
+        .resolve(&repo)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .filter(|r| r.connection.id == id)
+        .ok_or(ApiError::NotFound)?;
+
+    try_register_webhook(&st, &conn, &repo)
+        .await
+        .map_err(ApiError::BadRequest)?;
+    Ok(Json(BindRepoResultDto {
+        org: resolved.org,
+        project: resolved.project,
+        webhook_registered: true,
+        webhook_error: None,
+    }))
+}
+
+/// Unbind a repo — **which removes its Project** (ADR-0060 part C).
+///
+/// The inverse of the bind above, and destructive in the same measure: the
+/// binding is the Project, so its Environments, scoped secrets and RBAC go with
+/// it. That is why re-sync never does this on a forge's say-so and why this is an
+/// explicit, human-addressed endpoint.
+///
+/// The forge-side webhook is deliberately **left in place**. Deleting hooks is
+/// not in the port (ADR-0046 exposes registration only), and a stale hook is
+/// harmless: an unbound repo's deliveries resolve to nothing and are dropped.
+#[utoipa::path(
+    delete,
+    path = "/v1/connections/{id}/repos/{owner}/{name}",
+    summary = "Unbind a repo from a connection, removing its Project (ADR-0060)",
+    params(
+        ("id" = String, Path, description = "connection id"),
+        ("owner" = String, Path, description = "repo owner"),
+        ("name" = String, Path, description = "repo name")
+    ),
+    responses(
+        (status = 204, description = "repo unbound"),
+        (status = 403, description = "requires Administer on the org"),
+        (status = 404, description = "no such connection, or the repo is not bound to it")
+    )
+)]
+async fn unbind_repo(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((id, owner, name)): Path<(String, String, String)>,
+) -> Result<StatusCode, ApiError> {
+    authorize_org_administer(&st, &headers).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let repo = scarab_forge::RepoRef { owner, name };
+    // 404 rather than a silent 204 for a repo this connection does not govern: an
+    // unbind aimed at the wrong connection must not read as "already gone".
+    connections
+        .resolve(&repo)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .filter(|r| r.connection.id == id)
+        .ok_or(ApiError::NotFound)?;
+    connections
+        .unbind_repo(&id, &repo)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6454,6 +6828,10 @@ impl utoipa::Modify for TagGroups {
         create_connection,
         delete_connection,
         resync_connection,
+        available_repos,
+        bind_repo,
+        register_repo_webhook,
+        unbind_repo,
         ingest_step_results,
         create_run,
         dispatch,
@@ -6519,6 +6897,9 @@ impl utoipa::Modify for TagGroups {
         ConnectionProjectDto,
         CreateConnectionRequest,
         CreatedConnectionDto,
+        AvailableRepoDto,
+        BindRepoRequest,
+        BindRepoResultDto,
         ResyncResultDto,
         MeResponse
     ))
@@ -6629,6 +7010,16 @@ fn router_inner(state: AppState) -> Router {
             axum::routing::delete(delete_connection),
         )
         .route("/v1/connections/{id}/resync", post(resync_connection))
+        .route("/v1/connections/{id}/available-repos", get(available_repos))
+        .route("/v1/connections/{id}/repos", post(bind_repo))
+        .route(
+            "/v1/connections/{id}/repos/{owner}/{name}",
+            axum::routing::delete(unbind_repo),
+        )
+        .route(
+            "/v1/connections/{id}/repos/{owner}/{name}/webhook",
+            post(register_repo_webhook),
+        )
         .route("/v1/repos/{org}/{repo}/secrets/matrix", get(secret_matrix))
         .route(
             "/v1/repos/{org}/{repo}/secrets/matrix/silenced",

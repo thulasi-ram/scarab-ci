@@ -405,6 +405,27 @@ const connections = [
     supports_resync: true,
     managed_by_config: false,
   },
+  // A self-hosted Forgejo connection — the manually-onboarded kind (ADR-0060
+  // parts C/D), so the repo add/remove + webhook affordances render.
+  {
+    id: "forgejo-7f3a91c2",
+    kind: "forgejo",
+    base_url: "https://git.acme.dev",
+    web_url: "https://git.acme.dev",
+    credential_ref: "forgejo-7f3a91c2-credential",
+    credential_present: true,
+    last_delivery_at: ago(3_600_000),
+    projects: [{ org: "acme", project: "infra", owner: "acme", name: "infra" }],
+    supports_resync: true,
+    managed_by_config: false,
+  },
+];
+
+// What the Forgejo credential reaches — the bind pick-list (ADR-0060 slice 5).
+const availableRepos = [
+  { owner: "acme", name: "infra", bound: true },
+  { owner: "acme", name: "terraform-modules", bound: false },
+  { owner: "acme", name: "runbooks", bound: false },
 ];
 // The coverage matrix is now the repo/environment secret EDITOR (ADR-0060), so
 // the fixture carries the repo-default column ("") and inheritance origins:
@@ -465,6 +486,7 @@ function route(pathname: string, search: string): Response | null {
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) return json({ refs: [] });
 
   if (p === "/v1/connections") return json(connections);
+  if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);
   // Secret names are scope-addressed: no `repo=` is the org scope (ADR-0060).
   if (p === "/v1/secrets") {
     const scoped = new URLSearchParams(search).has("repo");

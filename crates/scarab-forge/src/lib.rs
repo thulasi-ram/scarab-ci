@@ -688,6 +688,25 @@ pub struct ForgeConnection {
     pub credential_ref: String,
 }
 
+/// Construct the vendor adapter that serves one [`ForgeConnection`] — the
+/// **connection-scoped** counterpart to routing a call by its repo.
+///
+/// Repo-routed resolution (`repo → registry → connection → adapter`) cannot
+/// answer a connection-scoped question, and the questions onboarding asks are
+/// exactly those: *which repos does this credential reach* and *register a
+/// webhook on this repo* both apply to a connection with **nothing bound yet** —
+/// there is no repo to route through until binding has already happened.
+///
+/// The implementation is composition-root glue (it knows every adapter crate and
+/// where credentials live), so only its shape lives in this pure crate.
+#[async_trait]
+pub trait ForgeAdapters: Send + Sync {
+    async fn adapter_for_connection(
+        &self,
+        conn: &ForgeConnection,
+    ) -> Result<std::sync::Arc<dyn ForgePort>, ForgeError>;
+}
+
 /// The result of resolving a [`RepoRef`] through the registry: which
 /// connection (forge, base URL, credential handle) serves it, and which
 /// governed Project owns it (ADR-0046: `ForgeConnection` resolves
