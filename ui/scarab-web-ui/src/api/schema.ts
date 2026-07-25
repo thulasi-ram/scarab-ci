@@ -398,11 +398,34 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The secret parity matrix (ADR-0037) - names + status, never values */
+        /**
+         * The secret coverage matrix (ADR-0037) - names + status, never values
+         * @description Names + status only, never values — the same `Administer` capability as
+         *     listing secrets. This is the read model behind the Project Secrets editor,
+         *     which writes through the scoped `/v1/secrets` endpoints.
+         */
         get: operations["secret_matrix"];
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/repos/{org}/{repo}/secrets/matrix/silenced": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Mark a coverage cell intentionally unset (ADR-0037, advisory) */
+        put: operations["silence_secret_cell"];
+        post?: never;
+        /** Drop an intentionally-unset marker (ADR-0037, advisory) */
+        delete: operations["unsilence_secret_cell"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1348,18 +1371,43 @@ export interface components {
             names: string[];
         };
         /**
-         * @description `GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory parity view
-         *     (ADR-0037). For each secret key, its **effective** status per environment
-         *     after inheritance — never a value. `unset` where the key resolves to nothing.
+         * @description `GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory coverage view
+         *     (ADR-0037 D) and — since ADR-0060 — the model behind the *editor* for repo-
+         *     and environment-scoped values. For each key, its **effective** status per
+         *     column after inheritance; never a value.
          */
         SecretMatrix: {
-            /** @description The repo's environments, in the order the columns should render. */
+            /**
+             * @description Column ids in render order: [`REPO_DEFAULT_COLUMN`] first (the repo-scope
+             *     default that the environments fall through to), then each environment.
+             */
+            columns: string[];
+            /**
+             * @description The repo's environments, in column order. A subset of `columns` — kept
+             *     separate so a client can tell an environment column from the repo one
+             *     without reasoning about the reserved id.
+             */
             environments: string[];
             keys: components["schemas"]["SecretMatrixRow"][];
         };
         SecretMatrixRow: {
+            /**
+             * @description For each `inherited` cell, the scope it resolves from — `"repo"` or
+             *     `"org"`. Lets a cell say *what* it would be overriding, so an edit reads
+             *     as "override the repo default" rather than an unexplained write.
+             */
+            inherited_from: {
+                [key: string]: string;
+            };
             key: string;
-            /** @description `environment name -> "set" | "inherited" | "unset"`. */
+            /**
+             * @description `column id -> "set" | "inherited" | "unset" | "silenced"`.
+             *
+             *     `set` = a value lives at exactly that scope · `inherited` = none here, but
+             *     it resolves from a broader scope · `unset` = resolves to nothing ·
+             *     `silenced` = unset **on purpose** (an ADR-0037 marker). Only a genuinely
+             *     unset cell can be silenced: a marker never hides a real value.
+             */
             status: {
                 [key: string]: string;
             };
@@ -1386,6 +1434,16 @@ export interface components {
              * @description The Take generation this instance belongs to (a Rerun opens a new one).
              */
             take: number;
+        };
+        /**
+         * @description `PUT …/secrets/matrix/silenced` body — and, as a query, the `DELETE`
+         *     selector: the one cell to annotate. Omitting `environment` addresses the
+         *     repo-scope default column. The Project is in the path, so unlike
+         *     [`SecretScopeQuery`] this carries no org/repo.
+         */
+        SilenceCellRequest: {
+            environment?: string | null;
+            key: string;
         };
         /** @description One step (IR subset): the step contract is an OCI `image` + `command`. */
         StepDto: {
@@ -2153,6 +2211,65 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["SecretMatrix"];
                 };
+            };
+        };
+    };
+    silence_secret_cell: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SilenceCellRequest"];
+            };
+        };
+        responses: {
+            /** @description marked (idempotent) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description coverage annotations not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unsilence_secret_cell: {
+        parameters: {
+            query: {
+                /** @description secret key */
+                key: string;
+                /** @description environment column; omitted = the repo default */
+                environment?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description cleared (idempotent) */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description coverage annotations not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

@@ -104,6 +104,10 @@ pub struct AppState {
     /// Environments + deployment history store. `None` disables the environment
     /// endpoints.
     pub environments: Option<Arc<dyn scarab_project::EnvironmentStore>>,
+    /// "Intentionally unset" markers for the secret coverage matrix (ADR-0037 D).
+    /// Advisory annotations only — `None` disables marking, and the matrix simply
+    /// reports nothing silenced. Never consulted on a run path.
+    pub secret_coverage: Option<Arc<dyn scarab_project::SecretCoverageStore>>,
     /// The OIDC issuer. When set, serves JWKS + discovery for keyless federation.
     pub oidc: Option<Arc<oidc::Rs256Issuer>>,
     /// HMAC secret for external-gate release tokens (ADR-0034). `None` disables
@@ -161,6 +165,7 @@ impl AppState {
             auth: None,
             sessions: None,
             environments: None,
+            secret_coverage: None,
             oidc: None,
             gate_token_secret: None,
             secrets: None,
@@ -206,6 +211,15 @@ impl AppState {
         environments: Arc<dyn scarab_project::EnvironmentStore>,
     ) -> Self {
         self.environments = Some(environments);
+        self
+    }
+
+    /// Enable "intentionally unset" coverage annotations (ADR-0037 D).
+    pub fn with_secret_coverage(
+        mut self,
+        store: Arc<dyn scarab_project::SecretCoverageStore>,
+    ) -> Self {
+        self.secret_coverage = Some(store);
         self
     }
 
@@ -707,12 +721,25 @@ pub struct SecretListResponse {
     pub names: Vec<String>,
 }
 
-/// `GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory parity view
-/// (ADR-0037). For each secret key, its **effective** status per environment
-/// after inheritance — never a value. `unset` where the key resolves to nothing.
+/// The column id of the repo-scope default in the coverage matrix (ADR-0060).
+///
+/// A reserved id rather than a separate field, so a row is one flat
+/// `column -> status` map that the UI can index uniformly. An environment named
+/// `""` is impossible, so it cannot collide.
+pub const REPO_DEFAULT_COLUMN: &str = "";
+
+/// `GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory coverage view
+/// (ADR-0037 D) and — since ADR-0060 — the model behind the *editor* for repo-
+/// and environment-scoped values. For each key, its **effective** status per
+/// column after inheritance; never a value.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SecretMatrix {
-    /// The repo's environments, in the order the columns should render.
+    /// Column ids in render order: [`REPO_DEFAULT_COLUMN`] first (the repo-scope
+    /// default that the environments fall through to), then each environment.
+    pub columns: Vec<String>,
+    /// The repo's environments, in column order. A subset of `columns` — kept
+    /// separate so a client can tell an environment column from the repo one
+    /// without reasoning about the reserved id.
     pub environments: Vec<String>,
     pub keys: Vec<SecretMatrixRow>,
 }
@@ -720,8 +747,28 @@ pub struct SecretMatrix {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SecretMatrixRow {
     pub key: String,
-    /// `environment name -> "set" | "inherited" | "unset"`.
+    /// `column id -> "set" | "inherited" | "unset" | "silenced"`.
+    ///
+    /// `set` = a value lives at exactly that scope · `inherited` = none here, but
+    /// it resolves from a broader scope · `unset` = resolves to nothing ·
+    /// `silenced` = unset **on purpose** (an ADR-0037 marker). Only a genuinely
+    /// unset cell can be silenced: a marker never hides a real value.
     pub status: std::collections::BTreeMap<String, String>,
+    /// For each `inherited` cell, the scope it resolves from — `"repo"` or
+    /// `"org"`. Lets a cell say *what* it would be overriding, so an edit reads
+    /// as "override the repo default" rather than an unexplained write.
+    pub inherited_from: std::collections::BTreeMap<String, String>,
+}
+
+/// `PUT …/secrets/matrix/silenced` body — and, as a query, the `DELETE`
+/// selector: the one cell to annotate. Omitting `environment` addresses the
+/// repo-scope default column. The Project is in the path, so unlike
+/// [`SecretScopeQuery`] this carries no org/repo.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SilenceCellRequest {
+    pub key: String,
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -5356,12 +5403,17 @@ async fn list_deployments(
     Ok(Json(history))
 }
 
-/// The advisory secret parity matrix for a repo (ADR-0037): each key's effective
-/// status per environment — `set` (defined at that env's scope), `inherited`
-/// (resolves from repo/org scope), or `unset`. Post-inheritance, so a shared key
-/// defined once at repo scope never reads as missing. Names + status only, never
-/// values — same `Administer` capability as listing secrets.
-#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/secrets/matrix", summary = "The secret parity matrix (ADR-0037) - names + status, never values", responses((status = 200, body = SecretMatrix)))]
+/// The secret coverage matrix for a repo (ADR-0037 D, editable since ADR-0060):
+/// each key's effective status in the **repo default** column and in each
+/// environment column — `set` (a value at exactly that scope), `inherited`
+/// (resolves from a broader scope, with `inherited_from` naming which),
+/// `silenced` (unset on purpose), or `unset`. Post-inheritance, so a key defined
+/// once at repo scope never reads as missing anywhere.
+///
+/// Names + status only, never values — the same `Administer` capability as
+/// listing secrets. This is the read model behind the Project Secrets editor,
+/// which writes through the scoped `/v1/secrets` endpoints.
+#[utoipa::path(get, path = "/v1/repos/{org}/{repo}/secrets/matrix", summary = "The secret coverage matrix (ADR-0037) - names + status, never values", responses((status = 200, body = SecretMatrix)))]
 async fn secret_matrix(
     State(st): State<AppState>,
     headers: HeaderMap,
@@ -5378,62 +5430,180 @@ async fn secret_matrix(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let env_names: Vec<String> = environments.iter().map(|e| e.name.clone()).collect();
 
-    // Keys resolvable by *any* environment via inheritance (repo + org scope).
-    let mut inherited: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for scope in [
-        scarab_secrets::SecretScope::Org { org: org.clone() },
-        scarab_secrets::SecretScope::Repo {
-            org: org.clone(),
-            repo: repo.clone(),
-        },
-    ] {
-        inherited.extend(secrets.list_scoped(&scope).await.map_err(secret_err)?);
-    }
+    // The two broader scopes, kept apart (not merged as "inherited") so a cell
+    // can name where it falls through FROM — the difference between overriding
+    // the repo default and overriding an org-wide value.
+    let keys_at = |scope: scarab_secrets::SecretScope| async move {
+        secrets
+            .list_scoped(&scope)
+            .await
+            .map(|v| v.into_iter().collect::<std::collections::BTreeSet<_>>())
+            .map_err(secret_err)
+    };
+    let org_keys = keys_at(scarab_secrets::SecretScope::Org { org: org.clone() }).await?;
+    let repo_keys = keys_at(scarab_secrets::SecretScope::Repo {
+        org: org.clone(),
+        repo: repo.clone(),
+    })
+    .await?;
 
     // Keys defined directly at each environment's scope.
     let mut env_keys: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
-    let mut all_keys: std::collections::BTreeSet<String> = inherited.clone();
+    let mut all_keys: std::collections::BTreeSet<String> =
+        org_keys.union(&repo_keys).cloned().collect();
     for name in &env_names {
-        let scope = scarab_secrets::SecretScope::Environment {
+        let keys = keys_at(scarab_secrets::SecretScope::Environment {
             org: org.clone(),
             repo: repo.clone(),
             environment: name.clone(),
-        };
-        let keys: std::collections::BTreeSet<String> = secrets
-            .list_scoped(&scope)
-            .await
-            .map_err(secret_err)?
-            .into_iter()
-            .collect();
+        })
+        .await?;
         all_keys.extend(keys.iter().cloned());
         env_keys.insert(name.clone(), keys);
     }
 
+    // Advisory annotations. A deployment with no coverage store still gets a
+    // matrix — it just has nothing marked (the markers are not correctness).
+    let mut silenced: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
+    if let Some(store) = st.secret_coverage.as_ref() {
+        for (column, key) in store
+            .silenced(&org, &repo)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        {
+            silenced.insert((column.unwrap_or_default(), key));
+        }
+    }
+    // A marker on a key that no longer exists anywhere would otherwise be
+    // invisible; surface those rows so the annotation can be cleaned up.
+    all_keys.extend(silenced.iter().map(|(_, key)| key.clone()));
+
+    let mut columns = vec![REPO_DEFAULT_COLUMN.to_string()];
+    columns.extend(env_names.iter().cloned());
+
     let keys = all_keys
         .into_iter()
         .map(|key| {
-            let status = env_names
-                .iter()
-                .map(|env| {
-                    let s = if env_keys.get(env).is_some_and(|k| k.contains(&key)) {
-                        "set"
-                    } else if inherited.contains(&key) {
+            let mut status = std::collections::BTreeMap::new();
+            let mut inherited_from = std::collections::BTreeMap::new();
+            for column in &columns {
+                // Where a value sits at *exactly* this column's scope.
+                let set_here = if column == REPO_DEFAULT_COLUMN {
+                    repo_keys.contains(&key)
+                } else {
+                    env_keys.get(column).is_some_and(|k| k.contains(&key))
+                };
+                // What it falls through to, nearest broader scope first.
+                let from = if set_here {
+                    None
+                } else if column != REPO_DEFAULT_COLUMN && repo_keys.contains(&key) {
+                    Some("repo")
+                } else if org_keys.contains(&key) {
+                    Some("org")
+                } else {
+                    None
+                };
+                let s = match (set_here, from) {
+                    (true, _) => "set",
+                    (false, Some(origin)) => {
+                        inherited_from.insert(column.clone(), origin.to_string());
                         "inherited"
-                    } else {
-                        "unset"
-                    };
-                    (env.clone(), s.to_string())
-                })
-                .collect();
-            SecretMatrixRow { key, status }
+                    }
+                    // Only a genuinely empty cell can be silenced.
+                    (false, None) if silenced.contains(&(column.clone(), key.clone())) => {
+                        "silenced"
+                    }
+                    (false, None) => "unset",
+                };
+                status.insert(column.clone(), s.to_string());
+            }
+            SecretMatrixRow {
+                key,
+                status,
+                inherited_from,
+            }
         })
         .collect();
 
     Ok(Json(SecretMatrix {
+        columns,
         environments: env_names,
         keys,
     }))
+}
+
+/// Mark a coverage cell as **intentionally unset** (ADR-0037 D). Purely
+/// advisory: it silences one cell of the matrix and has no effect on secret
+/// resolution, admission, or any run. Idempotent. `Administer`, like the rest of
+/// the secret surface.
+#[utoipa::path(
+    put,
+    path = "/v1/repos/{org}/{repo}/secrets/matrix/silenced",
+    summary = "Mark a coverage cell intentionally unset (ADR-0037, advisory)",
+    request_body = SilenceCellRequest,
+    responses(
+        (status = 204, description = "marked (idempotent)"),
+        (status = 404, description = "coverage annotations not configured")
+    )
+)]
+async fn silence_secret_cell(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo)): Path<(String, String)>,
+    Json(req): Json<SilenceCellRequest>,
+) -> Result<StatusCode, ApiError> {
+    let scope = rbac_scope(&org, Some(&repo));
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    let store = st.secret_coverage.as_ref().ok_or(ApiError::NotFound)?;
+    if req.key.is_empty() {
+        return Err(ApiError::BadRequest("key is required".into()));
+    }
+    store
+        .silence(&org, &repo, coverage_column(&req.environment), &req.key)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Drop an "intentionally unset" marker (ADR-0037 D). Idempotent.
+#[utoipa::path(
+    delete,
+    path = "/v1/repos/{org}/{repo}/secrets/matrix/silenced",
+    summary = "Drop an intentionally-unset marker (ADR-0037, advisory)",
+    params(
+        ("key" = String, Query, description = "secret key"),
+        ("environment" = Option<String>, Query, description = "environment column; omitted = the repo default")
+    ),
+    responses(
+        (status = 204, description = "cleared (idempotent)"),
+        (status = 404, description = "coverage annotations not configured")
+    )
+)]
+async fn unsilence_secret_cell(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, repo)): Path<(String, String)>,
+    Query(q): Query<SilenceCellRequest>,
+) -> Result<StatusCode, ApiError> {
+    let scope = rbac_scope(&org, Some(&repo));
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    let store = st.secret_coverage.as_ref().ok_or(ApiError::NotFound)?;
+    if q.key.is_empty() {
+        return Err(ApiError::BadRequest("key is required".into()));
+    }
+    store
+        .unsilence(&org, &repo, coverage_column(&q.environment), &q.key)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// An optional environment name as a coverage column: `None` (or an empty
+/// string, which no environment can be named) is the repo-default column.
+fn coverage_column(environment: &Option<String>) -> scarab_project::CoverageColumn<'_> {
+    environment.as_deref().filter(|e| !e.is_empty())
 }
 
 /// The reserved secret-scope org under which forge-connection credentials live
@@ -5768,6 +5938,8 @@ impl utoipa::Modify for TagGroups {
         delete_environment,
         list_deployments,
         secret_matrix,
+        silence_secret_cell,
+        unsilence_secret_cell,
         ingest_step_results,
         create_run,
         dispatch,
@@ -5826,6 +5998,9 @@ impl utoipa::Modify for TagGroups {
         WorkspaceListing,
         PutSecretRequest,
         SecretListResponse,
+        SecretMatrix,
+        SecretMatrixRow,
+        SilenceCellRequest,
         MeResponse
     ))
 )]
@@ -5927,6 +6102,10 @@ fn router_inner(state: AppState) -> Router {
             get(list_deployments),
         )
         .route("/v1/repos/{org}/{repo}/secrets/matrix", get(secret_matrix))
+        .route(
+            "/v1/repos/{org}/{repo}/secrets/matrix/silenced",
+            axum::routing::put(silence_secret_cell).delete(unsilence_secret_cell),
+        )
         .route("/v1/repos/{org}/{repo}/refs", get(list_refs))
         .route("/v1/repos/{org}/{repo}/pipelines", get(list_pipelines))
         .route(

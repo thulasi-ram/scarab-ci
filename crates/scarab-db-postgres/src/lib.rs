@@ -2141,6 +2141,77 @@ impl EnvironmentStore for PostgresDb {
     }
 }
 
+/// "Intentionally unset" markers for the advisory coverage matrix (ADR-0037 D).
+/// The repo-default column is stored as `environment = ''` (see migration 0037).
+#[async_trait]
+impl scarab_project::SecretCoverageStore for PostgresDb {
+    async fn silence(
+        &self,
+        org: &str,
+        project: &str,
+        column: scarab_project::CoverageColumn<'_>,
+        key: &str,
+    ) -> Result<(), ProjectError> {
+        sqlx::query(
+            "INSERT INTO secret_unset_markers (org, project, environment, key)
+             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        )
+        .bind(org)
+        .bind(project)
+        .bind(column.unwrap_or(""))
+        .bind(key)
+        .execute(self.pool())
+        .await
+        .map_err(|e| ProjectError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn unsilence(
+        &self,
+        org: &str,
+        project: &str,
+        column: scarab_project::CoverageColumn<'_>,
+        key: &str,
+    ) -> Result<(), ProjectError> {
+        sqlx::query(
+            "DELETE FROM secret_unset_markers
+             WHERE org = $1 AND project = $2 AND environment = $3 AND key = $4",
+        )
+        .bind(org)
+        .bind(project)
+        .bind(column.unwrap_or(""))
+        .bind(key)
+        .execute(self.pool())
+        .await
+        .map_err(|e| ProjectError::Store(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn silenced(
+        &self,
+        org: &str,
+        project: &str,
+    ) -> Result<Vec<(Option<String>, String)>, ProjectError> {
+        let rows = sqlx::query(
+            "SELECT environment, key FROM secret_unset_markers
+             WHERE org = $1 AND project = $2",
+        )
+        .bind(org)
+        .bind(project)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| ProjectError::Store(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let env = r.get::<String, _>("environment");
+                let column = (!env.is_empty()).then_some(env);
+                (column, r.get::<String, _>("key"))
+            })
+            .collect())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Codecs: domain enums <-> the small, stable strings stored in TEXT columns.
 // Kept explicit (rather than leaning on serde) so the on-disk vocabulary is

@@ -385,12 +385,29 @@ const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"]
 // Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
 // Settings page's Org Secrets section (ADR-0060).
 const orgSecretNames = { names: ["GHCR_TOKEN", "SENTRY_DSN"] };
+// The coverage matrix is now the repo/environment secret EDITOR (ADR-0060), so
+// the fixture carries the repo-default column ("") and inheritance origins:
+// GHCR_TOKEN comes from the org, DATABASE_URL is a repo default overridden in
+// both environments, SLACK_WEBHOOK_URL is production-only with staging silenced.
 const secretMatrix = {
+  columns: ["", "staging", "production"],
   environments: ["staging", "production"],
   keys: [
-    { key: "GHCR_TOKEN", status: { staging: "inherited", production: "inherited" } },
-    { key: "DATABASE_URL", status: { staging: "set", production: "set" } },
-    { key: "SLACK_WEBHOOK_URL", status: { staging: "unset", production: "set" } },
+    {
+      key: "GHCR_TOKEN",
+      status: { "": "inherited", staging: "inherited", production: "inherited" },
+      inherited_from: { "": "org", staging: "org", production: "org" },
+    },
+    {
+      key: "DATABASE_URL",
+      status: { "": "set", staging: "set", production: "set" },
+      inherited_from: {},
+    },
+    {
+      key: "SLACK_WEBHOOK_URL",
+      status: { "": "unset", staging: "silenced", production: "set" },
+      inherited_from: {},
+    },
   ],
 };
 

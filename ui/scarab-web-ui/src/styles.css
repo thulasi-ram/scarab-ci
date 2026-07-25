@@ -1647,6 +1647,26 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 .secret-matrix .m-unset {
   color: var(--muted-sage);
 }
+/* `silenced` is a deliberate gap (ADR-0037): dimmer than `unset`, because the
+   whole point of the marker is that this cell should stop asking for attention. */
+.secret-matrix .m-silenced {
+  color: var(--muted-sage);
+  opacity: 0.55;
+}
+/* Editable variant (ADR-0060): each cell is a click target that writes AT its
+   column's scope. The repo-default column is separated by a rule — everything
+   right of it falls through to it, so the boundary is meaningful, not decorative. */
+.secret-matrix.editable .mcell {
+  cursor: pointer;
+  transition: background 0.12s var(--ease-out);
+}
+.secret-matrix.editable .mcell:hover {
+  background: var(--emerald-surface);
+}
+.secret-matrix.editable th.mdefault,
+.secret-matrix.editable tr > td:nth-child(2) {
+  border-right: 1px solid var(--border);
+}
 
 /* ════════════════════════════════════════════════════════════════════════
    Dashboard (engineer landing): action inbox · activity · all-clear

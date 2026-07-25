@@ -627,7 +627,8 @@
         "tags": [
           "Secrets"
         ],
-        "summary": "The secret parity matrix (ADR-0037) - names + status, never values",
+        "summary": "The secret coverage matrix (ADR-0037) - names + status, never values",
+        "description": "Names + status only, never values — the same `Administer` capability as\nlisting secrets. This is the read model behind the Project Secrets editor,\nwhich writes through the scoped `/v1/secrets` endpoints.",
         "operationId": "secret_matrix",
         "responses": {
           "200": {
@@ -639,6 +640,68 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/repos/{org}/{repo}/secrets/matrix/silenced": {
+      "put": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "Mark a coverage cell intentionally unset (ADR-0037, advisory)",
+        "operationId": "silence_secret_cell",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SilenceCellRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "marked (idempotent)"
+          },
+          "404": {
+            "description": "coverage annotations not configured"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "Drop an intentionally-unset marker (ADR-0037, advisory)",
+        "operationId": "unsilence_secret_cell",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "query",
+            "description": "secret key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "description": "environment column; omitted = the repo default",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "cleared (idempotent)"
+          },
+          "404": {
+            "description": "coverage annotations not configured"
           }
         }
       }
@@ -2398,18 +2461,26 @@
       },
       "SecretMatrix": {
         "type": "object",
-        "description": "`GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory parity view\n(ADR-0037). For each secret key, its **effective** status per environment\nafter inheritance — never a value. `unset` where the key resolves to nothing.",
+        "description": "`GET /v1/repos/{org}/{repo}/secrets/matrix` body: the advisory coverage view\n(ADR-0037 D) and — since ADR-0060 — the model behind the *editor* for repo-\nand environment-scoped values. For each key, its **effective** status per\ncolumn after inheritance; never a value.",
         "required": [
+          "columns",
           "environments",
           "keys"
         ],
         "properties": {
+          "columns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Column ids in render order: [`REPO_DEFAULT_COLUMN`] first (the repo-scope\ndefault that the environments fall through to), then each environment."
+          },
           "environments": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "The repo's environments, in the order the columns should render."
+            "description": "The repo's environments, in column order. A subset of `columns` — kept\nseparate so a client can tell an environment column from the repo one\nwithout reasoning about the reserved id."
           },
           "keys": {
             "type": "array",
@@ -2423,15 +2494,26 @@
         "type": "object",
         "required": [
           "key",
-          "status"
+          "status",
+          "inherited_from"
         ],
         "properties": {
+          "inherited_from": {
+            "type": "object",
+            "description": "For each `inherited` cell, the scope it resolves from — `\"repo\"` or\n`\"org\"`. Lets a cell say *what* it would be overriding, so an edit reads\nas \"override the repo default\" rather than an unexplained write.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "key": {
             "type": "string"
           },
           "status": {
             "type": "object",
-            "description": "`environment name -> \"set\" | \"inherited\" | \"unset\"`.",
+            "description": "`column id -> \"set\" | \"inherited\" | \"unset\" | \"silenced\"`.\n\n`set` = a value lives at exactly that scope · `inherited` = none here, but\nit resolves from a broader scope · `unset` = resolves to nothing ·\n`silenced` = unset **on purpose** (an ADR-0037 marker). Only a genuinely\nunset cell can be silenced: a marker never hides a real value.",
             "additionalProperties": {
               "type": "string"
             },
@@ -2468,6 +2550,24 @@
             "type": "integer",
             "format": "int64",
             "description": "The Take generation this instance belongs to (a Rerun opens a new one)."
+          }
+        }
+      },
+      "SilenceCellRequest": {
+        "type": "object",
+        "description": "`PUT …/secrets/matrix/silenced` body — and, as a query, the `DELETE`\nselector: the one cell to annotate. Omitting `environment` addresses the\nrepo-scope default column. The Project is in the path, so unlike\n[`SecretScopeQuery`] this carries no org/repo.",
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "type": "string"
           }
         }
       },
