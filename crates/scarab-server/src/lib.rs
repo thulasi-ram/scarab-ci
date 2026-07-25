@@ -4401,6 +4401,12 @@ const SESSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct LoginRequest {
     pub credential: String,
+    /// PKCE (RFC 7636) verifier, for an API/CLI client that ran its OWN
+    /// authorize redirect and therefore holds one (ADR-0049 amendment). Absent
+    /// = the pre-PKCE API shape, still accepted: this path never had a
+    /// server-side browser flow to carry a verifier through.
+    #[serde(default)]
+    pub code_verifier: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -4423,10 +4429,14 @@ async fn login(
     let (Some(auth), Some(sessions)) = (st.auth.as_ref(), st.sessions.as_ref()) else {
         return Err(ApiError::NotFound); // login not configured
     };
-    let principal = auth
-        .authenticate(&req.credential)
-        .await
-        .map_err(|_| ApiError::Unauthorized)?;
+    // A client that carries a verifier gets it replayed at the token endpoint;
+    // otherwise this is exactly the pre-PKCE port call.
+    let verifier = req.code_verifier.as_deref().filter(|v| !v.is_empty());
+    let principal = match (st.oauth_login.as_ref(), verifier) {
+        (Some(oauth), Some(v)) => oauth.exchange(&req.credential, Some(v), None).await,
+        _ => auth.authenticate(&req.credential).await,
+    }
+    .map_err(|_| ApiError::Unauthorized)?;
     let now = st.clock.now().await.0;
     let session = mint_session(principal.clone(), now);
     sessions
@@ -4475,23 +4485,28 @@ fn set_session_cookies(headers: &mut HeaderMap, session: &Session) {
     }
 }
 
-/// `GET /v1/auth/login` (ADR-0049): begin the browser OAuth flow — set an
-/// unguessable `state` (HttpOnly cookie, 10 min) and redirect to the
-/// provider's authorize endpoint.
+/// `GET /v1/auth/login` (ADR-0049): begin the browser OAuth flow — mint the
+/// login secrets (`state` + PKCE verifier + OIDC nonce), keep them in one
+/// HttpOnly cookie (10 min), and redirect to the provider's authorize endpoint
+/// with the `state` echo and the S256 `code_challenge`.
 #[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 404, description = "OAuth not configured")))]
 async fn oauth_login_redirect(State(st): State<AppState>) -> Result<Response, ApiError> {
-    let Some(flow) = st.oauth_login.as_ref() else {
+    let Some(provider) = st.oauth_login.as_ref() else {
         return Err(ApiError::NotFound);
     };
-    let state = Uuid::new_v4().to_string();
+    let flow = oauth::LoginFlow::generate();
     let redirect_uri = format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'));
-    let location = flow.authorize_redirect(&redirect_uri, &state);
+    let location = provider.authorize_redirect(&redirect_uri, &flow);
     let mut resp = (StatusCode::FOUND, ()).into_response();
     if let Ok(v) = axum::http::HeaderValue::from_str(&location) {
         resp.headers_mut().insert(axum::http::header::LOCATION, v);
     }
-    let cookie =
-        format!("scarab_oauth_state={state}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=600");
+    // The verifier never leaves the server except in this HttpOnly cookie —
+    // that is what makes the challenge on the redirect worth anything.
+    let cookie = format!(
+        "scarab_oauth_state={}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=600",
+        flow.to_cookie()
+    );
     if let Ok(v) = axum::http::HeaderValue::from_str(&cookie) {
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
@@ -4513,14 +4528,21 @@ async fn oauth_callback(
     let (Some(code), Some(state)) = (q.get("code"), q.get("state")) else {
         return Err(ApiError::BadRequest("missing code/state".into()));
     };
-    // The state cookie proves THIS browser started the flow (login-CSRF guard).
-    if cookie_value(&headers, "scarab_oauth_state").as_deref() != Some(state.as_str()) {
+    // The state cookie proves THIS browser started the flow (login-CSRF guard)
+    // and carries the flow's PKCE verifier + expected nonce.
+    let flow = cookie_value(&headers, "scarab_oauth_state")
+        .as_deref()
+        .and_then(oauth::LoginFlow::from_cookie);
+    let Some(flow) = flow.filter(|f| f.state == *state) else {
         return Err(ApiError::Unauthorized);
+    };
+    // The OAuth provider is the one that can honour PKCE/nonce; a non-OAuth
+    // authenticator (dev fakes) still goes through the port unchanged.
+    let principal = match st.oauth_login.as_ref() {
+        Some(oauth) => oauth.exchange(code, flow.verifier(), flow.nonce()).await,
+        None => auth.authenticate(code).await,
     }
-    let principal = auth
-        .authenticate(code)
-        .await
-        .map_err(|_| ApiError::Unauthorized)?;
+    .map_err(|_| ApiError::Unauthorized)?;
     let now = st.clock.now().await.0;
     let session = mint_session(principal, now);
     sessions

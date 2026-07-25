@@ -234,6 +234,57 @@ async fn cookie_mutation_requires_the_csrf_token_bearer_does_not() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
+/// The browser callback resolves the code through the `Authenticator` **port**,
+/// not the OAuth adapter: with a non-OAuth authenticator wired and no OAuth
+/// provider, a state-only flow cookie (nothing to replay, no nonce to check)
+/// still completes the login (ADR-0049 hardening amendment). The browser
+/// *redirect* is the part that needs a provider, so it 404s here.
+#[tokio::test]
+async fn browser_callback_uses_the_authenticator_port_without_an_oauth_provider() {
+    let app = app();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no OAuth provider");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/callback?code=alice-code&state=flow-1")
+                .header("cookie", "scarab_oauth_state=flow-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let session = resp
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|c| c.strip_prefix("scarab_session="))
+        .map(|rest| rest.split(';').next().unwrap_or("").to_string())
+        .expect("session cookie");
+
+    // The session is real: alice is a Member, so she may write.
+    let resp = app
+        .clone()
+        .oneshot(create_run_req(Some(&session)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
 #[tokio::test]
 async fn logout_revokes_the_session_and_expires_cookies() {
     let app = app();

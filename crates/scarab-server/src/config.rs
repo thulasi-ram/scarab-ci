@@ -39,11 +39,12 @@
 //! | `SCARAB_PLACEMENT_CONFIG_FILE` | env | path to the operator placement config (ADR-0055): cluster baseline + PlacementProfile registry (YAML/JSON, gitops-managed); a bad path/parse is a boot failure |
 //! | `SCARAB_GITHUB_APP_ID` | env | GitHub App id (ADR-0046): when set, GitHub connections authenticate in **App mode** (their credential secret is the App PEM); absent = token mode (dev) |
 //! | `SCARAB_OAUTH_CLIENT_ID` … `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | env | OAuth/OIDC login provider (ADR-0049): all five together enable real authn (GitHub, Forgejo, or any OIDC issuer); a partial set refuses boot |
-//! | `SCARAB_OAUTH_SCOPES` | env | space-separated scopes for the authorize redirect (optional; e.g. `read:user` for GitHub, `openid profile` for OIDC) |
+//! | `SCARAB_OAUTH_SCOPES` | env | space-separated scopes for the authorize redirect (optional; e.g. `read:user` for GitHub, `openid profile email` for OIDC) |
+//! | `SCARAB_OAUTH_ISSUER` | env | **optional** — the provider's OIDC issuer (`iss`), e.g. `https://dex.example`. Set it for a real OIDC issuer (Dex/Keycloak/Google): the `id_token` is then verified (JWKS via `{issuer}/.well-known/openid-configuration`, `iss`/`aud`/`exp`/`nonce`) and its claims are the identity; an invalid one fails the login. Unset = plain OAuth2 (GitHub/Forgejo): no `id_token` is trusted, userinfo is the identity. Setting it *without* the five above is partial config and refuses boot |
 //! | `SCARAB_RETENTION_LOG_DAYS` | env | terminal runs' log TTL in days (ADR-0050); default 30 — metadata is retained regardless |
 //! | `SCARAB_RETENTION_ARTIFACT_DAYS` | env | terminal runs' artifact TTL in days (ADR-0052); default 90 |
 //! | `SCARAB_RETENTION_WORKSPACE_DAYS` | env | terminal runs' workspace-CAS reachability TTL in days (ADR-0050 mark-sweep); default 14 — non-terminal runs always reachable |
-//! | `SCARAB_OAUTH_OWNERS` | env | comma-separated subjects granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer` |
+//! | `SCARAB_OAUTH_OWNERS` | env | comma-separated entries granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer`. An entry matches the Principal subject (`sub`/`login`/`id`) **or** a provider-VERIFIED `email` claim (`email_verified`) — unverified/absent verification never grants `Owner` |
 //! | `SCARAB_CONNECTIONS` | env | the declarative `connections:` block inline (YAML/JSON, ADR-0060 part D): config-owned forge connections, provisioned at boot and read-only in the UI. Wins over `_FILE` |
 //! | `SCARAB_CONNECTIONS_FILE` | env | path to a file holding the same `connections:` block (the GitOps shape: a ConfigMap mount). A bad path/parse/validation is a boot failure |
 //!
@@ -372,10 +373,21 @@ pub struct OAuthConfig {
     /// The userinfo endpoint the access token is presented to; its `sub` (or
     /// `login`/`id`) becomes the Principal subject.
     pub userinfo_url: String,
+    /// The OIDC issuer (`iss`) this provider mints `id_token`s as, if it is one
+    /// (`SCARAB_OAUTH_ISSUER`). `Some` = **OIDC mode**: a returned `id_token` is
+    /// verified against the issuer's JWKS (found via `{issuer}/.well-known/
+    /// openid-configuration`) plus `iss`/`aud`/`exp`/`nonce`, and its claims win
+    /// over userinfo; an invalid one fails the login. `None` = plain OAuth2
+    /// (GitHub/Forgejo token mode): `id_token` is neither expected nor trusted,
+    /// userinfo is the identity.
+    pub oidc_issuer: Option<String>,
     /// Space-separated scopes for the authorize redirect (may be empty).
     pub scopes: String,
-    /// Subjects granted `Owner` at login (bootstrap until scoped RBAC, C2);
-    /// everyone else authenticates as `Viewer`.
+    /// Entries granted `Owner` at login (bootstrap until scoped RBAC, C2);
+    /// everyone else authenticates as `Viewer`. An entry matches the Principal
+    /// subject **or** a provider-VERIFIED `email` claim — with a real OIDC
+    /// issuer `sub` is an opaque per-client id, so subject-only bootstrap would
+    /// mean pasting UUIDs before anyone can administer anything.
     pub owners: Vec<String>,
 }
 
@@ -530,7 +542,9 @@ impl Config {
         };
 
         // OAuth/OIDC login (ADR-0049 C1). All five knobs or none: a partial
-        // provider is a misconfiguration, never silently ignored.
+        // provider is a misconfiguration, never silently ignored. The optional
+        // `SCARAB_OAUTH_ISSUER` (ADR-0049 amendment) is a *mode* on top of those
+        // five, so setting it alone is partial config too — never a silent no-op.
         let oauth_keys = [
             "SCARAB_OAUTH_CLIENT_ID",
             "SCARAB_OAUTH_CLIENT_SECRET",
@@ -549,6 +563,10 @@ impl Config {
                 authorize_url: oauth_vals[2].clone().unwrap(),
                 token_url: oauth_vals[3].clone().unwrap(),
                 userinfo_url: oauth_vals[4].clone().unwrap(),
+                // Optional sixth knob, deliberately OUTSIDE the all-five-or-none
+                // set: absent = plain OAuth2 (GitHub), present = OIDC mode with
+                // id_token verification (ADR-0049 amendment).
+                oidc_issuer: env("SCARAB_OAUTH_ISSUER").filter(|v| !v.is_empty()),
                 scopes: env("SCARAB_OAUTH_SCOPES").unwrap_or_default(),
                 owners: env("SCARAB_OAUTH_OWNERS")
                     .unwrap_or_default()
@@ -558,7 +576,11 @@ impl Config {
                     .map(String::from)
                     .collect(),
             })
-        } else if oauth_vals.iter().any(Option::is_some) {
+        } else if oauth_vals.iter().any(Option::is_some)
+            || env("SCARAB_OAUTH_ISSUER")
+                .filter(|v| !v.is_empty())
+                .is_some()
+        {
             let missing: Vec<&str> = oauth_keys
                 .iter()
                 .zip(&oauth_vals)
@@ -1597,6 +1619,59 @@ connections:
         assert!(err.to_string().contains("/nope/token"), "{err}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ADR-0049 amendment: `SCARAB_OAUTH_ISSUER` is an optional *mode* on top of
+    /// the five-knob provider — with them it turns on id_token verification;
+    /// alone it is partial config, never a silent no-op. Owners parse as
+    /// subject-or-email entries.
+    #[test]
+    fn oauth_issuer_is_optional_but_never_silently_ignored() {
+        const FIVE: &[(&str, &str)] = &[
+            ("SCARAB_OAUTH_CLIENT_ID", "cid"),
+            ("SCARAB_OAUTH_CLIENT_SECRET", "sekret"),
+            ("SCARAB_OAUTH_AUTHORIZE_URL", "https://idp.example/authorize"),
+            ("SCARAB_OAUTH_TOKEN_URL", "https://idp.example/token"),
+            ("SCARAB_OAUTH_USERINFO_URL", "https://idp.example/userinfo"),
+            ("SCARAB_OAUTH_OWNERS", " ada@example.com ,8f3c-opaque "),
+        ];
+        const WITH_ISSUER: &[(&str, &str)] = &[
+            ("SCARAB_OAUTH_CLIENT_ID", "cid"),
+            ("SCARAB_OAUTH_CLIENT_SECRET", "sekret"),
+            ("SCARAB_OAUTH_AUTHORIZE_URL", "https://idp.example/authorize"),
+            ("SCARAB_OAUTH_TOKEN_URL", "https://idp.example/token"),
+            ("SCARAB_OAUTH_USERINFO_URL", "https://idp.example/userinfo"),
+            ("SCARAB_OAUTH_ISSUER", "https://dex.example/"),
+        ];
+        const ISSUER_ONLY: &[(&str, &str)] = &[("SCARAB_OAUTH_ISSUER", "https://dex.example")];
+
+        // Plain OAuth2 (the GitHub shape): no issuer, so no id_token is trusted.
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(FIVE)).unwrap();
+        let oauth = cfg.oauth.as_ref().expect("five knobs enable login");
+        assert_eq!(oauth.oidc_issuer, None);
+        assert_eq!(oauth.owners, vec!["ada@example.com", "8f3c-opaque"]);
+
+        // OIDC mode.
+        let cfg =
+            Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(WITH_ISSUER)).unwrap();
+        assert_eq!(
+            cfg.oauth.unwrap().oidc_issuer.as_deref(),
+            Some("https://dex.example/")
+        );
+
+        // The issuer alone cannot quietly do nothing.
+        let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(ISSUER_ONLY))
+            .unwrap_err();
+        let msg = err.to_string();
+        for key in [
+            "SCARAB_OAUTH_CLIENT_ID",
+            "SCARAB_OAUTH_CLIENT_SECRET",
+            "SCARAB_OAUTH_AUTHORIZE_URL",
+            "SCARAB_OAUTH_TOKEN_URL",
+            "SCARAB_OAUTH_USERINFO_URL",
+        ] {
+            assert!(msg.contains(key), "{msg}");
+        }
     }
 
     #[test]
