@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1784996442,"nonce":"IAzm8AGUTIOnffnD2+ILLzF6ojo=","added":["ready-for-agent"],"removed":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1785003555,"nonce":"YW3a1RCsJwsslUYuAx4NpkGYk+8=","message":"Shipped and merged to main via PR #73 — secrets.forgejoWebhookSecret renders SCARAB_FORGEJO_WEBHOOK_SECRET, mirroring the GitHub value. Closing.","files":null}]}
