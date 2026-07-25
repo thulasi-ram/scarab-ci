@@ -223,6 +223,108 @@ async fn a_config_declared_forgejo_connection_is_provisioned_healthy_and_read_on
     assert!(msg.contains("managed by configuration"), "{msg}");
 }
 
+/// **Every** mutating endpoint refuses a config-owned connection — not just the
+/// one that existed when part D was written.
+///
+/// Slices 4/5 added connection create/delete and repo bind/unbind/webhook in
+/// parallel with slice 6, so each arrived without the ownership guard. That is
+/// the integration hazard worth a test rather than a code review: a UI write
+/// that lands on a config-owned row is either reverted by the next deploy or
+/// silently diverges from the source that is authoritative for it. Read paths
+/// stay open, because seeing the connection is how an admin confirms the deploy
+/// took effect.
+#[tokio::test]
+async fn every_mutating_endpoint_refuses_a_config_owned_connection() {
+    let specs = specs_from_block(BLOCK);
+    let db = Arc::new(InMemoryDb::new());
+    let provisioned = provision(db.as_ref(), &specs).await.unwrap();
+    assert_eq!(provisioned.owned, vec!["forgejo-main".to_string()]);
+    let app = app(db.clone(), CredentialOverrides::from_specs(&specs), None).await;
+    let token = login(&app).await;
+
+    let bearer = |r: axum::http::request::Builder| {
+        r.header("authorization", format!("Bearer {token}"))
+    };
+    // Each of these would write to a row whose contents the `connections:` block
+    // owns. `available-repos` is deliberately absent: it only reads.
+    let writes: Vec<(&str, Request<Body>)> = vec![
+        (
+            "delete connection",
+            bearer(Request::delete("/v1/connections/forgejo-main"))
+                .body(Body::empty())
+                .unwrap(),
+        ),
+        (
+            "bind repo",
+            bearer(Request::post("/v1/connections/forgejo-main/repos"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "owner": "acme", "name": "extra" }).to_string(),
+                ))
+                .unwrap(),
+        ),
+        (
+            "unbind repo",
+            bearer(Request::delete(
+                "/v1/connections/forgejo-main/repos/acme/widgets",
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        ),
+        (
+            "register webhook",
+            bearer(Request::post(
+                "/v1/connections/forgejo-main/repos/acme/widgets/webhook",
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        ),
+    ];
+
+    for (what, req) in writes {
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::CONFLICT,
+            "{what} must be refused on a config-owned connection"
+        );
+        let msg = String::from_utf8(
+            axum::body::to_bytes(res.into_body(), 64 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        // The refusal has to say where the change belongs, or the admin is stuck.
+        assert!(
+            msg.contains("managed by configuration") && msg.contains("connections:"),
+            "{what}: refusal must name the config block — got {msg}"
+        );
+    }
+
+    // The declared binding survived every attempt above.
+    let body = list(&app, &token).await;
+    assert_eq!(body[0]["projects"][0]["project"], "widgets");
+
+    // And a READ of the pick-list is still allowed.
+    let res = app
+        .clone()
+        .oneshot(
+            bearer(Request::get(
+                "/v1/connections/forgejo-main/available-repos",
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "reading a config-owned connection must stay allowed"
+    );
+}
+
 /// A DB-owned connection is never silently taken over: two owners is the drift
 /// hazard part D exists to remove, so the boot refuses and says which is which.
 #[tokio::test]
