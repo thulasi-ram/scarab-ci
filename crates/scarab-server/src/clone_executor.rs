@@ -200,6 +200,16 @@ impl Executor for CloneEnrichingExecutor {
         self.inner.results(handle).await
     }
 
+    async fn artifacts(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Vec<scarab_engine::ArtifactMeta>, ExecError> {
+        // The harvested artifact index (ADR-0052) must pass straight through:
+        // the trait default returns EMPTY, which silently unindexed every
+        // uploaded artifact in the real (decorated) executor stack (98ea804).
+        self.inner.artifacts(handle).await
+    }
+
     async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         self.inner.log_stream(step).await
     }

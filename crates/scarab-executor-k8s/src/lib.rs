@@ -523,17 +523,24 @@ impl K8sExecutor {
                 // step wrote to /scarab/artifacts, filtered by its authored
                 // globs, uploaded as plain object blobs (NOT the CAS — an
                 // independent lifecycle) and indexed on the Pod annotation.
+                //
+                // The upload is a real, already-committed effect, so its INDEX
+                // must be equally durable: a harvest error is TRANSIENT, exactly
+                // like the workspace snapshot above, and returns before the
+                // sidecar is released. That keeps the settle barrier closed, so
+                // the next poll re-harvests (idempotent: same object keys, and
+                // the annotation guard makes a completed harvest once-only) and
+                // the Succeeded verdict stays withheld meanwhile (see `poll`).
+                // Swallowing the error instead released the barrier and reported
+                // success with the blobs uploaded and NOTHING indexed (98ea804).
+                // Retries are bounded by the engine's step-timeout backstop: a
+                // permanently failing harvest settles the attempt as Timeout —
+                // it never reports success having lost the index.
                 if let Some(store) = &self.artifact_store {
-                    let already = annotations.contains_key(ANNOTATION_ARTIFACTS);
-                    if exit == 0 && !already {
-                        if let Err(e) = self
-                            .harvest_artifacts(pods, pod, &name, store.as_ref())
+                    if artifact_harvest_owed(pod, true) {
+                        self.harvest_artifacts(pods, pod, &name, store.as_ref())
                             .await
-                        {
-                            // Best-effort like logs: artifacts must never
-                            // wedge the run's settle path.
-                            eprintln!("scarab-executor: artifact harvest failed for {name}: {e}");
-                        }
+                            .map_err(|e| DriveErr::Transient(format!("artifact harvest: {e}")))?;
                     }
                 }
                 // Release the sidecar (idempotent): failed steps snapshot
@@ -607,7 +614,19 @@ impl K8sExecutor {
                 if !globs.is_empty() && !globs.iter().any(|g| glob_match(g, &rel)) {
                     continue;
                 }
-                let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                // An unreadable entry (a broken symlink the step left behind) is
+                // PERMANENT and this file's problem alone: skip it loudly rather
+                // than fail the whole harvest, which — now that a harvest error
+                // holds the settle barrier — would wedge the step until its
+                // timeout over one junk file. Nothing was uploaded for it, so
+                // the uploaded-implies-indexed invariant is untouched.
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        eprintln!("scarab-executor: skipping unreadable artifact {rel}: {e}");
+                        continue;
+                    }
+                };
                 let key = format!("artifacts/{run}/{rel}");
                 store
                     .put(&key, bytes.clone())
@@ -803,6 +822,50 @@ fn step_terminated_exit(pod: &Pod) -> Option<i32> {
         .map(|t| t.exit_code)
 }
 
+/// The verdict `poll` reports for a workspace Pod whose settle leg has already
+/// been driven this tick — pure, so the rule is testable without a cluster.
+///
+/// The settle (workspace snapshot + artifact harvest) runs in the egress NATIVE
+/// sidecar, which does NOT gate the Pod phase: a workspace Pod reports
+/// `phase=Succeeded` the instant the step container exits, BEFORE settle has
+/// patched the annotations that `output()`/`artifacts()` read. The orchestrator
+/// indexes those on the terminal verdict exactly once, so reporting Succeeded
+/// early loses them permanently (98ea804). `drive_workspace` touches
+/// `egress-done` only after patching, so that sidecar still running IS
+/// "settle incomplete": withhold ONLY the Succeeded verdict while it is.
+///
+/// Every other verdict passes through verbatim — an infra failure must never be
+/// masked as Running — and the scheduler's next poll drives settle to done, so
+/// this is deterministic rather than a sleep.
+fn settled_state(pod: &Pod) -> ExecState {
+    let state = pod_state(pod);
+    if matches!(state, ExecState::Succeeded)
+        && init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+    {
+        return ExecState::Running;
+    }
+    state
+}
+
+/// Whether the settle leg still owes an artifact harvest for this Pod (ADR-0052)
+/// — pure and derived entirely from the Pod, so it survives a control-plane
+/// restart and every re-poll reaches the same verdict.
+///
+/// The egress barrier must stay closed while this is true: releasing it lets the
+/// Pod report `phase=Succeeded`, and the orchestrator indexes a step's artifacts
+/// off that verdict exactly once (98ea804). It flips false only once the harvest
+/// has recorded its index on the Pod — including the EMPTY index of a step that
+/// published nothing — which is also what makes a re-harvest once-only.
+fn artifact_harvest_owed(pod: &Pod, harvesting: bool) -> bool {
+    harvesting
+        && step_terminated_exit(pod) == Some(0)
+        && !pod
+            .metadata
+            .annotations
+            .as_ref()
+            .is_some_and(|a| a.contains_key(ANNOTATION_ARTIFACTS))
+}
+
 /// Pack `dir` into an uncompressed tar (workspaces move within one cluster
 /// hop; compression buys little and costs CPU).
 fn pack_dir(dir: &std::path::Path) -> Result<Vec<u8>, String> {
@@ -947,13 +1010,7 @@ impl Executor for K8sExecutor {
                         Some(pod) => pod,
                         None => return Ok(ExecState::Lost),
                     };
-                    let state = pod_state(&pod);
-                    if matches!(state, ExecState::Succeeded)
-                        && init_container_running(&pod, WORKSPACE_EGRESS_CONTAINER)
-                    {
-                        return Ok(ExecState::Running);
-                    }
-                    return Ok(state);
+                    return Ok(settled_state(&pod));
                 }
                 Ok(pod_state(&pod))
             }
@@ -4273,6 +4330,114 @@ mod tests {
         assert_eq!(pod_state(&with_phase("Unknown", None)), ExecState::Lost);
         // No status yet -> not scheduled -> Pending.
         assert_eq!(pod_state(&Pod::default()), ExecState::Pending);
+    }
+
+    /// A workspace Pod, with the step container terminated at `exit`, the egress
+    /// sidecar either still running or terminated, and the harvested-artifact
+    /// annotation optionally recorded.
+    fn settling_pod(phase: &str, exit: i32, egress_running: bool, harvested: bool) -> Pod {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStatus,
+            PodStatus,
+        };
+        let terminated = |name: &str, code: i32| ContainerStatus {
+            name: name.into(),
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: code,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let egress = if egress_running {
+            ContainerStatus {
+                name: WORKSPACE_EGRESS_CONTAINER.into(),
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        } else {
+            terminated(WORKSPACE_EGRESS_CONTAINER, 0)
+        };
+        let mut annotations = std::collections::BTreeMap::new();
+        if harvested {
+            annotations.insert(
+                ANNOTATION_ARTIFACTS.to_string(),
+                "[{\"name\":\"dist/report.html\",\"size\":11,\
+                 \"content_type\":\"text/html\",\"object_key\":\"artifacts/r/dist/report.html\"}]"
+                    .to_string(),
+            );
+        }
+        Pod {
+            metadata: ObjectMeta {
+                name: Some("scarab-x".into()),
+                annotations: (!annotations.is_empty()).then_some(annotations),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                phase: Some(phase.into()),
+                container_statuses: Some(vec![terminated(STEP_CONTAINER, exit)]),
+                init_container_statuses: Some(vec![egress]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// 98ea804: the settle barrier. The artifact index is patched onto the Pod by
+    /// the egress sidecar AFTER the step container exits, but the orchestrator
+    /// indexes artifacts off the terminal verdict exactly once — so Succeeded must
+    /// be withheld until that sidecar has terminated (the settle-complete signal),
+    /// while every failure verdict passes through so infra faults are never masked.
+    #[test]
+    fn succeeded_is_withheld_until_the_settle_sidecar_has_finished() {
+        // Step exited 0, settle still in flight -> NOT terminal yet.
+        assert_eq!(
+            settled_state(&settling_pod("Succeeded", 0, true, false)),
+            ExecState::Running,
+            "reporting Succeeded here loses the artifact index permanently"
+        );
+        // Sidecar gone = settle recorded -> the real verdict.
+        assert_eq!(
+            settled_state(&settling_pod("Succeeded", 0, false, true)),
+            ExecState::Succeeded
+        );
+        // A failure is never masked as Running, settling or not.
+        assert_eq!(
+            settled_state(&settling_pod("Failed", 1, true, false)),
+            ExecState::Failed {
+                exit_code: Some(1),
+                class: FailureClass::Step,
+            }
+        );
+    }
+
+    /// 98ea804: the harvest is owed until its index is durably ON the Pod — which
+    /// is what lets a failed harvest be retried (transiently, holding the barrier)
+    /// instead of releasing the sidecar with the blobs uploaded and nothing
+    /// indexed, and what makes a completed harvest once-only across re-polls.
+    #[test]
+    fn the_artifact_harvest_is_owed_until_its_index_is_recorded() {
+        assert!(
+            artifact_harvest_owed(&settling_pod("Succeeded", 0, true, false), true),
+            "no index recorded yet — the barrier still owes a harvest"
+        );
+        assert!(
+            !artifact_harvest_owed(&settling_pod("Succeeded", 0, true, true), true),
+            "index recorded — a re-poll must not re-harvest (once-only)"
+        );
+        assert!(
+            !artifact_harvest_owed(&settling_pod("Failed", 1, true, false), true),
+            "a failed step publishes no artifacts of record"
+        );
+        assert!(
+            !artifact_harvest_owed(&settling_pod("Running", 0, true, false), false),
+            "no artifact store wired — nothing is ever owed"
+        );
     }
 
     #[test]

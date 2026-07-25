@@ -536,42 +536,6 @@ impl GithubForge {
         Ok(token)
     }
 
-    /// `GET /installation/repositories` for whatever installation `token`
-    /// belongs to, following pagination.
-    ///
-    /// Not [`get_paginated`](Self::get_paginated): this endpoint answers with an
-    /// **object** (`{total_count, repositories}`), which that helper treats as a
-    /// terminal single item — so it would silently stop after the first 100.
-    async fn installation_repos(&self, token: &str) -> Result<Vec<RepoRef>, ForgeError> {
-        let mut out = Vec::new();
-        let mut next = Some(self.url("/installation/repositories?per_page=100"));
-        while let Some(url) = next.take() {
-            let resp = self.send(|| self.client.get(&url), token).await?;
-            next = next_link(resp.headers());
-            let page: Value = ok_json(resp).await?;
-            let Some(repos) = page.get("repositories").and_then(Value::as_array) else {
-                return Err(ForgeError::Api(
-                    "installation/repositories: no `repositories` array".into(),
-                ));
-            };
-            for r in repos {
-                // `full_name` is "owner/name" — the same shape the installation
-                // webhook carries, so both paths parse identically.
-                if let Some((owner, name)) = r
-                    .get("full_name")
-                    .and_then(Value::as_str)
-                    .and_then(|f| f.split_once('/'))
-                {
-                    out.push(RepoRef {
-                        owner: owner.to_string(),
-                        name: name.to_string(),
-                    });
-                }
-            }
-        }
-        Ok(out)
-    }
-
     /// GET `path` following `Link: rel="next"` pagination, concatenating JSON
     /// array pages.
     async fn get_paginated(&self, path: &str, token: &str) -> Result<Vec<Value>, ForgeError> {
@@ -779,49 +743,6 @@ impl ForgePort for GithubForge {
         _callback_url: &str,
     ) -> Result<(), ForgeError> {
         Ok(())
-    }
-
-    /// The repos every installation of this App covers (ADR-0060) — the same
-    /// truth the `installation_repositories` webhook carries, pulled on demand so
-    /// a missed delivery can be healed.
-    ///
-    /// App mode walks `/app/installations` and asks each installation for its
-    /// repositories; fixed-token mode asks once as whatever the token is. Repos
-    /// are deduplicated: an App installed on both a user and an org can serve the
-    /// same repo twice.
-    async fn list_accessible_repos(&self) -> Result<Vec<RepoRef>, ForgeError> {
-        let mut out = std::collections::BTreeSet::new();
-        match &self.auth {
-            Auth::Token(token) => {
-                out.extend(self.installation_repos(token).await?);
-            }
-            Auth::App { app, cache } => {
-                let now = now_unix_secs();
-                let jwt = sign_app_jwt(app, now)?;
-                for inst in self.get_paginated("/app/installations", &jwt).await? {
-                    let Some(id) = inst.get("id").and_then(Value::as_u64) else {
-                        continue;
-                    };
-                    // Mint (and cache) this installation's token, then ask it
-                    // what it covers.
-                    let url = self.url(&format!("/app/installations/{id}/access_tokens"));
-                    let resp = self.send(|| self.client.post(&url), &jwt).await?;
-                    let body: Value = ok_json(resp).await?;
-                    let token = body
-                        .get("token")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| ForgeError::Api("access_tokens.token missing".into()))?
-                        .to_string();
-                    cache
-                        .lock()
-                        .unwrap()
-                        .tokens
-                        .insert(id, (token.clone(), now + 3600));
-                    out.extend(self.installation_repos(&token).await?);
-                }
-            }
-        }
-        Ok(out.into_iter().collect())
     }
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError> {
