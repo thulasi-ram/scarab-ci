@@ -5694,6 +5694,12 @@ pub struct ConnectionDto {
     /// the `connections:` config or the database — and this says which, so the
     /// UI never offers an edit the next boot would silently revert.
     pub managed_by_config: bool,
+    /// Can this connection's app configuration be checked against what Scarab
+    /// needs (`GET …/preflight`)? Decided from the kind, like `supports_resync`
+    /// and for the same reason: the check is a live forge round-trip, so the
+    /// list must not perform one per row just to discover the button is
+    /// pointless. The endpoint itself remains the authority.
+    pub supports_preflight: bool,
 }
 
 /// A Project a connection serves, plus the forge coordinate it came from.
@@ -5857,20 +5863,7 @@ async fn list_connections(
             }
         }
         projects.sort_by(|a, b| (&a.org, &a.project).cmp(&(&b.org, &b.project)));
-        // Presence, not the value. A missing provider means we cannot tell, which
-        // reads the same as absent here — either way the adapter cannot authenticate.
-        // Resolution goes through the ONE path (ADR-0060 part D): a credential the
-        // deployment supplies (`credential.env`/`file`, or the App PEM) is present
-        // even though `SecretProvider` has never heard of it, and reporting it as
-        // MISSING would be a lie that sends operators hunting a healthy connection.
-        let credential_present = if st.credential_overrides.covers(&conn) {
-            true
-        } else {
-            match st.secrets.as_ref() {
-                Some(secrets) => connection_credential(secrets.as_ref(), &conn).await.is_ok(),
-                None => false,
-            }
-        };
+        let credential_present = credential_present(&st, &conn).await;
         let last_delivery_at = connections
             .last_delivery_at(conn.kind)
             .await
@@ -5897,6 +5890,12 @@ async fn list_connections(
                 scarab_forge::ForgeKind::GitHub | scarab_forge::ForgeKind::Forgejo
             )
             && !managed_by_config;
+        // Only GitHub can be asked what it granted (`GET /app`), and only in App
+        // mode — which is also the only forge with the failure this checks for:
+        // an App whose event subscription or `statuses` grant is empty looks
+        // perfectly healthy from every other angle.
+        let supports_preflight = (st.forge.is_some() || st.forge_adapters.is_some())
+            && conn.kind == scarab_forge::ForgeKind::GitHub;
         out.push(ConnectionDto {
             web_url: forge_web_host(conn.kind, &conn.base_url),
             id: conn.id,
@@ -5907,11 +5906,253 @@ async fn list_connections(
             last_delivery_at,
             projects,
             supports_resync,
+            supports_preflight,
             managed_by_config,
         });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(Json(out))
+}
+
+/// Does this connection's credential handle resolve to material right now?
+///
+/// Presence, not the value. A missing provider means we cannot tell, which reads
+/// the same as absent here — either way the adapter cannot authenticate.
+/// Resolution goes through the ONE path (ADR-0060 part D): a credential the
+/// deployment supplies (`credential.env`/`file`, or the App PEM) is present even
+/// though `SecretProvider` has never heard of it, and reporting it as MISSING
+/// would be a lie that sends operators hunting a healthy connection.
+async fn credential_present(st: &AppState, conn: &scarab_forge::ForgeConnection) -> bool {
+    if st.credential_overrides.covers(conn) {
+        return true;
+    }
+    match st.secrets.as_ref() {
+        Some(secrets) => connection_credential(secrets.as_ref(), conn).await.is_ok(),
+        None => false,
+    }
+}
+
+/// One capability Scarab needs of a forge app, as the preflight reports it
+/// (`scarab_forge::preflight::ForgeRequirement` on the wire).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CapabilityRequirementDto {
+    /// `permission` | `event`.
+    pub kind: String,
+    /// The forge's own name for it (`statuses`, `push`) — the label on the
+    /// setting an operator has to go and change.
+    pub name: String,
+    /// Minimum level for a permission (`read`/`write`/`admin`); absent for an
+    /// event, which is subscribed or not.
+    pub level: Option<String>,
+    /// `required` | `recommended`.
+    pub severity: String,
+    /// What silently breaks without it.
+    pub why: String,
+}
+
+impl From<&scarab_forge::preflight::ForgeRequirement> for CapabilityRequirementDto {
+    fn from(r: &scarab_forge::preflight::ForgeRequirement) -> Self {
+        Self {
+            kind: r.kind.as_str().to_string(),
+            name: r.name.to_string(),
+            level: r.level.map(str::to_string),
+            severity: r.severity.as_str().to_string(),
+            why: r.why.to_string(),
+        }
+    }
+}
+
+/// A permission the forge reports as granted.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GrantedPermissionDto {
+    pub name: String,
+    pub level: String,
+}
+
+/// The result of checking a connection's app configuration against what Scarab
+/// needs (ADR-0060 preflight) — the deeper cut of the same question
+/// `credential_present` answers on the list.
+///
+/// Carries **no credential material**: granted permissions are names and levels,
+/// events are names. Nothing here can authenticate to anything.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ConnectionPreflightDto {
+    pub id: String,
+    pub kind: String,
+    /// `ok` — every required capability is granted; `degraded` — at least one is
+    /// missing (runs will silently not trigger, or checks will silently not
+    /// post); `unknown` — the forge could not be asked. Three values, not two:
+    /// "I could not look" must never render as "you are fine".
+    pub status: String,
+    /// Did the forge actually answer? `false` for every `unknown`.
+    pub checked: bool,
+    /// Why the check could not run, when it could not — an adapter that cannot
+    /// introspect, a credential that does not resolve, a forge that errored.
+    pub unavailable_reason: Option<String>,
+    /// Everything Scarab needs from this forge, so the answer is legible even
+    /// when nothing could be checked.
+    pub required: Vec<CapabilityRequirementDto>,
+    /// The subset of `required` the forge does not currently grant. Empty on
+    /// `ok`, and (necessarily) empty on `unknown` — read `status`, not this.
+    pub missing: Vec<CapabilityRequirementDto>,
+    /// What the forge says the app *is* granted, including grants Scarab does
+    /// not need — an operator comparing against the App settings page wants the
+    /// whole picture, and an over-broad grant is worth seeing.
+    pub granted_permissions: Vec<GrantedPermissionDto>,
+    /// The webhook events the forge will deliver, as it reports them.
+    pub subscribed_events: Vec<String>,
+}
+
+/// The "could not check" answer, in one place so every reason produces the same
+/// shape: no gaps claimed, the requirement list still rendered, and a sentence
+/// saying why. Kept honest by construction — a caller cannot accidentally report
+/// `ok` for a connection nobody managed to ask.
+fn preflight_unknown(
+    conn: &scarab_forge::ForgeConnection,
+    required: Vec<CapabilityRequirementDto>,
+    reason: String,
+) -> ConnectionPreflightDto {
+    ConnectionPreflightDto {
+        id: conn.id.clone(),
+        kind: conn.kind.as_str().to_string(),
+        status: "unknown".into(),
+        checked: false,
+        unavailable_reason: Some(reason),
+        required,
+        missing: Vec::new(),
+        granted_permissions: Vec::new(),
+        subscribed_events: Vec::new(),
+    }
+}
+
+/// **Preflight a connection** (git-bug 90644c6): diff the forge app's *actual*
+/// granted permissions and subscribed events against what Scarab needs, and
+/// report the gap.
+///
+/// This exists because both halves of a misconfigured GitHub App fail
+/// *silently*:
+///
+///  - **No events subscribed.** GitHub delivers `installation` /
+///    `installation_repositories` regardless, so the connection registers
+///    itself and `GET /v1/repos` looks healthy — while no push ever starts a
+///    run. The operator's only signal is that nothing happens.
+///  - **No `statuses:write`.** Every status post 403s while the run itself goes
+///    green, so the forge simply never shows a check.
+///
+/// Until now the only defence was documentation. `GET /v1/connections` already
+/// answers "does the credential resolve"; this is the same question one level
+/// deeper — *and is it allowed to do the things Scarab will ask of it*.
+///
+/// A live forge round-trip, so it is its **own endpoint** rather than fields on
+/// the list: rendering Settings must not fan out a call per connection
+/// unasked-for (the same reasoning that made `supports_resync` kind-derived
+/// rather than probed).
+///
+/// It answers **200 with `status: "unknown"`**, not 501, when the adapter cannot
+/// introspect. "Unknown" is a real health state the UI must render next to the
+/// credential line, and the requirement list is still worth showing; a 501 would
+/// force every caller to invent that state itself.
+///
+/// Never returns credential material — only names, levels and event ids.
+#[utoipa::path(
+    get,
+    path = "/v1/connections/{id}/preflight",
+    summary = "Diff a connection's granted permissions and subscribed events against what Scarab needs (ADR-0060)",
+    params(("id" = String, Path, description = "connection id")),
+    responses(
+        (status = 200, body = ConnectionPreflightDto),
+        (status = 403, description = "requires Administer on the org"),
+        (status = 404, description = "no such connection, or no registry wired")
+    )
+)]
+async fn connection_preflight(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<ConnectionPreflightDto>, ApiError> {
+    authorize_org_administer(&st, &headers).await?;
+    let connections = st.connections.as_ref().ok_or(ApiError::NotFound)?;
+    let conn = connections
+        .get_connection(&id)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+
+    let required: Vec<CapabilityRequirementDto> = scarab_forge::preflight::required(conn.kind)
+        .iter()
+        .map(CapabilityRequirementDto::from)
+        .collect();
+
+    // No credential, no question to ask. Short-circuit BEFORE building an
+    // adapter: the answer ("this connection cannot authenticate") is already
+    // known, and the list's credential line is the place that says so.
+    if !credential_present(&st, &conn).await {
+        return Ok(Json(preflight_unknown(
+            &conn,
+            required,
+            format!(
+                "the credential `{}` does not resolve, so the forge cannot be asked",
+                conn.credential_ref
+            ),
+        )));
+    }
+
+    // THIS connection's adapter, not the repo-routed port — the app's grants are
+    // a connection-scoped fact, and a connection with nothing bound yet has no
+    // repo to route through.
+    let forge = match connection_adapter(&st, &conn).await {
+        Ok(forge) => forge,
+        Err(_) => {
+            return Ok(Json(preflight_unknown(
+                &conn,
+                required,
+                "no forge adapter is wired for this connection".into(),
+            )))
+        }
+    };
+
+    let granted = match forge.describe_capabilities().await {
+        Ok(caps) => caps,
+        // The adapter cannot look at all (Forgejo, or GitHub on a fixed token).
+        Err(scarab_forge::ForgeError::Unsupported(what)) => {
+            return Ok(Json(preflight_unknown(
+                &conn,
+                required,
+                format!(
+                    "{} cannot report its granted permissions or subscribed events ({what})",
+                    conn.kind.as_str()
+                ),
+            )))
+        }
+        // It could have worked and did not — a forge outage, a revoked key. Also
+        // unknown, but for a reason worth repeating verbatim.
+        Err(e) => return Ok(Json(preflight_unknown(&conn, required, e.to_string()))),
+    };
+
+    let missing: Vec<CapabilityRequirementDto> =
+        scarab_forge::preflight::missing(conn.kind, &granted)
+            .into_iter()
+            .map(CapabilityRequirementDto::from)
+            .collect();
+    let degraded = scarab_forge::preflight::is_degraded(conn.kind, &granted);
+    Ok(Json(ConnectionPreflightDto {
+        id: conn.id.clone(),
+        kind: conn.kind.as_str().to_string(),
+        status: if degraded { "degraded" } else { "ok" }.into(),
+        checked: true,
+        unavailable_reason: None,
+        required,
+        missing,
+        granted_permissions: granted
+            .permissions
+            .iter()
+            .map(|(name, level)| GrantedPermissionDto {
+                name: name.clone(),
+                level: level.clone(),
+            })
+            .collect(),
+        subscribed_events: granted.events.iter().cloned().collect(),
+    }))
 }
 
 /// Re-sync a connection against the forge (ADR-0060 part C): ask the forge which
@@ -6918,6 +7159,7 @@ impl utoipa::Modify for TagGroups {
         create_connection,
         delete_connection,
         resync_connection,
+        connection_preflight,
         available_repos,
         bind_repo,
         register_repo_webhook,
@@ -6991,6 +7233,9 @@ impl utoipa::Modify for TagGroups {
         BindRepoRequest,
         BindRepoResultDto,
         ResyncResultDto,
+        ConnectionPreflightDto,
+        CapabilityRequirementDto,
+        GrantedPermissionDto,
         MeResponse
     ))
 )]
@@ -7100,6 +7345,7 @@ fn router_inner(state: AppState) -> Router {
             axum::routing::delete(delete_connection),
         )
         .route("/v1/connections/{id}/resync", post(resync_connection))
+        .route("/v1/connections/{id}/preflight", get(connection_preflight))
         .route("/v1/connections/{id}/available-repos", get(available_repos))
         .route("/v1/connections/{id}/repos", post(bind_repo))
         .route(

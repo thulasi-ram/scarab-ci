@@ -9,8 +9,8 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use scarab_forge::{
-    filter_refs, CheckoutCredential, Commit, Event, ForgeError, ForgePort, ForgeRef, Permissions,
-    RefKind, RepoRef, Status, WebhookDelivery,
+    filter_refs, preflight::ForgeCapabilities, CheckoutCredential, Commit, Event, ForgeError,
+    ForgePort, ForgeRef, Permissions, RefKind, RepoRef, Status, WebhookDelivery,
 };
 use serde_json::Value;
 use sha2::Sha256;
@@ -627,6 +627,39 @@ async fn ok_json(resp: reqwest::Response) -> Result<Value, ForgeError> {
     serde_json::from_str(&text).map_err(|e| ForgeError::Api(format!("bad JSON: {e}")))
 }
 
+/// Read an App's granted permissions and subscribed events out of a `GET /app`
+/// body (ADR-0060 preflight).
+///
+/// Pure, and free-standing for the same reason [`normalize`] is: the mapping is
+/// the part that can be wrong, and it should be testable without a network. A
+/// non-string permission level or a non-string event is skipped rather than
+/// failing the whole read — a preflight that refuses to report anything because
+/// GitHub added a field is worse than one that reports what it understood.
+pub fn capabilities_from_app(body: &Value) -> ForgeCapabilities {
+    let permissions = body
+        .get("permissions")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let events = body
+        .get("events")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| Some(e.as_str()?.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    ForgeCapabilities {
+        permissions,
+        events,
+    }
+}
+
 /// Map GitHub's collaborator permission token to the agnostic flags.
 fn permissions_from_str(p: &str) -> Permissions {
     match p {
@@ -822,6 +855,32 @@ impl ForgePort for GithubForge {
             }
         }
         Ok(out.into_iter().collect())
+    }
+
+    /// `GET /app` — the App's own record of what it was granted and what it
+    /// subscribed to (ADR-0060 preflight).
+    ///
+    /// Asked of the **App**, not of an installation: the event subscription is
+    /// an App-level setting (an installation cannot narrow it), and the App's
+    /// permission set is the ceiling every installation token is minted under.
+    /// So this is the configuration an operator would go and change, which is
+    /// the only kind worth reporting.
+    ///
+    /// Fixed-token mode cannot answer: `/app` requires the App JWT, and a PAT
+    /// gets a 403 that would read as "your App is broken". Say *unsupported*
+    /// instead — the dev/token path has no App to be misconfigured.
+    async fn describe_capabilities(&self) -> Result<ForgeCapabilities, ForgeError> {
+        let Auth::App { app, .. } = &self.auth else {
+            return Err(ForgeError::Unsupported(
+                "capability introspection needs GitHub App credentials (this connection uses a \
+                 fixed token)"
+                    .into(),
+            ));
+        };
+        let jwt = sign_app_jwt(app, now_unix_secs())?;
+        let url = self.url("/app");
+        let resp = self.send(|| self.client.get(&url), &jwt).await?;
+        Ok(capabilities_from_app(&ok_json(resp).await?))
     }
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError> {
@@ -1300,6 +1359,37 @@ mod tests {
         );
         assert_eq!(next_link(&headers), None);
         assert_eq!(next_link(&reqwest::header::HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn app_capabilities_are_read_off_the_app_record() {
+        // A realistic `GET /app` body, trimmed. The two things a preflight cares
+        // about are a map and a list; everything else is noise.
+        let caps = capabilities_from_app(&json!({
+            "id": 4323648,
+            "slug": "scarab-ci",
+            "permissions": { "contents": "read", "statuses": "write", "metadata": "read" },
+            "events": ["push", "pull_request"]
+        }));
+        assert_eq!(caps.permissions.get("statuses").map(String::as_str), Some("write"));
+        assert!(caps.events.contains("push") && caps.events.contains("pull_request"));
+
+        // The silent-failure shape: an App with no event subscription. GitHub
+        // omits `events` entirely rather than sending `[]`, and that must read
+        // as "subscribed to nothing" — not as a parse failure.
+        let none = capabilities_from_app(&json!({
+            "permissions": { "contents": "read" }
+        }));
+        assert!(none.events.is_empty());
+        assert_eq!(none.permissions.len(), 1);
+
+        // A field GitHub added since must not take the whole readout down.
+        let odd = capabilities_from_app(&json!({
+            "permissions": { "contents": "read", "weird": 7 },
+            "events": ["push", 42]
+        }));
+        assert_eq!(odd.permissions.len(), 1, "the non-string level is skipped");
+        assert_eq!(odd.events.len(), 1, "the non-string event is skipped");
     }
 
     #[test]

@@ -107,6 +107,42 @@ Three details the single-owner rule forces, settled while building it:
   would deadlock a fresh database, the same bootstrap trap `SCARAB_GITHUB_APP_PEM` exists to
   avoid.
 
+### E. Connection health goes one level deeper than "the credential resolves"
+
+*(Addendum, 2026-07-26 — git-bug `90644c6`.)*
+
+`GET /v1/connections` reports `credential_present`. That catches a credential that is
+**gone**; it cannot catch a credential that is **present and insufficient**, which is the
+shape both known GitHub App misconfigurations take — and both fail *silently*:
+
+- **An empty webhook-event subscription.** GitHub delivers `installation` /
+  `installation_repositories` regardless of the subscription list, so the connection
+  registers itself, `GET /v1/repos` lists Projects, and no push ever starts a run.
+- **A missing `statuses:write` grant.** Every status post 403s inside the status pipeline
+  while the Run itself goes green, so the forge simply never shows a check.
+
+So a **preflight** — `GET /v1/connections/{id}/preflight` — mints the app's credential, asks
+the forge what it is *actually* granted and subscribed to, and diffs that against what
+Scarab needs. Three decisions carry it:
+
+- **The requirement set is data, in one place** (`scarab-forge::preflight`, keyed by
+  `ForgeKind`), with severity (`required` = a core promise breaks; `recommended` = an
+  authored feature does) and, per entry, *what silently breaks without it*. A diff is only
+  maintainable if the required side is a table rather than strings scattered across the
+  adapter, the API and the UI copy.
+- **The port observes; the domain judges.** `ForgePort::describe_capabilities` reports
+  granted permissions and subscribed events and nothing more; it defaults to `Unsupported`,
+  so a forge that cannot be introspected reads as **unknown** rather than as an empty grant
+  set (which the diff would report as "everything is missing"). GitHub answers from
+  `GET /app` — the App-level record, which is the configuration an operator would go and
+  change; a fixed-token connection has no App to be misconfigured and says so.
+- **Its own endpoint, and three states.** Checking is a live forge round-trip, so it is not
+  folded into the list (the same reason `supports_resync` is kind-derived rather than
+  probed). It answers 200 with `status: ok | degraded | unknown` — never 501 — because "I
+  could not look" is a health state Settings must render next to the credential line, and
+  must never render as "you are fine". No credential material is returned: names, levels
+  and event ids only.
+
 ## Consequences
 
 - Forgejo becomes **actually onboardable** from the product for the first time — the [0046]
@@ -114,8 +150,10 @@ Three details the single-owner rule forces, settled while building it:
 - Org and Environment secrets get a real editing home; the [0037] matrix stops being read-only
   and becomes the single mental model for "what resolves where."
 - New surface: `GET/POST/DELETE /v1/connections`, `bind_repo`/`unbind_repo`/`register_webhook`
-  endpoints, a `connections:` config schema, an editable-matrix component, and a global
-  Settings route. `SecretScope::Repo` is untouched.
+  endpoints, `GET /v1/connections/{id}/preflight` (part E), a `connections:` config schema, an
+  editable-matrix component, and a global Settings route. `SecretScope::Repo` is untouched.
+- The two silent GitHub App misconfigurations stop being a documentation problem: they are
+  reported where the operator already looks, in the language of the setting they must change.
 - Single-owner precedence avoids a config-vs-DB dual-write drift hazard (the same reasoning
   [0037] used to reject a standalone approvals table).
 - **Deferred:** org **RBAC / member management** (`Principal × scope × Role`, [0049]; the

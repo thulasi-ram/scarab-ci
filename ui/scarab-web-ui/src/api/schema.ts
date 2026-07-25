@@ -230,6 +230,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/connections/{id}/preflight": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Diff a connection's granted permissions and subscribed events against what Scarab needs (ADR-0060)
+         * @description This exists because both halves of a misconfigured GitHub App fail
+         *     *silently*:
+         *
+         *      - **No events subscribed.** GitHub delivers `installation` /
+         *        `installation_repositories` regardless, so the connection registers
+         *        itself and `GET /v1/repos` looks healthy — while no push ever starts a
+         *        run. The operator's only signal is that nothing happens.
+         *      - **No `statuses:write`.** Every status post 403s while the run itself goes
+         *        green, so the forge simply never shows a check.
+         *
+         *     Until now the only defence was documentation. `GET /v1/connections` already
+         *     answers "does the credential resolve"; this is the same question one level
+         *     deeper — *and is it allowed to do the things Scarab will ask of it*.
+         *
+         *     A live forge round-trip, so it is its **own endpoint** rather than fields on
+         *     the list: rendering Settings must not fan out a call per connection
+         *     unasked-for (the same reasoning that made `supports_resync` kind-derived
+         *     rather than probed).
+         *
+         *     It answers **200 with `status: "unknown"`**, not 501, when the adapter cannot
+         *     introspect. "Unknown" is a real health state the UI must render next to the
+         *     credential line, and the requirement list is still worth showing; a 501 would
+         *     force every caller to invent that state itself.
+         *
+         *     Never returns credential material — only names, levels and event ids.
+         */
+        get: operations["connection_preflight"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/connections/{id}/repos": {
         parameters: {
             query?: never;
@@ -1234,6 +1278,28 @@ export interface components {
             subject: string;
         };
         /**
+         * @description One capability Scarab needs of a forge app, as the preflight reports it
+         *     (`scarab_forge::preflight::ForgeRequirement` on the wire).
+         */
+        CapabilityRequirementDto: {
+            /** @description `permission` | `event`. */
+            kind: string;
+            /**
+             * @description Minimum level for a permission (`read`/`write`/`admin`); absent for an
+             *     event, which is subscribed or not.
+             */
+            level?: string | null;
+            /**
+             * @description The forge's own name for it (`statuses`, `push`) — the label on the
+             *     setting an operator has to go and change.
+             */
+            name: string;
+            /** @description `required` | `recommended`. */
+            severity: string;
+            /** @description What silently breaks without it. */
+            why: string;
+        };
+        /**
          * @description One pipeline in the dispatch catalog: its selection `name` and whether it
          *     opts into `manual` / `api` dispatch (its `on:` includes that trigger).
          */
@@ -1299,6 +1365,14 @@ export interface components {
              */
             projects: components["schemas"]["ConnectionProjectDto"][];
             /**
+             * @description Can this connection's app configuration be checked against what Scarab
+             *     needs (`GET …/preflight`)? Decided from the kind, like `supports_resync`
+             *     and for the same reason: the check is a live forge round-trip, so the
+             *     list must not perform one per row just to discover the button is
+             *     pointless. The endpoint itself remains the authority.
+             */
+            supports_preflight: boolean;
+            /**
              * @description Can the forge enumerate what this credential reaches? Gates the re-sync
              *     affordance: GitHub can, so a drifted registry is healable; an adapter that
              *     cannot should not offer a button that always errors.
@@ -1306,6 +1380,50 @@ export interface components {
             supports_resync: boolean;
             /** @description The forge's own web host, for deep links out of the UI. */
             web_url: string;
+        };
+        /**
+         * @description The result of checking a connection's app configuration against what Scarab
+         *     needs (ADR-0060 preflight) — the deeper cut of the same question
+         *     `credential_present` answers on the list.
+         *
+         *     Carries **no credential material**: granted permissions are names and levels,
+         *     events are names. Nothing here can authenticate to anything.
+         */
+        ConnectionPreflightDto: {
+            /** @description Did the forge actually answer? `false` for every `unknown`. */
+            checked: boolean;
+            /**
+             * @description What the forge says the app *is* granted, including grants Scarab does
+             *     not need — an operator comparing against the App settings page wants the
+             *     whole picture, and an over-broad grant is worth seeing.
+             */
+            granted_permissions: components["schemas"]["GrantedPermissionDto"][];
+            id: string;
+            kind: string;
+            /**
+             * @description The subset of `required` the forge does not currently grant. Empty on
+             *     `ok`, and (necessarily) empty on `unknown` — read `status`, not this.
+             */
+            missing: components["schemas"]["CapabilityRequirementDto"][];
+            /**
+             * @description Everything Scarab needs from this forge, so the answer is legible even
+             *     when nothing could be checked.
+             */
+            required: components["schemas"]["CapabilityRequirementDto"][];
+            /**
+             * @description `ok` — every required capability is granted; `degraded` — at least one is
+             *     missing (runs will silently not trigger, or checks will silently not
+             *     post); `unknown` — the forge could not be asked. Three values, not two:
+             *     "I could not look" must never render as "you are fine".
+             */
+            status: string;
+            /** @description The webhook events the forge will deliver, as it reports them. */
+            subscribed_events: string[];
+            /**
+             * @description Why the check could not run, when it could not — an adapter that cannot
+             *     introspect, a credential that does not resolve, a forge that errored.
+             */
+            unavailable_reason?: string | null;
         };
         /** @description A Project a connection serves, plus the forge coordinate it came from. */
         ConnectionProjectDto: {
@@ -1431,6 +1549,11 @@ export interface components {
              *     the run pins to that commit.
              */
             ref: string;
+        };
+        /** @description A permission the forge reports as granted. */
+        GrantedPermissionDto: {
+            level: string;
+            name: string;
         };
         LoginResponse: {
             /**
@@ -2327,6 +2450,42 @@ export interface operations {
             };
             /** @description this forge adapter cannot enumerate repos */
             501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    connection_preflight: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description connection id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConnectionPreflightDto"];
+                };
+            };
+            /** @description requires Administer on the org */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such connection, or no registry wired */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
