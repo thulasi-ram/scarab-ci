@@ -324,6 +324,45 @@
         }
       }
     },
+    "/v1/connections/{id}/preflight": {
+      "get": {
+        "tags": [
+          "Forge Connections"
+        ],
+        "summary": "Diff a connection's granted permissions and subscribed events against what Scarab needs (ADR-0060)",
+        "description": "This exists because both halves of a misconfigured GitHub App fail\n*silently*:\n\n - **No events subscribed.** GitHub delivers `installation` /\n   `installation_repositories` regardless, so the connection registers\n   itself and `GET /v1/repos` looks healthy — while no push ever starts a\n   run. The operator's only signal is that nothing happens.\n - **No `statuses:write`.** Every status post 403s while the run itself goes\n   green, so the forge simply never shows a check.\n\nUntil now the only defence was documentation. `GET /v1/connections` already\nanswers \"does the credential resolve\"; this is the same question one level\ndeeper — *and is it allowed to do the things Scarab will ask of it*.\n\nA live forge round-trip, so it is its **own endpoint** rather than fields on\nthe list: rendering Settings must not fan out a call per connection\nunasked-for (the same reasoning that made `supports_resync` kind-derived\nrather than probed).\n\nIt answers **200 with `status: \"unknown\"`**, not 501, when the adapter cannot\nintrospect. \"Unknown\" is a real health state the UI must render next to the\ncredential line, and the requirement list is still worth showing; a 501 would\nforce every caller to invent that state itself.\n\nNever returns credential material — only names, levels and event ids.",
+        "operationId": "connection_preflight",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "connection id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionPreflightDto"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "requires Administer on the org"
+          },
+          "404": {
+            "description": "no such connection, or no registry wired"
+          }
+        }
+      }
+    },
     "/v1/connections/{id}/repos": {
       "post": {
         "tags": [
@@ -2314,6 +2353,41 @@
           }
         }
       },
+      "CapabilityRequirementDto": {
+        "type": "object",
+        "description": "One capability Scarab needs of a forge app, as the preflight reports it\n(`scarab_forge::preflight::ForgeRequirement` on the wire).",
+        "required": [
+          "kind",
+          "name",
+          "severity",
+          "why"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`permission` | `event`."
+          },
+          "level": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Minimum level for a permission (`read`/`write`/`admin`); absent for an\nevent, which is subscribed or not."
+          },
+          "name": {
+            "type": "string",
+            "description": "The forge's own name for it (`statuses`, `push`) — the label on the\nsetting an operator has to go and change."
+          },
+          "severity": {
+            "type": "string",
+            "description": "`required` | `recommended`."
+          },
+          "why": {
+            "type": "string",
+            "description": "What silently breaks without it."
+          }
+        }
+      },
       "CatalogEntry": {
         "type": "object",
         "description": "One pipeline in the dispatch catalog: its selection `name` and whether it\nopts into `manual` / `api` dispatch (its `on:` includes that trigger).",
@@ -2356,7 +2430,8 @@
           "credential_present",
           "projects",
           "supports_resync",
-          "managed_by_config"
+          "managed_by_config",
+          "supports_preflight"
         ],
         "properties": {
           "base_url": {
@@ -2397,6 +2472,10 @@
             },
             "description": "The Projects this connection serves, from its repo bindings — a Project\n*is* a binding (ADR-0046), so this is the connection's whole footprint."
           },
+          "supports_preflight": {
+            "type": "boolean",
+            "description": "Can this connection's app configuration be checked against what Scarab\nneeds (`GET …/preflight`)? Decided from the kind, like `supports_resync`\nand for the same reason: the check is a live forge round-trip, so the\nlist must not perform one per row just to discover the button is\npointless. The endpoint itself remains the authority."
+          },
           "supports_resync": {
             "type": "boolean",
             "description": "Can the forge enumerate what this credential reaches? Gates the re-sync\naffordance: GitHub can, so a drifted registry is healable; an adapter that\ncannot should not offer a button that always errors."
@@ -2404,6 +2483,71 @@
           "web_url": {
             "type": "string",
             "description": "The forge's own web host, for deep links out of the UI."
+          }
+        }
+      },
+      "ConnectionPreflightDto": {
+        "type": "object",
+        "description": "The result of checking a connection's app configuration against what Scarab\nneeds (ADR-0060 preflight) — the deeper cut of the same question\n`credential_present` answers on the list.\n\nCarries **no credential material**: granted permissions are names and levels,\nevents are names. Nothing here can authenticate to anything.",
+        "required": [
+          "id",
+          "kind",
+          "status",
+          "checked",
+          "required",
+          "missing",
+          "granted_permissions",
+          "subscribed_events"
+        ],
+        "properties": {
+          "checked": {
+            "type": "boolean",
+            "description": "Did the forge actually answer? `false` for every `unknown`."
+          },
+          "granted_permissions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GrantedPermissionDto"
+            },
+            "description": "What the forge says the app *is* granted, including grants Scarab does\nnot need — an operator comparing against the App settings page wants the\nwhole picture, and an over-broad grant is worth seeing."
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "missing": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CapabilityRequirementDto"
+            },
+            "description": "The subset of `required` the forge does not currently grant. Empty on\n`ok`, and (necessarily) empty on `unknown` — read `status`, not this."
+          },
+          "required": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CapabilityRequirementDto"
+            },
+            "description": "Everything Scarab needs from this forge, so the answer is legible even\nwhen nothing could be checked."
+          },
+          "status": {
+            "type": "string",
+            "description": "`ok` — every required capability is granted; `degraded` — at least one is\nmissing (runs will silently not trigger, or checks will silently not\npost); `unknown` — the forge could not be asked. Three values, not two:\n\"I could not look\" must never render as \"you are fine\"."
+          },
+          "subscribed_events": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The webhook events the forge will deliver, as it reports them."
+          },
+          "unavailable_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the check could not run, when it could not — an adapter that cannot\nintrospect, a credential that does not resolve, a forge that errored."
           }
         }
       },
@@ -2569,6 +2713,22 @@
           "ref": {
             "type": "string",
             "description": "The ref to dispatch at (branch/tag/sha). Resolved to a concrete commit;\nthe run pins to that commit."
+          }
+        }
+      },
+      "GrantedPermissionDto": {
+        "type": "object",
+        "description": "A permission the forge reports as granted.",
+        "required": [
+          "name",
+          "level"
+        ],
+        "properties": {
+          "level": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
           }
         }
       },

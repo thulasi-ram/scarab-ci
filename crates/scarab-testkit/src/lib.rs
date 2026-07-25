@@ -2018,6 +2018,12 @@ pub struct FakeForge {
     /// without hook-administration scope, the one onboarding step that depends on
     /// the forge being reachable and sufficiently privileged right now.
     fail_webhook: Mutex<Option<String>>,
+    /// What the forge says this app is granted and subscribed to (ADR-0060
+    /// preflight). `None` (default) models an adapter that **cannot introspect**
+    /// — the port's `Unsupported` answer, deliberately distinct from
+    /// `Some(default)` ("looked, and it is granted nothing"), which is the whole
+    /// misconfiguration this surface reports.
+    capabilities: Mutex<Option<scarab_forge::preflight::ForgeCapabilities>>,
 }
 
 impl FakeForge {
@@ -2091,6 +2097,25 @@ impl FakeForge {
                     name: (*name).into(),
                 })
                 .collect(),
+        );
+        self
+    }
+
+    /// Make this forge **introspectable** (ADR-0060 preflight):
+    /// `describe_capabilities` reports exactly these granted permissions
+    /// (`name → level`) and subscribed events instead of answering
+    /// `Unsupported`.
+    ///
+    /// Pass empty slices to model the two silent misconfigurations this exists
+    /// for — an app subscribed to no events, or one with no `statuses` grant.
+    /// That is not the same as *not calling this at all*, which models a forge
+    /// that cannot be asked.
+    pub fn with_capabilities(self, permissions: &[(&str, &str)], events: &[&str]) -> Self {
+        *self.capabilities.lock().unwrap() = Some(
+            scarab_forge::preflight::ForgeCapabilities::new(
+                permissions.iter().map(|(k, v)| (*k, *v)),
+                events.iter().copied(),
+            ),
         );
         self
     }
@@ -2365,6 +2390,17 @@ impl ForgePort for FakeForge {
         match self.accessible.lock().unwrap().clone() {
             Some(repos) => Ok(repos),
             None => Err(ForgeError::Unsupported("listing accessible repos".into())),
+        }
+    }
+
+    async fn describe_capabilities(
+        &self,
+    ) -> Result<scarab_forge::preflight::ForgeCapabilities, ForgeError> {
+        match self.capabilities.lock().unwrap().clone() {
+            Some(caps) => Ok(caps),
+            None => Err(ForgeError::Unsupported(
+                "introspecting granted permissions and subscribed events".into(),
+            )),
         }
     }
 

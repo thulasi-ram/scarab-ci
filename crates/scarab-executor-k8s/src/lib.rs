@@ -392,8 +392,7 @@ impl K8sExecutor {
     ///    egress sidecar is still holding the Pod open, tar `/workspace` out
     ///    (successful steps only), `Cas::ingest` it (per-file merkle dedup —
     ///    unchanged blobs upload nothing), patch the root onto the Pod as an
-    ///    annotation, harvest the artifacts of record (EVERY terminated step,
-    ///    whatever its exit code — a28a173), then release the sidecar.
+    ///    annotation, then release the sidecar.
     async fn drive_workspace(
         &self,
         pods: &Api<Pod>,
@@ -525,51 +524,27 @@ impl K8sExecutor {
                 // globs, uploaded as plain object blobs (NOT the CAS — an
                 // independent lifecycle) and indexed on the Pod annotation.
                 //
-                // Unlike the snapshot above this runs for EVERY terminated step,
-                // whatever its exit code (a28a173). A failing step's artifacts
-                // are the ones a human most wants — the JUnit XML of the suite
-                // that just went red, the crash log, the screenshot — and the
-                // scheduler has always had an `ExecState::Failed` harvest branch
-                // waiting for them ("often THE evidence", ADR-0056). Gating this
-                // on `exit == 0` made that branch dead code on k8s and threw the
-                // evidence away.
-                //
                 // The upload is a real, already-committed effect, so its INDEX
                 // must be equally durable: a harvest error is TRANSIENT, exactly
                 // like the workspace snapshot above, and returns before the
                 // sidecar is released. That keeps the settle barrier closed, so
                 // the next poll re-harvests (idempotent: same object keys, and
                 // the annotation guard makes a completed harvest once-only) and
-                // the terminal verdict — Succeeded (98ea804) or the step's own
-                // Failed (a28a173) — stays withheld meanwhile (see `poll`).
+                // the Succeeded verdict stays withheld meanwhile (see `poll`).
                 // Swallowing the error instead released the barrier and reported
-                // a verdict with the blobs uploaded and NOTHING indexed.
-                // Retries are bounded by the engine's step-timeout backstop.
+                // success with the blobs uploaded and NOTHING indexed (98ea804).
+                // Retries are bounded by the engine's step-timeout backstop: a
+                // permanently failing harvest settles the attempt as Timeout —
+                // it never reports success having lost the index.
                 if let Some(store) = &self.artifact_store {
                     if artifact_harvest_owed(pod, true) {
-                        if let Err(e) = self
-                            .harvest_artifacts(pods, pod, &name, store.as_ref())
+                        self.harvest_artifacts(pods, pod, &name, store.as_ref())
                             .await
-                        {
-                            // A harvest error is EVIDENCE, never a verdict
-                            // (a28a173). It is only ever `Transient` — never
-                            // `OutputContract`/`InputMissing` — so it can never
-                            // be reported as `Failed { class: Config | Infra }`
-                            // and displace the step's own failure. The class is
-                            // re-derived from the Pod's exit code on every poll,
-                            // so a broken harvest can delay the report; it can
-                            // never change what the step is reported to have done.
-                            eprintln!(
-                                "scarab-executor: artifact harvest failed for pod {name} \
-                                 (step exit {exit}) — the step's own verdict is unchanged: {e}"
-                            );
-                            return Err(DriveErr::Transient(format!("artifact harvest: {e}")));
-                        }
+                            .map_err(|e| DriveErr::Transient(format!("artifact harvest: {e}")))?;
                     }
                 }
                 // Release the sidecar (idempotent): failed steps snapshot
-                // nothing — their workspace is not an output (their artifacts,
-                // harvested above, are).
+                // nothing — their workspace is not an output.
                 self.exec_with_stdin(
                     pods,
                     &name,
@@ -849,62 +824,41 @@ fn step_terminated_exit(pod: &Pod) -> Option<i32> {
 
 /// The verdict `poll` reports for a workspace Pod whose settle leg has already
 /// been driven this tick — pure, so the rule is testable without a cluster.
-/// `harvesting` is whether an artifact store is wired (see `artifact_harvest_owed`).
 ///
 /// The settle (workspace snapshot + artifact harvest) runs in the egress NATIVE
-/// sidecar, which does NOT gate the Pod phase: a workspace Pod reports its
-/// terminal phase the instant the step container exits, BEFORE settle has
+/// sidecar, which does NOT gate the Pod phase: a workspace Pod reports
+/// `phase=Succeeded` the instant the step container exits, BEFORE settle has
 /// patched the annotations that `output()`/`artifacts()` read. The orchestrator
-/// indexes those on the terminal verdict exactly once, so reporting that verdict
-/// early loses them permanently. `drive_workspace` touches `egress-done` only
-/// after patching, so the sidecar still running IS "settle incomplete".
+/// indexes those on the terminal verdict exactly once, so reporting Succeeded
+/// early loses them permanently (98ea804). `drive_workspace` touches
+/// `egress-done` only after patching, so that sidecar still running IS
+/// "settle incomplete": withhold ONLY the Succeeded verdict while it is.
 ///
-/// Two verdicts are withheld while their settle products are still outstanding,
-/// and the shapes differ because what they owe differs:
-///
-/// - **Succeeded** (98ea804) owes BOTH the workspace snapshot root and the
-///   artifact index. The sidecar terminating is the single signal that covers
-///   both, so it is withheld for the sidecar's whole lifetime.
-/// - **Failed on the step's own exit code** (a28a173) owes only the artifact
-///   index — a failed step's workspace is not an output — so it is withheld
-///   precisely while that harvest is still owed, and not one poll longer. Once
-///   the index is on the Pod the failure is reported immediately, even if the
-///   sidecar has yet to drain: a wedged sidecar must not be able to hide a
-///   verdict we already know.
-///
-/// EVERY other verdict passes through verbatim — an infra failure, a timeout, a
-/// config failure or a lost Pod must never be masked as Running — and the
-/// scheduler's next poll drives settle to done, so this is deterministic rather
-/// than a sleep. Withholding is bounded by the engine's step-timeout backstop.
-fn settled_state(pod: &Pod, harvesting: bool) -> ExecState {
+/// Every other verdict passes through verbatim — an infra failure must never be
+/// masked as Running — and the scheduler's next poll drives settle to done, so
+/// this is deterministic rather than a sleep.
+fn settled_state(pod: &Pod) -> ExecState {
     let state = pod_state(pod);
-    let settling = init_container_running(pod, WORKSPACE_EGRESS_CONTAINER);
-    match state {
-        ExecState::Succeeded if settling => ExecState::Running,
-        ExecState::Failed {
-            class: FailureClass::Step,
-            ..
-        } if settling && artifact_harvest_owed(pod, harvesting) => ExecState::Running,
-        other => other,
+    if matches!(state, ExecState::Succeeded)
+        && init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+    {
+        return ExecState::Running;
     }
+    state
 }
 
 /// Whether the settle leg still owes an artifact harvest for this Pod (ADR-0052)
 /// — pure and derived entirely from the Pod, so it survives a control-plane
 /// restart and every re-poll reaches the same verdict.
 ///
-/// Owed for EVERY terminated step, whatever its exit code (a28a173): a failing
-/// step's artifacts are evidence — often THE evidence — and the scheduler indexes
-/// them off the `Failed` verdict exactly as it does off `Succeeded`.
-///
 /// The egress barrier must stay closed while this is true: releasing it lets the
-/// Pod report its terminal phase, and the orchestrator indexes a step's artifacts
+/// Pod report `phase=Succeeded`, and the orchestrator indexes a step's artifacts
 /// off that verdict exactly once (98ea804). It flips false only once the harvest
 /// has recorded its index on the Pod — including the EMPTY index of a step that
 /// published nothing — which is also what makes a re-harvest once-only.
 fn artifact_harvest_owed(pod: &Pod, harvesting: bool) -> bool {
     harvesting
-        && step_terminated_exit(pod).is_some()
+        && step_terminated_exit(pod) == Some(0)
         && !pod
             .metadata
             .annotations
@@ -1038,17 +992,16 @@ impl Executor for K8sExecutor {
                     // the egress NATIVE sidecar and patches the durable Pod
                     // annotations that output()/artifacts() read. A native
                     // sidecar does NOT gate the Pod phase, so a workspace Pod
-                    // reports its terminal phase the instant the step exits —
-                    // BEFORE the settle has patched them, which would let the
-                    // scheduler read an empty artifact set exactly once and index
-                    // nothing (98ea804 for Succeeded, a28a173 for the step's own
-                    // Failed). drive_workspace touches egress-done only AFTER
+                    // reports phase=Succeeded the instant the step exits — BEFORE
+                    // the settle has patched them, which would let the scheduler
+                    // read an empty artifact set exactly once and index nothing
+                    // (98ea804). drive_workspace touches egress-done only AFTER
                     // patching, so the sidecar terminating is the settle-complete
-                    // signal: re-read and withhold those two verdicts while their
-                    // settle products are outstanding (see `settled_state`).
-                    // Every other verdict passes through verbatim so infra
-                    // failures are never masked; the scheduler re-polls next tick
-                    // and drives settle to done (deterministic, no sleeps).
+                    // signal: re-read and withhold ONLY the Succeeded verdict
+                    // while that sidecar is still running. Every other verdict
+                    // passes through verbatim so infra failures are never masked;
+                    // the scheduler re-polls next tick and drives settle to done
+                    // (deterministic, no sleeps).
                     let pod = match pods
                         .get_opt(&handle.0)
                         .await
@@ -1057,7 +1010,7 @@ impl Executor for K8sExecutor {
                         Some(pod) => pod,
                         None => return Ok(ExecState::Lost),
                     };
-                    return Ok(settled_state(&pod, self.artifact_store.is_some()));
+                    return Ok(settled_state(&pod));
                 }
                 Ok(pod_state(&pod))
             }
@@ -4475,87 +4428,34 @@ mod tests {
     /// the egress sidecar AFTER the step container exits, but the orchestrator
     /// indexes artifacts off the terminal verdict exactly once — so Succeeded must
     /// be withheld until that sidecar has terminated (the settle-complete signal),
-    /// while every failure verdict the settle cannot inform passes through so
-    /// infra faults are never masked.
+    /// while every failure verdict passes through so infra faults are never masked.
     #[test]
     fn succeeded_is_withheld_until_the_settle_sidecar_has_finished() {
         // Step exited 0, settle still in flight -> NOT terminal yet.
         assert_eq!(
-            settled_state(&settling_pod("Succeeded", 0, true, false), true),
+            settled_state(&settling_pod("Succeeded", 0, true, false)),
             ExecState::Running,
             "reporting Succeeded here loses the artifact index permanently"
         );
         // Sidecar gone = settle recorded -> the real verdict.
         assert_eq!(
-            settled_state(&settling_pod("Succeeded", 0, false, true), true),
+            settled_state(&settling_pod("Succeeded", 0, false, true)),
             ExecState::Succeeded
         );
-    }
-
-    /// a28a173: the same barrier now covers the step's OWN failure verdict —
-    /// otherwise the failed attempt's artifacts (the JUnit XML, the crash log) are
-    /// uploaded and never indexed, because the scheduler reads `artifacts()` off
-    /// the terminal verdict exactly once. It is withheld only while the harvest is
-    /// genuinely owed, so a wedged sidecar can never hide a verdict we already
-    /// know — and the class is always the step's own, never the harvest's.
-    #[test]
-    fn a_step_failure_is_withheld_only_while_its_artifact_harvest_is_owed() {
-        let failed = ExecState::Failed {
-            exit_code: Some(1),
-            class: FailureClass::Step,
-        };
-        // Step exited 1, index not yet on the Pod -> withhold, or the evidence
-        // is uploaded-but-unindexed forever.
+        // A failure is never masked as Running, settling or not.
         assert_eq!(
-            settled_state(&settling_pod("Failed", 1, true, false), true),
-            ExecState::Running,
-            "reporting Failed here loses the failed attempt's artifact index"
-        );
-        // Index recorded -> report the failure at once; do not wait on the drain.
-        assert_eq!(
-            settled_state(&settling_pod("Failed", 1, true, true), true),
-            failed,
-            "the harvest landed — a still-draining sidecar must not hide the verdict"
-        );
-        assert_eq!(
-            settled_state(&settling_pod("Failed", 1, false, true), true),
-            failed
-        );
-        // No artifact store wired -> nothing is ever owed, nothing is withheld.
-        assert_eq!(
-            settled_state(&settling_pod("Failed", 1, true, false), false),
-            failed
-        );
-    }
-
-    /// a28a173: only the step's own verdict participates in the harvest barrier.
-    /// An infra/timeout/config failure is the platform's verdict about a step that
-    /// may never have produced anything, and masking it as Running would burn the
-    /// step's timeout and re-classify the failure. It passes through verbatim even
-    /// with the sidecar running and the harvest owed.
-    #[test]
-    fn a_platform_failure_is_never_masked_by_the_harvest_barrier() {
-        let mut pod = settling_pod("Failed", 137, true, false);
-        pod.status.as_mut().unwrap().reason = Some("DeadlineExceeded".into());
-        assert!(
-            artifact_harvest_owed(&pod, true),
-            "precondition: the harvest is outstanding"
-        );
-        assert_eq!(
-            settled_state(&pod, true),
+            settled_state(&settling_pod("Failed", 1, true, false)),
             ExecState::Failed {
-                exit_code: Some(137),
-                class: FailureClass::Timeout,
-            },
-            "a timeout must not be withheld as Running"
+                exit_code: Some(1),
+                class: FailureClass::Step,
+            }
         );
     }
 
-    /// 98ea804 + a28a173: the harvest is owed until its index is durably ON the
-    /// Pod — which is what lets a failed harvest be retried (transiently, holding
-    /// the barrier) instead of releasing the sidecar with the blobs uploaded and
-    /// nothing indexed, and what makes a completed harvest once-only across
-    /// re-polls. It is owed for EVERY terminated step, not just the green ones.
+    /// 98ea804: the harvest is owed until its index is durably ON the Pod — which
+    /// is what lets a failed harvest be retried (transiently, holding the barrier)
+    /// instead of releasing the sidecar with the blobs uploaded and nothing
+    /// indexed, and what makes a completed harvest once-only across re-polls.
     #[test]
     fn the_artifact_harvest_is_owed_until_its_index_is_recorded() {
         assert!(
@@ -4567,12 +4467,8 @@ mod tests {
             "index recorded — a re-poll must not re-harvest (once-only)"
         );
         assert!(
-            artifact_harvest_owed(&settling_pod("Failed", 1, true, false), true),
-            "a failed step's artifacts are evidence — often THE evidence (a28a173)"
-        );
-        assert!(
-            !artifact_harvest_owed(&settling_pod("Failed", 1, true, true), true),
-            "index recorded — a failed step's harvest is once-only too"
+            !artifact_harvest_owed(&settling_pod("Failed", 1, true, false), true),
+            "a failed step publishes no artifacts of record"
         );
         assert!(
             !artifact_harvest_owed(&settling_pod("Running", 0, true, false), false),

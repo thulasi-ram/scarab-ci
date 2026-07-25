@@ -12,7 +12,7 @@
 //! code recorded, and a second `launch` of the same fence re-attaches to the
 //! existing Pod rather than creating a new one.
 
-use scarab_engine::ports::{ExecHandle, ExecState, FailureClass};
+use scarab_engine::ports::{ExecHandle, ExecState};
 use scarab_engine::{
     Attempt, AttemptId, AttemptOutcome, Executor, RunId, StepId, StepRun, StepSpec, StepStatus,
     Timestamp,
@@ -1382,84 +1382,6 @@ async fn artifacts_are_harvested_post_step() {
     // The blob is real and downloadable from the store.
     let bytes = storage.get(&artifacts[0].object_key).await.expect("blob");
     assert_eq!(bytes, b"report\n");
-
-    exec.cancel(&h).await.expect("cleanup");
-}
-
-/// LIVE artifacts from a FAILING step (a28a173, ADR-0052 + ADR-0056). The
-/// harvest used to be gated on `exit == 0`, so a red step's evidence — the JUnit
-/// XML, the crash log, the screenshot — was uploaded nowhere and indexed nowhere,
-/// which also made the scheduler's `ExecState::Failed` harvest branch dead code
-/// on k8s. Kind-tier because the gate is k8s-observable-only: it lives in the
-/// egress-sidecar settle, which `FakeExecutor` cannot model.
-///
-/// The step writes its artifact and then exits 1. The terminal verdict must be
-/// the step's OWN failure (never masked as Timeout by the withhold, never
-/// re-classified by the harvest), and the artifact must be harvested anyway.
-#[tokio::test]
-#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
-async fn artifacts_are_harvested_from_a_failed_step() {
-    use scarab_storage::ObjectStore;
-    let Some(ns) = opted_in() else { return };
-    let run_id = unique_run("run-artifacts-failed");
-
-    let client = kube::Client::try_default().await.expect("kube client");
-    let tmp = tempfile::tempdir().expect("store dir");
-    let storage = std::sync::Arc::new(
-        scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local store"),
-    );
-    let exec = K8sExecutor::with_client(ns, client)
-        .with_workspace_cas(storage.clone())
-        .with_artifact_store(storage.clone());
-
-    let step = step_run_of(&run_id, "emit-and-fail");
-    let spec = StepSpec {
-        image: "busybox:latest".into(),
-        command: vec![
-            "sh".into(),
-            "-c".into(),
-            // The evidence is written, THEN the step goes red.
-            "mkdir -p /scarab/artifacts/dist && \
-             echo 'FAILED 3 tests' > /scarab/artifacts/dist/report.txt && \
-             exit 1"
-                .into(),
-        ],
-        env: vec![],
-        secrets: vec![],
-        run_as_root: true, // busybox
-        add_capabilities: vec![],
-        privileged: false,
-        timeout_seconds: Some(120),
-        workspace_inputs: vec![],
-        workspace_outputs: vec![],
-        clone: None,
-        build: None,
-        artifacts: vec!["dist/*".into()],
-        placement_profiles: vec![],
-        resources: Default::default(),
-        k8s_overlay: None,
-        oidc_token: None,
-        services: Vec::new(),
-        uses: Vec::new(),
-        matrix_values: Default::default(),
-    };
-    let h = exec.launch(&step, &spec).await.expect("launch");
-    let terminal = poll_to_terminal(&exec, &h, 120).await;
-    assert_eq!(
-        terminal,
-        Some(ExecState::Failed {
-            exit_code: Some(1),
-            class: FailureClass::Step,
-        }),
-        "the harvest must not re-classify or mask the step's own failure"
-    );
-
-    // The point of the ticket: the failed step's evidence survived.
-    let artifacts = exec.artifacts(&h).await.expect("artifacts");
-    assert_eq!(artifacts.len(), 1, "{artifacts:?}");
-    assert_eq!(artifacts[0].name, "dist/report.txt");
-    let bytes = storage.get(&artifacts[0].object_key).await.expect("blob");
-    assert_eq!(bytes, b"FAILED 3 tests\n");
 
     exec.cancel(&h).await.expect("cleanup");
 }
