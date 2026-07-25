@@ -21,7 +21,7 @@ can write these fields today and get zero effect and zero error. The `scarab-exe
 Pod builder ends with `..Default::default()` — no `node_selector`, `tolerations`, `affinity`,
 or container `resources`.
 
-The forcing function is Acme (the intended dogfood cluster). Its CI nodes are tainted
+The forcing function is ACME (the intended dogfood cluster). Its CI nodes are tainted
 (`workload-type=application-sub-critical:NoSchedule`) across **multiple pools** by
 architecture (amd64/arm64) and workload tier. Their Woodpecker setup needed the toleration
 on *every* step Pod or nothing schedules, and was fragile enough that they bolted on **two**
@@ -115,11 +115,11 @@ pipeline involvement.
 
 ## Consequences
 
-- A tainted, multi-pool cluster (Acme) is unblocked with **no admission-controller
+- A tainted, multi-pool cluster (ACME) is unblocked with **no admission-controller
   backstop** — the control plane owns the baseline.
 - **Pipelines contain no k8s.** The one bounded topology leak is the profile *names*
   (`placement_profiles: [critical]`), accepted as GHA does — portability across orgs was never
-  a real CI property, and Acme is the one cluster that matters.
+  a real CI property, and ACME is the one cluster that matters.
 - **Profiles absorb Case 1 with zero break-away.** Because `k8s:` is an opaque overlay (not a
   fixed vocabulary), a new static placement fact — an exotic annotation, `runtimeClass`,
   topology spread — is an admin edit to a profile, not a Scarab change and not a pipeline
@@ -143,7 +143,7 @@ pipeline involvement.
   reintroduces is bounded and, per GHA, tolerated. Revisit if multi-cluster portability
   becomes a real requirement.
 - **Raw k8s in every job** (Woodpecker's model) — the escape hatch *as* the interface. Both
-  leaks, and the exact fragility that forced Acme's two admission controllers. Rejected;
+  leaks, and the exact fragility that forced ACME's two admission controllers. Rejected;
   survives only as the governed `k8s_overlay` for Case 2.
 - **`size:` named tiers** ([0026], CircleCI `resource_class`) — hides the magnitude the author
   wants to state precisely and invites cost-blindness. Dropped.

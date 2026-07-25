@@ -91,7 +91,7 @@ Work top-to-bottom; finish a slice's ACCEPTANCE before the next slice. Skip clos
   — PG-backed tests run; they skip cleanly without it.
 - **No Docker daemon / no `kind` / no `just`** → keep cluster/BuildKit/UI-browser live-runs
   `#[ignore]`-gated + env-gated. Verify with real Postgres + fakes.
-- ⚠️ The ambient kubeconfig points at **real Acme prod/staging EKS** — never launch against it.
+- ⚠️ The ambient kubeconfig points at **real ACME prod/staging EKS** — never launch against it.
   The dev harness uses an isolated `dev/.kubeconfig` (kind only).
 
 ## The loop prompt

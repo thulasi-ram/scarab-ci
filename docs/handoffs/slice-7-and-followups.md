@@ -42,7 +42,7 @@ decisions and any deferral.
 - **No Docker daemon / no `kind` / no `just`** → cluster/BuildKit/browser
   live-runs stay `#[ignore]` + env-gated (`SCARAB_TEST_KUBE=1`). Verify with real
   Postgres + fakes.
-- ⚠️ The ambient kubeconfig points at **real Acme prod/staging EKS** — never
+- ⚠️ The ambient kubeconfig points at **real ACME prod/staging EKS** — never
   launch against it. Dev uses an isolated `dev/.kubeconfig` (kind only).
 
 ## Slice 7 (the roadmap's next slice)

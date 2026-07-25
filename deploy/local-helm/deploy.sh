@@ -45,7 +45,7 @@ fi
 [ -n "$_img_clone" ] && export SCARAB_CLONE_IMAGE="$_img_clone"
 [ -n "$_img_sidecar" ] && export SCARAB_SIDECAR_IMAGE="$_img_sidecar"
 
-# HARD GUARD: only ever touch the local colima cluster, never a Acme EKS ctx.
+# HARD GUARD: only ever touch the local colima cluster, never an ACME EKS ctx.
 ctx="$(kubectl config current-context)"
 [ "$ctx" = "colima" ] || { echo "refusing: kubectl context is '$ctx', not 'colima'." >&2; exit 1; }
 

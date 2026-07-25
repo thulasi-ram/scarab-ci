@@ -62,7 +62,7 @@ criteria + blockers.
 5. **Verify it actually works** — drive the change, don't just typecheck. For
    live k8s use **Colima only**: `colima start --kubernetes` if needed, and
    **assert `kubectl config current-context` == `colima`** before *any* cluster
-   op. ⚠️ The kubeconfig also holds real **Acme prod/staging EKS** contexts —
+   op. ⚠️ The kubeconfig also holds real **ACME prod/staging EKS** contexts —
    never target them. Tear down what you start.
 6. **Commit:** `<type>(<area>): <subject>` + a body explaining the decision, with
    trailer `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
@@ -87,7 +87,7 @@ Paste this into a new session to run the backlog self-paced, one ticket per
 iteration:
 
 ```
-/loop Implement the Scarab Arc A/B/C backlog one git-bug ticket per iteration, following docs/handoffs/arc-abc-implementation.md exactly. Each iteration: (1) ensure you are on branch feat/arc-abc-impl, created off origin/main if missing (never commit to main, never push, never open PRs); (2) pick the highest-value UNBLOCKED ready-for-agent ticket (all its "Blocked by" ids closed) following the dependency spine in the handoff (0048 config → 0047 durability → 0046 forge → 0045 clone → 0049 identity → rest of Arc C); (3) read the ticket body + the ADR it cites + relevant CONTEXT.md; (4) implement to the acceptance criteria, honoring hexagonal purity (ADR-0016/0031); (5) keep cargo check --workspace + clippy clean; (6) test per ADR-0017 (real Postgres via SCARAB_TEST_DATABASE_URL, mock only true externals, cluster/GitHub/Forgejo/UI live-runs #[ignore]+SCARAB_TEST_KUBE gated); (7) verify it actually works — for live k8s use Colima ONLY and assert kubectl current-context is colima first, NEVER the Acme EKS contexts, tear down what you start; (8) commit onto feat/arc-abc-impl as <type>(<area>): <subject> with a body + trailer "Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"; (9) git bug bug status close <id>. If a ticket needs a live external you cannot provide (real GitHub App creds, a Forgejo instance), implement the code + #[ignore] live test + a git bug comment on what a human must verify, then move on. Stop the loop when no unblocked ticket remains or something needs a human design decision.
+/loop Implement the Scarab Arc A/B/C backlog one git-bug ticket per iteration, following docs/handoffs/arc-abc-implementation.md exactly. Each iteration: (1) ensure you are on branch feat/arc-abc-impl, created off origin/main if missing (never commit to main, never push, never open PRs); (2) pick the highest-value UNBLOCKED ready-for-agent ticket (all its "Blocked by" ids closed) following the dependency spine in the handoff (0048 config → 0047 durability → 0046 forge → 0045 clone → 0049 identity → rest of Arc C); (3) read the ticket body + the ADR it cites + relevant CONTEXT.md; (4) implement to the acceptance criteria, honoring hexagonal purity (ADR-0016/0031); (5) keep cargo check --workspace + clippy clean; (6) test per ADR-0017 (real Postgres via SCARAB_TEST_DATABASE_URL, mock only true externals, cluster/GitHub/Forgejo/UI live-runs #[ignore]+SCARAB_TEST_KUBE gated); (7) verify it actually works — for live k8s use Colima ONLY and assert kubectl current-context is colima first, NEVER the ACME EKS contexts, tear down what you start; (8) commit onto feat/arc-abc-impl as <type>(<area>): <subject> with a body + trailer "Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"; (9) git bug bug status close <id>. If a ticket needs a live external you cannot provide (real GitHub App creds, a Forgejo instance), implement the code + #[ignore] live test + a git bug comment on what a human must verify, then move on. Stop the loop when no unblocked ticket remains or something needs a human design decision.
 ```
 
 (Omitting an interval makes it self-pace. For a durable cloud run instead, use
@@ -95,7 +95,7 @@ iteration:
 
 ## Safety rails (non-negotiable)
 
-- Never target the Acme EKS contexts; Colima only, context-checked.
+- Never target the ACME EKS contexts; Colima only, context-checked.
 - Never push or open PRs; never touch `main` directly.
 - ADRs are **Proposed** — implement them as written; if a ticket contradicts its
   ADR or reality, leave a `git bug bug comment` and skip rather than guess.
