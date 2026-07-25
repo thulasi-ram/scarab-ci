@@ -40,6 +40,55 @@ helm upgrade --install scarab deploy/helm/scarab -n scarab \
   --set secrets.existingSecret=scarab-env --set scarab.s3.bucket=scarab-logs
 ```
 
+## Login (`scarab.oauth`, ADR-0049)
+
+Scarab authenticates operators against a **forge-agnostic OAuth/OIDC provider**:
+the endpoints are explicit values, so GitHub, Forgejo and any OIDC issuer are the
+same code path. Without one the server has no authenticator and **refuses to
+start** (ADR-0048); the only other bootable shape is `scarab.devInsecure`, where
+every caller is a synthetic Owner.
+
+The four endpoints/ids are chart values; the **client secret never is** — it comes
+by reference from a Secret you manage out-of-band, exactly like the App PEM
+below:
+
+```sh
+kubectl -n scarab create secret generic scarab-oauth \
+  --from-literal=oauth-client-secret=<client secret>
+
+helm upgrade --install scarab deploy/helm/scarab -n scarab \
+  --set scarab.oauth.clientId=Iv1.0123456789abcdef \
+  --set scarab.oauth.authorizeUrl=https://github.com/login/oauth/authorize \
+  --set scarab.oauth.tokenUrl=https://github.com/login/oauth/access_token \
+  --set scarab.oauth.userinfoUrl=https://api.github.com/user \
+  --set scarab.oauth.scopes='read:user' \
+  --set 'scarab.oauth.owners={alice,bob}' \
+  --set secrets.oauthClientSecret.name=scarab-oauth
+```
+
+That renders `SCARAB_OAUTH_CLIENT_ID` / `_AUTHORIZE_URL` / `_TOKEN_URL` /
+`_USERINFO_URL` (+ optional `_SCOPES`, `_OWNERS` comma-joined) into the ConfigMap,
+and injects `SCARAB_OAUTH_CLIENT_SECRET` into the container with a `secretKeyRef`.
+For a Forgejo host the same four point at `/login/oauth/authorize`,
+`/login/oauth/access_token` and `/api/v1/user` on your instance.
+
+`scarab.oauth.owners` are the provider subjects granted **Owner** at login
+(bootstrap until scoped RBAC, ADR-0049 C2); everyone else authenticates as
+**Viewer**. An empty list means nobody can administer the install — the chart says
+so on install.
+
+**All five or none.** The server refuses to boot on a partially configured
+provider, so the chart refuses to render one: a missing endpoint, or a login
+config with no reachable client secret, **fails `helm upgrade`** with the exact
+value to set. If you already use `secrets.existingSecret`, you may supply
+`SCARAB_OAUTH_CLIENT_SECRET` as a key of it and leave
+`secrets.oauthClientSecret.name` empty.
+
+**`devInsecure` is not a fallback.** Setting `scarab.devInsecure=true` *and*
+`scarab.oauth.*` is a hard render error, not a precedence rule — dev-insecure
+would silently turn every caller back into an Owner and neuter the login you just
+configured. Pick one.
+
 ## The GitHub App credential (bootstrap-free)
 
 In App mode (`scarab.githubAppId`) the credential a GitHub connection
@@ -122,7 +171,10 @@ mechanism, applied kind-wide to GitHub App-mode connections.
 | `scarab.executor` | `k8s` | `k8s` (prod) or `local` (dev only) |
 | `scarab.namespace` | release ns | namespace step Pods launch into (RBAC granted there) |
 | `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
+| `scarab.oauth.*` | — | OAuth/OIDC login: `clientId`, `authorizeUrl`, `tokenUrl`, `userinfoUrl`, `scopes`, `owners` (above) |
+| `scarab.devInsecure` | `false` | ⚠ dev/eval only — no auth; mutually exclusive with `scarab.oauth` |
 | `secrets.*` / `secrets.existingSecret` | — | sensitive `SCARAB_*` env |
+| `secrets.oauthClientSecret.name` / `.key` | — / `oauth-client-secret` | OAuth client secret by reference from your own Secret (above) |
 | `secrets.githubAppPemSecret.name` / `.key` | — / `github-app.pem` | mount the App PEM from your own Secret (above) |
 | `scarab.connections` | `[]` | declarative, config-owned forge connections (above) |
 | `rbac.create` | `true` | Role/RoleBinding for Pod execution |
@@ -140,3 +192,5 @@ or supply them as keys of your own `secrets.existingSecret`.
 - [ADR-0005 — Tenancy & deployment; Kubernetes as the only backend](../../../docs/adr/0005-tenancy-and-k8s-only.md)
 - [ADR-0016 — Code architecture: hexagonal + adapter crates + converged binary](../../../docs/adr/0016-code-architecture.md)
 - [ADR-0046 — Forge auth is adapter-internal; GitHub + Forgejo adapters in v1](../../../docs/adr/0046-forge-auth-and-multi-adapter.md)
+- [ADR-0048 — Fail-closed startup](../../../docs/adr/0048-fail-closed-startup.md)
+- [ADR-0049 — Identity & access: forge-agnostic OAuth/OIDC login](../../../docs/adr/0049-identity-and-access.md)

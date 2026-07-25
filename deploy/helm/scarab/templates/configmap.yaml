@@ -1,3 +1,6 @@
+{{- /* Fail the render on a contradictory / partial authenticator config before
+       anything is applied (ADR-0048/0049). Emits nothing when sane. */ -}}
+{{- include "scarab.validateAuth" . -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -20,6 +23,22 @@ data:
   {{- end }}
   {{- with .Values.scarab.oidcIssuer }}
   SCARAB_OIDC_ISSUER: {{ . | quote }}
+  {{- end }}
+  {{- if include "scarab.oauthConfigured" . }}
+  {{- /* OAuth/OIDC login (ADR-0049). The client SECRET is deliberately absent
+         here — the Deployment injects it with a secretKeyRef. These four render
+         together or not at all: scarab.validateAuth already refused a partial
+         provider, which the server would reject at boot anyway. */}}
+  SCARAB_OAUTH_CLIENT_ID: {{ .Values.scarab.oauth.clientId | quote }}
+  SCARAB_OAUTH_AUTHORIZE_URL: {{ .Values.scarab.oauth.authorizeUrl | quote }}
+  SCARAB_OAUTH_TOKEN_URL: {{ .Values.scarab.oauth.tokenUrl | quote }}
+  SCARAB_OAUTH_USERINFO_URL: {{ .Values.scarab.oauth.userinfoUrl | quote }}
+  {{- with .Values.scarab.oauth.scopes }}
+  SCARAB_OAUTH_SCOPES: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.scarab.oauth.owners }}
+  SCARAB_OAUTH_OWNERS: {{ join "," . | quote }}
+  {{- end }}
   {{- end }}
   {{- if .Values.scarab.devInsecure }}
   SCARAB_DEV_INSECURE: "1"
