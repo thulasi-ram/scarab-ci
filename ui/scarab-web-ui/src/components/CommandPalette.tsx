@@ -6,11 +6,18 @@ import { createResource, createSignal, createMemo, createEffect, For, Show, onCl
 import { useNavigate } from "@solidjs/router";
 import { listProjects, type Project } from "../api/client";
 import { paletteOpen as open, setPaletteOpen as setOpen } from "../palette";
+import { canAdminister } from "../session";
 import Icon from "./Icon";
 
 type Item =
   | { kind: "repo"; label: string; sub: string; href: string }
-  | { kind: "run"; label: string; sub: string; href: string };
+  | { kind: "run"; label: string; sub: string; href: string }
+  | { kind: "page"; label: string; sub: string; href: string };
+
+/** Static destinations, offered only when the caller may actually reach them. */
+const PAGES: { label: string; sub: string; href: string; admin: boolean }[] = [
+  { label: "Settings", sub: "organization-wide configuration", href: "/settings", admin: true },
+];
 
 const RUN_ID = /^[0-9a-f]{4,}$/i;
 
@@ -35,7 +42,10 @@ export default function CommandPalette() {
         sub: `${p.owner}/${p.name}`,
         href: `/${p.org}/${p.project}`,
       }));
-    const out: Item[] = [...repos];
+    const pages = PAGES.filter((pg) => !pg.admin || canAdminister())
+      .filter((pg) => !query || pg.label.toLowerCase().includes(query))
+      .map<Item>((pg) => ({ kind: "page", label: pg.label, sub: pg.sub, href: pg.href }));
+    const out: Item[] = [...repos, ...pages];
     // A hex-looking query is also a run id to jump to.
     if (RUN_ID.test(q().trim())) {
       out.unshift({
@@ -115,7 +125,16 @@ export default function CommandPalette() {
                   onMouseEnter={() => setSel(i())}
                   onClick={() => go(item)}
                 >
-                  <Icon icon={item.kind === "run" ? "workflow" : "git-branch"} size={14} />
+                  <Icon
+                    icon={
+                      item.kind === "run"
+                        ? "workflow"
+                        : item.kind === "page"
+                          ? "settings"
+                          : "git-branch"
+                    }
+                    size={14}
+                  />
                   <span class="cmdk-label">{item.label}</span>
                   <span class="cmdk-sub mono">{item.sub}</span>
                 </button>

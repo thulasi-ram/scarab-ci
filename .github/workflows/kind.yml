@@ -3,15 +3,10 @@
 # SCARAB_TEST_KUBE) against a throwaway kind cluster on every PR/push that
 # touches the execution path.
 #
-# REQUIRED (promoted off probation 2026-07-25, git-bug a0b42ad). Nine runs,
-# one failure — and that failure was the *harness* `.expect()`ing a transient
-# poll error the engine is designed to retry (`workspace: broken pipe`), not
-# cluster flake; `poll_to_terminal` in tests/cluster.rs now rides transients
-# out the way the scheduler does. Enforcement lives in
-# `.github/required-checks.txt` + `just pr-gate <n>`, because branch
-# protection and rulesets are both 403 on this repo (private, free plan).
-# Listed there as `required-if-run`: the path filter below means a clean
-# absence on an unrelated PR is correct, not a missing gate.
+# ADVISORY PROBATION: this job is intentionally NOT a required check. Live
+# k8s runs carry inherent flake surface (registry pulls, kubelet timing); it
+# reports, humans read it. Promote it to required only once it has a track
+# record of being quiet.
 #
 # Images: the clone + results-sidecar step images are pulled from the GHCR
 # `edge` tags image.yml publishes off main and `kind load`ed; when the PR

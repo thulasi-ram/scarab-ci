@@ -369,12 +369,6 @@ pub struct StepDto {
     /// computed over exactly these inputs (mirrors `scarab_pipeline::StepSpec`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Vec<String>>,
-    /// Explicit output workspace paths (ADR-0007): the workspace-relative paths
-    /// this step publishes downstream. Absent = the whole workspace. A declared
-    /// path the step did not produce fails the step (fail-closed), so this is a
-    /// contract, not a filter (mirrors `scarab_pipeline::StepSpec`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outputs: Option<Vec<String>>,
     /// Privilege escalation requested above the hardened baseline (ADR-0039).
     /// On an inline API run only the self-service `run_as_root` grant is admitted
     /// (it stays inside the sandbox); governed grants (add-capabilities /
@@ -973,7 +967,6 @@ async fn create_run(
             privileged: admitted.privileged,
             timeout_seconds: step.timeout,
             workspace_inputs: vec![],
-            workspace_outputs: step.outputs.clone().unwrap_or_default(),
             clone: None,
             build: None,
             artifacts: vec![],
@@ -2042,6 +2035,23 @@ pub struct MeResponse {
     pub display_name: Option<String>,
     /// The principal's Scarab-native roles (e.g. `["Owner"]`).
     pub roles: Vec<String>,
+    /// May this principal administer org-level settings (ADR-0060)? The gate on
+    /// the global Settings area — the UI hides the nav entry when false, since
+    /// nothing there is actionable or informative without `Administer`.
+    ///
+    /// True for a globally-`Administer` role, or an `Admin`+ binding on the Org
+    /// scope of any org the caller can see. Deliberately *not* implied by a
+    /// Project-scoped `Administer`: administering one repo does not grant the
+    /// org's secrets or its forge connections (ADR-0049 — Org inherits down,
+    /// never up).
+    pub can_administer: bool,
+    /// The orgs this principal may administer, for the Settings area to act on.
+    /// One entry in practice (single implicit Org, ADR-0060) — a list because
+    /// `Org` remains the model's real inheritance root, not a collapsed
+    /// constant. Empty on a fresh install: an org only exists once a Project is
+    /// bound to it, so `can_administer` can be true with nothing to administer
+    /// yet.
+    pub admin_orgs: Vec<String>,
 }
 
 /// Return the current authenticated principal. In dev (auth disabled) this is
@@ -2056,11 +2066,68 @@ pub struct MeResponse {
 )]
 async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeResponse>, ApiError> {
     let principal = authenticate(&st, &headers, Action::Read).await?;
+    let admin_orgs = administrable_orgs(&st, &principal).await?;
+    let can_administer = principal.can(Action::Administer) || !admin_orgs.is_empty();
     Ok(Json(MeResponse {
         subject: principal.subject,
         display_name: principal.display_name,
         roles: principal.roles.iter().map(|r| format!("{r:?}")).collect(),
+        can_administer,
+        admin_orgs,
     }))
+}
+
+/// The orgs `principal` may administer (ADR-0060), sorted and deduplicated.
+///
+/// An org exists only as the coordinate of a bound Project — there is no `orgs`
+/// table (ADR-0046) — so the candidate set is exactly the orgs of the registry's
+/// bindings. A globally-`Administer` role takes all of them; anyone else needs an
+/// `Admin`+ binding on that specific `Scope::Org`.
+async fn administrable_orgs(
+    st: &AppState,
+    principal: &Principal,
+) -> Result<Vec<String>, ApiError> {
+    let Some(connections) = st.connections.as_ref() else {
+        return Ok(Vec::new()); // no registry wired (dev): no orgs exist yet
+    };
+    let mut orgs = std::collections::BTreeSet::new();
+    let conns = connections
+        .list_connections()
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    for conn in conns {
+        let repos = connections
+            .repos_of(&conn.id)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        for repo in repos {
+            if let Some(resolved) = connections
+                .resolve(&repo)
+                .await
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?
+            {
+                orgs.insert(resolved.org);
+            }
+        }
+    }
+    if principal.can(Action::Administer) {
+        return Ok(orgs.into_iter().collect());
+    }
+    let Some(rbac) = st.rbac.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut allowed = Vec::new();
+    for org in orgs {
+        let scope = scarab_identity::Scope::Org(org.clone());
+        let role = rbac
+            .role_of(&principal.subject, &scope)
+            .await
+            .map_err(|_| ApiError::Forbidden)?;
+        if role.is_some_and(|r| r.allows(Action::Administer)) {
+            allowed.push(org);
+        }
+    }
+    Ok(allowed)
 }
 
 /// The forge WEB (html) base for a repo — what the UI appends `/commit/<sha>`
@@ -3744,11 +3811,6 @@ async fn persist_run_from_ir(
                 privileged: false,
                 timeout_seconds: step.timeout,
                 workspace_inputs: vec![],
-                // Honored on a clone step too (ADR-0007) — same egress prune, no
-                // special case. Narrowing a checkout is unusual and drops `.git`
-                // unless declared, but it is the author's call, and silently
-                // ignoring the field here would be the one thing we won't do.
-                workspace_outputs: step.outputs.clone().unwrap_or_default(),
                 clone: Some(scarab_engine::CloneConfig {
                     owner: repo.owner.clone(),
                     name: repo.name.clone(),
@@ -3828,10 +3890,6 @@ async fn persist_run_from_ir(
                 privileged: admitted.privileged,
                 timeout_seconds: step.timeout,
                 workspace_inputs: vec![],
-                // Per-PATH output publishing (ADR-0007): the backend prunes the
-                // post-step snapshot to exactly these workspace-relative paths.
-                // Empty = publish the whole workspace (the implicit default).
-                workspace_outputs: step.outputs.clone().unwrap_or_default(),
                 clone: None,
                 build,
                 artifacts: step.artifacts.clone(),
@@ -3860,6 +3918,12 @@ async fn persist_run_from_ir(
             let inputs: Vec<StepId> = inputs.iter().map(|i| StepId(i.clone())).collect();
             db.set_step_inputs(run, &step_id, &inputs).await?;
         }
+        // NOTE: the sibling `step.outputs` (per-PATH output publishing, ADR-0007)
+        // is intentionally NOT threaded into the IR here. Whole-workspace
+        // publishing is the shipped behavior; a path subset needs CAS sub-tree
+        // addressing that scarab-storage-s3 lacks (whole-tree only). The field is
+        // parsed + validated but a no-op — see the output-snapshot site in
+        // scarab-engine/src/scheduler.rs and docs/followups.md. Not a silent drop.
 
         // A `when:`-excluded step is kept in the DAG (edges intact) but starts
         // Skipped, so the scheduler transitively skips its descendants (ADR-0033).
@@ -5540,137 +5604,9 @@ async fn openapi() -> Json<utoipa::openapi::OpenApi> {
     Json(ApiDoc::openapi())
 }
 
-/// The curated operation groups carried by the spec, in sidebar display order.
-///
-/// The doc renderer (`starlight-openapi`) builds a page per operation and groups
-/// them by tag, so an untagged spec renders as a bare overview with no operation
-/// pages at all. Tagging happens here rather than on 53 `#[utoipa::path]`
-/// annotations so the grouping is one curated list a reviewer can read, and a
-/// newly-added route inherits its group from its path instead of silently
-/// landing untagged (`operation_tags_cover_every_operation` asserts that).
-const TAG_GROUPS: &[(&str, &str)] = &[
-    (
-        "Runs",
-        "Launch, read, cancel, rerun and retry Runs; their events, logs, \
-         results, workspace, artifacts and gates.",
-    ),
-    (
-        "Repositories",
-        "The governed repos Scarab knows about, their pipeline catalog, refs, \
-         launch interface and manual dispatch.",
-    ),
-    (
-        "Environments",
-        "Environments and their protection rules, plus deployment history.",
-    ),
-    (
-        "Secrets",
-        "Scoped secrets (org / repo / environment) and the effective-status \
-         matrix that resolves them.",
-    ),
-    (
-        "Webhooks",
-        "Forge delivery endpoints. Called by the forge, not by clients; each \
-         verifies its own signature.",
-    ),
-    (
-        "Auth & Identity",
-        "Login/session, the current principal, OIDC discovery and JWKS, and \
-         RBAC role bindings.",
-    ),
-    (
-        "System",
-        "Liveness, readiness and Prometheus metrics (ADR-0053).",
-    ),
-];
-
-/// Which [`TAG_GROUPS`] entry an operation belongs to, decided by its path.
-///
-/// First match wins, so the order is load-bearing: `/…/bindings/import` is
-/// access control rather than a repo operation, and `/…/repos/…/runs` is a Run
-/// listing rather than a repo one. Returns `None` for a path no rule claims —
-/// a test turns that into a build failure rather than an untagged operation.
-fn tag_for_path(path: &str) -> Option<&'static str> {
-    let group = if path.starts_with("/webhooks/") {
-        "Webhooks"
-    } else if path.starts_with("/.well-known/")
-        || path.starts_with("/v1/auth/")
-        || path == "/v1/me"
-        || path.contains("bindings")
-    {
-        "Auth & Identity"
-    } else if matches!(path, "/healthz" | "/readyz" | "/metrics") {
-        "System"
-    } else if path.contains("/environments") {
-        "Environments"
-    } else if path.contains("/secrets") {
-        "Secrets"
-    } else if path.contains("/runs") {
-        "Runs"
-    } else if path.starts_with("/v1/repos") {
-        "Repositories"
-    } else {
-        return None;
-    };
-    Some(group)
-}
-
-/// Every operation a `PathItem` actually declares. `utoipa` models the methods
-/// as separate `Option` fields rather than a map, so walking them needs this.
-fn path_item_operations(
-    item: &mut utoipa::openapi::path::PathItem,
-) -> impl Iterator<Item = &mut utoipa::openapi::path::Operation> {
-    [
-        &mut item.get,
-        &mut item.put,
-        &mut item.post,
-        &mut item.delete,
-        &mut item.options,
-        &mut item.head,
-        &mut item.patch,
-        &mut item.trace,
-    ]
-    .into_iter()
-    .flatten()
-}
-
-/// Stamps the curated group onto every operation and declares the groups
-/// top-level, so the canonical `openapi.json` carries its own grouping.
-struct TagGroups;
-
-impl utoipa::Modify for TagGroups {
-    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
-        let mut used = std::collections::HashSet::new();
-        for (path, item) in &mut openapi.paths.paths {
-            let Some(group) = tag_for_path(path) else {
-                continue;
-            };
-            for op in path_item_operations(item) {
-                op.tags = Some(vec![group.to_owned()]);
-            }
-            used.insert(group);
-        }
-        // Declare only the groups actually in use, in TAG_GROUPS order — an
-        // empty group would render as an empty sidebar section.
-        openapi.tags = Some(
-            TAG_GROUPS
-                .iter()
-                .filter(|(name, _)| used.contains(name))
-                .map(|(name, description)| {
-                    utoipa::openapi::tag::TagBuilder::new()
-                        .name(*name)
-                        .description(Some(*description))
-                        .build()
-                })
-                .collect(),
-        );
-    }
-}
-
 /// The generated OpenAPI document. The pipeline request schema is the IR subset.
 #[derive(OpenApi)]
 #[openapi(
-    modifiers(&TagGroups),
     paths(
         healthz,
         readyz,

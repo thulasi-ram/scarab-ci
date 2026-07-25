@@ -1,8 +1,9 @@
 // The signed-in identity (ADR-0049): an avatar showing initials, opening a
 // dropdown with the principal's name, subject, and role, plus sign-out. Driven
 // by the real `GET /v1/me` — no more hardcoded placeholder.
-import { createResource, createSignal, onCleanup, onMount, Show } from "solid-js";
-import { getMe, logout } from "../api/client";
+import { createSignal, onCleanup, onMount, Show } from "solid-js";
+import { logout } from "../api/client";
+import { me } from "../session";
 
 /** Initials from a display name ("Thulasi Ram" → "TR") or subject ("t.ram" → "T"). */
 function initials(name: string): string {
@@ -12,7 +13,6 @@ function initials(name: string): string {
 }
 
 export default function UserMenu() {
-  const [me] = createResource(getMe);
   const [open, setOpen] = createSignal(false);
   let root: HTMLDivElement | undefined;
 

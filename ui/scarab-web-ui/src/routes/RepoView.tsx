@@ -11,9 +11,6 @@ import { recordVisit } from "../visited";
 import {
   listRepoRuns,
   repoForgeUrl,
-  listSecrets,
-  putSecret,
-  deleteSecret,
   fetchSecretMatrix,
   listEnvironments,
   listDeployments,
@@ -21,7 +18,6 @@ import {
   type RunSummary,
   type RepoEnvironment,
   type SecretCellStatus,
-  type SecretScope,
 } from "../api/client";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
@@ -29,6 +25,7 @@ import TriggerCell from "../components/TriggerCell";
 import RunNumber from "../components/RunNumber";
 import Icon from "../components/Icon";
 import SearchSelect from "../components/SearchSelect";
+import ScopedSecrets from "../components/ScopedSecrets";
 import Doodle from "../components/Doodle";
 import AsciiScene from "../components/AsciiScene";
 import ponderIdle from "../../../brand/ascii/generated/ponder-ponder.json";
@@ -417,7 +414,11 @@ export default function RepoView() {
 
       {/* ---- Secrets ---- */}
       <Show when={tab() === "secrets"}>
-        <RepoSecrets org={org()} repo={repo()} focusPing={secretFocus()} />
+        <ScopedSecrets
+          scope={{ org: org(), repo: repo() }}
+          title={`Secrets · ${org()}/${repo()}`}
+          focusPing={secretFocus()}
+        />
         <SecretMatrix org={org()} repo={repo()} />
       </Show>
 
@@ -634,154 +635,6 @@ function EnvDialog(props: {
           <p class="subtle modal-note">
             Defines a deploy gate (approvers, wait timer, allowed refs). Requires the
             Administer capability on this repo (ADR-0037).
-          </p>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ---- repo-scoped secrets (real API) --------------------------------------
-
-function RepoSecrets(props: { org: string; repo: string; focusPing: number }) {
-  const scope = () => ({ org: props.org, repo: props.repo });
-  const [names, { refetch }] = createResource(scope, listSecrets);
-  const [showDialog, setShowDialog] = createSignal(false);
-
-  // The header "New secret" CTA pings us to open the add-secret modal. Guard on
-  // > 0 so we don't pop the dialog on the initial mount.
-  createEffect(() => {
-    if (props.focusPing > 0) setShowDialog(true);
-  });
-
-  return (
-    <div class="panel">
-      <div class="panel-h"><span>Secrets · {props.org}/{props.repo}</span></div>
-      <div class="secrets-body">
-        <Show when={!names.loading} fallback={<p class="empty">loading…</p>}>
-          <Show when={(names()?.length ?? 0) > 0} fallback={<p class="empty">No secrets at this scope.</p>}>
-            <ul class="secret-list">
-              <For each={names()}>
-                {(n) => (
-                  <li class="secret-row">
-                    <Icon icon="key-round" size={15} />
-                    <code class="mono">{n}</code>
-                    <button class="btn btn-danger btn-sm" onClick={async () => { await deleteSecret(scope(), n); refetch(); }}>
-                      delete
-                    </button>
-                  </li>
-                )}
-              </For>
-            </ul>
-          </Show>
-          <div class="secrets-actions">
-            <button class="btn btn-primary btn-sm" onClick={() => setShowDialog(true)}>
-              <Icon icon="plus" size={14} /> New secret
-            </button>
-          </div>
-          <p class="subtle"><small>Encrypted at rest, never displayed — overwrite but never read back.</small></p>
-        </Show>
-      </div>
-      <Show when={showDialog()}>
-        <NewSecretDialog
-          scope={scope()}
-          existing={names() ?? []}
-          onClose={() => setShowDialog(false)}
-          onSaved={() => refetch()}
-        />
-      </Show>
-    </div>
-  );
-}
-
-// New-secret modal. `putSecret` is an unconditional upsert, so the overwrite
-// checkbox is a client-side guard: replacing an existing name requires opting
-// in, which keeps an accidental Save from silently clobbering a live secret.
-function NewSecretDialog(props: {
-  scope: SecretScope;
-  existing: string[];
-  onClose: () => void;
-  onSaved: () => void;
-}) {
-  const [name, setName] = createSignal("");
-  const [value, setValue] = createSignal("");
-  const [overwrite, setOverwrite] = createSignal(false);
-  const [saving, setSaving] = createSignal(false);
-  const [error, setError] = createSignal<string | null>(null);
-
-  const exists = () => props.existing.includes(name().trim());
-  const blocked = () => exists() && !overwrite();
-  let nameRef: HTMLInputElement | undefined;
-  createEffect(() => nameRef?.focus());
-
-  const save = async () => {
-    const n = name().trim();
-    if (!n || blocked()) return;
-    setSaving(true);
-    setError(null);
-    try {
-      await putSecret({ ...props.scope, name: n, value: value() });
-      props.onSaved();
-      props.onClose();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not save secret.");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div class="modal-scrim" onClick={props.onClose}>
-      <div class="modal" onClick={(e) => e.stopPropagation()}>
-        <div class="panel-h"><span>New secret</span></div>
-        <div class="modal-body">
-          <div class="form-r">
-            <label>name</label>
-            <input
-              ref={nameRef}
-              class="input"
-              placeholder="NAME"
-              value={name()}
-              onInput={(e) => setName(e.currentTarget.value)}
-            />
-          </div>
-          <div class="form-r">
-            <label>value</label>
-            <input
-              class="input"
-              type="password"
-              placeholder="value (write-only)"
-              value={value()}
-              onInput={(e) => setValue(e.currentTarget.value)}
-            />
-          </div>
-          <Show when={exists()}>
-            <label class="secret-overwrite">
-              <input
-                type="checkbox"
-                checked={overwrite()}
-                onChange={(e) => setOverwrite(e.currentTarget.checked)}
-              />
-              <span>
-                <code class="mono">{name().trim()}</code> already exists — overwrite it
-              </span>
-            </label>
-          </Show>
-          <Show when={error()}>
-            <p class="error">{error()}</p>
-          </Show>
-          <div class="modal-actions">
-            <button
-              class="btn btn-primary"
-              disabled={saving() || !name().trim() || blocked()}
-              onClick={save}
-            >
-              <Icon icon="plus" size={14} /> {saving() ? "Saving…" : "Save"}
-            </button>
-            <button class="btn btn-ghost" onClick={props.onClose}>Cancel</button>
-          </div>
-          <p class="subtle modal-note">
-            <small>Encrypted at rest, never displayed — overwrite but never read back.</small>
           </p>
         </div>
       </div>

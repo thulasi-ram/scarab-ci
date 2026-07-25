@@ -773,11 +773,6 @@ struct Config {
     /// How long a shared service (ADR-0058) may stay `starting` before the
     /// scheduler fails it (and its opt-in steps) fail-closed. Default 5 min.
     service_ready_timeout_ms: i64,
-    /// How long one run's per-run tick work may fail *continuously* before the
-    /// run is dead-lettered (ADR-0059). Default 5 min — long enough that a db
-    /// blip or a since-fixed control-plane bug self-heals on a later tick,
-    /// short enough that a poison run does not hot-loop forever.
-    tick_failure_deadline_ms: i64,
 }
 
 /// One control-plane instance's supervision memory (ADR-0056): the attempts
@@ -807,65 +802,6 @@ impl Supervision {
     }
 }
 
-/// One control-plane instance's per-run **tick health** (ADR-0059): for each
-/// run whose per-run tick work is currently failing, when this PROCESS first
-/// saw it fail. Drives the bound that turns a persistently poisoned run into an
-/// explicit dead-letter instead of an unbounded hot-loop (CONTEXT §7.1:
-/// forward progress **or** explicit dead-letter).
-///
-/// Deliberately in-memory and per-replica, like [`Supervision`] — ADR-0059's
-/// Consequences floated a *durable* signal, and this deviates on purpose. A
-/// durable marker only pays off if a matching "recovered" marker is written on
-/// the healthy path too; skip that and a stale marker from an old, long-since-
-/// healed episode makes the *next* single blip look like a deadline-exceeding
-/// streak, dead-lettering a healthy run. Writing the recovery marker instead
-/// puts an append on every clean tick of every run. In-memory has the opposite,
-/// benign failure mode: a restart or failover resets the streak, so a poison
-/// run dead-letters *later* than the deadline (never sooner) — and a control
-/// plane that restarts faster than the deadline is itself the louder problem.
-///
-/// Same threading caveat as [`Supervision`]: the [`Scheduler`] is often built
-/// fresh each tick, so a long-lived driver MUST create one of these at boot and
-/// pass it in via [`with_tick_health`](Scheduler::with_tick_health). A
-/// per-cycle map would make every failure look like the first one, and the
-/// bound would never be reached.
-#[derive(Clone, Default)]
-pub struct TickHealth(
-    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<RunId, Timestamp>>>,
-);
-
-impl TickHealth {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Record a failure at `now`; returns when the CURRENT consecutive failure
-    /// streak started (`now` itself if this is the first failure).
-    fn failing_since(&self, run: &RunId, now: Timestamp) -> Timestamp {
-        *self
-            .0
-            .lock()
-            .expect("tick health map poisoned")
-            .entry(run.clone())
-            .or_insert(now)
-    }
-
-    /// End `run`'s failure streak — a clean per-run tick, or the run is gone.
-    fn healthy(&self, run: &RunId) {
-        self.0.lock().expect("tick health map poisoned").remove(run);
-    }
-
-    /// Forget runs that are no longer active, so the map cannot grow for the
-    /// life of the process.
-    fn retain_active(&self, active: &[RunId]) {
-        let live: std::collections::HashSet<&RunId> = active.iter().collect();
-        self.0
-            .lock()
-            .expect("tick health map poisoned")
-            .retain(|run, _| live.contains(run));
-    }
-}
-
 /// The durable scheduler. Borrows the ports for the duration of a cycle.
 pub struct Scheduler<'a> {
     db: &'a dyn Db,
@@ -877,8 +813,6 @@ pub struct Scheduler<'a> {
     /// value itself lives as long as the process, as in tests); a per-cycle
     /// caller must inject the process-lifetime one.
     supervised: Supervision,
-    /// See [`TickHealth`] — same per-process threading rule as `supervised`.
-    health: TickHealth,
 }
 
 impl<'a> Scheduler<'a> {
@@ -894,7 +828,6 @@ impl<'a> Scheduler<'a> {
             executor,
             owner: owner.into(),
             supervised: Supervision::new(),
-            health: TickHealth::new(),
             cfg: Config {
                 lease_ttl_ms: 30_000,
                 outbox_batch: 16,
@@ -903,7 +836,6 @@ impl<'a> Scheduler<'a> {
                 global_run_cap: u32::MAX,
                 default_step_timeout_ms: 3_600_000,
                 service_ready_timeout_ms: 300_000,
-                tick_failure_deadline_ms: 300_000,
             },
         }
     }
@@ -925,21 +857,6 @@ impl<'a> Scheduler<'a> {
     /// degrades into per-cycle noise.
     pub fn with_supervision(mut self, supervision: Supervision) -> Self {
         self.supervised = supervision;
-        self
-    }
-
-    /// Inject the process-lifetime [`TickHealth`] map (ADR-0059). Required when
-    /// the Scheduler is constructed per cycle, or every per-run failure looks
-    /// like the first one and the dead-letter bound is never reached.
-    pub fn with_tick_health(mut self, health: TickHealth) -> Self {
-        self.health = health;
-        self
-    }
-
-    /// Override how long a run's per-run tick work may fail continuously before
-    /// the run dead-letters (ADR-0059).
-    pub fn with_tick_failure_deadline_ms(mut self, ms: i64) -> Self {
-        self.cfg.tick_failure_deadline_ms = ms;
         self
     }
 
@@ -983,46 +900,26 @@ impl<'a> Scheduler<'a> {
     /// each active run, reconciles the outbox globally (one pass covers all
     /// runs), then advances each. This is what the background loop calls.
     ///
-    /// **Per-run fault isolation is a tick invariant** (ADR-0059): every per-run
-    /// leg — reconcile-services, admit, advance — is collected-and-continued, so
-    /// one poison run can never starve another run's progress. The isolated
-    /// errors come back in the returned vec; the pure engine emits no logs, so
-    /// the caller (the converged driver in `scarab-server`, which owns
-    /// `tracing`) surfaces them. An empty vec = a fully clean tick.
-    ///
-    /// The outer `Result` is reserved for genuinely **tick-global** failure —
-    /// `active_runs()` and the cross-run outbox passes, which are
-    /// infrastructural rather than attributable to one run. Keep that split
-    /// legible: `Err` = "the tick itself broke", vec = "these runs are stuck".
-    ///
-    /// Isolation alone would hot-loop a persistently broken run forever, so it
-    /// is bounded: a run whose per-run legs fail continuously past
-    /// `tick_failure_deadline_ms` is dead-lettered with a distinct diagnostic
-    /// (see [`TickHealth`]), restoring "forward progress **or** explicit
-    /// dead-letter" (CONTEXT §7.1) at the per-run grain.
+    /// Returns the per-run reconcile errors that were **swallowed** this cycle
+    /// (git-bug 6825830). A `reconcile_services` error for ONE run (a db /
+    /// teardown blip; launch errors no longer escape after the launch-error
+    /// bound) must not abort the whole converged tick and starve the other runs,
+    /// so it is caught and the run is skipped this cycle (retried next tick). The
+    /// pure engine emits no logs; it hands the swallowed errors back so the
+    /// caller — the converged driver in `scarab-server`, which legitimately owns
+    /// `tracing` — surfaces them. An empty vec = a fully clean tick.
     pub async fn tick_all(&self) -> Result<Vec<(RunId, SchedulerError)>, SchedulerError> {
         let runs = self.db.active_runs().await?;
-        // Runs that finished (or dead-lettered) must not keep a failure streak
-        // alive in the process-lifetime map.
-        self.health.retain_active(&runs);
-        let mut isolated: Vec<(RunId, SchedulerError)> = Vec::new();
-        let mut stuck: std::collections::HashSet<&RunId> = std::collections::HashSet::new();
+        let mut skipped: Vec<(RunId, SchedulerError)> = Vec::new();
         for run in &runs {
             // Shared services (ADR-0058) before admit, so the readiness gate sees
-            // fresh statuses this tick.
-            let leg = async {
-                self.reconcile_services(run).await?;
-                self.admit(run).await
+            // fresh statuses this tick. Per-run isolation: collect + skip on error
+            // rather than aborting the whole converged tick.
+            if let Err(e) = self.reconcile_services(run).await {
+                skipped.push((run.clone(), e));
+                continue;
             }
-            .await;
-            if let Err(e) = leg {
-                if let Some(e) = self.isolate_run_failure(run, e).await {
-                    isolated.push((run.clone(), e));
-                }
-                // Advancing a run whose admission just failed only re-hits the
-                // same fault: one isolated error per run per tick.
-                stuck.insert(run);
-            }
+            self.admit(run).await?;
         }
         self.reconcile().await?;
         // API-requested cancellations (ADR-0054): tear down the Pods of runs
@@ -1033,52 +930,9 @@ impl<'a> Scheduler<'a> {
         // orphans left when rerun_step re-armed a running descendant.
         self.reconcile_supersessions().await?;
         for run in &runs {
-            if stuck.contains(run) {
-                continue;
-            }
-            match self.advance(run).await {
-                // A clean pass over every per-run leg ends the failure streak.
-                Ok(()) => self.health.healthy(run),
-                Err(e) => {
-                    if let Some(e) = self.isolate_run_failure(run, e).await {
-                        isolated.push((run.clone(), e));
-                    }
-                }
-            }
+            self.advance(run).await?;
         }
-        Ok(isolated)
-    }
-
-    /// Apply ADR-0059's bound to one isolated per-run tick failure.
-    ///
-    /// Returns the error for the driver to log, or `None` when the run was
-    /// dead-lettered instead — then the diagnosis lives on the run's event log,
-    /// which is the durable operator signal, and re-logging it would just be
-    /// noise. Deliberately infallible: a failure *inside* the dead-lettering is
-    /// reported as this run's isolated error rather than propagated, because
-    /// propagating would abort the tick for every other run — the exact stall
-    /// this method exists to prevent.
-    async fn isolate_run_failure(&self, run: &RunId, e: SchedulerError) -> Option<SchedulerError> {
-        let now = self.clock.now().await;
-        let since = self.health.failing_since(run, now);
-        let failing_ms = now.0 - since.0;
-        if failing_ms < self.cfg.tick_failure_deadline_ms {
-            return Some(e);
-        }
-        let reason = format!(
-            "scheduler tick failed continuously for {failing_ms}ms (bound: {}ms, ADR-0059) — \
-             this run cannot be driven forward; last error: {e}",
-            self.cfg.tick_failure_deadline_ms
-        );
-        match self.dead_letter_run(run, reason).await {
-            // Streak closed: the run is terminal, so `retain_active` drops it
-            // next tick — clear now so a same-tick straggler can't re-trip this.
-            Ok(()) => {
-                self.health.healthy(run);
-                None
-            }
-            Err(dl) => Some(dl),
-        }
+        Ok(skipped)
     }
 
     /// Are we the admission leader right now?
@@ -1423,35 +1277,25 @@ impl<'a> Scheduler<'a> {
             )
             .await?;
         for msg in msgs {
-            // Per-MESSAGE fault isolation (ADR-0059): the body's own `?` sites
-            // (the db reads) would otherwise abort the whole tick for every run,
-            // and a permanently failing one — a poison row — would stall the
-            // fleet on every cycle forever.
-            let processed = async {
-                // Attempt every recorded Pod's teardown, remembering whether any
-                // cancel genuinely failed (an already-gone Pod is `Ok`). Keep going
-                // past a failure so the reachable Pods still die this tick; the whole
-                // message is retried idempotently if any cancel failed.
-                let mut outcome: Result<(), ExecError> = Ok(());
-                for step in self.db.steps_of_run(&msg.run).await? {
-                    if let Some(attempt) = step.attempts.last() {
-                        if let Some(h) = self
-                            .db
-                            .attempt_handle(&msg.run, &step.step, &attempt.id)
-                            .await?
-                        {
-                            if let Err(e) = self.executor.cancel(&ExecHandle(h)).await {
-                                outcome = Err(e);
-                            }
+            // Attempt every recorded Pod's teardown, remembering whether any
+            // cancel genuinely failed (an already-gone Pod is `Ok`). Keep going
+            // past a failure so the reachable Pods still die this tick; the whole
+            // message is retried idempotently if any cancel failed.
+            let mut outcome: Result<(), ExecError> = Ok(());
+            for step in self.db.steps_of_run(&msg.run).await? {
+                if let Some(attempt) = step.attempts.last() {
+                    if let Some(h) = self
+                        .db
+                        .attempt_handle(&msg.run, &step.step, &attempt.id)
+                        .await?
+                    {
+                        if let Err(e) = self.executor.cancel(&ExecHandle(h)).await {
+                            outcome = Err(e);
                         }
                     }
                 }
-                self.settle_teardown(&msg, outcome).await
             }
-            .await;
-            if let Err(e) = processed {
-                self.abandon_poison_message(&msg, &e).await?;
-            }
+            self.settle_teardown(&msg, outcome).await?;
         }
         Ok(())
     }
@@ -1471,73 +1315,24 @@ impl<'a> Scheduler<'a> {
             )
             .await?;
         for msg in msgs {
-            // Per-MESSAGE fault isolation (ADR-0059). A malformed payload is the
-            // sharp case: `BadPayload` is permanent, so propagating it aborted
-            // every later run's tick on this and every future cycle — one
-            // un-deserializable row could wedge the whole fleet indefinitely.
-            let processed = async {
-                let payload: SupersedeTeardown = serde_json::from_value(msg.payload.clone())
-                    .map_err(|e| SchedulerError::BadPayload(e.to_string()))?;
-                // Cancel every named Pod, remembering whether any cancel genuinely
-                // failed (an already-gone Pod is `Ok`). A later reconcile re-cancels
-                // the already-gone ones harmlessly and retries only those still up.
-                let mut outcome: Result<(), ExecError> = Ok(());
-                for item in payload.attempts {
-                    if let Some(h) = self
-                        .db
-                        .attempt_handle(&msg.run, &StepId(item.step), &AttemptId(item.attempt))
-                        .await?
-                    {
-                        if let Err(e) = self.executor.cancel(&ExecHandle(h)).await {
-                            outcome = Err(e);
-                        }
+            let payload: SupersedeTeardown = serde_json::from_value(msg.payload.clone())
+                .map_err(|e| SchedulerError::BadPayload(e.to_string()))?;
+            // Cancel every named Pod, remembering whether any cancel genuinely
+            // failed (an already-gone Pod is `Ok`). A later reconcile re-cancels
+            // the already-gone ones harmlessly and retries only those still up.
+            let mut outcome: Result<(), ExecError> = Ok(());
+            for item in payload.attempts {
+                if let Some(h) = self
+                    .db
+                    .attempt_handle(&msg.run, &StepId(item.step), &AttemptId(item.attempt))
+                    .await?
+                {
+                    if let Err(e) = self.executor.cancel(&ExecHandle(h)).await {
+                        outcome = Err(e);
                     }
                 }
-                self.settle_teardown(&msg, outcome).await
             }
-            .await;
-            if let Err(e) = processed {
-                self.abandon_poison_message(&msg, &e).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Count one failed *processing* attempt of a teardown message and, at
-    /// [`MAX_DELIVERY_ATTEMPTS`], retire it as poison with a diagnostic on the
-    /// run's event log (ADR-0047's ceiling, ADR-0059's isolation).
-    ///
-    /// Distinct from [`settle_teardown`](Self::settle_teardown), which handles
-    /// the *cancel outcome*: this is for errors in the surrounding work (a db
-    /// read, an un-deserializable payload). Like `settle_teardown` it never
-    /// touches the run's own state — teardown is resource hygiene, and fencing
-    /// already keeps durable state correct whether or not a stale Pod dies. The
-    /// `?` sites here are deliberate: failing to *record* a failure is
-    /// infrastructural, not per-run poison (ADR-0059 decision 2).
-    async fn abandon_poison_message(
-        &self,
-        msg: &OutboxMessage,
-        e: &SchedulerError,
-    ) -> Result<(), SchedulerError> {
-        let failures = self.db.record_outbox_failure(msg.id).await?;
-        if failures >= MAX_DELIVERY_ATTEMPTS {
-            self.db.dead_letter_outbox(msg.id).await?;
-            let now = self.clock.now().await;
-            self.append(
-                &msg.run,
-                EventPayload::Raw(serde_json::json!({
-                    "event": "TeardownAbandoned",
-                    "outbox_kind": msg.kind,
-                    "outbox_id": msg.id.0,
-                    "reason": format!(
-                        "teardown message could not be processed {MAX_DELIVERY_ATTEMPTS} times \
-                         and was abandoned; the backend unit may be orphaned (fencing keeps run \
-                         state correct): {e}"
-                    ),
-                })),
-                now,
-            )
-            .await?;
+            self.settle_teardown(&msg, outcome).await?;
         }
         Ok(())
     }
@@ -2465,36 +2260,18 @@ impl<'a> Scheduler<'a> {
     /// Dead-letter a run outright (ADR-0047, e.g. a poison outbox message):
     /// cancel its non-terminal steps, record diagnostics on the event log, and
     /// transition it to `DeadLettered` — the operator signal.
-    async fn dead_letter_run(&self, run: &RunId, mut reason: String) -> Result<(), SchedulerError> {
+    async fn dead_letter_run(&self, run: &RunId, reason: String) -> Result<(), SchedulerError> {
         let Some(current) = self.db.run_status(run).await? else {
             return Ok(());
         };
         if current.is_terminal() {
             return Ok(());
         }
-        // Tidying the run's steps is best-effort ON PURPOSE (ADR-0059). A run
-        // dead-lettered *because its own reads keep failing* would otherwise be
-        // undead-letterable: the very fault being escaped blocks the escape, the
-        // bound never fires, and the hot-loop returns. An explicit terminal
-        // verdict the operator can see beats a tidy but unreachable one, so a
-        // failure here is recorded in the diagnostic and the dead-letter
-        // proceeds. Leftover non-terminal step rows are harmless — the run is
-        // terminal, so nothing launches from them, and fencing keeps any
-        // still-live backend unit from mutating durable state (ADR-0021).
-        let cleanup = async {
-            for step in self.db.steps_of_run(run).await? {
-                if !step.status.is_terminal() {
-                    self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
-                        .await?;
-                }
+        for step in self.db.steps_of_run(run).await? {
+            if !step.status.is_terminal() {
+                self.transition_step(run, &step.step, step.status, StepStatus::Cancelled)
+                    .await?;
             }
-            Ok::<(), SchedulerError>(())
-        }
-        .await;
-        if let Err(e) = cleanup {
-            reason.push_str(&format!(
-                " (step cleanup also failed, step rows may be left non-terminal: {e})"
-            ));
         }
         let now = self.clock.now().await;
         self.append(run, EventPayload::RunDeadLettered { reason }, now)

@@ -31,7 +31,14 @@ const RUN_ID = "0190f8a2000071fb8c0011223344aabb";
 const RICH_RUN_ID = "0190f8a2000071fb8c0099887766ccdd";
 
 // ── /v1/me ────────────────────────────────────────────────────────────────
-const me = { subject: "a.kim", display_name: "Avery Kim", roles: ["Owner"] };
+// An Owner of the one implicit org (ADR-0060), so the Settings gear renders.
+const me = {
+  subject: "a.kim",
+  display_name: "Avery Kim",
+  roles: ["Owner"],
+  can_administer: true,
+  admin_orgs: ["acme"],
+};
 
 // ── /v1/repos (dashboard: first 4 → "most active" cards; count → "repos · 7")
 const proj = (project: string, mins: number | null) => ({
@@ -375,6 +382,9 @@ const deployments: Record<string, unknown[]> = {
 };
 
 const secretNames = { names: ["GHCR_TOKEN", "DATABASE_URL", "SLACK_WEBHOOK_URL"] };
+// Org scope (no `repo=`) holds the org-wide base of the inheritance chain — the
+// Settings page's Org Secrets section (ADR-0060).
+const orgSecretNames = { names: ["GHCR_TOKEN", "SENTRY_DSN"] };
 const secretMatrix = {
   environments: ["staging", "production"],
   keys: [
@@ -416,7 +426,11 @@ function route(pathname: string, search: string): Response | null {
   // /v1/repos/{org}/{repo}/refs  (ref picker — not on the shot screens)
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) return json({ refs: [] });
 
-  if (p === "/v1/secrets") return json(secretNames);
+  // Secret names are scope-addressed: no `repo=` is the org scope (ADR-0060).
+  if (p === "/v1/secrets") {
+    const scoped = new URLSearchParams(search).has("repo");
+    return json(scoped ? secretNames : orgSecretNames);
+  }
 
   // run-scoped
   if (p === `/v1/runs/${RUN_ID}`) return json(runStatus);

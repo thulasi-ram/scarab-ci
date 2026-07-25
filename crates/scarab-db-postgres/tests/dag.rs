@@ -24,7 +24,6 @@ fn spec() -> StepSpec {
         privileged: false,
         timeout_seconds: None,
         workspace_inputs: vec![],
-        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],

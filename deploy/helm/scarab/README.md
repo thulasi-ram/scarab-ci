@@ -56,9 +56,7 @@ helm upgrade --install scarab deploy/helm/scarab -n scarab \
 See `values.yaml` for the full surface. Every value maps to a `SCARAB_*` env var
 read by `crates/scarab-server/src/config.rs`. Webhook verification binds a secret
 per forge endpoint: `SCARAB_GITHUB_WEBHOOK_SECRET` for `/webhooks/github`
-and `SCARAB_FORGEJO_WEBHOOK_SECRET` for `/webhooks/forgejo`. Both render from
-first-class values (`secrets.githubWebhookSecret` / `secrets.forgejoWebhookSecret`),
-or supply them as keys of your own `secrets.existingSecret`.
+and `SCARAB_FORGEJO_WEBHOOK_SECRET` for `/webhooks/forgejo`.
 
 ## References
 

@@ -1257,6 +1257,20 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .theme-toggle:hover { color: var(--copper); border-color: var(--copper); }
 .theme-toggle:active { transform: scale(0.94); }
+/* Topbar icon LINK (the org-settings gear, ADR-0060) — same affordance as the
+   theme toggle so the cluster reads as one control group. `active` marks the
+   current route, not the press state, so it stays lit while you're in there. */
+.topbar-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; border-radius: 7px;
+  background: var(--emerald-surface); border: 1px solid var(--border);
+  color: var(--muted-sage);
+  transition: color 0.12s var(--ease-out), border-color 0.12s var(--ease-out),
+    transform 0.12s var(--ease-out);
+}
+.topbar-icon:hover { color: var(--copper); border-color: var(--copper); }
+.topbar-icon:active { transform: scale(0.94); }
+.topbar-icon.active { color: var(--emerald); border-color: var(--emerald); }
 /* Both icons are stacked; the theme crossfades + rotates between them rather
    than hard-swapping. The toggle is infrequent, so a little delight is earned. */
 .theme-toggle { position: relative; }

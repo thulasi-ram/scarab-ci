@@ -88,12 +88,10 @@ secrets:
   # MANDATORY unless scarab.devInsecure is on (ADR-0048).
   masterKey: ""
   # HMAC secrets for webhook verification / gate + results token minting.
-  # Each forge binds its own secret (ADR-0046): githubWebhookSecret renders
-  # SCARAB_GITHUB_WEBHOOK_SECRET (/webhooks/github) and forgejoWebhookSecret
-  # renders SCARAB_FORGEJO_WEBHOOK_SECRET (/webhooks/forgejo). Set only the ones
-  # whose adapter you actually deliver to.
+  # githubWebhookSecret renders SCARAB_GITHUB_WEBHOOK_SECRET (/webhooks/github).
+  # Forgejo binds its own secret (ADR-0046): set SCARAB_FORGEJO_WEBHOOK_SECRET via
+  # existingSecret / envFrom (this chart does not render a dedicated key for it).
   githubWebhookSecret: ""
-  forgejoWebhookSecret: ""
   gateTokenSecret: ""
   resultsTokenSecret: ""
   # GitHub App private-key PEM (enh 245a99c): supplies the App credential at

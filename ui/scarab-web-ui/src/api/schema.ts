@@ -1084,6 +1084,27 @@ export interface components {
         };
         /** @description The authenticated principal (ADR-0049) — powers the UI's identity menu. */
         MeResponse: {
+            /**
+             * @description The orgs this principal may administer, for the Settings area to act on.
+             *     One entry in practice (single implicit Org, ADR-0060) — a list because
+             *     `Org` remains the model's real inheritance root, not a collapsed
+             *     constant. Empty on a fresh install: an org only exists once a Project is
+             *     bound to it, so `can_administer` can be true with nothing to administer
+             *     yet.
+             */
+            admin_orgs: string[];
+            /**
+             * @description May this principal administer org-level settings (ADR-0060)? The gate on
+             *     the global Settings area — the UI hides the nav entry when false, since
+             *     nothing there is actionable or informative without `Administer`.
+             *
+             *     True for a globally-`Administer` role, or an `Admin`+ binding on the Org
+             *     scope of any org the caller can see. Deliberately *not* implied by a
+             *     Project-scoped `Administer`: administering one repo does not grant the
+             *     org's secrets or its forge connections (ADR-0049 — Org inherits down,
+             *     never up).
+             */
+            can_administer: boolean;
             /** @description Human display name, when the identity provides one. */
             display_name?: string | null;
             /** @description The principal's Scarab-native roles (e.g. `["Owner"]`). */
@@ -1388,13 +1409,6 @@ export interface components {
              */
             k8s_overlay?: Record<string, never>;
             needs?: string[];
-            /**
-             * @description Explicit output workspace paths (ADR-0007): the workspace-relative paths
-             *     this step publishes downstream. Absent = the whole workspace. A declared
-             *     path the step did not produce fails the step (fail-closed), so this is a
-             *     contract, not a filter (mirrors `scarab_pipeline::StepSpec`).
-             */
-            outputs?: string[] | null;
             /**
              * @description PlacementProfile names this step runs on (ADR-0055); their admin-defined
              *     k8s overlays merge onto the Pod in listed order. Empty = the default profile.

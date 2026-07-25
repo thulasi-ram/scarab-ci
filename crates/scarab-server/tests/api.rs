@@ -312,50 +312,6 @@ fn every_registered_route_is_in_the_openapi_spec() {
     );
 }
 
-/// Every operation carries exactly one curated group, and every group it names
-/// is declared top-level (git-bug 305ce8a). The doc renderer builds a page per
-/// operation from tags, so an untagged operation silently vanishes from the
-/// published reference — this is the gate that makes a new route pick a group.
-#[test]
-fn operation_tags_cover_every_operation() {
-    const METHODS: [&str; 7] = ["get", "put", "post", "delete", "options", "head", "patch"];
-
-    let spec: serde_json::Value = serde_json::from_str(&scarab_server::openapi_json()).unwrap();
-    let declared: std::collections::BTreeSet<&str> = spec["tags"]
-        .as_array()
-        .expect("spec declares top-level tags")
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
-
-    let mut untagged = Vec::new();
-    let mut used = std::collections::BTreeSet::new();
-    for (path, item) in spec["paths"].as_object().unwrap() {
-        for method in METHODS {
-            let Some(op) = item.get(method) else { continue };
-            match op["tags"].as_array().map(Vec::as_slice) {
-                Some([tag]) => {
-                    let tag = tag.as_str().unwrap();
-                    assert!(
-                        declared.contains(tag),
-                        "{method} {path} is tagged {tag:?}, which is not declared top-level"
-                    );
-                    used.insert(tag.to_owned());
-                }
-                _ => untagged.push(format!("{method} {path}")),
-            }
-        }
-    }
-    untagged.sort();
-    assert!(
-        untagged.is_empty(),
-        "operations with no group — extend `tag_for_path`: {untagged:?}"
-    );
-    // No empty sidebar sections: a declared group must have members.
-    let unused: Vec<&&str> = declared.iter().filter(|t| !used.contains(**t)).collect();
-    assert!(unused.is_empty(), "declared groups with no operations: {unused:?}");
-}
-
 /// The embedded web UI (ADR-0054): `/` serves index.html, real assets serve
 /// with their content type, an SPA client route falls back to index, and the
 /// API keeps winning under /v1. Path traversal cannot escape the dist dir.

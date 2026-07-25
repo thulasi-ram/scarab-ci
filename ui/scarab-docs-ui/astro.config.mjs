@@ -71,11 +71,10 @@ export default defineConfig({
         }),
         // API reference generated from the canonical spec, in place.
         starlightOpenAPI([
-          // The canonical spec, read in place. It now carries its own curated
-          // operation groups (scarab-server's `TagGroups` modifier), which is
-          // what starlight-openapi needs to render per-operation pages — so
-          // there is no derived/tagged copy in between.
-          { base: 'reference/api', label: 'API', schema: '../../openapi.json' },
+          // Tagged copy produced by scripts/gen-openapi.mjs (the canonical
+          // ../../openapi.json ships tag-free; starlight-openapi needs tags to
+          // render per-operation pages). Regenerated on every predev/prebuild.
+          { base: 'reference/api', label: 'API', schema: './openapi.gen.json' },
         ]),
       ],
       sidebar: [

@@ -2,12 +2,13 @@
 // the signed-in user. Page context lives in the big page header (and, on a run,
 // a header-sized breadcrumb) — not in the top bar. Rendered as the Router root
 // so it persists across navigations (docs/DESIGN.md §4).
-import type { ParentProps } from "solid-js";
+import { Show, type ParentProps } from "solid-js";
 import { A } from "@solidjs/router";
 import Icon from "./components/Icon";
 import UserMenu from "./components/UserMenu";
 import CommandPalette from "./components/CommandPalette";
 import { setPaletteOpen } from "./palette";
+import { canAdminister } from "./session";
 import { theme, toggleTheme } from "./theme";
 import emblemGold from "./assets/brand/scarab-emblem-dark.svg";
 
@@ -32,6 +33,13 @@ export default function Layout(props: ParentProps) {
           <span class="search-chip-label">Search</span>
           <span class="mono kbd">⌘K</span>
         </button>
+        {/* Org settings (ADR-0060): hidden outright from non-admins — nothing
+            in there is actionable or informative without `Administer`. */}
+        <Show when={canAdminister()}>
+          <A href="/settings" class="topbar-icon" title="Settings" aria-label="Settings">
+            <Icon icon="settings" size={15} />
+          </A>
+        </Show>
         <button
           class="theme-toggle"
           type="button"

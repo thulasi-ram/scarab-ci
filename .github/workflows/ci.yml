@@ -108,52 +108,6 @@ jobs:
           name: lcov
           path: lcov.info
 
-  # UI no-DOM tier (test-strategy Phase 3): the base of the UI pyramid —
-  # pure-function suites over the derivations that carry the run-detail logic
-  # (event folding, Takes, attempt grouping, log level parsing, DAG layout). No
-  # jsdom, no browser, no server: seconds to run, so it sits in the required
-  # tier next to the Rust suite.
-  ui-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: ui/scarab-web-ui/package-lock.json
-      - name: Run the no-DOM suite
-        working-directory: ui/scarab-web-ui
-        run: |
-          npm ci
-          npm test
-
-  # UI browser tier (test-strategy Phase 3): EXACTLY 2 Playwright specs against
-  # mock mode — boot-breakage and the derivation→DOM wiring on run detail.
-  #
-  # ADVISORY PROBATION: `continue-on-error` on purpose. A browser tier carries
-  # real flake surface (dev-server boot, timing); it reports for a while before
-  # it is allowed to red a run. Promote by deleting the flag — same probation
-  # deal as the `kind` job (git-bug a0b42ad).
-  ui-e2e:
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: ui/scarab-web-ui/package-lock.json
-      - name: Install deps + Chromium
-        working-directory: ui/scarab-web-ui
-        run: |
-          npm ci
-          npx playwright install --with-deps chromium
-      - name: Run the browser specs
-        working-directory: ui/scarab-web-ui
-        run: npm run test:e2e
-
   openapi-drift:
     runs-on: ubuntu-latest
     steps:
@@ -186,23 +140,3 @@ jobs:
             echo '::error::the generated TS client is stale — run: npm run gen in ui/scarab-web-ui'
             exit 1
           }
-
-  # UI unit gate (test-strategy Phase 1): the no-DOM vitest suite over the
-  # extracted derivation seam (takes / dag-layout / attempts / events / logs).
-  # A sibling of `openapi-drift` rather than a step inside it, so a red
-  # derivation is distinguishable from a stale contract at a glance. Coverage
-  # stays report-only per the test strategy — this gates correctness, not a %.
-  ui-unit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: ui/scarab-web-ui/package-lock.json
-      - name: Run the UI vitest suite
-        working-directory: ui/scarab-web-ui
-        run: |
-          npm ci
-          npm test

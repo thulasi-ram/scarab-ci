@@ -1,6 +1,6 @@
 # 0059. Per-run tick fault isolation + bounded per-run failures
 
-- **Status:** Accepted (implemented 2026-07-25 — see the amendment at the bottom for how the open questions resolved)
+- **Status:** Proposed
 - **Date:** 2026-07-21
 - **Deciders:** thulasi.ram (architect)
 - **Relates:** [0058](0058-runtime-service-containers.md) (its "Fix B" introduced *partial* per-run isolation for `reconcile_services`, and "Fix A" the deadline-bound this generalizes), [0011](0011-durable-scheduler.md) (the durable scheduler tick), [0047](0047-retry-classification-and-attempt-model.md) (retry classification + dead-letter), [0001](0001-ci-as-durable-execution.md) / CONTEXT §7.1 (the "forward progress **or** explicit dead-letter" invariant), [0051](0051-multi-replica-operation.md) (leader/lease), [0056](0056-run-takes-and-attempt-grain-evidence.md) (Takes)
@@ -90,45 +90,3 @@ alternative.
   transient errors but hot-loops on persistent ones and never dead-letters; violates §7.1.
 - **Isolate only `reconcile_services` (today's state)** — the point fix; leaves `admit`/`advance`
   able to stall the fleet, and leaves persistent per-Run errors unbounded.
-
-## Amendment (2026-07-25) — built; open questions resolved
-
-Implemented in `scarab-engine/src/scheduler.rs` (`tick_all`, `isolate_run_failure`,
-`TickHealth`) with acceptance in `crates/scarab-server/tests/tick_isolation.rs`. How each open
-question landed:
-
-**Bound: wall-clock, not a tick count.** `tick_failure_deadline_ms`, default 5 min — the same
-number and shape as [0058](0058-runtime-service-containers.md)'s `service_ready_timeout_ms`, and
-independent of tick frequency, so re-tuning the interval can't silently re-tune the bound.
-
-**The failure signal is IN-MEMORY per replica** (`TickHealth`, threaded like
-[`Supervision`](0056-run-takes-and-attempt-grain-evidence.md)) — deliberately *not* durable, which
-reverses this ADR's own Consequences note. A durable marker is only safe if a matching "recovered"
-marker is written on the healthy path too; skip it and a stale marker from a long-healed episode
-makes the next single blip look like a deadline-crossing streak and dead-letters a healthy Run.
-Writing the recovery marker instead puts an append on every clean tick of every Run — a permanent
-cost on the hot path to sharpen a bound that only matters for Runs already broken. In-memory fails
-the other way: a restart or failover resets the streak, so a poison Run dead-letters *later* than
-the bound, never sooner. A control plane restarting faster than 5 minutes is a louder problem than
-a late dead-letter. Revisit only if a real poison Run is observed surviving repeated failovers.
-
-**Cross-run passes: per-*item* isolation for the teardown drains.** `reconcile_cancellations` and
-`reconcile_supersessions` now isolate per outbox message, because they could genuinely wedge the
-fleet *permanently*: a `SUPERSEDE_TEARDOWN` payload that no longer deserializes made `BadPayload`
-abort the tick — for every Run — on that cycle and every future one. Failed *processing* now rides
-ADR-0047's existing `MAX_DELIVERY_ATTEMPTS` ceiling (`abandon_poison_message`), which retires the
-message with a `TeardownAbandoned` diagnostic and, like `settle_teardown`, never touches the Run's
-own state. `db.active_runs()` and the outbox claim itself stay tick-fatal — infrastructural, per
-decision 2.
-
-**Classification: reuse the existing dead-letter path.** `dead_letter_run` with a reason naming the
-tick and the bound, so it reads distinctly from a step dead-letter without a new terminal state.
-This forced one substantive change: dead-lettering now treats its *step-cleanup* preamble as
-best-effort. A Run dead-lettered **because its own reads keep failing** was otherwise
-undead-letterable — `steps_of_run` failed, the dead-letter propagated, the bound never fired and the
-hot-loop returned. An explicit verdict the operator can see beats a tidy one they never get; a
-cleanup failure is appended to the reason instead, and leftover non-terminal step rows are inert
-once the Run is terminal (nothing launches from them, and fencing protects durable state anyway).
-
-**Multi-replica:** the signal is per-replica, as above; the pre-existing leader lease already means
-one replica does admission at a time, so streaks don't interleave in practice.
