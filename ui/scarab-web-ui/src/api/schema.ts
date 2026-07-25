@@ -1375,26 +1375,11 @@ export interface components {
             id: string;
             image: string;
             /**
-             * @description Explicit input workspaces (ADR-0007): the subset of `needs` whose output
-             *     workspace this step consumes. Absent = implicit-by-default (inherit every
-             *     need's workspace). Naming a subset both restricts what flows in and
-             *     sharpens restart invalidation — the skip-if-unchanged signature is then
-             *     computed over exactly these inputs (mirrors `scarab_pipeline::StepSpec`).
-             */
-            inputs?: string[] | null;
-            /**
              * @description Governed raw pod-spec overlay (ADR-0055). Carries no authority; an inline
              *     API run targets no Environment, so any overlay is rejected fail-closed.
              */
             k8s_overlay?: Record<string, never>;
             needs?: string[];
-            /**
-             * @description Explicit output workspace paths (ADR-0007): the workspace-relative paths
-             *     this step publishes downstream. Absent = the whole workspace. A declared
-             *     path the step did not produce fails the step (fail-closed), so this is a
-             *     contract, not a filter (mirrors `scarab_pipeline::StepSpec`).
-             */
-            outputs?: string[] | null;
             /**
              * @description PlacementProfile names this step runs on (ADR-0055); their admin-defined
              *     k8s overlays merge onto the Pod in listed order. Empty = the default profile.
