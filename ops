@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1784996412,"nonce":"wRlEU3Ay2da4qK6BDZnB8/m5E3M=","message":"Shipped. Startup-flake bounding lives in `launch_service_bounded` + the `created_at + service_ready_timeout_ms` deadline; the admit path fails opt-in steps and cascades. Closing — verified against main at d81b3f4.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1784996412,"nonce":"auMAiugMoxbI7989BoKl9MHrgws=","status":2}]}
