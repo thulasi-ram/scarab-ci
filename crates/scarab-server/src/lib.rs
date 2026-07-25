@@ -369,6 +369,12 @@ pub struct StepDto {
     /// computed over exactly these inputs (mirrors `scarab_pipeline::StepSpec`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inputs: Option<Vec<String>>,
+    /// Explicit output workspace paths (ADR-0007): the workspace-relative paths
+    /// this step publishes downstream. Absent = the whole workspace. A declared
+    /// path the step did not produce fails the step (fail-closed), so this is a
+    /// contract, not a filter (mirrors `scarab_pipeline::StepSpec`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Vec<String>>,
     /// Privilege escalation requested above the hardened baseline (ADR-0039).
     /// On an inline API run only the self-service `run_as_root` grant is admitted
     /// (it stays inside the sandbox); governed grants (add-capabilities /
@@ -967,6 +973,7 @@ async fn create_run(
             privileged: admitted.privileged,
             timeout_seconds: step.timeout,
             workspace_inputs: vec![],
+            workspace_outputs: step.outputs.clone().unwrap_or_default(),
             clone: None,
             build: None,
             artifacts: vec![],
@@ -3737,6 +3744,11 @@ async fn persist_run_from_ir(
                 privileged: false,
                 timeout_seconds: step.timeout,
                 workspace_inputs: vec![],
+                // Honored on a clone step too (ADR-0007) — same egress prune, no
+                // special case. Narrowing a checkout is unusual and drops `.git`
+                // unless declared, but it is the author's call, and silently
+                // ignoring the field here would be the one thing we won't do.
+                workspace_outputs: step.outputs.clone().unwrap_or_default(),
                 clone: Some(scarab_engine::CloneConfig {
                     owner: repo.owner.clone(),
                     name: repo.name.clone(),
@@ -3816,6 +3828,10 @@ async fn persist_run_from_ir(
                 privileged: admitted.privileged,
                 timeout_seconds: step.timeout,
                 workspace_inputs: vec![],
+                // Per-PATH output publishing (ADR-0007): the backend prunes the
+                // post-step snapshot to exactly these workspace-relative paths.
+                // Empty = publish the whole workspace (the implicit default).
+                workspace_outputs: step.outputs.clone().unwrap_or_default(),
                 clone: None,
                 build,
                 artifacts: step.artifacts.clone(),
@@ -3844,12 +3860,6 @@ async fn persist_run_from_ir(
             let inputs: Vec<StepId> = inputs.iter().map(|i| StepId(i.clone())).collect();
             db.set_step_inputs(run, &step_id, &inputs).await?;
         }
-        // NOTE: the sibling `step.outputs` (per-PATH output publishing, ADR-0007)
-        // is intentionally NOT threaded into the IR here. Whole-workspace
-        // publishing is the shipped behavior; a path subset needs CAS sub-tree
-        // addressing that scarab-storage-s3 lacks (whole-tree only). The field is
-        // parsed + validated but a no-op — see the output-snapshot site in
-        // scarab-engine/src/scheduler.rs and docs/followups.md. Not a silent drop.
 
         // A `when:`-excluded step is kept in the DAG (edges intact) but starts
         // Skipped, so the scheduler transitively skips its descendants (ADR-0033).

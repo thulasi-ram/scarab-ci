@@ -421,6 +421,16 @@ pub struct StepSpec {
     /// executor materializes them into `/workspace` before the step starts.
     #[serde(default)]
     pub workspace_inputs: Vec<String>,
+    /// The workspace-relative paths this step **publishes** downstream
+    /// (ADR-0007), authored as `outputs:`. Empty = the whole workspace (the
+    /// implicit default). Unlike [`workspace_inputs`](Self::workspace_inputs)
+    /// these are authored at compile time, not resolved at launch: the backend
+    /// prunes the post-step snapshot to exactly these paths, so a dependent
+    /// receives a precise slice and the output hash is unaffected by unrelated
+    /// files. A declared path the step did not produce fails the step
+    /// (fail-closed — never a silently narrower publish).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspace_outputs: Vec<String>,
     /// Set when this is a **clone** step (ADR-0045): the engine runs the
     /// canonical scarab-clone image with this context instead of an authored
     /// image/command.

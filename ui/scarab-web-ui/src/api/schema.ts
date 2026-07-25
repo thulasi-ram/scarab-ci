@@ -1389,6 +1389,13 @@ export interface components {
             k8s_overlay?: Record<string, never>;
             needs?: string[];
             /**
+             * @description Explicit output workspace paths (ADR-0007): the workspace-relative paths
+             *     this step publishes downstream. Absent = the whole workspace. A declared
+             *     path the step did not produce fails the step (fail-closed), so this is a
+             *     contract, not a filter (mirrors `scarab_pipeline::StepSpec`).
+             */
+            outputs?: string[] | null;
+            /**
              * @description PlacementProfile names this step runs on (ADR-0055); their admin-defined
              *     k8s overlays merge onto the Pod in listed order. Empty = the default profile.
              */

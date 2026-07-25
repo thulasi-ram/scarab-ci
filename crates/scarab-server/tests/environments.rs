@@ -298,6 +298,7 @@ async fn drive_to_gate(pg: &Arc<PostgresDb>, run: &RunId) {
         privileged: false,
         timeout_seconds: None,
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],

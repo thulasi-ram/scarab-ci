@@ -61,9 +61,23 @@ Two buckets:
 
 ### Workspace inputs/outputs (ADR-0007 / ADR-0029)
 
-| Feature | Trigger to build | Notes |
-|---|---|---|
-| Per-PATH `outputs:` publishing (a step publishes only named workspace paths downstream) | A pipeline whose steps produce large workspaces where dependents need a precise slice, or want a stable output hash unaffected by unrelated files | **Blocked on CAS sub-tree addressing.** `scarab-storage-s3` snapshots/materializes whole trees only; restricting a published snapshot to an authored path subset needs sub-tree (path-prefix) addressing it lacks. The `outputs:` field is parsed + validated in `scarab_pipeline::StepSpec` but deliberately **not consumed** — a no-op, not a silent narrowing (see the output-snapshot site in `scarab-engine/src/scheduler.rs`). The sibling **`inputs:` selection IS shipped** (per-need input scoping + sharpened rerun invalidation, 2026-07-24 sweep item 4a). |
+Both halves are now **shipped**: `inputs:` per-need scoping (2026-07-24) and
+per-PATH `outputs:` publishing (2026-07-25). The `outputs:` entry that used to
+sit here called itself "blocked on CAS sub-tree addressing" — that turned out to
+be wrong, and is worth recording as a lesson: the CAS is a **per-file merkle**
+store, so a tree is already a hashed list of `name -> blob|tree` entries.
+Selecting a path subset needed no new storage capability at all, just a walk with
+`tree_entries` and a bottom-up rebuild with `put_tree` (`scarab_storage::prune_tree`),
+sharing every blob with the full snapshot. The deferral had been reasoning about a
+path-prefix-addressing design the code never needed.
+
+One optimization is genuinely left, and it is small: the egress leg still tars
+the **whole** workspace out of the Pod before pruning, so a narrow `outputs:` on
+a huge workspace saves storage but not transfer. Selecting at `tar` time would
+fix that; it was not done because it moves authored paths into a shell command
+string (quoting/injection surface) and makes "declared path was not produced"
+a `tar` exit code instead of a precise diagnostic. Build it if egress transfer
+time on large workspaces becomes a measured problem.
 
 ### Identity & access (ADR-0049 / ADR-0060)
 

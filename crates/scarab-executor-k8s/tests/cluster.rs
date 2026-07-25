@@ -170,6 +170,7 @@ async fn busybox_runs_to_completion_and_relaunch_reattaches() {
         privileged: false,
         timeout_seconds: None,
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],
@@ -234,6 +235,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
         privileged: false,
         timeout_seconds: Some(5),
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],
@@ -286,6 +288,7 @@ async fn log_stream_tails_pod_stdout() {
         privileged: false,
         timeout_seconds: None,
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],
@@ -367,6 +370,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         privileged: false,
         timeout_seconds: Some(120),
         workspace_inputs: inputs,
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],
@@ -439,6 +443,137 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
     }
 }
 
+/// LIVE per-path publishing (`outputs:`, ADR-0007): the egress leg prunes the
+/// published snapshot to the declared paths, and a dependent materializes only
+/// those. Kind-tier because the prune runs in `drive_workspace` off the Pod
+/// annotation — `FakeExecutor` has no workspace at all, so this wiring is
+/// k8s-observable-only (the feature-acceptance rule's kind trigger). The prune
+/// *algebra* is proven in-process in `scarab-storage-s3/tests/workspace.rs`.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn declared_outputs_publish_only_those_paths_through_the_cas() {
+    use scarab_storage::Cas;
+    let Some(ns) = opted_in() else { return };
+    let run_id = unique_run("run-ws-out");
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    let tmp = tempfile::tempdir().expect("cas dir");
+    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
+        scarab_storage_s3::S3Storage::local(tmp.path()).expect("local cas"),
+    );
+    let exec = K8sExecutor::with_client(ns, client).with_workspace_cas(cas);
+
+    let step_run = |id: &str| StepRun {
+        run: RunId(run_id.clone()),
+        step: StepId(id.into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+            outcome: AttemptOutcome::Running,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let spec = |cmd: &str, inputs: Vec<String>, outputs: Vec<String>| StepSpec {
+        image: "busybox:latest".into(),
+        command: vec!["sh".into(), "-c".into(), cmd.into()],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: true,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(120),
+        workspace_inputs: inputs,
+        workspace_outputs: outputs,
+        clone: None,
+        build: None,
+        artifacts: vec![],
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
+        services: Vec::new(),
+        uses: Vec::new(),
+        matrix_values: Default::default(),
+    };
+
+    // Producer writes a publishable dir AND junk; it declares only `dist`.
+    let a = step_run("a");
+    let ha = exec
+        .launch(
+            &a,
+            &spec(
+                "mkdir -p /workspace/dist /workspace/target && \
+                 echo shipped > /workspace/dist/app && \
+                 echo cache > /workspace/target/huge && \
+                 echo scratch > /workspace/scratch.tmp",
+                vec![],
+                vec!["dist".into()],
+            ),
+        )
+        .await
+        .expect("launch A");
+    assert_eq!(
+        poll_to_terminal(&exec, &ha, 90).await,
+        Some(ExecState::Succeeded),
+        "the producer succeeds"
+    );
+    let root_a = exec
+        .output(&ha)
+        .await
+        .expect("output")
+        .expect("A published a snapshot");
+
+    // The consumer sees `dist` and NOTHING else.
+    let b = step_run("b");
+    let hb = exec
+        .launch(
+            &b,
+            &spec(
+                "grep -q shipped /workspace/dist/app && \
+                 [ ! -e /workspace/target ] && [ ! -e /workspace/scratch.tmp ]",
+                vec![root_a.clone()],
+                vec![],
+            ),
+        )
+        .await
+        .expect("launch B");
+    assert_eq!(
+        poll_to_terminal(&exec, &hb, 90).await,
+        Some(ExecState::Succeeded),
+        "B must see the declared `dist` and none of the undeclared files"
+    );
+
+    // Fail-closed: declaring a path the step never produced fails the step with
+    // a permanent, author-fixable verdict — not a narrower publish, not a retry.
+    let c = step_run("c");
+    let hc = exec
+        .launch(
+            &c,
+            &spec(
+                "mkdir -p /workspace/dist && echo shipped > /workspace/dist/app",
+                vec![],
+                vec!["dist".into(), "coverage".into()],
+            ),
+        )
+        .await
+        .expect("launch C");
+    assert_eq!(
+        poll_to_terminal(&exec, &hc, 90).await,
+        Some(ExecState::Failed {
+            exit_code: None,
+            class: scarab_engine::ports::FailureClass::Config,
+        }),
+        "an undeclared-but-missing output is a developer verdict, not infra churn"
+    );
+
+    for h in [ha, hb, hc] {
+        exec.cancel(&h).await.expect("cleanup");
+    }
+}
+
 /// LIVE clone step (ADR-0045): the canonical scarab-clone image clones a real
 /// public repo at a pinned SHA into /workspace, the workspace (incl. .git) is
 /// snapshotted into the CAS, and .git/config is credential-free. Anonymous
@@ -489,6 +624,7 @@ async fn clone_step_produces_a_source_workspace() {
         privileged: false,
         timeout_seconds: Some(300),
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: Some(scarab_engine::CloneConfig {
             owner: "thulasi-ram".into(),
             name: "scarab-ci".into(),
@@ -581,6 +717,7 @@ async fn clone_step_produces_a_source_workspace() {
         privileged: false,
         timeout_seconds: Some(300),
         workspace_inputs: vec![root.clone()],
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],
@@ -654,6 +791,7 @@ async fn clone_depth_full_exposes_history() {
         privileged: false,
         timeout_seconds: Some(300),
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: Some(scarab_engine::CloneConfig {
             owner: "thulasi-ram".into(),
             name: "scarab-ci".into(),
@@ -712,6 +850,7 @@ async fn clone_depth_full_exposes_history() {
         privileged: false,
         timeout_seconds: Some(300),
         workspace_inputs: vec![root],
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],
@@ -783,6 +922,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
         privileged: false,
         timeout_seconds: Some(300),
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: Some(scarab_engine::CloneConfig {
             owner: "thulasi-ram".into(),
             name: "scarab-ci".into(),
@@ -891,6 +1031,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         privileged: false,
         timeout_seconds: Some(600),
         workspace_inputs: vec![root],
+        workspace_outputs: vec![],
         clone: None,
         build: Some(scarab_engine::BuildConfig {
             context: ".".into(),
@@ -946,6 +1087,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
         privileged: false,
         timeout_seconds: Some(120),
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],
@@ -1058,6 +1200,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
         privileged: false,
         timeout_seconds: Some(120),
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],
@@ -1129,6 +1272,7 @@ async fn cancel_tears_down_a_running_pod() {
         privileged: false,
         timeout_seconds: Some(600),
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],
@@ -1214,6 +1358,7 @@ async fn artifacts_are_harvested_post_step() {
         privileged: false,
         timeout_seconds: Some(120),
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec!["dist/*".into()], // the .tmp is NOT published
@@ -1271,6 +1416,7 @@ fn busybox_spec(cmd: &str, run_as_root: bool) -> StepSpec {
         privileged: false,
         timeout_seconds: Some(600),
         workspace_inputs: vec![],
+        workspace_outputs: vec![],
         clone: None,
         build: None,
         artifacts: vec![],

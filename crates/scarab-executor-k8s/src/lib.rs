@@ -478,10 +478,42 @@ impl K8sExecutor {
                         .ingest(tmp.path().to_str().ok_or("tmp path")?)
                         .await
                         .map_err(|e| format!("ingest: {e}"))?;
+                    // Per-path publishing (ADR-0007): restrict the published root
+                    // to the authored `outputs:` paths. The whole workspace is
+                    // still ingested first — blobs are shared, so pruning is a
+                    // tree rebuild that uploads nothing new, and the step's own
+                    // files stay recoverable from the full snapshot if we ever
+                    // want them. A declared path the step did not produce is a
+                    // permanent contract violation, never a narrower publish.
+                    let declared: Vec<String> = annotations
+                        .get(ANNOTATION_WS_OUTPUTS)
+                        .map(|csv| {
+                            csv.split(',')
+                                .map(str::trim)
+                                .filter(|p| !p.is_empty())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let published = if declared.is_empty() {
+                        snapshot.root
+                    } else {
+                        scarab_storage::prune_tree(cas, &snapshot.root, &declared)
+                            .await
+                            .map_err(|e| match e {
+                                scarab_storage::PruneError::Storage(e) => {
+                                    DriveErr::Transient(format!("prune outputs: {e}"))
+                                }
+                                permanent => DriveErr::OutputContract(format!(
+                                    "outputs: {permanent} (declared: {})",
+                                    declared.join(", ")
+                                )),
+                            })?
+                    };
                     // Record the root on the Pod BEFORE releasing the sidecar:
                     // output() reads it durably across control-plane restarts.
                     let patch = serde_json::json!({
-                        "metadata": { "annotations": { ANNOTATION_WS_ROOT: snapshot.root.0 } }
+                        "metadata": { "annotations": { ANNOTATION_WS_ROOT: published.0 } }
                     });
                     pods.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
                         .await
@@ -719,12 +751,18 @@ fn clone_secret_name(pod_name: &str) -> String {
 enum DriveErr {
     InputMissing(String),
     Transient(String),
+    /// A declared `outputs:` path was not produced (or is not a legal
+    /// workspace-relative path) — permanent and author-fixable, so it fails the
+    /// step with a developer verdict instead of retrying (ADR-0007 fail-closed).
+    OutputContract(String),
 }
 
 impl std::fmt::Display for DriveErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DriveErr::InputMissing(s) | DriveErr::Transient(s) => f.write_str(s),
+            DriveErr::InputMissing(s)
+            | DriveErr::Transient(s)
+            | DriveErr::OutputContract(s) => f.write_str(s),
         }
     }
 }
@@ -870,6 +908,19 @@ impl Executor for K8sExecutor {
                                 },
                             });
                         }
+                        // Permanent and author-fixable (ADR-0007): the step ran and
+                        // exited 0, but did not honor its declared `outputs:`
+                        // contract. Retrying the identical spec cannot fix it, so
+                        // fail fast with a developer verdict (`Config`) rather than
+                        // burn the infra retry budget and dead-letter as an
+                        // operator problem it is not. The Pod is left for its logs.
+                        Err(DriveErr::OutputContract(msg)) => {
+                            eprintln!("scarab-executor: {msg} (pod {})", handle.0);
+                            return Ok(ExecState::Failed {
+                                exit_code: None,
+                                class: FailureClass::Config,
+                            });
+                        }
                         Err(DriveErr::Transient(e)) => {
                             return Err(ExecError::Other(format!("workspace: {e}")));
                         }
@@ -911,7 +962,8 @@ impl Executor for K8sExecutor {
         }
     }
 
-    /// The step's output workspace: the CAS root ingested at egress, recorded
+    /// The step's output workspace: the CAS root ingested at egress — pruned to
+    /// the step's declared `outputs:` paths when it has any (ADR-0007) — recorded
     /// as a Pod annotation (durable with the Pod across restarts).
     async fn output(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
         if self.workspace_cas.is_none() {
@@ -1505,6 +1557,10 @@ const ANNOTATION_ARTIFACT_GLOBS: &str = "scarab.io/artifact-globs";
 pub const ARTIFACTS_MOUNT_PATH: &str = "/scarab/artifacts";
 const ARTIFACTS_VOLUME: &str = "scarab-artifacts";
 const ANNOTATION_WS_ROOT: &str = "scarab.io/workspace-root";
+/// The Pod annotation carrying the step's authored `outputs:` paths (ADR-0007),
+/// comma-separated. Absent/empty = publish the whole workspace. Read at egress,
+/// so an adopted Pod prunes identically with no in-memory state.
+const ANNOTATION_WS_OUTPUTS: &str = "scarab.io/workspace-outputs";
 /// Grace period for workspace Pods: the egress sidecar ignores SIGTERM and
 /// waits for the control plane to snapshot `/workspace`, bounded by this.
 const WORKSPACE_TERMINATION_GRACE_SECS: i64 = 600;
@@ -1857,6 +1913,14 @@ pub fn build_pod(
             ANNOTATION_WS_INPUTS.to_string(),
             spec.workspace_inputs.join(","),
         );
+        // Authored per-path publishing (ADR-0007) rides the Pod too, for the same
+        // reason: the egress prune must be identical after a control-plane restart.
+        if !spec.workspace_outputs.is_empty() {
+            annotations.insert(
+                ANNOTATION_WS_OUTPUTS.to_string(),
+                spec.workspace_outputs.join(","),
+            );
+        }
         let ws = workspace_mount.clone().unwrap();
         let ctl = ctl_mount.clone().unwrap();
         // Ordinary init container: blocks the step until the control plane
@@ -2933,6 +2997,7 @@ mod tests {
             privileged: false,
             timeout_seconds: None,
             workspace_inputs: vec![],
+            workspace_outputs: vec![],
             clone: None,
             build: None,
             artifacts: vec![],
@@ -3146,6 +3211,7 @@ mod tests {
             privileged: true,
             timeout_seconds: None,
             workspace_inputs: vec![],
+            workspace_outputs: vec![],
             clone: None,
             build: None,
             artifacts: vec![],
@@ -4048,6 +4114,57 @@ mod tests {
             DEFAULT_CLONE_IMAGE,
         );
         assert!(pod.spec.as_ref().unwrap().volumes.is_none());
+    }
+
+    #[test]
+    fn declared_outputs_ride_the_pod_annotation() {
+        // ADR-0007 per-path publishing: the authored `outputs:` must live ON THE
+        // POD, because the egress prune runs in `drive_workspace` — which may be
+        // a *different* control plane after a restart and has no in-memory spec.
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        spec.workspace_outputs = vec!["dist".into(), "reports/junit".into()];
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            DEFAULT_CLONE_IMAGE,
+        );
+        assert_eq!(
+            pod.metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get(ANNOTATION_WS_OUTPUTS)
+                .map(String::as_str),
+            Some("dist,reports/junit"),
+            "the declared paths must be recoverable from the Pod alone"
+        );
+
+        // No `outputs:` => no annotation at all, which is what the egress leg
+        // reads as "publish the whole workspace" (the implicit default).
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &busybox(),
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            DEFAULT_CLONE_IMAGE,
+        );
+        assert!(
+            !pod.metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .contains_key(ANNOTATION_WS_OUTPUTS),
+            "absent, not empty — an empty annotation would be an ambiguous encoding"
+        );
     }
 
     #[test]
