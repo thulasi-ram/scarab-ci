@@ -1,0 +1,56 @@
+# A REAL Forgejo, for the `just forgejo-verify` tier (git-bug 3863d5e).
+#
+# The Forgejo adapter's request/response shapes were asserted against unit tests
+# of what we *believed* Forgejo does, and one of those guesses (a hook created
+# with no `config.secret`) shipped. This instance exists so the guesses can be
+# answered by the software itself.
+#
+# Deliberately throwaway: SQLite on a named volume, install wizard pre-locked,
+# registration off. `down.sh` deletes the volume — never point anything real here.
+name: scarab-forgejo-verify
+
+services:
+  forgejo:
+    # Overridable so the tier can be re-run against another release without
+    # editing a committed file: `FORGEJO_IMAGE=…:15 just forgejo-verify`.
+    image: ${FORGEJO_IMAGE:-codeberg.org/forgejo/forgejo:16.0.1}
+    restart: "no"
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      # No install wizard: boot straight into a usable instance.
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO__database__DB_TYPE: sqlite3
+      FORGEJO__database__PATH: /data/forgejo/forgejo.db
+      FORGEJO__server__HTTP_PORT: "3000"
+      # Must match the published port: Forgejo builds clone URLs and webhook
+      # payload links from ROOT_URL.
+      FORGEJO__server__ROOT_URL: http://127.0.0.1:${FORGEJO_HTTP_PORT:-3300}/
+      FORGEJO__server__DISABLE_SSH: "true"
+      FORGEJO__service__DISABLE_REGISTRATION: "true"
+      FORGEJO__repository__DEFAULT_BRANCH: main
+      # THE setting that decides whether this tier can prove anything: Forgejo's
+      # webhook allow-list defaults to `external`, which REFUSES to deliver to a
+      # private/loopback address. Scarab (and the test's capture listener) live on
+      # the docker host, so without this every delivery is dropped before it is
+      # ever signed and the tier would "pass" by never testing the ingest path.
+      FORGEJO__webhook__ALLOWED_HOST_LIST: "*"
+      FORGEJO__webhook__DELIVER_TIMEOUT: "30"
+      FORGEJO__log__LEVEL: warn
+    # `host.docker.internal` is how the hook reaches the Scarab on the host. Docker
+    # Desktop/colima provide it; this mapping adds it on plain Linux docker too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${FORGEJO_HTTP_PORT:-3300}:3000"
+    volumes:
+      - forgejo-data:/data
+    healthcheck:
+      # busybox wget — the base image is Alpine; curl is not guaranteed.
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:3000/api/v1/version || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+volumes:
+  forgejo-data:

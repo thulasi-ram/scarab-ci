@@ -165,6 +165,49 @@ e2e:
     export SCARAB_E2E_KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
     cargo nextest run -p scarab-e2e --no-fail-fast
 
+# LIVE Forgejo verification (git-bug 3863d5e). Everything in the Forgejo path was
+# asserted against unit tests of the shapes we BELIEVED Forgejo uses, and one of
+# those guesses (a hook created with no `config.secret`) shipped. This recipe
+# answers the remaining guesses with the software itself: it stands up a real
+# Forgejo, seeds an admin + token + more repos than fit on one API page, points
+# the proc-mode stack at it, and drives the flow the FakeForge acceptance test
+# only simulates — add connection → pick-list → bind → hook registered → real
+# push → Run.
+#
+# Needs: docker (Forgejo is pulled from codeberg.org), kind, and ports 3300 +
+# 8080 free. CI does NOT run this — both tiers are env-gated and skip loudly.
+# `just forgejo-verify keep` leaves both stacks up for poking at afterwards.
+forgejo-verify keep="0":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # 1. The real Forgejo, seeded. Writes .env.generated (the tests' contract)
+    #    and .env.scarab (the server overlay).
+    bash deploy/local-forgejo/up.sh
+    # 2. The proc-mode stack, with the server bound 0.0.0.0 and publishing a URL
+    #    the Forgejo CONTAINER can reach — a hook pointed at 127.0.0.1 would be
+    #    registered successfully and then never deliver.
+    export SCARAB_ENV_EXTRA="$PWD/deploy/local-forgejo/.env.scarab"
+    bash deploy/local-proc/up.sh
+    if [ "{{keep}}" = "0" ]; then
+      trap 'code=$?; if [ "$code" -ne 0 ]; then echo "==> scarab-server log (verification failed):"; tail -n 200 deploy/local-proc/server.log 2>/dev/null || true; fi; bash deploy/local-proc/down.sh; bash deploy/local-forgejo/down.sh; exit "$code"' EXIT
+    else
+      echo "==> keep=1: both stacks stay up (tear down with 'bash deploy/local-proc/down.sh; bash deploy/local-forgejo/down.sh')"
+    fi
+    set -a
+    source deploy/local-proc/.env
+    source deploy/local-forgejo/.env.scarab
+    source deploy/local-forgejo/.env.generated
+    set +a
+    export SCARAB_E2E=1
+    export SCARAB_E2E_URL="http://${SCARAB_ADDR/0.0.0.0/127.0.0.1}"
+    export SCARAB_E2E_DATABASE_URL="$SCARAB_DATABASE_URL"
+    export SCARAB_E2E_KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
+    # Adapter-level shapes first (pick-list pagination, hook signing, the push
+    # payload spelling), then the whole onboarding flow through the server.
+    # Captured real payloads land in target/forgejo-capture/.
+    cargo nextest run -p scarab-forge-forgejo --test live --no-fail-fast
+    cargo nextest run -p scarab-e2e --test forgejo_onboarding --no-fail-fast
+
 # UI no-DOM suite (test-strategy Phase 3, base of the UI pyramid): vitest over
 # the run-detail derivations — event folding, Takes, attempts, logs, DAG layout.
 # No jsdom, no browser, no server; runs in under a second.

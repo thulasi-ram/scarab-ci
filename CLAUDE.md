@@ -19,11 +19,13 @@ colima safety guards; a bare command skips those and drifts from what CI does.
 | UI / server from source | `just ui`, `just serve` | dev loop against the proc stack; env from `deploy/local-proc/.env` |
 | **Full local stack** (proc mode) | `just up` → `just demo` → `just down` | Postgres+MinIO (compose) + kind + `scarab-server` as a host process; `just logs` tails it |
 | **Helm dogfood** (helm mode) | `just local-helm` | in-cluster on colima via the real chart + published image; `just local-helm local` builds from the tree, `just local-helm sha-<sha>` pins a build |
+| **Live Forgejo verification** | `just forgejo-verify` | a REAL Forgejo container + the proc stack; drives add-connection → bind → hook → push → Run. Env-gated (`SCARAB_TEST_FORGEJO`), never in CI |
 
-The two deployment modes live under `deploy/`: `local-proc/` (server = host
+The deployment modes live under `deploy/`: `local-proc/` (server = host
 process, kind for steps) and `local-helm/` (server = Helm-deployed image on
-colima). Image build contexts live under `docker/` (`server/`, `clone/`,
-`sidecar/`). `deploy/helm/` is the distribution chart.
+colima), plus `local-forgejo/` — not a way to run Scarab but the throwaway
+Forgejo the verification tier drives. Image build contexts live under `docker/`
+(`server/`, `clone/`, `sidecar/`). `deploy/helm/` is the distribution chart.
 
 If a recipe is missing for something you need to test, **add/extend a recipe**
 rather than running the raw commands ad hoc — that keeps the next run

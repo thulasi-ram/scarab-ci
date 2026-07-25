@@ -58,6 +58,15 @@ echo "==> starting scarab-server (converged) in the background"
 # committed template on first run.
 [ -f "$here/.env" ] || cp "$here/.env.example" "$here/.env"
 set -a; . "$here/.env"; set +a
+# A caller-supplied OVERLAY, applied last so it wins over the dev defaults. This
+# is how a verification tier reconfigures the stack for its own run without
+# editing (or racing on) the shared dev env file — e.g. `just forgejo-verify`
+# needs the server bound on 0.0.0.0 with a public URL a container can reach.
+if [ -n "${SCARAB_ENV_EXTRA:-}" ]; then
+  [ -f "$SCARAB_ENV_EXTRA" ] || { echo "error: SCARAB_ENV_EXTRA=$SCARAB_ENV_EXTRA does not exist" >&2; exit 1; }
+  echo "    applying env overlay: $SCARAB_ENV_EXTRA"
+  set -a; . "$SCARAB_ENV_EXTRA"; set +a
+fi
 # KUBECONFIG is dynamic (this run's kind cluster), so it's set here, not in .env.
 export KUBECONFIG="$kubeconfig"
 
