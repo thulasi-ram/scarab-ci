@@ -96,44 +96,9 @@ scarab:
   # the server refuses to boot without one (ADR-0048).
   oidcIssuer: ""
 
-  # --- OAuth/OIDC login (ADR-0049) ----------------------------------------
-  # Real authentication: a forge-agnostic OAuth/OIDC provider (GitHub, Forgejo,
-  # or any OIDC issuer — the endpoints are explicit, so there is no per-forge
-  # special case). Empty => no authenticator, and the server then only boots
-  # under scarab.devInsecure (ADR-0048 fail-closed).
-  #
-  # The four URLs/ids below plus a client SECRET are all-or-nothing: the server
-  # refuses to boot on a partial provider, so the chart refuses to render one.
-  # The secret is NEVER a chart value — supply it via
-  # secrets.oauthClientSecret.name (mounted as env via secretKeyRef) or as a
-  # SCARAB_OAUTH_CLIENT_SECRET key of secrets.existingSecret.
-  #
-  # Setting this together with devInsecure is a hard render error, not a
-  # fallback: dev-insecure would silently make every caller an Owner again.
-  oauth:
-    clientId: ""
-    authorizeUrl: ""    # e.g. https://github.com/login/oauth/authorize
-    tokenUrl: ""        # e.g. https://github.com/login/oauth/access_token
-    userinfoUrl: ""     # e.g. https://api.github.com/user
-    # Space-separated scopes for the authorize redirect. May be empty.
-    scopes: ""
-    # OIDC issuer URL (ADR-0049 amendment). Empty => plain OAuth2: the provider
-    # returns no id_token and the Principal comes from userinfoUrl (GitHub,
-    # Forgejo). Set => OIDC mode: the id_token is verified against this
-    # issuer's discovery/JWKS and its claims are authoritative (Dex, Keycloak,
-    # Google). Only meaningful alongside the four knobs above — setting it
-    # alone makes the server refuse to boot, so the chart refuses to render it.
-    issuer: ""          # e.g. https://dex.example.com
-    # Subjects granted Owner at login (bootstrap until scoped RBAC, ADR-0049
-    # C2); everyone else authenticates as Viewer. Rendered comma-separated into
-    # SCARAB_OAUTH_OWNERS. Leave empty and nobody can administer the install.
-    # An entry matches the provider subject OR a verified email claim — with an
-    # OIDC issuer, `sub` is usually an opaque id, so prefer the email there.
-    owners: []
-
   # ⚠ Dev-only (ADR-0048): boots without an authenticator/KEK, with loud
-  # warnings, instead of refusing. NEVER set in production — every caller
-  # becomes a synthetic Owner. Mutually exclusive with scarab.oauth above.
+  # warnings, instead of refusing. NEVER set in production. Until authn
+  # (ADR-0049) ships, a deploy only boots with this on — an honest red line.
   devInsecure: false
 
   # Results-egress sidecar image injected into step Pods (ADR-0042). Only used
@@ -185,15 +150,6 @@ secrets:
   githubAppPemSecret:
     name: ""                # Secret to mount; empty => no mount, no env var
     key: github-app.pem     # key within that Secret holding the PEM
-  # OAuth client secret (ADR-0049), same shape as githubAppPemSecret: a Secret
-  # you manage out-of-band (external-secrets / sealed-secrets / SOPS), never a
-  # plaintext value here. The chart wires it into SCARAB_OAUTH_CLIENT_SECRET
-  # with a secretKeyRef — no key material passes through Helm values. If you
-  # already run secrets.existingSecret, add a SCARAB_OAUTH_CLIENT_SECRET key
-  # there instead and leave this empty; this ref wins if both are set.
-  oauthClientSecret:
-    name: ""                     # Secret holding it; empty => no env var
-    key: oauth-client-secret     # key within that Secret
 
 # RBAC the k8s executor needs to run one Pod per step in scarab.namespace.
 rbac:

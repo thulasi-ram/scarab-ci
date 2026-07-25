@@ -33,9 +33,3 @@
 .env
 .env.*
 !.env.example
-
-# `.cargo/config.toml` IS tracked — repo-level build settings belong in version
-# control. `cargo login` writes a registry token next to it, and that must never
-# be committed; guard it now, while the file does not yet exist.
-.cargo/credentials
-.cargo/credentials.toml

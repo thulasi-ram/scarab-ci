@@ -43,8 +43,7 @@ what each variable does. For how to set them on your machine, see
 | `SCARAB_DEV_INSECURE` | `1`/`true` downgrades the strict security failures (KEK, auth) to loud boot warnings (dev only); never relaxes the Postgres requirement. |
 | `SCARAB_OAUTH_CLIENT_ID`, `_CLIENT_SECRET`, `_AUTHORIZE_URL`, `_TOKEN_URL`, `_USERINFO_URL` | OAuth/OIDC login provider (all five together enable real authn; a partial set refuses boot). |
 | `SCARAB_OAUTH_SCOPES` | Space-separated scopes for the authorize redirect (optional). |
-| `SCARAB_OAUTH_ISSUER` | Optional. The provider's OIDC issuer (`iss`), e.g. `https://dex.example`. Set it for a real OIDC issuer: the `id_token` is then verified (JWKS via discovery, plus `iss`/`aud`/`exp`/`nonce`) and its claims are the identity; an invalid one fails the login. Unset = plain OAuth2 (GitHub/Forgejo), where userinfo is the identity. Setting it without the five above refuses boot. |
-| `SCARAB_OAUTH_OWNERS` | Comma-separated entries granted `Owner` at login (bootstrap until scoped RBAC); others log in as `Viewer`. An entry matches the Principal subject **or** a provider-verified `email` claim (`email_verified`) — unverified email never grants `Owner`. |
+| `SCARAB_OAUTH_OWNERS` | Comma-separated subjects granted `Owner` at login (bootstrap until scoped RBAC); others log in as `Viewer`. |
 | `SCARAB_OIDC_ISSUER` | Enables the OIDC issuer for keyless federation. |
 | `SCARAB_OIDC_SIGNING_KEY_FILE` | PKCS#8 RSA PEM the issuer signs with, required when the issuer is enabled. |
 | `SCARAB_OIDC_AUDIENCE` | `aud` of minted per-run tokens (default `scarab`). |

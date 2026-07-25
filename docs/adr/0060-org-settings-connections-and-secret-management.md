@@ -1,6 +1,6 @@
 # 0060. Org settings surface: connection lifecycle, org/env secret editing, IaC-or-UI connections
 
-- **Status:** Accepted
+- **Status:** Proposed
 - **Date:** 2026-07-24
 - **Deciders:** thulasi.ram (architect)
 - **Builds on:** [0014](0014-secrets.md) (secret scopes + inheritance),

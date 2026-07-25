@@ -74,36 +74,6 @@ the `Project`/`Org` scope enforced.
 - Ties to ADR-0048: no authenticator wired → refuse to boot (unless
   `SCARAB_DEV_INSECURE`).
 
-## Amendment (2026-07-26): login hardening in the C1 adapter
-
-Three refinements from reviewing the shipped adapter. They do not change the
-decision above; they close gaps that only show up against a *real* OIDC issuer.
-
-- **`id_token` is verified; userinfo is the fallback, not the source of truth.**
-  A new **optional** `SCARAB_OAUTH_ISSUER` selects *OIDC mode*: when the token
-  response carries an `id_token` it is verified — RS256 against the issuer's
-  JWKS (found via `{issuer}/.well-known/openid-configuration`, cached in the
-  adapter, refetched when a `kid` is unknown, i.e. rotation), plus `iss`,
-  `aud == client_id`, `exp`, and the login flow's `nonce` — and its claims are
-  the Principal. A **present-but-invalid `id_token` fails the login**; falling
-  back to userinfo there would make the verification decorative. With no issuer
-  configured (GitHub/Forgejo: plain OAuth2) no `id_token` is expected or
-  trusted and userinfo remains the identity, unchanged.
-- **PKCE (RFC 7636, S256) on the browser flow.** The redirect carries
-  `code_challenge` + `code_challenge_method=S256`; the verifier stays server-side
-  in the same one-shot `HttpOnly` state cookie (now `state.verifier.nonce`) and
-  is replayed at the token endpoint. The adapter keeps the seam: the HTTP layer
-  owns the cookie, the adapter owns the secrets and the exchange, so the
-  API/CLI `POST /v1/auth/login` still works with no verifier — and may thread
-  its own (`code_verifier`) if it ran its own authorize.
-- **Owner bootstrap matches a VERIFIED email.** With GitHub/Forgejo the subject
-  is a readable login, but a real issuer's `sub` is an opaque per-client id, so
-  subject-only `SCARAB_OAUTH_OWNERS` means discovering and pasting UUIDs before
-  anyone can administer anything. An owners entry now matches the subject **or**
-  an `email` the issuer asserts as `email_verified`. `sub` remains the stored
-  Principal identity — email is only ever a matcher — and an unverified or
-  absent `email_verified` never grants `Owner`.
-
 ## Alternatives considered
 
 - **Forge-synced-live authorization:** best ergonomics, but couples authz to a

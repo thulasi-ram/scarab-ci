@@ -22,22 +22,10 @@ scarab-server is deployed as release "{{ .Release.Name }}" in namespace "{{ .Rel
 
   ⚠  scarab.devInsecure is ON — auth is disabled (every caller is Owner).
      Dev/eval only; never run production like this.
-{{- else if include "scarab.oauthConfigured" . }}
-
-  Auth:     OAuth/OIDC login (ADR-0049) via {{ .Values.scarab.oauth.authorizeUrl }}
-  {{- if .Values.scarab.oauth.owners }}
-  Owners:   {{ join ", " .Values.scarab.oauth.owners }}  (everyone else logs in as Viewer)
-  {{- else }}
-
-  ⚠  scarab.oauth.owners is empty — every login authenticates as Viewer and
-     nobody can administer this install. Set at least one provider subject.
-  {{- end }}
 {{- else }}
 
-  ⚠  No authenticator is configured — scarab-server will REFUSE TO START
-     (ADR-0048 fail-closed). Configure OAuth login (ADR-0049): scarab.oauth.*
-     plus secrets.oauthClientSecret.name; or set scarab.devInsecure=true for a
-     dev/eval install. The two are mutually exclusive.
+  Note: no authenticator ships yet (ADR-0049). Until it lands, boot requires
+  scarab.devInsecure=true — an honest red line, not a silent default.
 {{- end }}
 
 Check health:

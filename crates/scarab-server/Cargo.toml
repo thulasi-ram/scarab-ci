@@ -36,8 +36,6 @@ rsa = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }
-# PKCE S256 code challenges (ADR-0049): SHA-256 of the login verifier.
-sha2 = { workspace = true }
 
 # every scarab crate — the server is the composition root
 scarab-engine = { workspace = true }
