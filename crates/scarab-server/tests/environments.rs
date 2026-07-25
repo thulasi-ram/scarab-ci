@@ -498,16 +498,27 @@ async fn secret_matrix_reports_effective_status() {
     let m: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert_eq!(m["environments"], serde_json::json!(["prod", "staging"]));
+    // The repo-scope default is the leftmost column (ADR-0060) — the thing the
+    // environments fall through to, addressed by the reserved empty id.
+    assert_eq!(m["columns"], serde_json::json!(["", "prod", "staging"]));
     let rows = m["keys"].as_array().unwrap();
-    let row = |k: &str| rows.iter().find(|r| r["key"] == k).unwrap()["status"].clone();
+    let find = |k: &str| rows.iter().find(|r| r["key"] == k).unwrap();
+    // Defined once at repo scope: set THERE, inherited everywhere else — and the
+    // cells name what they'd be overriding.
     assert_eq!(
-        row("SHARED"),
-        serde_json::json!({ "prod": "inherited", "staging": "inherited" })
+        find("SHARED")["status"],
+        serde_json::json!({ "": "set", "prod": "inherited", "staging": "inherited" })
     );
     assert_eq!(
-        row("PROD_ONLY"),
-        serde_json::json!({ "prod": "set", "staging": "unset" })
+        find("SHARED")["inherited_from"],
+        serde_json::json!({ "prod": "repo", "staging": "repo" })
     );
+    // Defined at one environment only: the repo default is genuinely empty.
+    assert_eq!(
+        find("PROD_ONLY")["status"],
+        serde_json::json!({ "": "unset", "prod": "set", "staging": "unset" })
+    );
+    assert_eq!(find("PROD_ONLY")["inherited_from"], serde_json::json!({}));
 
     tdb.cleanup().await;
 }

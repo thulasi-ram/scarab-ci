@@ -10,12 +10,14 @@
 // rather than a wall of failed fetches. Layout hides the nav entry too — belt
 // and braces, not a security boundary.
 //
-// Section one is **Org Secrets**: the top of the `env → repo → org` inheritance
-// chain, until now settable only by raw HTTP. Connections (part C) lands next
-// and gets its own section here.
+// Two sections today: **Connections** (which forges Scarab is wired to, and what
+// they cover) and **Org Secrets** (the top of the `env → repo → org` inheritance
+// chain, until now settable only by raw HTTP). Connections comes first: without
+// one there are no Projects, so nothing else here has anything to act on.
 import { createResource, Show } from "solid-js";
 import { getMe } from "../api/client";
 import ScopedSecrets from "../components/ScopedSecrets";
+import Connections from "../components/Connections";
 import Icon from "../components/Icon";
 
 export default function Settings() {
@@ -49,6 +51,7 @@ export default function Settings() {
             </div>
           }
         >
+          <Connections />
           <Show
             when={org()}
             fallback={

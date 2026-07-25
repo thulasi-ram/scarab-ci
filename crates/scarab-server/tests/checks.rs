@@ -168,6 +168,10 @@ async fn rejected_status_posts_are_retried_then_dead_lettered_not_silently_dropp
         Some(RunStatus::Succeeded)
     );
 
+    // Counters are process-global, so measure the DELTA this drain causes.
+    let failures_before = scarab_server::metrics::forge_status_failures();
+    let dead_before = scarab_server::metrics::forge_status_dead_lettered();
+
     // visibility_ms = 0 makes each claimed-but-unposted message immediately
     // reclaimable, so repeated drains accumulate failures on the same messages.
     for _ in 0..scarab_engine::MAX_DELIVERY_ATTEMPTS {
@@ -193,5 +197,21 @@ async fn rejected_status_posts_are_retried_then_dead_lettered_not_silently_dropp
         db.outbox_depth().await.unwrap(),
         0,
         "dead-lettered status messages no longer sit in the outbox"
+    );
+
+    // …and every rejection is COUNTED, so a broken App is visible on /metrics
+    // instead of only in a log line nobody is grepping (ba921db). Two messages
+    // (pending, success) × MAX_DELIVERY_ATTEMPTS rejections each, then both
+    // retired as poison.
+    let attempts = u64::from(scarab_engine::MAX_DELIVERY_ATTEMPTS);
+    assert_eq!(
+        scarab_server::metrics::forge_status_failures() - failures_before,
+        2 * attempts,
+        "each rejected post increments the failure counter"
+    );
+    assert_eq!(
+        scarab_server::metrics::forge_status_dead_lettered() - dead_before,
+        2,
+        "each poisoned status message increments the dead-letter counter"
     );
 }
