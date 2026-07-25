@@ -9,7 +9,11 @@
 //! (directory) is a canonical JSON list of `(name -> target)` entries stored at
 //! `trees/<sha256>`. Addressing by content hash means identical content stores
 //! once — dedup is by construction. Chunking a large blob into a rolling-hash
-//! sub-tree stays deferred (ADR-0029); a blob is whole-file for now.
+//! sub-tree stays deferred (ADR-0029); a blob is whole-file for now. That
+//! deferral is about the *inside of one file* — it is NOT a limit on addressing
+//! a path subset of a workspace, which `scarab_storage::prune_tree` does with
+//! the tree primitives right here (a stalled `outputs:` follow-up once read it
+//! the other way).
 
 use std::sync::Arc;
 

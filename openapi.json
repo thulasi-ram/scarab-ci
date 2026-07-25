@@ -12,7 +12,9 @@
   "paths": {
     "/.well-known/jwks.json": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Auth & Identity"
+        ],
         "summary": "OIDC issuer JWKS (ADR-0015)",
         "operationId": "jwks",
         "responses": {
@@ -27,7 +29,9 @@
     },
     "/.well-known/openid-configuration": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Auth & Identity"
+        ],
         "summary": "OIDC discovery (ADR-0015)",
         "operationId": "openid_configuration",
         "responses": {
@@ -42,7 +46,9 @@
     },
     "/healthz": {
       "get": {
-        "tags": [],
+        "tags": [
+          "System"
+        ],
         "summary": "Liveness: process up (ADR-0053)",
         "operationId": "healthz",
         "responses": {
@@ -54,7 +60,9 @@
     },
     "/metrics": {
       "get": {
-        "tags": [],
+        "tags": [
+          "System"
+        ],
         "summary": "Prometheus gauges (ADR-0053)",
         "operationId": "metrics",
         "responses": {
@@ -66,7 +74,9 @@
     },
     "/readyz": {
       "get": {
-        "tags": [],
+        "tags": [
+          "System"
+        ],
         "summary": "Readiness: DB + object store reachable (ADR-0053)",
         "operationId": "readyz",
         "responses": {
@@ -81,7 +91,9 @@
     },
     "/v1/auth/callback": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Auth & Identity"
+        ],
         "summary": "Finish the browser OAuth flow (ADR-0049)",
         "operationId": "oauth_callback",
         "responses": {
@@ -96,7 +108,9 @@
     },
     "/v1/auth/login": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Auth & Identity"
+        ],
         "summary": "Begin the browser OAuth flow (ADR-0049)",
         "operationId": "oauth_login_redirect",
         "responses": {
@@ -109,7 +123,9 @@
         }
       },
       "post": {
-        "tags": [],
+        "tags": [
+          "Auth & Identity"
+        ],
         "summary": "Exchange an OAuth credential for a session (API/CLI, ADR-0049)",
         "operationId": "login",
         "responses": {
@@ -134,7 +150,9 @@
     },
     "/v1/auth/logout": {
       "post": {
-        "tags": [],
+        "tags": [
+          "Auth & Identity"
+        ],
         "summary": "Revoke the session (ADR-0049)",
         "operationId": "logout",
         "responses": {
@@ -146,7 +164,9 @@
     },
     "/v1/me": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Auth & Identity"
+        ],
         "summary": "Return the current authenticated principal. In dev (auth disabled) this is\nthe synthetic Owner.",
         "operationId": "me",
         "responses": {
@@ -168,7 +188,9 @@
     },
     "/v1/orgs/{org}/bindings": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Auth & Identity"
+        ],
         "summary": "List an org's role bindings (ADR-0049)",
         "operationId": "list_bindings",
         "responses": {
@@ -191,7 +213,9 @@
         }
       },
       "put": {
-        "tags": [],
+        "tags": [
+          "Auth & Identity"
+        ],
         "summary": "Natively grant a role (ADR-0049)",
         "operationId": "put_binding",
         "responses": {
@@ -201,7 +225,9 @@
         }
       },
       "delete": {
-        "tags": [],
+        "tags": [
+          "Auth & Identity"
+        ],
         "summary": "Natively revoke a role - a durable tombstone (ADR-0049)",
         "operationId": "delete_binding",
         "responses": {
@@ -213,7 +239,9 @@
     },
     "/v1/repos": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Repositories"
+        ],
         "summary": "List the registered projects (ADR-0046 registry — what the dashboard's\nrepo cards render). Scoped: global roles see all; otherwise only orgs/\nprojects the caller's bindings grant Read on.",
         "operationId": "list_projects",
         "responses": {
@@ -235,7 +263,9 @@
     },
     "/v1/repos/{org}/{repo}/bindings/import": {
       "post": {
-        "tags": [],
+        "tags": [
+          "Auth & Identity"
+        ],
         "summary": "Seed bindings from forge permissions (ADR-0049)",
         "operationId": "import_bindings",
         "responses": {
@@ -257,7 +287,9 @@
     },
     "/v1/repos/{org}/{repo}/dispatch": {
       "post": {
-        "tags": [],
+        "tags": [
+          "Repositories"
+        ],
         "summary": "Dispatch a named repo pipeline at a ref (ADR-0043 \"World B\"). Authorized as a\nwrite (like [`create_run`]); a dispatch is a *trigger*, so a deploy pipeline\nstill hits its Environment's protection rules at admission. Returns the new\nrun id (mirrors [`CreateRunResponse`]); creates **no** run on any error.",
         "operationId": "dispatch",
         "parameters": [
@@ -306,7 +338,9 @@
     },
     "/v1/repos/{org}/{repo}/environments": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Environments"
+        ],
         "summary": "List a repo's environments",
         "operationId": "list_environments",
         "responses": {
@@ -318,7 +352,9 @@
     },
     "/v1/repos/{org}/{repo}/environments/{name}": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Environments"
+        ],
         "summary": "One environment's protection rules",
         "operationId": "get_environment",
         "responses": {
@@ -331,7 +367,9 @@
         }
       },
       "put": {
-        "tags": [],
+        "tags": [
+          "Environments"
+        ],
         "summary": "Create/replace a protected environment (ADR-0024/0037)",
         "operationId": "put_environment",
         "responses": {
@@ -341,7 +379,9 @@
         }
       },
       "delete": {
-        "tags": [],
+        "tags": [
+          "Environments"
+        ],
         "summary": "Delete an environment (idempotent)",
         "operationId": "delete_environment",
         "responses": {
@@ -353,7 +393,9 @@
     },
     "/v1/repos/{org}/{repo}/environments/{name}/deployments": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Environments"
+        ],
         "summary": "An environment's deployment history (ADR-0037)",
         "operationId": "list_deployments",
         "responses": {
@@ -365,7 +407,9 @@
     },
     "/v1/repos/{org}/{repo}/pipelines": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Repositories"
+        ],
         "summary": "The manually-dispatchable catalog at a ref (ADR-0043 §4). Resolves `ref` to a\nconcrete commit (echoed back), enumerates every `.scarab/*.{yaml,yml}` at it\n(direct children only — `.scarab/lib/**` is excluded, mirroring webhook\ndiscovery), and reports each pipeline's `manual`/`api` opt-in from a\n**lightweight `on:`-only parse** (no `invoke:` pre-fetch, no full compile —\nthat cost is deferred to the on-selection interface read). A single file that\nfails to parse is flagged with an `error` rather than failing the whole list;\nan absent `.scarab/` yields an empty catalog, not an error. Read capability.",
         "operationId": "list_pipelines",
         "parameters": [
@@ -413,7 +457,9 @@
     },
     "/v1/repos/{org}/{repo}/pipelines/{name}/interface": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Repositories"
+        ],
         "summary": "The compiled, typed launch-parameter schema for one selected pipeline\n(ADR-0043 §4) — the on-selection describe. Resolves `ref` to a concrete\ncommit (echoed back), reads the named pipeline there, and **fully compiles**\nit (reusing the shared [`prefetch_libs_and_compile`] — this is where the\nlib-prefetch cost is justified), returning `interface.inputs` as typed\n[`ParamSpec`](scarab_pipeline::ParamSpec)s. The response is a pure function of\nthe compiled IR — the same path dispatch rides, no parallel parser — so a\ncompile error surfaces as a structured 4xx (never a 500), identical to\ndispatch. Read capability.",
         "operationId": "pipeline_interface",
         "parameters": [
@@ -476,7 +522,9 @@
     },
     "/v1/repos/{org}/{repo}/refs": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Repositories"
+        ],
         "summary": "`GET /v1/repos/{org}/{repo}/refs?q=` — the repo's branches and tags for a\nsearchable ref picker (ADR-0046), backed by the repo's `ForgeConnection`.\n`q`, when set, is a case-insensitive substring the ref name must contain\n(applied by the adapter, since neither forge's list API takes a search\nparam). Branches sort before tags, each group name-ascending, so the picker\norder is stable regardless of forge return order. Scoped to branches + tags.\nRead capability.",
         "operationId": "list_refs",
         "parameters": [
@@ -524,7 +572,9 @@
     },
     "/v1/repos/{org}/{repo}/runs": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "A repo's most recent runs, newest first (ADR-0046) — the dashboard's per-repo\nhistory and pass/fail chart source. Scoped to the repo's tenant.",
         "operationId": "list_repo_runs",
         "parameters": [
@@ -574,7 +624,9 @@
     },
     "/v1/repos/{org}/{repo}/secrets/matrix": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Secrets"
+        ],
         "summary": "The secret parity matrix (ADR-0037) - names + status, never values",
         "operationId": "secret_matrix",
         "responses": {
@@ -593,7 +645,9 @@
     },
     "/v1/runs": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "The most recent runs, newest first — the runs-list view (ADR-0013, 0028).",
         "operationId": "list_runs",
         "parameters": [
@@ -623,7 +677,9 @@
         }
       },
       "post": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Create and durably persist a new run from an inline pipeline.",
         "operationId": "create_run",
         "requestBody": {
@@ -652,7 +708,9 @@
     },
     "/v1/runs/{id}": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Current status of a run and its steps.",
         "operationId": "get_run",
         "parameters": [
@@ -685,7 +743,9 @@
     },
     "/v1/runs/{id}/artifacts": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "List a run's artifact versions (ADR-0052/0056). Read at the run's tenant.",
         "operationId": "list_artifacts",
         "parameters": [
@@ -721,7 +781,9 @@
     },
     "/v1/runs/{id}/artifacts/{name}": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Download one artifact's bytes (ADR-0052). Streams through the server (a\npresigned-URL fast path can replace this when the store backend supports\nsigning). Read at the run's tenant; immutable content. The bare name\nresolves to the latest SUCCESSFUL version (ADR-0056); `?step=&attempt=`\npins an exact version.",
         "operationId": "download_artifact",
         "parameters": [
@@ -772,7 +834,9 @@
     },
     "/v1/runs/{id}/cancel": {
       "post": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Cancel a run (ADR-0054): drive its non-terminal steps and the run to\n`Cancelled` durably and enqueue the Pod-teardown intent the driver\nexecutes (SIGTERM + grace via the backend). Idempotent — cancelling a\nterminal run is a 409; an unknown run is a 404.",
         "operationId": "cancel_run",
         "parameters": [
@@ -801,7 +865,9 @@
     },
     "/v1/runs/{id}/events": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Server-Sent-Events tail of the run's append-only event log — the status\ntimeline (ADR-0013): RunCreated, transitions, attempt start/finish.",
         "operationId": "get_events",
         "parameters": [
@@ -824,7 +890,9 @@
     },
     "/v1/runs/{id}/gates/{step}/approve": {
       "post": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Approve a `manual` gate (ADR-0008, 0037). The authenticated principal's\napproval is recorded on the event log (append-only, idempotent). For a\n**deploy** run (one with a target environment), the gate is released only\nonce the accumulated approvers satisfy the environment's protection rules\n(`admits`); on release the deployment is written to history. A plain gate (no\nenvironment) releases on the first approval. Authz'd as a write.",
         "operationId": "approve_gate",
         "parameters": [
@@ -859,7 +927,9 @@
     },
     "/v1/runs/{id}/gates/{step}/release": {
       "post": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Release an **external** gate by presenting its token (ADR-0034) — the path an\noutside system (a deploy webhook, a change-management tool) uses instead of an\ninteractive approval. The token is `HMAC-SHA256(secret, \"{run}:{step}\")`\n(`sha256=<hex>`), verified in constant time; no per-gate storage. The endpoint\nis 404 when no token secret is configured, and only releases gates of kind\n`external` (manual gates stay approval-only).",
         "operationId": "release_gate_external",
         "parameters": [
@@ -897,7 +967,9 @@
     },
     "/v1/runs/{id}/logs": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Server-Sent-Events of step **log bodies** (ADR-0013): replays every\ncommitted chunk (decompressed from the object store, indexed by Postgres\noffsets), then — while the run is still going — live-tails new chunks via the\nlog pipeline's broadcast. A terminal run yields the full log and closes.",
         "operationId": "get_logs",
         "parameters": [
@@ -920,7 +992,9 @@
     },
     "/v1/runs/{id}/services": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "The shared services of a run's **current Take** (ADR-0058), name-ordered —\neach with its lifecycle status, for the run detail's Services panel beside the\nDAG. A shared service is not a DAG node, so it is never folded into the step\nlist. Read at the run's tenant. Empty when the pipeline declares no shared\nservices.",
         "operationId": "get_services",
         "parameters": [
@@ -956,7 +1030,9 @@
     },
     "/v1/runs/{id}/services/{service}/logs": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "SSE of ONE shared service's log output (ADR-0058 evidence), the source for the\nrun detail's Services panel \"logs\" view. Best-effort, the SAME reliability\nclass and pipeline as step logs (ADR-0013): replays committed chunks then\nlive-tails while the run is still going. `?take=` reads an older Take's\ninstance in isolation; absent = the current Take. Read at the run's tenant.",
         "operationId": "get_service_logs",
         "parameters": [
@@ -1001,7 +1077,9 @@
     },
     "/v1/runs/{id}/steps/{step}/attach": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "WebSocket: an interactive debug shell into a **running** step's Pod (the\ndebug surface). Gated behind `Administer` — exec is the most privileged\nsurface. Only a running step has a live Pod (they are `restartPolicy: Never`\nand gone once done), so a terminal/pending step is refused. Bridges the\nPod's TTY to the socket: client text/binary → shell stdin, shell output →\nclient. Disabled (404) unless an attacher is wired (k8s executor only).",
         "operationId": "attach_step",
         "parameters": [
@@ -1039,7 +1117,9 @@
     },
     "/v1/runs/{id}/steps/{step}/consumed": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "An attempt's consumption map (ADR-0056). Bare = the attempt behind the\nstep's current evidence; `?attempt=` = that attempt. Read at the run's\ntenant. Fetched lazily by the step pane's Outputs tab — deliberately NOT\npart of the polled run-status DTO.",
         "operationId": "get_attempt_consumed",
         "parameters": [
@@ -1089,7 +1169,9 @@
     },
     "/v1/runs/{id}/steps/{step}/debug-pod": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "WebSocket: reproduce a **finished** step in a fresh ephemeral Pod — its\nimage, its output workspace snapshot re-materialized at `/workspace` —\nrunning `sleep` so the operator can shell in and debug (ADR-0039 world). The\nlive-attach surface needs a still-running step; this one works after the fact.\nGated behind `Administer`; the debug Pod is TTL-bounded and torn down when\nthe socket closes. Disabled (404) unless a debug launcher is wired (k8s only).",
         "operationId": "debug_pod_step",
         "parameters": [
@@ -1124,7 +1206,9 @@
     },
     "/v1/runs/{id}/steps/{step}/logs": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "SSE of ONE step's log bodies (ADR-0013), the source for the run detail's\nper-step fold. Same machinery as the run-wide `/logs`, scoped to the step —\nand, with `?attempt=`, to a single attempt so a rerun's earlier (failed)\noutput can be read in isolation. Replays committed chunks then live-tails\nonly when the run is still going AND the latest attempt is in scope\n(historical attempts are immutable). Read at the run's tenant.",
         "operationId": "get_step_logs",
         "parameters": [
@@ -1178,7 +1262,9 @@
     },
     "/v1/runs/{id}/steps/{step}/rerun": {
       "post": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Rerun a step and its transitive descendants (ADR-0027 smart invalidation) —\n**forks a new Take** (ADR-0056). The target and every step depending on it are\nre-armed and re-run in dependency order; siblings and ancestors are left\nas-is. Rejected `409` if the target's dependencies have not all succeeded (it\ncould not run).",
         "operationId": "rerun_step",
         "parameters": [
@@ -1216,7 +1302,9 @@
     },
     "/v1/runs/{id}/steps/{step}/results": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "A step's named results (ADR-0041). The read side of the results-ingest\nwrite path (`POST …/steps/{step}/results`): the Inspector's Results tab,\nand the source the Outputs view derives from. Bare = latest evidence;\n`?attempt=` = that attempt's immutable copy (ADR-0056). Read at the run's\ntenant.",
         "operationId": "get_step_results",
         "parameters": [
@@ -1267,7 +1355,9 @@
         }
       },
       "post": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Ingest a step's named results (ADR-0040/0042): the trusted per-Pod egress\nsidecar POSTs `{ name: value, … }` here, authenticated by a fence-scoped\ntoken, and the control plane persists them to `step_runs.results`. The\nuntrusted step never calls this — only the sidecar holds the token.",
         "description": "404 when no token secret is configured; 401 on a bad/missing token; 404 for\nan unknown step; 413 for an over-large body. The write is idempotent on the\nfence (a re-drive overwrites deterministically, ADR-0021).",
         "operationId": "ingest_step_results",
@@ -1306,7 +1396,9 @@
     },
     "/v1/runs/{id}/steps/{step}/retry": {
       "post": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Retry a **Failed** step (ADR-0056 amendment) — another Attempt **in the\ncurrent Take** (no fork). Re-arms the target and its dependent cascade;\nrejected `409` if the step is not Failed (use rerun instead).",
         "operationId": "retry_step",
         "parameters": [
@@ -1344,7 +1436,9 @@
     },
     "/v1/runs/{id}/steps/{step}/workspace": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "List a directory inside a step's output workspace snapshot (ADR-0029). The\nlive Pod workspace is gone once the step ends (`restartPolicy: Never`); what\nsurvives is the content-addressed snapshot, walked read-only here. Read at\nthe run's tenant.",
         "operationId": "list_workspace",
         "parameters": [
@@ -1404,7 +1498,9 @@
     },
     "/v1/runs/{id}/steps/{step}/workspace/file": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Runs"
+        ],
         "summary": "Stream one file's bytes from a step's output workspace snapshot (ADR-0029).\nRead at the run's tenant; immutable content.",
         "operationId": "get_workspace_file",
         "parameters": [
@@ -1457,7 +1553,9 @@
     },
     "/v1/secrets": {
       "get": {
-        "tags": [],
+        "tags": [
+          "Secrets"
+        ],
         "summary": "List the secret **names** at a scope (ADR-0014) — never the values.",
         "operationId": "list_secrets",
         "parameters": [
@@ -1506,7 +1604,9 @@
         }
       },
       "post": {
-        "tags": [],
+        "tags": [
+          "Secrets"
+        ],
         "summary": "Define (or overwrite) a secret at a scope (ADR-0014). The value is stored\nenvelope-encrypted and is **never** returned by any endpoint. Administering\nsecrets requires the Administer capability.",
         "operationId": "put_secret",
         "requestBody": {
@@ -1529,7 +1629,9 @@
         }
       },
       "delete": {
-        "tags": [],
+        "tags": [
+          "Secrets"
+        ],
         "summary": "Delete a secret at a scope (ADR-0014). Idempotent.",
         "operationId": "delete_secret",
         "parameters": [
@@ -1582,7 +1684,9 @@
     },
     "/webhooks/forgejo": {
       "post": {
-        "tags": [],
+        "tags": [
+          "Webhooks"
+        ],
         "summary": "Forgejo webhook ingest (HMAC-verified, ADR-0046)",
         "operationId": "forgejo_webhook",
         "responses": {
@@ -1597,7 +1701,9 @@
     },
     "/webhooks/github": {
       "post": {
-        "tags": [],
+        "tags": [
+          "Webhooks"
+        ],
         "summary": "GitHub webhook ingest (HMAC-verified, ADR-0046)",
         "operationId": "github_webhook",
         "responses": {
@@ -2414,6 +2520,16 @@
               "type": "string"
             }
           },
+          "outputs": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Explicit output workspace paths (ADR-0007): the workspace-relative paths\nthis step publishes downstream. Absent = the whole workspace. A declared\npath the step did not produce fails the step (fail-closed), so this is a\ncontract, not a filter (mirrors `scarab_pipeline::StepSpec`)."
+          },
           "placement_profiles": {
             "type": "array",
             "items": {
@@ -2608,5 +2724,35 @@
         }
       }
     }
-  }
+  },
+  "tags": [
+    {
+      "name": "Runs",
+      "description": "Launch, read, cancel, rerun and retry Runs; their events, logs, results, workspace, artifacts and gates."
+    },
+    {
+      "name": "Repositories",
+      "description": "The governed repos Scarab knows about, their pipeline catalog, refs, launch interface and manual dispatch."
+    },
+    {
+      "name": "Environments",
+      "description": "Environments and their protection rules, plus deployment history."
+    },
+    {
+      "name": "Secrets",
+      "description": "Scoped secrets (org / repo / environment) and the effective-status matrix that resolves them."
+    },
+    {
+      "name": "Webhooks",
+      "description": "Forge delivery endpoints. Called by the forge, not by clients; each verifies its own signature."
+    },
+    {
+      "name": "Auth & Identity",
+      "description": "Login/session, the current principal, OIDC discovery and JWKS, and RBAC role bindings."
+    },
+    {
+      "name": "System",
+      "description": "Liveness, readiness and Prometheus metrics (ADR-0053)."
+    }
+  ]
 }

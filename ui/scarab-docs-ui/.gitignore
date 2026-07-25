@@ -5,8 +5,6 @@ dist/
 # generated content synced from ../../docs by scripts/sync-content.mjs (ADR-0040);
 # canonical source lives in docs/ — never edit or commit these
 src/content/docs/tech/
-# tagged OpenAPI copy produced by scripts/gen-openapi.mjs; canonical is ../../openapi.json
-openapi.gen.json
 
 # dependencies
 node_modules/

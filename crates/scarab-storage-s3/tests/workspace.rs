@@ -3,13 +3,15 @@
 //! a *local* CAS and the *in-memory* Db (the executor/pod is faked): step A
 //! produces a file, its workspace is snapshotted to CAS and recorded on the run;
 //! step B (which `needs` A) resolves its inputs and materializes them — and sees
-//! the file A produced. The real cluster path (init-container fetch + post-step
-//! upload) is `#[ignore]`-gated below (needs a live cluster).
+//! the file A produced. Also covers per-path publishing (`outputs:`, ADR-0007):
+//! pruning a snapshot to the declared paths, its order-independence, and its
+//! fail-closed diagnostics. The real cluster path (init-container fetch +
+//! egress snapshot) lives in `scarab-executor-k8s/tests/cluster.rs`.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use scarab_engine::{workspace_inputs, AttemptId, Db, RunId, StepId, Timestamp};
-use scarab_storage::{Cas, TreeHash};
+use scarab_storage::{prune_tree, Cas, PruneError, TreeHash};
 use scarab_storage_s3::S3Storage;
 use scarab_testkit::InMemoryDb;
 
@@ -78,17 +80,142 @@ async fn output_workspace_flows_to_dependent_input() {
     let _ = std::fs::remove_dir_all(&b_work);
 }
 
-/// The real cluster path — a step Pod with an init-container that fetches the
-/// input snapshot from CAS and a post-step wrapper that uploads outputs — needs
-/// a live cluster + object store, so it is opt-in only. Placeholder guarding the
-/// intended behavior; the in-process test above proves the CAS-along-edges
-/// mechanic itself. TODO(slice-2): wire init-container/post-step into build_pod.
+// The real cluster path (init container fetches the input snapshot, egress
+// snapshots the output) lives in `scarab-executor-k8s/tests/cluster.rs` —
+// `workspace_flows_from_a_to_b_through_the_cas` and friends, run by the `kind`
+// CI tier. An empty placeholder used to sit here claiming build_pod still needed
+// that wiring; it has been wired since, so the placeholder was a lie.
+
+/// Publishing a path subset (`outputs:`, ADR-0007): the dependent sees exactly
+/// the declared paths and nothing else — proving the selection needs no new CAS
+/// capability, just a prune-and-rebuild over the existing tree primitives.
 #[tokio::test]
-#[ignore = "requires a dev kubernetes cluster + object store; opt in with SCARAB_TEST_KUBE=1"]
-async fn cluster_workspace_round_trip() {
-    if std::env::var("SCARAB_TEST_KUBE").is_err() {
-        return;
+async fn declared_outputs_publish_only_those_paths() {
+    let store_dir = temp_dir("store-prune");
+    let a_work = temp_dir("a-prune");
+    let b_work = temp_dir("b-prune");
+    let cas = S3Storage::local(&store_dir).expect("local cas");
+
+    // A messy workspace: the artifact we publish, a nested report, and junk.
+    std::fs::create_dir_all(a_work.join("dist/inner")).unwrap();
+    std::fs::create_dir_all(a_work.join("reports/junit")).unwrap();
+    std::fs::create_dir_all(a_work.join("target/debug")).unwrap();
+    std::fs::write(a_work.join("dist/app"), b"binary").unwrap();
+    std::fs::write(a_work.join("dist/inner/lib"), b"lib").unwrap();
+    std::fs::write(a_work.join("reports/junit/results.xml"), b"<xml/>").unwrap();
+    std::fs::write(a_work.join("reports/noise.log"), b"noise").unwrap();
+    std::fs::write(a_work.join("target/debug/huge"), b"cache").unwrap();
+    std::fs::write(a_work.join("scratch.tmp"), b"tmp").unwrap();
+
+    let full = cas.ingest(a_work.to_str().unwrap()).await.expect("ingest");
+    let pruned = prune_tree(
+        &cas,
+        &full.root,
+        &[
+            "dist".to_string(),
+            "reports/junit/results.xml".to_string(),
+        ],
+    )
+    .await
+    .expect("prune to the declared outputs");
+
+    assert_ne!(pruned.0, full.root.0, "a narrower publish is a new root");
+    cas.materialize(&pruned, b_work.to_str().unwrap())
+        .await
+        .expect("materialize the pruned tree");
+
+    // Declared paths arrive, whole subtrees included.
+    assert_eq!(std::fs::read(b_work.join("dist/app")).unwrap(), b"binary");
+    assert_eq!(std::fs::read(b_work.join("dist/inner/lib")).unwrap(), b"lib");
+    assert_eq!(
+        std::fs::read(b_work.join("reports/junit/results.xml")).unwrap(),
+        b"<xml/>"
+    );
+    // Everything else is absent — including siblings inside a selected path's
+    // parent, which is the whole point of a precise slice.
+    assert!(!b_work.join("target").exists(), "unrelated dir published");
+    assert!(!b_work.join("scratch.tmp").exists(), "junk file published");
+    assert!(
+        !b_work.join("reports/noise.log").exists(),
+        "sibling of a selected nested file published"
+    );
+
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let _ = std::fs::remove_dir_all(&a_work);
+    let _ = std::fs::remove_dir_all(&b_work);
+}
+
+/// Selecting the same paths must yield the same root regardless of authoring
+/// order — the output hash is a property of the content, so `outputs: [b, a]`
+/// and `outputs: [a, b]` cannot produce different cache keys.
+#[tokio::test]
+async fn pruning_is_order_independent_and_merges_nested_selections() {
+    let store_dir = temp_dir("store-order");
+    let work = temp_dir("work-order");
+    let cas = S3Storage::local(&store_dir).expect("local cas");
+
+    std::fs::create_dir_all(work.join("a/x")).unwrap();
+    std::fs::write(work.join("a/x/one"), b"1").unwrap();
+    std::fs::write(work.join("a/two"), b"2").unwrap();
+    std::fs::write(work.join("b"), b"3").unwrap();
+    let full = cas.ingest(work.to_str().unwrap()).await.expect("ingest");
+
+    let forward = prune_tree(&cas, &full.root, &["a/x/one".into(), "a/two".into()])
+        .await
+        .unwrap();
+    let reverse = prune_tree(&cas, &full.root, &["a/two".into(), "a/x/one".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        forward.0, reverse.0,
+        "the published root must not depend on authoring order"
+    );
+
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// Fail-closed: a declared output the step never produced is an error naming the
+/// path, not a quietly narrower publish (the exact failure mode the earlier
+/// "parsed but not consumed" deferral existed to avoid).
+#[tokio::test]
+async fn a_declared_output_that_was_not_produced_is_an_error() {
+    let store_dir = temp_dir("store-missing");
+    let work = temp_dir("work-missing");
+    let cas = S3Storage::local(&store_dir).expect("local cas");
+
+    std::fs::create_dir_all(work.join("dist")).unwrap();
+    std::fs::write(work.join("dist/app"), b"binary").unwrap();
+    let full = cas.ingest(work.to_str().unwrap()).await.expect("ingest");
+
+    let err = prune_tree(&cas, &full.root, &["dist".into(), "coverage".into()])
+        .await
+        .expect_err("a missing declared path must fail");
+    assert!(
+        matches!(&err, PruneError::MissingPath(p) if p == "coverage"),
+        "the error must name the path the author declared: {err}"
+    );
+
+    // A nested miss reports the authored path, not just the leaf.
+    let err = prune_tree(&cas, &full.root, &["dist/missing".into()])
+        .await
+        .expect_err("a missing nested path must fail");
+    assert!(
+        matches!(&err, PruneError::MissingPath(p) if p == "dist/missing"),
+        "nested diagnostics must be re-rooted on the authored path: {err}"
+    );
+
+    // Escaping the workspace is rejected outright.
+    for bad in ["../secrets", "/etc/passwd", "."] {
+        let err = prune_tree(&cas, &full.root, &[bad.to_string()])
+            .await
+            .expect_err("an unsafe path must fail");
+        assert!(
+            matches!(err, PruneError::UnsafePath(_)),
+            "{bad} should be rejected as unsafe, got: {err}"
+        );
     }
-    // Intentionally unimplemented until build_pod gains init-container/post-step
-    // workspace wiring (a follow-up in this slice).
+
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let _ = std::fs::remove_dir_all(&work);
 }
