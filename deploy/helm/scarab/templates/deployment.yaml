@@ -15,6 +15,12 @@ spec:
         # Roll pods when the rendered config/secret changes.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- if .Values.scarab.connections }}
+        # Roll pods when the declarative connections block changes — config is
+        # authoritative for the connections it declares (ADR-0060 part D), so a
+        # values edit must reach a running server.
+        checksum/connections: {{ include (print $.Template.BasePath "/configmap-connections.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -75,6 +81,14 @@ spec:
               mountPath: {{ include "scarab.githubAppPemDir" . | quote }}
               readOnly: true
             {{- end }}
+            {{- if .Values.scarab.connections }}
+            # The declarative connections block (ADR-0060 part D) —
+            # SCARAB_CONNECTIONS_FILE points at the file inside. Read at boot; a
+            # bad path or an invalid entry fails the boot loudly.
+            - name: connections
+              mountPath: {{ include "scarab.connectionsDir" . | quote }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: scratch
           emptyDir: {}
@@ -90,6 +104,11 @@ spec:
             # Group-readable only: Secret files are owned root:fsGroup, and the
             # container runs as the unprivileged podSecurityContext.fsGroup.
             defaultMode: 0440
+        {{- end }}
+        {{- if .Values.scarab.connections }}
+        - name: connections
+          configMap:
+            name: {{ include "scarab.connectionsConfigMapName" . }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

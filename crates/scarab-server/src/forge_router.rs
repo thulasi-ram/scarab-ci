@@ -12,11 +12,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use scarab_forge::{
-    CheckoutCredential, Commit, Event, ForgeAdapters, ForgeConnection, ForgeConnectionStore,
-    ForgeError, ForgeKind, ForgePort, ForgeRef, Permissions, RepoRef, Status, WebhookDelivery,
+    CheckoutCredential, Commit, Event, ForgeConnection, ForgeConnectionStore, ForgeError,
+    ForgeKind, ForgePort, ForgeRef, Permissions, RepoRef, Status, WebhookDelivery,
 };
 
-use crate::connection_credential;
+use crate::connections_config::{resolve_connection_credential, CredentialOverrides};
 
 /// A registry-routed [`ForgePort`]. See the module docs.
 pub struct RegistryForge {
@@ -26,14 +26,11 @@ pub struct RegistryForge {
     /// authenticate in App mode (the credential secret is the App PEM); when
     /// absent, the credential secret is used as a plain token (dev).
     github_app_id: Option<String>,
-    /// Boot-provided GitHub App private-key PEM (enh 245a99c). When set (App
-    /// mode), it OVERRIDES the DB-stored `_forge` credential for every GitHub
-    /// connection — so a fresh DB / GitOps deploy needs no `reseed.sh` PUT.
-    github_app_pem: Option<String>,
-    /// The HMAC secret Forgejo hooks are created with (`SCARAB_FORGEJO_WEBHOOK_
-    /// SECRET`) — the same one `/webhooks/forgejo` verifies against. Without it,
-    /// registered hooks send unsigned deliveries that the endpoint rejects.
-    forgejo_webhook_secret: Option<String>,
+    /// Deployment-supplied credential material (ADR-0060 part D): config-declared
+    /// `credential.env`/`file` per connection, plus the kind-wide
+    /// `SCARAB_GITHUB_APP_PEM[_FILE]`. Consulted BEFORE `SecretProvider` —
+    /// one path, one precedence, for every forge.
+    overrides: Arc<CredentialOverrides>,
     /// Constructed adapters, cached by connection id. Rebuilt only when a
     /// connection is first seen; credential rotation lands on restart (the
     /// GitHub adapter refreshes its *installation* tokens internally anyway).
@@ -47,95 +44,68 @@ impl RegistryForge {
         github_app_id: Option<String>,
         github_app_pem: Option<String>,
     ) -> Self {
+        let app_mode = github_app_id.is_some();
         Self {
             connections,
             secrets,
             github_app_id,
-            github_app_pem,
-            forgejo_webhook_secret: None,
+            overrides: Arc::new(
+                CredentialOverrides::new().with_github_app_pem(github_app_pem, app_mode),
+            ),
             adapters: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Supply the Forgejo webhook secret every Forgejo adapter this router builds
-    /// stamps onto the hooks it registers (ADR-0046). Absent it, registration
-    /// creates hooks whose deliveries `/webhooks/forgejo` answers with 401 — the
-    /// failure mode where onboarding reports success and no push ever runs.
-    pub fn with_forgejo_webhook_secret(mut self, secret: Option<Vec<u8>>) -> Self {
-        self.forgejo_webhook_secret = secret.and_then(|s| String::from_utf8(s).ok());
+    /// Add the config-declared connection credentials (ADR-0060 part D) to the
+    /// override table. The kind-wide App PEM from [`new`](Self::new) is kept, and
+    /// an explicit per-connection override wins over it.
+    pub fn with_credential_overrides(mut self, overrides: Arc<CredentialOverrides>) -> Self {
+        let merged = overrides.merged_over(&self.overrides);
+        self.overrides = Arc::new(merged);
         self
     }
 
     /// Build the vendor adapter for `conn`, fetching its credential material
-    /// at use-time (ADR-0046).
+    /// at use-time (ADR-0046) through the one resolution path: deployment
+    /// override → `SecretProvider` (ADR-0060 part D).
     async fn build_adapter(
         &self,
         conn: &ForgeConnection,
     ) -> Result<Arc<dyn ForgePort>, ForgeError> {
-        // The DB-stored credential, fetched only when actually needed — a
-        // boot-provided App PEM (below) serves GitHub connections without it.
-        let db_credential = || async {
-            let credential = connection_credential(self.secrets.as_ref(), conn)
-                .await
-                .map_err(|e| {
-                    ForgeError::Api(format!(
-                        "credential `{}` for connection `{}` unavailable: {e}",
-                        conn.credential_ref, conn.id
-                    ))
-                })?;
+        let credential = || async {
+            let credential =
+                resolve_connection_credential(&self.overrides, self.secrets.as_ref(), conn)
+                    .await
+                    .map_err(|e| {
+                        ForgeError::Api(format!(
+                            "credential `{}` for connection `{}` unavailable: {e}",
+                            conn.credential_ref, conn.id
+                        ))
+                    })?;
             String::from_utf8(credential)
                 .map_err(|_| ForgeError::Api("credential is not valid UTF-8".into()))
         };
         Ok(match conn.kind {
             ForgeKind::GitHub => match &self.github_app_id {
-                // App mode: the credential is the App private-key PEM. A
-                // boot-provided PEM (GitOps) wins over the DB credential.
-                Some(app_id) => {
-                    let private_key_pem = match &self.github_app_pem {
-                        Some(pem) => pem.clone(),
-                        None => db_credential().await?,
-                    };
-                    Arc::new(
-                        scarab_forge_github::GithubForge::app(scarab_forge_github::GithubApp {
-                            app_id: app_id.clone(),
-                            private_key_pem,
-                        })
-                        .with_base_url(conn.base_url.clone()),
-                    )
-                }
+                // App mode: the credential is the App private-key PEM.
+                Some(app_id) => Arc::new(
+                    scarab_forge_github::GithubForge::app(scarab_forge_github::GithubApp {
+                        app_id: app_id.clone(),
+                        private_key_pem: credential().await?,
+                    })
+                    .with_base_url(conn.base_url.clone()),
+                ),
                 // Token mode (dev): the credential is a plain token.
                 None => Arc::new(
-                    scarab_forge_github::GithubForge::new(db_credential().await?)
+                    scarab_forge_github::GithubForge::new(credential().await?)
                         .with_base_url(conn.base_url.clone()),
                 ),
             },
-            ForgeKind::Forgejo => {
-                let mut adapter = scarab_forge_forgejo::ForgejoForge::new(
-                    conn.base_url.clone(),
-                    db_credential().await?,
-                );
-                if let Some(secret) = &self.forgejo_webhook_secret {
-                    adapter = adapter.with_webhook_secret(secret.clone());
-                }
-                Arc::new(adapter)
-            }
+            ForgeKind::Forgejo => Arc::new(scarab_forge_forgejo::ForgejoForge::new(
+                conn.base_url.clone(),
+                credential().await?,
+            )),
         })
-    }
-
-    /// The cached adapter for `conn`, building it on first use.
-    async fn cached_adapter(
-        &self,
-        conn: &ForgeConnection,
-    ) -> Result<Arc<dyn ForgePort>, ForgeError> {
-        if let Some(adapter) = self.adapters.lock().unwrap().get(&conn.id) {
-            return Ok(adapter.clone());
-        }
-        let adapter = self.build_adapter(conn).await?;
-        self.adapters
-            .lock()
-            .unwrap()
-            .insert(conn.id.clone(), adapter.clone());
-        Ok(adapter)
     }
 
     /// The adapter serving `repo`, via the registry (cached per connection).
@@ -151,21 +121,15 @@ impl RegistryForge {
                     repo.owner, repo.name
                 ))
             })?;
-        self.cached_adapter(&resolved.connection).await
-    }
-}
-
-/// The connection-scoped half of the same wiring (ADR-0060): onboarding asks
-/// "which repos does this credential reach?" and "register a hook on this repo"
-/// of a connection that may have **nothing bound yet**, so there is no repo to
-/// route through. Same adapter, same cache — a different way in.
-#[async_trait]
-impl ForgeAdapters for RegistryForge {
-    async fn adapter_for_connection(
-        &self,
-        conn: &ForgeConnection,
-    ) -> Result<Arc<dyn ForgePort>, ForgeError> {
-        self.cached_adapter(conn).await
+        if let Some(adapter) = self.adapters.lock().unwrap().get(&resolved.connection.id) {
+            return Ok(adapter.clone());
+        }
+        let adapter = self.build_adapter(&resolved.connection).await?;
+        self.adapters
+            .lock()
+            .unwrap()
+            .insert(resolved.connection.id.clone(), adapter.clone());
+        Ok(adapter)
     }
 }
 

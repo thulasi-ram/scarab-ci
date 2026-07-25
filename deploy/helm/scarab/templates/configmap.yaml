@@ -41,6 +41,12 @@ data:
          the mounted Secret is — so it belongs in the ConfigMap. */}}
   SCARAB_GITHUB_APP_PEM_FILE: {{ include "scarab.githubAppPemPath" . | quote }}
   {{- end }}
+  {{- if .Values.scarab.connections }}
+  {{- /* Declarative connections (ADR-0060 part D): the block itself is a
+         mounted ConfigMap; only its path is env. A bad path/parse/validation
+         fails the boot loudly, never a degraded start. */}}
+  SCARAB_CONNECTIONS_FILE: {{ include "scarab.connectionsPath" . | quote }}
+  {{- end }}
   {{- if .Values.secrets.resultsTokenSecret }}
   SCARAB_SIDECAR_IMAGE: {{ .Values.scarab.sidecarImage | quote }}
   SCARAB_RESULTS_API_URL: {{ .Values.scarab.resultsApiUrl | default (printf "http://%s.%s.svc" (include "scarab.fullname" .) .Release.Namespace) | quote }}

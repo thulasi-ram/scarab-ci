@@ -46,6 +46,43 @@ scarab:
   # default (3600). Per-step `timeout:` always overrides.
   stepTimeoutSecs: ""
 
+  # --- declarative forge connections (ADR-0060 part D) --------------------
+  # Config-owned connections: provisioned at boot, AUTHORITATIVE, and read-only
+  # in the UI ("managed by configuration"). A connection has exactly one owner —
+  # this block or the database — never both: declaring an id the database
+  # already owns REFUSES the boot rather than letting config and the running
+  # system drift apart. Undeclaring an entry releases ownership back to the UI;
+  # it never deletes the connection (Projects hang off its repo bindings).
+  #
+  # Rendered verbatim into a mounted ConfigMap, so these keys are the SERVER's
+  # schema (snake_case), not the chart's camelCase. An unknown key fails the
+  # boot loudly (ADR-0048) instead of being silently ignored.
+  #
+  # Credential resolution is one path — env override, then Scarab's secret store:
+  #   credential: { env: FORGEJO_CI_TOKEN }        # supply the var via
+  #                                                # secrets.existingSecret or
+  #                                                # scarab.extraEnv
+  #   credential: { file: /etc/scarab/forgejo/tok } # a Secret you mount yourself
+  #   credential: { secret_ref: forgejo-token }     # `_forge`-scoped handle in
+  #                                                # Scarab's own secret store
+  # An `env`/`file` credential that is missing or empty fails the boot; a
+  # `secret_ref` that is not registered yet is reported DEGRADED (only the
+  # running server can store it).
+  #
+  # Each `repos:` entry binds `owner/name` as a Project (ADR-0046) — the
+  # declarative repo-onboarding path, and the only way Forgejo repos become
+  # Projects without clicking through the UI.
+  #
+  # connections:
+  #   - id: forgejo-main
+  #     kind: forgejo                  # github | forgejo
+  #     base_url: https://git.example.com
+  #     credential:
+  #       env: FORGEJO_CI_TOKEN
+  #     repos:
+  #       - acme/widgets
+  connections: []
+
   # Object store (logs/artifacts). When bucket is set the S3/MinIO backend is
   # used; otherwise scarab falls back to a local directory (dev only).
   s3:

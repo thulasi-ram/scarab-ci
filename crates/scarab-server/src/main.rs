@@ -211,38 +211,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => PlacementConfig::default(),
     };
 
+    // Declarative connections (ADR-0060 part D): the `connections:` block is
+    // ALREADY parsed, validated and credential-resolved by the config gate — so
+    // all that remains is applying it to the registry. Config-owned connections
+    // are provisioned as real registry rows (so the forge router, the clone-step
+    // enricher and webhook resolution need no special case), and a connection
+    // declared in config that already exists as a DB-owned row is a single-owner
+    // collision that REFUSES the boot rather than picking a winner.
+    let credential_overrides = Arc::new(
+        scarab_server::connections_config::CredentialOverrides::from_specs(&config.connections)
+            .with_github_app_pem(github_app_pem.clone(), config.github_app_id.is_some()),
+    );
+    {
+        let provisioned =
+            scarab_server::connections_config::provision(pg.as_ref(), &config.connections)
+                .await
+                .map_err(|e| format!("refusing to start: {e}"))?;
+        if !provisioned.owned.is_empty() {
+            tracing::info!(
+                connections = ?provisioned.owned,
+                bound = ?provisioned.bound,
+                "startup: provisioned config-owned forge connections (ADR-0060 part D)"
+            );
+        }
+        // Ownership released, not deleted: a Project (and its Environments,
+        // secrets, RBAC) hangs off a repo binding, so undeclaring a connection
+        // hands it back to the UI instead of destroying governance.
+        for id in &provisioned.released {
+            tracing::warn!(
+                connection = %id,
+                "startup: connection is no longer declared in config — ownership released \
+                 to the database; it is now editable/deletable in Settings"
+            );
+        }
+    }
+
     // The production forge (ADR-0046): a registry-routed ForgePort — each call
     // resolves its repo through the ForgeConnection registry, constructs the
     // vendor adapter (GitHub App/token, Forgejo token) with credentials
-    // fetched from SecretProvider at use-time, and caches it per connection.
-    // One instance, two ports: the repo-routed `ForgePort` every run path uses,
-    // and the connection-scoped `ForgeAdapters` the ADR-0060 onboarding endpoints
-    // need (a connection with nothing bound yet has no repo to route through).
-    // They share the adapter cache by construction.
-    let registry_forge = Arc::new(
+    // fetched at use-time via the one resolution path (deployment override →
+    // SecretProvider, ADR-0060 part D), and caches it per connection.
+    let forge: Arc<dyn scarab_forge::ForgePort> = Arc::new(
         scarab_server::forge_router::RegistryForge::new(
             pg.clone(),
             secrets.clone(),
             config.github_app_id.clone(),
             github_app_pem.clone(),
         )
-        // Hooks this server registers must be signed with the secret its own
-        // `/webhooks/forgejo` verifies, or every delivery comes back 401.
-        .with_forgejo_webhook_secret(config.forgejo_webhook_secret.clone()),
+        .with_credential_overrides(credential_overrides.clone()),
     );
-    let forge: Arc<dyn scarab_forge::ForgePort> = registry_forge.clone();
     // Startup validation (ADR-0046): every registered connection's credential
-    // handle must resolve. Missing material is a loud DEGRADED warning — the
-    // connection cannot serve until the secret is registered. When a boot-time
-    // App PEM is supplied, it overrides the DB credential for GitHub App-mode
-    // connections, so an absent `_forge` secret there is expected — skip it.
+    // must resolve. A credential the DEPLOYMENT supplies (a config-declared
+    // `credential.env`/`file`, or the kind-wide App PEM) is already in hand and
+    // needs no secret store — the same override table the forge router uses
+    // answers that, so the audit and the runtime can never disagree. Anything
+    // else must resolve from SecretProvider, and missing material is a loud
+    // DEGRADED warning: only the running server can PUT it, so refusing the boot
+    // would deadlock a fresh database.
     {
         use scarab_forge::ForgeConnectionStore;
-        let app_pem_overrides_github = github_app_pem.is_some() && config.github_app_id.is_some();
         match pg.list_connections().await {
             Ok(conns) => {
                 for conn in conns {
-                    if app_pem_overrides_github && conn.kind == scarab_forge::ForgeKind::GitHub {
+                    if credential_overrides.covers(&conn) {
                         continue;
                     }
                     if let Err(e) =
@@ -373,16 +404,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The acting forge (no more forge=None): webhook-triggered runs read
         // in-repo `.scarab` config through it for real.
         .with_forge(forge.clone())
-        // The same wiring, connection-scoped: repo enumeration for the bind
-        // pick-list and per-repo webhook registration (ADR-0060).
-        .with_forge_adapters(registry_forge.clone())
         // /v1/secrets management with the secrets store built above (ADR-0014).
         .with_secrets(secrets.clone())
         // Artifact list/download (ADR-0052), served from the object store.
         .with_artifact_store(store.clone())
         // Read-only workspace browser (ADR-0029): serves a step's output
         // snapshot tree + file bytes for the run detail Inspector.
-        .with_workspace_cas(workspace_cas.clone());
+        .with_workspace_cas(workspace_cas.clone())
+        // The same credential-override table the forge router resolves through
+        // (ADR-0060 part D), so the Settings health readout reports a
+        // config-supplied credential as present rather than MISSING.
+        .with_credential_overrides(credential_overrides.clone());
     // Debug shell (step-attach): only the k8s executor can exec into a running
     // Pod. A dedicated kube client, independent of the runs driver, so a
     // UI-only replica can still serve attach. Absent a cluster it stays off.

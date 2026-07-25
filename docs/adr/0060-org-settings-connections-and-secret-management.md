@@ -88,6 +88,25 @@ Credential resolution is one path — **env-override → `SecretProvider`** — 
 `connection_credential()` generalized. The `_forge` pseudo-org stays an internal mechanism,
 never surfaced to users.
 
+Three details the single-owner rule forces, settled while building it:
+
+- **Ownership is persisted, not inferred** (`forge_connections.owned_by_config`). Only a
+  durable marker lets a *later* boot tell "the row I provisioned from config" (safe to
+  overwrite) from "a row a human created" (a collision). Config-declared connections are
+  provisioned as real registry rows, so the forge router, the clone-step enricher and
+  webhook resolution need no special case.
+- **A collision refuses the boot.** An id declared in config that already exists as a
+  DB-owned connection stops the process before any write, naming both sources — the
+  operator decides which owns it. Un-declaring an entry **releases** ownership back to the
+  UI rather than deleting the connection: a Project (and its Environments, secrets, RBAC)
+  hangs off its repo bindings, so removal stays an explicit human act.
+- **Only *deployment-supplied* credentials fail the boot.** A missing/empty `credential.env`
+  or `credential.file` is a broken promise by the same deploy that made it ⇒ refuse
+  (ADR-0048). A `credential.secret_ref` that is not registered yet is reported **DEGRADED**
+  instead, because the running server is the only thing that can store it — refusing there
+  would deadlock a fresh database, the same bootstrap trap `SCARAB_GITHUB_APP_PEM` exists to
+  avoid.
+
 ## Consequences
 
 - Forgejo becomes **actually onboardable** from the product for the first time — the [0046]

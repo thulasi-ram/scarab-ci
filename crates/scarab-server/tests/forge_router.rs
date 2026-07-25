@@ -59,57 +59,6 @@ async fn missing_credential_material_fails_loudly_at_use_time() {
     assert!(err.to_string().contains("unavailable"), "{err}");
 }
 
-/// A connection with **nothing bound yet** still yields an adapter (ADR-0060).
-///
-/// This is the whole reason `ForgeAdapters` exists alongside the repo-routed
-/// port: onboarding asks "what does this credential reach?" *before* any repo is
-/// a Project, so there is nothing for `resolve()` to route on. Before the
-/// connection-scoped path, that question could only fail.
-#[tokio::test]
-async fn a_connection_with_no_bound_repos_still_yields_an_adapter() {
-    use scarab_forge::ForgeAdapters;
-
-    let registry = Arc::new(InMemoryDb::new());
-    let conn = ForgeConnection {
-        id: "fj-1".into(),
-        kind: ForgeKind::Forgejo,
-        base_url: "https://git.acme.test".into(),
-        credential_ref: "fj-1-credential".into(),
-    };
-    registry.put_connection(&conn).await.unwrap();
-    let scope = SecretScope::Org {
-        org: FORGE_CREDENTIALS_ORG.to_string(),
-    };
-    let secrets = Arc::new(FakeSecrets::new().with_secret(&scope, "fj-1-credential", b"fj-token"));
-    let forge = RegistryForge::new(registry, secrets, None, None);
-
-    // The repo-routed way in cannot answer — no binding, nothing to resolve.
-    let err = forge
-        .latest_commit(&repo("acme", "web"), "main")
-        .await
-        .expect_err("no binding, so no route");
-    assert!(err.to_string().contains("not registered"), "{err}");
-
-    // The connection-scoped way in does. (No network: constructing the adapter
-    // only resolves the credential.)
-    assert!(
-        forge.adapter_for_connection(&conn).await.is_ok(),
-        "a connection-scoped adapter needs no binding"
-    );
-
-    // A dangling credential still fails loudly here rather than degrading.
-    let broken = ForgeConnection {
-        id: "fj-2".into(),
-        credential_ref: "nothing-here".into(),
-        ..conn.clone()
-    };
-    let err = match forge.adapter_for_connection(&broken).await {
-        Err(e) => e,
-        Ok(_) => panic!("a dangling credential must fail, never silently degrade"),
-    };
-    assert!(err.to_string().contains("unavailable"), "{err}");
-}
-
 /// LIVE: the full production path — registry resolution → use-time credential
 /// → GitHub adapter → a real commit status WITH the run deep-link — against
 /// real GitHub. Gated + `#[ignore]`d.

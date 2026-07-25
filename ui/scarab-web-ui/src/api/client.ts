@@ -656,16 +656,11 @@ export async function deleteSecret(scope: SecretScope, name: string): Promise<vo
   }
 }
 
-// --- Forge connections (ADR-0060 parts C + D). Read + a re-sync heal action,
-// plus the manual create/delete path that makes Forgejo onboardable.
-//
-// The credential is **write-only** end to end: it goes up in a create body and
-// is never in a response — `Connection` reports only whether the handle
-// resolves, so there is nothing here to render a token from even by accident. ---
+// --- Forge connections (ADR-0060 part C). Read-only + a re-sync heal action.
+// Credential material is never in these payloads — only whether it resolves. ---
 
 export type Connection = components["schemas"]["ConnectionDto"];
 export type ResyncResult = components["schemas"]["ResyncResultDto"];
-export type CreatedConnection = components["schemas"]["CreatedConnectionDto"];
 
 /** The registered forge connections with their bound Projects and health. */
 export async function listConnections(): Promise<Connection[]> {
@@ -688,106 +683,6 @@ export async function resyncConnection(id: string): Promise<ResyncResult> {
   }
   if (error || !data) throw new Error("re-sync failed");
   return data;
-}
-
-/**
- * Create a forge connection (`POST /v1/connections`), writing its credential
- * through to the secret store. The token leaves the browser once and never comes
- * back — the response is only the new id and the generated handle.
- */
-export async function createConnection(body: {
-  kind: string;
-  base_url: string;
-  credential: string;
-}): Promise<CreatedConnection> {
-  const { data, error, response } = await api.POST("/v1/connections", { body });
-  if (error || !data) {
-    throw new Error(errorText(error) || `could not create the connection (${response.status})`);
-  }
-  return data;
-}
-
-/**
- * Delete a connection (`DELETE /v1/connections/{id}`). `unbindRepos` is the
- * server's required acknowledgement that the connection's Projects — and the
- * Environments, secrets and RBAC on them — go with it; without it a connection
- * that still has bindings answers 409.
- */
-export async function deleteConnection(id: string, unbindRepos = false): Promise<void> {
-  const { error, response } = await api.DELETE("/v1/connections/{id}", {
-    params: { path: { id }, query: { unbind_repos: unbindRepos } },
-  });
-  if (error) {
-    throw new Error(errorText(error) || `could not delete the connection (${response.status})`);
-  }
-}
-
-// --- Repo binding = Project onboarding (ADR-0060 part C). There is no
-// `projects` table: a Project IS a `forge_repos` binding (ADR-0046), so these
-// calls are what bring a repo into existence as a governed Project. ---
-
-export type AvailableRepo = components["schemas"]["AvailableRepoDto"];
-export type BindRepoResult = components["schemas"]["BindRepoResultDto"];
-
-/**
- * The repos a connection's credential can reach (`GET …/available-repos`) — the
- * pick-list, so nobody has to type `owner/name`. Returns `null` when the adapter
- * cannot enumerate (501), which is NOT the same as "reaches nothing": the caller
- * falls back to a manual entry field instead of claiming the token is empty.
- */
-export async function availableRepos(id: string): Promise<AvailableRepo[] | null> {
-  const { data, error, response } = await api.GET("/v1/connections/{id}/available-repos", {
-    params: { path: { id } },
-  });
-  if (response.status === 501) return null;
-  if (error || !data) throw new Error("failed to list the connection's repositories");
-  return data;
-}
-
-/**
- * Bind a repo to a connection (`POST …/repos`) — **this creates the Project**,
- * and by default registers the forge-side webhook so pushes actually arrive. A
- * webhook that fails does not undo the binding; the result says so and
- * `registerRepoWebhook` retries.
- */
-export async function bindRepo(
-  id: string,
-  repo: { owner: string; name: string; register_webhook?: boolean },
-): Promise<BindRepoResult> {
-  const { data, error, response } = await api.POST("/v1/connections/{id}/repos", {
-    params: { path: { id } },
-    body: repo,
-  });
-  if (error || !data) {
-    throw new Error(errorText(error) || `could not add the repository (${response.status})`);
-  }
-  return data;
-}
-
-/** Retry the forge-side webhook for a bound repo (`POST …/repos/{owner}/{name}/webhook`). */
-export async function registerRepoWebhook(
-  id: string,
-  owner: string,
-  name: string,
-): Promise<BindRepoResult> {
-  const { data, error, response } = await api.POST(
-    "/v1/connections/{id}/repos/{owner}/{name}/webhook",
-    { params: { path: { id, owner, name } } },
-  );
-  if (error || !data) {
-    throw new Error(errorText(error) || `could not register the webhook (${response.status})`);
-  }
-  return data;
-}
-
-/** Unbind a repo (`DELETE …/repos/{owner}/{name}`) — removes its Project. */
-export async function unbindRepo(id: string, owner: string, name: string): Promise<void> {
-  const { error, response } = await api.DELETE("/v1/connections/{id}/repos/{owner}/{name}", {
-    params: { path: { id, owner, name } },
-  });
-  if (error) {
-    throw new Error(errorText(error) || `could not remove the repository (${response.status})`);
-  }
 }
 
 // --- Secret coverage matrix (ADR-0037) — and, since ADR-0060, the read model

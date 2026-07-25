@@ -195,6 +195,9 @@ struct InMemoryState {
     forge_connections: HashMap<String, scarab_forge::ForgeConnection>,
     /// Repo bindings: (owner, name) → (connection id, org, project).
     forge_repos: HashMap<(String, String), (String, String, String)>,
+    /// Connections owned by the declarative `connections:` config, not the DB
+    /// (ADR-0060 part D single-owner marker; the `owned_by_config` column).
+    forge_config_owned: std::collections::HashSet<String>,
     /// Webhook delivery-id replay guard: (forge kind token, delivery id).
     webhook_deliveries: std::collections::HashSet<(String, String)>,
     /// Lease table: resource → (owner, expiry instant).
@@ -2007,14 +2010,6 @@ pub struct FakeForge {
     /// `Unsupported` answer, deliberately distinct from `Some(vec![])`
     /// ("enumerable, reaches nothing").
     accessible: Mutex<Option<Vec<RepoRef>>>,
-    /// Webhooks registered through [`register_webhook`](ForgePort::register_webhook)
-    /// as `(repo, callback_url)` — the record onboarding tests assert against
-    /// (ADR-0060): a bound repo with no hook is a Project that never builds.
-    webhooks: Mutex<Vec<(RepoRef, String)>>,
-    /// When set, `register_webhook` fails with this message — models a token
-    /// without hook-administration scope, the one onboarding step that depends on
-    /// the forge being reachable and sufficiently privileged right now.
-    fail_webhook: Mutex<Option<String>>,
 }
 
 impl FakeForge {
@@ -2092,18 +2087,6 @@ impl FakeForge {
         self
     }
 
-    /// Make [`register_webhook`](ForgePort::register_webhook) fail — models a
-    /// credential the forge will not let administer hooks.
-    pub fn failing_webhook(self, message: impl Into<String>) -> Self {
-        *self.fail_webhook.lock().unwrap() = Some(message.into());
-        self
-    }
-
-    /// The webhooks registered so far, as `(repo, callback_url)`.
-    pub fn webhooks(&self) -> Vec<(RepoRef, String)> {
-        self.webhooks.lock().unwrap().clone()
-    }
-
     /// Statuses pushed back via [`set_status`](ForgePort::set_status).
     pub fn statuses(&self) -> Vec<Status> {
         self.statuses.lock().unwrap().clone()
@@ -2161,6 +2144,7 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
         let mut st = self.state.lock().unwrap();
         st.forge_connections.remove(id);
         st.forge_repos.retain(|_, (conn, _, _)| conn != id);
+        st.forge_config_owned.remove(id);
         Ok(())
     }
 
@@ -2248,6 +2232,41 @@ impl scarab_forge::ForgeConnectionStore for InMemoryDb {
             .webhook_deliveries
             .insert((forge.as_str().to_string(), delivery_id.to_string())))
     }
+
+    /// The single-owner marker (ADR-0060 part D), mirroring the Postgres
+    /// `owned_by_config` column so ownership behaviour is testable hermetically.
+    async fn set_connection_owned_by_config(
+        &self,
+        id: &str,
+        owned: bool,
+    ) -> Result<(), scarab_forge::RegistryError> {
+        let mut st = self.state.lock().unwrap();
+        // Mirrors `UPDATE … WHERE id = $1`: marking an absent connection is a
+        // no-op, not an insert.
+        if st.forge_connections.contains_key(id) {
+            if owned {
+                st.forge_config_owned.insert(id.to_string());
+            } else {
+                st.forge_config_owned.remove(id);
+            }
+        }
+        Ok(())
+    }
+
+    async fn config_owned_connection_ids(
+        &self,
+    ) -> Result<Vec<String>, scarab_forge::RegistryError> {
+        let mut out: Vec<String> = self
+            .state
+            .lock()
+            .unwrap()
+            .forge_config_owned
+            .iter()
+            .cloned()
+            .collect();
+        out.sort();
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -2303,14 +2322,11 @@ impl ForgePort for FakeForge {
         Ok(out)
     }
 
-    async fn register_webhook(&self, repo: &RepoRef, callback_url: &str) -> Result<(), ForgeError> {
-        if let Some(msg) = self.fail_webhook.lock().unwrap().clone() {
-            return Err(ForgeError::Api(msg));
-        }
-        self.webhooks
-            .lock()
-            .unwrap()
-            .push((repo.clone(), callback_url.to_string()));
+    async fn register_webhook(
+        &self,
+        _repo: &RepoRef,
+        _callback_url: &str,
+    ) -> Result<(), ForgeError> {
         Ok(())
     }
 

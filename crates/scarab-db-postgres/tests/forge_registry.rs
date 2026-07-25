@@ -136,3 +136,63 @@ async fn registration_and_resolution_round_trip() {
 
     tdb.cleanup().await;
 }
+
+/// The single-owner marker (ADR-0060 part D) against real Postgres. Ownership has
+/// to be **durable** for the rule to work at all: it is the only way a second
+/// boot can tell "the row I provisioned from config" (safe to overwrite) from "a
+/// row a human created" (a collision that must refuse the boot).
+#[tokio::test]
+async fn connection_ownership_is_durable_and_defaults_to_the_database() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = PostgresDb::with_pool(tdb.pool.clone());
+    db.migrate().await.unwrap();
+
+    // A connection created the pre-0060 way (API/UI, or the installation
+    // webhook) is DB-owned — nothing becomes read-only by accident.
+    db.put_connection(&github_conn()).await.unwrap();
+    db.put_connection(&forgejo_conn()).await.unwrap();
+    assert!(db.config_owned_connection_ids().await.unwrap().is_empty());
+
+    // Boot provisioning claims one.
+    db.set_connection_owned_by_config("codeberg-acme", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.config_owned_connection_ids().await.unwrap(),
+        vec!["codeberg-acme".to_string()]
+    );
+
+    // Re-provisioning (`put_connection` again, as every boot does) must not
+    // clear the claim — otherwise the connection would flip to editable for the
+    // rest of the process's life.
+    let mut moved = forgejo_conn();
+    moved.base_url = "https://codeberg.example".into();
+    db.put_connection(&moved).await.unwrap();
+    assert_eq!(
+        db.config_owned_connection_ids().await.unwrap(),
+        vec!["codeberg-acme".to_string()]
+    );
+    assert_eq!(
+        db.get_connection("codeberg-acme").await.unwrap(),
+        Some(moved)
+    );
+
+    // Releasing (config stopped declaring it) hands ownership back without
+    // touching the connection itself.
+    db.set_connection_owned_by_config("codeberg-acme", false)
+        .await
+        .unwrap();
+    assert!(db.config_owned_connection_ids().await.unwrap().is_empty());
+    assert!(db.get_connection("codeberg-acme").await.unwrap().is_some());
+
+    // Marking an absent connection is a no-op, not an insert.
+    db.set_connection_owned_by_config("ghost", true)
+        .await
+        .unwrap();
+    assert!(db.config_owned_connection_ids().await.unwrap().is_empty());
+
+    tdb.cleanup().await;
+}

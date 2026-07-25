@@ -688,25 +688,6 @@ pub struct ForgeConnection {
     pub credential_ref: String,
 }
 
-/// Construct the vendor adapter that serves one [`ForgeConnection`] — the
-/// **connection-scoped** counterpart to routing a call by its repo.
-///
-/// Repo-routed resolution (`repo → registry → connection → adapter`) cannot
-/// answer a connection-scoped question, and the questions onboarding asks are
-/// exactly those: *which repos does this credential reach* and *register a
-/// webhook on this repo* both apply to a connection with **nothing bound yet** —
-/// there is no repo to route through until binding has already happened.
-///
-/// The implementation is composition-root glue (it knows every adapter crate and
-/// where credentials live), so only its shape lives in this pure crate.
-#[async_trait]
-pub trait ForgeAdapters: Send + Sync {
-    async fn adapter_for_connection(
-        &self,
-        conn: &ForgeConnection,
-    ) -> Result<std::sync::Arc<dyn ForgePort>, ForgeError>;
-}
-
 /// The result of resolving a [`RepoRef`] through the registry: which
 /// connection (forge, base URL, credential handle) serves it, and which
 /// governed Project owns it (ADR-0046: `ForgeConnection` resolves
@@ -785,6 +766,35 @@ pub trait ForgeConnectionStore: Send + Sync {
     /// webhook is broken"; the UI must render it as unknown, not as a fault.
     async fn last_delivery_at(&self, _forge: ForgeKind) -> Result<Option<i64>, RegistryError> {
         Ok(None)
+    }
+
+    /// Record which source **owns** a connection (ADR-0060 part D): `true` = it
+    /// was provisioned from the server's declarative `connections:` config,
+    /// `false` = it belongs to the DB (created through the API/UI, or by the
+    /// GitHub installation webhook).
+    ///
+    /// Ownership is persisted rather than inferred because it is the only way a
+    /// later boot can tell "the row *I* provisioned last time" from "a row a
+    /// human created" — the distinction the single-owner rule rests on.
+    ///
+    /// Defaults to a no-op, which is what a store that tracks no ownership can
+    /// honestly do: it then reports every connection as DB-owned.
+    async fn set_connection_owned_by_config(
+        &self,
+        _id: &str,
+        _owned: bool,
+    ) -> Result<(), RegistryError> {
+        Ok(())
+    }
+
+    /// The ids of connections currently owned by configuration (ADR-0060 part D)
+    /// — the set the API renders read-only ("managed by configuration") and the
+    /// set boot provisioning is allowed to overwrite.
+    ///
+    /// Defaults to empty: a store that keeps no ownership says "none are
+    /// config-owned", so everything stays editable rather than silently frozen.
+    async fn config_owned_connection_ids(&self) -> Result<Vec<String>, RegistryError> {
+        Ok(Vec::new())
     }
 }
 

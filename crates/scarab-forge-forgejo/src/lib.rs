@@ -201,54 +201,6 @@ fn string_at(payload: &Value, key: &str) -> Result<String, ForgeError> {
         .ok_or_else(|| ForgeError::Malformed(key.to_string()))
 }
 
-/// The `POST /repos/{owner}/{name}/hooks` body — pure, so the one thing that
-/// must not be forgotten is assertable without a Forgejo instance: the **secret**
-/// in the hook config. Absent it, Forgejo sends unsigned deliveries and
-/// `/webhooks/forgejo` rejects every one with 401 (ADR-0046: each forge endpoint
-/// binds its own verification secret).
-fn hook_create_body(callback_url: &str, secret: Option<&str>) -> Value {
-    let mut config = serde_json::json!({ "url": callback_url, "content_type": "json" });
-    if let Some(secret) = secret {
-        config["secret"] = serde_json::json!(secret);
-    }
-    serde_json::json!({
-        "type": "forgejo",
-        "active": true,
-        // The events `normalize` can turn into a canonical Event. Subscribing to
-        // more would mean deliveries we answer with `UnsupportedEvent`.
-        "events": ["push", "pull_request", "release", "issue_comment"],
-        "config": config,
-    })
-}
-
-/// One page of `/user/repos` as forge coordinates. Pure. Entries missing an owner
-/// or name are skipped rather than failing the page — one odd row must not hide
-/// every other repo from the pick-list.
-fn repos_from_page(body: &Value) -> Vec<RepoRef> {
-    body.as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    // The same `login`-or-`username` tolerance the webhook
-                    // payloads need — Forgejo is inconsistent about which it
-                    // sends, and a pick-list that silently drops org repos is
-                    // worse than no pick-list.
-                    let owner = item
-                        .pointer("/owner/login")
-                        .or_else(|| item.pointer("/owner/username"))
-                        .and_then(Value::as_str)?;
-                    let name = item.get("name").and_then(Value::as_str)?;
-                    Some(RepoRef {
-                        owner: owner.to_string(),
-                        name: name.to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -272,11 +224,6 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 /// not expire; consumers treat the credential as short-lived regardless).
 const CHECKOUT_CRED_TTL_SECS: i64 = 55 * 60;
 
-/// The page size the adapter requests when walking a paginated collection.
-/// Forgejo's default cap is 50; asking for more is silently clamped, so a short
-/// page is the reliable end-of-collection signal.
-const PAGE: usize = 50;
-
 /// A Forgejo/Codeberg-backed [`ForgePort`] over real HTTP.
 pub struct ForgejoForge {
     client: reqwest::Client,
@@ -284,10 +231,6 @@ pub struct ForgejoForge {
     base_url: String,
     /// Bot access token (or a short OAuth2 access token).
     token: String,
-    /// The HMAC secret stamped onto hooks this adapter creates, so their
-    /// deliveries arrive **signed**. `None` creates unsigned hooks — see
-    /// [`with_webhook_secret`](ForgejoForge::with_webhook_secret).
-    webhook_secret: Option<String>,
 }
 
 impl ForgejoForge {
@@ -298,20 +241,7 @@ impl ForgejoForge {
             client: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
-            webhook_secret: None,
         }
-    }
-
-    /// Set the secret Forgejo signs this connection's deliveries with.
-    ///
-    /// Load-bearing for registration, not an option: `/webhooks/forgejo` verifies
-    /// every delivery against the server's configured secret and rejects an
-    /// unsigned one with 401. A hook created without the matching secret is a hook
-    /// whose every delivery is silently refused — registration would "succeed"
-    /// and no push would ever start a run.
-    pub fn with_webhook_secret(mut self, secret: impl Into<String>) -> Self {
-        self.webhook_secret = Some(secret.into());
-        self
     }
 
     fn url(&self, path: &str) -> String {
@@ -463,6 +393,7 @@ impl ForgePort for ForgejoForge {
         // Forgejo has no name-search param and paginates at `limit=50`; page each
         // collection until a short page. Branch tips live at `commit.id`, tag
         // tips at `commit.sha` — accept either. Filter by `query` after fetch.
+        const PAGE: usize = 50;
         let mut refs = Vec::new();
         for (kind, coll) in [(RefKind::Branch, "branches"), (RefKind::Tag, "tags")] {
             let mut page = 1;
@@ -501,10 +432,6 @@ impl ForgePort for ForgejoForge {
     /// REAL webhook registration (ADR-0046): Forgejo has no single-app
     /// webhook, so each repo gets one. Idempotent — an existing hook with the
     /// same callback URL is left as-is.
-    ///
-    /// The hook carries the connection's `webhook_secret` in its config, which is
-    /// what makes its deliveries verifiable at `/webhooks/forgejo`; without it the
-    /// server answers every delivery with 401.
     async fn register_webhook(&self, repo: &RepoRef, callback_url: &str) -> Result<(), ForgeError> {
         let hooks_url = self.url(&format!("/repos/{}/{}/hooks", repo.owner, repo.name));
         let resp = self.send(|| self.client.get(&hooks_url)).await?;
@@ -519,36 +446,16 @@ impl ForgePort for ForgejoForge {
         if exists {
             return Ok(());
         }
-        let body = hook_create_body(callback_url, self.webhook_secret.as_deref());
+        let body = serde_json::json!({
+            "type": "forgejo",
+            "active": true,
+            "events": ["push", "pull_request", "release", "issue_comment"],
+            "config": { "url": callback_url, "content_type": "json" },
+        });
         let resp = self
             .send(|| self.client.post(&hooks_url).json(&body))
             .await?;
         ok_json(resp).await.map(|_| ())
-    }
-
-    /// Every repo the configured token can reach, via `/user/repos` — the
-    /// token-holder's own repos plus those its org memberships and collaborations
-    /// grant. Paginated to the end.
-    ///
-    /// This is the Forgejo half of the capability GitHub already had (ADR-0060):
-    /// it is what lets the bind UI offer a **pick-list** instead of asking an
-    /// admin to type `owner/name` correctly, and what makes re-sync mean something
-    /// on a Forgejo connection.
-    async fn list_accessible_repos(&self) -> Result<Vec<RepoRef>, ForgeError> {
-        let mut out = Vec::new();
-        let mut page = 1;
-        loop {
-            let url = self.url(&format!("/user/repos?page={page}&limit={PAGE}"));
-            let resp = self.send(|| self.client.get(&url)).await?;
-            let body = ok_json(resp).await?;
-            let n = body.as_array().map(Vec::len).unwrap_or(0);
-            out.extend(repos_from_page(&body));
-            if n < PAGE {
-                break;
-            }
-            page += 1;
-        }
-        Ok(out)
     }
 
     async fn normalize_event(&self, raw: WebhookDelivery) -> Result<Event, ForgeError> {
@@ -745,67 +652,6 @@ mod tests {
             normalize(&delivery("fork", json!({}))),
             Err(ForgeError::UnsupportedEvent(e)) if e == "fork"
         ));
-    }
-
-    #[test]
-    fn a_registered_hook_carries_the_verification_secret() {
-        // The whole point of registration is a delivery the server ACCEPTS. Ours
-        // are HMAC-verified, so a hook without the secret is a hook whose every
-        // delivery 401s — registration would look successful and no push would
-        // ever start a run.
-        let body = hook_create_body("https://scarab.example/webhooks/forgejo", Some("s3cret"));
-        assert_eq!(body["config"]["secret"], "s3cret");
-        assert_eq!(
-            body["config"]["url"],
-            "https://scarab.example/webhooks/forgejo"
-        );
-        assert_eq!(body["config"]["content_type"], "json", "JSON, not form");
-        assert_eq!(body["active"], true);
-        // Exactly the events `normalize` can map; anything else would be a
-        // delivery we answer with UnsupportedEvent.
-        let events: Vec<&str> = body["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|e| e.as_str().unwrap())
-            .collect();
-        assert_eq!(
-            events,
-            vec!["push", "pull_request", "release", "issue_comment"]
-        );
-
-        // With no secret configured the key is absent rather than empty — an
-        // empty-string secret would make Forgejo sign with "" and the mismatch
-        // would read as tampering instead of misconfiguration.
-        let unsigned = hook_create_body("https://scarab.example/webhooks/forgejo", None);
-        assert!(unsigned["config"].get("secret").is_none());
-    }
-
-    #[test]
-    fn accessible_repos_accept_either_owner_spelling_and_skip_junk() {
-        // Forgejo is inconsistent about `login` vs `username`; a pick-list that
-        // dropped every org repo because of that would be worse than none.
-        let page = json!([
-            { "name": "web", "owner": { "login": "acme" } },
-            { "name": "api", "owner": { "username": "acme" } },
-            { "name": "orphan" },
-            { "owner": { "login": "acme" } },
-        ]);
-        assert_eq!(
-            repos_from_page(&page),
-            vec![
-                RepoRef {
-                    owner: "acme".into(),
-                    name: "web".into()
-                },
-                RepoRef {
-                    owner: "acme".into(),
-                    name: "api".into()
-                },
-            ]
-        );
-        // A non-array body (an error object) yields nothing, not a panic.
-        assert!(repos_from_page(&json!({ "message": "unauthorized" })).is_empty());
     }
 
     #[test]

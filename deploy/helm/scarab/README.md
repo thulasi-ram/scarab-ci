@@ -78,6 +78,41 @@ durable state, registered by the App's `installation` /
 `installation_repositories` webhook deliveries (or `deploy/local-helm/reseed.sh`
 for a local loop) — a fresh database still needs one delivery.
 
+## Declarative connections (`scarab.connections`, ADR-0060 part D)
+
+A forge connection can be **declared in config** instead of created through the
+UI. Config-declared connections are provisioned at boot, are **authoritative**,
+and are read-only in the UI ("managed by configuration"). This is the only way to
+onboard a Forgejo host — and its repos as Projects — without any API call.
+
+```sh
+kubectl -n scarab create secret generic scarab-forgejo \
+  --from-literal=FORGEJO_CI_TOKEN=<token>
+
+helm upgrade --install scarab deploy/helm/scarab -n scarab \
+  --set secrets.existingSecret=scarab-forgejo \
+  --set-json 'scarab.connections=[{"id":"forgejo-main","kind":"forgejo","base_url":"https://git.example.com","credential":{"env":"FORGEJO_CI_TOKEN"},"repos":["acme/widgets"]}]'
+```
+
+The block is rendered verbatim into a mounted ConfigMap and
+`SCARAB_CONNECTIONS_FILE` points at it, so the keys are the **server's** schema
+(`base_url`, `secret_ref` — snake_case, not the chart's camelCase). An unknown key
+fails the boot loudly rather than being ignored (ADR-0048).
+
+**One owner, never two.** A connection is owned by the config *or* by the
+database — declaring an id the database already owns (e.g. one a GitHub
+`installation` delivery created) **refuses the boot** and says so, rather than
+letting the two drift apart with no authority to break the tie. Removing an entry
+*releases* ownership back to the UI; it never deletes the connection, because
+Projects — and their Environments, secrets and RBAC — hang off its repo bindings.
+
+**Credentials resolve by one path: env override, then Scarab's secret store.**
+`credential: {env: VAR}` / `{file: PATH}` supply the material from the deployment
+(missing or empty ⇒ boot failure); `credential: {secret_ref: HANDLE}` resolves the
+`_forge`-scoped handle at use-time (unregistered ⇒ reported DEGRADED, since only
+the running server can store it). `SCARAB_GITHUB_APP_PEM[_FILE]` above is the same
+mechanism, applied kind-wide to GitHub App-mode connections.
+
 ## Key values
 
 | Key | Default | Notes |
@@ -89,6 +124,7 @@ for a local loop) — a fresh database still needs one delivery.
 | `scarab.s3.*` | — | object store; set `bucket` to enable S3/MinIO |
 | `secrets.*` / `secrets.existingSecret` | — | sensitive `SCARAB_*` env |
 | `secrets.githubAppPemSecret.name` / `.key` | — / `github-app.pem` | mount the App PEM from your own Secret (above) |
+| `scarab.connections` | `[]` | declarative, config-owned forge connections (above) |
 | `rbac.create` | `true` | Role/RoleBinding for Pod execution |
 | `ingress.enabled` | `false` | expose the HTTP API |
 

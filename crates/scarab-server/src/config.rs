@@ -44,6 +44,8 @@
 //! | `SCARAB_RETENTION_ARTIFACT_DAYS` | env | terminal runs' artifact TTL in days (ADR-0052); default 90 |
 //! | `SCARAB_RETENTION_WORKSPACE_DAYS` | env | terminal runs' workspace-CAS reachability TTL in days (ADR-0050 mark-sweep); default 14 — non-terminal runs always reachable |
 //! | `SCARAB_OAUTH_OWNERS` | env | comma-separated subjects granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer` |
+//! | `SCARAB_CONNECTIONS` | env | the declarative `connections:` block inline (YAML/JSON, ADR-0060 part D): config-owned forge connections, provisioned at boot and read-only in the UI. Wins over `_FILE` |
+//! | `SCARAB_CONNECTIONS_FILE` | env | path to a file holding the same `connections:` block (the GitOps shape: a ConfigMap mount). A bad path/parse/validation is a boot failure |
 //!
 //! Step-runtime env (`SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`/
 //! `SCARAB_RESULTS*`/`SCARAB_PARAM_*`) is injected *into* step containers by
@@ -52,6 +54,7 @@
 
 use base64::Engine;
 use clap::{Parser, ValueEnum};
+use serde::Deserialize;
 
 /// Which slice(s) of Scarab this process should run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -184,6 +187,107 @@ pub struct OidcConfig {
     pub audience: String,
 }
 
+/// A string whose value must never reach a log line. `Debug` prints `***`, so
+/// putting one inside a `#[derive(Debug)]` struct (like [`Config`]) cannot leak
+/// it into the startup report, a panic message, or a `tracing` field.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Redacted(String);
+
+impl Redacted {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The material itself. Named so every read site is grep-able.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+/// One declaratively-provisioned forge connection (ADR-0060 part D): the
+/// `connections:` block is **authoritative** for the connections it declares,
+/// which are therefore read-only in the UI.
+///
+/// A spec is fully resolved: `credential.env` / `credential.file` material is
+/// read and checked at boot, so if a `ConnectionSpec` exists its credential is
+/// either present in hand or is a `SecretProvider` handle to look up at use-time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionSpec {
+    /// Stable identity — the `forge_connections` primary key. Changing it in
+    /// config provisions a *new* connection; it is not a rename.
+    pub id: String,
+    pub kind: scarab_forge::ForgeKind,
+    /// The API base URL the adapter talks to.
+    pub base_url: String,
+    /// The `_forge`-scoped handle recorded on the connection row. For an
+    /// env/file credential there is nothing to look up, so the id doubles as
+    /// the handle — the readout then names the *config* as the source.
+    pub credential_ref: String,
+    /// Deployment-supplied credential material (`credential.env` /
+    /// `credential.file`) — the **override** half of the one resolution path
+    /// (ADR-0060 part D), generalizing `SCARAB_GITHUB_APP_PEM[_FILE]` from "just
+    /// the PEM" to any connection. `None` = resolve `credential_ref` from
+    /// `SecretProvider` instead.
+    pub credential_material: Option<Redacted>,
+    /// Where the credential comes from, for the startup report: `env VAR`,
+    /// `file PATH`, or `secret VAR`. Never the value.
+    pub credential_source: String,
+    /// Repos this connection owns — each binding *is* a Project (ADR-0046), so
+    /// declaring repos here is the declarative Project-onboarding path.
+    pub repos: Vec<scarab_forge::RepoRef>,
+}
+
+/// The `connections:` document, as written in `SCARAB_CONNECTIONS` /
+/// `SCARAB_CONNECTIONS_FILE` (or a Helm `scarab.connections` value, which is
+/// passed through verbatim).
+///
+/// `deny_unknown_fields` throughout: a typo in a declarative block that is
+/// silently ignored is exactly the "silent facade" ADR-0048 refuses. A misspelled
+/// key fails the boot with the field name in the message.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConnectionsDoc {
+    #[serde(default)]
+    connections: Vec<RawConnection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConnection {
+    id: String,
+    kind: String,
+    base_url: String,
+    credential: RawCredential,
+    /// `owner/name` coordinates to bind. Org = owner, Project = name — the same
+    /// 1:1 mapping the installation webhook and re-sync use, so a config-bound
+    /// Project is indistinguishable from a webhook-registered one.
+    #[serde(default)]
+    repos: Vec<String>,
+}
+
+/// Exactly one of the three sources. Two would make "which one wins?" a config
+/// question, which is the ambiguity part D exists to remove.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCredential {
+    /// Name of an env var holding the material (an override).
+    #[serde(default)]
+    env: Option<String>,
+    /// Path to a mounted file holding the material (an override).
+    #[serde(default)]
+    file: Option<String>,
+    /// A `SecretProvider` handle under the `_forge` org — no override; the
+    /// material is fetched at use-time as it is for a DB-owned connection.
+    #[serde(default)]
+    secret_ref: Option<String>,
+}
+
 /// A validated boot configuration: if a `Config` exists, the process may
 /// legitimately start. Construction is the startup gate (ADR-0048).
 #[derive(Debug, Clone)]
@@ -248,6 +352,11 @@ pub struct Config {
     /// (ADR-0050 mark-sweep; default 14). Non-terminal runs are always
     /// reachable regardless of age.
     pub retention_workspace_days: u32,
+    /// Config-owned forge connections (ADR-0060 part D), parsed and fully
+    /// resolved at boot from `SCARAB_CONNECTIONS[_FILE]`. Empty = every
+    /// connection is DB-owned (the pre-0060 world). Each of these is
+    /// authoritative over its DB row and read-only in the UI.
+    pub connections: Vec<ConnectionSpec>,
 }
 
 /// The forge-agnostic OAuth/OIDC login provider (ADR-0049): explicit
@@ -340,6 +449,14 @@ pub enum ConfigError {
          of seconds (the global default step deadline, ADR-0047)."
     )]
     InvalidStepTimeout,
+
+    #[error(
+        "the declarative `connections:` block is invalid (ADR-0060 part D): {0}\n\
+         A connection Scarab cannot construct would fail at first webhook, not at boot \
+         (ADR-0048), so this refuses to start. Fix SCARAB_CONNECTIONS[_FILE] \
+         (Helm: scarab.connections) and redeploy."
+    )]
+    InvalidConnections(String),
 }
 
 impl Config {
@@ -469,6 +586,11 @@ impl Config {
             None => 3_600,
         };
 
+        // Declarative connections (ADR-0060 part D). Parsed, validated AND
+        // credential-resolved here: the whole point of the block is that a boot
+        // either has working config-owned connections or refuses.
+        let connections = connections_from_env(&env)?;
+
         let results_egress = env("SCARAB_RESULTS_TOKEN_SECRET").map(|secret| ResultsEgressConfig {
             token_secret: secret.into_bytes(),
             api_url: env("SCARAB_RESULTS_API_URL").unwrap_or_else(|| "http://scarab-server".into()),
@@ -531,6 +653,7 @@ impl Config {
                     .ok_or(ConfigError::InvalidRetention)?,
                 None => 14,
             },
+            connections,
         })
     }
 
@@ -646,7 +769,215 @@ impl Config {
                 None => "oidc issuer: disabled".to_string(),
             },
         ]
+        .into_iter()
+        // Declarative connections (ADR-0060 part D): the report names each one
+        // and where its credential comes from — never the material — so
+        // "which connections does config own?" is answerable from line one.
+        .chain(std::iter::once(format!(
+            "config-owned connections: {} (ADR-0060 part D; authoritative, read-only in the UI)",
+            if self.connections.is_empty() {
+                "none".to_string()
+            } else {
+                self.connections.len().to_string()
+            },
+        )))
+        .chain(self.connections.iter().map(|c| {
+            format!(
+                "  connection {}: {} {} (credential: {}) → {} repo(s)",
+                c.id,
+                c.kind.as_str(),
+                c.base_url,
+                c.credential_source,
+                c.repos.len(),
+            )
+        }))
+        .collect()
     }
+}
+
+/// Read, parse, validate and credential-resolve the declarative `connections:`
+/// block (ADR-0060 part D).
+///
+/// Inline `SCARAB_CONNECTIONS` wins over `SCARAB_CONNECTIONS_FILE`, mirroring
+/// `SCARAB_GITHUB_APP_PEM` vs `..._FILE` — the precedent this generalizes.
+/// Every failure mode is a boot refusal (ADR-0048): an unreadable file, a parse
+/// error, an unknown field, an invalid entry, or credential material the
+/// deployment promised (`env:`/`file:`) but did not deliver.
+///
+/// Public with an injectable environment so the block can be exercised end-to-end
+/// (YAML → specs → registry → API) without mutating the process environment.
+pub fn connections_from_env(
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Vec<ConnectionSpec>, ConfigError> {
+    let (raw, source) = match env("SCARAB_CONNECTIONS").filter(|v| !v.trim().is_empty()) {
+        Some(inline) => (inline, "SCARAB_CONNECTIONS".to_string()),
+        None => match env("SCARAB_CONNECTIONS_FILE").filter(|v| !v.is_empty()) {
+            Some(path) => {
+                let raw = std::fs::read_to_string(&path).map_err(|e| {
+                    ConfigError::InvalidConnections(format!(
+                        "cannot read SCARAB_CONNECTIONS_FILE {path}: {e}"
+                    ))
+                })?;
+                (raw, format!("SCARAB_CONNECTIONS_FILE {path}"))
+            }
+            None => return Ok(Vec::new()),
+        },
+    };
+
+    // YAML is a superset of JSON, so one parser accepts both shapes.
+    let doc: RawConnectionsDoc = serde_yaml::from_str(&raw)
+        .map_err(|e| ConfigError::InvalidConnections(format!("{source}: {e}")))?;
+
+    let mut out: Vec<ConnectionSpec> = Vec::with_capacity(doc.connections.len());
+    for raw_conn in doc.connections {
+        let spec = resolve_connection(raw_conn, env)
+            .map_err(|e| ConfigError::InvalidConnections(format!("{source}: {e}")))?;
+        // Duplicate ids would race each other into the same row on every boot,
+        // with the last one silently winning.
+        if out.iter().any(|s| s.id == spec.id) {
+            return Err(ConfigError::InvalidConnections(format!(
+                "{source}: connection id `{}` is declared twice",
+                spec.id
+            )));
+        }
+        out.push(spec);
+    }
+    Ok(out)
+}
+
+/// Validate one raw entry into a fully-resolved [`ConnectionSpec`]. Errors are
+/// plain messages; the caller prefixes the source.
+fn resolve_connection(
+    raw: RawConnection,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<ConnectionSpec, String> {
+    let id = raw.id.trim().to_string();
+    if id.is_empty() {
+        return Err("a connection needs a non-empty `id`".into());
+    }
+    // The id is a durable primary key that also appears in URLs and log fields.
+    if id.chars().any(|c| c.is_whitespace()) {
+        return Err(format!("connection id `{id}` must not contain whitespace"));
+    }
+    let kind = scarab_forge::ForgeKind::from_str_token(raw.kind.trim()).ok_or_else(|| {
+        format!(
+            "connection `{id}`: unknown kind `{}` — want `github` or `forgejo` \
+             (a kind selects the adapter crate, ADR-0046)",
+            raw.kind
+        )
+    })?;
+    let base_url = raw.base_url.trim().trim_end_matches('/').to_string();
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Err(format!(
+            "connection `{id}`: base_url `{base_url}` must be an absolute http(s) URL"
+        ));
+    }
+
+    // Exactly one credential source. Zero means the connection can never
+    // authenticate; more than one reintroduces a precedence question.
+    let declared: Vec<&str> = [
+        raw.credential.env.as_ref().map(|_| "env"),
+        raw.credential.file.as_ref().map(|_| "file"),
+        raw.credential.secret_ref.as_ref().map(|_| "secret_ref"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if declared.len() != 1 {
+        return Err(format!(
+            "connection `{id}`: credential must declare exactly one of \
+             `env` / `file` / `secret_ref` (found {})",
+            if declared.is_empty() {
+                "none".to_string()
+            } else {
+                declared.join(" + ")
+            }
+        ));
+    }
+
+    let (credential_ref, credential_material, credential_source) = match (
+        raw.credential.env,
+        raw.credential.file,
+        raw.credential.secret_ref,
+    ) {
+        // env-override: the deployment supplies the material directly. An empty
+        // or absent var is a broken promise, so it refuses the boot rather than
+        // authenticating with "" at first use.
+        (Some(var), _, _) => {
+            let var = var.trim().to_string();
+            let material = env(&var).filter(|v| !v.trim().is_empty()).ok_or_else(|| {
+                format!(
+                    "connection `{id}`: credential env var `{var}` is not set (or empty). \
+                     The config promises this connection's credential comes from the \
+                     environment; booting without it would fail at the first webhook."
+                )
+            })?;
+            (
+                id.clone(),
+                Some(Redacted::new(material)),
+                format!("env {var}"),
+            )
+        }
+        // file-override: same contract, mounted-file shape (external-secrets /
+        // sealed-secrets / SOPS), mirroring SCARAB_GITHUB_APP_PEM_FILE.
+        (None, Some(path), _) => {
+            let path = path.trim().to_string();
+            let material = std::fs::read_to_string(&path).map_err(|e| {
+                format!("connection `{id}`: cannot read credential file {path}: {e}")
+            })?;
+            if material.trim().is_empty() {
+                return Err(format!(
+                    "connection `{id}`: credential file {path} is empty"
+                ));
+            }
+            (
+                id.clone(),
+                Some(Redacted::new(material)),
+                format!("file {path}"),
+            )
+        }
+        // No override: a `SecretProvider` handle, resolved at use-time exactly
+        // as a DB-owned connection's is. Deliberately NOT a boot failure when
+        // absent — the running server is the only way to PUT it, so refusing
+        // here would deadlock a fresh database. The startup audit reports it
+        // DEGRADED instead.
+        (None, None, Some(secret_ref)) => {
+            let secret_ref = secret_ref.trim().to_string();
+            if secret_ref.is_empty() {
+                return Err(format!("connection `{id}`: credential secret_ref is empty"));
+            }
+            let source = format!("secret {secret_ref}");
+            (secret_ref, None, source)
+        }
+        (None, None, None) => unreachable!("guarded by the exactly-one check above"),
+    };
+
+    let mut repos = Vec::with_capacity(raw.repos.len());
+    for entry in &raw.repos {
+        let entry = entry.trim();
+        let (owner, name) = entry.split_once('/').ok_or_else(|| {
+            format!("connection `{id}`: repo `{entry}` must be written `owner/name`")
+        })?;
+        if owner.is_empty() || name.is_empty() || name.contains('/') {
+            return Err(format!(
+                "connection `{id}`: repo `{entry}` must be written `owner/name`"
+            ));
+        }
+        repos.push(scarab_forge::RepoRef {
+            owner: owner.to_string(),
+            name: name.to_string(),
+        });
+    }
+
+    Ok(ConnectionSpec {
+        id,
+        kind,
+        base_url,
+        credential_ref,
+        credential_material,
+        credential_source,
+        repos,
+    })
 }
 
 /// Redact the password in a connection URL for logging
@@ -884,6 +1215,388 @@ mod tests {
         // The insecure posture is visible in the report, not hidden.
         assert!(report.contains("auth: DISABLED"), "{report}");
         assert!(report.contains("KEK EPHEMERAL"), "{report}");
+    }
+
+    // --- declarative connections (ADR-0060 part D) --------------------------
+    //
+    // The block is the IaC half of "a connection has exactly one owner", so its
+    // parsing is a *gate*, not a convenience: every one of these cases would
+    // otherwise surface as a connection that silently cannot authenticate.
+
+    const FORGEJO_BLOCK: &str = r#"
+connections:
+  - id: forgejo-main
+    kind: forgejo
+    base_url: https://git.example.com/
+    credential:
+      env: FORGEJO_CI_TOKEN
+    repos:
+      - acme/widgets
+      - acme/gadgets
+"#;
+
+    #[test]
+    fn no_connections_declared_by_default() {
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(&[])).unwrap();
+        assert!(cfg.connections.is_empty());
+    }
+
+    #[test]
+    fn config_declared_connection_resolves_its_credential_from_an_env_var() {
+        let cfg = Config::resolve_from(
+            &cli(Some("postgres://l/scarab")),
+            dev_env(&[
+                ("SCARAB_CONNECTIONS", FORGEJO_BLOCK),
+                ("FORGEJO_CI_TOKEN", "tok-abc123"),
+            ]),
+        )
+        .unwrap();
+        let conn = &cfg.connections[0];
+        assert_eq!(conn.id, "forgejo-main");
+        assert_eq!(conn.kind, scarab_forge::ForgeKind::Forgejo);
+        // The trailing slash is normalized away — the adapter joins paths onto it.
+        assert_eq!(conn.base_url, "https://git.example.com");
+        // The material is in hand: no SecretProvider round-trip will be needed.
+        assert_eq!(
+            conn.credential_material.as_ref().map(Redacted::expose),
+            Some("tok-abc123")
+        );
+        assert_eq!(conn.credential_source, "env FORGEJO_CI_TOKEN");
+        assert_eq!(
+            conn.repos,
+            vec![
+                scarab_forge::RepoRef {
+                    owner: "acme".into(),
+                    name: "widgets".into()
+                },
+                scarab_forge::RepoRef {
+                    owner: "acme".into(),
+                    name: "gadgets".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn credential_material_never_appears_in_debug_or_the_startup_report() {
+        let cfg = Config::resolve_from(
+            &cli(Some("postgres://l/scarab")),
+            dev_env(&[
+                ("SCARAB_CONNECTIONS", FORGEJO_BLOCK),
+                ("FORGEJO_CI_TOKEN", "tok-abc123"),
+            ]),
+        )
+        .unwrap();
+        // `Config` is Debug and gets logged/panicked with; the token must not
+        // ride along.
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("tok-abc123"), "{debug}");
+        let report = cfg.startup_report().join("\n");
+        assert!(!report.contains("tok-abc123"), "{report}");
+        // What the operator DOES get: which connections config owns, and where
+        // each credential comes from.
+        assert!(report.contains("config-owned connections: 1"), "{report}");
+        assert!(
+            report.contains("connection forgejo-main: forgejo https://git.example.com"),
+            "{report}"
+        );
+        assert!(
+            report.contains("credential: env FORGEJO_CI_TOKEN"),
+            "{report}"
+        );
+        assert!(report.contains("2 repo(s)"), "{report}");
+    }
+
+    #[test]
+    fn a_promised_credential_env_var_that_is_unset_refuses_to_boot() {
+        // The whole value of the declarative path is that a deploy either has
+        // working connections or does not come up (ADR-0048). Booting with an
+        // empty token would fail at the first webhook instead.
+        let err = Config::resolve_from(
+            &cli(Some("postgres://l/scarab")),
+            dev_env(&[("SCARAB_CONNECTIONS", FORGEJO_BLOCK)]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::InvalidConnections(_)), "{msg}");
+        assert!(msg.contains("FORGEJO_CI_TOKEN"), "{msg}");
+        assert!(msg.contains("forgejo-main"), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_credential_env_var_is_treated_as_unset() {
+        let err = Config::resolve_from(
+            &cli(Some("postgres://l/scarab")),
+            dev_env(&[
+                ("SCARAB_CONNECTIONS", FORGEJO_BLOCK),
+                ("FORGEJO_CI_TOKEN", "   "),
+            ]),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidConnections(_)), "{err}");
+    }
+
+    #[test]
+    fn a_secret_ref_credential_carries_no_override_material() {
+        // The other half of the one resolution path: no override, so the handle
+        // is resolved from SecretProvider at use-time exactly as a DB-owned
+        // connection's is. Absence there is DEGRADED, not a boot refusal — only
+        // the running server can PUT it.
+        let cfg = Config::resolve_from(
+            &cli(Some("postgres://l/scarab")),
+            dev_env(&[(
+                "SCARAB_CONNECTIONS",
+                r#"
+connections:
+  - id: forgejo-main
+    kind: forgejo
+    base_url: https://git.example.com
+    credential:
+      secret_ref: forgejo-token
+"#,
+            )]),
+        )
+        .unwrap();
+        let conn = &cfg.connections[0];
+        assert!(conn.credential_material.is_none());
+        assert_eq!(conn.credential_ref, "forgejo-token");
+        assert_eq!(conn.credential_source, "secret forgejo-token");
+    }
+
+    #[test]
+    fn a_connection_needs_exactly_one_credential_source() {
+        for (block, expect) in [
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    base_url: https://git.example.com
+    credential: {}
+"#,
+                "none",
+            ),
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    base_url: https://git.example.com
+    credential:
+      env: A
+      secret_ref: b
+"#,
+                "env + secret_ref",
+            ),
+        ] {
+            let env = move |k: &str| match k {
+                "SCARAB_DEV_INSECURE" => Some("1".to_string()),
+                "SCARAB_CONNECTIONS" => Some(block.to_string()),
+                _ => None,
+            };
+            let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, ConfigError::InvalidConnections(_)), "{msg}");
+            assert!(msg.contains(expect), "{msg}");
+        }
+    }
+
+    #[test]
+    fn invalid_entries_refuse_to_boot_with_the_offending_value_named() {
+        // Each case is a misconfiguration that would otherwise become a
+        // connection that cannot work, or (for the typo) be silently ignored.
+        let cases: [(&str, &str); 4] = [
+            (
+                r#"
+connections:
+  - id: c
+    kind: gitlob
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "gitlob",
+            ),
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    base_url: git.example.com
+    credential: { secret_ref: t }
+"#,
+                "absolute http(s) URL",
+            ),
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    base_url: https://git.example.com
+    credential: { secret_ref: t }
+    repos: [ widgets ]
+"#,
+                "owner/name",
+            ),
+            (
+                r#"
+connections:
+  - id: c
+    kind: forgejo
+    base_urls: https://git.example.com
+    credential: { secret_ref: t }
+"#,
+                "base_urls",
+            ),
+        ];
+        for (block, expect) in cases {
+            let env = move |k: &str| match k {
+                "SCARAB_DEV_INSECURE" => Some("1".to_string()),
+                "SCARAB_CONNECTIONS" => Some(block.to_string()),
+                _ => None,
+            };
+            let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, ConfigError::InvalidConnections(_)), "{msg}");
+            assert!(msg.contains(expect), "want {expect:?} in: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_duplicate_connection_id_refuses_to_boot() {
+        // Two entries with one id would race into the same row every boot, last
+        // one silently winning — the drift the single-owner rule forbids.
+        let err = Config::resolve_from(
+            &cli(Some("postgres://l/scarab")),
+            dev_env(&[(
+                "SCARAB_CONNECTIONS",
+                r#"
+connections:
+  - id: dup
+    kind: forgejo
+    base_url: https://a.example.com
+    credential: { secret_ref: t }
+  - id: dup
+    kind: forgejo
+    base_url: https://b.example.com
+    credential: { secret_ref: t }
+"#,
+            )]),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("declared twice"), "{msg}");
+    }
+
+    #[test]
+    fn the_block_can_come_from_a_file_and_inline_wins_over_it() {
+        let dir = std::env::temp_dir().join(format!("scarab-conn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("connections.yaml");
+        std::fs::write(
+            &path,
+            r#"
+connections:
+  - id: from-file
+    kind: forgejo
+    base_url: https://file.example.com
+    credential: { secret_ref: t }
+"#,
+        )
+        .unwrap();
+        let path_s = path.to_string_lossy().to_string();
+
+        // File only: parsed (the GitOps shape — a mounted ConfigMap).
+        let p = path_s.clone();
+        let env = move |k: &str| match k {
+            "SCARAB_DEV_INSECURE" => Some("1".to_string()),
+            "SCARAB_CONNECTIONS_FILE" => Some(p.clone()),
+            _ => None,
+        };
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
+        assert_eq!(cfg.connections[0].id, "from-file");
+
+        // Inline wins, mirroring SCARAB_GITHUB_APP_PEM vs ..._FILE.
+        let p = path_s.clone();
+        let env = move |k: &str| match k {
+            "SCARAB_DEV_INSECURE" => Some("1".to_string()),
+            "SCARAB_CONNECTIONS_FILE" => Some(p.clone()),
+            "SCARAB_CONNECTIONS" => Some(
+                r#"
+connections:
+  - id: from-inline
+    kind: forgejo
+    base_url: https://inline.example.com
+    credential: { secret_ref: t }
+"#
+                .to_string(),
+            ),
+            _ => None,
+        };
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
+        assert_eq!(cfg.connections.len(), 1);
+        assert_eq!(cfg.connections[0].id, "from-inline");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_unreadable_connections_file_refuses_to_boot() {
+        // Mirrors SCARAB_GITHUB_APP_PEM_FILE / the OIDC signing key: a path that
+        // does not exist is a misconfiguration, not "no connections".
+        let env = dev_env(&[("SCARAB_CONNECTIONS_FILE", "/nope/connections.yaml")]);
+        let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, ConfigError::InvalidConnections(_)), "{msg}");
+        assert!(msg.contains("/nope/connections.yaml"), "{msg}");
+    }
+
+    #[test]
+    fn a_file_credential_is_read_at_boot_and_a_bad_path_refuses() {
+        let dir = std::env::temp_dir().join(format!("scarab-cred-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, "file-token\n").unwrap();
+        let block = format!(
+            r#"
+connections:
+  - id: forgejo-main
+    kind: forgejo
+    base_url: https://git.example.com
+    credential:
+      file: {}
+"#,
+            path.to_string_lossy()
+        );
+        let b = block.clone();
+        let env = move |k: &str| match k {
+            "SCARAB_DEV_INSECURE" => Some("1".to_string()),
+            "SCARAB_CONNECTIONS" => Some(b.clone()),
+            _ => None,
+        };
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
+        assert_eq!(
+            cfg.connections[0]
+                .credential_material
+                .as_ref()
+                .map(Redacted::expose),
+            Some("file-token\n")
+        );
+
+        let env = dev_env(&[(
+            "SCARAB_CONNECTIONS",
+            r#"
+connections:
+  - id: forgejo-main
+    kind: forgejo
+    base_url: https://git.example.com
+    credential:
+      file: /nope/token
+"#,
+        )]);
+        let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
+        assert!(err.to_string().contains("/nope/token"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -1988,6 +1988,34 @@ impl ForgeConnectionStore for PostgresDb {
             .map_err(reg_err)?;
         Ok(row.get::<Option<i64>, _>("at"))
     }
+
+    /// Single-owner marker (ADR-0060 part D). Ownership is a property of the row,
+    /// not of the connection identity, so it is set separately from
+    /// `put_connection` — boot provisioning upserts the connection and then
+    /// claims it, and *releasing* it (config stopped declaring it) is the same
+    /// call with `false`, which never touches the connection's own fields.
+    async fn set_connection_owned_by_config(
+        &self,
+        id: &str,
+        owned: bool,
+    ) -> Result<(), RegistryError> {
+        sqlx::query("UPDATE forge_connections SET owned_by_config = $2 WHERE id = $1")
+            .bind(id)
+            .bind(owned)
+            .execute(self.pool())
+            .await
+            .map_err(reg_err)?;
+        Ok(())
+    }
+
+    async fn config_owned_connection_ids(&self) -> Result<Vec<String>, RegistryError> {
+        let rows =
+            sqlx::query("SELECT id FROM forge_connections WHERE owned_by_config ORDER BY id")
+                .fetch_all(self.pool())
+                .await
+                .map_err(reg_err)?;
+        Ok(rows.into_iter().map(|r| r.get::<String, _>("id")).collect())
+    }
 }
 
 fn connection_from_row(r: sqlx::postgres::PgRow) -> Result<ForgeConnection, RegistryError> {

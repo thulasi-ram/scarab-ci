@@ -59,6 +59,26 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- printf "%s/%s" (include "scarab.githubAppPemDir" .) .Values.secrets.githubAppPemSecret.key -}}
 {{- end -}}
 
+{{/* Directory the declarative `connections:` block is projected into
+     (ADR-0060 part D). */}}
+{{- define "scarab.connectionsDir" -}}
+/etc/scarab/connections
+{{- end -}}
+
+{{/* Absolute path of the rendered connections block — the value of
+     SCARAB_CONNECTIONS_FILE and the file the ConfigMap is mounted as. One
+     definition so the ConfigMap, the env var and the mount cannot disagree. */}}
+{{- define "scarab.connectionsPath" -}}
+{{- printf "%s/connections.yaml" (include "scarab.connectionsDir" .) -}}
+{{- end -}}
+
+{{/* Name of the ConfigMap holding the declarative connections block. Separate
+     from the main ConfigMap because that one is consumed with `envFrom`, where a
+     key named `connections.yaml` is not a legal env var name. */}}
+{{- define "scarab.connectionsConfigMapName" -}}
+{{- printf "%s-connections" (include "scarab.fullname" .) -}}
+{{- end -}}
+
 {{/* Name of the Secret holding sensitive env (existing or chart-managed). */}}
 {{- define "scarab.secretName" -}}
 {{- if .Values.secrets.existingSecret -}}

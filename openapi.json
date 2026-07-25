@@ -191,302 +191,6 @@
             "description": "no connection registry wired"
           }
         }
-      },
-      "post": {
-        "tags": [
-          "Forge Connections"
-        ],
-        "summary": "Create a forge connection, writing its credential through to the secret store (ADR-0060)",
-        "description": "This is the manual/UI half of part D and the reason Forgejo can be onboarded\nat all: GitHub registers itself when the App is installed, but a Forgejo\ninstance has no such event, so without this endpoint its only route into the\nregistry was a hand-written database row.\n\nThe credential is **write-only** in the strong sense — it is written before\nthe connection row exists, never read back by any endpoint, and the response\ncarries only the generated handle. Order matters: writing the secret first\nmeans a failure leaves an orphan secret (harmless, overwritten on retry)\nrather than a connection whose credential never landed (a live row that\nsilently cannot authenticate).",
-        "operationId": "create_connection",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateConnectionRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CreatedConnectionDto"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "unknown kind, non-creatable kind, or a malformed base URL"
-          },
-          "403": {
-            "description": "requires Administer on the org"
-          },
-          "404": {
-            "description": "no connection registry or secret store wired"
-          },
-          "409": {
-            "description": "a connection to that forge and base URL already exists"
-          }
-        }
-      }
-    },
-    "/v1/connections/{id}": {
-      "delete": {
-        "tags": [
-          "Forge Connections"
-        ],
-        "summary": "Delete a forge connection and its unreferenced credential (ADR-0060)",
-        "description": "Two deliberate safeties:\n\n 1. **Bound repos block the delete** unless `unbind_repos=true`. A Project\n    *is* a repo binding (ADR-0046), so deleting a connection deletes\n    governance — the same reasoning that stops `resync` from ever unbinding.\n    A one-word query parameter is cheap; a silently deleted Environment is\n    not recoverable from the UI.\n 2. **A shared credential survives.** Every GitHub App installation points at\n    the one `github-app` handle, so deleting one installation must not pull\n    the material out from under the others. The secret is removed only when\n    no remaining connection references that handle.",
-        "operationId": "delete_connection",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "connection id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "unbind_repos",
-            "in": "query",
-            "description": "acknowledge that the connection's Projects go with it",
-            "required": false,
-            "schema": {
-              "type": "boolean"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "connection deleted"
-          },
-          "403": {
-            "description": "requires Administer on the org"
-          },
-          "404": {
-            "description": "no such connection, or no registry wired"
-          },
-          "409": {
-            "description": "the connection still has bound repos (Projects)"
-          }
-        }
-      }
-    },
-    "/v1/connections/{id}/available-repos": {
-      "get": {
-        "tags": [
-          "Forge Connections"
-        ],
-        "summary": "Repos this connection's credential can reach, for the bind pick-list (ADR-0060)",
-        "description": "The forge is the authority on what a connection covers, so this is a live\ncall, not a cached view. An adapter that cannot enumerate answers 501 rather\nthan an empty list: \"I cannot look\" and \"there is nothing there\" must not read\nthe same, or an admin concludes their token is scoped wrong.",
-        "operationId": "available_repos",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "connection id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/AvailableRepoDto"
-                  }
-                }
-              }
-            }
-          },
-          "403": {
-            "description": "requires Administer on the org"
-          },
-          "404": {
-            "description": "no such connection, or no registry/forge wired"
-          },
-          "501": {
-            "description": "this forge adapter cannot enumerate repos"
-          }
-        }
-      }
-    },
-    "/v1/connections/{id}/repos": {
-      "post": {
-        "tags": [
-          "Forge Connections"
-        ],
-        "summary": "Bind a repo to a connection, creating its Project, and register its webhook (ADR-0060)",
-        "description": "There is no `projects` table: a Project *is* a `forge_repos` binding\n(ADR-0046), so this endpoint is the repo→Project onboarding flow for any forge\nwithout installation-style auto-registration. After it, the repo appears on\n`GET /v1/repos`, can hold Environments and secrets, and its pushes resolve to\na tenant. GitHub keeps binding itself from the `installation` webhook; this is\nthe Forgejo path.\n\nRegistration is attempted **after** the binding lands and its failure is\n*reported, not rolled back*: the binding is the durable governance fact, a\nhook is a remote side effect on a system that may be momentarily unreachable,\nand unbinding on a failed hook call would delete a Project an admin just\nasked for. `POST …/repos/{owner}/{name}/webhook` retries.",
-        "operationId": "bind_repo",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "connection id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BindRepoRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BindRepoResultDto"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "missing owner/name"
-          },
-          "403": {
-            "description": "requires Administer on the org"
-          },
-          "404": {
-            "description": "no such connection, or no registry wired"
-          },
-          "409": {
-            "description": "the repo is already bound to a different connection"
-          }
-        }
-      }
-    },
-    "/v1/connections/{id}/repos/{owner}/{name}": {
-      "delete": {
-        "tags": [
-          "Forge Connections"
-        ],
-        "summary": "Unbind a repo from a connection, removing its Project (ADR-0060)",
-        "description": "The inverse of the bind above, and destructive in the same measure: the\nbinding is the Project, so its Environments, scoped secrets and RBAC go with\nit. That is why re-sync never does this on a forge's say-so and why this is an\nexplicit, human-addressed endpoint.\n\nThe forge-side webhook is deliberately **left in place**. Deleting hooks is\nnot in the port (ADR-0046 exposes registration only), and a stale hook is\nharmless: an unbound repo's deliveries resolve to nothing and are dropped.",
-        "operationId": "unbind_repo",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "connection id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "owner",
-            "in": "path",
-            "description": "repo owner",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "name",
-            "in": "path",
-            "description": "repo name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "repo unbound"
-          },
-          "403": {
-            "description": "requires Administer on the org"
-          },
-          "404": {
-            "description": "no such connection, or the repo is not bound to it"
-          }
-        }
-      }
-    },
-    "/v1/connections/{id}/repos/{owner}/{name}/webhook": {
-      "post": {
-        "tags": [
-          "Forge Connections"
-        ],
-        "summary": "Register the forge-side webhook for a bound repo (ADR-0046 register_webhook)",
-        "description": "Only for a repo this connection already governs: registering a hook that\npoints at Scarab for a repo Scarab has no Project for would produce deliveries\nthat resolve to nothing.",
-        "operationId": "register_repo_webhook",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "connection id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "owner",
-            "in": "path",
-            "description": "repo owner",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "name",
-            "in": "path",
-            "description": "repo name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/BindRepoResultDto"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "the forge rejected the registration"
-          },
-          "403": {
-            "description": "requires Administer on the org"
-          },
-          "404": {
-            "description": "no such connection, or the repo is not bound to it"
-          }
-        }
       }
     },
     "/v1/connections/{id}/resync": {
@@ -521,6 +225,9 @@
           },
           "404": {
             "description": "no such connection, or no registry/forge wired"
+          },
+          "409": {
+            "description": "the connection is managed by configuration (read-only)"
           },
           "501": {
             "description": "this forge adapter cannot enumerate repos"
@@ -2221,76 +1928,6 @@
           }
         }
       },
-      "AvailableRepoDto": {
-        "type": "object",
-        "description": "`GET /v1/connections/{id}/available-repos`: what the connection's credential\nreaches, and which of those Scarab already governs.",
-        "required": [
-          "owner",
-          "name",
-          "bound"
-        ],
-        "properties": {
-          "bound": {
-            "type": "boolean",
-            "description": "Already a Project on this connection — the bind form renders it as done\nrather than offering a no-op that silently re-homes a live binding."
-          },
-          "name": {
-            "type": "string"
-          },
-          "owner": {
-            "type": "string"
-          }
-        }
-      },
-      "BindRepoRequest": {
-        "type": "object",
-        "description": "`POST /v1/connections/{id}/repos` body: the repo to bring under governance.",
-        "required": [
-          "owner",
-          "name"
-        ],
-        "properties": {
-          "name": {
-            "type": "string"
-          },
-          "owner": {
-            "type": "string"
-          },
-          "register_webhook": {
-            "type": "boolean",
-            "description": "Also create the forge-side webhook, so a push actually reaches Scarab.\nDefaults to **true**: a bound repo with no hook is a Project that silently\nnever builds, which is not a state anyone asks for on purpose."
-          }
-        }
-      },
-      "BindRepoResultDto": {
-        "type": "object",
-        "description": "The outcome of binding a repo: the Project it created, and what happened to\nthe webhook.",
-        "required": [
-          "org",
-          "project",
-          "webhook_registered"
-        ],
-        "properties": {
-          "org": {
-            "type": "string",
-            "description": "The governed Project's natural key — `(owner, name)` in v1 (1 Project : 1\nRepoRef), the same mapping installation auto-registration uses."
-          },
-          "project": {
-            "type": "string"
-          },
-          "webhook_error": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Why it did not, when it did not. The binding still stands — see the\nhandler's note on why a hook failure is reported rather than rolled back."
-          },
-          "webhook_registered": {
-            "type": "boolean",
-            "description": "Did a forge-side webhook get registered (or already exist)?"
-          }
-        }
-      },
       "BindingDto": {
         "type": "object",
         "required": [
@@ -2385,7 +2022,7 @@
           },
           "managed_by_config": {
             "type": "boolean",
-            "description": "Is this connection managed declaratively (config-owned) and therefore\nread-only here? Always `false` until the IaC path lands (ADR-0060 part D);\npresent now so the UI can render the distinction from the start."
+            "description": "Is this connection managed declaratively (config-owned) and therefore\nread-only here (ADR-0060 part D)? A connection has exactly one owner —\nthe `connections:` config or the database — and this says which, so the\nUI never offers an edit the next boot would silently revert."
           },
           "projects": {
             "type": "array",
@@ -2450,29 +2087,6 @@
           }
         }
       },
-      "CreateConnectionRequest": {
-        "type": "object",
-        "description": "`POST /v1/connections` body (ADR-0060 part D, manual path): the forge to\nconnect and the credential to reach it with.\n\n`credential` is **write-only** — it is written through to `SecretProvider`\nunder a server-generated handle and never appears in any response. There is\ndeliberately no \"update the credential\" field on the read DTO: a secret you\ncan read back is a secret you have leaked.",
-        "required": [
-          "kind",
-          "base_url",
-          "credential"
-        ],
-        "properties": {
-          "base_url": {
-            "type": "string",
-            "description": "The instance root Scarab talks to (e.g. `https://codeberg.org`). A\ntrailing slash is normalized away."
-          },
-          "credential": {
-            "type": "string",
-            "description": "The forge access token. Write-only (see the struct docs)."
-          },
-          "kind": {
-            "type": "string",
-            "description": "`forgejo`. GitHub is not creatable here — installing the App *is* its\nregistration (ADR-0060 part C), so a create form for it could not work."
-          }
-        }
-      },
       "CreateRunRequest": {
         "type": "object",
         "description": "`POST /v1/runs` body: an inline pipeline to run immediately, plus any launch\nparameters (ADR-0043) declared by the pipeline's `interface`.",
@@ -2507,23 +2121,6 @@
             "type": "string"
           },
           "status": {
-            "type": "string"
-          }
-        }
-      },
-      "CreatedConnectionDto": {
-        "type": "object",
-        "description": "`POST /v1/connections` response: the created connection's id and the\ngenerated handle its credential now lives under. Not the credential.",
-        "required": [
-          "id",
-          "credential_ref"
-        ],
-        "properties": {
-          "credential_ref": {
-            "type": "string",
-            "description": "The server-generated `_forge`-scoped handle. Echoed so an operator can\ncorrelate the row with its secret; it is a name, not a value."
-          },
-          "id": {
             "type": "string"
           }
         }

@@ -1,0 +1,24 @@
+{{- if .Values.scarab.connections -}}
+{{- /* The declarative `connections:` block (ADR-0060 part D): config-owned forge
+       connections, provisioned at boot, authoritative, and read-only in the UI.
+
+       Rendered verbatim from `scarab.connections`, so the values use the SERVER's
+       schema (snake_case `base_url` / `secret_ref`), not the chart's camelCase —
+       what you write here is exactly what the server parses, and an unknown key
+       fails the boot loudly rather than being ignored (ADR-0048).
+
+       No credential material passes through this ConfigMap: an entry names an env
+       var (`credential.env`, supplied via secrets.existingSecret / your own
+       Secret), a mounted file (`credential.file`), or a handle in Scarab's own
+       secret store (`credential.secret_ref`). */ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "scarab.connectionsConfigMapName" . }}
+  labels:
+    {{- include "scarab.labels" . | nindent 4 }}
+data:
+  connections.yaml: |
+    connections:
+      {{- toYaml .Values.scarab.connections | nindent 6 }}
+{{- end }}
