@@ -120,6 +120,15 @@ async fn prune_run_logs(
 /// torn CAS — which the executor's own input-missing fail-fast still catches. A
 /// transitive walk would cost one round-trip per tree on a path a human is
 /// waiting on, to defend against a case that is already covered.
+///
+/// **This must stay a COLD-tier question.** Behind a tiered `Cas`
+/// (`scarab_storage::tiered`) `tree_entries` reads warm, falls back to cold, and
+/// reports `NotFound` only when *both* miss — which is exactly the semantics this
+/// needs. A warm miss alone must never widen a rerun: the warm tier is bounded by
+/// space and evicts LRU, so a miss there is slower and never wrong, and widening
+/// on one would turn ordinary cache pressure into surprise full-pipeline re-runs.
+/// If anything ever gives this a warm-only view of the store, that is a bug here,
+/// not a behaviour change.
 pub struct CasSnapshots(pub Arc<dyn scarab_storage::Cas>);
 
 #[async_trait::async_trait]
