@@ -253,6 +253,25 @@ async fn a_snapshot_written_through_the_service_has_the_same_root_as_one_written
         via_service.root, via_store.root,
         "the client's canonicalisation must match S3Storage::put_tree byte for byte"
     );
+    // And the SECOND digest too (ADR-0061 s8). This is the sharper of the two
+    // checks, because a content identity is never stored: a drift in the root
+    // shows up as a cache miss, a drift in the identity shows up as
+    // skip-if-unchanged silently deciding "changed" for a step that ran on the
+    // other data path. Nothing would fail; work would just always be redone.
+    assert_eq!(
+        via_service.identity, via_store.identity,
+        "the two data paths must fold the same content identity"
+    );
+    assert!(
+        via_service.identity.is_some(),
+        "both paths must actually compute one — two `None`s would satisfy the \
+         assertion above while proving nothing"
+    );
+    assert_ne!(
+        via_service.identity.as_ref(), Some(&via_service.root),
+        "the fixture must record mtimes, or identity and root coincide and this \
+         test degenerates into the one above"
+    );
 }
 
 /// `have` reports MISSING, and it reports it correctly in both directions.
