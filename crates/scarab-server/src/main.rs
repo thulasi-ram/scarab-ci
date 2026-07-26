@@ -19,7 +19,7 @@ use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
 use scarab_executor_k8s::{K8sExecutor, PlacementConfig, ResultsEgress};
 use scarab_executor_local::LocalExecutor;
-use scarab_server::config::{Cli, Config, ExecutorKind, StoreConfig};
+use scarab_server::config::{Cli, Config, ExecutorKind, Role, StoreConfig};
 use scarab_server::{
     converged, router, AppState, LogService, SecretInjectingExecutor, SystemClock,
 };
@@ -88,13 +88,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // ADR-0061: the workspace service is a DATA-plane role. It shares this
+    // binary — one image, so server↔service version skew is structurally
+    // impossible under one Helm release — but NOT the durable core: it never
+    // connects to Postgres and never runs a migration.
+    //
+    // The early return is deliberately HERE, before anything below it runs.
+    // Everything that follows is the durable core's composition root: it
+    // connects Postgres and migrates, connects and migrates the secrets store,
+    // reads the OIDC PEM, and provisions forge connections — none of which the
+    // workspace service has, needs, or may be allowed to do from N per-failure-
+    // domain replicas. Do not move this down, and do not restructure the code
+    // below it to make the role a branch: a branch is something a future edit
+    // can fall through.
+    if matches!(config.role, Role::Workspace) {
+        return scarab_server::workspaced::run(&config).await;
+    }
+
+    // From here on the durable core is mandatory, and the config gate already
+    // guaranteed it for every role that reaches this line (see
+    // `Role::needs_durable_core`). One `expect`, at the dispatch site, so the
+    // `Option` carries the fact instead of a `""` sentinel travelling onward.
+    let database_url = config
+        .database_url
+        .clone()
+        .expect("the config gate requires SCARAB_DATABASE_URL for every durable-core role");
+
     // This replica's identity for leases + outbox claims (ADR-0051): MUST be
     // unique per process — identical owners would make every replica believe
     // it holds every lease (leader election + tail dedup would be void).
     let replica_id = format!("scarab-server-{}", uuid::Uuid::new_v4());
 
     // Durable store — mandatory, already guaranteed by the config gate.
-    let pg = PostgresDb::connect(&config.database_url).await?;
+    let pg = PostgresDb::connect(&database_url).await?;
     pg.migrate().await?;
     // Keep a typed handle so the same Postgres adapter can back both the `Db`
     // port and the `EnvironmentStore` port (it implements both).
@@ -130,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         key
     });
     let secrets: Arc<dyn scarab_secrets::SecretProvider> = {
-        let s = scarab_secrets_postgres::PostgresSecrets::connect(&config.database_url, master_key)
+        let s = scarab_secrets_postgres::PostgresSecrets::connect(&database_url, master_key)
             .await?;
         s.migrate().await?;
         Arc::new(s)
@@ -428,6 +454,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Read-only workspace browser (ADR-0029): serves a step's output
         // snapshot tree + file bytes for the run detail Inspector.
         .with_workspace_cas(workspace_cas.clone())
+        // The cold tier's TIME bound (ADR-0061 s5), from the SAME config value the
+        // GC sweeper above runs on — so what the UI promises and what the sweeper
+        // enforces cannot drift.
+        .with_workspace_retention_days(config.retention_workspace_days)
         // The same credential-override table the forge router resolves through
         // (ADR-0060 part D), so the Settings health readout reports a
         // config-supplied credential as present rather than MISSING.

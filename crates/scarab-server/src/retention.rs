@@ -107,6 +107,49 @@ async fn prune_run_logs(
     Ok(())
 }
 
+/// The [`WorkspaceSnapshots`](scarab_engine::WorkspaceSnapshots) adapter over the
+/// workspace CAS (ADR-0061 s5): the one bit of truth the pure engine needs about
+/// the cold tier — *can this Workspace Snapshot still be materialised?*
+///
+/// The check is the presence of the **root tree object**, not a full walk. That is
+/// sound under mark-sweep (ADR-0050) rather than merely cheap: the sweep deletes
+/// unmarked objects, and a root is unmarked exactly when nothing reachable
+/// references it — in which case its exclusive subtree is unmarked too and goes
+/// with it, while anything that survived did so because something else marked it.
+/// So "root present" and "tree materialisable" coincide, except in a genuinely
+/// torn CAS — which the executor's own input-missing fail-fast still catches. A
+/// transitive walk would cost one round-trip per tree on a path a human is
+/// waiting on, to defend against a case that is already covered.
+pub struct CasSnapshots(pub Arc<dyn scarab_storage::Cas>);
+
+#[async_trait::async_trait]
+impl scarab_engine::WorkspaceSnapshots for CasSnapshots {
+    async fn snapshot_present(&self, root: &str) -> bool {
+        match self
+            .0
+            .tree_entries(&scarab_storage::TreeHash(root.to_string()))
+            .await
+        {
+            Ok(_) => true,
+            Err(scarab_storage::StorageError::NotFound) => false,
+            // NOT proof of absence. Only a definitive not-found may widen a
+            // rerun; treating a store blip as an expiry would re-run a whole
+            // pipeline from `clone` because of one bad TCP connection. Assume
+            // present, say so loudly, and let the executor's input-missing
+            // fail-fast be the backstop if it really is gone.
+            Err(e) => {
+                tracing::warn!(
+                    root = %root,
+                    error = %e,
+                    "workspace snapshot presence check failed — assuming PRESENT (a transient \
+                     error is not proof of expiry)"
+                );
+                true
+            }
+        }
+    }
+}
+
 /// The workspace-CAS GC configuration (ADR-0050).
 #[derive(Debug, Clone, Copy)]
 pub struct GcConfig {
