@@ -15,8 +15,15 @@ The implementation does not honour that promise. `build_pod` gives each Step Pod
 **through the control plane**: `tar -xf` in over `kubectl exec`, `tar -cf` out over
 `kubectl exec`, hashed on the server. So every byte of every workspace crosses the
 **Kubernetes API server** — a control-plane component never intended for bulk data — twice
-per Step. [0029](0029-workspace-cas.md)'s dedup and incremental transfer are real, but they
-apply only between the server and object storage, i.e. *after* the expensive part.
+per Step.
+
+This ADR originally continued: "[0029](0029-workspace-cas.md)'s dedup and incremental transfer
+are real, but they apply only between the server and object storage, i.e. *after* the expensive
+part." **Measurement — s0, recorded under Open below — showed that sentence to be backwards.**
+The server↔object-storage leg *is* the expensive part, 81–88% of every Step boundary, and the
+dedup saves approximately nothing: the cost is one sequential round-trip **per file**, not the
+bytes. Every structural complaint below still holds. The money is simply not where this
+paragraph guessed it was.
 
 **This is unsound by inspection, independent of any benchmark.** A tar piped through an
 `exec` stream is: a single sequential connection (no parallel ranges, no saturating a NIC);
@@ -24,7 +31,9 @@ unresumable (a break at 90% starts over); routed through the cluster's most cont
 component, competing with the control traffic that keeps the cluster alive; funnelled through
 one `scarab-server` process that must also hold and hash every byte; and it moves the *whole*
 workspace in both directions regardless of what changed. Object storage clients have the
-opposite properties on every line. No measurement is required to reject this path — only to
+opposite properties on every line — *in principle*; the client we actually wrote does not (s0
+again: `materialize`/`ingest` walk the tree one file at a time and await a round-trip each, so
+they have no parallelism either). No measurement is required to reject this path — only to
 size the win.
 
 The operating environment sharpens this into a design constraint rather than a performance
@@ -172,8 +181,13 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   solves without giving anything up.
 - **Node-local blob cache only (no service)** — attractive until Karpenter: consolidation and
   spot reclaim keep node lifetimes short and pods land on fresh nodes, so the within-Run hit
-  rate approaches zero. Still viable *behind* the service as a second-level cache; parked
-  pending measurement.
+  rate approaches zero. As a second-level cache *behind* the service it was parked pending
+  measurement; **s0 answers it: not yet, and not for this reason.** The measured cost is
+  per-file round-trip count, and a cache is a second-order fix for that — it lowers the
+  latency of a round-trip that lazy materialisation would not have made at all, and it only
+  ever helps on a hit, which is precisely what Karpenter denies. Do the first-order work
+  (lazy reads, then concurrency/batching in the CAS legs) and re-measure; a cache tier
+  evaluated before that would be credited with wins that belong to the cheaper fix.
 - **Fat helper with eager parallel fetch, no driver** — removes the `exec` tunnel and needs no
   privileges, so it is a legitimate stepping stone. Rejected as an endpoint: it still moves
   the whole workspace to every fresh node, i.e. it rebuilds the same complaint over a shorter
@@ -186,13 +200,51 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 
 ## Open — deliberately not decided here
 
-- **Measurement — of the win, not of the premise.** No numbers were taken. Two claims should
-  not be confused: *"the `exec` tar path is the wrong design"* is structural and settled above
-  on its properties; *"it is the dominant cost today"* is empirical and is **not** established.
-  This ADR rests only on the first. Instrumenting one dogfood run — tunnel time vs hashing
-  time vs object-storage time vs bytes per edge — is still worth doing before build, but to
-  size the payoff, sequence the slices, and settle the parked question of whether a
-  second-level node cache earns its place. It cannot rescue the current path.
+- **Measurement — of the win, not of the premise. DONE (s0); it changed the slice order.**
+  Two claims were kept separate on purpose: *"the `exec` tar path is the wrong design"* is
+  structural and settled above on its properties, and *"it is the dominant cost today"* was
+  empirical and unestablished. This ADR rests only on the first — which is just as well,
+  **because the second turned out to be false.**
+
+  `drive_workspace` now emits one `ws-timing` line per leg per Step boundary
+  (`just logs | grep ws-timing`). Proc-mode stack, kind on colima, MinIO on loopback, two
+  synthetic 3-step chains (`produce → consume → verify`) at a constant 8.19 MB workspace and
+  two file counts, so per-file cost separates from per-byte cost:
+
+  | leg | files | `exec` tunnel | server tar | **CAS (object storage)** | total | CAS share |
+  |---|---|---|---|---|---|---|
+  | feed  | 2000 | 1244 ms | 1102 ms | **11581 ms** | 13940 ms | **83%** |
+  | drain | 2000 | 385 ms | 939 ms | **8867 ms** | 10213 ms | **87%** |
+  | feed  | 250 | 421 ms | 94 ms | **2300 ms** | 2823 ms | **81%** |
+  | drain | 250 | 105 ms | 156 ms | **1960 ms** | 2242 ms | **88%** |
+
+  Three findings, in descending order of how much they matter:
+
+  1. **The `exec` tar tunnel is 4–15% of a Step boundary. The CAS legs are 81–88%.** The
+     component this ADR was written to delete is not the bottleneck. Deleting it (part 3) is
+     still right — it is unresumable, it abuses the API server, and it blocks lazy reads — but
+     on its own it buys roughly a tenth of the boundary.
+  2. **The CAS cost tracks file count, not bytes.** At identical total bytes, an 8× file-count
+     reduction cut `cas_ingest` 4.4× and `cas_materialize` 5.0×. Cause: `materialize` awaits a
+     `get_tree` + `get_blob` per file and `ingest_dir` awaits a `head` + maybe-`put` per file,
+     strictly one at a time. ~4–6 ms/file against **loopback** MinIO — so real object storage
+     over a real network makes this *worse*, and the CAS share above is a floor, not a ceiling.
+  3. **Content-addressed dedup currently saves nothing in time.** `consume` and `verify`
+     re-drain byte-identical content the CAS already holds; their fully-deduped `cas_ingest`
+     (9704 ms, 10096 ms) is *no faster than* the cold ingest that uploaded everything
+     (8867 ms). `put_if_absent` pays a `head` round-trip per file either way, and the avoided
+     `put` costs about the same as the `head`. Dedup saves storage, not wall-clock.
+
+  **Consequence for sequencing.** Part 2 (**lazy materialisation**) is the load-bearing part,
+  not part 3: it attacks file count, which finding 2 identifies as the actual cost driver.
+  Whatever else the workspace service does, it must not reproduce a per-file sequential
+  round-trip walk — concurrency and batching in the CAS legs are worth more today than the
+  tunnel deletion, and are cheap enough to be worth doing even before the service exists.
+
+  Caveats, stated so the numbers are not over-read: synthetic uniform-size files, not a real
+  checkout; one machine, loopback object storage, no cross-AZ latency; and the measured binary
+  also carried the in-progress s7 metadata-fidelity work, which adds per-file syscalls (not
+  round-trips) to both CAS legs. None of that touches the ordering — the gap is 6–20×.
 - ~~**mtime fidelity across the CAS.**~~ **Answered (s7) — it did not, and now it does.**
   Measured, not reasoned about: the CAS tree entry carried only `name` and `target`, so a
   round-trip silently dropped every mode (an executable came back `0644`) and every mtime
