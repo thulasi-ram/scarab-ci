@@ -4176,5 +4176,35 @@ mod tests {
                 build.context
             );
         }
+
+        // The results channel (ADR-0042) drains `/scarab/results/<name>.json`
+        // and NOTHING else. A step that redirects into a bare
+        // `/scarab/results/tag` publishes nothing, logs only "no results to
+        // drain", and STILL EXITS 0 — so the pipeline goes green while
+        // `${{ outputs.<step>.<name> }}` silently resolves empty downstream.
+        // This sample shipped that exact bug. Only a check like this catches it.
+        for step in ir.steps.iter() {
+            for arg in step.command.iter() {
+                // Redirect targets only: the surrounding prose mentions the
+                // wrong form on purpose, to document it.
+                for (i, _) in arg.match_indices('>') {
+                    let target: String = arg[i + 1..]
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| !c.is_whitespace() && *c != ';' && *c != '|')
+                        .collect();
+                    if let Some(name) = target.strip_prefix("/scarab/results/") {
+                        assert!(
+                            name.ends_with(".json"),
+                            "step `{}` writes result `{}` — the sidecar drains \
+                             `<name>.json` only, so this publishes nothing while \
+                             the step still passes",
+                            step.id,
+                            target
+                        );
+                    }
+                }
+            }
+        }
     }
 }
