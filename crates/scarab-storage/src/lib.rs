@@ -14,6 +14,13 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// The data-plane content port (ADR-0061): byte ranges, sizes, batched
+/// existence and one-call tree manifests. Additive — [`Cas`] is unchanged.
+pub mod content;
+/// Warm-then-cold tiering (ADR-0061): the workspace service's volume in front
+/// of the cold object-storage archive.
+pub mod tiered;
+
 /// Content hash of a single file blob.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BlobHash(pub String);

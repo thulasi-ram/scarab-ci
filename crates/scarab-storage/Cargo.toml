@@ -8,3 +8,14 @@ license.workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+# NOT an infra dep despite the name: `tracing` is a facade with no I/O, no
+# clock and no sockets — without a subscriber every macro compiles to nothing,
+# and the subscriber is installed by the composition root. It is here because
+# `tiered::TieredCas` (ADR-0061) has one behaviour that ONLY exists as a log
+# line: a warm-tier write failure must succeed the caller (cold is the
+# durability promise) while still being loud. Swallowing it silently would be
+# the exact "silent facade" this codebase refuses.
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
