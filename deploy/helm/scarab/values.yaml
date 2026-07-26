@@ -143,6 +143,11 @@ scarab:
   # Service DNS name derived from the release.
   resultsApiUrl: ""
 
+  # Base URL of the workspace service (ADR-0061). Empty => the in-cluster
+  # Service DNS name derived from the release, which is right unless you run the
+  # service from a separate release (e.g. one per availability zone).
+  workspaceUrl: ""
+
 # Sensitive config. Two modes:
 #   1. existingSecret: reference a Secret you manage out-of-band (recommended
 #      for production). Keys must match the env var names below.
@@ -168,6 +173,16 @@ secrets:
   forgejoWebhookSecret: ""
   gateTokenSecret: ""
   resultsTokenSecret: ""
+  # HMAC secret for the workspace token (ADR-0061): the credential a step Pod
+  # presents to the workspace service. Set this to enable the service — the
+  # StatefulSet refuses to boot without it, because a workspace service with no
+  # token secret would serve every step's inputs to any caller that can reach the
+  # port. It MUST be different from resultsTokenSecret: that one carries no verb
+  # and never expires, so reusing it would turn a results-write credential into a
+  # content read+write credential, and would let the workspace service forge step
+  # results for any {run, step, attempt} — the workspace service being precisely
+  # the component ADR-0061 moves out of the trusted control plane.
+  workspaceTokenSecret: ""
   # GitHub App private-key PEM (enh 245a99c): supplies the App credential at
   # boot, GitOps-style — no PUT /v1/secrets reseed, and it survives DB recreate.
   # Overrides any DB-stored `_forge` credential. For existingSecret mode, add a
@@ -195,7 +210,52 @@ secrets:
     name: ""                     # Secret holding it; empty => no env var
     key: oauth-client-secret     # key within that Secret
 
+# --- the workspace service (ADR-0061) ---------------------------------------
+# A warm content-addressed store on a PERSISTENT VOLUME, in front of the
+# configured object store as the cold archive. In the standard path in every
+# deployment mode, because a fast path plus a fallback path is two mental models
+# and the taxonomy cost is worse than the component cost.
+#
+# This is the chart's FIRST StatefulSet and its first PVC. The volume attaches to
+# the SERVICE, never to a step Pod — every problem PVCs have at step grain
+# (attach/detach latency per boundary, stuck volumes when a spot node is
+# reclaimed, per-node attachment quotas) comes from binding volumes to
+# short-lived pods.
+#
+# It runs the SAME IMAGE as the server with SCARAB_ROLE=workspace, which is what
+# makes server↔service version skew structurally impossible under one release.
+#
+# `enabled: true` but nothing renders unless secrets.workspaceTokenSecret is set:
+# the service needs a token secret to verify anything, so an install that has not
+# set one gets no service rather than an open one.
+workspace:
+  enabled: true
+  # One per failure domain. Per-AZ topology is a later slice; NOTHING in this
+  # design has been exercised with more than one instance, so treat >1 as
+  # unproven rather than supported.
+  replicaCount: 1
+  # Where the warm tier lives inside the container — the PVC's mount point, and
+  # the value of SCARAB_WORKSPACE_DATA_DIR.
+  dataDir: /var/lib/scarab/cas
+  persistence:
+    # The warm tier is bounded by SPACE (cold is bounded by time). LRU eviction
+    # is NOT implemented yet, so until it is, watch the
+    # `scarab_workspace_warm_used_bytes` gauge: this number is the whole budget.
+    size: 20Gi
+    storageClass: ""       # "" = the cluster default
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+  nodeSelector: {}
+  tolerations: []
+
 # RBAC the k8s executor needs to run one Pod per step in scarab.namespace.
+# NOTE: the workspace StatefulSet gets its own ServiceAccount with NO
+# RoleBinding — see templates/serviceaccount-workspace.yaml for why that is
+# deliberate rather than an omission.
 rbac:
   create: true
 

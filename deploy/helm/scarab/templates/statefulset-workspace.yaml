@@ -1,0 +1,149 @@
+{{- if include "scarab.workspaceEnabled" . -}}
+{{- /*
+  The workspace service (ADR-0061): a warm content-addressed store on a
+  PERSISTENT VOLUME, in front of the configured object store as the cold archive.
+  In the standard path in every deployment mode — two paths would be two mental
+  models.
+
+  A StatefulSet, and the first one in this chart, because the identity of the
+  volume matters: a Deployment's replicas would fight over one PVC, and the warm
+  tier is per-replica cache, not shared state.
+
+  SAME IMAGE as the server, verbatim from `image.*`. That is the anti-skew
+  property and it is the reason this is a role on the converged binary rather
+  than a fourth release artifact: under one Helm release, server and service
+  cannot be different versions.
+
+  Note what this Pod does NOT get:
+    * no SCARAB_DATABASE_URL is *used* — the workspace role never connects to
+      Postgres and never runs a migration (ADR-0061; Role::needs_durable_core).
+      The key still arrives via envFrom because the Secret is shared, and the
+      server would refuse to boot without it; the role simply ignores it. In
+      Kubernetes, capability comes from the ServiceAccount and mounted secrets,
+      and this Pod's ServiceAccount has NO RoleBinding at all.
+    * no RBAC. The chart's Role is pods/secrets/exec for the executor; a
+      workspace replica needs none of it (see serviceaccount-workspace.yaml,
+      which is deliberately unbound).
+*/ -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "scarab.fullname" . }}-workspace
+  labels:
+    {{- include "scarab.workspaceLabels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "scarab.fullname" . }}-workspace
+  # One per failure domain. Per-AZ topology is a later slice; today this is 1 and
+  # nothing in the design has yet been exercised with more than one instance.
+  replicas: {{ .Values.workspace.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "scarab.workspaceSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "scarab.workspaceLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "scarab.workspaceServiceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: scarab-workspace
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "scarab.fullname" . }}
+            - secretRef:
+                name: {{ include "scarab.secretName" . }}
+                optional: true
+          # THE LOAD-BEARING LINES. An explicit `env` entry WINS over `envFrom`,
+          # so these override the ConfigMap's SCARAB_ROLE (`converged`) and
+          # SCARAB_ADDR for this Pod only. Get the precedence wrong and this
+          # StatefulSet silently runs a second converged control plane — with a
+          # PVC, a database connection and a driver loop — which is a far worse
+          # failure than refusing to start.
+          #
+          # NOT assumed. Verified twice: `helm template` shows `env` rendered
+          # after `envFrom` (see the chart README), and a real kubelet on colima
+          # was given a ConfigMap with SCARAB_ROLE=converged plus this exact
+          # `env` entry and printed `workspace`.
+          env:
+            - name: SCARAB_ROLE
+              value: workspace
+            - name: SCARAB_ADDR
+              value: "0.0.0.0:8080"
+            - name: SCARAB_WORKSPACE_DATA_DIR
+              value: {{ .Values.workspace.dataDir | quote }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          # Liveness is the process; readiness is warm-WRITABLE + cold reachable
+          # (the workspace role's own /readyz — NOT the control plane's, which
+          # asks the database a question this role cannot answer).
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.workspace.resources | nindent 12 }}
+          volumeMounts:
+            # The warm tier. `readOnlyRootFilesystem: true` (from
+            # .Values.securityContext) is untouched by this — a PersistentVolume
+            # is a volume, and volumes stay writable.
+            - name: cas
+              mountPath: {{ .Values.workspace.dataDir | quote }}
+            # The cold-tier local-dir fallback and any temp file. Unused when
+            # scarab.s3.bucket is set, which it must be in any real install.
+            - name: scratch
+              mountPath: /home/scarab/.scarab
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: scratch
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.workspace.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.workspace.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: cas
+        labels:
+          {{- include "scarab.workspaceLabels" . | nindent 10 }}
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.workspace.persistence.storageClass }}
+        storageClassName: {{ .Values.workspace.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.workspace.persistence.size | quote }}
+{{- end }}
