@@ -31,12 +31,6 @@ export function describeEvent(e: RunEvent): string {
       return `${s(v.target)} retried${v.by ? ` by ${s(v.by)}` : ""} — same version`;
     case "AttemptReadopted":
       return `${s(v.step)} — re-adopted after control-plane restart`;
-    // ADR-0061 s5: keeping a run's Workspace Snapshots past the retention window
-    // costs storage, so both directions are recorded and both name who asked.
-    case "RunSnapshotsPinned":
-      return `Workspace snapshots pinned${v.by ? ` by ${s(v.by)}` : ""} — kept past the retention window`;
-    case "RunSnapshotsUnpinned":
-      return `Workspace snapshots unpinned${v.by ? ` by ${s(v.by)}` : ""} — back to the retention window`;
     default:
       return tag;
   }
@@ -105,12 +99,6 @@ export function eventCategory(e: RunEvent): EventCat {
       return "run";
     case "AttemptReadopted":
       return "recover";
-    // Everything else — including the ADR-0061 s5 snapshot pin/unpin — is `info`.
-    // Those two used to have their own arms returning `info`, which was dead code
-    // AND untestable: no input could tell the arm from this fall-through, so the
-    // test that "covered" them was pinning this line. The decision they encoded
-    // still holds and is what `default` means here: a category is a claim that
-    // something *ran*, and only the cases above get to make it.
     default:
       return "info";
   }

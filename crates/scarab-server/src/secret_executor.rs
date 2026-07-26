@@ -191,23 +191,6 @@ impl Executor for SecretInjectingExecutor {
         self.inner.output(handle).await
     }
 
-    async fn output_identity(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
-        // Forward the content identity (ADR-0061 s8) — this was MISSING until
-        // ADR-0064 s2: the trait default returned `None`, so a secrets-wired
-        // deployment (every real one) recorded no identity, restart compared
-        // roots, and skip-if-unchanged could never fire (the 945b1f4 failure
-        // shape, reintroduced by this wrapper). Same forward-or-drop hazard
-        // as `results`/`artifacts` below.
-        self.inner.output_identity(handle).await
-    }
-
-    async fn output_durability(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
-        // Forward the durability stamp (ADR-0064 s2). The method is REQUIRED
-        // on the trait precisely so this wrapper cannot silently swallow it
-        // the way the defaulted `output_identity` above once was.
-        self.inner.output_durability(handle).await
-    }
-
     async fn results(
         &self,
         handle: &ExecHandle,

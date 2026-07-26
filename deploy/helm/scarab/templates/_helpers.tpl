@@ -42,68 +42,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
-{{/* Does the workspace service (ADR-0061) actually render?
-
-     `workspace.enabled` is not enough on its own: the service REFUSES to boot
-     without SCARAB_WORKSPACE_TOKEN_SECRET (a workspace service with no token
-     secret would serve every step's inputs to any caller that reaches the port),
-     so rendering a StatefulSet that can only CrashLoopBackOff would be a worse
-     default than rendering nothing. An install that has not set a secret gets no
-     service; the NOTES say so.
-
-     `existingSecret` counts, because in that mode the key is supplied
-     out-of-band and the chart cannot see it. */}}
-{{- define "scarab.workspaceEnabled" -}}
-{{- if and .Values.workspace.enabled (or .Values.secrets.workspaceTokenSecret .Values.secrets.existingSecret) -}}
-true
-{{- end -}}
-{{- end -}}
-
-{{/* Selector labels for the workspace StatefulSet (ADR-0061).
-
-     `app.kubernetes.io/name` is `<name>-workspace`, NOT `<name>` plus a
-     component label, and that is load-bearing. The main Service selects on
-     `scarab.selectorLabels` = {name, instance}; a workspace Pod carrying those
-     two labels plus a third would still MATCH it, so control-plane traffic to
-     svc/<fullname> would round-robin into a data-plane Pod that serves no
-     control-plane route — intermittent 404s on half the API, which is exactly
-     the "reports success but structurally cannot work" class. Kubernetes label
-     selectors are subset matches; the only way out is a distinct `name`.
-
-     Same reason the ServiceMonitor keeps working: it selects the main Service's
-     labels, so it does not accidentally scrape both workloads through one
-     endpoint set. (Scraping the workspace service is a separate ServiceMonitor;
-     not shipped, because serviceMonitor.enabled is off by default.) */}}
-{{- define "scarab.workspaceSelectorLabels" -}}
-app.kubernetes.io/name: {{ printf "%s-workspace" (include "scarab.name" .) }}
-app.kubernetes.io/instance: {{ .Release.Name }}
-{{- end -}}
-
-{{- define "scarab.workspaceLabels" -}}
-helm.sh/chart: {{ include "scarab.chart" . }}
-{{ include "scarab.workspaceSelectorLabels" . }}
-app.kubernetes.io/component: workspace
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
-{{- end -}}
-
-{{/* ServiceAccount name for the workspace StatefulSet (ADR-0061). Separate from
-     the server's, and deliberately UNBOUND — see serviceaccount-workspace.yaml. */}}
-{{- define "scarab.workspaceServiceAccountName" -}}
-{{- printf "%s-workspace" (include "scarab.fullname" .) -}}
-{{- end -}}
-
-{{/* In-cluster base URL of the workspace service — the value of
-     SCARAB_WORKSPACE_URL. One definition so the ConfigMap and the Service name
-     cannot disagree. Overridable via scarab.workspaceUrl for a split install. */}}
-{{- define "scarab.workspaceUrl" -}}
-{{- if .Values.scarab.workspaceUrl -}}
-{{- .Values.scarab.workspaceUrl -}}
-{{- else -}}
-{{- printf "http://%s-workspace.%s.svc" (include "scarab.fullname" .) .Release.Namespace -}}
-{{- end -}}
-{{- end -}}
-
 {{/* Namespace the executor launches step Pods into (defaults to release ns). */}}
 {{- define "scarab.execNamespace" -}}
 {{- default .Release.Namespace .Values.scarab.namespace -}}

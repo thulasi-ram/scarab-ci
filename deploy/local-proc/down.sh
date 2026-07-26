@@ -27,20 +27,14 @@ is_scarab_server() {
   return 1
 }
 
-# `kill` and hope was not enough: a server that ignores SIGTERM used to keep
-# SCARAB_ADDR while the pidfile naming it was already deleted, so nothing could
-# ever reap it and the next up.sh inherited an orphan. Wait for the exit,
-# escalate, and only forget the pid once the process is really gone.
-#
-# Two processes now (ADR-0061): the converged control plane and the workspace
-# service, same binary, different roles. Both are ours and both must die, or the
-# next `just up` refuses on a held port.
-stop_pidfile() {
-  local label="$1" file="$2" pid
-  [[ -f "$file" ]] || return 0
-  pid="$(cat "$file" 2>/dev/null || true)"
+if [[ -f "$here/server.pid" ]]; then
+  pid="$(cat "$here/server.pid" 2>/dev/null || true)"
+  # `kill` and hope was not enough: a server that ignores SIGTERM used to keep
+  # SCARAB_ADDR while the pidfile naming it was already deleted, so nothing
+  # could ever reap it and the next up.sh inherited an orphan. Wait for the
+  # exit, escalate, and only forget the pid once the process is really gone.
   if [[ -n "$pid" ]] && proc_alive "$pid" && is_scarab_server "$pid"; then
-    echo "==> stopping $label (pid $pid)"
+    echo "==> stopping scarab-server (pid $pid)"
     kill "$pid" 2>/dev/null || true
     for _ in $(seq 1 10); do
       proc_alive "$pid" || break
@@ -53,15 +47,12 @@ stop_pidfile() {
     fi
   fi
   if [[ -n "$pid" ]] && proc_alive "$pid" && is_scarab_server "$pid"; then
-    echo "error: $label (pid $pid) survived SIGKILL; keeping $(basename "$file") so it can still be found" >&2
+    echo "error: scarab-server (pid $pid) survived SIGKILL; keeping server.pid so it can still be found" >&2
     rc=1
   else
-    rm -f "$file"
+    rm -f "$here/server.pid"
   fi
-}
-
-stop_pidfile "scarab-server" "$here/server.pid"
-stop_pidfile "the workspace service" "$here/workspace.pid"
+fi
 
 # An orphan from a run that predates the reaping above (or a stray `just serve`)
 # still holding the port is the exact condition that makes the next up.sh verify
@@ -89,11 +80,7 @@ docker compose -f "$here/compose.yaml" down -v || true
 echo "==> deleting kind cluster '$cluster'"
 kind delete cluster --name "$cluster" 2>/dev/null || true
 
-rm -f "$here/.kubeconfig" "$here/server.log" "$here/workspace.log"
-# The warm tier is a CACHE with no promise (ADR-0061): cold (the compose MinIO,
-# whose volume `docker compose down -v` just removed) is the guarantee, so
-# deleting it here loses nothing that survived anyway.
-rm -rf "$here/../../.scarab/workspace-cas"
+rm -f "$here/.kubeconfig" "$here/server.log"
 if [[ "$rc" -eq 0 ]]; then
   echo "==> down."
 else

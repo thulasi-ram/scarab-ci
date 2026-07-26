@@ -88,9 +88,6 @@ async fn fork_evidence(
                 target,
                 invalidated,
                 by,
-                // ADR-0061 s5's widened set is irrelevant here (this run has no
-                // workspace snapshots at all); the alias contract is the subject.
-                widened: _,
             } => Some((
                 target.0,
                 invalidated.into_iter().map(|s| s.0).collect::<Vec<_>>(),

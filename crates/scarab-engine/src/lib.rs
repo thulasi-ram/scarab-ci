@@ -20,13 +20,11 @@
 pub mod ports;
 pub mod scheduler;
 
-pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots};
+pub use ports::{Clock, Db, Executor, LogChunks};
 pub use scheduler::{
-    cancel_run_request, pin_run_snapshots, plan_rerun, record_gate_approval, release_gate,
-    rerun_step, rerun_step_widened, retry_step, retry_step_widened, unpin_run_snapshots,
-    ExpiredInput, RerunError, RerunPlan, Scheduler, SchedulerError, SupersedeTeardown,
-    SupersededAttempt, Supervision, TickHealth, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
-    RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
+    cancel_run_request, record_gate_approval, release_gate, rerun_step, retry_step, RerunError,
+    Scheduler, SchedulerError, SupersedeTeardown, SupersededAttempt, Supervision, TickHealth,
+    CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
 use serde::{Deserialize, Serialize};
@@ -251,22 +249,6 @@ pub struct Attempt {
     pub id: AttemptId,
     pub started_at: Timestamp,
     pub failure: Option<FailureKind>,
-    /// The executor's human-readable cause for a `Failed` attempt (ticket
-    /// 4cf03d7) — e.g. "cold tier refused: connection refused" from a
-    /// lost-evidence drain — alongside the machine-consumed `failure` class.
-    /// `#[serde(default)]` keeps rows/blobs written before the column existed
-    /// decodable; `None` means the class alone is the whole story.
-    #[serde(default)]
-    pub failure_detail: Option<String>,
-    /// Where this attempt's output workspace snapshot was **durable** when its
-    /// verdict was granted (ADR-0064 s2): the Depot's self-reported tier wire
-    /// string — `object` | `separate-volume` | `warm-only` — stamped by
-    /// `set_step_output` beside the snapshot root. Per-attempt evidence, never
-    /// recomputed: it answers "what did THIS `Succeeded` license?" after the
-    /// deployment's tier has changed. `#[serde(default)]` keeps pre-s2
-    /// rows/blobs decodable; `None` = no workspace, pre-s2 row, or unknown.
-    #[serde(default)]
-    pub output_durability: Option<String>,
     /// The recorded terminal (or in-flight) outcome of this attempt (ADR-0056
     /// amendment). `Running` until an outcome is written; `Superseded` and
     /// `Cancelled` are the non-failure terminations that must never render as a
@@ -748,12 +730,6 @@ pub enum EventPayload {
         step: StepId,
         attempt: AttemptId,
         failure: Option<FailureKind>,
-        /// The executor's human-readable cause for the failure, when it
-        /// reported one (ticket 4cf03d7). Explicitly `#[serde(default)]`:
-        /// this event IS persisted in the events table and replayed, so a row
-        /// appended before the field existed must still deserialize.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cause: Option<String>,
     },
     /// A single approval was recorded against a `manual` gate by the named
     /// principal (ADR-0037). Append-only, accumulating — the run stays suspended
@@ -809,15 +785,6 @@ pub enum EventPayload {
         target: StepId,
         invalidated: Vec<StepId>,
         by: Option<String>,
-        /// The members of `invalidated` that are **upstream** of the target and
-        /// are there only because a Workspace Snapshot they produced is gone
-        /// (ADR-0061 s5): the rerun was *widened* to regenerate expired inputs
-        /// instead of failing a step that could never be provisioned. Empty on
-        /// an ordinary rerun, and on every event recorded before widening
-        /// existed — hence `default`, which is what keeps the read path
-        /// zero-migration (ADR-0022 expand-contract).
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        widened: Vec<StepId>,
     },
     /// A human retried a **Failed** step (ADR-0056 amendment 2026-07-22) — an
     /// attribution/audit fact, **NOT a Take boundary**. A Retry re-executes the
@@ -829,11 +796,6 @@ pub enum EventPayload {
         target: StepId,
         invalidated: Vec<StepId>,
         by: Option<String>,
-        /// As on [`RunRerunRequested`](EventPayload::RunRerunRequested): the
-        /// upstream steps dragged in to regenerate expired Workspace Snapshots
-        /// (ADR-0061 s5). Empty on an ordinary retry.
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        widened: Vec<StepId>,
     },
     /// A control plane that did not launch this attempt resumed supervising
     /// it (ADR-0047 re-adoption, surfaced by ADR-0056). Same attempt, same
@@ -866,20 +828,6 @@ pub enum EventPayload {
     StepServicesUnready {
         step: StepId,
         reason: String,
-    },
-    /// A human **pinned** this Run's Workspace Snapshots (ADR-0061 s5): keep
-    /// them past the cold tier's retention TTL, for an investigation. The pin is
-    /// a durable fact on the run row; this event is its audit half — who asked
-    /// for the exception and when — mirroring [`GateApproved`](EventPayload::GateApproved).
-    /// `by` is the acting principal (`None` only when auth is off).
-    RunSnapshotsPinned {
-        by: Option<String>,
-    },
-    /// A human released the pin, returning this Run's Workspace Snapshots to the
-    /// ordinary TTL. Recorded for the same reason as the pin: an exception that
-    /// costs storage should be attributable in both directions.
-    RunSnapshotsUnpinned {
-        by: Option<String>,
     },
     /// Escape hatch for forward-compatible payloads not yet modelled.
     Raw(serde_json::Value),
@@ -1160,8 +1108,6 @@ impl StepRun {
             id: attempt.clone(),
             started_at: at,
             failure: None,
-            failure_detail: None,
-            output_durability: None,
             outcome: AttemptOutcome::Running,
         });
         Ok(vec![
@@ -1243,9 +1189,6 @@ impl StepRun {
                     step: self.step.clone(),
                     attempt,
                     failure,
-                    // The pure state machine has no executor to ask; the
-                    // scheduler's settle path is where causes are known.
-                    cause: None,
                 },
                 at,
             ),
@@ -1461,64 +1404,12 @@ mod tests {
                 target,
                 invalidated,
                 by,
-                widened,
             } => {
                 assert_eq!(target, StepId("b".into()));
                 assert_eq!(invalidated, vec![StepId("b".into())]);
                 assert_eq!(by, None);
-                // A pre-ADR-0061 event carries no `widened` key at all; the
-                // `#[serde(default)]` is what keeps the read path zero-migration.
-                assert!(widened.is_empty());
             }
             other => panic!("expected RunRerunRequested, got {other:?}"),
         }
-    }
-
-    /// ADR-0064 / ticket 4cf03d7: `AttemptFinished` gained `cause`, and the
-    /// events table replays rows written before it existed. A literal
-    /// pre-`cause` JSON row must still deserialize (with `cause: None`) —
-    /// kills removing the field's `#[serde(default)]`, which would make every
-    /// replay of an old run's log fail at the first finished attempt.
-    #[test]
-    fn attempt_finished_without_cause_still_deserializes() {
-        let old = r#"{"AttemptFinished":{"step":"build","attempt":"a1","failure":{"Infra":{"never_started":false}}}}"#;
-        let payload: EventPayload = serde_json::from_str(old).expect("pre-cause row deserializes");
-        match payload {
-            EventPayload::AttemptFinished {
-                step,
-                attempt,
-                failure,
-                cause,
-            } => {
-                assert_eq!(step, StepId("build".into()));
-                assert_eq!(attempt, AttemptId("a1".into()));
-                assert_eq!(
-                    failure,
-                    Some(FailureKind::Infra {
-                        never_started: false
-                    })
-                );
-                assert_eq!(cause, None, "an old row simply has no recorded cause");
-            }
-            other => panic!("expected AttemptFinished, got {other:?}"),
-        }
-    }
-
-    /// And a cause that IS recorded survives the round-trip — kills a
-    /// `skip_serializing` (unconditional) mutation that would accept the cause
-    /// in memory and lose it in the persisted event.
-    #[test]
-    fn attempt_finished_cause_round_trips() {
-        let payload = EventPayload::AttemptFinished {
-            step: StepId("build".into()),
-            attempt: AttemptId("a2".into()),
-            failure: Some(FailureKind::Infra {
-                never_started: false,
-            }),
-            cause: Some("cold tier refused: connection refused".into()),
-        };
-        let json = serde_json::to_string(&payload).unwrap();
-        let back: EventPayload = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, payload);
     }
 }

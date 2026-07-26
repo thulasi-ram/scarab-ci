@@ -46,21 +46,10 @@ use scarab_engine::{
 };
 use scarab_identity::{Action, Principal, Session};
 
-/// ADR-0062 part 3: the **change set** of a Workspace Export — the exact paths an
-/// Attempt wrote, read out of an `overlayfs` upper layer rather than inferred.
-pub mod changeset;
 pub mod clone_executor;
 pub mod config;
 pub mod connections_config;
 pub mod converged;
-/// ADR-0062 part 2: the **Workspace Export** — the per-Attempt, writable view a
-/// Step Pod receives *as* its Workspace, and the capability that addresses it.
-pub mod export;
-/// ADR-0062 part 1: the **Snapshot Farm** — one Workspace Snapshot given tree
-/// shape on the service's own disk, by `reflink` where the filesystem offers it
-/// and a local copy where it does not. Never hardlinks: a hardlink shares its
-/// inode, so restoring a snapshot's mode/mtime would mutate the CAS blob.
-pub mod farm;
 pub mod forge_router;
 pub mod log_tail;
 pub mod logs;
@@ -69,21 +58,10 @@ pub mod oauth;
 pub mod oidc;
 pub mod retention;
 pub mod secret_executor;
-/// ADR-0062 part 3: folding an Attempt's **change set** back into the CAS — how a
-/// Workspace Export settles into a new Workspace Snapshot.
-pub mod settle;
-/// `--role workspace`: the ADR-0061 workspace service. Its own router, its own
-/// `/readyz`, and NO durable core — see the module docs.
-pub mod workspaced;
 
 pub use log_tail::{pump_log_stream, LogTailer};
 pub use logs::LogService;
 pub use secret_executor::SecretInjectingExecutor;
-
-/// The cold-tier Workspace-Snapshot retention default, in days — mirrors
-/// `config::Config::retention_workspace_days`'s default so a hand-built
-/// [`AppState`] and a booted server quote the same promise.
-pub const DEFAULT_SNAPSHOT_RETENTION_DAYS: u32 = 14;
 
 /// A wall-clock [`Clock`] for production wiring (tests inject `FakeClock`).
 pub struct SystemClock;
@@ -192,14 +170,6 @@ pub struct AppState {
     /// reported as MISSING merely because it is absent from `SecretProvider`.
     /// Empty by default (every credential resolves from the secret store).
     pub credential_overrides: Arc<connections_config::CredentialOverrides>,
-    /// How long a TERMINAL run's **Workspace Snapshots** are retained in the cold
-    /// tier, in days (ADR-0061 s5 / ADR-0050) — the same number the GC sweeper
-    /// runs on, surfaced so the API can *state the promise* instead of leaving it
-    /// implicit in a sweeper's config. Defaults to the config default (14); set it
-    /// from the boot config with
-    /// [`with_snapshot_retention_days`](AppState::with_snapshot_retention_days)
-    /// so the UI never quotes a different number than the sweeper enforces.
-    pub snapshot_retention_days: u32,
 }
 
 impl AppState {
@@ -230,16 +200,7 @@ impl AppState {
             oauth_login: None,
             public_url: "http://localhost:8080".into(),
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
-            snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
         }
-    }
-
-    /// The cold-tier Workspace-Snapshot retention window the sweeper actually
-    /// enforces (ADR-0061 s5). Wire it from `config.retention_workspace_days` so
-    /// what the UI promises and what GC does are one number.
-    pub fn with_snapshot_retention_days(mut self, days: u32) -> Self {
-        self.snapshot_retention_days = days;
-        self
     }
 
     /// Deployment-supplied connection credentials (ADR-0060 part D): the
@@ -688,69 +649,6 @@ pub struct RunStatusResponse {
     /// fact; absent for non-PR runs and runs created before base-stamping.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_pr_base: Option<String>,
-    /// This run's **Workspace Snapshot** retention promise (ADR-0061 s5) — the
-    /// cold tier's time bound, made explicit rather than left implicit in a
-    /// sweeper's config, plus any manual pin over it.
-    pub snapshot_retention: SnapshotRetentionDto,
-}
-
-/// The cold-tier retention promise over one Run's **Workspace Snapshots**
-/// (ADR-0061 s5).
-///
-/// ADR-0061 gives Workspace Snapshots two tiers with two policies. The warm
-/// workspace service is bounded by **space** (LRU) and promises nothing — a miss
-/// there is slower, never wrong. Object storage is the cold tier, bounded by
-/// **time**, and *that* is the guarantee a user is given. Everything in this DTO
-/// describes the cold tier only; nothing here can or should say anything about
-/// the warm tier.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct SnapshotRetentionDto {
-    /// The retention window in days — what the GC sweeper actually enforces.
-    pub retention_days: u32,
-    /// When this run's Workspace Snapshots stop being promised (epoch millis).
-    /// `None` while the run is **non-terminal**: a run that has not settled —
-    /// including one suspended on a gate for weeks — is never GC-eligible
-    /// regardless of age (ADR-0050), so no expiry applies yet. Also `None` while
-    /// **pinned**, because a pin holds the window open indefinitely.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<i64>,
-    /// The promise has **lapsed**: this run is terminal, unpinned, and past its
-    /// window, so its snapshots may already have been swept. Not the same as
-    /// "gone" — GC is periodic and content is shared, so data often outlives the
-    /// promise. The honest word for it is *expired*, not *deleted*, and a rerun
-    /// resolves the difference by checking the store.
-    pub expired: bool,
-    /// A human **pinned** this run's Workspace Snapshots — hold them past the
-    /// window for an investigation.
-    pub pinned: bool,
-    /// Who pinned it (`None` when unpinned, or when auth is off).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pinned_by: Option<String>,
-    /// When it was pinned, epoch millis.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pinned_at: Option<i64>,
-}
-
-/// Build the retention promise for a run from its durable facts plus the
-/// deployment's window. Pure, so the UI copy and the sweeper's behaviour cannot
-/// drift apart by arithmetic.
-fn snapshot_retention_dto(
-    r: &scarab_engine::SnapshotRetention,
-    retention_days: u32,
-    now: Timestamp,
-) -> SnapshotRetentionDto {
-    let pinned = r.pinned_at.is_some();
-    let window_ms = (retention_days as i64) * 24 * 60 * 60 * 1000;
-    // Only a settled, unpinned run is on the clock at all.
-    let expires_at = (!pinned && r.terminal).then(|| r.settled_at.0 + window_ms);
-    SnapshotRetentionDto {
-        retention_days,
-        expires_at,
-        expired: expires_at.is_some_and(|e| now.0 >= e),
-        pinned,
-        pinned_by: r.pinned_by.clone(),
-        pinned_at: r.pinned_at.map(|t| t.0),
-    }
 }
 
 /// `GET /v1/runs` body: the most recent runs, newest first.
@@ -991,20 +889,6 @@ pub struct AttemptDto {
     /// | `config`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
-    /// The executor's human-readable cause for a failed attempt (ticket
-    /// 4cf03d7) — e.g. "cold tier refused: connection refused" — alongside the
-    /// machine-consumed `failure` class. Absent = the class is the whole story
-    /// (or a pre-0041 row). Stored since migration 0041; served since ADR-0064
-    /// s2 (same endpoint, same consumer as `output_durability`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure_detail: Option<String>,
-    /// Where this attempt's output workspace snapshot was durable when its
-    /// verdict was granted (ADR-0064 s2): `object` | `separate-volume` |
-    /// `warm-only`. Absent = pre-s2 row, no workspace, or a stamp-less
-    /// backend. Per-attempt and historical — it reports what `Succeeded`
-    /// licensed THEN, not the deployment's tier now.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_durability: Option<String>,
     /// The attempt's recorded outcome (ADR-0056 amendment): `running` |
     /// `succeeded` | `failed` | `superseded` | `cancelled`. Unlike `failed` this
     /// distinguishes a *superseded* attempt (a rerun/retry replaced its input
@@ -1030,8 +914,6 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
         started_at: a.started_at.0,
         failed: a.failure.is_some(),
         failure,
-        failure_detail: a.failure_detail.clone(),
-        output_durability: a.output_durability.clone(),
         // The durable read (storage boundary) already resolved back-compat, so
         // `a.outcome` is authoritative here.
         outcome: a.outcome.as_str().to_string(),
@@ -1671,21 +1553,6 @@ async fn get_run(
     let trigger_title = st.db.run_trigger_title(&run).await?;
     let origin_pr_base = st.db.run_pr_base(&run).await?;
     let run_number = st.db.run_number(&run).await?;
-    // The cold tier's TIME bound, stated rather than implied (ADR-0061 s5). Cheap
-    // by construction: one row read plus arithmetic, no object-store round-trip —
-    // the *promise* is a function of the run's lifecycle, and whether the bytes
-    // happen to still be there is a separate (and more expensive) question the
-    // rerun plan answers.
-    let retention = st
-        .db
-        .run_snapshot_retention(&run)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    let snapshot_retention = snapshot_retention_dto(
-        &retention,
-        st.snapshot_retention_days,
-        st.clock.now().await,
-    );
     // Enrich each step with its sidecar services + shared-service opt-ins (ADR-
     // 0058) from the stored spec, so the FE can render sidecar nodes and `uses`
     // edges and address per-sidecar logs by index. A step with no stored spec
@@ -1727,7 +1594,6 @@ async fn get_run(
         pipeline,
         trigger_title,
         origin_pr_base,
-        snapshot_retention,
     }))
 }
 
@@ -2168,29 +2034,16 @@ async fn rerun_step(
     // event it emits carries WHO pressed it — the same attribution pattern as
     // gate approval.
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    let oracle = snapshot_oracle(&st);
     rerun_outcome(
-        scarab_engine::rerun_step_widened(
+        scarab_engine::rerun_step(
             &*st.db,
             &*st.clock,
-            oracle.as_deref(),
             &run,
             &StepId(step),
             Some(principal.subject),
         )
-        .await
-        .map(|_| ()),
+        .await,
     )
-}
-
-/// The ADR-0061 s5 snapshot-availability oracle, when this deployment has a
-/// workspace CAS wired. `None` (the local executor, which snapshots nothing)
-/// means no presence check and therefore no widening — the pre-0061 behaviour,
-/// which is correct there because there are no snapshots to expire.
-fn snapshot_oracle(st: &AppState) -> Option<Box<dyn scarab_engine::WorkspaceSnapshots>> {
-    st.workspace_cas.clone().map(|cas| {
-        Box::new(retention::CasSnapshots(cas)) as Box<dyn scarab_engine::WorkspaceSnapshots>
-    })
 }
 
 /// Retry a **Failed** step (ADR-0056 amendment) — another Attempt **in the
@@ -2217,195 +2070,16 @@ async fn retry_step(
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    let oracle = snapshot_oracle(&st);
     rerun_outcome(
-        scarab_engine::retry_step_widened(
+        scarab_engine::retry_step(
             &*st.db,
             &*st.clock,
-            oracle.as_deref(),
             &run,
             &StepId(step),
             Some(principal.subject),
         )
-        .await
-        .map(|_| ()),
+        .await,
     )
-}
-
-/// `GET …/steps/{step}/rerun-plan` body: what a rerun/retry of this step would
-/// actually execute — **before** the user confirms it (ADR-0061 s5, and
-/// ADR-0027's rule that smart never means mysterious).
-///
-/// A read-only dry run. The interesting case is a widened one: a Run reopened
-/// after its Workspace Snapshots expired cannot rerun just the step you pointed
-/// at, because the inputs that step consumes no longer exist — so the scope
-/// expands upstream to regenerate them, in the limit back to `clone`. That is a
-/// bigger action than the button implies, so it has to be visible first.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct RerunPlanResponse {
-    /// The step the plan is for.
-    pub target: String,
-    /// Every step that would re-execute, sorted — the invalidation set after any
-    /// widening.
-    pub invalidated: Vec<String>,
-    /// The subset of `invalidated` present only because a Workspace Snapshot
-    /// expired: upstream steps dragged in to regenerate data. Empty on an
-    /// ordinary rerun.
-    pub widened: Vec<String>,
-    /// The steps the rerun effectively **starts from** (no dependency inside the
-    /// set). `[target]` on an ordinary rerun; on a widened one this is the phrase
-    /// the affordance says out loud — "this re-runs from *clone*".
-    pub starts_from: Vec<String>,
-    /// Each expired input that caused the widening: the consuming step, the step
-    /// that produced the missing snapshot, and its CAS root.
-    pub expired_inputs: Vec<ExpiredInputDto>,
-}
-
-/// One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5).
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ExpiredInputDto {
-    /// The step whose input workspace is incomplete.
-    pub consumer: String,
-    /// The upstream step that produced the missing snapshot.
-    pub produced_by: String,
-    /// The CAS merkle root the store no longer holds.
-    pub root: String,
-}
-
-/// Preview a rerun/retry of a step: the resolved scope, and whether expired
-/// Workspace Snapshots widened it (ADR-0061 s5).
-#[utoipa::path(
-    get,
-    path = "/v1/runs/{id}/steps/{step}/rerun-plan",
-    params(
-        ("id" = String, Path, description = "run id"),
-        ("step" = String, Path, description = "step id")
-    ),
-    responses(
-        (status = 200, body = RerunPlanResponse),
-        (status = 404, description = "no such run or step")
-    )
-)]
-async fn rerun_plan(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path((id, step)): Path<(String, String)>,
-) -> Result<Json<RerunPlanResponse>, ApiError> {
-    let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    // A preview mutates nothing, so Read is the right authority — the same
-    // principal who can see the run can see what reruning it would cost.
-    authorize_scoped(&st, &headers, Action::Read, scope.as_ref()).await?;
-    let oracle = snapshot_oracle(&st);
-    let plan = scarab_engine::plan_rerun(&*st.db, oracle.as_deref(), &run, &StepId(step))
-        .await
-        .map_err(|e| match e {
-            RerunError::StepNotFound(_) => ApiError::NotFound,
-            RerunError::Db(e) => ApiError::Db(e),
-            other => ApiError::Conflict(other.to_string()),
-        })?;
-    Ok(Json(RerunPlanResponse {
-        target: plan.target.0,
-        invalidated: plan.invalidated.into_iter().map(|s| s.0).collect(),
-        widened: plan.widened.into_iter().map(|s| s.0).collect(),
-        starts_from: plan.starts_from.into_iter().map(|s| s.0).collect(),
-        expired_inputs: plan
-            .expired
-            .into_iter()
-            .map(|e| ExpiredInputDto {
-                consumer: e.consumer.0,
-                produced_by: e.produced_by.0,
-                root: e.root,
-            })
-            .collect(),
-    }))
-}
-
-/// **Pin** this run's Workspace Snapshots (ADR-0061 s5): keep them past the cold
-/// tier's retention TTL, so an investigation is not raced by the GC sweeper.
-///
-/// The pin acts on the cold tier's **time** bound only. It says nothing about the
-/// warm workspace service, which is bounded by space and evicts least-recently-
-/// used by design — a warm miss is slower, never wrong, so there is nothing there
-/// to protect. Idempotent; recorded with who pinned it and when.
-#[utoipa::path(
-    post,
-    path = "/v1/runs/{id}/snapshots-pin",
-    params(("id" = String, Path, description = "run id")),
-    responses(
-        (status = 200, body = SnapshotRetentionDto, description = "pinned"),
-        (status = 404, description = "no such run")
-    )
-)]
-async fn pin_run_snapshots(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<SnapshotRetentionDto>, ApiError> {
-    let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    if !scarab_engine::pin_run_snapshots(
-        &*st.db,
-        &*st.clock,
-        &run,
-        Some(principal.subject.clone()),
-    )
-    .await?
-    {
-        return Err(ApiError::NotFound);
-    }
-    current_snapshot_retention(&st, &run).await
-}
-
-/// Release the [pin](pin_run_snapshots), returning this run's Workspace Snapshots
-/// to the ordinary retention window. Idempotent.
-#[utoipa::path(
-    delete,
-    path = "/v1/runs/{id}/snapshots-pin",
-    params(("id" = String, Path, description = "run id")),
-    responses(
-        (status = 200, body = SnapshotRetentionDto, description = "pin released"),
-        (status = 404, description = "no such run")
-    )
-)]
-async fn unpin_run_snapshots(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<SnapshotRetentionDto>, ApiError> {
-    let run = RunId(id);
-    let scope = run_scope(&st, &run).await;
-    let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    if !scarab_engine::unpin_run_snapshots(
-        &*st.db,
-        &*st.clock,
-        &run,
-        Some(principal.subject.clone()),
-    )
-    .await?
-    {
-        return Err(ApiError::NotFound);
-    }
-    current_snapshot_retention(&st, &run).await
-}
-
-/// Re-read and project one run's retention promise — what both pin endpoints
-/// return, so a client never has to re-fetch the whole run to see the effect.
-async fn current_snapshot_retention(
-    st: &AppState,
-    run: &RunId,
-) -> Result<Json<SnapshotRetentionDto>, ApiError> {
-    let r = st
-        .db
-        .run_snapshot_retention(run)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    Ok(Json(snapshot_retention_dto(
-        &r,
-        st.snapshot_retention_days,
-        st.clock.now().await,
-    )))
 }
 
 /// Cancel a run (ADR-0054): drive its non-terminal steps and the run to
@@ -7587,9 +7261,6 @@ impl utoipa::Modify for TagGroups {
         debug_pod_step,
         rerun_step,
         retry_step,
-        rerun_plan,
-        pin_run_snapshots,
-        unpin_run_snapshots,
         cancel_run,
         list_artifacts,
         download_artifact,
@@ -7618,9 +7289,6 @@ impl utoipa::Modify for TagGroups {
         RunListResponse,
         RunSummaryDto,
         RunStatusResponse,
-        SnapshotRetentionDto,
-        RerunPlanResponse,
-        ExpiredInputDto,
         StepStatusDto,
         StepServiceDto,
         AttemptDto,
@@ -7699,15 +7367,6 @@ fn router_inner(state: AppState) -> Router {
         // same handler, intentionally NOT in the OpenAPI surface.
         .route("/v1/runs/{id}/steps/{step}/restart", post(rerun_step))
         .route("/v1/runs/{id}/steps/{step}/retry", post(retry_step))
-        // The rerun PREVIEW (ADR-0061 s5): what the rerun would actually execute,
-        // read before the button is pressed so a widened scope is never a surprise.
-        .route("/v1/runs/{id}/steps/{step}/rerun-plan", get(rerun_plan))
-        // The manual Workspace-Snapshot pin (ADR-0061 s5) — one resource, two
-        // verbs, because pin and unpin are the same fact in two states.
-        .route(
-            "/v1/runs/{id}/snapshots-pin",
-            post(pin_run_snapshots).delete(unpin_run_snapshots),
-        )
         .route("/v1/runs/{id}/cancel", post(cancel_run))
         .route("/v1/runs/{id}/artifacts", get(list_artifacts))
         .route("/v1/runs/{id}/artifacts/{*name}", get(download_artifact))

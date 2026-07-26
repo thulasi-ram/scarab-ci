@@ -77,7 +77,6 @@ fn failed(class: FailureClass) -> ExecState {
     ExecState::Failed {
         exit_code: None,
         class,
-        cause: None,
     }
 }
 

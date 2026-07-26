@@ -37,11 +37,6 @@ trust posture.
 
 ## Decision
 
-> **Addendum 2026-08-01 (ADR-0061 s3-drain):** the trusted-egress role this ADR established —
-> a Scarab-owned, credentialed container beside the untrusted step doing acknowledged egress —
-> now also lives in the `scarab-wsfetch` helper binary, whose egress container drains
-> `/workspace` to the Data Depot in-Pod (`hold`/`drain` + a Depot-validated DrainRecord).
-
 A **trusted per-Pod egress sidecar** carries results out with acknowledged delivery:
 
 1. **Files in, over a shared volume.** The step container and a sidecar share an `emptyDir`

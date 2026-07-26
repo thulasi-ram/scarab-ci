@@ -4,11 +4,6 @@
 #   * Pure domain crates depend ONLY on serde / serde_json / thiserror /
 #     async-trait and on each other. They list NO infra crate (sqlx, kube,
 #     reqwest, object_store, axum, tokio-runtime, aws) in their Cargo.toml.
-#     A further I/O-free library (`cel-interpreter`, `sha2`, `tracing`) may be
-#     admitted per ADR-0031 when the capability is part of the domain rather
-#     than of a backend — see the `allowed inside pure domain crates` block
-#     below, and the justification each admitting crate carries next to its own
-#     dependency line, so the exception is argued rather than assumed.
 #   * Adapter crates pair a domain crate with exactly one infra crate and
 #     hold the stub `impl`s of that domain's ports.
 #   * The purity boundary is enforced by crate dependency edges: an infra
@@ -31,22 +26,6 @@ serde_yaml = "0.9"
 cel-interpreter = { version = "0.10", features = ["json"] }
 thiserror = "2"
 async-trait = "0.1"
-# The I/O-free-library carve-out (ADR-0031, amending ADR-0016). These two sit
-# HERE, not under
-# `infra` below, because a pure crate may name them — the header above and this
-# table have to agree or the boundary is decided by whichever one a reader
-# happens to check. Each admitting crate still argues the exception next to its
-# own dependency line (see `crates/scarab-storage/Cargo.toml`).
-#
-# `sha2`: SHA-256 is a pure function, and ADR-0029 makes the content address a
-# DOMAIN fact — a snapshot *is* the merkle root of its canonical tree bytes.
-sha2 = "0.10"
-# `tracing`: a facade, not a backend. No I/O, no clock, no sockets; without a
-# subscriber every macro compiles to nothing, and the subscriber is installed by
-# the composition root. Admitted so a pure crate whose behaviour only exists as
-# a log line (e.g. `TieredCas`'s loud-but-non-fatal warm-write failure) can be
-# loud instead of silently swallowing.
-tracing = "0.1"
 
 # --- internal crates (path deps) -------------------------------------------
 scarab-engine = { path = "crates/scarab-engine" }
@@ -61,10 +40,6 @@ scarab-forge-github = { path = "crates/scarab-forge-github" }
 scarab-forge-forgejo = { path = "crates/scarab-forge-forgejo" }
 scarab-secrets-postgres = { path = "crates/scarab-secrets-postgres" }
 scarab-storage-s3 = { path = "crates/scarab-storage-s3" }
-# ADR-0061: the workspace service's client, behind both `Cas` and
-# `ContentSource`. An adapter over reqwest — no kube, so the node driver can use
-# it without linking the kubernetes executor.
-scarab-workspace-client = { path = "crates/scarab-workspace-client" }
 scarab-executor-k8s = { path = "crates/scarab-executor-k8s" }
 scarab-executor-local = { path = "crates/scarab-executor-local" }
 scarab-testkit = { path = "crates/scarab-testkit" }
@@ -80,9 +55,7 @@ regex-lite = "0.1"
 flate2 = "1"
 tower = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
-# NB `tracing` itself is NOT here — it is a pure-crate-admissible facade, listed
-# in the allowed block above. `tracing-subscriber` IS infra: it is the backend
-# that actually writes, installed only by the composition root.
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "migrate", "macros", "json"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
@@ -90,8 +63,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 # note in scarab-server/src/main.rs. `ring` matches sqlx's `tls-rustls-ring`.
 rustls = { version = "0.23", features = ["ring"] }
 object_store = { version = "0.14", features = ["aws"] }
-# NB `sha2` is NOT here — see the allowed block above. `hmac` stays: it needs a
-# key, which is a deployment secret, so it belongs to a boundary not a domain.
+sha2 = "0.10"
 hmac = "0.12"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 rand = "0.8"
@@ -99,13 +71,6 @@ base64 = "0.22"
 jsonwebtoken = "9"
 tar = "0.4"
 tempfile = "3"
-# Reflink/CoW copy for the Snapshot Farm. Replaces hand-declared FICLONE +
-# clonefile FFI; covers Linux, APFS (the dev loop) and Windows ReFS.
-# NOT the `reflink` crate — that one has been abandoned since 2019.
-reflink-copy = "0.1"
-# l*xattr, for reading the overlay's trusted.* markers. Linux-only at the
-# call site; the crate itself is unconditional here.
-xattr = "1"
 rsa = { version = "0.9", features = ["pem"] }
 kube = { version = "4", default-features = false, features = ["client", "ws", "rustls-tls"] }
 k8s-openapi = { version = "0.28", features = ["latest"] }

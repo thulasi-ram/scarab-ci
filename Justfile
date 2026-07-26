@@ -41,16 +41,6 @@ up:
 demo:
     bash deploy/local-proc/demo.sh
 
-# `just demo` is ONE step with no `needs:`, so it never crosses a Step boundary and
-# exercises the workspace drain and none of the feed. Since ADR-0061 s3-feed the
-# feed is an init container that dials the workspace service, and this is the
-# cheapest real proof that it works — `consume` asserts on the CONTENT it
-# inherited, so a silently empty /workspace fails it.
-
-# Submit a CHAINED pipeline (produce → consume) — proves the workspace feed leg.
-demo-chain:
-    bash deploy/local-proc/demo-chain.sh
-
 # Tear down the whole stack.
 down:
     bash deploy/local-proc/down.sh
@@ -59,43 +49,10 @@ down:
 logs:
     tail -f deploy/local-proc/server.log
 
-# The workspace service (ADR-0061) is a SECOND process of the same binary, run by
-# `just up` with --role workspace, so its output never appears in `just logs`. A
-# warm-tier warning ("warm tier full — serving from cold") or a 401 from a Step
-# lands in its log, not the server's.
-
-# Tail the workspace service's log (ADR-0061).
-workspace-logs:
-    tail -f deploy/local-proc/workspace.log
-
-# `warm_used_bytes` is the gauge that matters: LRU eviction is NOT implemented
-# yet, so that number against the volume size is the entire budget. Readiness
-# here means warm writable + cold reachable — deliberately not the control
-# plane's database check.
-
-# Readiness + gauges of the local workspace service (ADR-0061).
-workspace-status port="8081":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "== /readyz =="; curl -sf "http://127.0.0.1:{{port}}/readyz" || echo "NOT READY"
-    echo; echo "== /metrics =="; curl -sf "http://127.0.0.1:{{port}}/metrics"
-
 # Requires deploy/local-helm/.env and kube context `colima`. Usage:
 #   just local-helm             # pull + deploy the latest ghcr `edge`
 #   just local-helm sha-abc123  # pull + deploy a specific published SHA
-#   just local-helm local       # build server+clone+sidecar+wsfetch locally, then deploy
-#
-# NFS prerequisite (ADR-0062 stage 2b ONLY — probed 2026-08-02):
-#   Nothing here needs an NFS client today, and nothing in stage 2a will: the
-#   `LocalPath` delivery hands a co-located Step the Depot's overlay through a
-#   `local` PV, no network. Only the NFS-delivered Export (2b) needs a client on
-#   each Step node, and the colima VM ships without one:
-#       colima ssh -- sudo apt-get update && colima ssh -- sudo apt-get install -y nfs-common
-#   Installed once, it survives `colima stop`/`start` and is lost on `colima
-#   delete`. Without it kubelet fails with "you might need a /sbin/mount.nfs
-#   helper program" and the Pod hangs in ContainerCreating FOREVER — no event
-#   worth reading, no timeout. Any PV we create must also pin
-#   `mountOptions: [nfsvers=4.2]` (see the kind note in deploy/local-proc/up.sh).
+#   just local-helm local       # build server+clone+sidecar locally, then deploy
 
 # Deploy the Helm dogfood stack on colima; pulls ghcr by default, `local` builds.
 local-helm ref="edge":
@@ -103,27 +60,13 @@ local-helm ref="edge":
     set -euo pipefail
     owner=ghcr.io/thulasi-ram
     if [ "{{ref}}" = "local" ]; then
-      echo "==> building server + clone + sidecar + wsfetch from the working tree"
+      echo "==> building server + clone + sidecar from the working tree"
       docker build -t scarab-server:dogfood-local -f docker/server/Dockerfile .
       docker build -t scarab-clone:dogfood docker/clone
       docker build -t scarab-results-sidecar:dogfood docker/sidecar
-      # The ADR-0061 wsfetch image — TWO jobs since s3-drain: the s3-feed fetcher
-      # init container AND the egress helper every workspace Pod carries
-      # (`scarab-wsfetch hold` + the in-Pod `drain` the control plane execs).
-      # Context is the repo root: it is a bin target of
-      # crates/scarab-workspace-client. Under ADR-0062 the Export replaces the
-      # in-cluster FEED, but this image does NOT go away — it stays the fetch
-      # path for modes without an Export and the drain helper regardless (the
-      # old node-driver deletion note, git-bug 0628369, is closed as
-      # superseded). Rollout order: this image must land BEFORE a control
-      # plane that expects the drain helper — a stale image makes every drain
-      # exit 0 with NO record, a prompt Config failure naming the skew (see
-      # deploy/helm values comment).
-      docker build -t scarab-wsfetch:dogfood -f docker/wsfetch/Dockerfile .
       IMAGE_REPOSITORY=scarab-server \
       SCARAB_CLONE_IMAGE=scarab-clone:dogfood \
       SCARAB_SIDECAR_IMAGE=scarab-results-sidecar:dogfood \
-      SCARAB_WSFETCH_IMAGE=scarab-wsfetch:dogfood \
         bash deploy/local-helm/deploy.sh dogfood-local
     else
       echo "==> pulling + deploying published images @ {{ref}} (ghcr, pullPolicy Always)"
@@ -131,7 +74,6 @@ local-helm ref="edge":
       IMAGE_PULL_POLICY=Always \
       SCARAB_CLONE_IMAGE="$owner/scarab-clone:{{ref}}" \
       SCARAB_SIDECAR_IMAGE="$owner/scarab-results-sidecar:{{ref}}" \
-      SCARAB_WSFETCH_IMAGE="$owner/scarab-wsfetch:{{ref}}" \
         bash deploy/local-helm/deploy.sh {{ref}}
     fi
 
@@ -285,97 +227,6 @@ forgejo-verify keep="0":
     cargo nextest run -p scarab-forge-forgejo --test live --no-fail-fast
     cargo nextest run -p scarab-e2e --test forgejo_onboarding --no-fail-fast
 
-# LIVE k8s executor tier (`crates/scarab-executor-k8s/tests/cluster.rs`) — the
-# same tier `.github/workflows/kind.yml` runs, against the proc-mode kind cluster.
-#
-# It exists because that tier needs far more than a cluster: an ADR-0061 workspace
-# service reachable BOTH from the host and from a Pod, the fetcher/clone/sidecar
-# images inside the node, an in-cluster registry, and a host address a Pod can
-# POST to. Nothing local supplied any of it, so seven cases skipped — five of
-# which had been passing — while `kind/cluster-tests` reported PASS. Those cases
-# now PANIC on a missing var rather than skip, so this recipe is the local half of
-# the repair: it is the only supported way to run the tier by hand.
-#
-# It does NOT tear the stack down: the suite is slow, you will want to poke at the
-# cluster afterwards, and `just down` runs `compose down -v` which would take the
-# shared dev Postgres with it. Stop with `just down` when you are actually done.
-#
-# Usage: `just kube-tests` | `just kube-tests workspace_flows` (nextest filter).
-kube-tests filter="":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # 1. The stack. Idempotent, and it re-probes the Pod-reachable workspace URL,
-    #    so a stale .env.generated from a torn-down cluster cannot be used.
-    bash deploy/local-proc/up.sh
-    set -a
-    source deploy/local-proc/.env
-    source deploy/local-proc/.env.generated
-    set +a
-    # The ISOLATED kubeconfig, never the ambient context: production EKS contexts
-    # sit next to the local one and this suite creates and deletes Pods.
-    export KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
-    ns="${SCARAB_TEST_KUBE_NS:-scarab}"
-    cluster=scarab-dev
-    # 2. The step images the tier drives. up.sh needs neither (it only builds the
-    #    fetcher), so they are built and kind-loaded here.
-    for entry in "scarab-clone:kube-tests docker/clone" "scarab-results-sidecar:kube-tests docker/sidecar"; do
-      set -- $entry
-      echo "==> building $1"
-      docker build -q -t "$1" "$2" >/dev/null
-      kind load docker-image "$1" --name "$cluster" >/dev/null
-    done
-    export SCARAB_TEST_CLONE_IMAGE=scarab-clone:kube-tests
-    export SCARAB_TEST_SIDECAR_IMAGE=scarab-results-sidecar:kube-tests
-    # 3. The plain-HTTP registry the `kind: build` case pushes to and then reads
-    #    the tag list of, from inside the cluster (same shape as kind.yml).
-    echo "==> ensuring an in-cluster registry in namespace $ns"
-    kubectl apply -n "$ns" -f - <<EOF
-    apiVersion: apps/v1
-    kind: Deployment
-    metadata:
-      name: registry
-    spec:
-      replicas: 1
-      selector:
-        matchLabels: { app: registry }
-      template:
-        metadata:
-          labels: { app: registry }
-        spec:
-          containers:
-            - name: registry
-              image: registry:2
-              ports:
-                - containerPort: 5000
-    ---
-    apiVersion: v1
-    kind: Service
-    metadata:
-      name: registry
-    spec:
-      selector: { app: registry }
-      ports:
-        - port: 5000
-          targetPort: 5000
-    EOF
-    kubectl rollout status deployment/registry -n "$ns" --timeout=180s
-    export SCARAB_TEST_REGISTRY="registry.$ns.svc.cluster.local:5000"
-    # 4. The clone cases fetch THIS repo at a SHA that must exist ON THE FORGE, so
-    #    the default is origin/main and not HEAD (which may be unpushed). The repo
-    #    is private, hence the token — delivered via tmpfs + GIT_ASKPASS (ADR-0045).
-    export SCARAB_TEST_CLONE_SHA="${SCARAB_TEST_CLONE_SHA:-$(git rev-parse origin/main)}"
-    export SCARAB_TEST_CLONE_TOKEN="${SCARAB_TEST_CLONE_TOKEN:-$(gh auth token 2>/dev/null || true)}"
-    export SCARAB_TEST_KUBE=1
-    echo "==> running the live tier (ns=$ns, workspace=$SCARAB_TEST_WORKSPACE_URL,"
-    echo "    pod-facing=$SCARAB_TEST_WORKSPACE_POD_URL, fetcher=$SCARAB_TEST_WSFETCH_IMAGE)"
-    if [ -n "{{filter}}" ]; then
-      cargo nextest run -p scarab-executor-k8s --test cluster \
-        --run-ignored all --no-fail-fast -E 'test(~{{filter}})'
-    else
-      cargo nextest run -p scarab-executor-k8s --test cluster \
-        --run-ignored all --no-fail-fast
-    fi
-
 # UI no-DOM suite (test-strategy Phase 3, base of the UI pyramid): vitest over
 # the run-detail derivations — event folding, Takes, attempts, logs, DAG layout.
 # No jsdom, no browser, no server; runs in under a second.
@@ -391,31 +242,6 @@ ui-e2e:
     npx --prefix ui/scarab-web-ui playwright install chromium
     npm --prefix ui/scarab-web-ui run test:e2e
 
-# Contract gate (mirrors the CI `openapi-drift` job, ADR-0054): regenerate the
-# OpenAPI spec and the generated TS client, then fail if either differs from
-# what is committed. Full-route coverage is asserted by the test suite
-# (every_registered_route_is_in_the_openapi_spec) — this gates DRIFT only.
-openapi-drift:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "==> regenerating openapi.json"
-    cargo run -p scarab-server -- --emit-openapi openapi.json
-    git diff --exit-code openapi.json || {
-      echo "error: openapi.json is stale — regenerate and commit it:" >&2
-      echo "  cargo run -p scarab-server -- --emit-openapi openapi.json" >&2
-      exit 1
-    }
-    echo "==> regenerating the UI client"
-    npm --prefix ui/scarab-web-ui ci
-    npm --prefix ui/scarab-web-ui run gen
-    npm --prefix ui/scarab-web-ui run typecheck
-    git diff --exit-code ui/scarab-web-ui/src/api/schema.ts || {
-      echo "error: the generated TS client is stale — regenerate and commit it:" >&2
-      echo "  npm --prefix ui/scarab-web-ui run gen" >&2
-      exit 1
-    }
-    echo "==> no drift: openapi.json and schema.ts match the code"
-
 # Merge gate: are PR <n>'s REQUIRED checks green? Run this before merging.
 # Branch protection and rulesets are both unavailable on this repo (private,
 # free plan → 403), so this is the enforcement, not a convenience: the required
@@ -426,133 +252,6 @@ pr-gate n:
 # Compile-check everything.
 check:
     cargo check --workspace
-
-# Re-assert the substrate facts ADR-0062 rests on (kube context must be `colima`).
-#
-# ADR-0062 picks its design because of a handful of kernel and PodSecurity
-# behaviours — Bidirectional needs privilege, `baseline` already forbids it,
-# `restricted` forbids inline `nfs:` but allows a PVC, overlayfs copy-up leaves
-# the lower layer intact, a hardlink shares its inode, metacopy does not help.
-# Every one of those is a property of a kernel version or an admission plugin, so
-# a colima/k3s bump can invalidate the ADR's reasoning WITHOUT ANY CODE CHANGING.
-#
-# This asserts them and fails loudly, naming the ADR section that would have to
-# be rewritten. It is not a demo: it prints no number it does not check.
-adr0062-substrate:
-    bash scripts/adr0062_substrate.sh
-
-# LIVE proof of ADR-0062 part 3: mount a REAL overlayfs, write/delete/replace/
-# rename through it, and assert the change set read out of the upper layer is
-# exactly what the Step did (crates/scarab-server/tests/changeset_overlay.rs).
-#
-# Everything in `changeset.rs`'s unit tests is a claim about what the KERNEL puts
-# in an upper directory. This is the only place that claim meets a kernel — so it
-# needs Linux, CAP_SYS_ADMIN (to mount, and to read `trusted.overlay.*` at all)
-# and an upperdir on a real disk filesystem. It cannot run on darwin and it
-# cannot run in CI, and it FAILS LOUDLY rather than skipping when it cannot:
-# `SCARAB_TEST_OVERLAY` unset behind `--ignored` is now a panic, because a tier
-# that reports PASS having executed nothing is the exact defect 505f313 repaired.
-#
-# The binary is built as YOU and only executed under sudo — `sudo cargo test`
-# would leave root-owned artifacts all over target/.
-#
-# Usage: `just overlay-tests` | `just overlay-tests /mnt/scratch` (upperdir).
-overlay-tests dir="/var/tmp/scarab-overlay":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if [ "$(uname -s)" != "Linux" ]; then
-      echo "REFUSING: this host is $(uname -s). \`overlayfs\` and the \`trusted.overlay.*\` xattr" >&2
-      echo "namespace are LINUX KERNEL features — there is nothing here for this tier to prove," >&2
-      echo "and a recipe that shrugged and exited 0 would be the failure it exists to prevent." >&2
-      echo "Run it on a Linux host: a VM, a kind/colima node, or 'docker run --privileged'." >&2
-      exit 2
-    fi
-    dir="{{dir}}"
-    mkdir -p "$dir"
-    # An overlay upperdir cannot live on tmpfs, and it cannot be stacked on an
-    # overlay rootfs (ADR-0062 measured both). Caught here rather than as an
-    # inscrutable `mount: wrong fs type` two minutes into the run.
-    fstype=$(stat -f -c %T "$dir")
-    case "$fstype" in
-      tmpfs|ramfs|overlayfs|overlay)
-        echo "REFUSING: $dir is on $fstype, which cannot serve as an overlayfs upperdir." >&2
-        echo "Point the recipe at a real ext4/xfs/btrfs directory: just overlay-tests /mnt/scratch" >&2
-        exit 2 ;;
-    esac
-    echo "==> upperdir $dir ($fstype), kernel $(uname -r)"
-    bin=$(cargo test -p scarab-server --test changeset_overlay --no-run --message-format=json \
-      | python3 -c "import sys, json; a = [m['executable'] for m in map(json.loads, sys.stdin) if m.get('reason') == 'compiler-artifact' and m.get('executable') and m.get('target', {}).get('name') == 'changeset_overlay']; print(a[-1] if a else '')")
-    [ -n "$bin" ] || { echo "could not locate the changeset_overlay test binary" >&2; exit 1; }
-    run=(env SCARAB_TEST_OVERLAY=1 SCARAB_TEST_OVERLAY_DIR="$dir" "$bin" --ignored --nocapture --test-threads=1)
-    if [ "$(id -u)" = 0 ]; then "${run[@]}"; else sudo "${run[@]}"; fi
-
-# The same tier, ACTUALLY EXECUTED, from a darwin laptop (ADR-0062 s2a-1).
-#
-# `just overlay-tests` refuses on darwin — correctly, and that refusal is exactly
-# why the overlay tier had never run ANYWHERE: the claims in `changeset.rs` about
-# what a kernel puts in an upper directory were only ever checked by unit tests
-# that build the upper themselves. The nearest kernel that can settle them is
-# already on this laptop: the colima VM (Ubuntu 24.04, 6.8.0-117-generic, ext4)
-# that `just adr0062-substrate` pins. This runs the real test binary there.
-#
-# Docker, not kubernetes. The tier needs three things — Linux, CAP_SYS_ADMIN, and
-# an upperdir on a real disk filesystem — and a `--privileged` container on the
-# colima node has all three (verified: mount -t overlay, redirect_dir=on, and
-# `trusted.overlay.*` reads all work). A Pod would add a namespace, a PSA
-# exemption and a cleanup obligation next to the operator's live dogfood stack
-# for no additional proof.
-#
-# Cargo runs INSIDE the VM because this host has no aarch64-linux cross
-# toolchain (no zig, no cross, no musl-cross), and installing one to avoid a
-# container is a bigger, less reproducible dependency than the container.
-# The VM has 2 vCPU, so the FIRST run is a cold ~40min workspace build; the
-# registry and target dir live in named volumes, so a rerun is seconds. The
-# container is memory-capped so a rustc that overreaches is killed instead of
-# the dogfood stack sharing the VM.
-#
-# Reset the caches with:
-#   docker volume rm scarab-overlay-cargo scarab-overlay-target scarab-overlay-scratch
-overlay-tests-colima image="rust:1-bookworm":
-    #!/usr/bin/env bash
-    set -euo pipefail
-    # This recipe runs containers on the machine that also hosts the operator's
-    # dogfood stack, and production EKS contexts sit next to the local one. Both
-    # handles must point at colima or we stop — even though only docker is used,
-    # a kube context that is not colima means this shell is aimed somewhere else.
-    dctx=$(docker context show)
-    if [ "$dctx" != "colima" ]; then
-      echo "REFUSING: docker context is '$dctx', not 'colima'." >&2
-      echo "This recipe runs a --privileged container; it will only do that on the local VM." >&2
-      exit 2
-    fi
-    if command -v kubectl >/dev/null 2>&1; then
-      kctx=$(kubectl config current-context 2>/dev/null || echo none)
-      if [ "$kctx" != "colima" ]; then
-        echo "REFUSING: kube context is '$kctx', not 'colima'." >&2
-        exit 2
-      fi
-    fi
-    # Named volumes: /var/lib/docker is ext4 on the VM, so /scratch is a legal
-    # overlayfs upperdir — the container ROOTFS is not (it is overlayfs itself,
-    # and overlay-on-overlay is refused), which is the whole reason for this mount.
-    for v in scarab-overlay-cargo scarab-overlay-target scarab-overlay-scratch; do
-      docker volume create "$v" >/dev/null
-    done
-    echo "==> node: $(colima ssh -- uname -r 2>/dev/null || echo '?'), image {{image}}, repo mounted read-only"
-    docker run --rm --privileged \
-      --memory=2g --memory-swap=2g \
-      -v "$PWD:/repo:ro" \
-      -v scarab-overlay-cargo:/cargo \
-      -v scarab-overlay-target:/target \
-      -v scarab-overlay-scratch:/scratch \
-      -w /repo \
-      -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target \
-      -e CARGO_BUILD_JOBS=2 -e CARGO_INCREMENTAL=0 \
-      -e CARGO_PROFILE_DEV_DEBUG=0 -e CARGO_PROFILE_TEST_DEBUG=0 \
-      -e SCARAB_TEST_OVERLAY=1 -e SCARAB_TEST_OVERLAY_DIR=/scratch/upper \
-      {{image}} \
-      sh -c 'mkdir -p /scratch/upper && cargo test --locked -p scarab-server \
-        --test changeset_overlay -- --ignored --nocapture --test-threads=1'
 
 # Reclaim build-cache disk. Cargo NEVER garbage-collects `target/`: every
 # fingerprint change (branch switch, dep bump, feature flag) writes a new

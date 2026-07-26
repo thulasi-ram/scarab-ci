@@ -38,9 +38,6 @@ import {
   Sun,
   Moon,
   User,
-  Pin,
-  PinOff,
-  Clock,
 } from "lucide";
 
 // IconNode = Array<[tagName, attributes]>.
@@ -81,11 +78,6 @@ const ICONS: Record<string, IconNode> = {
   sun: Sun as IconNode,
   moon: Moon as IconNode,
   user: User as IconNode,
-  // The Workspace-Snapshot retention affordances (ADR-0061 s5): the manual pin
-  // and the cold tier's time bound.
-  pin: Pin as IconNode,
-  "pin-off": PinOff as IconNode,
-  clock: Clock as IconNode,
 };
 
 export function iconNode(name: string): IconNode | undefined {

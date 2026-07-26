@@ -1,7 +1,7 @@
 // Activity-rail event rendering: categorisation (glyph/colour) and the
 // step-chip split, over representative event shapes.
 import { describe, it, expect } from "vitest";
-import { describeEvent, eventParts, eventCategory, EVENT_GLYPH } from "./events";
+import { describeEvent, eventParts, eventCategory } from "./events";
 import { ev, started, finished, transitioned, rerun, retryRequested, readoptedEv } from "./event-fixtures";
 
 describe("eventCategory", () => {
@@ -65,43 +65,5 @@ describe("describeEvent / eventParts", () => {
     const parts = eventParts(rerun(1, "b", ["c"], "a.kim"));
     expect(parts.step).toBeNull();
     expect(parts.text).toBe("b reran by a.kim — new version");
-  });
-
-  it("names the snapshot pin and unpin, with their actor (ADR-0061 s5)", () => {
-    // Keeping a run's Workspace Snapshots past the retention window costs storage, so the
-    // rail records both directions and attributes both. Neither is an execution
-    // event, so neither gets a louder category than `info`.
-    expect(describeEvent(ev(1, { RunSnapshotsPinned: { by: "priya" } }))).toBe(
-      "Workspace snapshots pinned by priya — kept past the retention window",
-    );
-    expect(describeEvent(ev(2, { RunSnapshotsUnpinned: { by: "priya" } }))).toBe(
-      "Workspace snapshots unpinned by priya — back to the retention window",
-    );
-    // `by` is null when auth is off — the line must still read.
-    expect(describeEvent(ev(3, { RunSnapshotsPinned: { by: null } }))).toBe(
-      "Workspace snapshots pinned — kept past the retention window",
-    );
-  });
-
-  it("does not give a retention decision an execution category", () => {
-    // A category is a claim that something RAN — it picks the rail's glyph and
-    // colour. A pin is a storage decision, so it must stay `info`.
-    //
-    // `info` is also `eventCategory`'s fall-through, which makes the naive
-    // assertion (`toBe("info")` on a pin, alone) unfalsifiable: it passes whether
-    // the kind is handled, unhandled, or misspelled. So assert the CONTRAST — a
-    // real Take boundary in the same breath — which is what actually distinguishes
-    // "deliberately quiet" from "eventCategory has stopped discriminating".
-    const pin = eventCategory(ev(1, { RunSnapshotsPinned: { by: "priya" } }));
-    const unpin = eventCategory(ev(2, { RunSnapshotsUnpinned: { by: "priya" } }));
-    const take = eventCategory(rerun(3, "b", ["c"], "a.kim"));
-    expect(take).toBe("take");
-    expect(pin).toBe("info");
-    expect(unpin).toBe("info");
-    expect(pin).not.toBe(take);
-    // And the glyph really is a distinct mark, not the same one twice — the rail
-    // is the surface a reader scans, so two categories that render identically
-    // would make the contrast above invisible where it matters.
-    expect(EVENT_GLYPH[pin]).not.toBe(EVENT_GLYPH[take]);
   });
 });

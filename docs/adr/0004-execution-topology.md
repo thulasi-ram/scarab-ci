@@ -37,20 +37,6 @@ storage** (per-file merkle CAS, [0029](0029-workspace-cas.md)):
 - The executor is a clean seam → a future remote agent (BYO cluster) is an added adapter,
   not a rewrite ([0005](0005-tenancy-and-k8s-only.md)).
 
-## Amendment (2026-07-26) — the data path is superseded by 0061
-
-The **topology** above stands: pod-per-step, content-addressed workspaces, cross-node
-parallelism, and the two rejected alternatives below remain rejected (re-examined against
-Karpenter + spot in [0061](0061-workspace-data-path.md), where they fare worse, not better).
-
-What does **not** stand is this ADR's data path and the claim that object storage is "the
-second (and last)" stateful dependency. The implementation routed the whole workspace
-*through* the control plane over `kubectl exec`, contradicting the control-plane / data-plane
-split promised here. [0061](0061-workspace-data-path.md) replaces it with a per-failure-domain
-**workspace service** plus a **Scarab node driver** doing lazy materialisation — a third
-stateful component, accepted deliberately — and reduces the control plane's involvement to
-exchanging root hashes.
-
 ## Alternatives considered
 
 - **Pod-per-pipeline + shared volume** — fast sequential, but fights restart-step, node-pinned.

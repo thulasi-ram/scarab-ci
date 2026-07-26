@@ -13,75 +13,6 @@ server Pod's `scratch` emptyDir, so — since every deploy now rolls the Pod —
 would wipe all workspaces and any rerun of a prior run would hang restoring its
 input. Override `SCARAB_S3_*` in `.env` to use real S3 (then MinIO is skipped).
 
-**Workspace service (ADR-0061):** `deploy.sh` also deploys the workspace service —
-a StatefulSet running the **same image** with `SCARAB_ROLE=workspace`, holding a
-warm content-addressed store of Workspace Snapshots on its own PVC, with MinIO
-behind it as the cold archive. It is deployed **by default**, not behind a flag:
-the ADR puts it in the standard path in every deployment mode, because a fast path
-plus a fallback path is two mental models.
-
-Its token secret is generated once into `deploy/local-helm/.workspace-token-secret`
-(gitignored) rather than per deploy — the control plane mints tokens with it and
-the service verifies them, so a value that rotated on every `just local-helm`
-would invalidate every in-flight Step's credential mid-run and look exactly like
-the service being down. It **must not** equal `SCARAB_RESULTS_TOKEN_SECRET`;
-`deploy.sh` refuses if it does.
-
-`deploy.sh` waits for `statefulset/scarab-workspace` to be Ready, which means its
-PVC bound *and* its `/readyz` passed (warm writable + cold reachable). Deploying a
-control plane whose data plane never came up is precisely the failure shape this
-repo keeps finding.
-
-> **Unverified:** this has not been deployed to colima in this change. The
-> templates render and the precedence of `SCARAB_ROLE` was checked against a real
-> kubelet, but no `just local-helm` run has exercised the StatefulSet, its PVC, or
-> whether a rerun of a pre-restart Run now restores instead of hanging.
-
-### `just local-helm` only works on an image that knows the workspace role
-
-Three deliberate choices interact badly, and until ADR-0061 merges they rule out
-every mode except `local`:
-
-1. the workspace service runs the **same image** as the server, with
-   `SCARAB_ROLE=workspace` (that is the anti-skew property);
-2. it is deployed **unconditionally** — standard path, no flag;
-3. its readiness is a **hard deploy gate**.
-
-`edge` and `sha-*` are built by `image.yml` from `main`. A `scarab-server` from
-before ADR-0061 has no `workspace` variant in its `--role` enum, so clap rejects
-the value, the container exits 2, the Pod CrashLoopBackOffs, and
-`kubectl rollout status statefulset/scarab-workspace` blocks for 180s before
-timing out **without naming any of that**.
-
-`deploy.sh` now **preflights** it, before touching a single cluster object. It
-asks the image itself which roles it knows (`--role <nonsense>` makes clap print
-its possible-values list — no config, no database, no network) and refuses with
-the cause, the consequence, and the way out. It preflights the **fetcher** image
-the same way, because that one fails differently and worse: a missing
-`scarab-wsfetch` does not break the deploy at all, it leaves every Step that
-inherits a workspace sitting in `Init:ImagePullBackOff` *after* the script has
-printed "Deployed." `ghcr.io/thulasi-ram/scarab-wsfetch:edge` does not exist until
-`image.yml` publishes it post-merge.
-
-So, today:
-
-```sh
-just local-helm local        # ✅ builds server + clone + sidecar + wsfetch from the tree
-just local-helm              # ❌ refused: `edge` predates ADR-0061 (and no wsfetch:edge yet)
-just local-helm sha-<sha>    # ✅ only once image.yml has published ADR-0061
-```
-
-There is deliberately **no flag that disables the workspace service** to work
-around this, and none should be added. ADR-0061 puts it in the standard path in
-every deployment mode precisely because a fast path plus a fallback path is two
-mental models — and the moment `workspace.enabled=false` becomes a documented
-escape hatch, the dogfood stops exercising the thing being dogfooded. The
-preflight's job is a clear error, not a fallback.
-
-An operator installing `deploy/helm/scarab` directly owns the same check; the
-symptom there is a CrashLoopBackOff on `statefulset/<release>-workspace` with the
-clap error in the container log.
-
 ## Config — one file
 Everything (image, App knobs, secrets, reseed inputs) lives in `deploy/local-helm/.env`
 (gitignored). Both scripts source it; a real environment variable already set in
@@ -95,29 +26,6 @@ cp deploy/local-helm/.env.example deploy/local-helm/.env
 #   (SCARAB_INSTALL_ID / ORG / REPO).
 ```
 Context **must** be `colima` (deploy.sh refuses otherwise — never target EKS).
-
-### NFS in the colima VM — a prerequisite of ADR-0062 stage **2b** only
-
-Nothing in this stack needs an NFS client today. It becomes a prerequisite only for the
-**NFS-delivered Workspace Export** (ADR-0062 stage 2b); the stage-2a `LocalPath` delivery
-hands a co-located Step the Depot's overlay through a `local` PV with no network in it.
-
-Probed 2026-08-02: the colima VM is Ubuntu 24.04.4 / kernel 6.8.0-117 / k3s v1.35.0+k3s1
-and ships **no `mount.nfs`**, though the `nfs`/`nfsv4`/`nfsd` modules are on disk. One
-command fixes it, and an NFS-backed PVC then mounts and round-trips on this cluster in
-about six seconds:
-
-```sh
-colima ssh -- sudo apt-get update
-colima ssh -- sudo apt-get install -y nfs-common   # mount.nfs 2.6.4 from ports.ubuntu.com
-```
-
-It survives `colima stop`/`start` and is **lost on `colima delete`**. There is no colima
-provision hook in this repo, so this is a documented step rather than an automated one —
-and the failure it prevents is silent-ish: kubelet reports *"you might need a
-`/sbin/mount.nfs` helper program"* and the Pod sits in `ContainerCreating` **forever**.
-`csi-driver-nfs` is the alternative for nodes where a package cannot be installed; see
-ADR-0062's amended "no DaemonSet" note, including its `fsGroupPolicy` trap.
 
 ## GitHub App configuration (REQUIRED — both gaps fail *silently*)
 The webhook URL + secret are not enough. Two App settings must be right or the
@@ -157,7 +65,7 @@ Convenience (recommended) — `just` picks the image source for you:
 ```sh
 just local-helm             # pull + deploy the latest ghcr `edge` (pullPolicy Always)
 just local-helm sha-<sha>   # pull + deploy a specific published SHA
-just local-helm local       # build server+clone+sidecar+wsfetch from the tree, then deploy
+just local-helm local       # build server+clone+sidecar from the tree, then deploy
 ```
 Or drive the script directly (image source then comes from `.env`):
 ```sh

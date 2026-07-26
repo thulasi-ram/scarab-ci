@@ -38,12 +38,6 @@ reqwest = { workspace = true }
 base64 = { workspace = true }
 # PKCE S256 code challenges (ADR-0049): SHA-256 of the login verifier.
 sha2 = { workspace = true }
-# ADR-0062 Snapshot Farm (`farm.rs`): the `FICLONE` ioctl on Linux and
-# `clonefile(2)` on macOS/APFS, which are the clone rung. Neither is in `std`.
-# `reflink-copy` (cargo-bins, MIT/Apache) covers both plus a plain `Unsupported`
-# error elsewhere, so the farm keeps one `reflink` wrapper and no per-OS arms.
-# NB *not* the crate named `reflink` — that one has been unmaintained since 2019.
-reflink-copy = { workspace = true }
 
 # every scarab crate — the server is the composition root
 scarab-engine = { workspace = true }
@@ -58,23 +52,9 @@ scarab-forge-github = { workspace = true }
 scarab-forge-forgejo = { workspace = true }
 scarab-secrets-postgres = { workspace = true }
 scarab-storage-s3 = { workspace = true }
-# ADR-0061 D1.6: the control plane's workspace `Cas` is a `TieredCas` whose WARM
-# tier is the workspace service, reached through this client, and whose COLD tier
-# is the object store directly. Without this dependency the warm tier is filled
-# only by the service's own read-path backfill — so every freshly-drained
-# snapshot is a guaranteed miss, half the wire protocol (`have`, `PUT`) is
-# production-dead, and "Browse reads snapshots from the service" is aspirational.
-scarab-workspace-client = { workspace = true }
 scarab-executor-k8s = { workspace = true }
 scarab-executor-local = { workspace = true }
 scarab-testkit = { workspace = true }
-
-# ADR-0062 overlay change-set (`changeset.rs`): reading `trusted.overlay.*` off a
-# Step's upper layer. Target-gated to match the `#[cfg(target_os = "linux")]` on
-# the only code that calls it — the namespace exists nowhere else, and off Linux
-# `require_marker_privilege` refuses before any read is attempted.
-[target.'cfg(target_os = "linux")'.dependencies]
-xattr = { workspace = true }
 
 [dev-dependencies]
 regex-lite = { workspace = true }

@@ -33,19 +33,28 @@ async fn blobs_and_trees_round_trip_and_dedup() {
 
     // sub/ = { c.txt -> "world" }
     let sub = cas
-        .put_tree(vec![TreeEntry::new(
-            "c.txt",
-            TreeTarget::Blob(world.clone()),
-        )])
+        .put_tree(vec![TreeEntry {
+            name: "c.txt".into(),
+            target: TreeTarget::Blob(world.clone()),
+        }])
         .await
         .unwrap();
 
     // root = { a.txt -> "hello", b.txt -> "hello", sub -> sub/ }
     let root = cas
         .put_tree(vec![
-            TreeEntry::new("a.txt", TreeTarget::Blob(hello_a.clone())),
-            TreeEntry::new("b.txt", TreeTarget::Blob(hello_b.clone())),
-            TreeEntry::new("sub", TreeTarget::Tree(sub.clone())),
+            TreeEntry {
+                name: "a.txt".into(),
+                target: TreeTarget::Blob(hello_a.clone()),
+            },
+            TreeEntry {
+                name: "b.txt".into(),
+                target: TreeTarget::Blob(hello_b.clone()),
+            },
+            TreeEntry {
+                name: "sub".into(),
+                target: TreeTarget::Tree(sub.clone()),
+            },
         ])
         .await
         .unwrap();
@@ -79,7 +88,12 @@ async fn get_blob_returns_content_and_trees_are_stable() {
     let h = cas.put_blob(b"payload").await.unwrap();
     assert_eq!(cas.get_blob(&h).await.unwrap(), b"payload");
 
-    let entries = || vec![TreeEntry::new("f", TreeTarget::Blob(h.clone()))];
+    let entries = || {
+        vec![TreeEntry {
+            name: "f".into(),
+            target: TreeTarget::Blob(h.clone()),
+        }]
+    };
     // Order-independent: same entries -> same tree hash.
     let t1 = cas.put_tree(entries()).await.unwrap();
     let t2 = cas.put_tree(entries()).await.unwrap();

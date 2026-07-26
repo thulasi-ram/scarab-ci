@@ -68,8 +68,6 @@ fn attempt(id: &str, started_at: i64) -> Attempt {
         id: AttemptId(id.into()),
         started_at: Timestamp(started_at),
         failure: None,
-        failure_detail: None,
-        output_durability: None,
         outcome: AttemptOutcome::Running,
     }
 }
@@ -199,15 +197,9 @@ async fn recorded_evidence_is_never_downgraded(db: &dyn Db) {
     db.record_attempt(&run, &step, &attempt("a1", 100))
         .await
         .unwrap();
-    db.set_attempt_failure(
-        &run,
-        &step,
-        &AttemptId("a1".into()),
-        FailureKind::Step,
-        Some("exit 1: tests failed"),
-    )
-    .await
-    .unwrap();
+    db.set_attempt_failure(&run, &step, &AttemptId("a1".into()), FailureKind::Step)
+        .await
+        .unwrap();
     db.record_attempt(&run, &step, &attempt("a1", 100))
         .await
         .unwrap();
@@ -215,10 +207,6 @@ async fn recorded_evidence_is_never_downgraded(db: &dyn Db) {
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].outcome, AttemptOutcome::Failed);
     assert_eq!(attempts[0].failure, Some(FailureKind::Step));
-    // The human-readable cause (4cf03d7) is evidence too: it survives the
-    // re-drive and reads back verbatim — kills a store that accepts the
-    // detail param and drops it (write not persisted, or read not selected).
-    assert_eq!(attempts[0].failure_detail.as_deref(), Some("exit 1: tests failed"));
 
     // a2: cancelled on purpose; its dying Pod's self-inflicted `Lost` (and any
     // later weaker outcome) must not clobber the intent verdict.
@@ -229,15 +217,9 @@ async fn recorded_evidence_is_never_downgraded(db: &dyn Db) {
     db.set_attempt_outcome(&run, &step, &a2, AttemptOutcome::Cancelled)
         .await
         .unwrap();
-    db.set_attempt_failure(
-        &run,
-        &step,
-        &a2,
-        FailureKind::Lost,
-        Some("self-inflicted teardown"),
-    )
-    .await
-    .unwrap();
+    db.set_attempt_failure(&run, &step, &a2, FailureKind::Lost)
+        .await
+        .unwrap();
     db.set_attempt_outcome(&run, &step, &a2, AttemptOutcome::Succeeded)
         .await
         .unwrap();
@@ -251,11 +233,6 @@ async fn recorded_evidence_is_never_downgraded(db: &dyn Db) {
     assert_eq!(
         a2_row.failure, None,
         "the rejected failure write must not leak its classification"
-    );
-    assert_eq!(
-        a2_row.failure_detail, None,
-        "the rejected failure write must not leak its detail either — the \
-         detail column moves in the SAME guarded UPDATE as the class"
     );
 }
 
@@ -445,69 +422,3 @@ async fn attempts_list_in_stable_defined_order(db: &dyn Db) {
 }
 
 contract_test!(attempt_ordering, attempts_list_in_stable_defined_order);
-
-// ---------------------------------------------------------------------------
-// 7. Output-durability stamp (ADR-0064 s2): `set_step_output` with a
-//    durability tier stamps exactly the ATTEMPT named and reads back verbatim;
-//    without one the attempt reads back `None` — which is also what every row
-//    written before migration 0042 answers (the column is a nullable expand,
-//    so "no stamp" and "pre-s2 row" are the same absence).
-// ---------------------------------------------------------------------------
-
-async fn output_durability_stamps_only_the_named_attempt(db: &dyn Db) {
-    let run = RunId("durability-run".into());
-    let step = StepId("s".into());
-    seed_run_and_step(db, &run, &step).await;
-
-    // a1: a snapshot recorded with NO stamp — the pre-s2 / stamp-less-backend
-    // shape (and, by the nullable-expand convention, what an actual
-    // pre-migration row answers).
-    db.record_attempt(&run, &step, &attempt("a1", 100))
-        .await
-        .unwrap();
-    db.set_step_output(&run, &step, &AttemptId("a1".into()), "root-1", None, None)
-        .await
-        .unwrap();
-    // a2 (a retry): the Depot reported object storage when the flush released
-    // this verdict.
-    db.record_attempt(&run, &step, &attempt("a2", 200))
-        .await
-        .unwrap();
-    db.set_step_output(
-        &run,
-        &step,
-        &AttemptId("a2".into()),
-        "root-2",
-        Some("identity-2"),
-        Some("object"),
-    )
-    .await
-    .unwrap();
-
-    let attempts = db.attempts_of_step(&run, &step).await.unwrap();
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(
-        attempts[0].output_durability, None,
-        "no stamp reads back as absence — kills a store that fabricates a \
-         default tier instead of persisting NULL"
-    );
-    assert_eq!(
-        attempts[1].output_durability.as_deref(),
-        Some("object"),
-        "the stamp reads back verbatim on exactly the attempt that earned it — \
-         kills a store that accepts the durability param and drops it (write \
-         not persisted, or read not selected), and one that denormalizes it \
-         across the step's attempts (a1 would then read `object` too)"
-    );
-    // The latest-evidence denorm is untouched by design: durability is
-    // attempt-grain historical evidence, `step_output` stays the address.
-    assert_eq!(
-        db.step_output(&run, &step).await.unwrap().as_deref(),
-        Some("root-2")
-    );
-}
-
-contract_test!(
-    output_durability_stamp,
-    output_durability_stamps_only_the_named_attempt
-);

@@ -18,22 +18,6 @@ in-memory per-process** → the same stdout is ingested by every replica; the
 sees no live tail for a step replica A is tailing; and the **OIDC signing key is
 regenerated per boot** → each replica publishes a different JWKS.
 
-> **Amended 2026-08-03 by [0066](0066-the-depot-is-a-cache.md) — this ADR is about the CONTROL PLANE
-> only.** Every mechanism below (the tail lease, replica-agnostic SSE, the shared OIDC key, the
-> leader-gated sweeper) converges replicas **through Postgres**, which is what the Consequences mean by
-> *"converged replicas share work via Postgres; no service-to-service RPC"*. The **Data Depot** has
-> **no durable core** — it never connects to Postgres — so none of it applies there, and
-> `replicaCount: 2+` becoming honest for the server says nothing about the Depot.
->
-> **The Depot's multi-replica story is [0066](0066-the-depot-is-a-cache.md)**, and it is a different
-> shape for a structural reason: the Depot is **definitionally a cache**, so replicas hold nothing
-> unique and HA is *"run more replicas"* rather than a coordination protocol. What it needs instead is
-> **fence affinity** — a headless Service, a replica chosen at launch and stamped into the Pod spec,
-> hashed by **Run** so every Step of a Run lands on one replica. That is a correctness requirement
-> rather than an optimisation the moment N > 1, and 0066 also records the prerequisite: git-bug
-> `e140121`, a Depot outage of 20–30 s dead-letters Runs today, which makes any replica count
-> meaningless until it is fixed.
-
 ## Decision
 
 ### One tailer per running step — a claim-to-tail lease

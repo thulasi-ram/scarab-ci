@@ -31,11 +31,6 @@ impl Executor for CapturingExec {
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
     }
-    // ADR-0064 s2: required (never defaulted) so the compiler makes every impl —
-    // wrappers included — decide; this stub snapshots nothing, so no stamp.
-    async fn output_durability(&self, _h: &ExecHandle) -> Result<Option<String>, ExecError> {
-        Ok(None)
-    }
 }
 
 fn step(run: &str) -> StepRun {
@@ -221,11 +216,6 @@ impl Executor for SpecCapturingExec {
     }
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
-    }
-    // ADR-0064 s2: required (never defaulted) so the compiler makes every impl —
-    // wrappers included — decide; this stub snapshots nothing, so no stamp.
-    async fn output_durability(&self, _h: &ExecHandle) -> Result<Option<String>, ExecError> {
-        Ok(None)
     }
 }
 

@@ -2,11 +2,6 @@
 #   - scarab-server           (the converged API/worker binary, docker/server/Dockerfile)
 #   - scarab-clone            (the canonical clone step image, ADR-0045)
 #   - scarab-results-sidecar  (the trusted results-egress sidecar, ADR-0042)
-#   - scarab-wsfetch          (the workspace fetcher init container, ADR-0061 s3-feed)
-#
-# ⚠ scarab-wsfetch is a temporally-ordered STEPPING STONE (ADR-0061 D2.3): it is
-# eager, and the CSI/FUSE node driver replaces it. git-bug 0628369 closes only
-# when it is REMOVED from this matrix again.
 #
 # Multi-arch via NATIVE runners (fast — no QEMU): each image is built once per
 # platform on a runner of that architecture, pushed BY DIGEST, then a `merge`
@@ -34,7 +29,6 @@ on:
       - 'openapi.json'
       - 'docker/clone/**'
       - 'docker/sidecar/**'
-      - 'docker/wsfetch/**'
       - '.github/workflows/image.yml'
   workflow_dispatch:
 
@@ -57,7 +51,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [scarab-server, scarab-clone, scarab-results-sidecar, scarab-wsfetch]
+        image: [scarab-server, scarab-clone, scarab-results-sidecar]
         platform: [linux/amd64, linux/arm64]
         include:
           - platform: linux/amd64
@@ -73,12 +67,6 @@ jobs:
           - image: scarab-results-sidecar
             context: docker/sidecar
             dockerfile: docker/sidecar/Dockerfile
-          # Context is the repo ROOT: the fetcher is a bin target of
-          # crates/scarab-workspace-client, deliberately, so it shares the one
-          # `Cas::materialize` that carries the fidelity rules.
-          - image: scarab-wsfetch
-            context: .
-            dockerfile: docker/wsfetch/Dockerfile
     steps:
       - uses: actions/checkout@v4
 
@@ -135,7 +123,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [scarab-server, scarab-clone, scarab-results-sidecar, scarab-wsfetch]
+        image: [scarab-server, scarab-clone, scarab-results-sidecar]
     steps:
       - name: Download this image's digests
         uses: actions/download-artifact@v4

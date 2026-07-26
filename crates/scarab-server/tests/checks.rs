@@ -119,7 +119,6 @@ async fn run_failure_posts_failure_status() {
     exec.script_outcome(ExecState::Failed {
         exit_code: Some(1),
         class: scarab_engine::ports::FailureClass::Step,
-        cause: None,
     });
     drive(&db, &clock, &exec, &run).await;
     assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));

@@ -17,39 +17,14 @@ use clap::Parser;
 
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
-use scarab_executor_k8s::{K8sExecutor, PlacementConfig, ResultsEgress, WorkspaceFetch};
+use scarab_executor_k8s::{K8sExecutor, PlacementConfig, ResultsEgress};
 use scarab_executor_local::LocalExecutor;
-use scarab_server::config::{Cli, Config, ExecutorKind, Role, StoreConfig};
+use scarab_server::config::{Cli, Config, ExecutorKind, StoreConfig};
 use scarab_server::{
     converged, router, AppState, LogService, SecretInjectingExecutor, SystemClock,
 };
 use scarab_storage::ObjectStore;
 use scarab_storage_s3::S3Storage;
-
-/// Lifetime of the `browse`-scope workspace token this process mints for itself.
-///
-/// Short, because it is minted per request and never stored: the only thing the
-/// window has to cover is one HTTP round trip to the workspace service plus clock
-/// skew between the two Pods. Five minutes is generous for both and still means a
-/// token captured off the wire is worthless almost immediately — unlike the
-/// results token, which never expires at all (ADR-0061 D1.4 names that as one of
-/// the three reasons this is a separate credential).
-const BROWSE_TOKEN_TTL_SECS: i64 = 300;
-
-/// The CAS sweeper's Depot tier probe (ADR-0064 s2), adapting the one
-/// [`scarab_workspace_client::WorkspaceClient`] this process holds to the
-/// sweeper's [`scarab_server::retention::DepotTierSource`] seam (a newtype
-/// because both the trait's home and the client are foreign to this bin).
-/// One `GET /v1/tier` per sweep pass; an error deliberately keeps the
-/// torn-cold detector ON (see the seam's docs).
-struct DepotTierProbe(Arc<scarab_workspace_client::WorkspaceClient>);
-
-#[async_trait::async_trait]
-impl scarab_server::retention::DepotTierSource for DepotTierProbe {
-    async fn depot_tier(&self) -> Result<String, String> {
-        self.0.depot_tier().await.map_err(|e| e.to_string())
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -113,39 +88,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // ADR-0061: the workspace service is a DATA-plane role. It shares this
-    // binary — one image, so server↔service version skew is structurally
-    // impossible under one Helm release — but NOT the durable core: it never
-    // connects to Postgres and never runs a migration.
-    //
-    // The early return is deliberately HERE, before anything below it runs.
-    // Everything that follows is the durable core's composition root: it
-    // connects Postgres and migrates, connects and migrates the secrets store,
-    // reads the OIDC PEM, and provisions forge connections — none of which the
-    // workspace service has, needs, or may be allowed to do from N per-failure-
-    // domain replicas. Do not move this down, and do not restructure the code
-    // below it to make the role a branch: a branch is something a future edit
-    // can fall through.
-    if matches!(config.role, Role::Workspace) {
-        return scarab_server::workspaced::run(&config).await;
-    }
-
-    // From here on the durable core is mandatory, and the config gate already
-    // guaranteed it for every role that reaches this line (see
-    // `Role::needs_durable_core`). One `expect`, at the dispatch site, so the
-    // `Option` carries the fact instead of a `""` sentinel travelling onward.
-    let database_url = config
-        .database_url
-        .clone()
-        .expect("the config gate requires SCARAB_DATABASE_URL for every durable-core role");
-
     // This replica's identity for leases + outbox claims (ADR-0051): MUST be
     // unique per process — identical owners would make every replica believe
     // it holds every lease (leader election + tail dedup would be void).
     let replica_id = format!("scarab-server-{}", uuid::Uuid::new_v4());
 
     // Durable store — mandatory, already guaranteed by the config gate.
-    let pg = PostgresDb::connect(&database_url).await?;
+    let pg = PostgresDb::connect(&config.database_url).await?;
     pg.migrate().await?;
     // Keep a typed handle so the same Postgres adapter can back both the `Db`
     // port and the `EnvironmentStore` port (it implements both).
@@ -156,105 +105,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // prod), else a local directory (zero-dependency dev). One S3Storage backs
     // BOTH ports: the log/artifact ObjectStore and the workspace Cas
     // (ADR-0029/0045).
-    // The CAS-leg parallelism comes from validated config (ADR-0061 s2), not from
-    // an ambient env read inside the adapter — so `startup_report()` above has
-    // already told the operator which value is live.
-    let storage = Arc::new(
-        match &config.store {
-            StoreConfig::S3(s3) => S3Storage::s3(
-                s3.bucket.clone(),
-                &s3.endpoint,
-                &s3.region,
-                &s3.access_key,
-                &s3.secret_key,
-            )?,
-            StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
-        }
-        .with_concurrency(config.cas_concurrency),
-    );
+    let storage = Arc::new(match &config.store {
+        StoreConfig::S3(s3) => S3Storage::s3(
+            s3.bucket.clone(),
+            &s3.endpoint,
+            &s3.region,
+            &s3.access_key,
+            &s3.secret_key,
+        )?,
+        StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
+    });
     let store: Arc<dyn ObjectStore> = storage.clone();
-    // The COLD tier: object storage, direct. This is the durable one — ADR-0061's
-    // retention table gives it a TTL and calls it "the guarantee users are given".
-    let cold_cas: Arc<dyn scarab_storage::Cas> = storage;
-
-    // The Depot client (ADR-0061/0064): ONE client, two jobs. As `Arc<dyn Cas>`
-    // it is the warm tier of the tiered READ handle below; held concretely it
-    // is also the executor's DRAIN handle, because the drain needs `flush` —
-    // a client capability, not a `Cas` port method.
-    //
-    // The token is minted **per request**, in `browse` scope, for this process's
-    // own use (`workspace_token::browse_claims`). Per-request rather than once at
-    // boot because a token has an `exp`: a server that minted one at startup
-    // would start 401-ing a day later from nothing anyone changed, and minting
-    // one with no meaningful expiry would rebuild the results token's wart that
-    // ADR-0061 D1.4 refused to inherit.
-    let depot_client: Option<Arc<scarab_workspace_client::WorkspaceClient>> =
-        config.workspace.as_ref().map(|ws| {
-            use scarab_executor_k8s::workspace_token;
-            let secret = ws.token_secret.clone();
-            Arc::new(scarab_workspace_client::WorkspaceClient::with_minted_token(
-                ws.url.clone(),
-                move || {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    workspace_token::mint(
-                        &secret,
-                        &workspace_token::browse_claims(now + BROWSE_TOKEN_TTL_SECS),
-                    )
-                },
-            ))
-        });
-
-    // The workspace `Cas` this process hands to Browse, the GC mark walk, the
-    // rerun-widening oracle and the debug pod (ADR-0061 D1.6) — and the READ
-    // half of the executor's drain.
-    //
-    // WARM = the workspace service, over HTTP. COLD = the object store above,
-    // direct. **This is a read-and-repair handle now, not a write path**
-    // (ADR-0064 control-plane half):
-    //
-    //  * **reads fall through to cold** when the service is unreachable. This
-    //    process already holds object-store credentials, so going direct crosses
-    //    no trust boundary and creates no second data path for Steps — the
-    //    literal reading of "a warm miss is slower, never wrong". Note this is
-    //    the OPPOSITE of a Step Pod, which must fail closed: a Pod has no
-    //    credentials, by design (ADR-0042).
-    //  * **the drain does NOT write through it.** The old shape ingested every
-    //    Step's snapshot cold-first through this handle and re-walked the
-    //    directory for warm (`TieredCas::ingest`, now deleted — it refuses
-    //    loudly if anything still reaches it through `dyn Cas`). The drain is
-    //    warm-first via `depot_client` above — one walk, `/have`-dedup, and
-    //    prune-minted trees land warm only — followed by ONE awaited
-    //    `flush(published_root)`: the Depot uploads the closure to cold and
-    //    only `Durable` releases the verdict. ADR-0061 part 4's guarantee is
-    //    kept by awaiting the flush, not by ordering each blob; a Depot outage
-    //    fails Attempts promptly and legibly (`Infra` + cause, time-bounded —
-    //    ticket 4cf03d7), never as a step-budget timeout.
-    //  * **stray writes** (`put_blob`/`put_tree` from anything that is not the
-    //    drain) keep the old cold-first rule: cold decides success, a warm
-    //    failure is a warning plus a counter.
-    let workspace_cas: Arc<dyn scarab_storage::Cas> = match &depot_client {
-        Some(client) => {
-            tracing::info!(
-                url = %config.workspace.as_ref().map(|ws| ws.url.as_str()).unwrap_or_default(),
-                "workspace snapshots: warm = the workspace service, cold = the object store \
-                 (ADR-0061 D1.6 reads fall through to cold; the drain is warm-first + one \
-                 awaited cold flush on the Depot, ADR-0064)"
-            );
-            Arc::new(
-                scarab_storage::tiered::TieredCas::new(client.clone(), cold_cas)
-                    .fall_through_on_warm_error(),
-            )
-        }
-        // No service configured: the object store IS the whole store. The
-        // executor already refuses to launch a step that inherits a workspace in
-        // this state (fail-closed) and its drain writes this handle directly
-        // (durable by construction, nothing to flush), so this path serves
-        // Browse and GC over pre-ADR-0061 snapshots and drain-less dev.
-        None => cold_cas,
-    };
+    let workspace_cas: Arc<dyn scarab_storage::Cas> = storage;
     let logs = Arc::new(LogService::new(store.clone(), db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
@@ -268,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         key
     });
     let secrets: Arc<dyn scarab_secrets::SecretProvider> = {
-        let s = scarab_secrets_postgres::PostgresSecrets::connect(&database_url, master_key)
+        let s = scarab_secrets_postgres::PostgresSecrets::connect(&config.database_url, master_key)
             .await?;
         s.migrate().await?;
         Arc::new(s)
@@ -294,16 +156,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // in-flight ingest whose root is not yet recorded.
                 grace_ms: 24 * 60 * 60 * 1000,
             },
-            // The Depot tier probe (ADR-0064 s2): a warm-only Depot has no
-            // cold tier to be torn, so the sweep suppresses the residue
-            // detector per pass. No Depot configured = detector always on
-            // (this handle also being how the drain-less shape is detected).
-            depot_client
-                .as_ref()
-                .map(|c| {
-                    Arc::new(DepotTierProbe(c.clone()))
-                        as Arc<dyn scarab_server::retention::DepotTierSource>
-                }),
             Duration::from_secs(300),
         );
         tracing::info!(
@@ -475,8 +327,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .with_default_step_timeout_secs(config.step_timeout_secs)
                         // Workspace flow (ADR-0029/0045): materialize `needs`
                         // into /workspace, snapshot it back after the step.
-                        // This is the drain's READ half (tiered, falls through
-                        // to cold); the WRITE half is the Depot handle below.
                         .with_workspace_cas(workspace_cas.clone())
                         // The canonical clone image (ADR-0045).
                         .with_clone_image(config.clone_image.clone())
@@ -485,37 +335,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .with_artifact_store(store.clone())
                         // Placement (ADR-0055): baseline + PlacementProfile registry.
                         .with_placement(placement.clone());
-                    // The workspace service (ADR-0061 s3-feed): a Step with
-                    // `needs:` is provisioned by an init container that dials it
-                    // directly. Without this the executor REFUSES to launch such a
-                    // step (fail-closed) rather than run it against a silently
-                    // empty /workspace — the old control-plane exec-tar feed is
-                    // deleted, not kept as a fallback.
-                    if let Some(ws) = &config.workspace {
-                        exec = exec.with_workspace_service(WorkspaceFetch {
-                            url: ws.url.clone(),
-                            token_secret: ws.token_secret.clone(),
-                            fetcher_image: ws.fetcher_image.clone(),
-                        });
-                        // The drain's WRITE half + durability gate (ADR-0064):
-                        // warm-first ingest through the Depot client and one
-                        // awaited flush per published root.
-                        if let Some(client) = &depot_client {
-                            exec = exec.with_workspace_depot(client.clone());
-                        }
-                        tracing::info!(
-                            url = %ws.url,
-                            image = %ws.fetcher_image,
-                            "workspace fetcher enabled (ADR-0061 s3-feed; EAGER — the node \
-                             driver replaces this)"
-                        );
-                    } else {
-                        tracing::warn!(
-                            "no workspace service configured (SCARAB_WORKSPACE_TOKEN_SECRET \
-                             unset): steps that inherit a workspace will be REFUSED at launch \
-                             (ADR-0061)"
-                        );
-                    }
                     if let Some(egress) = results_egress.clone() {
                         exec = exec.with_results_egress(egress);
                         tracing::info!("results egress sidecar enabled (ADR-0042)");
@@ -609,10 +428,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Read-only workspace browser (ADR-0029): serves a step's output
         // snapshot tree + file bytes for the run detail Inspector.
         .with_workspace_cas(workspace_cas.clone())
-        // The cold tier's TIME bound (ADR-0061 s5), from the SAME config value the
-        // GC sweeper above runs on — so what the UI promises and what the sweeper
-        // enforces cannot drift.
-        .with_snapshot_retention_days(config.retention_workspace_days)
         // The same credential-override table the forge router resolves through
         // (ADR-0060 part D), so the Settings health readout reports a
         // config-supplied credential as present rather than MISSING.
@@ -627,22 +442,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // step's snapshot. One instance serves both attach and debug-pod.
                 // Placement (ADR-0055) applies here too — a debug Pod must schedule
                 // on the same tainted nodes as the real step.
-                let mut exec = exec
-                    .with_workspace_cas(workspace_cas.clone())
-                    .with_placement(placement.clone());
-                // A debug Pod re-materializes its snapshot through the SAME fetcher
-                // a real step uses (ADR-0061 s3-feed) — the copy-pasted feed it
-                // used to carry is gone (git-bug 64897db). Without a service, a
-                // debug Pod *with* a snapshot reports Unavailable; one without a
-                // snapshot still opens an empty shell.
-                if let Some(ws) = &config.workspace {
-                    exec = exec.with_workspace_service(WorkspaceFetch {
-                        url: ws.url.clone(),
-                        token_secret: ws.token_secret.clone(),
-                        fetcher_image: ws.fetcher_image.clone(),
-                    });
-                }
-                let exec = Arc::new(exec);
+                let exec = Arc::new(
+                    exec.with_workspace_cas(workspace_cas.clone())
+                        .with_placement(placement.clone()),
+                );
                 state = state.with_attacher(exec.clone()).with_debug_launcher(exec);
                 tracing::info!("debug shell: step-attach + debug-pod enabled (k8s exec)");
             }

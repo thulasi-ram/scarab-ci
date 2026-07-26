@@ -505,7 +505,6 @@ async fn a_failing_steps_artifacts_are_indexed_and_downloadable() {
         backend.script_outcome(ExecState::Failed {
             exit_code: Some(1),
             class: FailureClass::Step,
-            cause: None,
         });
     }
     let sched = Scheduler::new(&*db as &dyn Db, &*clock as &dyn Clock, &*exec, "sched");

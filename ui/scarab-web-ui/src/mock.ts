@@ -111,9 +111,6 @@ const runStatus: RunStatusDto = {
   trigger_title: "Add exponential backoff to step retries",
   origin_pr_base: null,
   params: {},
-  // ADR-0061 s5: a live run is not on the retention clock at all (a non-terminal
-  // run is never GC-eligible), so no expiry is promised and nothing is pinned.
-  snapshot_retention: { retention_days: 14, expired: false, pinned: false },
   steps: [
     {
       id: "clone",
@@ -194,15 +191,6 @@ const richRunStatus: RunStatusDto = {
   trigger_title: "Wire shared postgres into the integration suite",
   origin_pr_base: null,
   params: {},
-  // Suspended on a gate, so likewise never GC-eligible regardless of age
-  // (ADR-0050) — but PINNED, to render the "keep this run's snapshots" state.
-  snapshot_retention: {
-    retention_days: 14,
-    expired: false,
-    pinned: true,
-    pinned_by: "priya",
-    pinned_at: ago(120000),
-  },
   steps: [
     {
       id: "clone",
@@ -548,19 +536,6 @@ function route(pathname: string, search: string): Response | null {
     });
   if (p === `/v1/runs/${RICH_RUN_ID}/artifacts`) return json(richArtifacts);
   if (p === `/v1/runs/${RICH_RUN_ID}/services`) return json(richServices);
-  // The rerun PREVIEW (ADR-0061 s5). Both mock runs are non-terminal, so
-  // RunDetail never asks for this — but a real answer beats the catch-all `{}`,
-  // which would deserialize into a plan with no arrays at all.
-  if ((m = p.match(/^\/v1\/runs\/[^/]+\/steps\/([^/]+)\/rerun-plan$/))) {
-    const target = m[1];
-    return json({
-      target,
-      invalidated: [target],
-      widened: [],
-      starts_from: [target],
-      expired_inputs: [],
-    });
-  }
   if (/\/steps\/[^/]+\/results$/.test(p)) return json(testResults);
   if (/\/steps\/[^/]+\/consumed$/.test(p)) return json(testConsumed);
   if (/\/steps\/[^/]+\/workspace$/.test(p))

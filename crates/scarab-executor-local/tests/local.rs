@@ -74,7 +74,6 @@ async fn nonzero_exit_command_fails_with_its_code() {
         ExecState::Failed {
             exit_code: Some(3),
             class: FailureClass::Step,
-            cause: None,
         }
     );
 }
@@ -96,7 +95,6 @@ async fn signal_kill_is_post_start_infra() {
             class: FailureClass::Infra {
                 never_started: false
             },
-            cause: None,
         }
     );
 }
@@ -152,7 +150,6 @@ async fn kill_timer_times_out_a_hung_step() {
         ExecState::Failed {
             exit_code: None,
             class: FailureClass::Timeout,
-            cause: None,
         }
     );
 }

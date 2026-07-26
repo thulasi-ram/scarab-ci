@@ -193,20 +193,6 @@ impl Executor for CloneEnrichingExecutor {
         self.inner.output(handle).await
     }
 
-    async fn output_identity(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
-        // Forward the content identity (ADR-0061 s8) — missing until ADR-0064
-        // s2: the trait default returned `None`, so this wrapper dropped the
-        // identity and restart fell back to comparing roots (the 945b1f4
-        // failure shape). Same forward-or-drop hazard as `artifacts` below.
-        self.inner.output_identity(handle).await
-    }
-
-    async fn output_durability(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
-        // Forward the durability stamp (ADR-0064 s2) — required on the trait
-        // so a decorator cannot silently swallow it.
-        self.inner.output_durability(handle).await
-    }
-
     async fn results(
         &self,
         handle: &ExecHandle,

@@ -102,10 +102,6 @@ async fn tables_round_trip_via_adapter() {
         failure: Some(FailureKind::Infra {
             never_started: false,
         }),
-        failure_detail: Some("cold tier refused: connection refused".into()),
-        // Round-trips the 0042 column through record_attempt/attempts (the
-        // scheduler's own write path is set_step_output — db_contract.rs).
-        output_durability: Some("object".into()),
         outcome: AttemptOutcome::Failed,
     };
     db.record_attempt(&run, &step, &attempt).await.unwrap();
@@ -127,8 +123,6 @@ async fn tables_round_trip_via_adapter() {
             id: AttemptId(format!("a{}", i + 2)),
             started_at: Timestamp(1_200 + i as i64),
             failure: Some(failure),
-            failure_detail: None,
-            output_durability: None,
             outcome: AttemptOutcome::Failed,
         };
         db.record_attempt(&run, &step, &attempt).await.unwrap();

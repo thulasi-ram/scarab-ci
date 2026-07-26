@@ -40,23 +40,6 @@ scarab-server is deployed as release "{{ .Release.Name }}" in namespace "{{ .Rel
      dev/eval install. The two are mutually exclusive.
 {{- end }}
 
-{{- if include "scarab.workspaceEnabled" . }}
-
-  Workspace service (ADR-0061): {{ include "scarab.fullname" . }}-workspace
-     {{ .Values.workspace.replicaCount }} replica(s), warm tier on a {{ .Values.workspace.persistence.size }} PVC at {{ .Values.workspace.dataDir }}
-     Same image as the server, SCARAB_ROLE=workspace. No Postgres, no RBAC.
-     The warm tier is bounded by SPACE and LRU eviction is NOT implemented yet —
-     watch scarab_workspace_warm_used_bytes against {{ .Values.workspace.persistence.size }}.
-{{- else if .Values.workspace.enabled }}
-
-  ⚠  The workspace service (ADR-0061) is NOT deployed: no
-     secrets.workspaceTokenSecret is set. A workspace service without a token
-     secret would serve every step's inputs to anything that can reach its port,
-     so the chart renders nothing rather than an open one. Set
-     secrets.workspaceTokenSecret (any high-entropy string — and NOT the same
-     value as secrets.resultsTokenSecret) to deploy it.
-{{- end }}
-
 Check health:
 
   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "scarab.fullname" . }}

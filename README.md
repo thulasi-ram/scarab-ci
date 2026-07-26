@@ -215,7 +215,7 @@ Scarab-on-Scarab), use the `local-helm` mode:
 ```sh
 just local-helm             # pull + deploy the latest ghcr `edge`
 just local-helm sha-<sha>   # pull + deploy a specific published SHA
-just local-helm local       # build server+clone+sidecar+wsfetch from the tree, then deploy
+just local-helm local       # build server+clone+sidecar from the tree, then deploy
 ```
 
 Needs `deploy/local-helm/.env` and kube context `colima`; see

@@ -95,8 +95,7 @@ impl PostgresDb {
     /// before `a2`. The in-memory `Db` (scarab-testkit) mirrors this exact order.
     pub async fn attempts(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
         let rows = sqlx::query(
-            "SELECT attempt_id, started_at, failure, failure_detail, output_durability, outcome
-             FROM attempts
+            "SELECT attempt_id, started_at, failure, outcome FROM attempts
              WHERE run_id = $1 AND step_id = $2
              ORDER BY started_at, CAST(substring(attempt_id FROM 2) AS INTEGER)",
         )
@@ -126,10 +125,6 @@ impl PostgresDb {
                     id: AttemptId(r.get::<String, _>("attempt_id")),
                     started_at: Timestamp(r.get::<i64, _>("started_at")),
                     failure,
-                    failure_detail: r.get::<Option<String>, _>("failure_detail"),
-                    // NULL = pre-0064-s2 row / no workspace / stamp-less
-                    // backend — absence of evidence, reported as such.
-                    output_durability: r.get::<Option<String>, _>("output_durability"),
                     outcome,
                 })
             })
@@ -370,21 +365,14 @@ impl Db for PostgresDb {
         step: &StepId,
         attempt: &AttemptId,
         snapshot: &str,
-        identity: Option<&str>,
-        durability: Option<&str>,
     ) -> Result<(), DbError> {
         // One transaction (ADR-0056): the attempt's immutable evidence copy
         // and the step's latest-evidence denormalization (+ its provenance
-        // stamp) move together or not at all. The identity travels in the same
-        // statement as the root it describes — a row with one and not the other
-        // would be a snapshot whose content nobody can compare (ADR-0061 s8).
-        // The durability stamp (ADR-0064 s2) rides the ATTEMPT update only:
-        // it is per-attempt historical evidence, never denormalized.
+        // stamp) move together or not at all.
         let mut tx = self.pool().begin().await.map_err(db_err)?;
         sqlx::query(
             "UPDATE step_runs
              SET output_snapshot = $3,
-                 output_identity = $5,
                  evidence_attempt = $4,
                  updated_at = (extract(epoch from now()) * 1000)::bigint
              WHERE run_id = $1 AND step_id = $2",
@@ -393,46 +381,22 @@ impl Db for PostgresDb {
         .bind(&step.0)
         .bind(snapshot)
         .bind(&attempt.0)
-        .bind(identity)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
         sqlx::query(
-            "UPDATE attempts
-             SET output_snapshot = $4, output_identity = $5, output_durability = $6
+            "UPDATE attempts SET output_snapshot = $4
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
         )
         .bind(&run.0)
         .bind(&step.0)
         .bind(&attempt.0)
         .bind(snapshot)
-        .bind(identity)
-        .bind(durability)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
-    }
-
-    async fn step_output_identity(
-        &self,
-        run: &RunId,
-        step: &StepId,
-    ) -> Result<Option<String>, DbError> {
-        // COALESCE is the fallback the port documents, in SQL: a row written
-        // before ADR-0061 s8 has no identity, and comparing by its root is the
-        // pre-identity behaviour — it cascades where it might have skipped.
-        let row = sqlx::query(
-            "SELECT COALESCE(output_identity, output_snapshot) AS cmp
-             FROM step_runs WHERE run_id = $1 AND step_id = $2",
-        )
-        .bind(&run.0)
-        .bind(&step.0)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(db_err)?;
-        Ok(row.and_then(|r| r.get::<Option<String>, _>("cmp")))
     }
 
     async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {
@@ -1352,10 +1316,8 @@ impl Db for PostgresDb {
         // refreshes (the launch handle is a separate column, written by
         // `set_attempt_handle`), so keep the existing row untouched.
         sqlx::query(
-            "INSERT INTO attempts
-                 (run_id, step_id, attempt_id, started_at, failure, failure_detail,
-                  output_durability, outcome)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "INSERT INTO attempts (run_id, step_id, attempt_id, started_at, failure, outcome)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (run_id, step_id, attempt_id) DO NOTHING",
         )
         .bind(&run.0)
@@ -1363,8 +1325,6 @@ impl Db for PostgresDb {
         .bind(&attempt.id.0)
         .bind(attempt.started_at.0)
         .bind(attempt.failure.map(failure_str))
-        .bind(attempt.failure_detail.as_deref())
-        .bind(attempt.output_durability.as_deref())
         .bind(attempt.outcome.as_str())
         .execute(self.pool())
         .await
@@ -1422,11 +1382,9 @@ impl Db for PostgresDb {
         step: &StepId,
         attempt: &AttemptId,
         failure: FailureKind,
-        detail: Option<&str>,
     ) -> Result<(), DbError> {
-        // Record the classification, the human-readable cause (4cf03d7) and the
-        // `Failed` outcome together so the columns never diverge (ADR-0056
-        // amendment). Defense in depth: never
+        // Record the classification and the `Failed` outcome together so the two
+        // columns never diverge (ADR-0056 amendment). Defense in depth: never
         // downgrade a terminal-by-intent outcome — a rerun (`superseded`) or a
         // run cancel (`cancelled`) tore this attempt down on purpose, and the
         // self-inflicted `Lost` its dying Pod reports must not clobber that
@@ -1434,7 +1392,7 @@ impl Db for PostgresDb {
         // outcomes writable — `outcome` is nullable and `NULL NOT IN (…)` is NULL,
         // which would wrongly refuse the legitimate write to a pre-outcome row.
         sqlx::query(
-            "UPDATE attempts SET failure = $4, failure_detail = $5, outcome = $6
+            "UPDATE attempts SET failure = $4, outcome = $5
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
                AND outcome IS DISTINCT FROM 'superseded'
                AND outcome IS DISTINCT FROM 'cancelled'",
@@ -1443,7 +1401,6 @@ impl Db for PostgresDb {
         .bind(&step.0)
         .bind(&attempt.0)
         .bind(failure_str(failure))
-        .bind(detail)
         .bind(AttemptOutcome::Failed.as_str())
         .execute(self.pool())
         .await
@@ -1800,48 +1757,23 @@ impl Db for PostgresDb {
         Ok(())
     }
 
-    async fn gc_workspace_roots(
-        &self,
-        terminal_cutoff: Timestamp,
-    ) -> Result<Vec<(String, Timestamp)>, DbError> {
+    async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError> {
         // EVERY attempt's snapshot is live while its run is (ADR-0056), not
         // just each step's latest — an old Take's workspace view must never
         // race the sweeper. The step_runs arm is kept for pre-ADR-0056 rows
         // whose attempts carry no snapshot copy.
-        //
-        // `snapshots_pinned_at IS NOT NULL` (ADR-0061 s5) is a third disjunct in
-        // the reachability predicate, alongside "non-terminal" and "within TTL".
-        // A pin therefore enters the **mark**, so the whole transitive tree under
-        // a pinned root survives — including subtrees shared with runs that are
-        // themselves collectable. Filtering the delete list instead would keep the
-        // root object and sweep the blobs beneath it, i.e. keep a pointer to
-        // nothing, which is the one outcome a pin must never produce.
-        //
-        // Each root travels with its RECORDING clock — when the reference row
-        // was written. `step_runs.updated_at` is stamped by `set_step_output`
-        // in the same UPDATE that writes the snapshot; attempts carry no write
-        // stamp, so their arm uses `started_at`, which can only be EARLIER
-        // than the recording. `MIN` per root keeps the earliest: one old
-        // recording proves the cold flush (ADR-0064) had time to land, so the
-        // sweeper's torn-cold alarm must not be suppressed merely because a
-        // younger run re-recorded the same root.
         let rows = sqlx::query(
-            "SELECT root, MIN(at) AS recorded_at FROM (
-                 SELECT sr.output_snapshot AS root, sr.updated_at AS at FROM step_runs sr
-                 JOIN runs r ON r.id = sr.run_id
-                 WHERE sr.output_snapshot IS NOT NULL
-                   AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
-                        OR r.updated_at >= $1
-                        OR r.snapshots_pinned_at IS NOT NULL)
-                 UNION ALL
-                 SELECT a.output_snapshot AS root, a.started_at AS at FROM attempts a
-                 JOIN runs r ON r.id = a.run_id
-                 WHERE a.output_snapshot IS NOT NULL
-                   AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
-                        OR r.updated_at >= $1
-                        OR r.snapshots_pinned_at IS NOT NULL)
-             ) refs
-             GROUP BY root",
+            "SELECT DISTINCT sr.output_snapshot AS root FROM step_runs sr
+             JOIN runs r ON r.id = sr.run_id
+             WHERE sr.output_snapshot IS NOT NULL
+               AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
+                    OR r.updated_at >= $1)
+             UNION
+             SELECT DISTINCT a.output_snapshot AS root FROM attempts a
+             JOIN runs r ON r.id = a.run_id
+             WHERE a.output_snapshot IS NOT NULL
+               AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
+                    OR r.updated_at >= $1)",
         )
         .bind(terminal_cutoff.0)
         .fetch_all(self.pool())
@@ -1849,77 +1781,8 @@ impl Db for PostgresDb {
         .map_err(db_err)?;
         Ok(rows
             .into_iter()
-            .map(|r| {
-                (
-                    r.get::<String, _>("root"),
-                    Timestamp(r.get::<i64, _>("recorded_at")),
-                )
-            })
+            .map(|r| r.get::<String, _>("root"))
             .collect())
-    }
-
-    async fn pin_run_snapshots(
-        &self,
-        run: &RunId,
-        by: Option<&str>,
-        at: Timestamp,
-    ) -> Result<bool, DbError> {
-        // Deliberately NOT touching `updated_at`: that column is the run's
-        // lifecycle clock and the TTL cutoff `gc_workspace_roots` compares
-        // against. A pin must not silently re-date the run, or "pinned" and
-        // "settled 5 minutes ago" would become indistinguishable in every view.
-        let n = sqlx::query(
-            "UPDATE runs SET snapshots_pinned_at = $2, snapshots_pinned_by = $3 WHERE id = $1",
-        )
-        .bind(&run.0)
-        .bind(at.0)
-        .bind(by)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        Ok(n > 0)
-    }
-
-    async fn unpin_run_snapshots(&self, run: &RunId) -> Result<bool, DbError> {
-        let n = sqlx::query(
-            "UPDATE runs SET snapshots_pinned_at = NULL, snapshots_pinned_by = NULL WHERE id = $1",
-        )
-        .bind(&run.0)
-        .execute(self.pool())
-        .await
-        .map_err(db_err)?
-        .rows_affected();
-        Ok(n > 0)
-    }
-
-    async fn run_snapshot_retention(
-        &self,
-        run: &RunId,
-    ) -> Result<Option<scarab_engine::SnapshotRetention>, DbError> {
-        let row = sqlx::query(
-            "SELECT status, updated_at, snapshots_pinned_at, snapshots_pinned_by
-             FROM runs WHERE id = $1",
-        )
-        .bind(&run.0)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(db_err)?;
-        let Some(row) = row else { return Ok(None) };
-        let status: String = row.get("status");
-        Ok(Some(scarab_engine::SnapshotRetention {
-            // The same terminal vocabulary the mark query filters on, so "on the
-            // TTL clock" means one thing in both places.
-            terminal: matches!(
-                status.as_str(),
-                "succeeded" | "failed" | "cancelled" | "dead_lettered"
-            ),
-            settled_at: Timestamp(row.get::<i64, _>("updated_at")),
-            pinned_at: row
-                .get::<Option<i64>, _>("snapshots_pinned_at")
-                .map(Timestamp),
-            pinned_by: row.get::<Option<String>, _>("snapshots_pinned_by"),
-        }))
     }
 
     async fn forget_workspace_root(&self, root: &str) -> Result<u32, DbError> {
