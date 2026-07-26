@@ -38,33 +38,37 @@ happens downstream? This is where content-addressing ([0004](0004-execution-topo
 
 The withdrawn text said the skip-if-unchanged half of the decision above was
 "deliberately not built" and that the engine shipped cascade-always. **That was
-wrong when it was written.** Admission has compared each step's recomputed input
-signature against the one it last consumed since migration `0013`
-(`Scheduler::tick`, "Skip-if-unchanged"), skips the match, emits `StepSkipped`,
-and carries the prior output forward. `crates/scarab-db-postgres/tests/restart.rs`
-asserts exactly that and passes.
+wrong when it was written**, by twelve days. Admission has compared each step's
+recomputed input signature against the one it last consumed since `7ea905d`
+(2026-07-12, migration `0013`) — see `Scheduler::tick`, "Skip-if-unchanged": it
+skips the match, emits `StepSkipped`, and carries the prior output forward.
+`crates/scarab-db-postgres/tests/restart.rs` asserts exactly that, and has passed
+throughout.
 
-The amendment is left in place, struck through, rather than deleted, because
-**how it came to be believed is the interesting part** — and it is a failure mode
-this repo will meet again:
+The amendment is left in place, struck through, rather than deleted, because the
+**chronology is the instructive part**, and it is not the one you would guess:
 
-1. The code was there and the tests were green.
-2. The behaviour in production was cascade-always, because the signature was
-   built over each upstream's snapshot **root**, and a root moves with every
-   file's mtime ([0061](0061-workspace-data-path.md) s7). A producer that re-runs
-   writes byte-identical bytes at a new wall clock, so it could never reproduce
-   its own root, so every dependent's signature always changed. Nothing was ever
-   skipped.
-3. Someone observed the real behaviour, correctly, and wrote it down as a
-   *decision*. A second reader found the doc consistent with reality and left it
-   alone. The doc comment on `rerun_step` said the same thing ~1000 lines above
-   the code that contradicted it.
+| date | what happened |
+|---|---|
+| 2026-07-12 | `7ea905d` **ships skip-if-unchanged**, in admission, with tests. |
+| 2026-07-24 | `17dace7` declares it "deliberately not built", in this ADR *and* in a doc comment on `rerun_step` — while it was working. |
+| 2026-07-27 | `dd67e12` ([0061](0061-workspace-data-path.md) s7) puts mtimes in the tree-hash preimage, and thereby **makes the false claim true in effect**: a re-run can no longer reproduce its own root, so nothing is ever skipped. |
 
-So the lesson is not "keep docs in sync". It is that **an ADR amendment
-describing shipped behaviour must say how it was verified**, because "I observed
-cascade-always" and "skip-if-unchanged is not built" are different claims and only
-the first was true. The gap between them was a live bug (git-bug `945b1f4`),
-recorded as an accepted trade-off for three days.
+So the amendment was not a stale doc that reality drifted away from. It was
+**wrong on the day it was written**, and three days later an unrelated slice
+retroactively made it accurate — which is the worst possible way for a false
+claim to survive review, because by the time anyone checked the behaviour, the
+behaviour agreed with it.
+
+The mechanism of the original error is worth naming, because it is cheap to
+repeat: `rerun_step` genuinely does not compare output hashes. It re-arms the
+invalidation set to `Pending` and stops. The comparison lives in **admission**,
+which decides per step whether a `Pending` step runs. Reading the rerun entry
+point and finding no comparison is a correct reading of that function and a wrong
+conclusion about the system. The fix is not "keep docs in sync" but: **an ADR
+amendment asserting that something is not built must name where it looked** — and
+"not built" is a claim about a behaviour, so it needs a behavioural check, not a
+reading of one function.
 
 `force-skip` and `force-cascade` remain genuinely unbuilt, and the "inputs
 unchanged" surface exists on the event log (`StepSkipped`) but not yet as a

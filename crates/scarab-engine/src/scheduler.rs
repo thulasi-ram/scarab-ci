@@ -398,12 +398,16 @@ pub async fn unpin_run_workspace(
 /// forward; the explicit target has its stored signature cleared here, so it
 /// always re-runs.
 ///
-/// The reason the false claim survived: the signature was built over snapshot
-/// **roots**, which move with file mtimes, so a re-run never reproduced one and
-/// nothing was ever skipped in practice (git-bug `945b1f4`). The machinery was
-/// live and the behaviour was cascade-always, which is exactly how a wrong
-/// comment gets written and then confirmed by observation. It signs **content
-/// identities** now (ADR-0061 s8).
+/// **Why reading this function and concluding "not built" is so easy** — because
+/// it is a correct reading of *this* function. `rerun_step` compares nothing; it
+/// re-arms and stops. Admission is the only place a `Pending` step's fate is
+/// decided, so "is skip-if-unchanged built?" is not answerable here. The
+/// 2026-07-24 claim was wrong by twelve days (`7ea905d` shipped it on 07-12), and
+/// then ADR-0061 s7 accidentally made it *true in effect* on 07-27 by putting
+/// mtimes in the tree-hash preimage — a re-run could no longer reproduce its own
+/// root, so nothing was ever skipped (git-bug `945b1f4`). The signature is over
+/// **content identities** now (ADR-0061 s8), which is what makes the rule live
+/// again as well as present.
 pub async fn rerun_step(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -1514,9 +1518,10 @@ impl<'a> Scheduler<'a> {
         // is ever skipped — skip-if-unchanged looked built and was dead.
         // `Db::step_output_identity` falls back to the root when a row carries no
         // identity, which cascades rather than falsely skipping.
-        // Named for what it holds: comparison digests, NOT snapshot roots. The
-        // launch path a few hundred lines down builds its own map from
-        // `step_output` because materializing a workspace needs the address.
+        //
+        // The map is named for what it holds: comparison digests, NOT snapshot
+        // roots. The launch path further down builds its own from `step_output`,
+        // because materializing a workspace needs the address.
         let mut signature_of: HashMap<StepId, String> = HashMap::new();
         for s in &steps {
             if let Some(id) = self.db.step_output_identity(run, &s.step).await? {
