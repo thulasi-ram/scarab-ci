@@ -17,3 +17,8 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 rsa = { workspace = true }
+# The stub GitHub that `tests/app_preflight.rs` serves over a real socket. The
+# forge is a true external (ADR-0017), so it is a real HTTP server rather than
+# a mock object — that is the only way to see the JWT the adapter actually put
+# on the wire.
+axum = { workspace = true }
