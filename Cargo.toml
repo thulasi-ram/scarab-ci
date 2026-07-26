@@ -4,6 +4,10 @@
 #   * Pure domain crates depend ONLY on serde / serde_json / thiserror /
 #     async-trait and on each other. They list NO infra crate (sqlx, kube,
 #     reqwest, object_store, axum, tokio-runtime, aws) in their Cargo.toml.
+#     A further I/O-free library (`tracing`, `sha2`) may be admitted when the
+#     capability is part of the domain rather than of a backend — each one
+#     carries a written justification in the crate's own manifest, next to the
+#     dependency, so the exception is argued rather than assumed.
 #   * Adapter crates pair a domain crate with exactly one infra crate and
 #     hold the stub `impl`s of that domain's ports.
 #   * The purity boundary is enforced by crate dependency edges: an infra

@@ -58,9 +58,17 @@ const MODE_TYPE_MASK: u32 = 0o170_000;
 /// however many modes and timestamps. The per-*path* facts — this file is
 /// executable, this file was last written at T — are properties of the entry,
 /// exactly as git puts the mode in the tree entry and the content in the blob.
-/// A tree's own hash therefore does move when an mtime moves, which is correct:
-/// two checkouts with different timestamps genuinely are different workspaces to
-/// every build tool that decides what to rebuild by comparing them.
+///
+/// A tree's own hash therefore **does** move when an mtime moves. That is right
+/// for an *address* — two checkouts with different timestamps are different bytes
+/// on disk, and a build tool that decides what to rebuild by comparing them will
+/// behave differently in each. It is **wrong for the question "did the content
+/// change?"**, which is what restart invalidation asks (ADR-0027). s7 recorded
+/// only the first half of that and a live cluster found the second
+/// (git-bug `945b1f4`): a producer that re-runs writes identical bytes at a new
+/// wall clock, so it can never reproduce its own root. Hence the second digest —
+/// see [`content_identity_of`]. Both are computed over these entries; only the
+/// hash is an address.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeEntry {
     pub name: String,
@@ -122,10 +130,157 @@ pub enum TreeTarget {
     Tree(TreeHash),
 }
 
-/// The merkle root of a materialized workspace.
+/// The merkle root of a materialized workspace, plus **what** it holds.
+///
+/// Two coordinates, and the distinction is load-bearing (ADR-0061 s8):
+///
+/// - [`root`](Snapshot::root) — **where the bytes are.** The storage address:
+///   the hash of the canonical tree bytes, mtimes and all. This is the one true
+///   root — what [`Cas::materialize`] resolves, what GC's mark walk starts from,
+///   what an Attempt records as its evidence.
+/// - [`identity`](Snapshot::identity) — **what the bytes are.** The
+///   [content identity](content_identity): the same merkle fold with every
+///   mtime dropped. **Never an address** — nothing is stored under it and
+///   nothing can be fetched by it. It exists so two snapshots can be compared
+///   for *sameness of content* without their timestamps voting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub root: TreeHash,
+    /// The snapshot's content identity, when the producing store computed one.
+    /// `None` from a store that predates it — callers then fall back to `root`,
+    /// which is the pre-identity behaviour (see [`content_identity`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<TreeHash>,
+}
+
+impl Snapshot {
+    /// A snapshot with no computed identity — the shape every snapshot had
+    /// before content identity existed.
+    pub fn new(root: TreeHash) -> Self {
+        Self {
+            root,
+            identity: None,
+        }
+    }
+
+    /// The digest to compare two snapshots by when the question is *"is this the
+    /// same content?"* — the identity if one was computed, else the root.
+    ///
+    /// Falling back to the root is the correct degradation, not a fudge: a
+    /// snapshot whose entries record no mtimes has an identity *equal* to its
+    /// root (dropping a field that is already absent changes no bytes), and a
+    /// snapshot that does record them compares by root, which is what the system
+    /// did before identity existed — it re-runs a dependent that might have been
+    /// skipped. Wasteful, never wrong.
+    pub fn comparison(&self) -> &TreeHash {
+        self.identity.as_ref().unwrap_or(&self.root)
+    }
+}
+
+/// The SHA-256 of `data`, lowercase hex — **the** content address in this
+/// system (ADR-0029). One definition, in the domain crate, because both
+/// adapters need to agree on it byte for byte.
+pub fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(data);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// The canonical byte form of a tree — **the hash preimage**: entries sorted by
+/// name, then compact `serde_json`. Structurally identical trees therefore share
+/// a hash (and thus dedup) regardless of insertion order.
+///
+/// **Do not change the ordering or the serialisation.** Every tree hash ever
+/// stored was computed over exactly these bytes; a change orphans every stored
+/// snapshot at once. `scarab-storage-s3/tests/hashing.rs` pins the result
+/// against independently-derived literals.
+pub fn canonical_tree_bytes(mut entries: Vec<TreeEntry>) -> Result<Vec<u8>, StorageError> {
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    serde_json::to_vec(&entries).map_err(|e| StorageError::Backend(e.to_string()))
+}
+
+/// The canonical bytes of a tree and the [`TreeHash`] they address.
+pub fn canonical_tree(entries: Vec<TreeEntry>) -> Result<(TreeHash, Vec<u8>), StorageError> {
+    let bytes = canonical_tree_bytes(entries)?;
+    Ok((TreeHash(sha256_hex(&bytes)), bytes))
+}
+
+/// The **content identity** of one tree level: the canonical form with every
+/// `mtime_ms` dropped.
+///
+/// # Why this exists (ADR-0061 s8, git-bug `945b1f4`)
+///
+/// A tree's *hash* moves with its files' mtimes, because the mtimes are in the
+/// preimage — deliberately, so a checkout is restored faithfully. The
+/// consequence, found on a live cluster rather than reasoned about: **a producer
+/// that re-runs can never reproduce its own root**, because it writes the same
+/// bytes at a new wall-clock time. That killed [0027](../../../docs/adr/0027-restart-semantics.md)'s
+/// skip-if-unchanged, which asks a question the root cannot answer: *did the
+/// content change?*
+///
+/// So there are two digests over one tree, and only one of them is an address:
+///
+/// | | covers | is an address? | answers |
+/// |---|---|---|---|
+/// | tree hash | names, targets, modes, **mtimes** | **yes** — `trees/<hash>` | "where are these exact bytes, with these exact timestamps?" |
+/// | content identity | names, targets, modes | **no** | "is this the same content?" |
+///
+/// **`entries` must already name each sub-tree by ITS identity**, not by its
+/// tree hash — otherwise a directory whose only change is a nested file's mtime
+/// would still get a fresh identity, and the fold would buy nothing. `ingest`
+/// substitutes as it folds up; [`content_identity`] does the same walking down.
+///
+/// Note the pleasing degenerate case: a tree that records **no** mtimes has an
+/// identity byte-identical to its canonical form, so its identity *is* its tree
+/// hash. Pre-metadata snapshots therefore need no special handling anywhere.
+pub fn content_identity_of(entries: &[TreeEntry]) -> Result<TreeHash, StorageError> {
+    let stripped: Vec<TreeEntry> = entries
+        .iter()
+        .map(|e| TreeEntry {
+            name: e.name.clone(),
+            target: e.target.clone(),
+            mode: e.mode,
+            mtime_ms: None,
+        })
+        .collect();
+    Ok(canonical_tree(stripped)?.0)
+}
+
+/// The [content identity](content_identity_of) of a **stored** tree, resolved by
+/// walking it.
+///
+/// The bottom-up dual of what `Cas::ingest` computes for free while it is
+/// already holding the whole tree. Use that when you have it; this is for the
+/// cases where a root arrived from somewhere else — a [`prune_tree`] rebuild, or
+/// a snapshot recorded before identities existed.
+///
+/// **Off the hot path on purpose.** It costs one `tree_entries` round-trip per
+/// *directory*, sequentially — the per-file sequential walk ADR-0061 s2 removed,
+/// one grain coarser. Directories are far fewer than files and a pruned tree is
+/// small by construction, but do not put this in a Step boundary's default path.
+pub async fn content_identity(
+    cas: &dyn Cas,
+    root: &TreeHash,
+) -> Result<TreeHash, StorageError> {
+    let entries = cas.tree_entries(root).await?;
+    let mut resolved = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let target = match &entry.target {
+            // A sub-tree contributes its IDENTITY, so a nested mtime cannot
+            // reach the root through a child's hash.
+            TreeTarget::Tree(sub) => {
+                TreeTarget::Tree(Box::pin(content_identity(cas, sub)).await?)
+            }
+            blob => blob.clone(),
+        };
+        resolved.push(TreeEntry { target, ..entry });
+    }
+    content_identity_of(&resolved)
 }
 
 /// Errors from storage operations.

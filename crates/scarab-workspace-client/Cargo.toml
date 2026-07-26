@@ -13,7 +13,6 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 # Concurrency in the CAS legs. ADR-0061's s0 measurement is unambiguous that
 # the cost of the existing data path is one sequential round-trip PER FILE, so a
 # client that walked files one at a time would inherit the exact problem it
@@ -47,3 +46,6 @@ scarab-storage-s3 = { workspace = true }
 scarab-executor-k8s = { workspace = true }
 axum = { workspace = true }
 tempfile = { workspace = true }
+# The acceptance test re-derives digests by hand to check the wire format; the
+# client itself gets its digest from `scarab-storage`.
+sha2 = { workspace = true }

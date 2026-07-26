@@ -2852,6 +2852,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2868,7 +2870,6 @@ dependencies = [
  "scarab-storage",
  "scarab-testkit",
  "serde_json",
- "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",

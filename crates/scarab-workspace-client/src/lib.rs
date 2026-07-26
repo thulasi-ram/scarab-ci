@@ -51,7 +51,6 @@ use scarab_storage::{
     BlobHash, Cas, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 /// How many blob transfers are in flight at once.
 ///
@@ -232,27 +231,20 @@ const fn scarab_storage_workspace_token_header() -> &'static str {
 
 /// The content address of `data`: SHA-256, lowercase hex.
 ///
-/// Must agree byte-for-byte with `scarab_storage_s3`'s private helper, or a
-/// snapshot written through the service would not be the same snapshot as one
-/// written straight to object storage. The acceptance test pins that.
+/// One definition for the whole system, in the domain crate — this used to be a
+/// hand-copy of `scarab-storage-s3`'s private helper, with a comment asking the
+/// reader to keep the two in step. A snapshot written through the service must be
+/// the *same* snapshot as one written straight to object storage, so the address
+/// function is not an adapter's business.
 fn hash_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    scarab_storage::sha256_hex(data)
 }
 
-/// Canonical tree bytes: entries sorted by name, then `serde_json`.
-///
-/// **The canonical form is defined here and nowhere else on this side of the
-/// wire.** It is byte-identical to `S3Storage::put_tree`'s, deliberately.
-fn canonical_tree(mut entries: Vec<TreeEntry>) -> Result<(TreeHash, Vec<u8>), StorageError> {
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    let bytes = serde_json::to_vec(&entries).map_err(|e| StorageError::Backend(e.to_string()))?;
-    Ok((TreeHash(hash_hex(&bytes)), bytes))
+/// Canonical tree bytes and the hash they address — [`scarab_storage`]'s
+/// definition, for the same reason as [`hash_hex`]: it is the hash **preimage**,
+/// so two copies of it is a storage-format fork waiting to happen.
+fn canonical_tree(entries: Vec<TreeEntry>) -> Result<(TreeHash, Vec<u8>), StorageError> {
+    scarab_storage::canonical_tree(entries)
 }
 
 #[async_trait]
@@ -411,6 +403,7 @@ impl Cas for WorkspaceClient {
         }
         Ok(Snapshot {
             root: TreeHash(scan.root),
+            identity: Some(TreeHash(scan.identity)),
         })
     }
 }
@@ -620,6 +613,10 @@ async fn read_blob_source(source: &BlobSource) -> Result<Vec<u8>, StorageError> 
 /// A local directory, hashed but not yet uploaded.
 struct Scan {
     root: String,
+    /// The root's **content identity** (ADR-0061 s8) — the same merkle fold with
+    /// mtimes dropped. Folded here rather than asked of the service: it is never
+    /// stored, so there is nothing to ask for.
+    identity: String,
     /// blob hash → where to read it from. A map, so identical content anywhere
     /// in the tree is uploaded once.
     blobs: std::collections::HashMap<String, BlobSource>,
@@ -638,18 +635,23 @@ struct Scan {
 fn scan_dir(dir: &std::path::Path) -> Result<Scan, StorageError> {
     let mut scan = Scan {
         root: String::new(),
+        identity: String::new(),
         blobs: std::collections::HashMap::new(),
         trees: Vec::new(),
     };
-    scan.root = scan_one(dir, &mut scan.blobs, &mut scan.trees)?;
+    let (root, identity) = scan_one(dir, &mut scan.blobs, &mut scan.trees)?;
+    scan.root = root;
+    scan.identity = identity;
     Ok(scan)
 }
 
+/// One directory: returns `(tree hash, content identity)`. The identity names
+/// each sub-directory by *its* identity, so a nested mtime cannot reach the root.
 fn scan_one(
     dir: &std::path::Path,
     blobs: &mut std::collections::HashMap<String, BlobSource>,
     trees: &mut Vec<(String, Vec<u8>)>,
-) -> Result<String, StorageError> {
+) -> Result<(String, String), StorageError> {
     let mut items: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
         .map_err(io_err)?
         .collect::<Result<_, _>>()
@@ -657,6 +659,9 @@ fn scan_one(
     items.sort_by_key(|e| e.file_name());
 
     let mut entries = Vec::with_capacity(items.len());
+    // The same entries with sub-trees named by identity; `content_identity_of`
+    // drops the mtimes.
+    let mut id_entries = Vec::with_capacity(items.len());
     for item in items {
         let name = item.file_name().to_string_lossy().into_owned();
         // `DirEntry::metadata` is an `lstat`: it does not follow links, which is
@@ -669,31 +674,48 @@ fn scan_one(
             let bytes = dest.as_os_str().as_bytes().to_vec();
             let hash = hash_hex(&bytes);
             blobs.entry(hash.clone()).or_insert(BlobSource::Link(bytes));
-            entries.push(TreeEntry::symlink(name, BlobHash(hash)));
+            let entry = TreeEntry::symlink(name, BlobHash(hash));
+            id_entries.push(entry.clone());
+            entries.push(entry);
             continue;
         }
 
-        let target = if file_type.is_dir() {
-            TreeTarget::Tree(TreeHash(scan_one(&item.path(), blobs, trees)?))
+        let (target, id_target) = if file_type.is_dir() {
+            let (sub, sub_identity) = scan_one(&item.path(), blobs, trees)?;
+            (
+                TreeTarget::Tree(TreeHash(sub)),
+                TreeTarget::Tree(TreeHash(sub_identity)),
+            )
         } else {
             let data = std::fs::read(item.path()).map_err(io_err)?;
             let hash = hash_hex(&data);
             blobs
                 .entry(hash.clone())
                 .or_insert(BlobSource::File(item.path()));
-            TreeTarget::Blob(BlobHash(hash))
+            (
+                TreeTarget::Blob(BlobHash(hash.clone())),
+                TreeTarget::Blob(BlobHash(hash)),
+            )
         };
+        let mode = Some(meta.permissions().mode() & 0o7777);
+        id_entries.push(TreeEntry {
+            name: name.clone(),
+            target: id_target,
+            mode,
+            mtime_ms: None,
+        });
         entries.push(TreeEntry {
             name,
             target,
-            mode: Some(meta.permissions().mode() & 0o7777),
+            mode,
             mtime_ms: mtime_ms(&meta),
         });
     }
 
+    let identity = scarab_storage::content_identity_of(&id_entries)?;
     let (hash, bytes) = canonical_tree(entries)?;
     trees.push((hash.0.clone(), bytes));
-    Ok(hash.0)
+    Ok((hash.0, identity.0))
 }
 
 /// A file's mtime as unix-ms. Pre-epoch timestamps come back negative rather

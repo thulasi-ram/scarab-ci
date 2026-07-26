@@ -61,7 +61,6 @@ use object_store::{ObjectStore as OsObjectStore, ObjectStoreExt};
 use scarab_storage::{
     BlobHash, Cas, ObjectStore, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget,
 };
-use sha2::{Digest, Sha256};
 
 /// How many object-store round-trips a single CAS leg keeps in flight.
 ///
@@ -189,27 +188,18 @@ fn io_err(e: std::io::Error) -> StorageError {
     StorageError::Backend(e.to_string())
 }
 
-/// The content address of `data`: its SHA-256, lowercase hex.
+/// The content address of `data`: its SHA-256, lowercase hex. One definition, in
+/// the domain crate — see [`scarab_storage::sha256_hex`].
 fn hash_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
+    scarab_storage::sha256_hex(data)
 }
 
-/// The canonical byte form of a tree — **the hash preimage**: entries sorted by
-/// name, then `serde_json`. Structurally identical trees therefore share a hash
-/// (and thus dedup) regardless of insertion order.
-///
-/// **Do not change the ordering or the serialisation.** Every tree hash ever
-/// stored was computed over exactly these bytes; a change orphans every stored
-/// snapshot at once. `tests/hashing.rs` pins the result against literals.
-fn canonical_tree(mut entries: Vec<TreeEntry>) -> Result<Vec<u8>, StorageError> {
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    serde_json::to_vec(&entries).map_err(|e| StorageError::Backend(e.to_string()))
+/// The canonical byte form of a tree — **the hash preimage**. Lives in
+/// `scarab-storage` ([`scarab_storage::canonical_tree_bytes`]) because
+/// `scarab-workspace-client` must produce the same bytes to the last byte, and
+/// two copies of a hash preimage is a drift waiting to happen.
+fn canonical_tree(entries: Vec<TreeEntry>) -> Result<Vec<u8>, StorageError> {
+    scarab_storage::canonical_tree_bytes(entries)
 }
 
 /// What storing one content-addressed object cost, and whether it was already
@@ -425,7 +415,7 @@ impl S3Storage {
     /// `tar` legs this replaces preserved both, an executable that returns
     /// `0644` cannot be run, and cargo/make/tsc decide what to rebuild by
     /// comparing timestamps.
-    async fn ingest_tree(&self, root: std::path::PathBuf) -> Result<TreeHash, StorageError> {
+    async fn ingest_tree(&self, root: std::path::PathBuf) -> Result<Snapshot, StorageError> {
         use futures::StreamExt;
 
         let started = Instant::now();
@@ -496,6 +486,10 @@ impl S3Storage {
             by_depth[dir.depth].push(i);
         }
         let mut trees: Vec<Option<TreeHash>> = vec![None; arena.len()];
+        // The content identity of each directory, folded up beside its tree hash
+        // (ADR-0061 s8). Costs one extra SHA-256 per directory and **no**
+        // round-trip: an identity is not an address, so it is never stored.
+        let mut identities: Vec<Option<TreeHash>> = vec![None; arena.len()];
         for level in by_depth.into_iter().rev() {
             let mut batch = Vec::with_capacity(level.len());
             for i in level {
@@ -536,6 +530,23 @@ impl S3Storage {
                         },
                     });
                 }
+                // The identity fold, same order as `entries` (both were pushed
+                // walking `arena[i].entries`): a sub-directory contributes its
+                // *identity*, never its tree hash, or a nested mtime would reach
+                // the root through a child and the fold would buy nothing.
+                let mut id_entries = Vec::with_capacity(entries.len());
+                for (e, entry) in arena[i].entries.iter().enumerate() {
+                    let mut ide = entries[e].clone();
+                    if let WalkEntry::Dir { idx, .. } = entry {
+                        ide.target = TreeTarget::Tree(
+                            identities[*idx]
+                                .clone()
+                                .ok_or_else(|| missing("a sub-tree identity"))?,
+                        );
+                    }
+                    id_entries.push(ide);
+                }
+                identities[i] = Some(scarab_storage::content_identity_of(&id_entries)?);
                 batch.push((i, canonical_tree(entries)?));
             }
             let mut stream = futures::stream::iter(batch)
@@ -570,11 +581,15 @@ impl S3Storage {
             "ws-timing"
         );
 
-        trees
+        let root = trees
             .into_iter()
             .next()
             .flatten()
-            .ok_or_else(|| missing("the root tree"))
+            .ok_or_else(|| missing("the root tree"))?;
+        Ok(Snapshot {
+            root,
+            identity: identities.into_iter().next().flatten(),
+        })
     }
 }
 
@@ -909,7 +924,6 @@ impl Cas for S3Storage {
     }
 
     async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
-        let root = self.ingest_tree(std::path::PathBuf::from(path)).await?;
-        Ok(Snapshot { root })
+        self.ingest_tree(std::path::PathBuf::from(path)).await
     }
 }
