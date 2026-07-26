@@ -2,11 +2,23 @@
 //!
 //! This test is `#[ignore]`d and additionally gated on the `SCARAB_TEST_KUBE`
 //! env var, so `cargo test` NEVER runs it and it never touches an ambient
-//! kubeconfig by accident. It is meant to run only against the dedicated dev
-//! kind cluster wired up by the dev-harness slice (issue 7e2038d), e.g.:
+//! kubeconfig by accident.
 //!
-//!   SCARAB_TEST_KUBE=1 SCARAB_TEST_KUBE_NS=scarab-dev \
-//!     cargo test -p scarab-executor-k8s --test cluster -- --ignored
+//! # How to run it — one recipe, both audiences
+//!
+//! Every case here needs more than a cluster: a workspace service (ADR-0061), the
+//! fetcher/clone/sidecar images present in the node, a registry, a host address a
+//! Pod can reach. There are exactly two places that stand all of that up, and
+//! they set the SAME `SCARAB_TEST_*` set:
+//!
+//! - CI: the `kind` workflow (`.github/workflows/kind.yml`);
+//! - local: `just kube-tests`, which owns the proc-mode stack and drives this
+//!   suite against it.
+//!
+//! Do not hand-roll the env. Once `SCARAB_TEST_KUBE` is set, a missing var is a
+//! **panic** ([`tier_var`], [`workspace_fixture`]) and not a skip — because for
+//! seven cases it silently was a skip, and `kind/cluster-tests` is
+//! `required-if-run`, so the merge gate read that silence as proof.
 //!
 //! It proves the acceptance: a busybox `echo` runs to completion with its exit
 //! code recorded, and a second `launch` of the same fence re-attaches to the
@@ -105,6 +117,32 @@ fn opted_in() -> Option<String> {
     Some(std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()))
 }
 
+/// Read a `SCARAB_TEST_*` var the tier's runner is expected to provide.
+///
+/// **Only ever called after [`opted_in`]**, so reaching it means the tier is
+/// running — and an absent var is therefore a wiring bug, not a reason to skip.
+/// It panics.
+///
+/// That is not pedantry. Every one of these used to be an `else { return }`, and
+/// with the ADR-0061 workspace vars nothing set them anywhere: seven cases
+/// reported PASS while executing nothing, and `kind/cluster-tests` is
+/// `required-if-run` in `.github/required-checks.txt`, so `just pr-gate` read that
+/// silence as a green tier. A live case that cannot run must be RED.
+///
+/// Wiring lives in exactly two places, both of which set the full set:
+/// `.github/workflows/kind.yml` and the `just kube-tests` recipe.
+fn tier_var(name: &str) -> String {
+    match std::env::var(name) {
+        Ok(v) if !v.is_empty() => v,
+        _ => panic!(
+            "{name} is not set, but SCARAB_TEST_KUBE is — this live case would have \
+             silently no-op'd while reporting PASS. Wire it in \
+             .github/workflows/kind.yml (CI) or run `just kube-tests` (local, which \
+             stands up everything this tier needs)."
+        ),
+    }
+}
+
 /// The ADR-0061 workspace service this tier drives, and the `Cas` that MUST be
 /// the same store.
 ///
@@ -133,11 +171,19 @@ fn opted_in() -> Option<String> {
 /// `deploy/local-proc/up.sh`). It defaults to the host URL, which is right in
 /// Helm mode where there is one in-cluster Service.
 ///
-/// # Not run, and said plainly
+/// # Missing configuration is FATAL, not a skip
 ///
-/// This whole tier is `#[ignore]` + `SCARAB_TEST_KUBE`-gated and was **not
-/// executed** for the s3-feed change: it needs a live cluster plus a reachable
-/// workspace service plus the fetcher image loaded into the node.
+/// This fixture shipped as a triple `else { return }`, and the effect was that
+/// seven cases — five of which ran green the week before — reported PASS while
+/// executing nothing, because no CI job, recipe or script set the three vars it
+/// asks for. `kind/cluster-tests` is `required-if-run`, so the merge gate saw
+/// green for a tier that had gone silent.
+///
+/// So: once the tier is opted in ([`opted_in`]), absent workspace configuration
+/// **panics**. Mirrors `SCARAB_TEST_REQUIRE_PG` in
+/// `crates/scarab-server/tests/common/mod.rs` — with one deliberate difference:
+/// the panic is keyed on the SAME condition as `opted_in` rather than on a second
+/// opt-out var, because a second var is how this failed the first time.
 struct WorkspaceFixture {
     /// The service, behind `Cas`. What the executor drains into and what the test
     /// reads back.
@@ -147,27 +193,44 @@ struct WorkspaceFixture {
 }
 
 fn workspace_fixture() -> Option<WorkspaceFixture> {
-    let Ok(url) = std::env::var("SCARAB_TEST_WORKSPACE_URL") else {
+    let vars = [
+        "SCARAB_TEST_WORKSPACE_URL",
+        "SCARAB_TEST_WORKSPACE_SECRET",
+        "SCARAB_TEST_WSFETCH_IMAGE",
+    ];
+    let missing: Vec<&str> = vars
+        .iter()
+        .copied()
+        .filter(|v| std::env::var(v).map(|s| s.is_empty()).unwrap_or(true))
+        .collect();
+    if !missing.is_empty() {
+        // Deliberately the same predicate `opted_in` uses. One var opts the tier
+        // in; nothing else may opt a case out of it.
+        if std::env::var("SCARAB_TEST_KUBE").is_ok() {
+            panic!(
+                "live workspace test skipped but SCARAB_TEST_KUBE is set — missing: {}.\n\
+                 Since ADR-0061 s3-feed a Step with `needs:` is provisioned by an init \
+                 container that dials the workspace service, so a green run without these \
+                 proves nothing. Wire them up:\n\
+                 \x20 CI:    .github/workflows/kind.yml (workspace service + kind-loaded fetcher)\n\
+                 \x20 local: `just up` writes deploy/local-proc/.env.generated; \
+                 `just kube-tests` sources it",
+                missing.join(", ")
+            );
+        }
         eprintln!(
-            "skipping: set SCARAB_TEST_WORKSPACE_URL (host-facing), \
-             SCARAB_TEST_WORKSPACE_SECRET and SCARAB_TEST_WSFETCH_IMAGE. Since ADR-0061 \
-             s3-feed a Step with `needs:` is provisioned by an init container that dials \
-             the workspace service, so there is nothing to test without one."
+            "SKIPPED (live workspace test): set {} — `just kube-tests` wires them up",
+            vars.join(", ")
         );
         return None;
-    };
-    let Ok(secret) = std::env::var("SCARAB_TEST_WORKSPACE_SECRET") else {
-        eprintln!("skipping: SCARAB_TEST_WORKSPACE_SECRET is not set");
-        return None;
-    };
-    let Ok(image) = std::env::var("SCARAB_TEST_WSFETCH_IMAGE") else {
-        eprintln!(
-            "skipping: set SCARAB_TEST_WSFETCH_IMAGE to a scarab-wsfetch image present in \
-             the cluster (proc mode: `just up` builds + kind-loads scarab-wsfetch:dev)"
-        );
-        return None;
-    };
-    let pod_url = std::env::var("SCARAB_TEST_WORKSPACE_POD_URL").unwrap_or_else(|_| url.clone());
+    }
+    let url = std::env::var("SCARAB_TEST_WORKSPACE_URL").expect("checked above");
+    let secret = std::env::var("SCARAB_TEST_WORKSPACE_SECRET").expect("checked above");
+    let image = std::env::var("SCARAB_TEST_WSFETCH_IMAGE").expect("checked above");
+    let pod_url = std::env::var("SCARAB_TEST_WORKSPACE_POD_URL")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| url.clone());
 
     // The test process stands in for the control plane, so it mints itself a
     // BROWSE token — not root-limited, because it reads and writes arbitrary
@@ -997,11 +1060,8 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
 async fn clone_step_produces_a_source_workspace() {
     let run_id = unique_run("run-clone");
     let Some(ns) = opted_in() else { return };
-    let Ok(clone_image) = std::env::var("SCARAB_TEST_CLONE_IMAGE") else {
-        eprintln!("skipping: set SCARAB_TEST_CLONE_IMAGE to a scarab-clone image in the cluster");
-        return;
-    };
-    let sha = std::env::var("SCARAB_TEST_CLONE_SHA").expect("SCARAB_TEST_CLONE_SHA");
+    let clone_image = tier_var("SCARAB_TEST_CLONE_IMAGE");
+    let sha = tier_var("SCARAB_TEST_CLONE_SHA");
     // The downstream `needs: [checkout]` step at the bottom of this test is fed by
     // the fetcher, so this test needs the service too.
     let Some(ws) = workspace_fixture() else { return };
@@ -1165,11 +1225,8 @@ async fn clone_step_produces_a_source_workspace() {
 async fn clone_depth_full_exposes_history() {
     let run_id = unique_run("run-clone-full");
     let Some(ns) = opted_in() else { return };
-    let Ok(clone_image) = std::env::var("SCARAB_TEST_CLONE_IMAGE") else {
-        eprintln!("skipping: set SCARAB_TEST_CLONE_IMAGE to a scarab-clone image in the cluster");
-        return;
-    };
-    let sha = std::env::var("SCARAB_TEST_CLONE_SHA").expect("SCARAB_TEST_CLONE_SHA");
+    let clone_image = tier_var("SCARAB_TEST_CLONE_IMAGE");
+    let sha = tier_var("SCARAB_TEST_CLONE_SHA");
     // The history check downstream inherits the checkout, so it is fed by the
     // fetcher (ADR-0061 s3-feed).
     let Some(ws) = workspace_fixture() else { return };
@@ -1297,10 +1354,7 @@ async fn clone_depth_full_exposes_history() {
 async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
     use scarab_storage::Cas;
     let Some(ns) = opted_in() else { return };
-    let Ok(clone_image) = std::env::var("SCARAB_TEST_CLONE_IMAGE") else {
-        eprintln!("skipping: set SCARAB_TEST_CLONE_IMAGE to a scarab-clone image in the cluster");
-        return;
-    };
+    let clone_image = tier_var("SCARAB_TEST_CLONE_IMAGE");
 
     let client = kube::Client::try_default().await.expect("kube client");
     let tmp = tempfile::tempdir().expect("cas dir");
@@ -1390,10 +1444,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn build_step_builds_and_pushes_to_a_local_registry() {
     let Some(ns) = opted_in() else { return };
-    let Ok(registry) = std::env::var("SCARAB_TEST_REGISTRY") else {
-        eprintln!("skipping: set SCARAB_TEST_REGISTRY to an in-cluster registry host:port");
-        return;
-    };
+    let registry = tier_var("SCARAB_TEST_REGISTRY");
     // The build step inherits its context as a workspace input, so the fetcher
     // provisions it (ADR-0061 s3-feed).
     let Some(ws) = workspace_fixture() else { return };
@@ -1538,14 +1589,8 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn results_sidecar_captures_a_named_result_end_to_end() {
     let Some(ns) = opted_in() else { return };
-    let Ok(sidecar_image) = std::env::var("SCARAB_TEST_SIDECAR_IMAGE") else {
-        eprintln!("skipping: set SCARAB_TEST_SIDECAR_IMAGE to a scarab-results-sidecar image");
-        return;
-    };
-    let Ok(host_ip) = std::env::var("SCARAB_TEST_HOST_IP") else {
-        eprintln!("skipping: set SCARAB_TEST_HOST_IP (host address reachable from Pods)");
-        return;
-    };
+    let sidecar_image = tier_var("SCARAB_TEST_SIDECAR_IMAGE");
+    let host_ip = tier_var("SCARAB_TEST_HOST_IP");
     let run_id = unique_run("run-results");
 
     // A stub ingest endpoint: records the one POST the sidecar makes.

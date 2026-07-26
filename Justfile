@@ -263,6 +263,97 @@ forgejo-verify keep="0":
     cargo nextest run -p scarab-forge-forgejo --test live --no-fail-fast
     cargo nextest run -p scarab-e2e --test forgejo_onboarding --no-fail-fast
 
+# LIVE k8s executor tier (`crates/scarab-executor-k8s/tests/cluster.rs`) — the
+# same tier `.github/workflows/kind.yml` runs, against the proc-mode kind cluster.
+#
+# It exists because that tier needs far more than a cluster: an ADR-0061 workspace
+# service reachable BOTH from the host and from a Pod, the fetcher/clone/sidecar
+# images inside the node, an in-cluster registry, and a host address a Pod can
+# POST to. Nothing local supplied any of it, so seven cases skipped — five of
+# which had been passing — while `kind/cluster-tests` reported PASS. Those cases
+# now PANIC on a missing var rather than skip, so this recipe is the local half of
+# the repair: it is the only supported way to run the tier by hand.
+#
+# It does NOT tear the stack down: the suite is slow, you will want to poke at the
+# cluster afterwards, and `just down` runs `compose down -v` which would take the
+# shared dev Postgres with it. Stop with `just down` when you are actually done.
+#
+# Usage: `just kube-tests` | `just kube-tests workspace_flows` (nextest filter).
+kube-tests filter="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # 1. The stack. Idempotent, and it re-probes the Pod-reachable workspace URL,
+    #    so a stale .env.generated from a torn-down cluster cannot be used.
+    bash deploy/local-proc/up.sh
+    set -a
+    source deploy/local-proc/.env
+    source deploy/local-proc/.env.generated
+    set +a
+    # The ISOLATED kubeconfig, never the ambient context: production EKS contexts
+    # sit next to the local one and this suite creates and deletes Pods.
+    export KUBECONFIG="$PWD/deploy/local-proc/.kubeconfig"
+    ns="${SCARAB_TEST_KUBE_NS:-scarab}"
+    cluster=scarab-dev
+    # 2. The step images the tier drives. up.sh needs neither (it only builds the
+    #    fetcher), so they are built and kind-loaded here.
+    for entry in "scarab-clone:kube-tests docker/clone" "scarab-results-sidecar:kube-tests docker/sidecar"; do
+      set -- $entry
+      echo "==> building $1"
+      docker build -q -t "$1" "$2" >/dev/null
+      kind load docker-image "$1" --name "$cluster" >/dev/null
+    done
+    export SCARAB_TEST_CLONE_IMAGE=scarab-clone:kube-tests
+    export SCARAB_TEST_SIDECAR_IMAGE=scarab-results-sidecar:kube-tests
+    # 3. The plain-HTTP registry the `kind: build` case pushes to and then reads
+    #    the tag list of, from inside the cluster (same shape as kind.yml).
+    echo "==> ensuring an in-cluster registry in namespace $ns"
+    kubectl apply -n "$ns" -f - <<EOF
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: registry
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: { app: registry }
+      template:
+        metadata:
+          labels: { app: registry }
+        spec:
+          containers:
+            - name: registry
+              image: registry:2
+              ports:
+                - containerPort: 5000
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: registry
+    spec:
+      selector: { app: registry }
+      ports:
+        - port: 5000
+          targetPort: 5000
+    EOF
+    kubectl rollout status deployment/registry -n "$ns" --timeout=180s
+    export SCARAB_TEST_REGISTRY="registry.$ns.svc.cluster.local:5000"
+    # 4. The clone cases fetch THIS repo at a SHA that must exist ON THE FORGE, so
+    #    the default is origin/main and not HEAD (which may be unpushed). The repo
+    #    is private, hence the token — delivered via tmpfs + GIT_ASKPASS (ADR-0045).
+    export SCARAB_TEST_CLONE_SHA="${SCARAB_TEST_CLONE_SHA:-$(git rev-parse origin/main)}"
+    export SCARAB_TEST_CLONE_TOKEN="${SCARAB_TEST_CLONE_TOKEN:-$(gh auth token 2>/dev/null || true)}"
+    export SCARAB_TEST_KUBE=1
+    echo "==> running the live tier (ns=$ns, workspace=$SCARAB_TEST_WORKSPACE_URL,"
+    echo "    pod-facing=$SCARAB_TEST_WORKSPACE_POD_URL, fetcher=$SCARAB_TEST_WSFETCH_IMAGE)"
+    if [ -n "{{filter}}" ]; then
+      cargo nextest run -p scarab-executor-k8s --test cluster \
+        --run-ignored all --no-fail-fast -E 'test(~{{filter}})'
+    else
+      cargo nextest run -p scarab-executor-k8s --test cluster \
+        --run-ignored all --no-fail-fast
+    fi
+
 # UI no-DOM suite (test-strategy Phase 3, base of the UI pyramid): vitest over
 # the run-detail derivations — event folding, Takes, attempts, logs, DAG layout.
 # No jsdom, no browser, no server; runs in under a second.

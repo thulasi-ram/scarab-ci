@@ -16,7 +16,15 @@
 # Images: the clone + results-sidecar step images are pulled from the GHCR
 # `edge` tags image.yml publishes off main and `kind load`ed; when the PR
 # itself changes `docker/**` they are instead built fresh from the tree so
-# the run exercises the PR's Dockerfiles.
+# the run exercises the PR's Dockerfiles. The ADR-0061 workspace FETCHER is
+# always built from the tree — see the step that builds it.
+#
+# ADR-0061: this job also stands up a workspace service, because since s3-feed
+# every Step with `needs:` is provisioned by an init container that dials one and
+# there is no control-plane feed to fall back on. Seven live cases (five of which
+# used to pass) went silent the moment `tests/cluster.rs` started asking for
+# `SCARAB_TEST_WORKSPACE_*` that nothing here set; they now PANIC rather than
+# skip, so this wiring is load-bearing, not optional colour.
 name: kind
 
 on:
@@ -27,6 +35,9 @@ on:
       - 'crates/scarab-engine/**'
       - 'crates/scarab-server/**'
       - 'crates/scarab-storage*/**'
+      # The workspace client is the fetcher's source AND the `Cas` the live
+      # workspace cases point the executor at (ADR-0061 s3-feed).
+      - 'crates/scarab-workspace-client/**'
       - 'docker/**'
       - '.github/workflows/kind.yml'
   pull_request:
@@ -35,6 +46,7 @@ on:
       - 'crates/scarab-engine/**'
       - 'crates/scarab-server/**'
       - 'crates/scarab-storage*/**'
+      - 'crates/scarab-workspace-client/**'
       - 'docker/**'
       - '.github/workflows/kind.yml'
 
@@ -47,6 +59,16 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   CLONE_IMAGE: ghcr.io/thulasi-ram/scarab-clone:edge
   SIDECAR_IMAGE: ghcr.io/thulasi-ram/scarab-results-sidecar:edge
+  # The ADR-0061 fetcher, always built from the tree (never the GHCR `edge` tag):
+  # its source is a bin target of `crates/scarab-workspace-client`, so a PR can
+  # change the fetcher without touching `docker/**` — pulling a published tag would
+  # test last week's fetcher against this week's executor.
+  WSFETCH_IMAGE: scarab-wsfetch:kind
+  WORKSPACE_PORT: '8081'
+  # The HMAC secret the control plane (here: the test process) mints workspace
+  # tokens with and the service verifies them with. Throwaway, for one throwaway
+  # cluster; it is in the clear because it grants nothing outside this job.
+  WORKSPACE_SECRET: kind-tier-workspace-secret
 
 jobs:
   cluster-tests:
@@ -107,12 +129,35 @@ jobs:
           docker build -t "$CLONE_IMAGE" docker/clone
           docker build -t "$SIDECAR_IMAGE" docker/sidecar
 
+      # The ADR-0061 s3-feed fetcher init container. ALWAYS from the tree: it is a
+      # bin target of `crates/scarab-workspace-client`, so the `docker/**` filter
+      # above cannot tell whether the fetcher changed, and a published tag would
+      # pair last week's fetcher with this week's executor. The gha layer cache
+      # keeps the release build off the critical path when nothing in `crates/`
+      # moved.
+      #
+      # ⚠ Goes away with the node driver (git-bug 0628369), together with
+      # docker/wsfetch/ and the executor's WorkspaceFetch.
+      - name: Build the workspace fetcher image from the tree
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/wsfetch/Dockerfile
+          tags: ${{ env.WSFETCH_IMAGE }}
+          load: true
+          cache-from: type=gha,scope=wsfetch
+          cache-to: type=gha,scope=wsfetch,mode=max
+
       # Preload busybox too: nearly every live case runs it, and pulling it
       # once here dodges Docker Hub anonymous-pull throttling on the kubelet.
+      # busybox:1.36 as well as :latest — the egress/helper container is pinned
+      # to :1.36 (ADR-0039: :latest defaults to root and the kubelet refuses it).
       - name: Load step images into kind
         run: |
           docker pull busybox:latest
-          kind load docker-image --name scarab-ci "$CLONE_IMAGE" "$SIDECAR_IMAGE" busybox:latest
+          docker pull busybox:1.36
+          kind load docker-image --name scarab-ci \
+            "$CLONE_IMAGE" "$SIDECAR_IMAGE" "$WSFETCH_IMAGE" busybox:latest busybox:1.36
 
       # The `kind: build` live test pushes to an in-cluster plain-HTTP registry
       # (SCARAB_TEST_REGISTRY) and verifies its tag list from a Pod.
@@ -170,13 +215,61 @@ jobs:
           test -n "$ip" # fail loud here, not as a silent test hang
           echo "ip=$ip" >> "$GITHUB_OUTPUT"
 
+      # The workspace service (ADR-0061) — the SAME binary under `--role
+      # workspace`, run as a host process exactly as `deploy/local-proc/up.sh`
+      # does. Built from the tree, not pulled: `--role workspace` only exists on
+      # this branch, so `scarab-server:edge` could not serve it.
+      #
+      # Two audiences, one service: the test process IS the control plane and
+      # reaches it on loopback; a Step Pod's fetcher reaches it at the kind
+      # network's gateway (already resolved above — on a Linux runner that gateway
+      # IS a host interface, which is what makes a host process viable here and
+      # what does NOT hold on darwin; see the long note in up.sh).
+      - name: Build scarab-server (the workspace service is the same binary)
+        run: cargo build -p scarab-server
+      - name: Start the workspace service (--role workspace)
+        env:
+          SCARAB_ADDR: 0.0.0.0:${{ env.WORKSPACE_PORT }}
+          SCARAB_WORKSPACE_TOKEN_SECRET: ${{ env.WORKSPACE_SECRET }}
+          SCARAB_WORKSPACE_DATA_DIR: ${{ github.workspace }}/.scarab/workspace-cas
+        run: |
+          # No SCARAB_DATABASE_URL, deliberately: the role's carve-out in the boot
+          # gate is scoped, and supplying one anyway would hide a regression in it.
+          mkdir -p "$SCARAB_WORKSPACE_DATA_DIR"
+          nohup ./target/debug/scarab-server --role workspace \
+            > workspace.log 2>&1 &
+          echo $! > workspace.pid
+          for _ in $(seq 1 60); do
+            if curl -sf "http://127.0.0.1:$WORKSPACE_PORT/readyz" >/dev/null; then
+              echo "workspace service ready on 127.0.0.1:$WORKSPACE_PORT"
+              exit 0
+            fi
+            kill -0 "$(cat workspace.pid)" 2>/dev/null || break
+            sleep 1
+          done
+          echo "::error::the workspace service never answered /readyz"
+          tail -n 60 workspace.log
+          exit 1
+
       # Everything is a normal test; `#[ignore]` + the SCARAB_TEST_* gates are
       # the opt-in, so run the ignored set explicitly. --no-fail-fast: one
       # flaky live case must not mask the rest of the tier's signal.
+      #
+      # Every SCARAB_TEST_* below is now MANDATORY once SCARAB_TEST_KUBE is set:
+      # tests/cluster.rs panics on an absent one instead of skipping. Deleting a
+      # line here turns the tier red, which is the whole repair — it used to turn
+      # it silently green.
       - name: Run live cluster tests
         env:
           SCARAB_TEST_KUBE: '1'
           SCARAB_TEST_KUBE_NS: default
+          # ADR-0061: host-facing for the test process (it stands in for the
+          # control plane and mints itself a browse token), Pod-facing for the
+          # fetcher init container. They differ, and both are load-bearing.
+          SCARAB_TEST_WORKSPACE_URL: http://127.0.0.1:${{ env.WORKSPACE_PORT }}
+          SCARAB_TEST_WORKSPACE_POD_URL: http://${{ steps.hostip.outputs.ip }}:${{ env.WORKSPACE_PORT }}
+          SCARAB_TEST_WORKSPACE_SECRET: ${{ env.WORKSPACE_SECRET }}
+          SCARAB_TEST_WSFETCH_IMAGE: ${{ env.WSFETCH_IMAGE }}
           SCARAB_TEST_CLONE_IMAGE: ${{ env.CLONE_IMAGE }}
           # A SHA this event guarantees exists on the forge: the PR head, or
           # the pushed main commit (the clone tests fetch it anonymously).
@@ -197,3 +290,7 @@ jobs:
           kubectl get pods -A -o wide || true
           kubectl get events -A --sort-by=.lastTimestamp | tail -50 || true
           kubectl describe pods -n default | tail -200 || true
+          # A 401 from a Step, or a warm-tier warning, lands in the workspace
+          # service's log and NOWHERE else — it is a second process.
+          echo "---- workspace service log ----"
+          tail -n 200 workspace.log || true
