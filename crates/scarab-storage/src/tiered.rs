@@ -41,6 +41,31 @@
 //!
 //! Warm; on [`StorageError::NotFound`] go cold and **backfill warm
 //! best-effort** — a backfill failure is never an error, only a counter.
+//!
+//! # Two compositions, and they want different read failure modes
+//!
+//! ADR-0061 D1.6 answers "the warm tier is unreachable" differently for
+//! different clients, and this type is composed on both sides of that line:
+//!
+//! - inside the **workspace service**, warm is a directory on its own
+//!   PersistentVolume. A read error that is not `NotFound` there means the volume
+//!   is broken, and falling through to cold would make a corrupt volume
+//!   indistinguishable from an empty one — so the error propagates. This is the
+//!   default.
+//! - inside the **control plane**, warm is the workspace *service*, reached over
+//!   HTTP, and cold is the object store the control plane already holds
+//!   credentials for. D1.6 point 2: *control-plane reads fall through to cold*,
+//!   because "a warm miss is slower, never wrong" and going direct crosses no
+//!   trust boundary. Opt in with
+//!   [`fall_through_on_warm_error`](TieredCas::fall_through_on_warm_error), which
+//!   is the difference between Browse showing a snapshot and Browse showing 404
+//!   while the service restarts.
+//!
+//! It is a constructor-time choice rather than an inspection of the error,
+//! because "unreachable" is not distinguishable from "broken" at this layer: the
+//! HTTP adapter flattens both into [`StorageError::Backend`] (deliberately — it
+//! must never report a connection failure as `NotFound`, or an unreachable
+//! service would look like an empty one).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -59,6 +84,17 @@ static WARM_BACKFILL_FAILED: AtomicU64 = AtomicU64::new(0);
 /// Reads the warm tier did not have. The warm hit rate is `1 - (this / total)`,
 /// and the number that says whether the service is earning its volume.
 static COLD_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// Warm reads that failed with something other than `NotFound` and were served
+/// from cold anyway (only possible under
+/// [`fall_through_on_warm_error`](TieredCas::fall_through_on_warm_error)).
+///
+/// Separate from [`COLD_FALLBACKS`] on purpose. A cold fallback is ordinary —
+/// it is what a cache miss looks like, and the hit rate is a tuning number. This
+/// one is *not* ordinary: it means the warm tier answered with an error, i.e. the
+/// workspace service is unreachable or unwell, and the only reason nothing broke
+/// is that the control plane had another way in. Silence here would turn a
+/// down data plane into a slow one nobody investigates.
+static WARM_READ_FAILED: AtomicU64 = AtomicU64::new(0);
 /// Warm writes that failed specifically because the volume is **full**. Broken
 /// out from [`WARM_WRITE_FAILED`] because it is the one warm failure with an
 /// obvious operator action (grow the volume / lower the retention window), and
@@ -84,6 +120,12 @@ pub fn cold_fallback_total() -> u64 {
 /// Warm writes that failed because the warm volume is out of space.
 pub fn warm_full_total() -> u64 {
     WARM_FULL.load(Ordering::Relaxed)
+}
+
+/// Warm reads that ERRORED (not merely missed) and were served from cold.
+/// Non-zero means the workspace service is unreachable or unwell.
+pub fn warm_read_failed_total() -> u64 {
+    WARM_READ_FAILED.load(Ordering::Relaxed)
 }
 
 /// Does this backend error look like "the disk is full"?
@@ -133,6 +175,9 @@ fn note_warm_write_failure(op: &str, err: &StorageError) {
 pub struct TieredCas {
     warm: Arc<dyn Cas>,
     cold: Arc<dyn Cas>,
+    /// Fall through to cold on **any** warm read error, not only `NotFound`.
+    /// See the module docs: the control plane opts in, the service does not.
+    tolerate_warm_read_errors: bool,
 }
 
 impl TieredCas {
@@ -140,7 +185,51 @@ impl TieredCas {
     /// deployment, `S3Storage::local(<data dir>)`); `cold` is the configured
     /// object store.
     pub fn new(warm: Arc<dyn Cas>, cold: Arc<dyn Cas>) -> Self {
-        Self { warm, cold }
+        Self {
+            warm,
+            cold,
+            tolerate_warm_read_errors: false,
+        }
+    }
+
+    /// Serve reads from cold whenever the **warm tier errors at all** — not just
+    /// when it reports `NotFound` (ADR-0061 D1.6 point 2).
+    ///
+    /// For the control plane, where warm is the workspace service over HTTP and
+    /// cold is the object store this process already has credentials for. A
+    /// service that is rolling, unreachable, or returning 500s must not make
+    /// Browse, the GC mark walk or the rerun-widening oracle answer *wrong*; the
+    /// worst it may do is make them slower. Without this, `StorageError::Backend`
+    /// from the HTTP adapter would propagate and Browse would 404 a snapshot that
+    /// is sitting in object storage.
+    ///
+    /// **Not** for the service's own tiering: there, a non-`NotFound` warm error
+    /// means its PersistentVolume is broken, and hiding that behind cold would
+    /// make a corrupt volume look like an empty one.
+    pub fn fall_through_on_warm_error(mut self) -> Self {
+        self.tolerate_warm_read_errors = true;
+        self
+    }
+
+    /// Should this warm read error be treated as "warm does not have it"?
+    fn warm_read_miss(&self, err: &StorageError) -> bool {
+        matches!(err, StorageError::NotFound) || self.tolerate_warm_read_errors
+    }
+
+    /// Count (and, when it was a real error, say out loud) that this read is
+    /// about to be served from cold.
+    fn note_warm_read_miss(&self, op: &str, err: &StorageError) {
+        COLD_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        if !matches!(err, StorageError::NotFound) {
+            WARM_READ_FAILED.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                op,
+                error = %err,
+                "warm tier ERRORED on a read — serving from cold storage directly \
+                 (ADR-0061 D1.6: a warm miss is slower, never wrong). This is not a \
+                 cache miss: the workspace service is unreachable or unwell."
+            );
+        }
     }
 
     /// The warm tier, for callers that must reach it directly — the workspace
@@ -170,8 +259,8 @@ impl Cas for TieredCas {
     async fn get_blob(&self, hash: &BlobHash) -> Result<Vec<u8>, StorageError> {
         match self.warm.get_blob(hash).await {
             Ok(data) => Ok(data),
-            Err(StorageError::NotFound) => {
-                COLD_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            Err(e) if self.warm_read_miss(&e) => {
+                self.note_warm_read_miss("get_blob", &e);
                 let data = self.cold.get_blob(hash).await?;
                 // Best-effort re-seed. A failure here is a slower next read,
                 // never a wrong answer.
@@ -193,9 +282,22 @@ impl Cas for TieredCas {
                 // whole protocol: a tree hash is the hash of the tree's
                 // *canonical bytes*, so two tiers that canonicalise differently
                 // would file the same snapshot under two addresses and every
-                // lookup would half-work. Never observed; if it fires, the two
-                // `Cas` impls disagree on canonical form and the wire format
-                // (ADR-0061) is broken, not just this write.
+                // lookup would half-work.
+                //
+                // **This is reachable, and the reason is version skew.** In the
+                // control plane the warm tier is not a local directory — it is
+                // the workspace *service*, over HTTP, and the canonicalisation
+                // that produced `warm_hash` ran in whatever binary is deployed
+                // there. One image per Helm release makes skew unlikely, not
+                // impossible (a split install, a rollback mid-roll, an operator
+                // pinning `scarab.workspaceUrl` at a different release). ADR-0061
+                // s8 books exactly this: the canonical form now lives in
+                // `scarab-storage` so two *compiled-together* copies cannot
+                // disagree, "the tripwire is kept for version skew between
+                // deployed binaries, which is a different hazard."
+                //
+                // `disagreeing_canonicalisation_between_tiers_is_reported` covers
+                // it.
                 WARM_WRITE_FAILED.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     cold = %hash.0,
@@ -213,8 +315,8 @@ impl Cas for TieredCas {
     async fn tree_entries(&self, hash: &TreeHash) -> Result<Vec<TreeEntry>, StorageError> {
         match self.warm.tree_entries(hash).await {
             Ok(entries) => Ok(entries),
-            Err(StorageError::NotFound) => {
-                COLD_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            Err(e) if self.warm_read_miss(&e) => {
+                self.note_warm_read_miss("tree_entries", &e);
                 let entries = self.cold.tree_entries(hash).await?;
                 match self.warm.put_tree(entries.clone()).await {
                     // Same tripwire as `put_tree`, and here it matters more: a
@@ -245,8 +347,8 @@ impl Cas for TieredCas {
     async fn materialize(&self, tree: &TreeHash, path: &str) -> Result<(), StorageError> {
         match self.warm.materialize(tree, path).await {
             Ok(()) => Ok(()),
-            Err(StorageError::NotFound) => {
-                COLD_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            Err(e) if self.warm_read_miss(&e) => {
+                self.note_warm_read_miss("materialize", &e);
                 // Re-running `materialize` over a partial result is safe by its
                 // own contract: it merges in order and unlinks before writing,
                 // precisely so several inputs can overlay one directory.
@@ -272,18 +374,52 @@ impl Cas for TieredCas {
         }
     }
 
+    /// Snapshot `path` into **both** tiers. Cold decides success.
+    ///
+    /// # This walks the directory twice, and that is the cheapest shape available
+    ///
+    /// The drain calls this (the control plane's workspace `Cas` is a
+    /// `TieredCas` whose warm tier is the workspace service), so the second walk
+    /// is paid on every Step boundary and must be justified rather than
+    /// apologised for. It is not free: ADR-0061's s2 measurement puts the drain
+    /// leg at **88% local filesystem** — reading every file in order to hash it —
+    /// so a second walk roughly doubles the leg.
+    ///
+    /// The two alternatives are both worse:
+    ///
+    /// - **A merkle-level copy** (walk the tree, pull each blob from cold, push
+    ///   it to warm) needs no second `stat`, but it moves the bytes over the
+    ///   network *twice more* for genuinely new content, and — decisively — it
+    ///   cannot be made concurrent here. `scarab-storage` is a pure domain crate
+    ///   with no `futures` dependency, so the copy would be one sequential
+    ///   round-trip per file, which is the *exact* pattern ADR-0061's s0
+    ///   measurement identified as the dominant cost and which the ADR forbids
+    ///   the new data path from reproducing. Delegating to `warm.ingest` instead
+    ///   reuses the adapter's own batched, concurrent implementation
+    ///   (`scarab-workspace-client`: one `POST /have`, then parallel uploads of
+    ///   only what is missing).
+    /// - **Writing warm first and letting the service tier onward** makes the
+    ///   warm tier load-bearing for durability, which part 4 forbids: a workspace
+    ///   service outage would then fail Steps that could have produced a
+    ///   perfectly durable snapshot.
+    ///
+    /// So the ordering here is forced and the second walk is the price. Removing
+    /// it needs a `Cas` that can write one walk to two backends, or an `ingest`
+    /// that returns the tree it built so a tiered impl could seed warm at merkle
+    /// grain **with the adapter's concurrency** — both are port changes, filed
+    /// rather than smuggled in here.
+    ///
+    /// Dedup does bound the *network* half: `warm.ingest` uploads only what the
+    /// warm tier says it is missing, so a re-drain of unchanged content moves no
+    /// bytes at all. Only genuinely new content is written to cold twice — once
+    /// by this method's cold leg, once by the service's own cold-first `PUT` —
+    /// because neither `ObjectStore` nor the wire protocol has an existence
+    /// primitive that would let either side skip (see the workspace service's
+    /// `have` handler).
     async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
         // Cold is the durability leg (part 4), so it goes first and its error is
         // the caller's error.
         let snapshot = self.cold.ingest(path).await?;
-        // Then warm, best-effort. This walks the filesystem a SECOND time, which
-        // is not free — ADR-0061's s0 measurement found the CAS legs to be
-        // 81–88% of a Step boundary, so doubling one of them matters. It is
-        // acceptable here only because nothing in this slice calls
-        // `TieredCas::ingest`: the drain still runs against the object store
-        // directly, and the workspace service's HTTP surface has no ingest verb.
-        // Replacing this with a merkle-level copy (walk the tree cold→warm, no
-        // second `stat` of every file) is a filed follow-up.
         match self.warm.ingest(path).await {
             Ok(warm) if warm.root != snapshot.root => {
                 WARM_WRITE_FAILED.fetch_add(1, Ordering::Relaxed);
@@ -363,6 +499,24 @@ impl ObjectStore for TieredObjectStore {
         cold
     }
 
+    /// **From cold, and this is a data-loss invariant rather than a preference.**
+    ///
+    /// The only production caller is ADR-0050's mark-sweep GC, which lists the
+    /// store, subtracts everything reachable, and **deletes the remainder**.
+    /// Answer it from warm and the sweep gets a *cache's* view of the durable
+    /// set: every object that is in cold but not (yet, or any longer) in warm
+    /// looks absent, so it is never listed — and, worse, the warm tier is
+    /// evictable by design, so its view legitimately shrinks over time while
+    /// cold's does not.
+    ///
+    /// Merging the two lists would be no better: a warm-only object (one whose
+    /// cold write failed — see [`note_warm_write_failure`]) would be listed,
+    /// found unreachable, and deleted from cold where it never existed, which is
+    /// harmless, but the reachable-set arithmetic would then be running over a
+    /// key space that does not match the one being deleted from. One tier, the
+    /// durable one, is the only coherent answer.
+    ///
+    /// `the_gc_sweep_sees_the_durable_set_not_the_cache` pins it.
     async fn list_objects(&self, prefix: &str) -> Result<Vec<StoredObject>, StorageError> {
         self.cold.list_objects(prefix).await
     }
@@ -604,6 +758,197 @@ mod tests {
             tiered.get_blob(&BlobHash("q".into())).await,
             Err(StorageError::HashMismatch)
         ));
+    }
+
+    /// The **control plane's** read failure mode (ADR-0061 D1.6 point 2): the
+    /// workspace service being unreachable must not make Browse wrong, only
+    /// slower. `WorkspaceClient` reports a connection failure as
+    /// `Backend`, never `NotFound` — deliberately — so without the opt-in this
+    /// read would 404 a snapshot that is sitting in object storage.
+    #[tokio::test]
+    async fn an_unreachable_warm_tier_falls_through_to_cold_for_the_control_plane() {
+        let cold = Arc::new(FakeCas::default());
+        let blob = cold.put_blob(b"in the archive").await.unwrap();
+        let root = cold.put_tree(vec![entry("a")]).await.unwrap();
+
+        // `Unreachable` is what the HTTP adapter produces when the service is
+        // down: a `Backend` error on every verb, not a `NotFound`.
+        let tiered = TieredCas::new(Arc::new(Unreachable), cold.clone()).fall_through_on_warm_error();
+        assert_eq!(tiered.get_blob(&blob).await.unwrap(), b"in the archive");
+        assert_eq!(tiered.tree_entries(&root).await.unwrap().len(), 1);
+        // And it is NOT silent: this is a down data plane, not a cache miss.
+        assert!(warm_read_failed_total() > 0);
+    }
+
+    /// The same error, in the **service's own** tiering, must still be an error:
+    /// there the warm tier is a local volume, and a broken volume that read like
+    /// an empty one is how a torn CAS goes unnoticed.
+    #[tokio::test]
+    async fn a_broken_warm_volume_is_still_an_error_by_default() {
+        let cold = Arc::new(FakeCas::default());
+        let blob = cold.put_blob(b"in the archive").await.unwrap();
+        let tiered = TieredCas::new(Arc::new(Unreachable), cold);
+        assert!(matches!(
+            tiered.get_blob(&blob).await,
+            Err(StorageError::Backend(_))
+        ));
+    }
+
+    /// The canonicalisation tripwire, reached.
+    ///
+    /// It was previously unreachable in tests because both tiers were built from
+    /// one `FakeCas`, and two instances of one function cannot disagree. In
+    /// production they are not one function: the control plane's warm tier is the
+    /// workspace *service*, over HTTP, canonicalising in whatever binary is
+    /// deployed there (ADR-0061 s8 keeps the tripwire for exactly that skew). So
+    /// the test needs two tiers that really do disagree.
+    #[tokio::test]
+    async fn disagreeing_canonicalisation_between_tiers_is_reported() {
+        /// A `Cas` that files trees under a *different* canonical form — a
+        /// stand-in for a deployed peer built before a canonicalisation change.
+        struct SkewedTrees;
+        #[async_trait]
+        impl Cas for SkewedTrees {
+            async fn put_blob(&self, _: &[u8]) -> Result<BlobHash, StorageError> {
+                Ok(BlobHash("b".into()))
+            }
+            async fn get_blob(&self, _: &BlobHash) -> Result<Vec<u8>, StorageError> {
+                Err(StorageError::NotFound)
+            }
+            async fn put_tree(&self, _: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {
+                Ok(TreeHash("a-different-canonical-form".into()))
+            }
+            async fn tree_entries(&self, _: &TreeHash) -> Result<Vec<TreeEntry>, StorageError> {
+                Err(StorageError::NotFound)
+            }
+            async fn materialize(&self, _: &TreeHash, _: &str) -> Result<(), StorageError> {
+                Ok(())
+            }
+            async fn ingest(&self, _: &str) -> Result<Snapshot, StorageError> {
+                Err(StorageError::NotFound)
+            }
+        }
+
+        let cold = Arc::new(FakeCas::default());
+        let before = warm_write_failed_total();
+        let tiered = TieredCas::new(Arc::new(SkewedTrees), cold.clone());
+        // The caller still gets COLD's address — the only one that is durable and
+        // the only one anything else in the system will look under.
+        let hash = tiered.put_tree(vec![entry("a")]).await.unwrap();
+        assert_eq!(hash, TreeHash(FakeCas::tree_key(&[entry("a")])));
+        // …and the disagreement was recorded rather than shrugged off.
+        assert!(warm_write_failed_total() > before);
+
+        // The backfill half of the same tripwire: a warm write that lands under a
+        // different address is a leak, not a backfill, and every later read would
+        // still miss warm.
+        let root = cold.put_tree(vec![entry("z")]).await.unwrap();
+        let before = warm_backfill_failed_total();
+        let tiered = TieredCas::new(Arc::new(SkewedTrees), cold);
+        assert_eq!(tiered.tree_entries(&root).await.unwrap().len(), 1);
+        assert!(warm_backfill_failed_total() > before);
+    }
+
+    /// The GC's view of the store is the DURABLE set, never the cache.
+    ///
+    /// ADR-0050's mark-sweep lists, subtracts what is reachable, and **deletes
+    /// the remainder**. A warm-tier answer would report every cold-only object as
+    /// absent — and the warm tier is evictable by design, so that set grows on its
+    /// own. There was no test for this and it is a data-loss invariant, so this is
+    /// it: the warm tier deliberately holds an object cold does not, and a
+    /// different one is missing from warm that cold has.
+    #[tokio::test]
+    async fn the_gc_sweep_sees_the_durable_set_not_the_cache() {
+        let warm = Arc::new(FakeObjectStore::default());
+        let cold = Arc::new(FakeObjectStore::default());
+        // In cold only — evicted from warm, or never backfilled. The sweep MUST
+        // still see it, or it can never be collected.
+        cold.put("blobs/durable", b"x".to_vec()).await.unwrap();
+        // In warm only — a write whose cold leg failed. The sweep must not treat
+        // it as part of the durable key space.
+        warm.put("blobs/cache-only", b"y".to_vec()).await.unwrap();
+
+        let tiered = TieredObjectStore::new(warm, cold);
+        let keys: Vec<String> = tiered
+            .list_objects("blobs/")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        assert_eq!(keys, vec!["blobs/durable".to_string()]);
+    }
+
+    /// A minimal in-memory `ObjectStore`. Same justification as [`FakeCas`]:
+    /// these tests are about which tier answers, which is not observable through
+    /// a real store without breaking one.
+    #[derive(Default)]
+    struct FakeObjectStore {
+        objects: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl ObjectStore for FakeObjectStore {
+        async fn get(&self, key: &str) -> Result<Vec<u8>, StorageError> {
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or(StorageError::NotFound)
+        }
+        async fn put(&self, key: &str, data: Vec<u8>) -> Result<(), StorageError> {
+            self.objects.lock().unwrap().insert(key.to_string(), data);
+            Ok(())
+        }
+        async fn delete(&self, key: &str) -> Result<(), StorageError> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+        async fn list_objects(&self, prefix: &str) -> Result<Vec<StoredObject>, StorageError> {
+            let objects = self.objects.lock().unwrap();
+            let mut out: Vec<StoredObject> = objects
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, _)| StoredObject {
+                    key: k.clone(),
+                    modified_ms: 0,
+                })
+                .collect();
+            out.sort_by(|a, b| a.key.cmp(&b.key));
+            Ok(out)
+        }
+    }
+
+    /// Every verb fails with a `Backend` error — what `WorkspaceClient` produces
+    /// when the workspace service is unreachable (it maps a transport failure to
+    /// `Backend`, never to `NotFound`, precisely so an unreachable service cannot
+    /// masquerade as an empty one).
+    struct Unreachable;
+    #[async_trait]
+    impl Cas for Unreachable {
+        async fn put_blob(&self, _: &[u8]) -> Result<BlobHash, StorageError> {
+            Err(down())
+        }
+        async fn get_blob(&self, _: &BlobHash) -> Result<Vec<u8>, StorageError> {
+            Err(down())
+        }
+        async fn put_tree(&self, _: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {
+            Err(down())
+        }
+        async fn tree_entries(&self, _: &TreeHash) -> Result<Vec<TreeEntry>, StorageError> {
+            Err(down())
+        }
+        async fn materialize(&self, _: &TreeHash, _: &str) -> Result<(), StorageError> {
+            Err(down())
+        }
+        async fn ingest(&self, _: &str) -> Result<Snapshot, StorageError> {
+            Err(down())
+        }
+    }
+
+    fn down() -> StorageError {
+        StorageError::Backend("workspace service unreachable: connection refused".into())
     }
 
     #[test]
