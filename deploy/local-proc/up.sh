@@ -261,11 +261,30 @@ echo "    workspace service ready (warm tier: $SCARAB_WORKSPACE_DATA_DIR, logs: 
 # worked.
 echo "==> discovering how a Pod reaches the workspace service"
 ws_probe_script="for h in $ws_candidates; do if wget -q -T 4 -O /dev/null \"http://\$h:$ws_port/readyz\"; then echo \"SCARAB_WS_HOST=\$h\"; exit 0; fi; done; echo SCARAB_WS_HOST=none"
-ws_host="$(kubectl run "ws-discover-$$" -n scarab \
-             --image=busybox:1.36 --restart=Never --rm --attach --quiet \
-             --command -- sh -c "$ws_probe_script" 2>/dev/null \
+ws_probe_pod="ws-discover-$$"
+# Create → wait → `kubectl logs` → delete, rather than `kubectl run --rm --attach`.
+# The `--attach` form is what this used to do and it is NOT reliable here: it
+# returned the winning host once and then returned NOTHING on every subsequent
+# invocation on the same cluster, while a plain `kubectl logs` on the very same
+# probe script printed `SCARAB_WS_HOST=host.docker.internal` every time. That
+# mattered the moment this check became a hard gate (below): a probe that silently
+# produces no output would fail `just up` on a stack whose network is perfectly
+# fine, which is the kind of false red that gets a gate deleted.
+kubectl delete pod "$ws_probe_pod" -n scarab --ignore-not-found --wait=false >/dev/null 2>&1 || true
+kubectl run "$ws_probe_pod" -n scarab \
+  --image=busybox:1.36 --restart=Never \
+  --command -- sh -c "$ws_probe_script" >/dev/null 2>&1 || true
+ws_host=""
+for _ in $(seq 1 30); do
+  phase="$(kubectl get pod "$ws_probe_pod" -n scarab -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  case "$phase" in
+    Succeeded|Failed) break ;;
+  esac
+  sleep 2
+done
+ws_host="$(kubectl logs "$ws_probe_pod" -n scarab 2>/dev/null \
            | sed -n 's/^SCARAB_WS_HOST=//p' | tr -d '\r' | head -n 1)"
-kubectl delete pod "ws-discover-$$" -n scarab --ignore-not-found --wait=false >/dev/null 2>&1 || true
+kubectl delete pod "$ws_probe_pod" -n scarab --ignore-not-found --wait=false >/dev/null 2>&1 || true
 if [ -z "$ws_host" ] || [ "$ws_host" = none ]; then
   # A HARD GATE, not a warning — and this is the promotion the previous version's
   # own comment promised "once the fetcher lands" (ADR-0061 D2.3 guard #3).
