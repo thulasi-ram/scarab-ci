@@ -590,38 +590,75 @@ fn mtime_ms(meta: &std::fs::Metadata) -> Option<i64> {
     }
 }
 
-/// Restore `mtime_ms` then `mode` on an existing path. Order matters: chmod-ing
-/// a file to `0o400` first would make it impossible to reopen for the time set.
-/// Failures are surfaced, not swallowed — a silently-unfaithful checkout is the
-/// exact class of bug this slice exists to close.
+/// A unix-ms timestamp as a `SystemTime`. Pre-epoch values are negative and go
+/// backwards rather than being dropped.
+fn system_time(ms: i64) -> std::time::SystemTime {
+    let epoch = std::time::SystemTime::UNIX_EPOCH;
+    if ms >= 0 {
+        epoch + std::time::Duration::from_millis(ms as u64)
+    } else {
+        epoch - std::time::Duration::from_millis(ms.unsigned_abs())
+    }
+}
+
+/// Restore `mtime_ms` then `mode` on an existing **directory**. Order matters:
+/// chmod-ing to `0o500` first would make it impossible to reopen for the time
+/// set. Failures are surfaced, not swallowed — a silently-unfaithful checkout is
+/// the exact class of bug ADR-0061 s7 exists to close.
+///
+/// Files do not come through here: [`write_file`] does the same two operations on
+/// the handle it already holds (see the syscall note there).
 fn apply_metadata(
     path: &std::path::Path,
     mode: Option<u32>,
     mtime_ms: Option<i64>,
-    is_dir: bool,
 ) -> Result<(), StorageError> {
     if let Some(ms) = mtime_ms {
-        let epoch = std::time::SystemTime::UNIX_EPOCH;
-        let when = if ms >= 0 {
-            epoch + std::time::Duration::from_millis(ms as u64)
-        } else {
-            epoch - std::time::Duration::from_millis(ms.unsigned_abs())
-        };
         // A directory cannot be opened for writing; owning the fd is enough for
         // `futimens` either way.
-        let file = if is_dir {
-            std::fs::File::open(path).map_err(io_err)?
-        } else {
-            std::fs::File::options()
-                .write(true)
-                .open(path)
-                .map_err(io_err)?
-        };
-        file.set_times(std::fs::FileTimes::new().set_modified(when))
+        let dir = std::fs::File::open(path).map_err(io_err)?;
+        dir.set_times(std::fs::FileTimes::new().set_modified(system_time(ms)))
             .map_err(io_err)?;
     }
     if let Some(bits) = mode {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).map_err(io_err)?;
+    }
+    Ok(())
+}
+
+/// Write one file of a checkout with its metadata, through a single open handle.
+///
+/// **Why one handle.** The `fs_ms` counter this slice added showed the local
+/// filesystem — not the object store — is what materialize is now floored on
+/// (ADR-0061 s2 measurement). `fs::write` + reopen-for-`futimens` + path-`chmod`
+/// is five syscalls per file (`open`, `write`, `close`, `open`, `futimens`,
+/// `chmod`); doing all three on the handle we already have is three. The
+/// *ordering* that s7 established is unchanged and still load-bearing:
+/// **write, then mtime, then mode** — a `0o444` file chmod-ed before the time set
+/// could not be reopened, and any write after `set_times` would bump the mtime
+/// straight back to now.
+fn write_file(
+    path: &std::path::Path,
+    data: &[u8],
+    mode: Option<u32>,
+    mtime_ms: Option<i64>,
+) -> Result<(), StorageError> {
+    use std::io::Write;
+    let mut file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(io_err)?;
+    file.write_all(data).map_err(io_err)?;
+    if let Some(ms) = mtime_ms {
+        file.set_times(std::fs::FileTimes::new().set_modified(system_time(ms)))
+            .map_err(io_err)?;
+    }
+    if let Some(bits) = mode {
+        // `fchmod` on the open handle, not a second path lookup.
+        file.set_permissions(std::fs::Permissions::from_mode(bits))
+            .map_err(io_err)?;
     }
     Ok(())
 }
@@ -833,8 +870,7 @@ impl Cas for S3Storage {
                     let dest = std::path::Path::new(std::ffi::OsStr::from_bytes(&data));
                     std::os::unix::fs::symlink(dest, &f.path).map_err(io_err)?;
                 } else {
-                    std::fs::write(&f.path, data).map_err(io_err)?;
-                    apply_metadata(&f.path, f.mode, f.mtime_ms, false)?;
+                    write_file(&f.path, &data, f.mode, f.mtime_ms)?;
                 }
                 Ok::<_, StorageError>((len, hash_ns, store_ns, elapsed_ns(t)))
             })
@@ -853,7 +889,7 @@ impl Cas for S3Storage {
         // before the time set would lock out the time set.
         let t = Instant::now();
         for (dir, mode, mtime) in dirs.into_iter().rev() {
-            apply_metadata(&dir, mode, mtime, true)?;
+            apply_metadata(&dir, mode, mtime)?;
         }
         counters.fs_ns += elapsed_ns(t);
 

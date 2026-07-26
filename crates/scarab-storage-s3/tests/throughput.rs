@@ -47,9 +47,14 @@ fn env_num(key: &str, default: usize) -> usize {
 }
 
 /// A workspace of `files` files of `bytes` each, spread over `files / 50`
-/// sub-directories so the tree walk is exercised too. `salt` makes the content
-/// unique per run, which is what keeps a "cold" ingest cold — content addressing
-/// would otherwise dedup the second run of the loop into a no-op.
+/// sub-directories so the tree walk is exercised too.
+///
+/// `salt` makes the content unique per run, which is what keeps a "cold" ingest
+/// cold — content addressing would otherwise dedup it into a no-op. It includes
+/// the pid, because a *second invocation of this harness* against the same
+/// bucket is otherwise warm too: the first run of this file reported
+/// `objects_put=41 objects_present=2000` on what it called a cold ingest, and
+/// only the new counters made that visible.
 fn build(root: &std::path::Path, files: usize, bytes: usize, salt: usize) {
     let per_dir = 50;
     for i in 0..files {
@@ -118,10 +123,10 @@ async fn cas_leg_throughput_by_concurrency() {
         }
         .with_concurrency(*limit);
 
-        // Salt by run index, not by limit, so re-ordering the limits list does not
-        // change which run is cold.
+        // Salt by run index (not by limit, so re-ordering the limits list does not
+        // change which run is cold) and by pid (so a re-invocation is cold too).
         let src = temp_dir("src");
-        build(&src, files, bytes, run);
+        build(&src, files, bytes, run + 1_000_000 * std::process::id() as usize);
         let out = temp_dir("out");
 
         let t = Instant::now();
