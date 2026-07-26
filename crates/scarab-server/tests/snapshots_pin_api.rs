@@ -24,7 +24,7 @@ fn state(db: Arc<InMemoryDb>, clock: Arc<FakeClock>) -> AppState {
     let logs = Arc::new(LogService::new(Arc::new(InMemoryObjectStore::new()), db.clone()));
     // 7 days, deliberately NOT the default: the API must quote the deployment's
     // window, not a constant baked into a DTO.
-    AppState::new(db, clock, logs).with_workspace_retention_days(7)
+    AppState::new(db, clock, logs).with_snapshot_retention_days(7)
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -85,7 +85,7 @@ async fn run_detail_states_the_cold_tier_time_bound() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let wr = body_json(resp).await["workspace_retention"].clone();
+    let wr = body_json(resp).await["snapshot_retention"].clone();
     assert_eq!(
         wr["retention_days"], 7,
         "the API quotes the deployment's window, not a hardcoded default"
@@ -119,7 +119,7 @@ async fn a_non_terminal_run_has_no_expiry_at_all() {
         )
         .await
         .unwrap();
-    let wr = body_json(resp).await["workspace_retention"].clone();
+    let wr = body_json(resp).await["snapshot_retention"].clone();
     assert!(
         wr.get("expires_at").is_none(),
         "no expiry is promised for a run that has not settled, at any age"
@@ -144,7 +144,7 @@ async fn an_aged_terminal_run_reports_expired() {
         )
         .await
         .unwrap();
-    let wr = body_json(resp).await["workspace_retention"].clone();
+    let wr = body_json(resp).await["snapshot_retention"].clone();
     assert_eq!(
         wr["expired"], true,
         "past the window the PROMISE has lapsed — which is not the same claim as 'deleted'"
@@ -164,7 +164,7 @@ async fn pin_then_unpin_round_trips_and_is_audited() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/runs/r-pin/workspace-pin")
+                .uri("/v1/runs/r-pin/snapshots-pin")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -194,12 +194,12 @@ async fn pin_then_unpin_round_trips_and_is_audited() {
         )
         .await
         .unwrap();
-    assert_eq!(body_json(resp).await["workspace_retention"]["pinned"], true);
+    assert_eq!(body_json(resp).await["snapshot_retention"]["pinned"], true);
 
     // The durable fact carries into the mark set: a pinned run's roots are
     // reachable no matter how old the cutoff is.
     assert!(db
-        .run_workspace_retention(&run)
+        .run_snapshot_retention(&run)
         .await
         .unwrap()
         .unwrap()
@@ -212,7 +212,7 @@ async fn pin_then_unpin_round_trips_and_is_audited() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri("/v1/runs/r-pin/workspace-pin")
+                .uri("/v1/runs/r-pin/snapshots-pin")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -227,8 +227,8 @@ async fn pin_then_unpin_round_trips_and_is_audited() {
         .unwrap()
         .into_iter()
         .filter_map(|e| match e.kind {
-            EventPayload::RunWorkspacePinned { .. } => Some("pinned".to_string()),
-            EventPayload::RunWorkspaceUnpinned { .. } => Some("unpinned".to_string()),
+            EventPayload::RunSnapshotsPinned { .. } => Some("pinned".to_string()),
+            EventPayload::RunSnapshotsUnpinned { .. } => Some("unpinned".to_string()),
             _ => None,
         })
         .collect();
@@ -248,7 +248,7 @@ async fn pinning_an_unknown_run_is_404() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/runs/ghost/workspace-pin")
+                .uri("/v1/runs/ghost/snapshots-pin")
                 .body(Body::empty())
                 .unwrap(),
         )

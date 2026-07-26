@@ -29,7 +29,7 @@ pub struct Lease {
 /// when the TTL clock started, and whether a human **pinned** the Run out of the
 /// sweep.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkspaceRetention {
+pub struct SnapshotRetention {
     /// The Run is TERMINAL, so its snapshots are on the TTL clock at all. A
     /// non-terminal Run — including one suspended on a gate for weeks — is never
     /// GC-eligible regardless of age (ADR-0050), so its snapshots are promised
@@ -41,7 +41,7 @@ pub struct WorkspaceRetention {
     /// construction rather than by coincidence.
     pub settled_at: Timestamp,
     /// When a human pinned this Run's Workspace Snapshots ("keep this Run's
-    /// workspaces"), if pinned. A pin holds the **cold** tier open past its TTL
+    /// snapshots"), if pinned. A pin holds the **cold** tier open past its TTL
     /// and promises nothing about the warm tier.
     pub pinned_at: Option<Timestamp>,
     /// Who pinned it — the audit half of the pin (`None` only when auth is off).
@@ -720,7 +720,7 @@ pub trait Db: Send + Sync {
     /// Covers EVERY attempt's snapshot, not just each step's latest
     /// (ADR-0056): an old Take's workspace view must never race the GC.
     ///
-    /// A **pinned** run (ADR-0061 s5 — [`pin_run_workspace`](Db::pin_run_workspace))
+    /// A **pinned** run (ADR-0061 s5 — [`pin_run_snapshots`](Db::pin_run_snapshots))
     /// is in the mark set unconditionally, exactly like a non-terminal one. The
     /// pin belongs *here*, in the mark, and never as a filter over the delete
     /// list: a pinned root's whole transitive tree — every shared subtree and
@@ -736,23 +736,23 @@ pub trait Db: Send + Sync {
     /// The pin acts on the **cold** tier's *time* bound only. It cannot promise
     /// anything about the warm workspace service, which is bounded by space and
     /// evicts LRU by design.
-    async fn pin_run_workspace(
+    async fn pin_run_snapshots(
         &self,
         run: &RunId,
         by: Option<&str>,
         at: Timestamp,
     ) -> Result<bool, DbError>;
 
-    /// Release a [pin](Db::pin_run_workspace), returning the Run's snapshots to
+    /// Release a [pin](Db::pin_run_snapshots), returning the Run's snapshots to
     /// the ordinary TTL. Idempotent; `false` when there is no such Run.
-    async fn unpin_run_workspace(&self, run: &RunId) -> Result<bool, DbError>;
+    async fn unpin_run_snapshots(&self, run: &RunId) -> Result<bool, DbError>;
 
     /// One Run's cold-tier retention facts (ADR-0061 s5) — the TTL clock plus
     /// any pin. `None` when there is no such Run.
-    async fn run_workspace_retention(
+    async fn run_snapshot_retention(
         &self,
         run: &RunId,
-    ) -> Result<Option<WorkspaceRetention>, DbError>;
+    ) -> Result<Option<SnapshotRetention>, DbError>;
 
     /// Forget a workspace-CAS root that GC proved ABSENT from the object store
     /// (ADR-0050): clear every recorded output snapshot equal to `root`,

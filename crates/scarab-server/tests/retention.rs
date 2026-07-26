@@ -597,13 +597,13 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
     let db: Arc<dyn Db> = Arc::new(pg);
     let pinned = RunId("pin-kept".into());
     assert!(
-        scarab_engine::pin_run_workspace(&*db, &*clock, &pinned, Some("alice".into()))
+        scarab_engine::pin_run_snapshots(&*db, &*clock, &pinned, Some("alice".into()))
             .await
             .unwrap(),
         "an existing run can be pinned"
     );
     let r = db
-        .run_workspace_retention(&pinned)
+        .run_snapshot_retention(&pinned)
         .await
         .unwrap()
         .expect("the run exists");
@@ -616,18 +616,18 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
     assert!(
         db.events(&pinned).await.unwrap().iter().any(|e| matches!(
             e.kind,
-            scarab_engine::EventPayload::RunWorkspacePinned { .. }
+            scarab_engine::EventPayload::RunSnapshotsPinned { .. }
         )),
         "the pin is in the audit log, not only in a column"
     );
     // Pinning is idempotent (re-stamping, never an error).
     assert!(
-        scarab_engine::pin_run_workspace(&*db, &*clock, &pinned, Some("alice".into()))
+        scarab_engine::pin_run_snapshots(&*db, &*clock, &pinned, Some("alice".into()))
             .await
             .unwrap()
     );
     assert!(
-        !scarab_engine::pin_run_workspace(&*db, &*clock, &RunId("nope".into()), None)
+        !scarab_engine::pin_run_snapshots(&*db, &*clock, &RunId("nope".into()), None)
             .await
             .unwrap(),
         "pinning a run that does not exist reports false, not a phantom pin"
@@ -675,11 +675,11 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
     // Release the pin: the next sweep collects it. This is the half that proves
     // the pin is a live predicate rather than a one-off reprieve.
     assert!(
-        scarab_engine::unpin_run_workspace(&*db, &*clock, &pinned, Some("alice".into()))
+        scarab_engine::unpin_run_snapshots(&*db, &*clock, &pinned, Some("alice".into()))
             .await
             .unwrap()
     );
-    let r = db.run_workspace_retention(&pinned).await.unwrap().unwrap();
+    let r = db.run_snapshot_retention(&pinned).await.unwrap().unwrap();
     assert!(r.pinned_at.is_none() && r.pinned_by.is_none(), "the pin is released");
     sweep_cas(
         &db,

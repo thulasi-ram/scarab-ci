@@ -10,7 +10,7 @@ import {
   widenedNote,
   type RerunPlan,
   type RetentionInfo,
-} from "./workspace-retention";
+} from "./snapshot-retention";
 
 const plan = (over: Partial<RerunPlan> = {}): RerunPlan => ({
   target: "test",
@@ -117,7 +117,7 @@ describe("rerunTitle", () => {
 describe("retentionNote", () => {
   it("states the window for a settled run", () => {
     expect(retentionNote(retention(), true)).toBe(
-      "Workspaces kept for 14 days after this run finished.",
+      "Workspace snapshots kept for 14 days after this run finished.",
     );
   });
 
@@ -125,7 +125,7 @@ describe("retentionNote", () => {
     // ADR-0050: a non-terminal run — including one suspended on a gate for
     // weeks — is never GC-eligible regardless of age.
     expect(retentionNote(retention({ expires_at: null }), false)).toBe(
-      "Workspaces are kept while this run is unfinished; the 14-day window starts when it finishes.",
+      "Workspace snapshots are kept while this run is unfinished; the 14-day window starts when it finishes.",
     );
   });
 
@@ -140,15 +140,15 @@ describe("retentionNote", () => {
 
   it("reports a pin with its attribution and drops the expiry", () => {
     expect(retentionNote(retention({ pinned: true, pinned_by: "alice" }), true)).toBe(
-      "Workspaces pinned by alice — kept past the 14-day window until unpinned.",
+      "Workspace snapshots pinned by alice — kept past the 14-day window until unpinned.",
     );
   });
 });
 
 describe("pin affordance", () => {
   it("toggles its label with the state", () => {
-    expect(pinLabel(retention())).toBe("Keep workspaces");
-    expect(pinLabel(retention({ pinned: true }))).toBe("Unpin workspaces");
+    expect(pinLabel(retention())).toBe("Keep snapshots");
+    expect(pinLabel(retention({ pinned: true }))).toBe("Unpin snapshots");
   });
 
   it("is honest that a pin cannot pin the warm cache", () => {

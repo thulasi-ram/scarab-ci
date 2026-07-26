@@ -20,10 +20,10 @@
 pub mod ports;
 pub mod scheduler;
 
-pub use ports::{Clock, Db, Executor, LogChunks, WorkspaceRetention, WorkspaceSnapshots};
+pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnapshots};
 pub use scheduler::{
-    cancel_run_request, pin_run_workspace, plan_rerun, record_gate_approval, release_gate,
-    rerun_step, rerun_step_widened, retry_step, retry_step_widened, unpin_run_workspace,
+    cancel_run_request, pin_run_snapshots, plan_rerun, record_gate_approval, release_gate,
+    rerun_step, rerun_step_widened, retry_step, retry_step_widened, unpin_run_snapshots,
     ExpiredInput, RerunError, RerunPlan, Scheduler, SchedulerError, SupersedeTeardown,
     SupersededAttempt, Supervision, TickHealth, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
     RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
@@ -850,13 +850,13 @@ pub enum EventPayload {
     /// a durable fact on the run row; this event is its audit half — who asked
     /// for the exception and when — mirroring [`GateApproved`](EventPayload::GateApproved).
     /// `by` is the acting principal (`None` only when auth is off).
-    RunWorkspacePinned {
+    RunSnapshotsPinned {
         by: Option<String>,
     },
     /// A human released the pin, returning this Run's Workspace Snapshots to the
     /// ordinary TTL. Recorded for the same reason as the pin: an exception that
     /// costs storage should be attributable in both directions.
-    RunWorkspaceUnpinned {
+    RunSnapshotsUnpinned {
         by: Option<String>,
     },
     /// Escape hatch for forward-compatible payloads not yet modelled.

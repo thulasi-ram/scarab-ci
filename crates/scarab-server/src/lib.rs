@@ -69,7 +69,7 @@ pub use secret_executor::SecretInjectingExecutor;
 /// The cold-tier Workspace-Snapshot retention default, in days — mirrors
 /// `config::Config::retention_workspace_days`'s default so a hand-built
 /// [`AppState`] and a booted server quote the same promise.
-pub const DEFAULT_WORKSPACE_RETENTION_DAYS: u32 = 14;
+pub const DEFAULT_SNAPSHOT_RETENTION_DAYS: u32 = 14;
 
 /// A wall-clock [`Clock`] for production wiring (tests inject `FakeClock`).
 pub struct SystemClock;
@@ -183,9 +183,9 @@ pub struct AppState {
     /// runs on, surfaced so the API can *state the promise* instead of leaving it
     /// implicit in a sweeper's config. Defaults to the config default (14); set it
     /// from the boot config with
-    /// [`with_workspace_retention_days`](AppState::with_workspace_retention_days)
+    /// [`with_snapshot_retention_days`](AppState::with_snapshot_retention_days)
     /// so the UI never quotes a different number than the sweeper enforces.
-    pub workspace_retention_days: u32,
+    pub snapshot_retention_days: u32,
 }
 
 impl AppState {
@@ -216,15 +216,15 @@ impl AppState {
             oauth_login: None,
             public_url: "http://localhost:8080".into(),
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
-            workspace_retention_days: DEFAULT_WORKSPACE_RETENTION_DAYS,
+            snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
         }
     }
 
     /// The cold-tier Workspace-Snapshot retention window the sweeper actually
     /// enforces (ADR-0061 s5). Wire it from `config.retention_workspace_days` so
     /// what the UI promises and what GC does are one number.
-    pub fn with_workspace_retention_days(mut self, days: u32) -> Self {
-        self.workspace_retention_days = days;
+    pub fn with_snapshot_retention_days(mut self, days: u32) -> Self {
+        self.snapshot_retention_days = days;
         self
     }
 
@@ -677,7 +677,7 @@ pub struct RunStatusResponse {
     /// This run's **Workspace Snapshot** retention promise (ADR-0061 s5) — the
     /// cold tier's time bound, made explicit rather than left implicit in a
     /// sweeper's config, plus any manual pin over it.
-    pub workspace_retention: WorkspaceRetentionDto,
+    pub snapshot_retention: SnapshotRetentionDto,
 }
 
 /// The cold-tier retention promise over one Run's **Workspace Snapshots**
@@ -690,7 +690,7 @@ pub struct RunStatusResponse {
 /// describes the cold tier only; nothing here can or should say anything about
 /// the warm tier.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct WorkspaceRetentionDto {
+pub struct SnapshotRetentionDto {
     /// The retention window in days — what the GC sweeper actually enforces.
     pub retention_days: u32,
     /// When this run's Workspace Snapshots stop being promised (epoch millis).
@@ -720,16 +720,16 @@ pub struct WorkspaceRetentionDto {
 /// Build the retention promise for a run from its durable facts plus the
 /// deployment's window. Pure, so the UI copy and the sweeper's behaviour cannot
 /// drift apart by arithmetic.
-fn workspace_retention_dto(
-    r: &scarab_engine::WorkspaceRetention,
+fn snapshot_retention_dto(
+    r: &scarab_engine::SnapshotRetention,
     retention_days: u32,
     now: Timestamp,
-) -> WorkspaceRetentionDto {
+) -> SnapshotRetentionDto {
     let pinned = r.pinned_at.is_some();
     let window_ms = (retention_days as i64) * 24 * 60 * 60 * 1000;
     // Only a settled, unpinned run is on the clock at all.
     let expires_at = (!pinned && r.terminal).then(|| r.settled_at.0 + window_ms);
-    WorkspaceRetentionDto {
+    SnapshotRetentionDto {
         retention_days,
         expires_at,
         expired: expires_at.is_some_and(|e| now.0 >= e),
@@ -1648,12 +1648,12 @@ async fn get_run(
     // rerun plan answers.
     let retention = st
         .db
-        .run_workspace_retention(&run)
+        .run_snapshot_retention(&run)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let workspace_retention = workspace_retention_dto(
+    let snapshot_retention = snapshot_retention_dto(
         &retention,
-        st.workspace_retention_days,
+        st.snapshot_retention_days,
         st.clock.now().await,
     );
     // Enrich each step with its sidecar services + shared-service opt-ins (ADR-
@@ -1697,7 +1697,7 @@ async fn get_run(
         pipeline,
         trigger_title,
         origin_pr_base,
-        workspace_retention,
+        snapshot_retention,
     }))
 }
 
@@ -2300,22 +2300,22 @@ async fn rerun_plan(
 /// to protect. Idempotent; recorded with who pinned it and when.
 #[utoipa::path(
     post,
-    path = "/v1/runs/{id}/workspace-pin",
+    path = "/v1/runs/{id}/snapshots-pin",
     params(("id" = String, Path, description = "run id")),
     responses(
-        (status = 200, body = WorkspaceRetentionDto, description = "pinned"),
+        (status = 200, body = SnapshotRetentionDto, description = "pinned"),
         (status = 404, description = "no such run")
     )
 )]
-async fn pin_run_workspace(
+async fn pin_run_snapshots(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<WorkspaceRetentionDto>, ApiError> {
+) -> Result<Json<SnapshotRetentionDto>, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    if !scarab_engine::pin_run_workspace(
+    if !scarab_engine::pin_run_snapshots(
         &*st.db,
         &*st.clock,
         &run,
@@ -2325,29 +2325,29 @@ async fn pin_run_workspace(
     {
         return Err(ApiError::NotFound);
     }
-    current_workspace_retention(&st, &run).await
+    current_snapshot_retention(&st, &run).await
 }
 
-/// Release the [pin](pin_run_workspace), returning this run's Workspace Snapshots
+/// Release the [pin](pin_run_snapshots), returning this run's Workspace Snapshots
 /// to the ordinary retention window. Idempotent.
 #[utoipa::path(
     delete,
-    path = "/v1/runs/{id}/workspace-pin",
+    path = "/v1/runs/{id}/snapshots-pin",
     params(("id" = String, Path, description = "run id")),
     responses(
-        (status = 200, body = WorkspaceRetentionDto, description = "pin released"),
+        (status = 200, body = SnapshotRetentionDto, description = "pin released"),
         (status = 404, description = "no such run")
     )
 )]
-async fn unpin_run_workspace(
+async fn unpin_run_snapshots(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<WorkspaceRetentionDto>, ApiError> {
+) -> Result<Json<SnapshotRetentionDto>, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
-    if !scarab_engine::unpin_run_workspace(
+    if !scarab_engine::unpin_run_snapshots(
         &*st.db,
         &*st.clock,
         &run,
@@ -2357,23 +2357,23 @@ async fn unpin_run_workspace(
     {
         return Err(ApiError::NotFound);
     }
-    current_workspace_retention(&st, &run).await
+    current_snapshot_retention(&st, &run).await
 }
 
 /// Re-read and project one run's retention promise — what both pin endpoints
 /// return, so a client never has to re-fetch the whole run to see the effect.
-async fn current_workspace_retention(
+async fn current_snapshot_retention(
     st: &AppState,
     run: &RunId,
-) -> Result<Json<WorkspaceRetentionDto>, ApiError> {
+) -> Result<Json<SnapshotRetentionDto>, ApiError> {
     let r = st
         .db
-        .run_workspace_retention(run)
+        .run_snapshot_retention(run)
         .await?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(workspace_retention_dto(
+    Ok(Json(snapshot_retention_dto(
         &r,
-        st.workspace_retention_days,
+        st.snapshot_retention_days,
         st.clock.now().await,
     )))
 }
@@ -7558,8 +7558,8 @@ impl utoipa::Modify for TagGroups {
         rerun_step,
         retry_step,
         rerun_plan,
-        pin_run_workspace,
-        unpin_run_workspace,
+        pin_run_snapshots,
+        unpin_run_snapshots,
         cancel_run,
         list_artifacts,
         download_artifact,
@@ -7588,7 +7588,7 @@ impl utoipa::Modify for TagGroups {
         RunListResponse,
         RunSummaryDto,
         RunStatusResponse,
-        WorkspaceRetentionDto,
+        SnapshotRetentionDto,
         RerunPlanResponse,
         ExpiredInputDto,
         StepStatusDto,
@@ -7675,8 +7675,8 @@ fn router_inner(state: AppState) -> Router {
         // The manual Workspace-Snapshot pin (ADR-0061 s5) — one resource, two
         // verbs, because pin and unpin are the same fact in two states.
         .route(
-            "/v1/runs/{id}/workspace-pin",
-            post(pin_run_workspace).delete(unpin_run_workspace),
+            "/v1/runs/{id}/snapshots-pin",
+            post(pin_run_snapshots).delete(unpin_run_snapshots),
         )
         .route("/v1/runs/{id}/cancel", post(cancel_run))
         .route("/v1/runs/{id}/artifacts", get(list_artifacts))

@@ -18,7 +18,7 @@
 //
 // Pure derivations, no DOM: the no-DOM vitest tier covers them.
 
-/** The run resource's `workspace_retention` block. Structural, so the mock
+/** The run resource's `snapshot_retention` block. Structural, so the mock
  * fixtures and the generated API type both satisfy it. */
 export type RetentionInfo = {
   retention_days: number;
@@ -102,20 +102,20 @@ export function retentionNote(r: RetentionInfo, terminal: boolean): string {
   const d = r.retention_days;
   if (r.pinned) {
     const who = r.pinned_by ? ` by ${r.pinned_by}` : "";
-    return `Workspaces pinned${who} — kept past the ${d}-day window until unpinned.`;
+    return `Workspace snapshots pinned${who} — kept past the ${d}-day window until unpinned.`;
   }
   if (!terminal) {
-    return `Workspaces are kept while this run is unfinished; the ${d}-day window starts when it finishes.`;
+    return `Workspace snapshots are kept while this run is unfinished; the ${d}-day window starts when it finishes.`;
   }
   if (r.expired) {
-    return `Workspaces expired — kept for ${d} days after a run finishes. A rerun may have to re-run earlier steps.`;
+    return `Workspace snapshots expired — kept for ${d} days after a run finishes. A rerun may have to re-run earlier steps.`;
   }
-  return `Workspaces kept for ${d} days after this run finished.`;
+  return `Workspace snapshots kept for ${d} days after this run finished.`;
 }
 
 /** The pin toggle's label. */
 export function pinLabel(r: RetentionInfo): string {
-  return r.pinned ? "Unpin workspaces" : "Keep workspaces";
+  return r.pinned ? "Unpin snapshots" : "Keep snapshots";
 }
 
 /** The pin toggle's title — and the one place the two-tier honesty lives. A pin
@@ -124,10 +124,10 @@ export function pinLabel(r: RetentionInfo): string {
  * durability contract forbids. */
 export function pinTitle(r: RetentionInfo): string {
   if (r.pinned) {
-    return `stop keeping this run's workspaces — they return to the ${r.retention_days}-day window and become collectable`;
+    return `stop keeping this run's workspace snapshots — they return to the ${r.retention_days}-day window and become collectable`;
   }
   return (
-    `keep this run's workspaces past the ${r.retention_days}-day window, for an investigation. ` +
+    `keep this run's workspace snapshots past the ${r.retention_days}-day window, for an investigation. ` +
     `Applies to the archive: the workspace service's cache is size-bounded and evicts on its ` +
     `own, which only ever makes a rerun slower, never wrong.`
   );

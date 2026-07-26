@@ -556,7 +556,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The cold tier's TIME bound (ADR-0061 s5), from the SAME config value the
         // GC sweeper above runs on — so what the UI promises and what the sweeper
         // enforces cannot drift.
-        .with_workspace_retention_days(config.retention_workspace_days)
+        .with_snapshot_retention_days(config.retention_workspace_days)
         // The same credential-override table the forge router resolves through
         // (ADR-0060 part D), so the Settings health readout reports a
         // config-supplied credential as present rather than MISSING.

@@ -24,8 +24,8 @@ import {
   repoForgeUrl,
   listServices,
   fetchRerunPlan,
-  pinWorkspaces,
-  unpinWorkspaces,
+  pinSnapshots,
+  unpinSnapshots,
   type RunStatus,
   type RunEvent,
   type StepStatus,
@@ -55,7 +55,7 @@ import {
   rerunTitle,
   retentionNote,
   widenedNote,
-} from "../workspace-retention";
+} from "../snapshot-retention";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
@@ -432,14 +432,14 @@ export default function RunDetail() {
   // endpoint last returned, so the toggle reflects the write instead of waiting
   // for the next poll.
   const retention = (): RetentionInfo | null =>
-    pinState() ?? run()?.workspace_retention ?? null;
+    pinState() ?? run()?.snapshot_retention ?? null;
 
   async function onTogglePin() {
     const r = retention();
     if (!r) return;
     setPinning(true);
     try {
-      setPinState(r.pinned ? await unpinWorkspaces(id()) : await pinWorkspaces(id()));
+      setPinState(r.pinned ? await unpinSnapshots(id()) : await pinSnapshots(id()));
     } finally {
       setPinning(false);
     }

@@ -2208,9 +2208,11 @@ pub const DEFAULT_WSFETCH_IMAGE: &str = "ghcr.io/thulasi-ram/scarab-wsfetch:edge
 /// the step), so neither credential's presence implies the other's.
 const WORKSPACE_TOKEN_VOLUME: &str = "scarab-workspace-token";
 
-/// The env var carrying the input snapshot roots into the fetcher, in merge
-/// order. Must agree with `scarab-wsfetch`'s `INPUTS_ENV`.
-const WSFETCH_INPUTS_ENV: &str = "SCARAB_WORKSPACE_INPUTS";
+/// The env var carrying the input **Workspace Snapshot** roots into the fetcher,
+/// in merge order. Roots, not workspaces (CONTEXT.md §4.2): the fetcher
+/// materialises the mutable Workspace *from* these immutable trees. Must agree
+/// with `scarab-wsfetch`'s `ROOTS_ENV`.
+const WSFETCH_ROOTS_ENV: &str = "SCARAB_SNAPSHOT_ROOTS";
 /// The env var telling the fetcher where to build the Workspace.
 const WSFETCH_TARGET_ENV: &str = "SCARAB_WORKSPACE_TARGET";
 
@@ -2304,7 +2306,7 @@ fn workspace_fetch_container(
             ),
             // Merge order is the LIST order (ADR-0007): later inputs overlay
             // earlier ones, so this join must not be sorted.
-            env_var(WSFETCH_INPUTS_ENV, &roots.join(",")),
+            env_var(WSFETCH_ROOTS_ENV, &roots.join(",")),
             env_var(WSFETCH_TARGET_ENV, WORKSPACE_MOUNT_PATH),
         ]),
         volume_mounts: Some(vec![
@@ -2363,7 +2365,7 @@ const ANNOTATION_WS_ROOT: &str = "scarab.io/workspace-root";
 /// restart invalidation compares, and the two are separate because a tree hash
 /// moves with every file's mtime, so a re-run can never reproduce its own root
 /// (git-bug `945b1f4`). Empty when the store computed none.
-const ANNOTATION_WS_IDENTITY: &str = "scarab.io/workspace-identity";
+const ANNOTATION_WS_IDENTITY: &str = "scarab.io/snapshot-identity";
 /// The Pod annotation carrying the step's authored `outputs:` paths (ADR-0007),
 /// comma-separated. Absent/empty = publish the whole workspace. Read at egress,
 /// so an adopted Pod prunes identically with no in-memory state.
@@ -5789,7 +5791,7 @@ mod tests {
             Some("http://scarab-workspace")
         );
         assert_eq!(
-            get("SCARAB_WORKSPACE_INPUTS").as_deref(),
+            get("SCARAB_SNAPSHOT_ROOTS").as_deref(),
             Some("tree-b,tree-a"),
             "merge order is the AUTHORED order — sorting here would change the result"
         );

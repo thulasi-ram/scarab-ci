@@ -67,20 +67,20 @@ describe("describeEvent / eventParts", () => {
     expect(parts.text).toBe("b reran by a.kim — new version");
   });
 
-  it("names the workspace pin and unpin, with their actor (ADR-0061 s5)", () => {
-    // Keeping a run's workspaces past the retention window costs storage, so the
+  it("names the snapshot pin and unpin, with their actor (ADR-0061 s5)", () => {
+    // Keeping a run's Workspace Snapshots past the retention window costs storage, so the
     // rail records both directions and attributes both. Neither is an execution
     // event, so neither gets a louder category than `info`.
-    expect(describeEvent(ev(1, { RunWorkspacePinned: { by: "priya" } }))).toBe(
-      "Workspaces pinned by priya — kept past the retention window",
+    expect(describeEvent(ev(1, { RunSnapshotsPinned: { by: "priya" } }))).toBe(
+      "Workspace snapshots pinned by priya — kept past the retention window",
     );
-    expect(describeEvent(ev(2, { RunWorkspaceUnpinned: { by: "priya" } }))).toBe(
-      "Workspaces unpinned by priya — back to the retention window",
+    expect(describeEvent(ev(2, { RunSnapshotsUnpinned: { by: "priya" } }))).toBe(
+      "Workspace snapshots unpinned by priya — back to the retention window",
     );
     // `by` is null when auth is off — the line must still read.
-    expect(describeEvent(ev(3, { RunWorkspacePinned: { by: null } }))).toBe(
-      "Workspaces pinned — kept past the retention window",
+    expect(describeEvent(ev(3, { RunSnapshotsPinned: { by: null } }))).toBe(
+      "Workspace snapshots pinned — kept past the retention window",
     );
-    expect(eventCategory(ev(1, { RunWorkspacePinned: { by: "priya" } }))).toBe("info");
+    expect(eventCategory(ev(1, { RunSnapshotsPinned: { by: "priya" } }))).toBe("info");
   });
 });

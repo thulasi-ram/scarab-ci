@@ -113,7 +113,7 @@ const runStatus: RunStatusDto = {
   params: {},
   // ADR-0061 s5: a live run is not on the retention clock at all (a non-terminal
   // run is never GC-eligible), so no expiry is promised and nothing is pinned.
-  workspace_retention: { retention_days: 14, expired: false, pinned: false },
+  snapshot_retention: { retention_days: 14, expired: false, pinned: false },
   steps: [
     {
       id: "clone",
@@ -195,8 +195,8 @@ const richRunStatus: RunStatusDto = {
   origin_pr_base: null,
   params: {},
   // Suspended on a gate, so likewise never GC-eligible regardless of age
-  // (ADR-0050) — but PINNED, to render the "keep this run's workspaces" state.
-  workspace_retention: {
+  // (ADR-0050) — but PINNED, to render the "keep this run's snapshots" state.
+  snapshot_retention: {
     retention_days: 14,
     expired: false,
     pinned: true,

@@ -337,42 +337,42 @@ async fn plan_rerun_over(
 /// warm workspace service, which is bounded by space and evicts LRU. That is the
 /// whole point of two tiers: only the time-bounded one carries a promise, so
 /// only it can be extended.
-pub async fn pin_run_workspace(
+pub async fn pin_run_snapshots(
     db: &dyn Db,
     clock: &dyn Clock,
     run: &RunId,
     by: Option<String>,
 ) -> Result<bool, DbError> {
     let now = clock.now().await;
-    if !db.pin_run_workspace(run, by.as_deref(), now).await? {
+    if !db.pin_run_snapshots(run, by.as_deref(), now).await? {
         return Ok(false);
     }
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
-        kind: EventPayload::RunWorkspacePinned { by },
+        kind: EventPayload::RunSnapshotsPinned { by },
         at: now,
     })
     .await?;
     Ok(true)
 }
 
-/// Release a [pin](pin_run_workspace), returning the Run's Workspace Snapshots
+/// Release a [pin](pin_run_snapshots), returning the Run's Workspace Snapshots
 /// to the ordinary TTL. `Ok(false)` = no such Run.
-pub async fn unpin_run_workspace(
+pub async fn unpin_run_snapshots(
     db: &dyn Db,
     clock: &dyn Clock,
     run: &RunId,
     by: Option<String>,
 ) -> Result<bool, DbError> {
-    if !db.unpin_run_workspace(run).await? {
+    if !db.unpin_run_snapshots(run).await? {
         return Ok(false);
     }
     let now = clock.now().await;
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
-        kind: EventPayload::RunWorkspaceUnpinned { by },
+        kind: EventPayload::RunSnapshotsUnpinned { by },
         at: now,
     })
     .await?;

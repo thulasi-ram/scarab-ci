@@ -1546,6 +1546,75 @@
         }
       }
     },
+    "/v1/runs/{id}/snapshots-pin": {
+      "post": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "**Pin** this run's Workspace Snapshots (ADR-0061 s5): keep them past the cold\ntier's retention TTL, so an investigation is not raced by the GC sweeper.",
+        "description": "The pin acts on the cold tier's **time** bound only. It says nothing about the\nwarm workspace service, which is bounded by space and evicts least-recently-\nused by design — a warm miss is slower, never wrong, so there is nothing there\nto protect. Idempotent; recorded with who pinned it and when.",
+        "operationId": "pin_run_snapshots",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "pinned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotRetentionDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such run"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Release the [pin](pin_run_snapshots), returning this run's Workspace Snapshots\nto the ordinary retention window. Idempotent.",
+        "operationId": "unpin_run_snapshots",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "pin released",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotRetentionDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such run"
+          }
+        }
+      }
+    },
     "/v1/runs/{id}/steps/{step}/attach": {
       "get": {
         "tags": [
@@ -2062,75 +2131,6 @@
           },
           "404": {
             "description": "no such file or browse disabled"
-          }
-        }
-      }
-    },
-    "/v1/runs/{id}/workspace-pin": {
-      "post": {
-        "tags": [
-          "Runs"
-        ],
-        "summary": "**Pin** this run's Workspace Snapshots (ADR-0061 s5): keep them past the cold\ntier's retention TTL, so an investigation is not raced by the GC sweeper.",
-        "description": "The pin acts on the cold tier's **time** bound only. It says nothing about the\nwarm workspace service, which is bounded by space and evicts least-recently-\nused by design — a warm miss is slower, never wrong, so there is nothing there\nto protect. Idempotent; recorded with who pinned it and when.",
-        "operationId": "pin_run_workspace",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "run id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "pinned",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WorkspaceRetentionDto"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "no such run"
-          }
-        }
-      },
-      "delete": {
-        "tags": [
-          "Runs"
-        ],
-        "summary": "Release the [pin](pin_run_workspace), returning this run's Workspace Snapshots\nto the ordinary retention window. Idempotent.",
-        "operationId": "unpin_run_workspace",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "description": "run id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "pin released",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/WorkspaceRetentionDto"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "no such run"
           }
         }
       }
@@ -3218,7 +3218,7 @@
           "id",
           "status",
           "steps",
-          "workspace_retention"
+          "snapshot_retention"
         ],
         "properties": {
           "id": {
@@ -3250,6 +3250,10 @@
             "format": "int64",
             "description": "The **run number** (ADR-0057 amendment) — the per-repo sequential `#N`,\nthe human handle shown in the run-detail breadcrumb + gutter. Absent for\nuntenanted inline runs and pre-allocation runs. Distinct from `id`."
           },
+          "snapshot_retention": {
+            "$ref": "#/components/schemas/SnapshotRetentionDto",
+            "description": "This run's **Workspace Snapshot** retention promise (ADR-0061 s5) — the\ncold tier's time bound, made explicit rather than left implicit in a\nsweeper's config, plus any manual pin over it."
+          },
           "status": {
             "type": "string"
           },
@@ -3265,10 +3269,6 @@
               "null"
             ],
             "description": "The run **Headline** (ADR-0057) — the one human line saying what this run\nis about (a push's commit subject; later a PR title / dispatch reason),\ndisambiguated by the trigger kind. Display/audit only; absent when the\ntrigger carried no headline and on runs created before headline-stamping."
-          },
-          "workspace_retention": {
-            "$ref": "#/components/schemas/WorkspaceRetentionDto",
-            "description": "This run's **Workspace Snapshot** retention promise (ADR-0061 s5) — the\ncold tier's time bound, made explicit rather than left implicit in a\nsweeper's config, plus any manual pin over it."
           }
         }
       },
@@ -3502,6 +3502,54 @@
           },
           "key": {
             "type": "string"
+          }
+        }
+      },
+      "SnapshotRetentionDto": {
+        "type": "object",
+        "description": "The cold-tier retention promise over one Run's **Workspace Snapshots**\n(ADR-0061 s5).\n\nADR-0061 gives Workspace Snapshots two tiers with two policies. The warm\nworkspace service is bounded by **space** (LRU) and promises nothing — a miss\nthere is slower, never wrong. Object storage is the cold tier, bounded by\n**time**, and *that* is the guarantee a user is given. Everything in this DTO\ndescribes the cold tier only; nothing here can or should say anything about\nthe warm tier.",
+        "required": [
+          "retention_days",
+          "expired",
+          "pinned"
+        ],
+        "properties": {
+          "expired": {
+            "type": "boolean",
+            "description": "The promise has **lapsed**: this run is terminal, unpinned, and past its\nwindow, so its snapshots may already have been swept. Not the same as\n\"gone\" — GC is periodic and content is shared, so data often outlives the\npromise. The honest word for it is *expired*, not *deleted*, and a rerun\nresolves the difference by checking the store."
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this run's Workspace Snapshots stop being promised (epoch millis).\n`None` while the run is **non-terminal**: a run that has not settled —\nincluding one suspended on a gate for weeks — is never GC-eligible\nregardless of age (ADR-0050), so no expiry applies yet. Also `None` while\n**pinned**, because a pin holds the window open indefinitely."
+          },
+          "pinned": {
+            "type": "boolean",
+            "description": "A human **pinned** this run's Workspace Snapshots — hold them past the\nwindow for an investigation."
+          },
+          "pinned_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When it was pinned, epoch millis."
+          },
+          "pinned_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who pinned it (`None` when unpinned, or when auth is off)."
+          },
+          "retention_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The retention window in days — what the GC sweeper actually enforces.",
+            "minimum": 0
           }
         }
       },
@@ -3754,54 +3802,6 @@
           "path": {
             "type": "string",
             "description": "The path listed (empty string = snapshot root)."
-          }
-        }
-      },
-      "WorkspaceRetentionDto": {
-        "type": "object",
-        "description": "The cold-tier retention promise over one Run's **Workspace Snapshots**\n(ADR-0061 s5).\n\nADR-0061 gives Workspace Snapshots two tiers with two policies. The warm\nworkspace service is bounded by **space** (LRU) and promises nothing — a miss\nthere is slower, never wrong. Object storage is the cold tier, bounded by\n**time**, and *that* is the guarantee a user is given. Everything in this DTO\ndescribes the cold tier only; nothing here can or should say anything about\nthe warm tier.",
-        "required": [
-          "retention_days",
-          "expired",
-          "pinned"
-        ],
-        "properties": {
-          "expired": {
-            "type": "boolean",
-            "description": "The promise has **lapsed**: this run is terminal, unpinned, and past its\nwindow, so its snapshots may already have been swept. Not the same as\n\"gone\" — GC is periodic and content is shared, so data often outlives the\npromise. The honest word for it is *expired*, not *deleted*, and a rerun\nresolves the difference by checking the store."
-          },
-          "expires_at": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "When this run's Workspace Snapshots stop being promised (epoch millis).\n`None` while the run is **non-terminal**: a run that has not settled —\nincluding one suspended on a gate for weeks — is never GC-eligible\nregardless of age (ADR-0050), so no expiry applies yet. Also `None` while\n**pinned**, because a pin holds the window open indefinitely."
-          },
-          "pinned": {
-            "type": "boolean",
-            "description": "A human **pinned** this run's Workspace Snapshots — hold them past the\nwindow for an investigation."
-          },
-          "pinned_at": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "When it was pinned, epoch millis."
-          },
-          "pinned_by": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Who pinned it (`None` when unpinned, or when auth is off)."
-          },
-          "retention_days": {
-            "type": "integer",
-            "format": "int32",
-            "description": "The retention window in days — what the GC sweeper actually enforces.",
-            "minimum": 0
           }
         }
       }

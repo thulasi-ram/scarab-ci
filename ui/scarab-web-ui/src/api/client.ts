@@ -21,7 +21,7 @@ export type StepStatus = components["schemas"]["StepStatusDto"];
 /** A run-scoped shared service instance (ADR-0058) — not a DAG node. */
 export type Service = components["schemas"]["ServiceStatusDto"];
 /** The cold tier's Workspace-Snapshot retention promise + any pin (ADR-0061 s5). */
-export type RetentionInfo = components["schemas"]["WorkspaceRetentionDto"];
+export type RetentionInfo = components["schemas"]["SnapshotRetentionDto"];
 /** A rerun preview: the resolved scope, and any widening over expired inputs. */
 export type RerunPlan = components["schemas"]["RerunPlanResponse"];
 
@@ -628,23 +628,23 @@ export async function fetchRerunPlan(id: string, step: string): Promise<RerunPla
   return data;
 }
 
-/** Pin this run's workspace snapshots (`POST …/workspace-pin`, ADR-0061 s5):
+/** Pin this run's Workspace Snapshots (`POST …/snapshots-pin`, ADR-0061 s5):
  * keep them past the retention window for an investigation. Returns the run's
  * updated retention state. */
-export async function pinWorkspaces(id: string): Promise<RetentionInfo> {
-  const { data, error } = await api.POST("/v1/runs/{id}/workspace-pin", {
+export async function pinSnapshots(id: string): Promise<RetentionInfo> {
+  const { data, error } = await api.POST("/v1/runs/{id}/snapshots-pin", {
     params: { path: { id } },
   });
-  if (error || !data) throw new Error(`failed to pin workspaces of run ${id}`);
+  if (error || !data) throw new Error(`failed to pin snapshots of run ${id}`);
   return data;
 }
 
-/** Release the pin (`DELETE …/workspace-pin`) — back to the ordinary window. */
-export async function unpinWorkspaces(id: string): Promise<RetentionInfo> {
-  const { data, error } = await api.DELETE("/v1/runs/{id}/workspace-pin", {
+/** Release the pin (`DELETE …/snapshots-pin`) — back to the ordinary window. */
+export async function unpinSnapshots(id: string): Promise<RetentionInfo> {
+  const { data, error } = await api.DELETE("/v1/runs/{id}/snapshots-pin", {
     params: { path: { id } },
   });
-  if (error || !data) throw new Error(`failed to unpin workspaces of run ${id}`);
+  if (error || !data) throw new Error(`failed to unpin snapshots of run ${id}`);
   return data;
 }
 

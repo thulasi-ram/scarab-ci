@@ -1789,7 +1789,7 @@ impl Db for PostgresDb {
         // race the sweeper. The step_runs arm is kept for pre-ADR-0056 rows
         // whose attempts carry no snapshot copy.
         //
-        // `workspace_pinned_at IS NOT NULL` (ADR-0061 s5) is a third disjunct in
+        // `snapshots_pinned_at IS NOT NULL` (ADR-0061 s5) is a third disjunct in
         // the reachability predicate, alongside "non-terminal" and "within TTL".
         // A pin therefore enters the **mark**, so the whole transitive tree under
         // a pinned root survives — including subtrees shared with runs that are
@@ -1802,14 +1802,14 @@ impl Db for PostgresDb {
              WHERE sr.output_snapshot IS NOT NULL
                AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
                     OR r.updated_at >= $1
-                    OR r.workspace_pinned_at IS NOT NULL)
+                    OR r.snapshots_pinned_at IS NOT NULL)
              UNION
              SELECT DISTINCT a.output_snapshot AS root FROM attempts a
              JOIN runs r ON r.id = a.run_id
              WHERE a.output_snapshot IS NOT NULL
                AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
                     OR r.updated_at >= $1
-                    OR r.workspace_pinned_at IS NOT NULL)",
+                    OR r.snapshots_pinned_at IS NOT NULL)",
         )
         .bind(terminal_cutoff.0)
         .fetch_all(self.pool())
@@ -1821,7 +1821,7 @@ impl Db for PostgresDb {
             .collect())
     }
 
-    async fn pin_run_workspace(
+    async fn pin_run_snapshots(
         &self,
         run: &RunId,
         by: Option<&str>,
@@ -1832,7 +1832,7 @@ impl Db for PostgresDb {
         // against. A pin must not silently re-date the run, or "pinned" and
         // "settled 5 minutes ago" would become indistinguishable in every view.
         let n = sqlx::query(
-            "UPDATE runs SET workspace_pinned_at = $2, workspace_pinned_by = $3 WHERE id = $1",
+            "UPDATE runs SET snapshots_pinned_at = $2, snapshots_pinned_by = $3 WHERE id = $1",
         )
         .bind(&run.0)
         .bind(at.0)
@@ -1844,9 +1844,9 @@ impl Db for PostgresDb {
         Ok(n > 0)
     }
 
-    async fn unpin_run_workspace(&self, run: &RunId) -> Result<bool, DbError> {
+    async fn unpin_run_snapshots(&self, run: &RunId) -> Result<bool, DbError> {
         let n = sqlx::query(
-            "UPDATE runs SET workspace_pinned_at = NULL, workspace_pinned_by = NULL WHERE id = $1",
+            "UPDATE runs SET snapshots_pinned_at = NULL, snapshots_pinned_by = NULL WHERE id = $1",
         )
         .bind(&run.0)
         .execute(self.pool())
@@ -1856,12 +1856,12 @@ impl Db for PostgresDb {
         Ok(n > 0)
     }
 
-    async fn run_workspace_retention(
+    async fn run_snapshot_retention(
         &self,
         run: &RunId,
-    ) -> Result<Option<scarab_engine::WorkspaceRetention>, DbError> {
+    ) -> Result<Option<scarab_engine::SnapshotRetention>, DbError> {
         let row = sqlx::query(
-            "SELECT status, updated_at, workspace_pinned_at, workspace_pinned_by
+            "SELECT status, updated_at, snapshots_pinned_at, snapshots_pinned_by
              FROM runs WHERE id = $1",
         )
         .bind(&run.0)
@@ -1870,7 +1870,7 @@ impl Db for PostgresDb {
         .map_err(db_err)?;
         let Some(row) = row else { return Ok(None) };
         let status: String = row.get("status");
-        Ok(Some(scarab_engine::WorkspaceRetention {
+        Ok(Some(scarab_engine::SnapshotRetention {
             // The same terminal vocabulary the mark query filters on, so "on the
             // TTL clock" means one thing in both places.
             terminal: matches!(
@@ -1879,9 +1879,9 @@ impl Db for PostgresDb {
             ),
             settled_at: Timestamp(row.get::<i64, _>("updated_at")),
             pinned_at: row
-                .get::<Option<i64>, _>("workspace_pinned_at")
+                .get::<Option<i64>, _>("snapshots_pinned_at")
                 .map(Timestamp),
-            pinned_by: row.get::<Option<String>, _>("workspace_pinned_by"),
+            pinned_by: row.get::<Option<String>, _>("snapshots_pinned_by"),
         }))
     }
 

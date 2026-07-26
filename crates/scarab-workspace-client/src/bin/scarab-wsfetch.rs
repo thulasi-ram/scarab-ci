@@ -93,8 +93,9 @@ use scarab_workspace_client::WorkspaceClient;
 const TOKEN_FILE_ENV: &str = "SCARAB_WORKSPACE_TOKEN_FILE";
 /// The env var carrying the workspace service's base URL.
 const URL_ENV: &str = "SCARAB_WORKSPACE_URL";
-/// Comma-separated snapshot roots, **in merge order**.
-const INPUTS_ENV: &str = "SCARAB_WORKSPACE_INPUTS";
+/// Comma-separated **Workspace Snapshot** roots, in merge order — the immutable
+/// trees this fetcher materialises the mutable Workspace from (CONTEXT.md §4.2).
+const ROOTS_ENV: &str = "SCARAB_SNAPSHOT_ROOTS";
 /// Where to build the Workspace. Overridable only so the binary is testable.
 const TARGET_ENV: &str = "SCARAB_WORKSPACE_TARGET";
 const DEFAULT_TARGET: &str = "/workspace";
@@ -130,7 +131,7 @@ impl From<std::io::Error> for FetchError {
 
 fn run() -> Result<(), FetchError> {
     let target = env_or(TARGET_ENV, DEFAULT_TARGET);
-    let roots: Vec<String> = env_or(INPUTS_ENV, "")
+    let roots: Vec<String> = env_or(ROOTS_ENV, "")
         .split(',')
         .map(str::trim)
         .filter(|r| !r.is_empty())
