@@ -89,6 +89,13 @@ steps:
     security:
       run_as_root: true
     timeout: 900
+    # `rust-toolchain.toml` pins `channel = "stable"`, which the official image
+    # does not ship under that name — so EVERY cargo invocation makes rustup sync
+    # the channel manifest over the network. Colima's egress DNS is flaky enough
+    # that a1 fails and a2 succeeds, so retry the network, exactly as `test` does.
+    retry:
+      on: failure
+      max: 2
     # The same two traps .scarab/ci.yaml documents. (1) The baseline drops
     # CAP_DAC_OVERRIDE and /workspace belongs to the clone's uid 65532, so uid 0
     # cannot write there — send cargo's target dir to a container-owned path.
@@ -155,20 +162,26 @@ steps:
   # This step publishes a `tag` result at runtime (results API, ADR-0042); the
   # deploy step reads it via `${{ outputs.version.tag }}`.
   - id: version
-    image: alpine:3.20
+    # Deliberately the rust image rather than a bare alpine: it already ships git
+    # (2.39.5), so this step needs NO network at all. `apk add --no-cache git` was
+    # the whole reason it used to fail on flaky egress DNS, and a step that only
+    # reads the checkout should not depend on a package mirror. Plain `git` runs
+    # no rustup shim, so the channel sync that costs lint/test does not apply.
+    image: rust:1-bookworm
     needs: [checkout]
-    # alpine is USER root, so opt into the self-service run-as-root grant (like
-    # lint/test above) — without it the kubelet refuses the container under the
-    # non-root baseline (CreateContainerConfigError). Base alpine ships no git,
-    # so install it before `git describe`.
+    # The rust image is USER root, so opt into the self-service run-as-root grant
+    # (like lint/test above) — without it the kubelet refuses the container under
+    # the non-root baseline (CreateContainerConfigError).
     security:
       run_as_root: true
+    retry:
+      on: failure
+      max: 2
     command:
-      - sh
+      - bash
       - -c
       - |
-        set -eux
-        apk add --no-cache git
+        set -euxo pipefail
         # Belt-and-braces against git's ownership guard: this step runs as a
         # different uid than the clone (which owns the tree as 65532).
         git config --global --add safe.directory /workspace
