@@ -39,3 +39,19 @@
 # be committed; guard it now, while the file does not yet exist.
 .cargo/credentials
 .cargo/credentials.toml
+
+# Gortex derives a "Community Skills" block and one SKILL.md per graph community
+# from the LOCAL code index. Both are regenerated on every reindex and carry
+# symbol counts that mean nothing on another machine, so they stay local. The
+# hand-written agent instructions — CLAUDE.md and `.claude/agents/` — ARE
+# tracked; only the generated files below are not. `.github/copilot-instructions.md`
+# and `AGENTS.md` currently hold nothing but that generated block; drop these
+# rules if either ever grows real content.
+/.claude/skills/generated/
+/.github/copilot-instructions.md
+/AGENTS.md
+
+# Stale generated copy of the canonical `/openapi.json`. Nothing reads it — the
+# docs site points starlight-openapi at `../../openapi.json` in place
+# (ui/scarab-docs-ui/astro.config.mjs).
+/ui/scarab-docs-ui/openapi.gen.json
