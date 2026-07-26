@@ -128,7 +128,8 @@ const GC_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
 ///   A transient walk error aborts the pass — robust over precise: a missed
 ///   mark must never become a deleted live object. A MISSING root (dangling
 ///   reference to a wiped tree) is skipped instead, so one lost object can't
-///   wedge GC forever.
+///   wedge GC forever, and the Db then FORGETS that root so the skip is
+///   reported once rather than on every pass forever.
 /// - **Sweep**: delete unmarked objects older than the grace window.
 pub async fn sweep_cas(
     db: &Arc<dyn Db>,
@@ -152,7 +153,11 @@ pub async fn sweep_cas(
         .gc_workspace_roots(Timestamp(now.0 - cfg.workspace_ttl_ms))
         .await
         .map_err(|e| e.to_string())?;
+    // Which hashes came straight from the Db, as opposed to being discovered
+    // under a parent tree: only a ROOT is a reference the Db can forget.
+    let root_set: std::collections::HashSet<String> = roots.iter().cloned().collect();
     let mut marked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dangling_roots: Vec<String> = Vec::new();
     let mut frontier: Vec<String> = roots;
     while let Some(hash) = frontier.pop() {
         if !marked.insert(format!("trees/{hash}")) {
@@ -172,8 +177,24 @@ pub async fn sweep_cas(
             // error may be transient over a tree that DOES exist, where an
             // unmarked-but-live blob could then be swept — stay conservative
             // and abort the pass (a missed mark must never delete a live object).
+            Err(scarab_storage::StorageError::NotFound) if root_set.contains(&hash) => {
+                tracing::warn!(
+                    tree = %hash,
+                    "cas gc: root tree missing (dangling reference) — forgetting"
+                );
+                dangling_roots.push(hash);
+                continue;
+            }
             Err(scarab_storage::StorageError::NotFound) => {
-                tracing::warn!(tree = %hash, "cas gc: root tree missing (dangling reference) — skipping");
+                // NOT a root: a parent tree that DOES exist referenced this
+                // subtree, so the CAS is partially torn rather than merely
+                // stale. There is nothing under it to mark (so the sweep stays
+                // safe) and no Db reference to forget — but unlike a stale root
+                // this is real corruption, so say so at a louder level.
+                tracing::error!(
+                    tree = %hash,
+                    "cas gc: inner tree missing under a live parent (torn CAS) — skipping"
+                );
                 continue;
             }
             Err(e) => return Err(format!("mark walk of tree {hash}: {e} — aborting pass")),
@@ -184,6 +205,24 @@ pub async fn sweep_cas(
                     marked.insert(format!("blobs/{}", b.0));
                 }
                 scarab_storage::TreeTarget::Tree(t) => frontier.push(t.0),
+            }
+        }
+    }
+
+    // --- Self-heal. ----------------------------------------------------
+    // Drop the references the walk PROVED dead, so each lost root is reported
+    // once instead of re-walked and re-warned every pass forever. Deliberately
+    // after the walk: an aborted walk must never mutate run history, and only
+    // a definitive NotFound over a root gets here.
+    for root in &dangling_roots {
+        match db.forget_workspace_root(root).await {
+            Ok(cleared) => {
+                tracing::info!(tree = %root, cleared, "cas gc: forgot dangling workspace root")
+            }
+            // Non-fatal: the sweep below is still correct (the root's subtree is
+            // absent either way) and the next pass retries the forget.
+            Err(e) => {
+                tracing::warn!(tree = %root, error = %e, "cas gc: could not forget dangling root")
             }
         }
     }

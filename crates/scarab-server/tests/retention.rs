@@ -498,5 +498,24 @@ async fn cas_gc_skips_a_dangling_root_instead_of_aborting() {
     .expect("the reachable workspace survives the pass");
     assert!(out.path().join("keep.txt").exists());
 
+    // ...and the pass FORGETS the proven-dead reference, so the dangling root
+    // leaves the mark set: the warning fires once for a lost root instead of on
+    // every pass forever. Both arms of the mark set must be cleared (ADR-0056),
+    // which `gc_workspace_roots` no longer reporting it is what actually proves.
+    assert_eq!(
+        db.step_output(&dangling, &StepId("s1".into()))
+            .await
+            .unwrap(),
+        None,
+        "the dangling snapshot reference is cleared"
+    );
+    assert!(
+        !db.gc_workspace_roots(Timestamp(0))
+            .await
+            .unwrap()
+            .contains(&missing),
+        "a forgotten root is not walked again"
+    );
+
     tdb.cleanup().await;
 }

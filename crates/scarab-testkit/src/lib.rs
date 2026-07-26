@@ -1526,6 +1526,24 @@ impl Db for InMemoryDb {
         Ok(roots)
     }
 
+    async fn forget_workspace_root(&self, root: &str) -> Result<u32, DbError> {
+        let mut st = self.state.lock().unwrap();
+        let mut cleared = 0u32;
+        for rec in st.steps.values_mut() {
+            if rec.output.as_deref() == Some(root) {
+                rec.output = None;
+                cleared += 1;
+            }
+        }
+        for e in st.attempt_evidence.values_mut() {
+            if e.output.as_deref() == Some(root) {
+                e.output = None;
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
+    }
+
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
         // Real lease semantics (the PG adapter's contract): the holder renews;
         // a peer only takes over an EXPIRED lease. Wall-clock via Instant —
