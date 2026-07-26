@@ -165,7 +165,7 @@ async fn seed_workspace(
         ])
         .await
         .unwrap();
-    db.set_step_output(run, step, &AttemptId("a1".into()), &root.0)
+    db.set_step_output(run, step, &AttemptId("a1".into()), &root.0, None)
         .await
         .unwrap();
     root

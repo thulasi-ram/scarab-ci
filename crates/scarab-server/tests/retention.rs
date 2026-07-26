@@ -291,7 +291,7 @@ async fn seed_run_with_workspace(
         .unwrap()
         .root
         .0;
-    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root)
+    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None)
         .await
         .unwrap();
     root
@@ -470,6 +470,7 @@ async fn cas_gc_skips_a_dangling_root_instead_of_aborting() {
         &StepId("s1".into()),
         &AttemptId("a1".into()),
         &missing,
+        None,
     )
     .await
     .unwrap();
@@ -731,15 +732,16 @@ async fn seed_chain(db: &PostgresDb, cas: &Arc<dyn Cas>, run: &RunId) -> Vec<Str
         // have recorded when the step last ran — the state a rerun starts from.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(format!("{name}.txt")), name).unwrap();
-        let root = cas
-            .ingest(dir.path().to_str().unwrap())
-            .await
-            .unwrap()
-            .root
-            .0;
-        db.set_step_output(run, &step, &AttemptId("a1".into()), &root)
-            .await
-            .unwrap();
+        let snap = cas.ingest(dir.path().to_str().unwrap()).await.unwrap();
+        db.set_step_output(
+            run,
+            &step,
+            &AttemptId("a1".into()),
+            &snap.root.0,
+            snap.identity.as_ref().map(|i| i.0.as_str()),
+        )
+        .await
+        .unwrap();
         db.record_step_transition(run, &step, StepStatus::Pending, StepStatus::Succeeded)
             .await
             .unwrap();
@@ -761,7 +763,11 @@ async fn seed_chain(db: &PostgresDb, cas: &Arc<dyn Cas>, run: &RunId) -> Vec<Str
             .needs;
         let sig = scarab_engine::input_signature(&needs, None, &output_of);
         db.set_step_input(run, &step, Some(&sig)).await.unwrap();
-        if let Some(o) = db.step_output(run, &step).await.unwrap() {
+        // `step_output_identity`, not `step_output` — admission signs each
+        // upstream's content IDENTITY, not its snapshot root (ADR-0061 s8). A
+        // fixture that signed roots would build a state admission never writes,
+        // and the widening assertions below would be testing a fiction.
+        if let Some(o) = db.step_output_identity(run, &step).await.unwrap() {
             output_of.insert(step, o);
         }
     }

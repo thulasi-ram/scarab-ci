@@ -365,14 +365,18 @@ impl Db for PostgresDb {
         step: &StepId,
         attempt: &AttemptId,
         snapshot: &str,
+        identity: Option<&str>,
     ) -> Result<(), DbError> {
         // One transaction (ADR-0056): the attempt's immutable evidence copy
         // and the step's latest-evidence denormalization (+ its provenance
-        // stamp) move together or not at all.
+        // stamp) move together or not at all. The identity travels in the same
+        // statement as the root it describes — a row with one and not the other
+        // would be a snapshot whose content nobody can compare (ADR-0061 s8).
         let mut tx = self.pool().begin().await.map_err(db_err)?;
         sqlx::query(
             "UPDATE step_runs
              SET output_snapshot = $3,
+                 output_identity = $5,
                  evidence_attempt = $4,
                  updated_at = (extract(epoch from now()) * 1000)::bigint
              WHERE run_id = $1 AND step_id = $2",
@@ -381,22 +385,44 @@ impl Db for PostgresDb {
         .bind(&step.0)
         .bind(snapshot)
         .bind(&attempt.0)
+        .bind(identity)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
         sqlx::query(
-            "UPDATE attempts SET output_snapshot = $4
+            "UPDATE attempts SET output_snapshot = $4, output_identity = $5
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
         )
         .bind(&run.0)
         .bind(&step.0)
         .bind(&attempt.0)
         .bind(snapshot)
+        .bind(identity)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
         Ok(())
+    }
+
+    async fn step_output_identity(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<String>, DbError> {
+        // COALESCE is the fallback the port documents, in SQL: a row written
+        // before ADR-0061 s8 has no identity, and comparing by its root is the
+        // pre-identity behaviour — it cascades where it might have skipped.
+        let row = sqlx::query(
+            "SELECT COALESCE(output_identity, output_snapshot) AS cmp
+             FROM step_runs WHERE run_id = $1 AND step_id = $2",
+        )
+        .bind(&run.0)
+        .bind(&step.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("cmp")))
     }
 
     async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError> {

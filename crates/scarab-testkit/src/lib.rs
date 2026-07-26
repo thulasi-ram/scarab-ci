@@ -84,8 +84,12 @@ struct StepRec {
     spec: Option<StepSpec>,
     needs: Vec<StepId>,
     attempts: Vec<Attempt>,
-    /// Output workspace snapshot (CAS root hash) this step produced.
+    /// Output workspace snapshot (CAS root hash) this step produced — *where*
+    /// the bytes are.
     output: Option<String>,
+    /// Its content identity — *what* the bytes are (ADR-0061 s8). What
+    /// skip-if-unchanged compares; `None` falls back to `output`.
+    output_identity: Option<String>,
     /// Named results (ADR-0041) this step emitted, captured on success.
     results: std::collections::BTreeMap<String, serde_json::Value>,
     /// Input signature consumed on the last run (restart skip-if-unchanged).
@@ -263,6 +267,7 @@ impl InMemoryDb {
                 needs: Vec::new(),
                 attempts: Vec::new(),
                 output: None,
+                output_identity: None,
                 results: Default::default(),
                 input: None,
                 gate_kind: None,
@@ -285,6 +290,7 @@ impl InMemoryDb {
                     needs: s.needs,
                     attempts: s.attempts,
                     output: None,
+                    output_identity: None,
                     results: Default::default(),
                     input: None,
                     gate_kind: None,
@@ -405,6 +411,7 @@ impl Db for InMemoryDb {
                 needs: needs.to_vec(),
                 attempts: Vec::new(),
                 output: None,
+                output_identity: None,
                 results: Default::default(),
                 input: None,
                 gate_kind: None,
@@ -422,6 +429,7 @@ impl Db for InMemoryDb {
         step: &StepId,
         attempt: &AttemptId,
         snapshot: &str,
+        identity: Option<&str>,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
         let rec = st
@@ -429,6 +437,7 @@ impl Db for InMemoryDb {
             .get_mut(&(run.clone(), step.clone()))
             .ok_or(DbError::Conflict)?;
         rec.output = Some(snapshot.to_string());
+        rec.output_identity = identity.map(str::to_string);
         rec.evidence_attempt = Some(attempt.clone());
         st.attempt_evidence
             .entry((run.clone(), step.clone(), attempt.clone()))
@@ -460,6 +469,22 @@ impl Db for InMemoryDb {
             .steps
             .get(&(run.clone(), step.clone()))
             .and_then(|r| r.output.clone()))
+    }
+
+    async fn step_output_identity(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<String>, DbError> {
+        // Same fallback the Postgres adapter does with COALESCE: no recorded
+        // identity means compare by the root (ADR-0061 s8).
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.output_identity.clone().or_else(|| r.output.clone())))
     }
 
     async fn set_step_results(
@@ -1653,6 +1678,14 @@ struct FakeExecState {
     /// across a step's re-runs models an unchanged output (restart skips its
     /// dependents); changing it models a changed output (dependents cascade).
     outputs: HashMap<String, String>,
+    /// The **content identity** each step's output has (ADR-0061 s8), keyed by
+    /// step id. Absent means "the backend computed none", which is a real case
+    /// (a pre-s8 row) and makes the engine fall back to the root.
+    identities: HashMap<String, String>,
+    /// Steps whose snapshot ROOT differs per attempt while their CONTENT does
+    /// not — the git-bug `945b1f4` shape, see
+    /// [`FakeExecutor::set_output_identical_content`].
+    churning_roots: std::collections::HashSet<String>,
     /// Named results (ADR-0041) each *step* emits on success, keyed by step id.
     results: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
     /// Artifacts of record (ADR-0052) each *step* published, keyed by step id —
@@ -1724,6 +1757,46 @@ impl FakeExecutor {
             .unwrap()
             .outputs
             .insert(step.to_string(), snapshot.to_string());
+    }
+
+    /// Model the real k8s backend's shape (ADR-0061 s8, git-bug `945b1f4`): a
+    /// step whose **content never changes** but whose **snapshot root does, on
+    /// every attempt**.
+    ///
+    /// That is not a contrivance, it is what a real CAS does. A tree hash covers
+    /// each file's mtime, so a producer re-running writes byte-identical content
+    /// at a new wall clock and gets a new root every time. Any test that models a
+    /// re-run with a *fixed* output string (`set_output`) is deterministic by
+    /// construction and can never see the failure that shape caused: the input
+    /// signature always changed, so no descendant was ever skipped.
+    ///
+    /// `identity` is what `Executor::output_identity` reports and what the engine
+    /// must compare; the root reported by `output` is derived from the attempt id.
+    pub fn set_output_identical_content(&self, step: &str, identity: &str) {
+        let mut st = self.inner.lock().unwrap();
+        st.outputs.insert(step.to_string(), identity.to_string());
+        st.identities.insert(step.to_string(), identity.to_string());
+        st.churning_roots.insert(step.to_string());
+    }
+
+    /// The content identity `step` reports, independently of its root. Use this
+    /// to model "the content changed" while `set_output_identical_content` models
+    /// "it did not".
+    pub fn set_output_identity(&self, step: &str, identity: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .identities
+            .insert(step.to_string(), identity.to_string());
+    }
+
+    /// `(step id, attempt id)` out of a `fake://{run}/{step}/{attempt}` handle.
+    fn step_and_attempt(handle: &ExecHandle) -> Option<(String, String)> {
+        let rest = handle.0.strip_prefix("fake://")?;
+        let mut parts = rest.split('/').skip(1);
+        let step = parts.next()?.to_string();
+        let attempt = parts.next()?.to_string();
+        Some((step, attempt))
     }
 
     /// Set the named results `step` (by id) emits on success (ADR-0041).
@@ -1889,12 +1962,27 @@ impl Executor for FakeExecutor {
     }
 
     async fn output(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
-        // Handle format is `fake://{run}/{step}/{attempt}` — key outputs by step.
-        let step = handle
-            .0
-            .strip_prefix("fake://")
-            .and_then(|rest| rest.split('/').nth(1));
-        Ok(step.and_then(|s| self.inner.lock().unwrap().outputs.get(s).cloned()))
+        let Some((step, attempt)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        let st = self.inner.lock().unwrap();
+        let Some(base) = st.outputs.get(&step).cloned() else {
+            return Ok(None);
+        };
+        // A churning step's root is a function of the ATTEMPT, not of its
+        // content — deterministic per attempt (so a re-poll of one attempt is
+        // stable, as a Pod annotation is) and different across attempts.
+        if st.churning_roots.contains(&step) {
+            return Ok(Some(format!("{base}@{attempt}")));
+        }
+        Ok(Some(base))
+    }
+
+    async fn output_identity(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        let Some((step, _)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        Ok(self.inner.lock().unwrap().identities.get(&step).cloned())
     }
 
     async fn results(

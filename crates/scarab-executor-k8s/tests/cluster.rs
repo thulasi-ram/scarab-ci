@@ -507,24 +507,26 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         "B read the file A wrote — the workspace flowed through the CAS"
     );
 
-    // --- Restart determinism, and what is left of it (git-bug 945b1f4). ---
+    // --- Restart determinism, on the digest that carries it (git-bug 945b1f4). ---
     //
-    // This used to assert `root_a == root_a2`: same content, same CAS root, which
-    // is what ADR-0027's content-addressed invalidation is built on. **It no longer
-    // holds, and it is not s3-feed that broke it.** ADR-0061's s7 slice put
-    // `mtime_ms` into the tree entry — deliberately, so cross-Step incremental
-    // compilation stops being degraded — and a tree hash therefore moves with the
-    // wall clock. Measured on this very cluster, the two roots differed in exactly
-    // one field:
+    // This once asserted `root_a == root_a2` — same content, same CAS root — and
+    // that assertion was **right about the requirement and wrong about the
+    // digest**, which is why it started failing here. ADR-0061's s7 put `mtime_ms`
+    // into the tree entry, deliberately, so cross-Step incremental compilation
+    // stops being degraded; the entry is in the hash preimage, so a root moves with
+    // the wall clock. Measured on this very cluster, the two roots differed in
+    // exactly one field:
     //
     //   6ab25ad8… [{"name":"out.txt","target":{"Blob":"d112afe6…"},"mode":420,"mtime_ms":1785098063000}]
     //   93722441… [{"name":"out.txt","target":{"Blob":"d112afe6…"},"mode":420,"mtime_ms":1785098073000}]
     //
-    // So the assertion is narrowed to the determinism that DOES survive — the
-    // content address of the file itself — rather than deleted, because a deleted
-    // assertion takes the knowledge with it. The consequence for ADR-0027 (a
-    // producer re-run always invalidates every dependent) is the ticket's, not this
-    // test's.
+    // It was narrowed to "the blob addresses match" for one commit, as a holding
+    // position with a pointer to the ticket. s8 answers it: the requirement lives on
+    // the **content identity** — the same fold with mtimes dropped, which is what
+    // ADR-0027's invalidation compares — and both halves are asserted here, because
+    // the pair is the point. If the roots ever stop differing, s7's mtime fidelity
+    // has silently regressed; if the identities ever start differing, ADR-0027 is
+    // dead again and nothing downstream will ever be skipped.
     let a2 = step_run("a", "a2");
     let ha2 = exec
         .launch(
@@ -535,6 +537,33 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         .expect("relaunch A");
     assert_eq!(settle(&exec, &ha2).await, ExecState::Succeeded);
     let root_a2 = exec.output(&ha2).await.expect("output").expect("snapshot");
+    assert_ne!(
+        root_a, root_a2,
+        "two attempts write at different wall clocks, so their ROOTS must differ — \
+         if they stop differing, the CAS stopped recording mtimes and s7's fidelity \
+         work has regressed"
+    );
+
+    let identity_a = exec
+        .output_identity(&ha)
+        .await
+        .expect("identity")
+        .expect("A recorded a content identity");
+    let identity_a2 = exec
+        .output_identity(&ha2)
+        .await
+        .expect("identity")
+        .expect("A2 recorded a content identity");
+    assert_eq!(
+        identity_a, identity_a2,
+        "same content => same CONTENT IDENTITY across attempts. This is the \
+         restart determinism ADR-0027 is built on; when it moves with the clock, a \
+         producer's re-run always invalidates every dependent and skip-if-unchanged \
+         is dead (git-bug 945b1f4)"
+    );
+
+    // Both roots still resolve independently: an identity is a label on evidence,
+    // never a redirection, so attempt a1's workspace is still exactly a1's.
     let blobs_of = |entries: Vec<scarab_storage::TreeEntry>| {
         let mut v: Vec<String> = entries
             .into_iter()
@@ -559,8 +588,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
     assert_eq!(
         blobs_of(first),
         blobs_of(second),
-        "same content => same BLOB addresses. The ROOT now moves with the mtimes s7 \
-         added (git-bug 945b1f4), which is what breaks ADR-0027 skip-if-unchanged."
+        "same content => same BLOB addresses, in both attempts' own trees"
     );
 
     for h in [ha, hb, ha2] {

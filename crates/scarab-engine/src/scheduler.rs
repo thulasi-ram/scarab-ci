@@ -388,15 +388,22 @@ pub async fn unpin_run_workspace(
 /// Needs only the [`Db`] and [`Clock`] ports (no executor), so the API role can
 /// call it directly without an execution backend.
 ///
-/// ACCEPTED INEFFICIENCY — deliberately not built (see ADR-0027 amendment
-/// 2026-07-24). Content-addressed *skip*-if-unchanged (skip a descendant when
-/// the rerun step's new output hash equals its old one) would spare downstream
-/// steps whose inputs did not actually change. We do NOT do this: every
-/// re-armed descendant re-runs — the always-cascade branch. That is correct
-/// (downstream never sees stale inputs), merely wasteful when a rerun
-/// reproduces an identical output. Left unbuilt on purpose; revisit only if
-/// identical-rebuild waste becomes a real, measured pain — the per-step
-/// output-snapshot substrate it would need is already in place.
+/// **Skip-if-unchanged IS built** — this comment used to say the opposite, ~1000
+/// lines above the admission code that implements it, and ADR-0027's 2026-07-24
+/// amendment said the same. Both were wrong. What re-arming does is put the
+/// invalidation set back to `Pending`; **admission** then decides per step
+/// whether to run it, by comparing the step's recomputed input signature to the
+/// one it last consumed (`tick`, "Skip-if-unchanged"). A descendant whose
+/// upstreams produced the same content is skipped and carries its prior output
+/// forward; the explicit target has its stored signature cleared here, so it
+/// always re-runs.
+///
+/// The reason the false claim survived: the signature was built over snapshot
+/// **roots**, which move with file mtimes, so a re-run never reproduced one and
+/// nothing was ever skipped in practice (git-bug `945b1f4`). The machinery was
+/// live and the behaviour was cascade-always, which is exactly how a wrong
+/// comment gets written and then confirmed by observation. It signs **content
+/// identities** now (ADR-0061 s8).
 pub async fn rerun_step(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -1498,10 +1505,22 @@ impl<'a> Scheduler<'a> {
 
         // Outputs recorded so far — the material for each step's input signature
         // (restart skip-if-unchanged, ADR-0027).
-        let mut output_of: HashMap<StepId, String> = HashMap::new();
+        //
+        // The signature is built over each upstream's **content identity**, not
+        // its snapshot root, and that distinction is the whole of git-bug
+        // `945b1f4`: a root covers every file's mtime, so a producer re-running
+        // writes identical bytes at a new wall clock and can never reproduce it.
+        // Signing roots therefore always reports "changed" and nothing downstream
+        // is ever skipped — skip-if-unchanged looked built and was dead.
+        // `Db::step_output_identity` falls back to the root when a row carries no
+        // identity, which cascades rather than falsely skipping.
+        // Named for what it holds: comparison digests, NOT snapshot roots. The
+        // launch path a few hundred lines down builds its own map from
+        // `step_output` because materializing a workspace needs the address.
+        let mut signature_of: HashMap<StepId, String> = HashMap::new();
         for s in &steps {
-            if let Some(out) = self.db.step_output(run, &s.step).await? {
-                output_of.insert(s.step.clone(), out);
+            if let Some(id) = self.db.step_output_identity(run, &s.step).await? {
+                signature_of.insert(s.step.clone(), id);
             }
         }
 
@@ -1594,11 +1613,11 @@ impl<'a> Scheduler<'a> {
                 let cur = crate::input_signature(
                     &step.needs,
                     explicit_inputs.as_deref(),
-                    &output_of,
+                    &signature_of,
                 );
                 let prev = self.db.step_input(run, &step.step).await?;
-                let unchanged =
-                    output_of.contains_key(&step.step) && prev.as_deref() == Some(cur.as_str());
+                let unchanged = signature_of.contains_key(&step.step)
+                    && prev.as_deref() == Some(cur.as_str());
                 if unchanged {
                     self.skip_unchanged(run, &step.step).await?;
                 } else {
@@ -2046,26 +2065,24 @@ impl<'a> Scheduler<'a> {
             match self.executor.poll(&handle).await? {
                 ExecState::Succeeded => {
                     // Record the output workspace snapshot (if the backend
-                    // produced one) so dependents can materialize it and restart
-                    // can compare it for skip-if-unchanged (ADR-0027, 0029).
+                    // produced one) so dependents can materialize it, plus its
+                    // content identity so restart can ask whether the content
+                    // changed (ADR-0027, 0029, 0061 s8 — the two are different
+                    // digests, see `Executor::output_identity`).
                     // Attempt-grain (ADR-0056): the write lands on both the
                     // attempt's immutable evidence row and the step's
                     // latest-evidence denormalization.
                     //
-                    // DEFERRED — the sibling `outputs:` per-PATH publishing
-                    // selection (scarab_pipeline::StepSpec::outputs) is NOT honored
-                    // here. This records the merkle root of the WHOLE workspace
-                    // (shipped behavior). Restricting the published snapshot to an
-                    // authored path subset needs CAS *sub-tree* addressing — the
-                    // ability to snapshot/materialize a path prefix of a tree — which
-                    // scarab-storage-s3 does not have (it is whole-file / whole-tree
-                    // only). Until that lands, `outputs:` is authored + validated in
-                    // the pipeline spec but deliberately not consumed: it is a no-op,
-                    // NOT silently narrowing. Blocked on CAS sub-tree addressing; see
-                    // docs/followups.md. Do not wire this half without that support.
+                    // (`outputs:` per-path publishing IS honored — by the egress
+                    // leg, which prunes the post-step snapshot with
+                    // `scarab_storage::prune_tree` before the root reaches us. This
+                    // comment used to say it was blocked on "CAS sub-tree
+                    // addressing"; that premise was false and ADR-0007's 2026-07-25
+                    // amendment records why.)
                     if let Some(output) = self.executor.output(&handle).await? {
+                        let identity = self.executor.output_identity(&handle).await?;
                         self.db
-                            .set_step_output(&run, &step, &attempt, &output)
+                            .set_step_output(&run, &step, &attempt, &output, identity.as_deref())
                             .await?;
                     }
                     // Capture the step's named results (ADR-0041) under the fence,

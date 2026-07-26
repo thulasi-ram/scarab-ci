@@ -1,0 +1,24 @@
+-- ADR-0061 s8 / git-bug 945b1f4: a snapshot has TWO coordinates, and only one
+-- of them is an address.
+--
+--   output_snapshot  — WHERE the bytes are. The CAS merkle root: names, targets,
+--                      modes AND each file's mtime. What a dependent
+--                      materializes, what GC's mark walk starts from.
+--   output_identity  — WHAT the bytes are. The same merkle fold with every mtime
+--                      dropped. Never an address: nothing is stored under it.
+--                      This is what ADR-0027's skip-if-unchanged compares.
+--
+-- Why the second column exists at all: s7 (ADR-0061) put mode + mtime in the
+-- tree entry so a checkout is faithful, and the entry is in the hash preimage.
+-- So a producer that re-runs writes identical bytes at a new wall clock and can
+-- NEVER reproduce its own root — which made the input signature always change,
+-- so no descendant was ever skipped and skip-if-unchanged was dead machinery
+-- that looked alive. Found on a live cluster, not reasoned about.
+--
+-- Expand-contract (invariant 3): NULLable, no backfill. A row written before
+-- this migration has no identity, and the reader falls back to
+-- `output_snapshot` — the pre-identity behaviour, which cascades where it might
+-- have skipped. Wasteful, never wrong; and a snapshot recording no mtimes has an
+-- identity equal to its root anyway, so for those rows the fallback is exact.
+ALTER TABLE step_runs ADD COLUMN output_identity TEXT;
+ALTER TABLE attempts ADD COLUMN output_identity TEXT;

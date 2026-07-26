@@ -196,12 +196,19 @@ pub trait Db: Send + Sync {
     /// writes the attempt's own immutable copy AND the step's latest-evidence
     /// denormalization (what dependents consume) atomically, stamping which
     /// attempt the denormalized row came from.
+    ///
+    /// **Two coordinates, ADR-0061 s8.** `snapshot` is *where the bytes are* —
+    /// the address a dependent materializes. `identity` is *what the bytes are* —
+    /// the mtime-free merkle fold that restart invalidation compares
+    /// (`Executor::output_identity`). `None` for a backend that cannot compute
+    /// one; readers then fall back to the root.
     async fn set_step_output(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
         snapshot: &str,
+        identity: Option<&str>,
     ) -> Result<(), DbError>;
 
     /// The output workspace snapshot a step produced, or `None` if it has not
@@ -209,6 +216,21 @@ pub trait Db: Send + Sync {
     /// latest-evidence read (workspace inheritance); per-attempt history is
     /// [`attempt_output`](Db::attempt_output).
     async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
+
+    /// The **content identity** of that snapshot (ADR-0061 s8), or `None` if the
+    /// step produced no workspace or the producing backend recorded no identity
+    /// (a pre-0061-s8 row). Latest-evidence read, beside
+    /// [`step_output`](Db::step_output).
+    ///
+    /// A caller comparing snapshots for sameness must use this **falling back to
+    /// the root**, never one or the other alone: the fallback is what keeps an old
+    /// row safe (it cascades where it might have skipped), and using the root when
+    /// an identity exists is the bug `945b1f4` records.
+    async fn step_output_identity(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<String>, DbError>;
 
     /// A single attempt's output workspace snapshot (ADR-0056) — the evidence
     /// a Take view reads; never overwritten by a later attempt.
@@ -785,12 +807,31 @@ pub trait Executor: Send + Sync {
 
     /// The content-addressed output workspace snapshot the (successfully
     /// finished) unit produced — the CAS merkle-root hash the orchestrator
-    /// records so a dependent can materialize it and so restart can compare
-    /// outputs for skip-if-unchanged (ADR-0027, 0029). `None` when the unit
+    /// records so a dependent can materialize it (ADR-0029). `None` when the unit
     /// produced no workspace (a side-effecting step) or the backend does not
     /// compute one. Default `None` so a backend that doesn't snapshot need not
     /// implement it.
+    ///
+    /// This is **where the bytes are** — an address. What restart invalidation
+    /// compares is [`output_identity`](Executor::output_identity).
     async fn output(&self, _handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+
+    /// The **content identity** of that same snapshot (ADR-0061 s8): the merkle
+    /// fold with mtimes dropped — **what the bytes are**, not where they live.
+    ///
+    /// This, not [`output`](Executor::output), is what skip-if-unchanged compares
+    /// (ADR-0027), and the two are different digests for a reason found on a live
+    /// cluster (git-bug `945b1f4`): a tree hash covers each file's mtime, so a
+    /// producer re-running writes identical bytes at a new wall clock and can
+    /// never reproduce its own root. Comparing roots therefore always says
+    /// "changed" and nothing downstream is ever skipped.
+    ///
+    /// `None` means the backend cannot tell, and the orchestrator then falls back
+    /// to the root — which is the pre-identity behaviour: cascade, never a false
+    /// skip.
+    async fn output_identity(&self, _handle: &ExecHandle) -> Result<Option<String>, ExecError> {
         Ok(None)
     }
 

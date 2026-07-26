@@ -685,10 +685,16 @@ impl K8sExecutor {
                         })
                         .unwrap_or_default();
                     let t_prune = std::time::Instant::now();
-                    let published = if declared.is_empty() {
-                        snapshot.root
+                    // Two coordinates leave this leg (ADR-0061 s8): the published
+                    // ROOT, which is where the bytes are, and its content
+                    // IDENTITY, which is what they are. `ingest` folds the
+                    // identity for free; a pruned root is a different tree, so its
+                    // identity has to be walked — cheap, because a pruned tree is
+                    // small by construction and only trees are read, never blobs.
+                    let (published, identity) = if declared.is_empty() {
+                        (snapshot.root, snapshot.identity)
                     } else {
-                        scarab_storage::prune_tree(cas, &snapshot.root, &declared)
+                        let pruned = scarab_storage::prune_tree(cas, &snapshot.root, &declared)
                             .await
                             .map_err(|e| match e {
                                 scarab_storage::PruneError::Storage(e) => {
@@ -698,13 +704,26 @@ impl K8sExecutor {
                                     "outputs: {permanent} (declared: {})",
                                     declared.join(", ")
                                 )),
-                            })?
+                            })?;
+                        let identity = scarab_storage::content_identity(cas, &pruned)
+                            .await
+                            .map_err(|e| {
+                                DriveErr::Transient(format!("outputs identity: {e}"))
+                            })?;
+                        (pruned, Some(identity))
                     };
                     let cas_prune_ms = t_prune.elapsed().as_millis();
-                    // Record the root on the Pod BEFORE releasing the sidecar:
-                    // output() reads it durably across control-plane restarts.
+                    // Record both on the Pod BEFORE releasing the sidecar:
+                    // output()/output_identity() read them durably across
+                    // control-plane restarts. One patch, so a crash between them
+                    // cannot leave a root whose content nobody can compare.
                     let patch = serde_json::json!({
-                        "metadata": { "annotations": { ANNOTATION_WS_ROOT: published.0 } }
+                        "metadata": { "annotations": {
+                            ANNOTATION_WS_ROOT: published.0,
+                            ANNOTATION_WS_IDENTITY: identity
+                                .map(|i| i.0)
+                                .unwrap_or_default(),
+                        } }
                     });
                     pods.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
                         .await
@@ -1425,6 +1444,27 @@ impl Executor for K8sExecutor {
                 .annotations
                 .as_ref()
                 .and_then(|a| a.get(ANNOTATION_WS_ROOT))
+                .filter(|v| !v.is_empty())
+                .cloned()
+        }))
+    }
+
+    /// The published snapshot's content identity (ADR-0061 s8), from the sibling
+    /// Pod annotation the drain leg wrote in the same patch as the root.
+    async fn output_identity(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        if self.workspace_cas.is_none() {
+            return Ok(None);
+        }
+        let pods = self.pods()?;
+        let pod = pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        Ok(pod.and_then(|p| {
+            p.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(ANNOTATION_WS_IDENTITY))
                 .filter(|v| !v.is_empty())
                 .cloned()
         }))
@@ -2174,6 +2214,13 @@ const ANNOTATION_ARTIFACT_GLOBS: &str = "scarab.io/artifact-globs";
 pub const ARTIFACTS_MOUNT_PATH: &str = "/scarab/artifacts";
 const ARTIFACTS_VOLUME: &str = "scarab-artifacts";
 const ANNOTATION_WS_ROOT: &str = "scarab.io/workspace-root";
+/// The Pod annotation carrying the published snapshot's **content identity**
+/// (ADR-0061 s8): the merkle fold with mtimes dropped — *what* the workspace
+/// holds, as against `ANNOTATION_WS_ROOT`'s *where the bytes are*. This is what
+/// restart invalidation compares, and the two are separate because a tree hash
+/// moves with every file's mtime, so a re-run can never reproduce its own root
+/// (git-bug `945b1f4`). Empty when the store computed none.
+const ANNOTATION_WS_IDENTITY: &str = "scarab.io/workspace-identity";
 /// The Pod annotation carrying the step's authored `outputs:` paths (ADR-0007),
 /// comma-separated. Absent/empty = publish the whole workspace. Read at egress,
 /// so an adopted Pod prunes identically with no in-memory state.
