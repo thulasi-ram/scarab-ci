@@ -65,6 +65,32 @@ DEPLOY_NONCE="$(date +%s)"
 : "${SCARAB_MASTER_KEY:?set SCARAB_MASTER_KEY in .env}"
 : "${SCARAB_DATABASE_URL:?set SCARAB_DATABASE_URL in .env}"
 
+# The workspace service (ADR-0061) is in the STANDARD path, so the dogfood runs it
+# by default rather than behind a flag — one path in every deployment mode, because
+# two paths is two mental models.
+#
+# The secret is generated once and kept on disk rather than regenerated per
+# deploy: the control plane mints tokens with it and the service verifies them, so
+# a value that changed on every `just local-helm` would invalidate every
+# in-flight Step's credential mid-run and look exactly like the service being
+# down. Deliberately NOT SCARAB_RESULTS_TOKEN_SECRET — see .env.example.
+WS_SECRET_FILE="$HERE/.workspace-token-secret"
+if [ -z "${SCARAB_WORKSPACE_TOKEN_SECRET:-}" ]; then
+  if [ ! -f "$WS_SECRET_FILE" ]; then
+    head -c 32 /dev/urandom | base64 | tr -d '\n' > "$WS_SECRET_FILE"
+    chmod 600 "$WS_SECRET_FILE"
+    echo "==> generated a workspace token secret at deploy/local-helm/.workspace-token-secret"
+  fi
+  SCARAB_WORKSPACE_TOKEN_SECRET="$(cat "$WS_SECRET_FILE")"
+fi
+if [ "$SCARAB_WORKSPACE_TOKEN_SECRET" = "${SCARAB_RESULTS_TOKEN_SECRET:-}" ]; then
+  echo "refusing: SCARAB_WORKSPACE_TOKEN_SECRET must differ from SCARAB_RESULTS_TOKEN_SECRET." >&2
+  echo "  Sharing them turns a results-write credential into a content read+write" >&2
+  echo "  credential and lets the workspace service forge step results (ADR-0061)." >&2
+  exit 1
+fi
+WS_PV_SIZE="${SCARAB_WORKSPACE_PV_SIZE:-20Gi}"
+
 # Object store: default to the in-cluster MinIO (minio.yaml). Backing the CAS
 # with durable storage is REQUIRED — the local-dir fallback lives on the server
 # Pod's `scratch` emptyDir, so a restart (every deploy now rolls the Pod) wipes
@@ -120,11 +146,23 @@ scarab:
   stepTimeoutSecs: "${SCARAB_STEP_TIMEOUT_SECS:-3600}"
   extraEnv:
     RUST_LOG: "info,scarab=debug"
+# The workspace service (ADR-0061) — a StatefulSet with a real PVC, in the
+# standard path. This is also what kills the emptyDir-CAS failure class that has
+# been biting this dogfood: the local-dir cold fallback lives on the server Pod's
+# `scratch` emptyDir, so every deploy (which rolls the Pod) wiped every workspace
+# snapshot and a rerun of an older Run hung at Init:1/3 and dead-lettered. A warm
+# tier on a PV survives the roll.
+workspace:
+  enabled: true
+  replicaCount: 1
+  persistence:
+    size: "${WS_PV_SIZE}"
 secrets:
   databaseUrl: "${SCARAB_DATABASE_URL}"
   masterKey: "${SCARAB_MASTER_KEY}"
   githubWebhookSecret: "${SCARAB_GITHUB_WEBHOOK_SECRET:-}"
   resultsTokenSecret: "${SCARAB_RESULTS_TOKEN_SECRET:-}"
+  workspaceTokenSecret: "${SCARAB_WORKSPACE_TOKEN_SECRET}"
   s3AccessKey: "${S3_ACCESS_KEY}"
   s3SecretKey: "${S3_SECRET_KEY}"
 ${PEM_VALUES}
@@ -155,9 +193,15 @@ if [ "$S3_ENDPOINT" = "http://scarab-minio:9000" ]; then
   kubectl wait -n "$NS" --for=condition=complete job/scarab-minio-mkbucket --timeout=90s
 fi
 
-echo "==> scarab-server (image tag: $TAG)"
+echo "==> scarab-server + workspace service (image tag: $TAG)"
 helm upgrade --install scarab "$ROOT/deploy/helm/scarab" -n "$NS" -f "$VALUES"
 kubectl rollout status -n "$NS" deploy/scarab --timeout=180s
+# The workspace service is standard-path, so its readiness is a deploy gate, not a
+# footnote: a Ready StatefulSet means its PVC bound AND its /readyz passed (warm
+# writable + cold reachable). Silently deploying a control plane whose data plane
+# never came up is the "reports success but structurally cannot work" shape.
+echo "==> workspace service (ADR-0061)"
+kubectl rollout status -n "$NS" statefulset/scarab-workspace --timeout=180s
 
 cat <<EOF
 

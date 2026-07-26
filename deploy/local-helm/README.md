@@ -13,6 +13,30 @@ server Pod's `scratch` emptyDir, so — since every deploy now rolls the Pod —
 would wipe all workspaces and any rerun of a prior run would hang restoring its
 input. Override `SCARAB_S3_*` in `.env` to use real S3 (then MinIO is skipped).
 
+**Workspace service (ADR-0061):** `deploy.sh` also deploys the workspace service —
+a StatefulSet running the **same image** with `SCARAB_ROLE=workspace`, holding a
+warm content-addressed store of Workspace Snapshots on its own PVC, with MinIO
+behind it as the cold archive. It is deployed **by default**, not behind a flag:
+the ADR puts it in the standard path in every deployment mode, because a fast path
+plus a fallback path is two mental models.
+
+Its token secret is generated once into `deploy/local-helm/.workspace-token-secret`
+(gitignored) rather than per deploy — the control plane mints tokens with it and
+the service verifies them, so a value that rotated on every `just local-helm`
+would invalidate every in-flight Step's credential mid-run and look exactly like
+the service being down. It **must not** equal `SCARAB_RESULTS_TOKEN_SECRET`;
+`deploy.sh` refuses if it does.
+
+`deploy.sh` waits for `statefulset/scarab-workspace` to be Ready, which means its
+PVC bound *and* its `/readyz` passed (warm writable + cold reachable). Deploying a
+control plane whose data plane never came up is precisely the failure shape this
+repo keeps finding.
+
+> **Unverified:** this has not been deployed to colima in this change. The
+> templates render and the precedence of `SCARAB_ROLE` was checked against a real
+> kubelet, but no `just local-helm` run has exercised the StatefulSet, its PVC, or
+> whether a rerun of a pre-restart Run now restores instead of hanging.
+
 ## Config — one file
 Everything (image, App knobs, secrets, reseed inputs) lives in `deploy/local-helm/.env`
 (gitignored). Both scripts source it; a real environment variable already set in
