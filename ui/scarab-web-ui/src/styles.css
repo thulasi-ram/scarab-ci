@@ -636,6 +636,37 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   gap: 8px;
   margin-bottom: 20px;
 }
+
+/* Gates awaiting a decision (ADR-0008). One row per gate — a run can suspend on
+   several — so the emphasis sits on WHICH gate, not on a single verb. */
+.gate-bar {
+  margin-bottom: 16px;
+  border: 1px solid color-mix(in srgb, var(--emerald) 35%, transparent);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--emerald) 6%, transparent);
+}
+.gate-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--emerald) 18%, transparent);
+}
+.gate-row:last-child { border-bottom: none; }
+/* Pending for the OTHER reason: upstream unfinished, so not yet your turn. */
+.gate-row.blocked { opacity: 0.6; }
+.gate-step { font-weight: 600; }
+.gate-hint {
+  color: var(--muted);
+  font-size: 13px;
+}
+.gate-note {
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+/* Push the action to the trailing edge, matching .run-toolbar's alignment. */
+.gate-row .btn { margin-left: auto; }
 .run-toolbar .btn-sm {
   display: inline-flex;
   align-items: center;

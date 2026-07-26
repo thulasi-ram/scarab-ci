@@ -620,6 +620,34 @@ export async function cancelRun(id: string): Promise<void> {
   if (error) throw new Error(`failed to cancel run ${id}`);
 }
 
+/** The approvals recorded on a manual gate, and whether they released it.
+ *
+ * `approvals` is OPTIONAL on purpose: the handler emits two shapes. The normal
+ * path returns `{approvals, released}`, but the late/duplicate-approval branch
+ * returns only `{released: true}`. Reading `.approvals.length` unguarded throws
+ * on that second shape. */
+export type GateApproval = { approvals?: string[]; released: boolean };
+
+/** Approve a `manual` gate (ADR-0008/0037). Append-only and idempotent: the
+ * principal's approval is RECORDED, and the gate releases only once the
+ * accumulated approvers satisfy the target environment's protection rules — a
+ * plain gate with no environment releases on the first approval. So `released:
+ * false` is a normal outcome, not an error: it means "counted, quorum not met".
+ * 404 when the step is not a gate; 409 once it is no longer awaiting a decision
+ * (a released or terminal gate cannot be reopened). `timer`/`external` gates are
+ * NOT approvable — they release by other means. */
+export async function approveGate(id: string, step: string): Promise<GateApproval> {
+  const { data, error } = await api.POST("/v1/runs/{id}/gates/{step}/approve", {
+    params: { path: { id, step } },
+  });
+  if (error) throw new Error(`failed to approve gate ${step}`);
+  // `as unknown` is required, not sloppiness: the 202 declares no response body
+  // in the OpenAPI spec (the handler returns an ad-hoc `Json(json!(…))` rather
+  // than a ToSchema DTO), so the generated type for `data` is `undefined`.
+  // Worth fixing at source, which would also settle the two-shapes wrinkle above.
+  return data as unknown as GateApproval;
+}
+
 /** Whether a run status is terminal (no further updates will stream). */
 export function isTerminal(status: string): boolean {
   return status === "succeeded" || status === "failed" || status === "cancelled";

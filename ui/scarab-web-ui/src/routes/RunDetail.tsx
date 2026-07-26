@@ -16,6 +16,7 @@ import {
   rerunStep,
   retryStep,
   cancelRun,
+  approveGate,
   isTerminal,
   runParams,
   listArtifacts,
@@ -40,6 +41,7 @@ import {
   type TakeView,
 } from "../takes";
 import { stripTries as stripTriesOf } from "../attempts";
+import { approvableGates, gateBlockers } from "../gates";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
@@ -73,6 +75,8 @@ export default function RunDetail() {
   const [events, setEvents] = createSignal<RunEvent[]>([]);
   const [live, setLive] = createSignal(true);
   const [sel, setSel] = createSignal<string | null>(null);
+  const [approving, setApproving] = createSignal<string | null>(null);
+  const [gateNotes, setGateNotes] = createSignal<Record<string, string>>({});
   const [selAttempt, setSelAttempt] = createSignal<string | null>(null);
   // A step's docked sidecar the user clicked (ADR-0058): its `services:` index,
   // or null. Focuses that container in the StepPane Logs tab. Cleared whenever
@@ -402,6 +406,42 @@ export default function RunDetail() {
     }
   }
 
+  // --- Gate approval (ADR-0008) -------------------------------------------
+  // A manual gate holds StepStatus::Pending until release flips it to
+  // Succeeded, so (gate === "manual" && status === "pending") is the server's
+  // OWN definition of "awaiting approval" — scheduler::GateNotPending rejects
+  // anything else. A run can suspend on SEVERAL gates, so this is a list and
+  // every gate carries its own action; there is deliberately no run-level
+  // "approve" button, which would be ambiguous about what it approved.
+  const pendingGates = () => approvableGates(run()?.steps ?? []);
+
+  const statusOf = (step: string) => (run()?.steps ?? []).find((s) => s.id === step)?.status;
+
+  const blockersOf = (g: StepStatus) => gateBlockers(g, statusOf);
+
+  async function onApprove(step: string) {
+    setApproving(step);
+    try {
+      const res = await approveGate(id(), step);
+      // `released: false` is normal — the approval counted but quorum is not
+      // met. Saying so beats a silently unchanged gate.
+      const n = res.approvals?.length ?? 0;
+      setGateNotes({
+        ...gateNotes(),
+        [step]: res.released
+          ? "released"
+          : `${n} approval${n === 1 ? "" : "s"} recorded · awaiting more`,
+      });
+      setLive(true);
+      await refresh();
+      if (!poll && live()) poll = setInterval(() => void refresh(), POLL_MS);
+    } catch (e) {
+      setGateNotes({ ...gateNotes(), [step]: e instanceof Error ? e.message : "approve failed" });
+    } finally {
+      setApproving(null);
+    }
+  }
+
   async function onCancel() {
     setCancelling(true);
     try {
@@ -490,6 +530,42 @@ export default function RunDetail() {
               </h1>
             </div>
 
+            {/* Gates awaiting a decision (ADR-0008). Listed per gate, because a
+                run can be suspended on more than one and "approve" has to say
+                WHICH. Hidden while time-travelling: an older version is
+                read-only. */}
+            <Show when={pendingGates().length > 0 && !timeTraveling()}>
+              <div class="gate-bar">
+                <For each={pendingGates()}>
+                  {(g) => (
+                    <div class="gate-row" classList={{ blocked: blockersOf(g).length > 0 }}>
+                      <Icon icon="shield-check" size={13} />
+                      <span class="gate-step mono">{g.id}</span>
+                      <span class="gate-hint">
+                        {blockersOf(g).length === 0
+                          ? "waiting for a decision"
+                          : `waiting on ${blockersOf(g).join(", ")}`}
+                      </span>
+                      <Show when={gateNotes()[g.id]}>
+                        {(note) => <span class="gate-note">{note()}</span>}
+                      </Show>
+                      <button
+                        class="btn btn-sm btn-primary"
+                        onClick={() => void onApprove(g.id)}
+                        disabled={approving() !== null || blockersOf(g).length > 0}
+                        title={
+                          blockersOf(g).length > 0
+                            ? `blocked — ${blockersOf(g).join(", ")} has not succeeded`
+                            : `approve ${g.id}`
+                        }
+                      >
+                        {approving() === g.id ? "approving…" : "Approve"}
+                      </button>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
             <div class="run-toolbar">
               {/* Two "agains" (ADR-0056 amendment): "Retry step" gives a FAILED
                   step another attempt in the CURRENT version (no fork); "Rerun

@@ -34,16 +34,6 @@
 .env.*
 !.env.example
 
-# `.envrc` is per-developer, not repo policy: what has to be ambient depends on
-# the machine (which local cluster exists, which kube contexts sit alongside it,
-# where a toolchain lives). It was tracked; it is not any more. Note `.env.*`
-# above does NOT cover this — that pattern needs a literal dot after `env`.
-.envrc
-# The kube-context overlay a local .envrc may generate to pin this repo to
-# colima. Holds no credentials (it names a context and nothing else) but it is
-# machine-local state, and must not exist until the local cluster does.
-/deploy/local-helm/.kubeconfig-colima
-
 # `.cargo/config.toml` IS tracked — repo-level build settings belong in version
 # control. `cargo login` writes a registry token next to it, and that must never
 # be committed; guard it now, while the file does not yet exist.

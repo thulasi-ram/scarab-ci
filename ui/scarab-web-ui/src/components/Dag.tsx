@@ -10,6 +10,7 @@
 // graph answers "what shape, and where does each step stand", not "which try".
 // Clicking a node selects it.
 import { createSignal, onMount, onCleanup, createEffect, createMemo, For, Show } from "solid-js";
+import { isGateOpen } from "../gates";
 import { layerSteps } from "../dag-layout";
 import Icon from "./Icon";
 
@@ -359,7 +360,7 @@ export default function Dag(props: {
     if (s.status === "running") {
       return s.runningSince ? `running · ${elapsed(s.runningSince, now())}` : "running";
     }
-    if (s.gate && (s.status === "pending" || s.status === "waiting" || s.status === "ready")) {
+    if (isGateOpen(s)) {
       return `gate · ${s.gate}`;
     }
     // Finished steps show how long they took (from the event log).

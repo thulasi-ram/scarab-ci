@@ -649,18 +649,6 @@ pub trait Db: Send + Sync {
     /// (ADR-0056): an old Take's workspace view must never race the GC.
     async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError>;
 
-    /// Forget a workspace-CAS root that GC proved ABSENT from the object store
-    /// (ADR-0050): clear every recorded output snapshot equal to `root`,
-    /// returning how many references were cleared. A dangling root cannot be
-    /// materialized ever again, so keeping the reference only makes every later
-    /// pass re-walk and re-warn over the same dead hash.
-    ///
-    /// The caller MUST have observed a definitive NOT-FOUND for the root itself
-    /// — never a merely transient read error (the tree may exist), and never an
-    /// inner subtree (its parent still lists it, so its loss is real corruption
-    /// to surface rather than a stale reference to drop).
-    async fn forget_workspace_root(&self, root: &str) -> Result<u32, DbError>;
-
     /// Acquire (or renew) a time-bounded lease over a named `resource` (a step
     /// id, `"scheduler"` leadership, …) for `owner`. Only an expired lease is
     /// taken over; the returned [`Lease`] names the current holder.

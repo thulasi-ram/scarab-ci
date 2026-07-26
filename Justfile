@@ -123,25 +123,6 @@ test:
       cargo test --workspace
     fi
 
-# One test (or one filter) against the same on-demand compose Postgres as
-# `just test` — the tight loop while iterating on a single PG-backed test.
-# Filter is nextest's expression/substring syntax: `just test-one cas_gc`.
-test-one FILTER:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if (exec 3<>/dev/tcp/127.0.0.1/55432) 2>/dev/null; then
-      echo "==> reusing the Postgres already listening on 127.0.0.1:55432"
-    else
-      docker compose -f deploy/local-proc/compose.yaml up -d --wait postgres
-    fi
-    export SCARAB_TEST_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab
-    if command -v cargo-nextest >/dev/null 2>&1; then
-      cargo nextest run --workspace -E 'test(~{{FILTER}})'
-    else
-      echo "warning: cargo-nextest not installed (https://nexte.st) — falling back to cargo test" >&2
-      cargo test --workspace -- {{FILTER}}
-    fi
-
 # Coverage run (mirrors the CI `coverage` job): suite under cargo-llvm-cov
 # against the compose Postgres, per-crate summary, and REGENERATES
 # docs/audits/coverage-baseline.toml — review + commit the baseline deliberately.
