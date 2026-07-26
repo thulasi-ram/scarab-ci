@@ -2830,6 +2830,7 @@ dependencies = [
  "scarab-storage",
  "scarab-storage-s3",
  "scarab-testkit",
+ "scarab-workspace-client",
  "serde",
  "serde_json",
  "serde_yaml",
