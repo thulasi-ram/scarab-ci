@@ -8,6 +8,12 @@
 //! after a control-plane crash re-attaches to the existing Pod rather than
 //! starting a second one (the double-effect guard, ADR-0021).
 
+/// The workspace token codec (ADR-0061): minted here for a Step Pod, verified
+/// by the workspace service. Mint and verify live in ONE module on purpose —
+/// the results token's message format is duplicated across two crates and that
+/// is a standing drift hazard, not a pattern to copy.
+pub mod workspace_token;
+
 use async_trait::async_trait;
 use futures::io::AsyncBufRead;
 use futures::AsyncReadExt;
