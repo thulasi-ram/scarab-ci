@@ -36,3 +36,34 @@ reproducible. `just local-helm` needs `deploy/local-helm/.env` and kube context
 
 Classical (not mockist): mock only true externals; keep the suite minimal in v1
 and grow tests from real bugs. See `CONTEXT.md` §8 and ADR-0017.
+
+<!-- gortex:communities:start -->
+<!-- gortex:skills:start -->
+## Community Skills
+
+| Area | Description | Skill |
+|------|-------------|-------|
+| Scarab Web Ui Src 4 Dirs | 892 symbols | `/gortex-scarab-web-ui-src-4-dirs` |
+| Scarab Server Src 9 Dirs | 686 symbols | `/gortex-scarab-server-src-9-dirs` |
+| Scarab Db Postgres Tests 10 Dirs | 636 symbols | `/gortex-scarab-db-postgres-tests-10-dirs` |
+| Scarab Server Src 14 Dirs | 594 symbols | `/gortex-scarab-server-src-14-dirs` |
+| Scarab Db Postgres Tests 8 Dirs | 540 symbols | `/gortex-scarab-db-postgres-tests-8-dirs` |
+| Scarab Engine Src 5 Dirs | 418 symbols | `/gortex-scarab-engine-src-5-dirs` |
+| Scarab Server Tests 3 Dirs Inmemorydb | 242 symbols | `/gortex-scarab-server-tests-3-dirs-inmemorydb` |
+| Scarab Forge Forgejo Src 6 Dirs | 193 symbols | `/gortex-scarab-forge-forgejo-src-6-dirs` |
+| Scarab Pipeline Src 3 Dirs | 193 symbols | `/gortex-scarab-pipeline-src-3-dirs` |
+| Scarab Web Ui Src 3 Dirs | 139 symbols | `/gortex-scarab-web-ui-src-3-dirs` |
+| Scarab Server Src Resolve From | 130 symbols | `/gortex-scarab-server-src-resolve-from` |
+| Scarab Engine Src 3 Dirs | 123 symbols | `/gortex-scarab-engine-src-3-dirs` |
+| Scarab Server Tests 4 Dirs | 108 symbols | `/gortex-scarab-server-tests-4-dirs` |
+| Scarab Server Tests 2 Dirs Projecterror | 103 symbols | `/gortex-scarab-server-tests-2-dirs-projecterror` |
+| Scarab Forge Src 1 Dirs Get | 101 symbols | `/gortex-scarab-forge-src-1-dirs-get` |
+| Scarab Pipeline Src Validate | 95 symbols | `/gortex-scarab-pipeline-src-validate` |
+| Src Components 3 Dirs | 90 symbols | `/gortex-src-components-3-dirs` |
+| Scarab Server Src 6 Dirs | 81 symbols | `/gortex-scarab-server-src-6-dirs` |
+| Scarab Pipeline Src 2 Dirs | 77 symbols | `/gortex-scarab-pipeline-src-2-dirs` |
+| Scarab Server Src 2 Dirs Tick Once | 74 symbols | `/gortex-scarab-server-src-2-dirs-tick-once` |
+<!-- gortex:skills:end -->
+
+<!-- gortex:communities:end -->
+
