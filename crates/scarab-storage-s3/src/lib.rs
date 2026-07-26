@@ -21,6 +21,16 @@
 //! byte-correct (ADR-0061 s7; `tests/fidelity.rs` is the proof). Blobs stay
 //! addressed by bytes alone, so metadata never costs a byte of dedup.
 //!
+//! Because an mtime is in the preimage, a tree hash moves with the wall clock, so
+//! `ingest` folds a **second** digest beside the root: the snapshot's
+//! **content identity** (`scarab_storage::content_identity_of`), the same fold
+//! with mtimes dropped. It costs one extra SHA-256 per directory and no
+//! round-trip, because nothing is stored under it — it is what restart
+//! invalidation compares (ADR-0061 s8, git-bug `945b1f4`), never an address.
+//! The canonical form and the digest function both live in `scarab-storage`: they
+//! are the wire format, and `scarab-workspace-client` has to produce the same
+//! bytes to the character.
+//!
 //! # The per-file round-trip, and why the legs are concurrent (ADR-0061 s2)
 //!
 //! s0 instrumented the Step boundary and found the `kubectl exec` tar tunnel

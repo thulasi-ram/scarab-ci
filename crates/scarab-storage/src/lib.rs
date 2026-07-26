@@ -259,10 +259,14 @@ pub fn content_identity_of(entries: &[TreeEntry]) -> Result<TreeHash, StorageErr
 /// cases where a root arrived from somewhere else — a [`prune_tree`] rebuild, or
 /// a snapshot recorded before identities existed.
 ///
-/// **Off the hot path on purpose.** It costs one `tree_entries` round-trip per
-/// *directory*, sequentially — the per-file sequential walk ADR-0061 s2 removed,
-/// one grain coarser. Directories are far fewer than files and a pruned tree is
-/// small by construction, but do not put this in a Step boundary's default path.
+/// **Off the default path on purpose.** It costs one `tree_entries` round-trip
+/// per *directory*, sequentially — the per-file sequential walk ADR-0061 s2
+/// removed, one grain coarser. The one caller on a Step boundary is the drain's
+/// `outputs:` branch, where it is affordable for two reasons that both have to
+/// hold: a pruned tree is small by construction (that is what `outputs:` is for),
+/// and the alternative is the same walk anyway — a wholly-selected sub-tree is
+/// kept by hash without being descended into, so its identity is not in hand.
+/// The no-`outputs:` path never calls this: `ingest` folds the identity for free.
 pub async fn content_identity(
     cas: &dyn Cas,
     root: &TreeHash,
