@@ -56,4 +56,28 @@ scarab_forge_status_dead_lettered_total {}
         forge_status_failures(),
         forge_status_dead_lettered()
     ));
+    // The control plane's own view of the ADR-0061 tiering. The workspace
+    // *service* exports the same counters from its own `/metrics`, and both are
+    // wanted: these say what the CONTROL PLANE saw of the service (writes it
+    // could not seed, reads it had to serve from cold storage directly), which is
+    // the only place a service that is up-but-unreachable-from-here shows up at
+    // all.
+    {
+        use scarab_storage::tiered;
+        out.push_str(&format!(
+            "# HELP scarab_workspace_warm_write_failed_total Snapshot writes that reached cold but not the workspace service (durable; a cache miss to come).
+# TYPE scarab_workspace_warm_write_failed_total counter
+scarab_workspace_warm_write_failed_total {}
+# HELP scarab_workspace_cold_fallback_total Snapshot reads served from cold storage because the workspace service did not have them.
+# TYPE scarab_workspace_cold_fallback_total counter
+scarab_workspace_cold_fallback_total {}
+# HELP scarab_workspace_warm_read_failed_total Snapshot reads where the workspace service ERRORED and cold storage answered instead (ADR-0061 D1.6).
+# TYPE scarab_workspace_warm_read_failed_total counter
+scarab_workspace_warm_read_failed_total {}
+",
+            tiered::warm_write_failed_total(),
+            tiered::cold_fallback_total(),
+            tiered::warm_read_failed_total(),
+        ));
+    }
 }

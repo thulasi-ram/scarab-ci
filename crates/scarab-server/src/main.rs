@@ -26,6 +26,16 @@ use scarab_server::{
 use scarab_storage::ObjectStore;
 use scarab_storage_s3::S3Storage;
 
+/// Lifetime of the `browse`-scope workspace token this process mints for itself.
+///
+/// Short, because it is minted per request and never stored: the only thing the
+/// window has to cover is one HTTP round trip to the workspace service plus clock
+/// skew between the two Pods. Five minutes is generous for both and still means a
+/// token captured off the wire is worthless almost immediately — unlike the
+/// results token, which never expires at all (ADR-0061 D1.4 names that as one of
+/// the three reasons this is a separate credential).
+const BROWSE_TOKEN_TTL_SECS: i64 = 300;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Structured logging (ADR-0053): EnvFilter honors RUST_LOG; the JSON
@@ -142,7 +152,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
     });
     let store: Arc<dyn ObjectStore> = storage.clone();
-    let workspace_cas: Arc<dyn scarab_storage::Cas> = storage;
+    // The COLD tier: object storage, direct. This is the durable one — ADR-0061's
+    // retention table gives it a TTL and calls it "the guarantee users are given".
+    let cold_cas: Arc<dyn scarab_storage::Cas> = storage;
+
+    // The workspace `Cas` this process hands to Browse, the GC mark walk, the
+    // rerun-widening oracle, the drain and the debug pod (ADR-0061 D1.6).
+    //
+    // WARM = the workspace service, over HTTP. COLD = the object store above,
+    // direct. That composition is not a nicety, it is the three answers D1.6
+    // gives, in one type:
+    //
+    //  * **reads fall through to cold** when the service is unreachable. This
+    //    process already holds object-store credentials, so going direct crosses
+    //    no trust boundary and creates no second data path for Steps — the
+    //    literal reading of "a warm miss is slower, never wrong". Note this is
+    //    the OPPOSITE of a Step Pod, which must fail closed: a Pod has no
+    //    credentials, by design (ADR-0042).
+    //  * **writes go cold first**, so a cold failure is an error (an Attempt
+    //    cannot reach `Succeeded` on a non-durable snapshot — part 4) while a
+    //    service failure is `Ok` plus a warning plus a counter.
+    //  * **the drain therefore populates the warm tier on write.** Without this
+    //    the warm tier is filled only by the service's own read-path backfill, so
+    //    the first fetch of every snapshot is a guaranteed cold miss — and in a
+    //    DAG most edges are consumed once, immediately after being produced. The
+    //    volume would earn nothing until a second consumer appeared.
+    //
+    // The token is minted **per request**, in `browse` scope, for this process's
+    // own use (`workspace_token::browse_claims`). Per-request rather than once at
+    // boot because a token has an `exp`: a server that minted one at startup
+    // would start 401-ing a day later from nothing anyone changed, and minting
+    // one with no meaningful expiry would rebuild the results token's wart that
+    // ADR-0061 D1.4 refused to inherit.
+    let workspace_cas: Arc<dyn scarab_storage::Cas> = match &config.workspace {
+        Some(ws) => {
+            use scarab_executor_k8s::workspace_token;
+            let secret = ws.token_secret.clone();
+            let client = scarab_workspace_client::WorkspaceClient::with_minted_token(
+                ws.url.clone(),
+                move || {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    workspace_token::mint(
+                        &secret,
+                        &workspace_token::browse_claims(now + BROWSE_TOKEN_TTL_SECS),
+                    )
+                },
+            );
+            tracing::info!(
+                url = %ws.url,
+                "workspace snapshots: warm = the workspace service, cold = the object store \
+                 (ADR-0061 D1.6; reads fall through to cold, writes are cold-first)"
+            );
+            Arc::new(
+                scarab_storage::tiered::TieredCas::new(Arc::new(client), cold_cas)
+                    .fall_through_on_warm_error(),
+            )
+        }
+        // No service configured: the object store IS the whole store. The
+        // executor already refuses to launch a step that inherits a workspace in
+        // this state (fail-closed), so this path serves Browse and GC over
+        // pre-ADR-0061 snapshots and nothing else.
+        None => cold_cas,
+    };
     let logs = Arc::new(LogService::new(store.clone(), db.clone()));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
