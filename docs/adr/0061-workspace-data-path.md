@@ -78,6 +78,13 @@ have here — attach/detach latency at each boundary, stuck volumes when a spot 
 reclaimed, per-node attachment quotas, provisioning delay — comes from binding volumes to
 short-lived pods. Bind them to the long-lived thing instead and all of it goes away.
 
+**One path is a direction-at-a-time claim, and today only one direction has arrived.**
+s3-feed converged the **read** path: every Step that inherits a workspace materialises it from
+the service, in every deployment mode, with no second route. The **write** path has not
+converged — the drain still hashes the workspace on the control plane and writes it to the
+object store directly (the service is seeded alongside, as a warm tier, not as the route), and
+it converges on the service only with **s3-drain**, which is not built.
+
 **2. A Scarab node driver, shipped and installed as standard.**
 It mounts a Workspace Snapshot into a Step Pod as a **read-only lower layer** with a
 **pod-local writable upper layer** on top. Materialisation is **lazy**: a Step transfers what
@@ -90,6 +97,16 @@ Service and driver are **one component in two halves** (server and client), not 
 **3. The control plane leaves the data path.** The server exchanges **root hashes** — tens of
 bytes. Helper containers become Scarab-owned images rather than `busybox` doorstops. The
 `kubectl exec` tar tunnel is deleted.
+
+> **Status of part 3, because it is a slice and not a completed decision.** There are
+> **three** `exec` tar tunnels on a Step boundary, not one, and only the first is gone.
+> **s3-feed has landed:** a Scarab-owned fetcher image pulls the Step's inputs from the
+> workspace service, and the feed-side tunnel and its `busybox` doorstop are deleted. Still
+> live: the **drain** tunnel (`tar -cf` out over `exec`, hashed on the server) and the
+> **artifact-harvest** tunnel (`harvest_artifacts` — a third `exec` tar on every boundary).
+> Both go in **s3-drain**, which is not built. So the control plane has left the data path in
+> one direction. Read every "the tunnel is deleted" in this ADR as scoped to the feed until
+> s3-drain lands.
 
 **4. An Attempt is not `Succeeded` until its Workspace Snapshot is durable.** On spot, a node
 can vanish between "the Step exited 0" and "its evidence is safe". Declaring success before
@@ -138,10 +155,17 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 - **"Don't put your cache in the workspace" is not a rule we will teach.** It is
   unenforceable and it is substrate knowledge. [0007](0007-data-passing-model.md)'s Cache
   concept remains the *better* tool; using it stays an optimisation, not a requirement.
-- **The Helm-dogfood failure class disappears.** `deploy/local-helm` puts the CAS on an
-  `emptyDir`, so a server restart wipes every workspace and reruns of older Runs hang at
-  `Init:1/3` and dead-letter. A standard-path service with a real volume removes that
-  entirely.
+- **The Helm-dogfood failure class goes — and the warm tier is not what removes it.** This
+  bullet used to credit the wrong component, which matters because the mis-attribution
+  contradicts this ADR's own retention table. The failure was real: `deploy/local-helm` had no
+  object store, so the CAS fell back to a local directory on the server Pod's `scratch`
+  **`emptyDir`**, every deploy rolled the Pod, and every rerun of an older Run hung at
+  `Init:1/3` and dead-lettered. What fixes it is `deploy.sh` **deploying MinIO** and pointing
+  the server at it: the durable copy lives in **cold**, and cold is the only tier that promises
+  anything. The workspace service's PV cannot be the fix — the retention table above says it is
+  bounded by space, evicts, and "promises none" — so a design that relied on it to prevent data
+  loss would have rebuilt the same bug with a bigger disk. The service's volume is a cache, and
+  a cache that survives a Pod roll is a latency win, not a durability one.
 - **Cross-AZ traffic is confined to the archive drain**, which can be throttled or scheduled.
   Step Pods talk only to their own zone's service. (In-region object storage is typically
   free per byte; EC2-to-EC2 across AZs is not. The cost was never "object storage" — it was
@@ -150,8 +174,21 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   multi-zone / storage-class call. That is the operator's cost model, not ours.
 - **Version skew** between server, service and driver becomes a supported concern.
 - **Browse** ([0056](0056-run-takes-and-attempt-grain-evidence.md)) reads snapshots from the
-  service, which keeps working after the Run's nodes are gone — on spot, that is within
-  minutes, and a live-volume design would show a blank pane exactly when people look.
+  service **and falls through to object storage when the service cannot answer**, which keeps
+  working after the Run's nodes are gone — on spot, that is within minutes, and a live-volume
+  design would show a blank pane exactly when people look. The fall-through is the second half
+  of the sentence and it is not a caveat: the control plane already holds object-store
+  credentials, so going direct crosses no trust boundary and creates no second data path for
+  Steps. It is the literal reading of "a warm miss is slower, never wrong", and it is the
+  **opposite** of a Step Pod, which must fail closed because it deliberately has no credentials
+  ([0042](0042-trusted-egress-sidecar.md)).
+
+  For a while this bullet was false rather than merely incomplete: the composition root handed
+  Browse the object store directly and never constructed a client of the service at all, so
+  "reads snapshots from the service" described nothing that ran. It is true now — the control
+  plane's workspace store is warm-then-cold with the service as the warm tier — which is also
+  what makes `POST /v1/cas/have`, both `PUT` verbs and the `browse` token scope live code
+  rather than test-only.
 - **OCI artifacts are an available internal representation** for the service, not a separate
   concept. Kubernetes already distributes immutable content to ephemeral nodes with per-node
   caching and dedup; if the service chooses to ride that, nothing above it changes.
@@ -458,6 +495,35 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
     *and* `scarab-workspace-client`, with a runtime tripwire in `tiered` to notice them
     drifting. They now live in `scarab-storage`; the tripwire is kept for version skew between
     deployed binaries, which is a different hazard.
+- **The price of seeding the warm tier on the write path — booked, not measured.** Making the
+  control plane's snapshot store warm-then-cold (D1.6) is what stops every freshly-drained
+  snapshot being a guaranteed cold miss, and it is what makes half the wire protocol live code.
+  It is not free, and the costs are recorded here rather than discovered later:
+
+  1. **The drain walks its directory twice.** `TieredCas::ingest` hashes to cold (the leg that
+     licenses `Succeeded`) and then asks the warm tier to ingest the same directory. s2 measured
+     the drain leg at **88% local filesystem** — reading every file in order to hash it — so
+     this roughly doubles that leg. Both alternatives are worse: a merkle-level copy cannot be
+     made concurrent inside a pure domain crate (no `futures` dependency), so it would be one
+     sequential round-trip per file, which is precisely the pattern s0 identified as the
+     dominant cost and this ADR forbids the new path from reproducing; and writing warm-first
+     and letting the service tier onward would make the warm tier load-bearing for durability,
+     which part 4 forbids. Removing the second walk needs a port change — a `Cas` that writes
+     one walk to two backends, or an `ingest` that returns the tree it built so a tiered
+     implementation could seed warm at merkle grain *with the adapter's concurrency*.
+  2. **Genuinely new content is written to cold twice** — once by the drain's own cold leg, once
+     by the service's cold-first `PUT`. Dedup bounds it: `POST /v1/cas/have` answers from warm,
+     so a re-drain of unchanged content uploads nothing at all, and only new blobs pay. Neither
+     `ObjectStore` nor the wire protocol has an **existence** primitive, so neither side can
+     skip; adding `exists` to the port is the fix and is filed.
+  3. **GC deletes from cold and leaves warm.** ADR-0050's sweep runs against the control plane's
+     own object store, and the service exposes no delete verb, so a collected blob can survive
+     in the warm tier as a phantom hit. Bounded and not a correctness bug — a phantom hit
+     returns content that *was* real and is now unreferenced — but it does mean the warm tier's
+     space bound (s5, deferred) is the only thing that will ever reclaim it.
+
+  **None of the three is measured.** No `ws-timing` numbers were taken after this wiring; the
+  ordering argument above is from s2's existing shares, not a new run.
 - **Overlay diff for the drain** — hashing only the writable upper layer (so a Step never
   re-walks an unchanged tree) is the natural partner to lazy reads and needs the same
   privileged mount. Specified as a follow-up slice, not part of the first cut.

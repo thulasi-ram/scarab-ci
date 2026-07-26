@@ -155,18 +155,37 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
                                     · priority · backpressure   │
                                                                 ▼ (outbox)
                                     [executor role]  Executor port
-                                    ├─ scarab-executor-k8s  ── Pod per Step ──┐
-                                    └─ scarab-executor-local ─ kind/local     │
-                                                                │             │ root hashes only
-   Postgres  ◀── state tables + append-only event log ──────────┤             │ (tens of bytes)
-                                                                              ▼
+                                    ├─ scarab-executor-k8s
+                                    └─ scarab-executor-local ─ kind/local
+                                             │        │
+   Postgres ◀── state tables + event log ────┘        │  creates + watches
+                                                      │  ROOT HASHES ONLY (tens of bytes)
+                                                      ▼
+                                                 [ Step Pod ]  one per Step
+                                                      │  ▲
+                                 BULK snapshot bytes  │  │  ✅ feed  (Scarab-owned fetcher)
+                                                      ▼  │  ⛔ drain (s3-drain, NOT built)
                                           [workspace role]  the workspace service (ADR-0061)
                                           warm merkle CAS on a PersistentVolume, one per
                                           failure domain · bounded by SPACE · no Postgres
-                                                                              │
-   Object store (S3/MinIO) ◀── logs · artifacts · cache ◀──────────────────────┘
-                            ◀── Workspace Snapshots: the COLD archive, bounded by TIME
+                                                      │
+   Object store (S3/MinIO) ◀── logs · artifacts · cache ┘
+                           ◀── Workspace Snapshots: the COLD archive, bounded by TIME
+                           ◀── ⚠ BULK, TODAY: the DRAIN tars every byte out of the Step Pod
+                               over `kubectl exec` into the control plane, which hashes it
+                               and writes it here. Artifact harvest is a third `exec` tar.
+                               So ADR-0061 part 3 is HALF done: the read path left the
+                               control plane, the write path has not.
 ```
+
+Which edge carries bulk is the whole point of ADR-0061, so the four labels are load-bearing.
+**control plane ↔ Step Pod** carries root hashes only — that property belongs to *this* edge
+and no other. **Step Pod ↔ workspace service** is the bulk edge by design; its feed half is
+real, its drain half is s3-drain and is not built. **control plane → object store** is bulk
+*today*, for the drain, and a diagram without that edge asserts part 3 is finished.
+**control plane ↔ workspace service** is small and off the critical path: Browse reads
+snapshots through the service (falling through to the object store when it cannot answer),
+and the drain seeds it as a warm tier.
 
 - **One binary, many roles**
   (`scarab-server --role converged|api|scheduler|executor|webhook|workspace`).
@@ -175,8 +194,12 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
   a migration (ADR-0061), so it keeps serving a Step its inputs through a database outage.
 - **Control-plane / data-plane split:** the durable *brain* records intent ("Step S should
   run"); the *executor* observes it, creates the Pod, watches it, writes back terminal state.
-  Bulk **data** does not cross the brain: the control plane exchanges root hashes and Step
-  Pods talk to the workspace service (ADR-0061 supersedes the `kubectl exec` tar tunnel).
+  The intent is that bulk **data** does not cross the brain — the control plane exchanges root
+  hashes and Step Pods talk to the workspace service. **Half true today**: ADR-0061 supersedes
+  the `kubectl exec` tar tunnel on the **feed** side, where a Scarab-owned fetcher has replaced
+  it. The **drain** still tars every byte out through the Kubernetes API server, and artifact
+  harvest is a third `exec` tar; both go with s3-drain. Do not read this bullet as a
+  description of the running system's write path.
 - **Three stateful components — and the third is deliberate.** Postgres (state + event log),
   an object store (blobs), and the **workspace service**'s persistent volume.
   [ADR-0004](docs/adr/0004-execution-topology.md) called object storage "the second (and
