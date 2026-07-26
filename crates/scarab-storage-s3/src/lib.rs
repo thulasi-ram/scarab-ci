@@ -20,10 +20,40 @@
 //! layout, and the reason a checkout is faithful rather than merely
 //! byte-correct (ADR-0061 s7; `tests/fidelity.rs` is the proof). Blobs stay
 //! addressed by bytes alone, so metadata never costs a byte of dedup.
+//!
+//! # The per-file round-trip, and why the legs are concurrent (ADR-0061 s2)
+//!
+//! s0 instrumented the Step boundary and found the `kubectl exec` tar tunnel
+//! ADR-0061 was written to delete is 4–15% of it, while these two CAS legs are
+//! **81–88%** — for the mundane reason that both walked a workspace one file at
+//! a time, awaiting a full object-store round-trip before starting the next.
+//! ~4–6 ms per file against *loopback* MinIO; worse against real object storage.
+//! Both legs are therefore latency-bound, not bandwidth- or CPU-bound, and both
+//! now run with bounded parallelism ([`DEFAULT_CAS_CONCURRENCY`]).
+//!
+//! The concurrency is deliberately shaped so the ordering guarantees ADR-0061 s7
+//! established survive it:
+//!
+//! - **Across calls, nothing changed.** `materialize` is called repeatedly into
+//!   *one* directory (merge-in-order, ADR-0007) and the caller awaits each call;
+//!   parallelism lives strictly *within* a call.
+//! - **`ingest` pre-walks synchronously**, then uploads blobs concurrently, then
+//!   writes trees one depth level at a time (deepest first) — a parent tree still
+//!   names children that are already stored, so a reachable root is never
+//!   published over a missing blob.
+//! - **`materialize` creates and widens every directory before anything writes
+//!   into it**, and still applies directory mode/mtime in a single sequential
+//!   reverse pass *after* every descendant write has completed. Concurrency makes
+//!   that deferral more important, not less: creating a child bumps its parent's
+//!   mtime.
+//! - Bounded parallelism means bounded memory: a blob is still a whole `Vec<u8>`,
+//!   so peak footprint is roughly `concurrency × largest blob`. That is the reason
+//!   the limit is an operator knob rather than a constant.
 
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use object_store::path::Path as ObjPath;
@@ -33,12 +63,45 @@ use scarab_storage::{
 };
 use sha2::{Digest, Sha256};
 
+/// How many object-store round-trips a single CAS leg keeps in flight.
+///
+/// **Why 32.** The legs are latency-bound (see the module docs): at ~4–6 ms per
+/// round-trip, wall-clock is `files × rtt / in-flight`, so the only thing that
+/// matters is having enough requests outstanding to hide the latency. 32 is the
+/// smallest round number that both (a) reduces a measured 2000-file leg from
+/// ~10 s to the seconds-or-less range if the path is purely latency-bound, and
+/// (b) stays inside what a default `object_store` HTTP connection pool and a
+/// single-node MinIO serve without queueing — pushing to 128 mostly buys a
+/// longer queue and 4× the peak memory. It is a *floor* for remote object
+/// storage: the further away the store, the higher this should go.
+///
+/// Override with `SCARAB_CAS_CONCURRENCY` (or [`S3Storage::with_concurrency`]).
+/// Raise it when the object store is far away; lower it when blobs are large,
+/// because peak memory is roughly `concurrency × largest blob`.
+pub const DEFAULT_CAS_CONCURRENCY: usize = 32;
+
+/// The environment variable an operator raises to widen the CAS legs.
+pub const CAS_CONCURRENCY_ENV: &str = "SCARAB_CAS_CONCURRENCY";
+
+/// [`DEFAULT_CAS_CONCURRENCY`], or whatever `SCARAB_CAS_CONCURRENCY` says.
+/// A junk or zero value falls back to the default rather than degrading the
+/// boundary to the serial behaviour this slice exists to remove.
+fn default_concurrency() -> usize {
+    std::env::var(CAS_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_CAS_CONCURRENCY)
+}
+
 /// An object-store-backed store. Wraps an `object_store` backend behind our port.
 pub struct S3Storage {
     #[allow(dead_code)]
     bucket: String,
     /// The underlying `object_store` backend, wired at composition time.
     inner: Option<Arc<dyn OsObjectStore>>,
+    /// In-flight round-trips per CAS leg (see [`DEFAULT_CAS_CONCURRENCY`]).
+    concurrency: usize,
 }
 
 impl S3Storage {
@@ -47,6 +110,7 @@ impl S3Storage {
         Self {
             bucket: bucket.into(),
             inner: None,
+            concurrency: default_concurrency(),
         }
     }
 
@@ -56,7 +120,20 @@ impl S3Storage {
         Self {
             bucket: bucket.into(),
             inner: Some(inner),
+            concurrency: default_concurrency(),
         }
+    }
+
+    /// Set how many object-store round-trips a CAS leg keeps in flight.
+    /// `0` is treated as `1` — the serial behaviour — rather than deadlocking.
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency.max(1);
+        self
+    }
+
+    /// The in-flight limit this store will use.
+    pub fn concurrency(&self) -> usize {
+        self.concurrency
     }
 
     /// A local-filesystem-backed store rooted at `dir` — the dev/CI backend that
@@ -123,6 +200,177 @@ fn hash_hex(data: &[u8]) -> String {
     hex
 }
 
+/// The canonical byte form of a tree — **the hash preimage**: entries sorted by
+/// name, then `serde_json`. Structurally identical trees therefore share a hash
+/// (and thus dedup) regardless of insertion order.
+///
+/// **Do not change the ordering or the serialisation.** Every tree hash ever
+/// stored was computed over exactly these bytes; a change orphans every stored
+/// snapshot at once. `tests/hashing.rs` pins the result against literals.
+fn canonical_tree(mut entries: Vec<TreeEntry>) -> Result<Vec<u8>, StorageError> {
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    serde_json::to_vec(&entries).map_err(|e| StorageError::Backend(e.to_string()))
+}
+
+/// What storing one content-addressed object cost, and whether it was already
+/// there.
+///
+/// This is the signal ADR-0061 s0 explicitly could **not** obtain from outside:
+/// `Cas::ingest` hashes and does its own `head`/`put` per blob internally, so a
+/// decorator could separate neither hashing from storage nor bytes-uploaded from
+/// bytes-deduped-away. It is produced at the only place that can see it.
+#[derive(Default, Clone, Copy)]
+struct Stored {
+    /// Size of the object's bytes, uploaded or not.
+    len: u64,
+    /// False when a `head` found the content already present — a real dedup hit.
+    uploaded: bool,
+    /// SHA-256 time. CPU, not network: the thing to watch once the round-trips
+    /// stop dominating.
+    hash_ns: u64,
+    /// Object-store time: the `head`, plus the `put` if there was one.
+    store_ns: u64,
+}
+
+/// Aggregated per-leg counters, emitted as one `ws-timing` line.
+///
+/// The `*_ns` figures are **sums over concurrent jobs**, so they legitimately
+/// exceed the leg's wall clock; their *ratio* is the useful reading (is this leg
+/// still round-trip-bound, or has hashing/local I/O taken over?).
+#[derive(Default)]
+struct Counters {
+    files: u64,
+    trees: u64,
+    objects_put: u64,
+    objects_present: u64,
+    bytes_put: u64,
+    bytes_deduped: u64,
+    bytes_get: u64,
+    hash_ns: u64,
+    store_ns: u64,
+    fs_ns: u64,
+}
+
+impl Counters {
+    fn add(&mut self, s: &Stored) {
+        if s.uploaded {
+            self.objects_put += 1;
+            self.bytes_put += s.len;
+        } else {
+            self.objects_present += 1;
+            self.bytes_deduped += s.len;
+        }
+        self.hash_ns += s.hash_ns;
+        self.store_ns += s.store_ns;
+    }
+}
+
+/// Nanoseconds as whole milliseconds — the unit every other `ws-timing` field
+/// uses (`crates/scarab-executor-k8s/src/lib.rs`, legs `feed`/`drain`).
+fn ms(ns: u64) -> u64 {
+    ns / 1_000_000
+}
+
+fn elapsed_ns(t: Instant) -> u64 {
+    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// One directory of the pre-walked source tree, held in an arena so the walk can
+/// be plain synchronous recursion (no boxed async frames) and so the whole shape
+/// is known before a single round-trip is spent.
+struct WalkDir {
+    depth: usize,
+    entries: Vec<WalkEntry>,
+}
+
+/// One name in a [`WalkDir`]. Metadata is captured during the walk; the content
+/// hash is filled in afterwards, concurrently.
+enum WalkEntry {
+    /// A regular file — its bytes become a blob.
+    Blob {
+        name: String,
+        path: std::path::PathBuf,
+        mode: u32,
+        mtime_ms: Option<i64>,
+    },
+    /// A symlink — the *link target path* becomes the blob content, marked
+    /// `MODE_SYMLINK` in the entry. Never followed: following would both lose
+    /// the distinction and let a symlink cycle hang the drain.
+    Symlink { name: String, dest: Vec<u8> },
+    /// A sub-directory, by arena index. Parents are pushed before their children,
+    /// so a child's index is always greater than its parent's.
+    Dir {
+        name: String,
+        idx: usize,
+        mode: u32,
+        mtime_ms: Option<i64>,
+    },
+}
+
+/// The bytes a blob upload will carry, resolved during the walk so the upload
+/// future owns everything it needs.
+enum BlobSource {
+    File(std::path::PathBuf),
+    Link(Vec<u8>),
+}
+
+/// Snapshot the shape and metadata of a directory tree with `lstat` only — no
+/// object storage, no `await`. `DirEntry::metadata` is an `lstat`, which is what
+/// lets us see a symlink as a symlink.
+fn walk(
+    dir: &std::path::Path,
+    depth: usize,
+    arena: &mut Vec<WalkDir>,
+) -> Result<usize, StorageError> {
+    let me = arena.len();
+    arena.push(WalkDir {
+        depth,
+        entries: Vec::new(),
+    });
+
+    let mut items: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
+        .map_err(io_err)?
+        .collect::<Result<_, _>>()
+        .map_err(io_err)?;
+    // Deterministic order (canonical_tree sorts too, but keep the walk stable).
+    items.sort_by_key(|e| e.file_name());
+
+    let mut entries = Vec::with_capacity(items.len());
+    for item in items {
+        let name = item.file_name().to_string_lossy().into_owned();
+        let meta = item.metadata().map_err(io_err)?;
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            let dest = std::fs::read_link(item.path()).map_err(io_err)?;
+            entries.push(WalkEntry::Symlink {
+                name,
+                dest: dest.as_os_str().as_bytes().to_vec(),
+            });
+        } else if file_type.is_dir() {
+            let idx = walk(&item.path(), depth + 1, arena)?;
+            entries.push(WalkEntry::Dir {
+                name,
+                idx,
+                mode: meta.permissions().mode() & 0o7777,
+                mtime_ms: mtime_ms(&meta),
+            });
+        } else {
+            entries.push(WalkEntry::Blob {
+                name,
+                path: item.path(),
+                mode: meta.permissions().mode() & 0o7777,
+                mtime_ms: mtime_ms(&meta),
+            });
+        }
+    }
+    arena[me].entries = entries;
+    Ok(me)
+}
+
+fn missing(what: &str) -> StorageError {
+    StorageError::Backend(format!("internal: {what} was not resolved during ingest"))
+}
+
 impl S3Storage {
     /// Read a tree object (its canonical JSON entry list) by hash.
     async fn get_tree(&self, hash: &TreeHash) -> Result<Vec<TreeEntry>, StorageError> {
@@ -132,68 +380,201 @@ impl S3Storage {
 
     /// Store `bytes` at `key` unless an object already lives there — content
     /// addressing makes a re-store a no-op, so we skip the redundant upload.
-    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<(), StorageError> {
+    async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<bool, StorageError> {
         match self.backend()?.head(&ObjPath::from(key)).await {
-            Ok(_) => Ok(()),
-            Err(object_store::Error::NotFound { .. }) => self.put(key, bytes).await,
+            Ok(_) => Ok(false),
+            Err(object_store::Error::NotFound { .. }) => {
+                self.put(key, bytes).await?;
+                Ok(true)
+            }
             Err(e) => Err(map_err(e)),
         }
     }
 
-    /// Snapshot one directory into a tree, recursing into sub-directories.
-    /// Bottom-up: children are hashed before the parent tree that names them.
-    /// Boxed because it recurses across an async boundary.
+    /// Hash `bytes`, store them at `<prefix>/<hash>` if absent, and report what
+    /// that cost. The single place both `put_blob` and `put_tree` go through, so
+    /// the counters cannot drift from the behaviour they describe.
+    async fn store_addressed(
+        &self,
+        prefix: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(String, Stored), StorageError> {
+        let t = Instant::now();
+        let hash = hash_hex(&bytes);
+        let hash_ns = elapsed_ns(t);
+        let len = bytes.len() as u64;
+        let t = Instant::now();
+        let uploaded = self.put_if_absent(&format!("{prefix}/{hash}"), bytes).await?;
+        Ok((
+            hash,
+            Stored {
+                len,
+                uploaded,
+                hash_ns,
+                store_ns: elapsed_ns(t),
+            },
+        ))
+    }
+
+    /// Snapshot a directory tree into the CAS in three phases: a synchronous
+    /// `lstat` walk, a concurrent blob upload pass, then a depth-level-at-a-time
+    /// tree write. Deepest trees first, so a parent tree only ever names children
+    /// that are already durably stored.
     ///
     /// Each entry carries the mode and mtime it had on disk (ADR-0061 s7): the
     /// `tar` legs this replaces preserved both, an executable that returns
     /// `0644` cannot be run, and cargo/make/tsc decide what to rebuild by
-    /// comparing timestamps. Symlinks are recorded as links, never followed —
-    /// following them would both lose the distinction and let a symlink cycle
-    /// hang the drain.
-    fn ingest_dir(
-        &self,
-        dir: std::path::PathBuf,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<TreeHash, StorageError>> + Send + '_>,
-    > {
-        Box::pin(async move {
-            let mut items: Vec<std::fs::DirEntry> = std::fs::read_dir(&dir)
-                .map_err(io_err)?
-                .collect::<Result<_, _>>()
-                .map_err(io_err)?;
-            // Deterministic order (put_tree sorts too, but keep the walk stable).
-            items.sort_by_key(|e| e.file_name());
+    /// comparing timestamps.
+    async fn ingest_tree(&self, root: std::path::PathBuf) -> Result<TreeHash, StorageError> {
+        use futures::StreamExt;
 
-            let mut entries = Vec::with_capacity(items.len());
-            for item in items {
-                let name = item.file_name().to_string_lossy().into_owned();
-                // `DirEntry::metadata` is an `lstat`: it does not follow links,
-                // which is what lets us see a symlink as a symlink.
-                let meta = item.metadata().map_err(io_err)?;
-                let file_type = meta.file_type();
+        let started = Instant::now();
+        let limit = self.concurrency;
+        let mut counters = Counters::default();
 
-                if file_type.is_symlink() {
-                    let dest = std::fs::read_link(item.path()).map_err(io_err)?;
-                    let blob = self.put_blob(dest.as_os_str().as_bytes()).await?;
-                    entries.push(TreeEntry::symlink(name, blob));
-                    continue;
+        // --- Phase 1: walk. Local syscalls only, nothing in flight. ----------
+        let t = Instant::now();
+        let mut arena: Vec<WalkDir> = Vec::new();
+        walk(&root, 0, &mut arena)?;
+        counters.fs_ns += elapsed_ns(t);
+        counters.trees = arena.len() as u64;
+
+        // --- Phase 2: blobs, concurrently. -----------------------------------
+        // Every file and symlink in the whole tree at once: this is the pass that
+        // used to be one strictly-serial round-trip per file.
+        let mut hashes: Vec<Vec<Option<BlobHash>>> = arena
+            .iter()
+            .map(|d| vec![None; d.entries.len()])
+            .collect();
+        let mut jobs: Vec<(usize, usize, BlobSource)> = Vec::new();
+        for (d, dir) in arena.iter().enumerate() {
+            for (e, entry) in dir.entries.iter().enumerate() {
+                match entry {
+                    WalkEntry::Blob { path, .. } => {
+                        jobs.push((d, e, BlobSource::File(path.clone())))
+                    }
+                    WalkEntry::Symlink { dest, .. } => {
+                        jobs.push((d, e, BlobSource::Link(dest.clone())))
+                    }
+                    WalkEntry::Dir { .. } => {}
                 }
-
-                let target = if file_type.is_dir() {
-                    TreeTarget::Tree(self.ingest_dir(item.path()).await?)
-                } else {
-                    let data = std::fs::read(item.path()).map_err(io_err)?;
-                    TreeTarget::Blob(self.put_blob(&data).await?)
-                };
-                entries.push(TreeEntry {
-                    name,
-                    target,
-                    mode: Some(meta.permissions().mode() & 0o7777),
-                    mtime_ms: mtime_ms(&meta),
-                });
             }
-            self.put_tree(entries).await
-        })
+        }
+        counters.files = jobs.len() as u64;
+
+        let mut stream = futures::stream::iter(jobs)
+            .map(|(d, e, src)| async move {
+                let mut fs_ns = 0;
+                let data = match src {
+                    BlobSource::File(path) => {
+                        let t = Instant::now();
+                        let data = std::fs::read(&path).map_err(io_err)?;
+                        fs_ns = elapsed_ns(t);
+                        data
+                    }
+                    // A symlink's "content" was already read by the walk.
+                    BlobSource::Link(dest) => dest,
+                };
+                let (hash, stored) = self.store_addressed("blobs", data).await?;
+                Ok::<_, StorageError>((d, e, BlobHash(hash), stored, fs_ns))
+            })
+            .buffer_unordered(limit);
+        while let Some(result) = stream.next().await {
+            let (d, e, hash, stored, fs_ns) = result?;
+            counters.add(&stored);
+            counters.fs_ns += fs_ns;
+            hashes[d][e] = Some(hash);
+        }
+
+        // --- Phase 3: trees, deepest depth level first. ----------------------
+        // A parent tree names its children's hashes, so a level can only be
+        // written once the level below it is durable — but the directories
+        // *within* one level are independent, so they go up together.
+        let max_depth = arena.iter().map(|d| d.depth).max().unwrap_or(0);
+        let mut by_depth: Vec<Vec<usize>> = vec![Vec::new(); max_depth + 1];
+        for (i, dir) in arena.iter().enumerate() {
+            by_depth[dir.depth].push(i);
+        }
+        let mut trees: Vec<Option<TreeHash>> = vec![None; arena.len()];
+        for level in by_depth.into_iter().rev() {
+            let mut batch = Vec::with_capacity(level.len());
+            for i in level {
+                let mut entries = Vec::with_capacity(arena[i].entries.len());
+                for (e, entry) in arena[i].entries.iter().enumerate() {
+                    entries.push(match entry {
+                        WalkEntry::Symlink { name, .. } => TreeEntry::symlink(
+                            name.clone(),
+                            hashes[i][e].clone().ok_or_else(|| missing("a symlink blob"))?,
+                        ),
+                        WalkEntry::Blob {
+                            name,
+                            mode,
+                            mtime_ms,
+                            ..
+                        } => TreeEntry {
+                            name: name.clone(),
+                            target: TreeTarget::Blob(
+                                hashes[i][e].clone().ok_or_else(|| missing("a file blob"))?,
+                            ),
+                            mode: Some(*mode),
+                            mtime_ms: *mtime_ms,
+                        },
+                        WalkEntry::Dir {
+                            name,
+                            idx,
+                            mode,
+                            mtime_ms,
+                        } => TreeEntry {
+                            name: name.clone(),
+                            target: TreeTarget::Tree(
+                                trees[*idx]
+                                    .clone()
+                                    .ok_or_else(|| missing("a sub-tree"))?,
+                            ),
+                            mode: Some(*mode),
+                            mtime_ms: *mtime_ms,
+                        },
+                    });
+                }
+                batch.push((i, canonical_tree(entries)?));
+            }
+            let mut stream = futures::stream::iter(batch)
+                .map(|(i, bytes)| async move {
+                    let (hash, stored) = self.store_addressed("trees", bytes).await?;
+                    Ok::<_, StorageError>((i, TreeHash(hash), stored))
+                })
+                .buffer_unordered(limit);
+            while let Some(result) = stream.next().await {
+                let (i, hash, stored) = result?;
+                counters.add(&stored);
+                trees[i] = Some(hash);
+            }
+        }
+
+        // ADR-0061 s2. Same `ws-timing` message as the Step-boundary legs in
+        // `scarab-executor-k8s`, so one grep harvests the whole boundary; the
+        // `cas` field is what distinguishes these lines from `leg=feed|drain`.
+        tracing::info!(
+            cas = "ingest",
+            files = counters.files,
+            trees = counters.trees,
+            objects_put = counters.objects_put,
+            objects_present = counters.objects_present,
+            bytes_put = counters.bytes_put,
+            bytes_deduped = counters.bytes_deduped,
+            hash_ms = ms(counters.hash_ns),
+            store_ms = ms(counters.store_ns),
+            fs_ms = ms(counters.fs_ns),
+            concurrency = limit,
+            total_ms = started.elapsed().as_millis(),
+            "ws-timing"
+        );
+
+        trees
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| missing("the root tree"))
     }
 }
 
@@ -298,10 +679,8 @@ impl ObjectStore for S3Storage {
 #[async_trait]
 impl Cas for S3Storage {
     async fn put_blob(&self, data: &[u8]) -> Result<BlobHash, StorageError> {
-        let hash = BlobHash(hash_hex(data));
-        self.put_if_absent(&format!("blobs/{}", hash.0), data.to_vec())
-            .await?;
-        Ok(hash)
+        let (hash, _) = self.store_addressed("blobs", data.to_vec()).await?;
+        Ok(BlobHash(hash))
     }
 
     async fn get_blob(&self, hash: &BlobHash) -> Result<Vec<u8>, StorageError> {
@@ -317,86 +696,184 @@ impl Cas for S3Storage {
         self.get_tree(hash).await
     }
 
-    async fn put_tree(&self, mut entries: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {
-        // Canonical form: entries sorted by name so structurally identical trees
-        // share a hash (and thus dedup) regardless of insertion order.
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        let bytes =
-            serde_json::to_vec(&entries).map_err(|e| StorageError::Backend(e.to_string()))?;
-        let hash = TreeHash(hash_hex(&bytes));
-        self.put_if_absent(&format!("trees/{}", hash.0), bytes)
+    async fn put_tree(&self, entries: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {
+        let (hash, _) = self
+            .store_addressed("trees", canonical_tree(entries)?)
             .await?;
-        Ok(hash)
+        Ok(TreeHash(hash))
     }
 
+    /// Check a tree out into `path` in three phases: fetch the shape a depth
+    /// level at a time (creating and widening directories as each level is
+    /// reached), write every file concurrently, then apply directory metadata in
+    /// one sequential reverse pass.
+    ///
+    /// **This is called repeatedly into ONE directory** — a step with several
+    /// `needs` merges its inputs in order (ADR-0007), later inputs overlaying
+    /// earlier ones — and the caller awaits each call. The parallelism here is
+    /// strictly *within* a call; nothing about the ordering across calls moved.
     async fn materialize(&self, tree: &TreeHash, path: &str) -> Result<(), StorageError> {
-        // Iterative walk of the merkle tree (no async recursion): each frame is a
-        // sub-tree, its target directory, and the metadata that directory should
-        // end up with.
-        let mut stack = vec![(tree.clone(), std::path::PathBuf::from(path), None, None)];
-        // Directory metadata is deferred: creating a child bumps the parent's
-        // mtime, and a restrictive mode applied early would lock the walk out of
-        // its own subtree. Collected parent-first, applied in reverse.
-        let mut dirs: Vec<(std::path::PathBuf, Option<u32>, Option<i64>)> = Vec::new();
+        use futures::StreamExt;
 
-        while let Some((node, dir, mode, mtime)) = stack.pop() {
-            // A step with several `needs` materializes each input snapshot into
-            // the *same* directory (merge-in-order, ADR-0007). Now that real modes
-            // are restored, a directory an earlier input left read-only would lock
-            // this pass out of it — so widen it for the walk and restore below.
-            let pre = std::fs::metadata(&dir)
-                .ok()
-                .map(|m| m.permissions().mode() & 0o7777);
-            std::fs::create_dir_all(&dir).map_err(io_err)?;
-            let mut restore = mode;
-            if let Some(cur) = pre {
-                if cur & 0o700 != 0o700 {
-                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(cur | 0o700))
-                        .map_err(io_err)?;
-                    // With no recorded mode, put back exactly what was there.
-                    restore = restore.or(Some(cur));
-                }
-            }
-            dirs.push((dir.clone(), restore, mtime));
-            for entry in self.get_tree(&node).await? {
-                let child = dir.join(&entry.name);
-                let is_symlink = entry.is_symlink();
-                let permissions = entry.permissions();
-                match entry.target {
-                    TreeTarget::Blob(blob) => {
-                        let data = self.get_blob(&blob).await?;
-                        // Unlink first, always: an overlaying input must be able
-                        // to replace a read-only file (which `write` cannot open)
-                        // or a symlink (which `symlink` cannot create over), and
-                        // unlinking needs permission on the directory, not the
-                        // file. Also stops a write leaking through a link.
-                        if std::fs::symlink_metadata(&child).is_ok() {
-                            std::fs::remove_file(&child).map_err(io_err)?;
-                        }
-                        if is_symlink {
-                            // The blob holds the link target path.
-                            let dest = std::path::Path::new(std::ffi::OsStr::from_bytes(&data));
-                            std::os::unix::fs::symlink(dest, &child).map_err(io_err)?;
-                            // No chmod / utimes on a link itself (`std` has no
-                            // `lutimes`, and a link's own mode is meaningless).
-                            continue;
-                        }
-                        std::fs::write(&child, data).map_err(io_err)?;
-                        apply_metadata(&child, permissions, entry.mtime_ms, false)?;
+        /// One file (or symlink) the checkout owes, resolved before any write.
+        struct PlanFile {
+            path: std::path::PathBuf,
+            blob: BlobHash,
+            is_symlink: bool,
+            mode: Option<u32>,
+            mtime_ms: Option<i64>,
+        }
+
+        let started = Instant::now();
+        let limit = self.concurrency;
+        let mut counters = Counters::default();
+
+        // Directory metadata is deferred to the very end: creating a child bumps
+        // its parent's mtime, so a directory's mode/mtime must not be applied
+        // until every descendant write has completed — and a restrictive mode
+        // applied early would lock the walk out of its own subtree. Collected
+        // parent-first (a level's dirs always precede the next level's), applied
+        // in reverse, which is descendants-first.
+        let mut dirs: Vec<(std::path::PathBuf, Option<u32>, Option<i64>)> = Vec::new();
+        let mut files: Vec<PlanFile> = Vec::new();
+
+        // --- Phase 1: the merkle shape, one depth level at a time. ------------
+        let mut level = vec![(tree.clone(), std::path::PathBuf::from(path), None, None)];
+        while !level.is_empty() {
+            // Every directory at this level is created — and widened — BEFORE
+            // anything reads or writes inside it.
+            let t = Instant::now();
+            let mut fetch = Vec::with_capacity(level.len());
+            for (node, dir, mode, mtime) in level.drain(..) {
+                // Now that real modes are restored, a directory an earlier input
+                // left read-only would lock this pass out of it: a `0555`
+                // directory takes no new children. So widen it for the duration
+                // of the walk and restore below. Removing this guard is exactly
+                // what makes `fidelity.rs::a_later_input_overlays_a_read_only_
+                // checkout` fail with `Permission denied (os error 13)`.
+                let pre = std::fs::metadata(&dir)
+                    .ok()
+                    .map(|m| m.permissions().mode() & 0o7777);
+                std::fs::create_dir_all(&dir).map_err(io_err)?;
+                let mut restore = mode;
+                if let Some(cur) = pre {
+                    if cur & 0o700 != 0o700 {
+                        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(cur | 0o700))
+                            .map_err(io_err)?;
+                        // With no recorded mode, put back exactly what was there.
+                        restore = restore.or(Some(cur));
                     }
-                    TreeTarget::Tree(sub) => stack.push((sub, child, permissions, entry.mtime_ms)),
+                }
+                dirs.push((dir.clone(), restore, mtime));
+                fetch.push((node, dir));
+            }
+            counters.fs_ns += elapsed_ns(t);
+
+            let mut stream = futures::stream::iter(fetch)
+                .map(|(node, dir)| async move {
+                    let t = Instant::now();
+                    let entries = self.get_tree(&node).await?;
+                    Ok::<_, StorageError>((dir, entries, elapsed_ns(t)))
+                })
+                .buffer_unordered(limit);
+            while let Some(result) = stream.next().await {
+                let (dir, entries, store_ns) = result?;
+                counters.trees += 1;
+                counters.store_ns += store_ns;
+                for entry in entries {
+                    let child = dir.join(&entry.name);
+                    let is_symlink = entry.is_symlink();
+                    let mode = entry.permissions();
+                    match entry.target {
+                        TreeTarget::Blob(blob) => files.push(PlanFile {
+                            path: child,
+                            blob,
+                            is_symlink,
+                            mode,
+                            mtime_ms: entry.mtime_ms,
+                        }),
+                        TreeTarget::Tree(sub) => level.push((sub, child, mode, entry.mtime_ms)),
+                    }
                 }
             }
         }
+        counters.files = files.len() as u64;
 
+        // --- Phase 2: the files, concurrently. -------------------------------
+        // Every path here is distinct (names are unique within a tree), so the
+        // writes are independent; only the object-store GETs benefit from being
+        // in flight together, which is the whole point.
+        let mut stream = futures::stream::iter(files)
+            .map(|f| async move {
+                let t = Instant::now();
+                // Open-coded `get_blob` so the fetch and the integrity re-hash
+                // land in different counters; the check itself is identical.
+                let data = self.get(&format!("blobs/{}", f.blob.0)).await?;
+                let store_ns = elapsed_ns(t);
+                let t = Instant::now();
+                if hash_hex(&data) != f.blob.0 {
+                    return Err(StorageError::HashMismatch);
+                }
+                let hash_ns = elapsed_ns(t);
+                let len = data.len() as u64;
+
+                let t = Instant::now();
+                // Unlink first, always: an overlaying input must be able to
+                // replace a read-only file (which `write` cannot open) or a
+                // symlink (which `symlink` cannot create over), and unlinking
+                // needs permission on the directory, not the file. Also stops a
+                // write leaking through a link.
+                if std::fs::symlink_metadata(&f.path).is_ok() {
+                    std::fs::remove_file(&f.path).map_err(io_err)?;
+                }
+                if f.is_symlink {
+                    // The blob holds the link target path. No chmod / utimes on a
+                    // link itself (`std` has no `lutimes`, and a link's own mode
+                    // is meaningless).
+                    let dest = std::path::Path::new(std::ffi::OsStr::from_bytes(&data));
+                    std::os::unix::fs::symlink(dest, &f.path).map_err(io_err)?;
+                } else {
+                    std::fs::write(&f.path, data).map_err(io_err)?;
+                    apply_metadata(&f.path, f.mode, f.mtime_ms, false)?;
+                }
+                Ok::<_, StorageError>((len, hash_ns, store_ns, elapsed_ns(t)))
+            })
+            .buffer_unordered(limit);
+        while let Some(result) = stream.next().await {
+            let (len, hash_ns, store_ns, fs_ns) = result?;
+            counters.bytes_get += len;
+            counters.hash_ns += hash_ns;
+            counters.store_ns += store_ns;
+            counters.fs_ns += fs_ns;
+        }
+
+        // --- Phase 3: directory metadata, last and sequentially. -------------
+        // mtime then mode, deepest first. Order is load-bearing twice over: a
+        // parent's mtime is only final once its children exist, and chmod-ing
+        // before the time set would lock out the time set.
+        let t = Instant::now();
         for (dir, mode, mtime) in dirs.into_iter().rev() {
             apply_metadata(&dir, mode, mtime, true)?;
         }
+        counters.fs_ns += elapsed_ns(t);
+
+        tracing::info!(
+            cas = "materialize",
+            files = counters.files,
+            trees = counters.trees,
+            bytes_get = counters.bytes_get,
+            hash_ms = ms(counters.hash_ns),
+            store_ms = ms(counters.store_ns),
+            fs_ms = ms(counters.fs_ns),
+            concurrency = limit,
+            total_ms = started.elapsed().as_millis(),
+            "ws-timing"
+        );
         Ok(())
     }
 
     async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
-        let root = self.ingest_dir(std::path::PathBuf::from(path)).await?;
+        let root = self.ingest_tree(std::path::PathBuf::from(path)).await?;
         Ok(Snapshot { root })
     }
 }
