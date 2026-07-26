@@ -104,6 +104,9 @@ are now distinct:
 - **Workspace** — the *mutable* filesystem a Step executes in. Pod-local, dies with the Pod.
 - **Workspace Snapshot** — the *immutable*, content-addressed tree that flows along a DAG
   edge and that an Attempt owns as evidence. Retained per policy, then archived, then gone.
+  It has two coordinates (s8, below): a **snapshot root** — *where the bytes are*, the address
+  a Step materialises — and a **content identity** — *what the bytes are*, the digest restart
+  invalidation compares. Only the root is an address.
 
 ### Retention
 
@@ -376,6 +379,85 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   different timestamps are different workspaces to every tool that compares them.
   `crates/scarab-storage-s3/tests/fidelity.rs` is the standing proof, and **s3 must keep it
   passing** — whatever replaces the `tar` legs inherits this contract.
+
+  **That last clause was half an answer, and s8 below is the other half.** "A tree hash moves
+  with an mtime, which is correct" is true of an *address* and false of the question ADR-0027
+  asks. s7 went further and argued the consequence was harmless — *"Cost **not** paid: nothing
+  decision-relevant — restart skip-if-unchanged compares the recorded snapshot roots of
+  upstream steps that did **not** re-run, which are byte-identical strings regardless."* That
+  sentence excluded from consideration **exactly the case skip-if-unchanged exists for**: an
+  ancestor that *did* re-run and produced the same output. The live kube tier then measured it
+  (git-bug `945b1f4`): two Attempts writing byte-identical content produced roots differing in
+  `mtime_ms` alone. Recorded here because the reasoning error is reusable — a cost argument
+  that names the cases it does not pay for is not yet an argument.
+- **Two digests, one address — s8. DONE, and it closes `945b1f4`.** A Workspace Snapshot now
+  has two coordinates, and only one of them is an address:
+
+  | | covers | is an address? | answers |
+  |---|---|---|---|
+  | **snapshot root** | names, targets, modes, **mtimes** | **yes** — `trees/<hash>` | where are these exact bytes? |
+  | **content identity** | names, targets, modes | **no** | is this the same content? |
+
+  The identity is the same merkle fold with every mtime dropped and each sub-tree named by
+  *its* identity. It is folded up for free during `ingest` (one extra SHA-256 per directory,
+  **zero** round-trips — nothing is stored under it), recorded beside the root as Attempt
+  evidence, and it is what [0027](0027-restart-semantics.md)'s input signature compares.
+
+  **Why not the three options the ticket sketched.** Each is a real position and each loses
+  to a specific argument:
+
+  - **Normalise mtimes on ingest** (to the epoch, as reproducible-build tooling does) —
+    rejected as **unsafe**, not merely as a loss of s7's gain. mtime-based build tools are
+    wrong in exactly one direction: a timestamp that is too *old* makes them skip a rebuild
+    they needed. Constant mtimes make every inherited source look ancient, so a **Cache**
+    ([0007](0007-data-passing-model.md)) restored beside the workspace with real timestamps
+    looks newer than the sources it was built from, and `make`/`cargo` skip. Silently wrong
+    output is a worse failure than a slow one.
+  - **Drop mtime from the hash preimage and carry it as unhashed entry metadata** — the
+    cheapest fix, and the tempting one, because the counter-argument to s7's objection nearly
+    works: two trees sharing a content identity hold *identical content*, so serving either
+    one's timestamps cannot mislead a tool comparing files *within* the tree. It fails because
+    CI tools do not compare only within the tree. Under `put_if_absent` the **first**-stored
+    hint wins, so a path whose content went X → Y → X (a revert, a flaky generator, two
+    branches sharing a store) is served the *week-old* X timestamp, and a Cache built from Y
+    yesterday then looks newer than the sources — the same wrong-output class as above. It
+    also breaks the CAS's defining property: the key would no longer determine the content,
+    so a tree could not be verified against its address at all (blobs are, today), and
+    `materialize` would stop being a pure function of the root. **s7's objection to this
+    option holds — but for a sharper reason than s7 gave.** Non-determinism of *timestamps*
+    is not the problem; being served a *stale* one from a different lineage is.
+  - **Keep mtimes and make ADR-0027's comparison structural (compare blob sets)** — this is
+    what s8 does, made cheap. Comparing blob *sets* means walking two trees at admission
+    time; a single derived digest answers the same question in a string compare, and is
+    computed where the tree is already in hand.
+
+  Also considered and rejected: **carrying mtimes forward from a baseline** — on ingest, reuse
+  the previous snapshot's mtime for any path whose content is unchanged. This is the only
+  scheme that keeps *one* digest and stays safe, and it is genuinely elegant: it makes a root
+  reproducible *and* keeps every timestamp truthful about when content last changed. It loses
+  on this ADR's own retention model. The baseline is a snapshot, snapshots expire (warm by
+  space, cold by TTL), and when the baseline is gone the mtimes revert to wall clock and the
+  root moves again. A determinism guarantee that decays with retention, silently, is the
+  failure we are already fixing.
+
+  **Consequences, stated plainly:**
+
+  - **The identity is never an address.** Nothing is stored under it, `materialize` never sees
+    it, GC's mark walk still starts from roots, `prune_tree` is unchanged. It is a label on
+    evidence.
+  - **Cross-run *tree* dedup stays lost** — two runs producing identical content still store
+    two root objects, because their mtimes differ. Trees are small JSON, and s0/s2 measured
+    that dedup buys storage rather than wall-clock, so this is priced and accepted.
+  - **The tree preimage is untouched**, so no stored snapshot is orphaned. `tests/hashing.rs`
+    still pins the same literals; the identity literals beside them were derived the same
+    independent way.
+  - **A snapshot recording no mtimes has an identity equal to its root** (dropping an absent
+    field changes no bytes), which is why the fallback for a pre-s8 row — compare by root — is
+    exact for those rows and merely conservative for the rest.
+  - **One canonical form, one digest function.** Both were hand-copied in `scarab-storage-s3`
+    *and* `scarab-workspace-client`, with a runtime tripwire in `tiered` to notice them
+    drifting. They now live in `scarab-storage`; the tripwire is kept for version skew between
+    deployed binaries, which is a different hazard.
 - **Overlay diff for the drain** — hashing only the writable upper layer (so a Step never
   re-walks an unchanged tree) is the natural partner to lazy reads and needs the same
   privileged mount. Specified as a follow-up slice, not part of the first cut.

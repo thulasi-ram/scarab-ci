@@ -251,12 +251,21 @@ impl Cas for TieredCas {
                 // own contract: it merges in order and unlinks before writing,
                 // precisely so several inputs can overlay one directory.
                 //
-                // Deliberately NO warm backfill here. `ingest`-ing the directory
-                // we just wrote would mint a *different* tree hash — the entries
-                // carry mtimes, and a checkout's mtimes are its own — so it
-                // would not be a backfill at all, it would be a second snapshot.
-                // Warm gets filled by `get_blob`/`tree_entries` on the way
-                // through instead.
+                // Deliberately NO warm backfill here, and the reason is NOT the
+                // one this comment used to give ("re-ingesting would mint a
+                // different tree hash, because a checkout's mtimes are its own").
+                // That is false, and `hashing.rs`'s round-trip proves it:
+                // `materialize` restores every recorded mtime, so re-ingesting a
+                // clean checkout lands on the *same* root — which is the whole of
+                // s7's fidelity contract.
+                //
+                // The real reason is that this call may be **overlaying** — a Step
+                // with several inputs materialises them in order into ONE directory
+                // (ADR-0007) — so the directory on disk at this moment is generally
+                // not this tree, it is some prefix of a merge. Re-ingesting it would
+                // store a snapshot of a half-built workspace. Warm gets filled by
+                // `get_blob`/`tree_entries` on the way through instead, at the grain
+                // where each object really is the object requested.
                 self.cold.materialize(tree, path).await
             }
             Err(other) => Err(other),
