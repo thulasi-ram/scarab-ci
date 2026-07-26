@@ -1,0 +1,35 @@
+[package]
+name = "scarab-workspace-client"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# Adapter crate (ADR-0016): pairs the pure `scarab-storage` domain with exactly
+# one piece of infra — `reqwest` — and holds the impls of two of its ports
+# (`Cas` and `ContentSource`) against the ADR-0061 workspace service.
+[dependencies]
+scarab-storage = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+# Concurrency in the CAS legs. ADR-0061's s0 measurement is unambiguous that
+# the cost of the existing data path is one sequential round-trip PER FILE, so a
+# client that walked files one at a time would inherit the exact problem it
+# exists to remove.
+futures = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The acceptance test drives the REAL workspace service (from scarab-server)
+# over a REAL TieredCas on tempdirs. Classical, not mockist: the only thing
+# stubbed is nothing.
+# Not in `[workspace.dependencies]` — scarab-server is the composition root and
+# nothing depends on it in production. A dev-dep path is deliberate.
+scarab-server = { path = "../scarab-server" }
+scarab-storage-s3 = { workspace = true }
+scarab-executor-k8s = { workspace = true }
+axum = { workspace = true }
+tempfile = { workspace = true }

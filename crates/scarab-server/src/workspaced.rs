@@ -158,48 +158,7 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
     });
 
-    // Warm tier: a local-filesystem `Cas` over the persistent volume. NO new
-    // adapter is needed for this — `S3Storage::local` is already a local
-    // filesystem store behind the same two ports.
-    let warm_dir = std::path::PathBuf::from(&ws.data_dir);
-    let warm_store = Arc::new(S3Storage::local(&warm_dir)?);
-
-    let warm_cas: Arc<dyn Cas> = warm_store.clone();
-    let cold_cas: Arc<dyn Cas> = cold_store.clone();
-    let warm_objects: Arc<dyn ObjectStore> = warm_store.clone();
-    let cold_objects: Arc<dyn ObjectStore> = cold_store.clone();
-
-    let state = WorkspaceState {
-        cas: Arc::new(TieredCas::new(warm_cas, cold_cas)),
-        objects: Arc::new(TieredObjectStore::new(
-            warm_objects.clone(),
-            cold_objects.clone(),
-        )),
-        warm: warm_objects,
-        cold: cold_objects,
-        warm_dir: warm_dir.clone(),
-        token_secret: Arc::new(ws.token_secret.clone()),
-        warm_used_bytes: Arc::new(AtomicU64::new(0)),
-    };
-
-    // The warm-tier size gauge (ADR-0061): LRU eviction is deferred, so this
-    // number climbing towards the volume size IS the operator's only warning
-    // that the deferral is about to bite.
-    {
-        let gauge = state.warm_used_bytes.clone();
-        let dir = warm_dir.clone();
-        tokio::spawn(async move {
-            loop {
-                let dir = dir.clone();
-                if let Ok(bytes) = tokio::task::spawn_blocking(move || dir_size(&dir)).await {
-                    gauge.store(bytes, Ordering::Relaxed);
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(WARM_SIZE_REFRESH_SECS)).await;
-            }
-        });
-    }
-
-    let app = router(state);
+    let app = router(&ws.data_dir, cold_store, ws.token_secret.clone())?;
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     tracing::info!(
         addr = %config.addr,
@@ -215,7 +174,62 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// The workspace service's router — **not** the control-plane router.
-fn router(state: WorkspaceState) -> Router {
+///
+/// Public and parameterised over the two tiers so the service can be driven for
+/// real over tempdirs (`crates/scarab-workspace-client/tests/`). A feature is not
+/// done without an acceptance test at its own grain (ADR-0017 addendum), and the
+/// grain of this feature is *the HTTP surface over a real `TieredCas`* — a test
+/// that could only reach the handlers by calling them directly would be testing
+/// something else.
+pub fn router(
+    warm_dir: impl AsRef<std::path::Path>,
+    cold: Arc<S3Storage>,
+    token_secret: Vec<u8>,
+) -> Result<Router, StorageError> {
+    // Warm tier: a local-filesystem `Cas` over the persistent volume. NO new
+    // adapter is needed for this — `S3Storage::local` is already a local
+    // filesystem store behind the same two ports.
+    let warm_dir = warm_dir.as_ref().to_path_buf();
+    let warm_store = Arc::new(S3Storage::local(&warm_dir)?);
+
+    let warm_cas: Arc<dyn Cas> = warm_store.clone();
+    let cold_cas: Arc<dyn Cas> = cold.clone();
+    let warm_objects: Arc<dyn ObjectStore> = warm_store;
+    let cold_objects: Arc<dyn ObjectStore> = cold;
+
+    let state = WorkspaceState {
+        cas: Arc::new(TieredCas::new(warm_cas, cold_cas)),
+        objects: Arc::new(TieredObjectStore::new(
+            warm_objects.clone(),
+            cold_objects.clone(),
+        )),
+        warm: warm_objects,
+        cold: cold_objects,
+        warm_dir: warm_dir.clone(),
+        token_secret: Arc::new(token_secret),
+        warm_used_bytes: Arc::new(AtomicU64::new(0)),
+    };
+
+    // The warm-tier size gauge (ADR-0061): LRU eviction is deferred, so this
+    // number climbing towards the volume size IS the operator's only warning
+    // that the deferral is about to bite.
+    {
+        let gauge = state.warm_used_bytes.clone();
+        tokio::spawn(async move {
+            loop {
+                let dir = warm_dir.clone();
+                if let Ok(bytes) = tokio::task::spawn_blocking(move || dir_size(&dir)).await {
+                    gauge.store(bytes, Ordering::Relaxed);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(WARM_SIZE_REFRESH_SECS)).await;
+            }
+        });
+    }
+
+    Ok(build_router(state))
+}
+
+fn build_router(state: WorkspaceState) -> Router {
     let cas = Router::new()
         .route(
             "/v1/cas/blobs/{hash}",
@@ -411,7 +425,31 @@ fn warm_blob_path(state: &WorkspaceState, hash: &str) -> std::path::PathBuf {
     state.warm_dir.join("blobs").join(hash)
 }
 
-/// `GET /v1/cas/blobs/{hash}` — the blob's bytes, **streamed**.
+/// A `Range: bytes=<first>-<last>` header, if present and well-formed.
+///
+/// Only the single-range `bytes=first-last` and `bytes=first-` forms are
+/// supported; a suffix range (`bytes=-N`) or a multi-range request is treated as
+/// no range at all and the whole blob is returned, which is a legal (if
+/// unhelpful) answer under RFC 9110 §14.2.
+fn parse_range(headers: &HeaderMap) -> Option<(u64, Option<u64>)> {
+    let raw = headers.get(axum::http::header::RANGE)?.to_str().ok()?;
+    let spec = raw.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (first, last) = spec.split_once('-')?;
+    let first = first.trim().parse::<u64>().ok()?;
+    let last = match last.trim() {
+        "" => None,
+        s => Some(s.parse::<u64>().ok()?),
+    };
+    if matches!(last, Some(l) if l < first) {
+        return None;
+    }
+    Some((first, last))
+}
+
+/// `GET /v1/cas/blobs/{hash}` — the blob's bytes, **streamed**, with `Range`.
 ///
 /// Streamed off the warm volume rather than returned through
 /// [`Cas::get_blob`], which is `-> Vec<u8>` and would buffer the whole blob in
@@ -419,6 +457,13 @@ fn warm_blob_path(state: &WorkspaceState, hash: &str) -> std::path::PathBuf {
 /// tiered read pulls it through from cold (which does backfill warm), and that
 /// one is buffered — the cold port has no range read either. That asymmetry is
 /// the reason [`scarab_storage::content::ContentSource`] exists.
+///
+/// **`Range` is an addition to the protocol as originally tabled**, and a
+/// deliberate one: `ContentSource::read_range` is the whole reason that port
+/// exists (a FUSE `read` of one page must not transfer a 2 GB blob), and without
+/// server-side ranges the client's implementation of it would have to download
+/// the blob and slice — a facade with the right signature and none of the
+/// property. A ranged request answers `206` with `content-range`.
 async fn get_blob(
     State(state): State<WorkspaceState>,
     headers: HeaderMap,
@@ -426,6 +471,10 @@ async fn get_blob(
 ) -> Result<Response, WsError> {
     authenticate(&state, &headers)?;
     valid_hash(&hash)?;
+
+    if let Some((first, last)) = parse_range(&headers) {
+        return ranged_blob(&state, &hash, first, last).await;
+    }
 
     let path = warm_blob_path(&state, &hash);
     if let Ok(file) = tokio::fs::File::open(&path).await {
@@ -449,6 +498,68 @@ async fn get_blob(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static("application/octet-stream"),
     );
+    Ok(resp)
+}
+
+/// Serve one byte range. Seeks the warm file so a one-page read costs one page;
+/// falls back to a whole cold read plus a slice when warm does not have it
+/// (slow, never wrong, and it backfills warm so the next range is cheap).
+async fn ranged_blob(
+    state: &WorkspaceState,
+    hash: &str,
+    first: u64,
+    last: Option<u64>,
+) -> Result<Response, WsError> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let (data, total) = match tokio::fs::File::open(warm_blob_path(state, hash)).await {
+        Ok(mut file) => {
+            let total = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+            if first >= total {
+                // RFC 9110 §15.5.17: an unsatisfiable range.
+                let mut resp = Response::new(Body::empty());
+                *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+                if let Ok(v) = axum::http::HeaderValue::from_str(&format!("bytes */{total}")) {
+                    resp.headers_mut()
+                        .insert(axum::http::header::CONTENT_RANGE, v);
+                }
+                return Ok(resp);
+            }
+            let end = last.map(|l| l.min(total - 1)).unwrap_or(total - 1);
+            let want = (end - first + 1) as usize;
+            file.seek(std::io::SeekFrom::Start(first))
+                .await
+                .map_err(|e| WsError::Backend(e.to_string()))?;
+            let mut buf = vec![0u8; want];
+            file.read_exact(&mut buf)
+                .await
+                .map_err(|e| WsError::Backend(e.to_string()))?;
+            (buf, total)
+        }
+        Err(_) => {
+            let whole = state.cas.get_blob(&BlobHash(hash.to_string())).await?;
+            let total = whole.len() as u64;
+            if first >= total {
+                let mut resp = Response::new(Body::empty());
+                *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+                return Ok(resp);
+            }
+            let end = last.map(|l| l.min(total - 1)).unwrap_or(total - 1);
+            (whole[first as usize..=end as usize].to_vec(), total)
+        }
+    };
+
+    let end = first + data.len() as u64 - 1;
+    let mut resp = data.into_response();
+    *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/octet-stream"),
+    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("bytes {first}-{end}/{total}")) {
+        h.insert(axum::http::header::CONTENT_RANGE, v);
+    }
     Ok(resp)
 }
 
