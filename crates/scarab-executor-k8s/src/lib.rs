@@ -409,8 +409,15 @@ impl K8sExecutor {
 
         // --- Leg 1: feed the waiting init container. -----------------------
         if init_container_running(pod, WORKSPACE_INIT_CONTAINER) && !inputs_csv.is_empty() {
+            // ADR-0061 s0: split this half of the Step boundary into its parts —
+            // CAS read, server-side tar pack, and the `exec` tunnel — so the win
+            // ADR-0061 argues for structurally can be *sized*. Deliberately
+            // cheap and local: s3 deletes the tunnel and these timers with it.
+            let t_leg = std::time::Instant::now();
+            let mut n_inputs = 0usize;
             let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
             for root in inputs_csv.split(',').filter(|r| !r.is_empty()) {
+                n_inputs += 1;
                 // Later inputs overlay earlier ones (merge-in-order, ADR-0007).
                 cas.materialize(
                     &scarab_storage::TreeHash(root.to_string()),
@@ -430,7 +437,15 @@ impl K8sExecutor {
                     other => DriveErr::Transient(format!("materialize {root}: {other}")),
                 })?;
             }
+            // CAS read = object-storage GETs + writing the tree to a temp dir.
+            // `S3Storage::materialize` walks the merkle tree with one sequential
+            // `get_blob` per file, so this scales with FILE COUNT, not bytes.
+            let cas_materialize_ms = t_leg.elapsed().as_millis();
+            let (files, tree_bytes, walk_ms) = dir_stats(tmp.path());
+            let t_pack = std::time::Instant::now();
             let tar_bytes = pack_dir(tmp.path())?;
+            let tar_pack_ms = t_pack.elapsed().as_millis();
+            let tar_len = tar_bytes.len() as u64;
             // The CAS tarball carries the server's uid/gid/mode (65532, 0755) on
             // every entry incl. `.`, so extracting it resets /workspace itself to
             // `65532:65532 0755` — clobbering the group-writability that fsGroup
@@ -442,6 +457,7 @@ impl K8sExecutor {
             // process — which is always in group 65532 — can write, and setgid on
             // dirs (g+s) so files it creates stay in group 65532 for the egress
             // snapshot. Grants no capability/ownership the operator didn't ask for.
+            let t_feed = std::time::Instant::now();
             self.exec_with_stdin(
                 pods,
                 &name,
@@ -455,6 +471,21 @@ impl K8sExecutor {
                 tar_bytes,
             )
             .await?;
+            let exec_feed_ms = t_feed.elapsed().as_millis();
+            tracing::info!(
+                pod = %name,
+                leg = "feed",
+                inputs = n_inputs,
+                files,
+                tree_bytes,
+                tar_bytes = tar_len,
+                cas_materialize_ms,
+                walk_ms,
+                tar_pack_ms,
+                exec_feed_ms,
+                total_ms = t_leg.elapsed().as_millis(),
+                "ws-timing"
+            );
         }
 
         // --- Leg 2: snapshot after the step exits. --------------------------
@@ -465,6 +496,11 @@ impl K8sExecutor {
                     .get(ANNOTATION_WS_ROOT)
                     .is_some_and(|v| !v.is_empty());
                 if exit == 0 && !already {
+                    // ADR-0061 s0: the other half of the Step boundary — the
+                    // `exec` drain, the server-side unpack, and `Cas::ingest`
+                    // (hash + store, inseparable from out here: `ingest` hashes
+                    // and does its `head`/`put` per blob inside the CAS impl).
+                    let t_leg = std::time::Instant::now();
                     let out = self
                         .exec_capture_stdout(
                             pods,
@@ -473,12 +509,19 @@ impl K8sExecutor {
                             &format!("tar -cf - -C {WORKSPACE_MOUNT_PATH} ."),
                         )
                         .await?;
+                    let exec_drain_ms = t_leg.elapsed().as_millis();
+                    let drain_tar_bytes = out.len() as u64;
                     let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+                    let t_unpack = std::time::Instant::now();
                     unpack_dir(&out, tmp.path())?;
+                    let tar_unpack_ms = t_unpack.elapsed().as_millis();
+                    let (files, tree_bytes, walk_ms) = dir_stats(tmp.path());
+                    let t_ingest = std::time::Instant::now();
                     let snapshot = cas
                         .ingest(tmp.path().to_str().ok_or("tmp path")?)
                         .await
                         .map_err(|e| format!("ingest: {e}"))?;
+                    let cas_ingest_ms = t_ingest.elapsed().as_millis();
                     // Per-path publishing (ADR-0007): restrict the published root
                     // to the authored `outputs:` paths. The whole workspace is
                     // still ingested first — blobs are shared, so pruning is a
@@ -496,6 +539,7 @@ impl K8sExecutor {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let t_prune = std::time::Instant::now();
                     let published = if declared.is_empty() {
                         snapshot.root
                     } else {
@@ -511,6 +555,7 @@ impl K8sExecutor {
                                 )),
                             })?
                     };
+                    let cas_prune_ms = t_prune.elapsed().as_millis();
                     // Record the root on the Pod BEFORE releasing the sidecar:
                     // output() reads it durably across control-plane restarts.
                     let patch = serde_json::json!({
@@ -519,6 +564,21 @@ impl K8sExecutor {
                     pods.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
                         .await
                         .map_err(|e| format!("annotate root: {e}"))?;
+                    tracing::info!(
+                        pod = %name,
+                        leg = "drain",
+                        files,
+                        tree_bytes,
+                        tar_bytes = drain_tar_bytes,
+                        exec_drain_ms,
+                        tar_unpack_ms,
+                        walk_ms,
+                        cas_ingest_ms,
+                        cas_prune_ms,
+                        outputs = declared.len(),
+                        total_ms = t_leg.elapsed().as_millis(),
+                        "ws-timing"
+                    );
                 }
                 // Harvest artifacts of record (ADR-0052): everything the
                 // step wrote to /scarab/artifacts, filtered by its authored
@@ -607,6 +667,10 @@ impl K8sExecutor {
             .and_then(|a| a.get(ANNOTATION_ARTIFACT_GLOBS))
             .and_then(|v| serde_json::from_str(v).ok())
             .unwrap_or_default();
+        // ADR-0061 s0: the artifact harvest is a THIRD `exec` tar tunnel on every
+        // Step boundary (it runs for every terminated step, any exit code), so it
+        // belongs in the same budget as the workspace legs.
+        let t_leg = std::time::Instant::now();
         let out = self
             .exec_capture_stdout(
                 pods,
@@ -615,11 +679,15 @@ impl K8sExecutor {
                 &format!("tar -cf - -C {ARTIFACTS_MOUNT_PATH} . 2>/dev/null || true"),
             )
             .await?;
+        let exec_drain_ms = t_leg.elapsed().as_millis();
+        let drain_tar_bytes = out.len() as u64;
         let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
         if !out.is_empty() {
             let _ = unpack_dir(&out, tmp.path()); // an empty dir tars to nothing
         }
 
+        let t_upload = std::time::Instant::now();
+        let mut uploaded_bytes: u64 = 0;
         let mut metas: Vec<scarab_engine::ArtifactMeta> = Vec::new();
         let mut stack = vec![tmp.path().to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -657,6 +725,7 @@ impl K8sExecutor {
                     .put(&key, bytes.clone())
                     .await
                     .map_err(|e| e.to_string())?;
+                uploaded_bytes += bytes.len() as u64;
                 metas.push(scarab_engine::ArtifactMeta {
                     name: rel.clone(),
                     size: bytes.len() as u64,
@@ -665,6 +734,7 @@ impl K8sExecutor {
                 });
             }
         }
+        let store_upload_ms = t_upload.elapsed().as_millis();
         metas.sort_by(|a, b| a.name.cmp(&b.name));
 
         // Record BEFORE the sidecar releases — artifacts() reads it durably.
@@ -676,6 +746,17 @@ impl K8sExecutor {
         pods.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
             .await
             .map_err(|e| format!("annotate artifacts: {e}"))?;
+        tracing::info!(
+            pod = %name,
+            leg = "artifacts",
+            files = metas.len(),
+            tar_bytes = drain_tar_bytes,
+            uploaded_bytes,
+            exec_drain_ms,
+            store_upload_ms,
+            total_ms = t_leg.elapsed().as_millis(),
+            "ws-timing"
+        );
         Ok(())
     }
 
@@ -920,6 +1001,43 @@ fn pack_dir(dir: &std::path::Path) -> Result<Vec<u8>, String> {
         .append_dir_all(".", dir)
         .map_err(|e| format!("tar pack: {e}"))?;
     builder.into_inner().map_err(|e| format!("tar finish: {e}"))
+}
+
+/// Shape of a materialized workspace tree: `(files, bytes, walk_ms)`.
+///
+/// ADR-0061 s0 measurement support. **File count is the number that matters**:
+/// `S3Storage::materialize` and `ingest_dir` both walk the tree one file at a
+/// time, awaiting a `get_blob` / `head`+`put` round-trip each, so the CAS legs
+/// scale with file count while the `exec` tar legs scale with bytes. Reporting
+/// both is what lets the two be told apart.
+///
+/// Best-effort and non-fatal: an unreadable entry is skipped rather than failing
+/// a Step boundary for a measurement. Cheap — it stats a tree that was just
+/// written, so it is warm in page cache — and timed separately so it can be
+/// subtracted from the phase it sits next to.
+fn dir_stats(dir: &std::path::Path) -> (u64, u64, u128) {
+    let start = std::time::Instant::now();
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(entry.path()),
+                Ok(_) => {
+                    files += 1;
+                    if let Ok(md) = entry.metadata() {
+                        bytes += md.len();
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+    (files, bytes, start.elapsed().as_millis())
 }
 
 /// Unpack a tar stream into `dir`.

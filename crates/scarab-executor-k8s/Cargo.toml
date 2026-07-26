@@ -24,6 +24,9 @@ scarab-forge-github = { workspace = true }
 # The k8s log tail (ADR-0013): kube's `log_stream` yields a `futures::AsyncBufRead`
 # we chunk with `AsyncReadExt`.
 futures = { workspace = true }
+# Structured logging (ADR-0053): the `ws-timing` phase breakdown of a Step
+# boundary that ADR-0061 s0 measures. The server installs the subscriber.
+tracing = { workspace = true }
 
 [dev-dependencies]
 scarab-storage-s3 = { workspace = true }
