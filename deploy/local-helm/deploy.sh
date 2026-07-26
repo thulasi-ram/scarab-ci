@@ -174,6 +174,126 @@ secrets:
 ${PEM_VALUES}
 YAML
 
+# ---------------------------------------------------------------------------
+# PREFLIGHT — before a single cluster object is touched.
+#
+# The workspace service (ADR-0061) runs the SAME image as the server with
+# SCARAB_ROLE=workspace, and it is deployed unconditionally, and its readiness is
+# a hard deploy gate. All three are deliberate. Together they mean the deploy
+# CANNOT succeed against an image whose `scarab-server` predates ADR-0061 — clap
+# rejects the role, the container exits 2, the Pod CrashLoopBackOffs, and
+# `kubectl rollout status statefulset/scarab-workspace` sits there for 180s before
+# timing out with nothing that names the cause.
+#
+# `edge` and `sha-*` are built by image.yml from `main`, so until ADR-0061 merges
+# every mode except `just local-helm local` is in exactly that state. Failing here
+# instead, with the reason and the way out, is the whole point of this block.
+#
+# Deliberately NOT a fallback: there is no flag here that disables the workspace
+# service. ADR-0061 puts it in the standard path in every deployment mode because
+# a fast path plus a fallback path is two mental models, and the moment
+# `workspace.enabled=false` becomes a documented escape hatch, the dogfood stops
+# exercising the thing being dogfooded.
+# ---------------------------------------------------------------------------
+SERVER_IMAGE="${IMAGE_REPOSITORY:-scarab-server}:${TAG}"
+WSFETCH_IMAGE="${SCARAB_WSFETCH_IMAGE:-ghcr.io/thulasi-ram/scarab-wsfetch:edge}"
+
+# Make an image ref available locally, pulling only if it is not already there
+# (`just local-helm local` builds into the Docker store and must not be
+# overwritten by a pull).
+ensure_image() {
+  docker image inspect "$1" >/dev/null 2>&1 && return 0
+  echo "==> pulling $1"
+  docker pull "$1" >/dev/null 2>&1
+}
+
+echo "==> preflight: images"
+if ! ensure_image "$SERVER_IMAGE"; then
+  cat >&2 <<EOF
+refusing: cannot obtain the server image
+    $SERVER_IMAGE
+It is neither in the local Docker store nor pullable. The kubelet will not manage
+any better, so this would deploy straight into ImagePullBackOff.
+
+  * to deploy the working tree:   just local-helm local
+  * to deploy a published build:  just local-helm sha-<gitsha>   (see the ghcr
+    package list for tags image.yml has actually published)
+EOF
+  exit 1
+fi
+
+# Ask the image itself which roles it knows. `--role <nonsense>` makes clap print
+# its possible-values list and exit non-zero, which needs no configuration, no
+# database and no network — and it reports the truth for ANY image version rather
+# than us inferring it from a tag name.
+ROLES="$(docker run --rm "$SERVER_IMAGE" --role __scarab_preflight__ 2>&1 \
+          | sed -n 's/.*\[possible values: \([^]]*\)\].*/\1/p' | tr -d ' ')"
+if [ -z "$ROLES" ]; then
+  cat >&2 <<EOF
+refusing: could not determine which roles $SERVER_IMAGE supports.
+Expected \`scarab-server --role <invalid>\` to print a clap possible-values list.
+This image may not be a scarab-server image at all. Check IMAGE_REPOSITORY in
+$ENVFILE.
+EOF
+  exit 1
+fi
+case ",$ROLES," in
+  *,workspace,*) ;;
+  *)
+    cat >&2 <<EOF
+refusing: $SERVER_IMAGE does not support --role workspace.
+
+  it supports: $ROLES
+
+That image was built from a commit without the ADR-0061 workspace service. This
+deploy would have:
+  1. rolled the control plane fine,
+  2. created statefulset/scarab-workspace from the SAME image,
+  3. had the container exit 2 with
+       error: invalid value 'workspace' for '--role <ROLE>'
+     into CrashLoopBackOff,
+  4. and blocked for 180s on \`kubectl rollout status\` before failing with a
+     timeout that names none of the above.
+
+The workspace service is standard-path (ADR-0061), so it is not disabled to work
+around this. Two honest ways forward:
+
+  * build from this working tree:
+      just local-helm local
+  * deploy a published tag that CONTAINS ADR-0061 (i.e. after it merges to main
+    and image.yml republishes):
+      just local-helm sha-<gitsha>
+EOF
+    exit 1
+    ;;
+esac
+
+# The s3-feed fetcher runs as an init container in every Step Pod that has
+# "needs:". A missing fetcher image does NOT break this deploy — it breaks *runs*,
+# later, quietly: every such Step sits in Init:ImagePullBackOff while this script
+# has already printed "Deployed." Check it here, where the message can say so.
+# (⚠ this whole check goes away with the node driver, git-bug 0628369.)
+if ! ensure_image "$WSFETCH_IMAGE"; then
+  cat >&2 <<EOF
+refusing: cannot obtain the workspace fetcher image
+    $WSFETCH_IMAGE
+
+This would NOT have failed the deploy — it would have failed every RUN, after
+the fact: the ADR-0061 s3-feed fetcher is the init container of every Step Pod
+that inherits a workspace, so each one would sit in Init:ImagePullBackOff long
+after this script printed "Deployed."
+
+\`ghcr.io/thulasi-ram/scarab-wsfetch:edge\` does not exist until image.yml
+publishes it, which happens post-merge. Until then:
+
+  * build it from this working tree:  just local-helm local
+  * or point SCARAB_WSFETCH_IMAGE at a tag that exists.
+EOF
+  exit 1
+fi
+echo "    server $SERVER_IMAGE (roles: $ROLES)"
+echo "    fetcher $WSFETCH_IMAGE"
+
 echo "==> namespace"
 kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 

@@ -14,6 +14,16 @@
   than a fourth release artifact: under one Helm release, server and service
   cannot be different versions.
 
+  THE IMAGE CONTRACT NOTHING HERE CAN EXPRESS: that image's `scarab-server` must
+  know `--role workspace`. One built before ADR-0061 renders a perfectly valid
+  StatefulSet whose container exits 2 with
+    error: invalid value 'workspace' for '--role <ROLE>'
+  and CrashLoopBackOffs. A chart cannot check that, so `deploy/local-helm/deploy.sh`
+  preflights it — it asks the image which roles it supports and refuses the deploy
+  with the cause and the way out. An operator installing this chart directly owns
+  the same check; the failure is a CrashLoopBackOff on this StatefulSet with that
+  message in the container log.
+
   Note what this Pod does NOT get:
     * no SCARAB_DATABASE_URL is *used* — the workspace role never connects to
       Postgres and never runs a migration (ADR-0061; Role::needs_durable_core).

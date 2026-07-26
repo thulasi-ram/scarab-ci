@@ -37,6 +37,51 @@ repo keeps finding.
 > kubelet, but no `just local-helm` run has exercised the StatefulSet, its PVC, or
 > whether a rerun of a pre-restart Run now restores instead of hanging.
 
+### `just local-helm` only works on an image that knows the workspace role
+
+Three deliberate choices interact badly, and until ADR-0061 merges they rule out
+every mode except `local`:
+
+1. the workspace service runs the **same image** as the server, with
+   `SCARAB_ROLE=workspace` (that is the anti-skew property);
+2. it is deployed **unconditionally** — standard path, no flag;
+3. its readiness is a **hard deploy gate**.
+
+`edge` and `sha-*` are built by `image.yml` from `main`. A `scarab-server` from
+before ADR-0061 has no `workspace` variant in its `--role` enum, so clap rejects
+the value, the container exits 2, the Pod CrashLoopBackOffs, and
+`kubectl rollout status statefulset/scarab-workspace` blocks for 180s before
+timing out **without naming any of that**.
+
+`deploy.sh` now **preflights** it, before touching a single cluster object. It
+asks the image itself which roles it knows (`--role <nonsense>` makes clap print
+its possible-values list — no config, no database, no network) and refuses with
+the cause, the consequence, and the way out. It preflights the **fetcher** image
+the same way, because that one fails differently and worse: a missing
+`scarab-wsfetch` does not break the deploy at all, it leaves every Step that
+inherits a workspace sitting in `Init:ImagePullBackOff` *after* the script has
+printed "Deployed." `ghcr.io/thulasi-ram/scarab-wsfetch:edge` does not exist until
+`image.yml` publishes it post-merge.
+
+So, today:
+
+```sh
+just local-helm local        # ✅ builds server + clone + sidecar + wsfetch from the tree
+just local-helm              # ❌ refused: `edge` predates ADR-0061 (and no wsfetch:edge yet)
+just local-helm sha-<sha>    # ✅ only once image.yml has published ADR-0061
+```
+
+There is deliberately **no flag that disables the workspace service** to work
+around this, and none should be added. ADR-0061 puts it in the standard path in
+every deployment mode precisely because a fast path plus a fallback path is two
+mental models — and the moment `workspace.enabled=false` becomes a documented
+escape hatch, the dogfood stops exercising the thing being dogfooded. The
+preflight's job is a clear error, not a fallback.
+
+An operator installing `deploy/helm/scarab` directly owns the same check; the
+symptom there is a CrashLoopBackOff on `statefulset/<release>-workspace` with the
+clap error in the container log.
+
 ## Config — one file
 Everything (image, App knobs, secrets, reseed inputs) lives in `deploy/local-helm/.env`
 (gitignored). Both scripts source it; a real environment variable already set in
