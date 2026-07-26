@@ -22,6 +22,20 @@ futures = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
 
+# The ADR-0061 s3-feed fetcher (`docker/wsfetch/`): the init container that
+# materialises a Step's input snapshots straight from the workspace service,
+# replacing the `kubectl exec` tar tunnel. It lives HERE rather than in its own
+# crate because its whole job is to call this crate's `Cas::materialize` — the
+# one implementation that carries the mode/mtime/symlink fidelity rules and has
+# tests pinning them. A separate crate would have had to depend on this one for
+# exactly that, and would have invited a second, drifting copy.
+#
+# A stepping stone, deliberately: git-bug 0628369 closes only when this target
+# and `docker/wsfetch/` are DELETED by the node driver (ADR-0061 D2.3).
+[[bin]]
+name = "scarab-wsfetch"
+path = "src/bin/scarab-wsfetch.rs"
+
 [dev-dependencies]
 # The acceptance test drives the REAL workspace service (from scarab-server)
 # over a REAL TieredCas on tempdirs. Classical, not mockist: the only thing

@@ -52,6 +52,35 @@ const LOG_CHUNK_BYTES: usize = 8 * 1024;
 /// Default graceful-cancel window: SIGTERM, then SIGKILL after this many seconds.
 const CANCEL_GRACE_SECS: i64 = 30;
 
+/// What a Step Pod needs to fetch its own input snapshots (ADR-0061 s3-feed).
+///
+/// Present ⇒ a Step with `needs:` gets a **Scarab-owned** init container
+/// ([`DEFAULT_WSFETCH_IMAGE`]) that dials the workspace service directly.
+/// Absent ⇒ such a Step **cannot be launched at all**
+/// ([`workspace_feed_is_satisfiable`]), and that is deliberate: the
+/// control-plane `kubectl exec` tar tunnel this replaced is deleted, not kept as
+/// a fallback. ADR-0061 D2.3 draws that line explicitly — an eager path is
+/// permitted as a *temporally ordered replacement*, never as a runtime branch,
+/// because a fallback that works is a fallback that becomes permanent.
+///
+/// ⚠ **ADR-0061 s3-feed: DELETE ME with the node driver (git-bug 0628369).**
+/// This whole type is the stepping stone. The driver mounts a snapshot lazily as
+/// a read-only lower layer, at which point there is no fetcher, no image, and no
+/// eager copy of anything.
+#[derive(Debug, Clone)]
+pub struct WorkspaceFetch {
+    /// Base URL of the workspace service **as a Pod sees it**. In proc mode
+    /// that is generally *not* the URL the host uses (see
+    /// `deploy/local-proc/up.sh`).
+    pub url: String,
+    /// HMAC secret the workspace token is minted with — the same secret the
+    /// service verifies with. Never the results-egress secret: see
+    /// [`workspace_token`] for the three reasons that reuse is refused.
+    pub token_secret: Vec<u8>,
+    /// The fetcher image. Digest-pin in production, exactly like the clone image.
+    pub fetcher_image: String,
+}
+
 /// Configuration for the trusted per-Pod results-egress sidecar (ADR-0042). When
 /// present, each step Pod gains a shared `/scarab/results` volume and a sidecar
 /// that reads the step's `<name>.json` files and does a confirmed, fence-token-
@@ -110,12 +139,15 @@ pub struct K8sExecutor {
     /// digest-pinned in production, never the author's image.
     clone_image: String,
     /// The workspace CAS (ADR-0029/0045). When wired, every step Pod gets the
-    /// `/workspace` machinery: an init container that receives the merged
-    /// `needs` workspaces (materialized by the control plane and streamed in
-    /// over exec), and an egress sidecar the control plane snapshots back
-    /// into the CAS after the step exits. `None` = no workspace flow (tests /
-    /// object-store-less dev).
+    /// `/workspace` machinery: an init container that **fetches** the merged
+    /// `needs` snapshots straight from the workspace service (ADR-0061 s3-feed),
+    /// and an egress sidecar the control plane snapshots back into the CAS after
+    /// the step exits. `None` = no workspace flow (tests / object-store-less dev).
     workspace_cas: Option<Arc<dyn Cas>>,
+    /// The workspace service a Step Pod fetches its inputs from (ADR-0061
+    /// s3-feed). Required for any Step with `needs:` once the workspace flow is
+    /// on — there is no control-plane feed path any more.
+    workspace_fetch: Option<WorkspaceFetch>,
     /// The artifact blob store (ADR-0052). When wired (and the workspace
     /// flow is on), every step Pod gets a `/scarab/artifacts` emptyDir that
     /// is harvested post-step: matching files upload as object blobs and the
@@ -133,6 +165,7 @@ impl K8sExecutor {
             results_egress: None,
             default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
             workspace_cas: None,
+            workspace_fetch: None,
             artifact_store: None,
             clone_image: DEFAULT_CLONE_IMAGE.to_string(),
             placement: PlacementConfig::default(),
@@ -146,6 +179,7 @@ impl K8sExecutor {
             results_egress: None,
             default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
             workspace_cas: None,
+            workspace_fetch: None,
             artifact_store: None,
             clone_image: DEFAULT_CLONE_IMAGE.to_string(),
             placement: PlacementConfig::default(),
@@ -173,11 +207,23 @@ impl K8sExecutor {
         self
     }
 
-    /// Enable the workspace CAS flow (ADR-0029/0045): materialize `needs`
-    /// workspaces into each step Pod and snapshot `/workspace` back after it
-    /// exits.
+    /// Enable the workspace CAS flow (ADR-0029/0045): give each step Pod a
+    /// `/workspace` its `needs` snapshots are fetched into, and snapshot it back
+    /// after the step exits.
+    ///
+    /// This wires the **drain** half. A Step with `needs:` additionally requires
+    /// [`with_workspace_service`](Self::with_workspace_service) — the feed half
+    /// now happens inside the Pod (ADR-0061 s3-feed), not on the control plane.
     pub fn with_workspace_cas(mut self, cas: Arc<dyn Cas>) -> Self {
         self.workspace_cas = Some(cas);
+        self
+    }
+
+    /// Point Step Pods at the workspace service for their inputs (ADR-0061
+    /// s3-feed): the `scarab-workspace-init` container becomes the Scarab-owned
+    /// fetcher, and no workspace bytes cross the Kubernetes API server.
+    pub fn with_workspace_service(mut self, fetch: WorkspaceFetch) -> Self {
+        self.workspace_fetch = Some(fetch);
         self
     }
 
@@ -223,12 +269,159 @@ impl K8sExecutor {
         &self,
         pod_name: &str,
         pod: &Pod,
+        step: &StepRun,
         spec: &StepSpec,
     ) -> Result<(), ExecError> {
         self.ensure_clone_secret(pod_name, pod, spec).await?;
         self.ensure_registry_secret(pod_name, pod, spec).await?;
         self.ensure_oidc_secret(pod_name, pod, spec).await?;
+        self.ensure_workspace_secret(pod_name, pod, step, spec)
+            .await?;
         Ok(())
+    }
+
+    /// Upsert the per-Pod Secret carrying the **workspace token** (ADR-0061):
+    /// mounted read-only on tmpfs at [`workspace_token::WORKSPACE_SECRETS_MOUNT_PATH`],
+    /// pointed at by `SCARAB_WORKSPACE_TOKEN_FILE`, and held only by the fetcher
+    /// init container — never by the untrusted step container.
+    ///
+    /// Re-minted on every call, exactly like the clone credential, because the
+    /// token carries an **expiry**: a Pod adopted by a re-drive twenty minutes
+    /// later must not present a token that expired while it was Pending.
+    /// [`workspace_token::mint`] is deterministic in its claims, so a re-mint at
+    /// the same instant is byte-identical and the replace is a no-op.
+    async fn ensure_workspace_secret(
+        &self,
+        pod_name: &str,
+        pod: &Pod,
+        step: &StepRun,
+        spec: &StepSpec,
+    ) -> Result<(), ExecError> {
+        // No inputs ⇒ no fetch ⇒ no credential. Not "an empty token": a Secret
+        // that exists is a Secret something might mount.
+        if self.workspace_cas.is_none() || spec.workspace_inputs.is_empty() {
+            return Ok(());
+        }
+        let Some(fetch) = &self.workspace_fetch else {
+            return Ok(());
+        };
+        let token = self.mint_workspace_token(fetch, step, spec);
+        self.put_workspace_token_secret(pod_name, Some(pod), token)
+            .await
+    }
+
+    /// Create-or-replace the per-Pod workspace-token Secret. Shared by the step
+    /// path and the debug Pod so there is exactly one place that decides the
+    /// Secret's name, key and owner reference.
+    async fn put_workspace_token_secret(
+        &self,
+        pod_name: &str,
+        pod: Option<&Pod>,
+        token: String,
+    ) -> Result<(), ExecError> {
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+            Api::namespaced(client, &self.namespace);
+        let secret = k8s_openapi::api::core::v1::Secret {
+            metadata: ObjectMeta {
+                name: Some(workspace_secret_name(pod_name)),
+                namespace: Some(self.namespace.clone()),
+                owner_references: pod.and_then(|p| p.metadata.uid.clone()).map(|uid| {
+                    vec![
+                        k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                            api_version: "v1".into(),
+                            kind: "Pod".into(),
+                            name: pod_name.to_string(),
+                            uid,
+                            ..Default::default()
+                        },
+                    ]
+                }),
+                ..Default::default()
+            },
+            string_data: Some(std::collections::BTreeMap::from([(
+                workspace_token::WORKSPACE_TOKEN_KEY.to_string(),
+                token,
+            )])),
+            ..Default::default()
+        };
+        match secrets.create(&PostParams::default(), &secret).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(ae)) if ae.code == 409 => secrets
+                .replace(
+                    &workspace_secret_name(pod_name),
+                    &PostParams::default(),
+                    &secret,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| ExecError::Launch(format!("workspace secret: {e}"))),
+            Err(e) => Err(ExecError::Launch(format!("workspace secret: {e}"))),
+        }
+    }
+
+    /// The debug Pod's workspace token: the same codec, fenced to the step being
+    /// reproduced with attempt `debug`, and scoped to the ONE snapshot root it
+    /// re-materialises. Not [`Scope::Browse`](workspace_token::Scope::Browse) —
+    /// browse tokens are minted by the control plane for itself and are not root
+    /// limited, and a debug Pod is a Pod.
+    fn mint_debug_workspace_token(
+        &self,
+        fetch: &WorkspaceFetch,
+        step: &StepRun,
+        root: &str,
+        ttl_secs: u64,
+    ) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let exp = workspace_token::expiry_for(now, u32::try_from(ttl_secs).unwrap_or(u32::MAX));
+        let claims = workspace_token::step_claims(
+            workspace_token::Fence {
+                run: step.run.0.clone(),
+                step: step.step.0.clone(),
+                attempt: "debug".to_string(),
+            },
+            exp,
+            vec![root.to_string()],
+        );
+        workspace_token::mint(&fetch.token_secret, &claims)
+    }
+
+    /// Mint the fence-scoped, expiring, root-limited workspace token for a Step.
+    ///
+    /// `roots` is exactly the Step's declared inputs, so the service can refuse a
+    /// tree read the Step was never given (`WorkspaceClaims::may_read_tree`) — a
+    /// compromised Step cannot enumerate other runs' snapshots by asking.
+    fn mint_workspace_token(
+        &self,
+        fetch: &WorkspaceFetch,
+        step: &StepRun,
+        spec: &StepSpec,
+    ) -> String {
+        let attempt = step
+            .current_attempt()
+            .map(|a| a.id.0.clone())
+            .unwrap_or_else(|| "0".to_string());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let exp = workspace_token::expiry_for(
+            now,
+            spec.timeout_seconds.unwrap_or(self.default_step_timeout_secs),
+        );
+        let claims = workspace_token::step_claims(
+            workspace_token::Fence {
+                run: step.run.0.clone(),
+                step: step.step.0.clone(),
+                attempt,
+            },
+            exp,
+            spec.workspace_inputs.clone(),
+        );
+        workspace_token::mint(&fetch.token_secret, &claims)
     }
 
     async fn ensure_clone_secret(
@@ -386,20 +579,41 @@ impl K8sExecutor {
         }
     }
 
-    /// Drive the workspace lifecycle for `pod` (ADR-0029/0045). Two idempotent
-    /// legs, all state derived from the Pod itself:
+    /// Drive the workspace lifecycle for `pod` (ADR-0029/0045/0061). **One**
+    /// idempotent leg now, all state derived from the Pod itself:
     ///
-    /// 1. **Feed** — while the `scarab-workspace-init` container is running
-    ///    (it waits on a marker), materialize the input CAS roots (from the
-    ///    Pod annotation) into a temp dir, stream them in as a tar over exec,
-    ///    and touch the marker. Only content the Pod lacks moves: the init
-    ///    container only ever runs before the step, exactly once per Pod.
-    /// 2. **Snapshot** — once the step container has terminated and the
-    ///    egress sidecar is still holding the Pod open, tar `/workspace` out
-    ///    (successful steps only), `Cas::ingest` it (per-file merkle dedup —
-    ///    unchanged blobs upload nothing), patch the root onto the Pod as an
-    ///    annotation, harvest the artifacts of record (EVERY terminated step,
-    ///    whatever its exit code — a28a173), then release the sidecar.
+    /// **Snapshot (drain)** — once the step container has terminated and the
+    /// egress sidecar is still holding the Pod open, tar `/workspace` out
+    /// (successful steps only), `Cas::ingest` it (per-file merkle dedup —
+    /// unchanged blobs upload nothing), patch the root onto the Pod as an
+    /// annotation, harvest the artifacts of record (EVERY terminated step,
+    /// whatever its exit code — a28a173), then release the sidecar.
+    ///
+    /// # The feed leg used to be here, and is gone (ADR-0061 s3-feed)
+    ///
+    /// It materialised every input into a control-plane tempdir, tarred it, and
+    /// streamed the tar into a `busybox` doorstop over `kubectl exec`. The
+    /// fetcher init container ([`WorkspaceFetch`]) does it inside the Pod now, so
+    /// this function's only remaining involvement in the feed is *nothing* —
+    /// there is no marker to touch and no barrier to release. Three things
+    /// improved, and only one of them is speed:
+    ///
+    /// - bulk data no longer crosses the **API server** (structural);
+    /// - the control plane no longer writes then re-reads the whole workspace
+    ///   through its page cache — s2 measured that tmpdir round-trip *growing* to
+    ///   ~4.7 s as the CAS leg got faster, so it had to be removed rather than
+    ///   accelerated;
+    /// - a **partial** tree can no longer be published as a Step's authoritative
+    ///   snapshot (git-bug `a3e7845`): a failed fetch fails the init container and
+    ///   the Step never runs.
+    ///
+    /// s0 priced the deleted tunnel at 4–15% of a Step boundary, so this is not
+    /// sold as a performance win. It is the prerequisite for lazy materialisation,
+    /// which is.
+    ///
+    /// The **drain** tunnel (and the third `exec` tar inside
+    /// [`harvest_artifacts`](Self::harvest_artifacts)) are still here on purpose:
+    /// s3-drain is a separately-ticketed slice (git-bug `7f05f39`).
     async fn drive_workspace(
         &self,
         pods: &Api<Pod>,
@@ -408,93 +622,18 @@ impl K8sExecutor {
     ) -> Result<(), DriveErr> {
         let name = pod.metadata.name.clone().ok_or("pod has no name")?;
         let annotations = pod.metadata.annotations.clone().unwrap_or_default();
-        // Not a workspace Pod (built before the CAS was wired) — nothing to do.
-        let Some(inputs_csv) = annotations.get(ANNOTATION_WS_INPUTS) else {
-            return Ok(());
-        };
+        // No "is this a workspace Pod?" guard here any more, and that is the
+        // untangling git-bug 7f05f39 asked for. It used to be
+        // `annotations.contains(ANNOTATION_WS_INPUTS)`, which conflated two
+        // different questions — "is this a workspace Pod" (annotation *present*,
+        // inserted even when empty) and "does it need a feed" (annotation
+        // *non-empty*). The drain leg below already asks the only question that
+        // matters, and asks it of the Pod's own containers rather than of an
+        // annotation: a non-workspace Pod has no egress sidecar, so every branch
+        // below is a no-op for it. `ANNOTATION_WS_INPUTS` is now written only
+        // when there ARE inputs, and is evidence rather than control flow.
 
-        // --- Leg 1: feed the waiting init container. -----------------------
-        if init_container_running(pod, WORKSPACE_INIT_CONTAINER) && !inputs_csv.is_empty() {
-            // ADR-0061 s0: split this half of the Step boundary into its parts —
-            // CAS read, server-side tar pack, and the `exec` tunnel — so the win
-            // ADR-0061 argues for structurally can be *sized*. Deliberately
-            // cheap and local: s3 deletes the tunnel and these timers with it.
-            let t_leg = std::time::Instant::now();
-            let mut n_inputs = 0usize;
-            let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
-            for root in inputs_csv.split(',').filter(|r| !r.is_empty()) {
-                n_inputs += 1;
-                // Later inputs overlay earlier ones (merge-in-order, ADR-0007).
-                cas.materialize(
-                    &scarab_storage::TreeHash(root.to_string()),
-                    tmp.path().to_str().ok_or("tmp path")?,
-                )
-                .await
-                .map_err(|e| match e {
-                    // Permanent: the input workspace blob is gone from the object
-                    // store (evicted, or — the classic dev footgun — the store
-                    // lived on an emptyDir that a restart wiped). The step can
-                    // never be provisioned, so fail the attempt fast rather than
-                    // leave the `scarab-workspace-init` barrier waiting forever.
-                    scarab_storage::StorageError::NotFound => DriveErr::InputMissing(format!(
-                        "workspace input {root} is missing from the object store — cannot \
-                         provision this step (blob evicted or the store was wiped)"
-                    )),
-                    other => DriveErr::Transient(format!("materialize {root}: {other}")),
-                })?;
-            }
-            // CAS read = object-storage GETs + writing the tree to a temp dir.
-            // `S3Storage::materialize` walks the merkle tree with one sequential
-            // `get_blob` per file, so this scales with FILE COUNT, not bytes.
-            let cas_materialize_ms = t_leg.elapsed().as_millis();
-            let (files, tree_bytes, walk_ms) = dir_stats(tmp.path());
-            let t_pack = std::time::Instant::now();
-            let tar_bytes = pack_dir(tmp.path())?;
-            let tar_pack_ms = t_pack.elapsed().as_millis();
-            let tar_len = tar_bytes.len() as u64;
-            // The CAS tarball carries the server's uid/gid/mode (65532, 0755) on
-            // every entry incl. `.`, so extracting it resets /workspace itself to
-            // `65532:65532 0755` — clobbering the group-writability that fsGroup
-            // (also 65532) set up at mount time. A `run_as_root` step (uid 0, all
-            // caps incl. DAC_OVERRIDE dropped), or any non-root image whose uid
-            // isn't 65532, is then a member of group 65532 via fsGroup but can't
-            // write the group-unwritable tree (b04697f: `Permission denied` on
-            // e.g. cargo's target dir). Restore group write (g+w) so every step
-            // process — which is always in group 65532 — can write, and setgid on
-            // dirs (g+s) so files it creates stay in group 65532 for the egress
-            // snapshot. Grants no capability/ownership the operator didn't ask for.
-            let t_feed = std::time::Instant::now();
-            self.exec_with_stdin(
-                pods,
-                &name,
-                WORKSPACE_INIT_CONTAINER,
-                &format!(
-                    "tar -xf - -C {WORKSPACE_MOUNT_PATH} \
-                     && chmod -R g+rwX {WORKSPACE_MOUNT_PATH} \
-                     && find {WORKSPACE_MOUNT_PATH} -type d -exec chmod g+s {{}} ';' \
-                     && touch {CTL_MOUNT_PATH}/init-done"
-                ),
-                tar_bytes,
-            )
-            .await?;
-            let exec_feed_ms = t_feed.elapsed().as_millis();
-            tracing::info!(
-                pod = %name,
-                leg = "feed",
-                inputs = n_inputs,
-                files,
-                tree_bytes,
-                tar_bytes = tar_len,
-                cas_materialize_ms,
-                walk_ms,
-                tar_pack_ms,
-                exec_feed_ms,
-                total_ms = t_leg.elapsed().as_millis(),
-                "ws-timing"
-            );
-        }
-
-        // --- Leg 2: snapshot after the step exits. --------------------------
+        // --- The one leg: snapshot after the step exits. --------------------
         let step_exit = step_terminated_exit(pod);
         if let Some(exit) = step_exit {
             if init_container_running(pod, WORKSPACE_EGRESS_CONTAINER) {
@@ -871,16 +1010,18 @@ fn clone_secret_name(pod_name: &str) -> String {
 }
 
 /// Is the named (init) container currently in a `running` state?
-/// Why a `drive_workspace` call failed. `InputMissing` is a **permanent**
-/// provisioning failure — a CAS input the step needs is gone, so it can never
-/// start and the attempt must fail fast (`poll` deletes the barrier-stuck Pod
-/// and reports `Infra { never_started }`). `Transient` is anything else (a
-/// store blip, an exec hiccup): `poll` surfaces it as an error and re-drives.
+/// Why a `drive_workspace` call failed. `Transient` is the default (a store
+/// blip, an exec hiccup): `poll` surfaces it as an error and re-drives.
 /// `From<String>`/`From<&str>` keep every `?` inside `drive_workspace` — which
-/// all yield string errors — compiling unchanged; only the CAS `materialize`
-/// call is special-cased to distinguish the two.
+/// all yield string errors — compiling unchanged.
+///
+/// There used to be an `InputMissing` variant for "a CAS input this step needs is
+/// gone". It is gone with the feed leg (ADR-0061 s3-feed): the *fetcher* is the
+/// thing that now discovers a missing snapshot, from inside the Pod, and it
+/// reports it by exiting non-zero. `pod_state` classifies that as
+/// `Infra { never_started: true }` — deliberately the identical verdict this
+/// variant produced, so nothing downstream of the executor changed.
 enum DriveErr {
-    InputMissing(String),
     Transient(String),
     /// A declared `outputs:` path was not produced (or is not a legal
     /// workspace-relative path) — permanent and author-fixable, so it fails the
@@ -891,9 +1032,7 @@ enum DriveErr {
 impl std::fmt::Display for DriveErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DriveErr::InputMissing(s)
-            | DriveErr::Transient(s)
-            | DriveErr::OutputContract(s) => f.write_str(s),
+            DriveErr::Transient(s) | DriveErr::OutputContract(s) => f.write_str(s),
         }
     }
 }
@@ -999,15 +1138,11 @@ fn artifact_harvest_owed(pod: &Pod, harvesting: bool) -> bool {
             .is_some_and(|a| a.contains_key(ANNOTATION_ARTIFACTS))
 }
 
-/// Pack `dir` into an uncompressed tar (workspaces move within one cluster
-/// hop; compression buys little and costs CPU).
-fn pack_dir(dir: &std::path::Path) -> Result<Vec<u8>, String> {
-    let mut builder = tar::Builder::new(Vec::new());
-    builder
-        .append_dir_all(".", dir)
-        .map_err(|e| format!("tar pack: {e}"))?;
-    builder.into_inner().map_err(|e| format!("tar finish: {e}"))
-}
+// `pack_dir` lived here: it tarred a control-plane tempdir for the feed leg's
+// `exec` tunnel and for the debug Pod's copy of it. Both are deleted (ADR-0061
+// s3-feed), and nothing else ever packed a tar — the drain and the artifact
+// harvest only *unpack* one (`unpack_dir`), because the tar is produced inside
+// the Pod by `tar -cf -`.
 
 /// Shape of a materialized workspace tree: `(files, bytes, walk_ms)`.
 ///
@@ -1058,6 +1193,16 @@ impl Executor for K8sExecutor {
         let pods = self.pods()?;
         let name = pod_name(step);
 
+        // ADR-0061 s3-feed, fail-closed and BEFORE any Pod exists: a Step with
+        // input snapshots is provisioned by the fetcher talking to the workspace
+        // service, and there is no control-plane feed to fall back on. Refusing
+        // here (rather than creating a Pod whose `/workspace` would silently be
+        // empty) is the whole point — an empty workspace does not fail, it
+        // produces a wrong answer, and a wrong answer in the durable record is
+        // the one thing this product may not do (CONTEXT.md §2).
+        workspace_feed_is_satisfiable(spec, self.workspace_cas.is_some(), self.workspace_fetch.as_ref())
+            .map_err(ExecError::Launch)?;
+
         // Re-attach: if the Pod already exists (a prior launch we may not have
         // observed completing), adopt it instead of creating a duplicate.
         let existing = pods
@@ -1065,8 +1210,9 @@ impl Executor for K8sExecutor {
             .await
             .map_err(|e| ExecError::Launch(e.to_string()))?;
         if let Some(pod) = existing {
-            // Refresh the short-TTL clone credential on re-drives (ADR-0045).
-            self.ensure_step_secrets(&name, &pod, spec).await?;
+            // Refresh the short-TTL clone credential and re-mint the expiring
+            // workspace token on re-drives (ADR-0045 / ADR-0061).
+            self.ensure_step_secrets(&name, &pod, step, spec).await?;
             return Ok(ExecHandle(name));
         }
 
@@ -1079,6 +1225,7 @@ impl Executor for K8sExecutor {
             self.default_step_timeout_secs,
             self.workspace_cas.is_some(),
             &self.clone_image,
+            self.workspace_fetch.as_ref(),
         );
         // ADR-0055: stamp the baseline, merge the named PlacementProfiles + the
         // governed k8s_overlay, and apply requested resources — fallible because a
@@ -1086,7 +1233,7 @@ impl Executor for K8sExecutor {
         let pod = apply_placement(pod, spec, &self.placement).map_err(ExecError::Launch)?;
         match pods.create(&PostParams::default(), &pod).await {
             Ok(created) => {
-                self.ensure_step_secrets(&name, &created, spec).await?;
+                self.ensure_step_secrets(&name, &created, step, spec).await?;
                 Ok(ExecHandle(name))
             }
             // A concurrent launcher (or a re-drive) won the create race — the
@@ -1101,7 +1248,7 @@ impl Executor for K8sExecutor {
                     .await
                     .map_err(|e| ExecError::Launch(e.to_string()))?
                 {
-                    self.ensure_step_secrets(&name, &pod, spec).await?;
+                    self.ensure_step_secrets(&name, &pod, step, spec).await?;
                 }
                 Ok(ExecHandle(name))
             }
@@ -1124,23 +1271,6 @@ impl Executor for K8sExecutor {
                 if let Some(cas) = &self.workspace_cas {
                     match self.drive_workspace(&pods, &pod, cas.as_ref()).await {
                         Ok(()) => {}
-                        // Permanent: an input workspace is gone from the object
-                        // store, so this step can never be provisioned. Delete
-                        // the Pod stuck on the workspace-init barrier and fail
-                        // the attempt fast — `Infra { never_started: true }`
-                        // (the main process never ran ⇒ no side effect) — with a
-                        // clear reason, instead of the init container waiting
-                        // forever. Bounded retries then dead-letter deterministically.
-                        Err(DriveErr::InputMissing(msg)) => {
-                            eprintln!("scarab-executor: {msg} (pod {})", handle.0);
-                            let _ = pods.delete(&handle.0, &DeleteParams::default()).await;
-                            return Ok(ExecState::Failed {
-                                exit_code: None,
-                                class: FailureClass::Infra {
-                                    never_started: true,
-                                },
-                            });
-                        }
                         // Permanent and author-fixable (ADR-0007): the step ran and
                         // exited 0, but did not honor its declared `outputs:`
                         // contract. Retrying the identical spec cannot fix it, so
@@ -1617,32 +1747,44 @@ impl DebugLauncher for K8sExecutor {
             mount_path: WORKSPACE_MOUNT_PATH.to_string(),
             ..Default::default()
         };
-        let ctl_mount = VolumeMount {
-            name: CTL_VOLUME.to_string(),
-            mount_path: CTL_MOUNT_PATH.to_string(),
+        // The debug Pod's feed goes through the SAME fetcher as a real Step's
+        // (ADR-0061 s3-feed). It used to carry a copy-pasted control-plane feed —
+        // its own `cas.materialize` into a tempdir, its own `pack_dir`, its own
+        // `tar -xf -` over exec, its own `chmod -R g+rwX` — which is git-bug
+        // 64897db: two implementations of one contract, only one of them tested,
+        // free to drift on merge order and on the ownership fix-up. There is now
+        // one.
+        let mut init_containers: Vec<Container> = Vec::new();
+        let mut volumes: Vec<Volume> = vec![Volume {
+            name: WORKSPACE_VOLUME.to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
             ..Default::default()
-        };
-        // With a snapshot, the init container waits for the control-plane feed;
-        // without one, it exits immediately and the shell starts empty.
-        let wait = if snapshot_root.is_some() {
-            format!("until [ -f {CTL_MOUNT_PATH}/init-done ]; do sleep 0.2; done")
-        } else {
-            "exit 0".to_string()
-        };
-        let init = Container {
-            name: WORKSPACE_INIT_CONTAINER.to_string(),
-            image: Some(WORKSPACE_HELPER_IMAGE.to_string()),
-            command: Some(vec!["sh".into(), "-c".into(), wait]),
-            volume_mounts: Some(vec![ws_mount.clone(), ctl_mount.clone()]),
-            ..Default::default()
-        };
+        }];
+        if let Some(root) = snapshot_root {
+            // No workspace service ⇒ no way to re-materialise the snapshot, and
+            // no fallback (see `workspace_feed_is_satisfiable`). Reporting
+            // `Unavailable` is what the old code did when the CAS was unwired; the
+            // reason has moved, the verdict has not.
+            let fetch = self
+                .workspace_fetch
+                .as_ref()
+                .ok_or(ExecError::Unavailable)?;
+            let (container, token_volume) = workspace_fetch_container(
+                &name,
+                fetch,
+                std::slice::from_ref(&root.to_string()),
+                &ws_mount,
+            );
+            init_containers.push(container);
+            volumes.push(token_volume);
+        }
         let shell = Container {
             name: STEP_CONTAINER.to_string(),
             image: Some(image.to_string()),
             // Keep the Pod alive so it can be shelled into; TTL-bounded.
             command: Some(vec!["sleep".into(), ttl_secs.to_string()]),
             working_dir: Some(WORKSPACE_MOUNT_PATH.to_string()),
-            volume_mounts: Some(vec![ws_mount, ctl_mount]),
+            volume_mounts: Some(vec![ws_mount]),
             ..Default::default()
         };
         let pod = Pod {
@@ -1662,7 +1804,7 @@ impl DebugLauncher for K8sExecutor {
             },
             spec: Some(PodSpec {
                 restart_policy: Some("Never".to_string()),
-                init_containers: Some(vec![init]),
+                init_containers: (!init_containers.is_empty()).then_some(init_containers),
                 containers: vec![shell],
                 // Same workspace-ownership contract as a real step Pod: the
                 // re-materialized snapshot is owned by `WORKSPACE_GID` and only
@@ -1673,18 +1815,7 @@ impl DebugLauncher for K8sExecutor {
                     supplemental_groups: Some(vec![WORKSPACE_GID]),
                     ..Default::default()
                 }),
-                volumes: Some(vec![
-                    Volume {
-                        name: WORKSPACE_VOLUME.to_string(),
-                        empty_dir: Some(EmptyDirVolumeSource::default()),
-                        ..Default::default()
-                    },
-                    Volume {
-                        name: CTL_VOLUME.to_string(),
-                        empty_dir: Some(EmptyDirVolumeSource::default()),
-                        ..Default::default()
-                    },
-                ]),
+                volumes: Some(volumes),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1693,38 +1824,28 @@ impl DebugLauncher for K8sExecutor {
             .await
             .map_err(|e| ExecError::Other(format!("create debug pod: {e}")))?;
 
-        // Re-materialize the step's output snapshot into /workspace (same feed
-        // path as a real step's inputs).
-        if let Some(root) = snapshot_root {
-            let cas = self.workspace_cas.clone().ok_or(ExecError::Unavailable)?;
-            self.wait_container(&pods, &name, WORKSPACE_INIT_CONTAINER, true, 90)
-                .await?;
-            let tmp = tempfile::tempdir().map_err(|e| ExecError::Other(e.to_string()))?;
-            cas.materialize(
-                &scarab_storage::TreeHash(root.to_string()),
-                tmp.path()
-                    .to_str()
-                    .ok_or_else(|| ExecError::Other("tmp path".into()))?,
-            )
-            .await
-            .map_err(|e| ExecError::Other(format!("materialize {root}: {e}")))?;
-            let tar = pack_dir(tmp.path()).map_err(ExecError::Other)?;
-            self.exec_with_stdin(
-                &pods,
+        // The token Secret must exist before the kubelet mounts it, but the Pod
+        // must exist before the Secret can be owner-referenced to it — the same
+        // create-then-provision order every other per-Pod credential uses, and the
+        // reason a FailedMount here resolves itself on the kubelet's retry rather
+        // than wedging.
+        if let (Some(root), Some(fetch)) = (snapshot_root, self.workspace_fetch.as_ref()) {
+            let created = pods
+                .get_opt(&name)
+                .await
+                .map_err(|e| ExecError::Other(e.to_string()))?;
+            self.put_workspace_token_secret(
                 &name,
-                WORKSPACE_INIT_CONTAINER,
-                &format!(
-                    "tar -xf - -C {WORKSPACE_MOUNT_PATH} \
-                     && chmod -R g+rwX {WORKSPACE_MOUNT_PATH} \
-                     && find {WORKSPACE_MOUNT_PATH} -type d -exec chmod g+s {{}} ';' \
-                     && touch {CTL_MOUNT_PATH}/init-done"
-                ),
-                tar,
+                created.as_ref(),
+                self.mint_debug_workspace_token(fetch, step, root, ttl_secs),
             )
-            .await
-            .map_err(ExecError::Other)?;
+            .await?;
         }
-        // Wait for the shell container to be running before we let a client attach.
+
+        // Wait for the shell container to be running before we let a client
+        // attach. The fetcher is an ordinary init container, so the kubelet will
+        // not start this until the workspace is provisioned — the wait that used
+        // to be a marker file is now just the container ordering.
         self.wait_container(&pods, &name, STEP_CONTAINER, false, 90)
             .await?;
         Ok(DebugPod { name })
@@ -1780,17 +1901,180 @@ pub const WORKSPACE_MOUNT_PATH: &str = "/workspace";
 /// subject to ordinary DAC). Every workspace Pod puts it in `supplementalGroups`
 /// so that guarantee is explicit rather than a side effect of `fsGroup`.
 const WORKSPACE_GID: i64 = 65532;
+/// The uid Scarab's own helper containers run as (ADR-0039: non-root, always).
+/// Numerically equal to [`WORKSPACE_GID`] — `docker/wsfetch` and `docker/clone`
+/// both create user 65532 with a matching primary group — but they are different
+/// concepts, so they are different constants: this one is *who the fetcher is*,
+/// that one is *who owns the workspace*.
+const WORKSPACE_HELPER_UID: i64 = 65532;
 /// The workspace `emptyDir` volume name.
 const WORKSPACE_VOLUME: &str = "scarab-workspace";
 /// Control-plane→Pod handshake dir (markers only; NEVER part of the snapshot).
 const CTL_MOUNT_PATH: &str = "/scarab-ctl";
 const CTL_VOLUME: &str = "scarab-ctl";
-/// The helper image for the workspace init/egress containers: they only run
-/// `sh`/`tar`/`sleep`, so a pinned busybox suffices.
+/// The helper image for the workspace **egress** container: it only runs
+/// `sh`/`tar`/`sleep`, so a pinned busybox suffices. (`:1.36` and not `:latest`
+/// deliberately — `busybox:latest` defaults to root, which the ADR-0039
+/// restricted baseline refuses with `CreateContainerConfigError`.)
+///
+/// The *init* side stopped being a busybox doorstop in ADR-0061 s3-feed; it is
+/// [`DEFAULT_WSFETCH_IMAGE`] now. This constant survives only for the drain
+/// barrier, and dies with s3-drain (git-bug `7f05f39`).
 const WORKSPACE_HELPER_IMAGE: &str = "busybox:1.36";
 /// Names of the workspace helper containers.
 const WORKSPACE_INIT_CONTAINER: &str = "scarab-workspace-init";
 const WORKSPACE_EGRESS_CONTAINER: &str = "scarab-workspace-egress";
+
+/// The default workspace-fetcher image (ADR-0061 s3-feed): the Scarab-owned
+/// init container that materialises a Step's input snapshots from the workspace
+/// service. Overridable via `SCARAB_WSFETCH_IMAGE`; digest-pin in production, as
+/// with the clone image.
+///
+/// ⚠ **ADR-0061 s3-feed: DELETE ME with the driver (git-bug 0628369).**
+pub const DEFAULT_WSFETCH_IMAGE: &str = "ghcr.io/thulasi-ram/scarab-wsfetch:edge";
+
+/// The volume name carrying the per-Pod workspace-token Secret. Distinct from
+/// `CLONE_SECRETS_VOLUME` even though both land on
+/// [`workspace_token::WORKSPACE_SECRETS_MOUNT_PATH`]: they are mounted into
+/// *different containers* (the token into the fetcher, the clone credential into
+/// the step), so neither credential's presence implies the other's.
+const WORKSPACE_TOKEN_VOLUME: &str = "scarab-workspace-token";
+
+/// The env var carrying the input snapshot roots into the fetcher, in merge
+/// order. Must agree with `scarab-wsfetch`'s `INPUTS_ENV`.
+const WSFETCH_INPUTS_ENV: &str = "SCARAB_WORKSPACE_INPUTS";
+/// The env var telling the fetcher where to build the Workspace.
+const WSFETCH_TARGET_ENV: &str = "SCARAB_WORKSPACE_TARGET";
+
+/// How many Step Pods this process has provisioned with the **eager** fetcher.
+///
+/// Guard #1 of ADR-0061 D2.3's three anti-calcification guards, control-plane
+/// half. The fetcher itself prints `mode=eager (…)` into every Step Pod's log,
+/// but a one-shot process cannot hold a counter, so the accumulating one lives
+/// here — where a `/metrics` scrape or a test can read it and see the stepping
+/// stone still being stood on.
+static EAGER_FETCH_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Step Pods provisioned by the eager fetcher since process start (ADR-0061
+/// s3-feed). This number should go to zero and stay there once the node driver
+/// lands; while it climbs, the stepping stone is load-bearing.
+pub fn eager_fetch_total() -> u64 {
+    EAGER_FETCH_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The per-Pod Secret carrying the workspace token (owner-referenced to the Pod,
+/// so it is garbage-collected with it).
+fn workspace_secret_name(pod_name: &str) -> String {
+    format!("{pod_name}-workspace")
+}
+
+/// Can this Step's workspace actually be provisioned? (ADR-0061 s3-feed.)
+///
+/// `Err` when the Step declares input snapshots, the workspace flow is on, and no
+/// workspace service is configured. **Fail-closed, and there is no fallback by
+/// design**: the control-plane `kubectl exec` tar feed is deleted, not kept for a
+/// rainy day (ADR-0061 D2.3 — an eager path is permitted as a temporally ordered
+/// replacement, never as a runtime branch). The alternative to failing is a Pod
+/// whose `/workspace` is silently empty, which does not fail: it produces a
+/// *wrong answer*, and the Attempt would then claim to have tested a tree that was
+/// never there.
+///
+/// Pure, so the rule is testable without a cluster.
+pub fn workspace_feed_is_satisfiable(
+    spec: &StepSpec,
+    workspace: bool,
+    fetch: Option<&WorkspaceFetch>,
+) -> Result<(), String> {
+    if workspace && !spec.workspace_inputs.is_empty() && fetch.is_none() {
+        return Err(format!(
+            "this step inherits {} workspace snapshot(s) but no workspace service is \
+             configured (ADR-0061): set SCARAB_WORKSPACE_TOKEN_SECRET and \
+             SCARAB_WORKSPACE_URL. Refusing to launch a step whose /workspace would be \
+             silently empty.",
+            spec.workspace_inputs.len()
+        ));
+    }
+    Ok(())
+}
+
+/// The fetcher init container plus the tmpfs Secret volume it reads its token
+/// from (ADR-0061 s3-feed).
+///
+/// Shared by [`build_pod`] and the debug Pod, which is the point: the debug Pod
+/// used to carry a **copy-pasted** feed implementation (git-bug `64897db`), so
+/// the two could drift on the merge order, the ownership fix-up or the fidelity
+/// rules — and only one of them had tests.
+///
+/// Security posture: the ADR-0039 restricted baseline, pinned to uid 65532. The
+/// fetcher holds a credential the untrusted step container never sees, so it gets
+/// the same treatment as any other trusted helper: non-root, all capabilities
+/// dropped, no privilege escalation, `RuntimeDefault` seccomp.
+fn workspace_fetch_container(
+    pod_name: &str,
+    fetch: &WorkspaceFetch,
+    roots: &[String],
+    ws_mount: &VolumeMount,
+) -> (Container, Volume) {
+    EAGER_FETCH_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The other half of guard #1: loud on the control plane too, so an operator
+    // reading server logs sees the stepping stone without reading Pod logs.
+    tracing::warn!(
+        pod = %pod_name,
+        inputs = roots.len(),
+        image = %fetch.fetcher_image,
+        "mode=eager (ADR-0061 s3-feed stepping stone — the node driver replaces this)"
+    );
+    let container = Container {
+        name: WORKSPACE_INIT_CONTAINER.to_string(),
+        image: Some(fetch.fetcher_image.clone()),
+        // The image's entrypoint IS the fetcher; nothing to override.
+        env: Some(vec![
+            env_var(workspace_token::WORKSPACE_URL_ENV, &fetch.url),
+            env_var(
+                workspace_token::WORKSPACE_TOKEN_FILE_ENV,
+                &workspace_token::workspace_token_path(),
+            ),
+            // Merge order is the LIST order (ADR-0007): later inputs overlay
+            // earlier ones, so this join must not be sorted.
+            env_var(WSFETCH_INPUTS_ENV, &roots.join(",")),
+            env_var(WSFETCH_TARGET_ENV, WORKSPACE_MOUNT_PATH),
+        ]),
+        volume_mounts: Some(vec![
+            ws_mount.clone(),
+            VolumeMount {
+                name: WORKSPACE_TOKEN_VOLUME.to_string(),
+                mount_path: workspace_token::WORKSPACE_SECRETS_MOUNT_PATH.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            },
+        ]),
+        security_context: Some(SecurityContext {
+            run_as_non_root: Some(true),
+            run_as_user: Some(WORKSPACE_HELPER_UID),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                add: None,
+            }),
+            allow_privilege_escalation: Some(false),
+            privileged: Some(false),
+            seccomp_profile: Some(SeccompProfile {
+                type_: "RuntimeDefault".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let volume = Volume {
+        name: WORKSPACE_TOKEN_VOLUME.to_string(),
+        secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
+            secret_name: Some(workspace_secret_name(pod_name)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    (container, volume)
+}
 /// Pod annotations: the input CAS roots (set at build, read at feed time so a
 /// resumed control plane needs no in-memory state) and the ingested output
 /// root (patched after egress; `Executor::output` reads it — durable with the
@@ -1831,6 +2115,14 @@ const RESULTS_VOLUME: &str = "scarab-results";
 /// (ADR-0042) — a native sidecar (an `initContainer` with `restartPolicy: Always`)
 /// that drains `/scarab/results` to the fence-scoped results API after the step
 /// exits. The untrusted step container never holds the token; only the sidecar does.
+///
+/// `fetch` is the ADR-0061 workspace service. When the workspace flow is on and
+/// the Step has input snapshots, it becomes the `scarab-workspace-init` fetcher
+/// container. **Precondition:** if `workspace` is true and
+/// `spec.workspace_inputs` is non-empty, `fetch` must be `Some` — see
+/// [`workspace_feed_is_satisfiable`], which `launch` calls before it ever gets
+/// here. Passing `None` anyway builds a Pod with no feed at all, which is why
+/// the check is at the launch site and not buried in this assembly.
 #[allow(clippy::too_many_arguments)] // the one Pod-assembly point; splitting hides the shape
 pub fn build_pod(
     name: &str,
@@ -1841,7 +2133,13 @@ pub fn build_pod(
     default_timeout_secs: u32,
     workspace: bool,
     clone_image: &str,
+    fetch: Option<&WorkspaceFetch>,
 ) -> Pod {
+    debug_assert!(
+        !(workspace && !spec.workspace_inputs.is_empty() && fetch.is_none()),
+        "ADR-0061: a Step with input snapshots needs a workspace service; \
+         workspace_feed_is_satisfiable() must gate this"
+    );
     let attempt = step
         .current_attempt()
         .map(|a| a.id.0.clone())
@@ -2147,6 +2445,14 @@ pub fn build_pod(
     if workspace {
         volumes.push(Volume {
             name: WORKSPACE_VOLUME.to_string(),
+            // ADR-0061 s3-feed: DELETE ME with the driver (git-bug 0628369).
+            // ↑ THE one line that chooses the volume kind, and the one line s2b
+            // replaces with a `CSIVolumeSource` for `workspace.scarab.io`. An
+            // `emptyDir` means the whole snapshot is copied onto this node before
+            // the Step starts (eager); the driver mounts it as a read-only lower
+            // layer with a pod-local writable upper layer and transfers only what
+            // the Step actually reads (lazy). Everything else in this slice is
+            // preparation for changing this expression.
             empty_dir: Some(EmptyDirVolumeSource::default()),
             ..Default::default()
         });
@@ -2155,12 +2461,19 @@ pub fn build_pod(
             empty_dir: Some(EmptyDirVolumeSource::default()),
             ..Default::default()
         });
-        // The input CAS roots ride on the Pod itself, so a resumed control
-        // plane can feed an adopted Pod with no in-memory state.
-        annotations.insert(
-            ANNOTATION_WS_INPUTS.to_string(),
-            spec.workspace_inputs.join(","),
-        );
+        // The input snapshot roots ride on the Pod as EVIDENCE — what this Pod was
+        // fed, readable by anyone with `get pod`, durable across a control-plane
+        // restart. Written only when there ARE inputs (git-bug 7f05f39): an
+        // always-present-but-sometimes-empty annotation made "is this a workspace
+        // Pod" and "does it need a feed" the same key with two meanings.
+        // Deliberately NOT control flow any more — the fetcher gets its roots from
+        // its own container env, which is the more durable of the two.
+        if !spec.workspace_inputs.is_empty() {
+            annotations.insert(
+                ANNOTATION_WS_INPUTS.to_string(),
+                spec.workspace_inputs.join(","),
+            );
+        }
         // Authored per-path publishing (ADR-0007) rides the Pod too, for the same
         // reason: the egress prune must be identical after a control-plane restart.
         if !spec.workspace_outputs.is_empty() {
@@ -2171,21 +2484,19 @@ pub fn build_pod(
         }
         let ws = workspace_mount.clone().unwrap();
         let ctl = ctl_mount.clone().unwrap();
-        // Ordinary init container: blocks the step until the control plane
-        // has streamed the merged input workspaces in (exits immediately when
-        // there is nothing to feed).
-        let wait = if spec.workspace_inputs.is_empty() {
-            "exit 0".to_string()
-        } else {
-            format!("until [ -f {CTL_MOUNT_PATH}/init-done ]; do sleep 0.2; done")
-        };
-        init_containers.push(Container {
-            name: WORKSPACE_INIT_CONTAINER.to_string(),
-            image: Some(WORKSPACE_HELPER_IMAGE.to_string()),
-            command: Some(vec!["sh".into(), "-c".into(), wait]),
-            volume_mounts: Some(vec![ws.clone(), ctl.clone()]),
-            ..Default::default()
-        });
+        // The feed (ADR-0061 s3-feed): an init container that FETCHES the merged
+        // input snapshots from the workspace service and exits. There is no marker
+        // file and no `until [ -f … ]` wait loop, because there is nothing left to
+        // wait for — the container does the work itself. A Step with no inputs gets
+        // no init container at all, rather than a `busybox` that runs `exit 0`.
+        if !spec.workspace_inputs.is_empty() {
+            if let Some(fetch) = fetch {
+                let (container, token_volume) =
+                    workspace_fetch_container(name, fetch, &spec.workspace_inputs, &ws);
+                init_containers.push(container);
+                volumes.push(token_volume);
+            }
+        }
         // Native egress sidecar: outlives the step (ignoring SIGTERM) until
         // the control plane has snapshotted /workspace into the CAS and
         // touches the release marker.
@@ -2946,6 +3257,27 @@ pub fn pod_state(pod: &Pod) -> ExecState {
         "Succeeded" => ExecState::Succeeded,
         "Failed" => {
             let exit_code = container_exit_code(pod);
+            // ADR-0061 s3-feed: the fetcher can FAIL, where the `busybox` doorstop
+            // it replaced structurally could not. A Step whose workspace was never
+            // provisioned has no step-container verdict at all, so without this the
+            // Pod would fall into the "no verdict yet, defer" branch below and stay
+            // `Pending` until the engine's timeout backstop — an hour, by default,
+            // for a failure we already know about.
+            //
+            // `Infra { never_started: true }` is deliberately the SAME verdict the
+            // deleted `DriveErr::InputMissing` produced: the Step's main process
+            // never ran, so no side effect is possible, and a bounded retry may
+            // land on a node that can reach the service. A permanently-missing
+            // snapshot simply exhausts that budget and dead-letters, which is what
+            // it did before.
+            if exit_code.is_none() && workspace_fetch_failed(pod).is_some() {
+                return ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Infra {
+                        never_started: true,
+                    },
+                };
+            }
             // A just-killed Pod can surface `phase: Failed` BEFORE the kubelet
             // finishes writing the verdict — no status reason, no terminated
             // container state (observed on k3s enforcing
@@ -2983,7 +3315,17 @@ pub fn pod_state(pod: &Pod) -> ExecState {
         // rejection is permanent (`Config`, fail fast) or possibly transient
         // (`Infra { never_started }`, bounded auto-retry).
         _ => {
-            if let Some(class) = terminal_waiting_class(pod) {
+            // Also checked while Pending: an init container that exited non-zero
+            // under `restartPolicy: Never` is never retried by the kubelet, so
+            // there is nothing to wait for even before the phase flips to Failed.
+            if workspace_fetch_failed(pod).is_some() {
+                ExecState::Failed {
+                    exit_code: None,
+                    class: FailureClass::Infra {
+                        never_started: true,
+                    },
+                }
+            } else if let Some(class) = terminal_waiting_class(pod) {
                 ExecState::Failed {
                     exit_code: None,
                     class,
@@ -3078,6 +3420,37 @@ fn step_container_started(pod: &Pod) -> bool {
         || c.last_state
             .as_ref()
             .is_some_and(|s| s.terminated.is_some())
+}
+
+/// The workspace fetcher's non-zero exit code, if it failed (ADR-0061 s3-feed).
+///
+/// Scoped to `scarab-workspace-init` **by name**, and that narrowness is the
+/// point: the other entries in `init_container_statuses` are *native sidecars*
+/// (the egress barrier, the results sidecar, `service-*`), which the kubelet
+/// terminates when the Pod ends and which routinely exit non-zero (137) while the
+/// Step itself succeeded or failed on its own terms. Treating any non-zero init
+/// container as a provisioning failure would report `never_started: true` for a
+/// Step that had in fact run — the exact misclassification `never_started` exists
+/// to prevent (ADR-0047: it is what tells the engine whether a side effect was
+/// possible).
+///
+/// `last_state` is consulted too, so a status snapshot taken after the Pod moved
+/// on still yields the verdict.
+fn workspace_fetch_failed(pod: &Pod) -> Option<i32> {
+    pod.status
+        .as_ref()?
+        .init_container_statuses
+        .as_ref()?
+        .iter()
+        .find(|c| c.name == WORKSPACE_INIT_CONTAINER)
+        .and_then(|c| {
+            c.state
+                .as_ref()
+                .and_then(|s| s.terminated.as_ref())
+                .or_else(|| c.last_state.as_ref().and_then(|s| s.terminated.as_ref()))
+        })
+        .map(|t| t.exit_code)
+        .filter(|code| *code != 0)
 }
 
 /// The step container's terminated `reason` (e.g. `OOMKilled`), current or last.
@@ -3294,6 +3667,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         )
     }
 
@@ -3444,6 +3818,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         let sc = pod.spec.unwrap().containers[0]
             .security_context
@@ -3496,6 +3871,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         let sc = pod.spec.unwrap().containers[0]
             .security_context
@@ -3527,6 +3903,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         let sc = pod.spec.unwrap().containers[0]
             .security_context
@@ -3926,6 +4303,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
 
         let spec = pod.spec.unwrap();
@@ -3971,6 +4349,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         let spec = pod.spec.unwrap();
         assert!(spec.volumes.is_none(), "no shared volume without egress");
@@ -3999,6 +4378,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         let spec = pod.spec.unwrap();
 
@@ -4062,6 +4442,15 @@ mod tests {
         );
     }
 
+    /// The ADR-0061 workspace service, as a Step Pod is told about it.
+    fn sample_fetch() -> WorkspaceFetch {
+        WorkspaceFetch {
+            url: "http://scarab-workspace".into(),
+            token_secret: b"ws-secret".to_vec(),
+            fetcher_image: "ghcr.io/acme/scarab-wsfetch:test".into(),
+        }
+    }
+
     fn sample_build() -> scarab_engine::BuildConfig {
         scarab_engine::BuildConfig {
             context: ".".into(),
@@ -4083,6 +4472,10 @@ mod tests {
         spec.image = String::new();
         spec.command = vec![];
         spec.build = Some(sample_build());
+        // A build step consumes its `needs` workspace like any other step, so it
+        // gets the ADR-0061 fetcher too — asserted at the bottom of this test.
+        spec.workspace_inputs = vec!["tree-from-clone".into()];
+        let fetch = sample_fetch();
         let pod = build_pod(
             "scarab-image-a1",
             "ns",
@@ -4092,6 +4485,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
             DEFAULT_CLONE_IMAGE,
+            Some(&fetch),
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
 
@@ -4166,6 +4560,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
         let env = c.env.as_ref().unwrap();
@@ -4229,6 +4624,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         let args = pod.spec.as_ref().unwrap().containers[0]
             .args
@@ -4257,6 +4653,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
         let env = c.env.as_ref().unwrap();
@@ -4296,6 +4693,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
         assert!(c
@@ -4331,6 +4729,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
         let m = c
@@ -4376,6 +4775,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         assert!(pod.spec.as_ref().unwrap().volumes.is_none());
     }
@@ -4397,6 +4797,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         assert_eq!(
             pod.metadata
@@ -4420,14 +4821,74 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         assert!(
             !pod.metadata
                 .annotations
                 .as_ref()
-                .unwrap()
-                .contains_key(ANNOTATION_WS_OUTPUTS),
+                .is_some_and(|a| a.contains_key(ANNOTATION_WS_OUTPUTS)),
             "absent, not empty — an empty annotation would be an ambiguous encoding"
+        );
+    }
+
+    /// git-bug 7f05f39: `ANNOTATION_WS_INPUTS` used to be inserted **even when
+    /// empty**, which made one key carry two different questions — "is this a
+    /// workspace Pod" (present) and "does it need a feed" (non-empty). It is now
+    /// written only when there ARE inputs, and it is evidence rather than control
+    /// flow: `drive_workspace` no longer reads it, and the fetcher gets its roots
+    /// from its own container env.
+    #[test]
+    fn the_inputs_annotation_is_absent_when_there_are_no_inputs() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let fetch = sample_fetch();
+        // A workspace Pod with no `needs:` — the shape of every `clone` step and
+        // every first step in a pipeline.
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &busybox(),
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            DEFAULT_CLONE_IMAGE,
+            Some(&fetch),
+        );
+        assert!(
+            !pod.metadata
+                .annotations
+                .as_ref()
+                .is_some_and(|a| a.contains_key(ANNOTATION_WS_INPUTS)),
+            "absent, not empty: an always-present key cannot answer two questions"
+        );
+        // …and it IS a workspace Pod all the same — proven by the machinery, not
+        // by an annotation.
+        let ps = pod.spec.as_ref().unwrap();
+        assert!(ps
+            .init_containers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|c| c.name == WORKSPACE_EGRESS_CONTAINER));
+        assert_eq!(ps.security_context.as_ref().unwrap().fs_group, Some(65532));
+
+        let mut with_inputs = busybox();
+        with_inputs.workspace_inputs = vec!["tree-a".into()];
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &with_inputs,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            DEFAULT_CLONE_IMAGE,
+            Some(&fetch),
+        );
+        assert_eq!(
+            pod.metadata.annotations.as_ref().unwrap()[ANNOTATION_WS_INPUTS],
+            "tree-a"
         );
     }
 
@@ -4448,6 +4909,7 @@ mod tests {
                 DEFAULT_STEP_TIMEOUT_SECS,
                 workspace,
                 DEFAULT_CLONE_IMAGE,
+                None,
             )
             .spec
             .unwrap()
@@ -4709,6 +5171,7 @@ mod tests {
         let step = step_with_attempt("run-1", "build", "a1");
         let mut spec = busybox();
         spec.workspace_inputs = vec!["tree-a".into(), "tree-b".into()];
+        let fetch = sample_fetch();
         let pod = build_pod(
             "scarab-x",
             "ns",
@@ -4718,10 +5181,10 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
             DEFAULT_CLONE_IMAGE,
+            Some(&fetch),
         );
 
-        // The input roots ride on the Pod (a resumed control plane feeds an
-        // adopted Pod with no in-memory state).
+        // The input roots ride on the Pod as evidence of what it was fed.
         assert_eq!(
             pod.metadata.annotations.as_ref().unwrap()["scarab.io/workspace-inputs"],
             "tree-a,tree-b"
@@ -4739,26 +5202,37 @@ mod tests {
             vols.contains(&"scarab-workspace") && vols.contains(&"scarab-ctl"),
             "{vols:?}"
         );
-        // Init container waits for the feed; egress sidecar (restartPolicy
-        // Always) holds the Pod for the snapshot.
+        // The init container FETCHES (ADR-0061 s3-feed) — no marker, no wait loop.
+        // The egress sidecar (restartPolicy Always) still holds the Pod for the
+        // drain, which s3-drain owns (git-bug 7f05f39).
         let inits = ps.init_containers.as_ref().unwrap();
         let init = inits
             .iter()
             .find(|c| c.name == WORKSPACE_INIT_CONTAINER)
             .unwrap();
-        assert!(init.command.as_ref().unwrap()[2].contains("init-done"));
+        assert!(
+            init.command.is_none(),
+            "the fetcher image's entrypoint IS the fetcher; there is nothing to script"
+        );
         let egress = inits
             .iter()
             .find(|c| c.name == WORKSPACE_EGRESS_CONTAINER)
             .unwrap();
         assert_eq!(egress.restart_policy.as_deref(), Some("Always"));
         assert!(egress.command.as_ref().unwrap()[2].contains("egress-done"));
+        // Nothing anywhere in the Pod still waits on the deleted feed marker.
+        let rendered = serde_json::to_string(&pod).unwrap();
+        assert!(
+            !rendered.contains("init-done"),
+            "the init-done marker and its wait loop are deleted, not merely unused"
+        );
         // The step runs IN the workspace, which is writable via the workspace group.
         assert_eq!(ps.containers[0].working_dir.as_deref(), Some("/workspace"));
         assert_eq!(ps.security_context.as_ref().unwrap().fs_group, Some(65532));
         assert_eq!(ps.termination_grace_period_seconds, Some(600));
 
-        // No inputs => the init container exits immediately (nothing to feed).
+        // No inputs => NO init container at all. The busybox doorstop that used to
+        // run `exit 0` here existed only to be a barrier, and there is no barrier.
         let mut spec = busybox();
         spec.workspace_inputs = vec![];
         let pod = build_pod(
@@ -4770,13 +5244,13 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
             DEFAULT_CLONE_IMAGE,
+            Some(&fetch),
         );
         let inits = pod.spec.as_ref().unwrap().init_containers.clone().unwrap();
-        let init = inits
-            .iter()
-            .find(|c| c.name == WORKSPACE_INIT_CONTAINER)
-            .unwrap();
-        assert_eq!(init.command.as_ref().unwrap()[2], "exit 0");
+        assert!(
+            !inits.iter().any(|c| c.name == WORKSPACE_INIT_CONTAINER),
+            "a step with nothing to fetch must not pay for a container"
+        );
 
         // workspace=false => none of the machinery appears (unchanged shape).
         let pod = build_pod(
@@ -4788,24 +5262,348 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         assert!(pod.metadata.annotations.is_none());
         assert!(pod.spec.as_ref().unwrap().init_containers.is_none());
     }
 
+    /// ADR-0061 s3-feed acceptance, at the grain `build_pod` owns: the feed
+    /// container is the Scarab-owned fetcher, it is told the service URL and the
+    /// roots **in merge order**, the token reaches it on tmpfs and NOWHERE else,
+    /// and it runs non-root under the ADR-0039 baseline.
+    #[test]
+    fn the_feed_container_is_the_scarab_fetcher_with_a_tmpfs_token() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        // Deliberately NOT sorted: a later input overlays an earlier one
+        // (ADR-0007), so the env must preserve the authored order.
+        spec.workspace_inputs = vec!["tree-b".into(), "tree-a".into()];
+        let fetch = sample_fetch();
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            DEFAULT_CLONE_IMAGE,
+            Some(&fetch),
+        );
+        let ps = pod.spec.as_ref().unwrap();
+        let init = ps
+            .init_containers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|c| c.name == WORKSPACE_INIT_CONTAINER)
+            .expect("the fetcher init container");
+
+        assert_eq!(
+            init.image.as_deref(),
+            Some("ghcr.io/acme/scarab-wsfetch:test"),
+            "Scarab-owned image, never a busybox doorstop"
+        );
+        let env = init.env.as_ref().unwrap();
+        let get = |k: &str| {
+            env.iter()
+                .find(|e| e.name == k)
+                .and_then(|e| e.value.clone())
+        };
+        assert_eq!(
+            get("SCARAB_WORKSPACE_URL").as_deref(),
+            Some("http://scarab-workspace")
+        );
+        assert_eq!(
+            get("SCARAB_WORKSPACE_INPUTS").as_deref(),
+            Some("tree-b,tree-a"),
+            "merge order is the AUTHORED order — sorting here would change the result"
+        );
+        assert_eq!(
+            get("SCARAB_WORKSPACE_TOKEN_FILE").as_deref(),
+            Some("/scarab/secrets/workspace-token")
+        );
+        assert_eq!(get("SCARAB_WORKSPACE_TARGET").as_deref(), Some("/workspace"));
+
+        // THE INVARIANT (ADR-0061 D1.4): the token itself is nowhere in the Pod
+        // spec — not in the fetcher's env, not in the step's, not in an annotation.
+        // Only a Secret *reference* is, and the Secret is tmpfs at mount time.
+        let minted = workspace_token::mint(
+            &fetch.token_secret,
+            &workspace_token::step_claims(
+                workspace_token::Fence {
+                    run: "run-1".into(),
+                    step: "build".into(),
+                    attempt: "a1".into(),
+                },
+                0,
+                spec.workspace_inputs.clone(),
+            ),
+        );
+        let signature = minted.rsplit('.').next().unwrap().to_string();
+        let rendered = serde_json::to_string(&pod).unwrap();
+        assert!(
+            !rendered.contains(&signature),
+            "a workspace token must never appear in a PodSpec — it is readable by \
+             anyone with `get pod`"
+        );
+
+        // tmpfs Secret volume, read-only, on the FETCHER only.
+        let mount = init
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == WORKSPACE_TOKEN_VOLUME)
+            .expect("token mount");
+        assert_eq!(mount.mount_path, "/scarab/secrets");
+        assert_eq!(mount.read_only, Some(true));
+        let volume = ps
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == WORKSPACE_TOKEN_VOLUME)
+            .expect("token volume");
+        assert_eq!(
+            volume.secret.as_ref().unwrap().secret_name.as_deref(),
+            Some("scarab-x-workspace")
+        );
+        assert!(
+            !ps.containers[0]
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|m| m.name == WORKSPACE_TOKEN_VOLUME),
+            "the untrusted step container must not be able to read the token"
+        );
+
+        // ADR-0039: the helper is non-root at uid 65532 with every capability
+        // dropped. `busybox:latest` is refused by this baseline, which is exactly
+        // why the doorstop had to be pinned — a Scarab-owned image just complies.
+        let sc = init.security_context.as_ref().expect("baseline");
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.run_as_user, Some(65532));
+        assert_eq!(sc.privileged, Some(false));
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().drop,
+            Some(vec!["ALL".to_string()])
+        );
+        assert_eq!(sc.seccomp_profile.as_ref().unwrap().type_, "RuntimeDefault");
+    }
+
+    /// Guard #1 of ADR-0061 D2.3, control-plane half: every eagerly-provisioned
+    /// Pod bumps a counter, so "are we still standing on the stepping stone?" is
+    /// an observable number rather than a code read.
+    #[test]
+    fn every_eager_feed_is_counted() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut spec = busybox();
+        spec.workspace_inputs = vec!["tree-a".into()];
+        let fetch = sample_fetch();
+        let before = eager_fetch_total();
+        for _ in 0..2 {
+            build_pod(
+                "scarab-x",
+                "ns",
+                &step,
+                &spec,
+                None,
+                DEFAULT_STEP_TIMEOUT_SECS,
+                true,
+                DEFAULT_CLONE_IMAGE,
+                Some(&fetch),
+            );
+        }
+        assert_eq!(eager_fetch_total(), before + 2);
+        // A Pod with nothing to fetch is not an eager fetch.
+        let at = eager_fetch_total();
+        build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &busybox(),
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            DEFAULT_CLONE_IMAGE,
+            Some(&fetch),
+        );
+        assert_eq!(eager_fetch_total(), at);
+    }
+
+    /// Fail-closed, and the reason it must be: a Step whose `/workspace` is
+    /// silently empty does not fail — it produces a WRONG ANSWER, and then claims
+    /// in the durable record to have tested a tree that was never there. There is
+    /// deliberately no fallback to the deleted control-plane feed (ADR-0061 D2.3).
+    #[test]
+    fn a_step_with_inputs_and_no_workspace_service_cannot_be_launched() {
+        let mut spec = busybox();
+        spec.workspace_inputs = vec!["tree-a".into()];
+        let err = workspace_feed_is_satisfiable(&spec, true, None).unwrap_err();
+        assert!(err.contains("no workspace service is configured"), "{err}");
+
+        // A service configured ⇒ fine.
+        let fetch = sample_fetch();
+        assert!(workspace_feed_is_satisfiable(&spec, true, Some(&fetch)).is_ok());
+        // No inputs ⇒ nothing to fetch ⇒ no service needed (every `clone` step).
+        assert!(workspace_feed_is_satisfiable(&busybox(), true, None).is_ok());
+        // Workspace flow off entirely (tests / object-store-less dev) ⇒ untouched.
+        assert!(workspace_feed_is_satisfiable(&spec, false, None).is_ok());
+    }
+
+    /// The fetcher can FAIL where the doorstop it replaced structurally could not,
+    /// so a Pod whose workspace was never provisioned must get a verdict instead
+    /// of sitting `Pending` until the step timeout. It is
+    /// `Infra { never_started: true }` — the same verdict the deleted
+    /// `DriveErr::InputMissing` produced, because the same thing is true: the
+    /// step's process never ran, so no side effect is possible.
+    #[test]
+    fn a_failed_workspace_fetch_is_never_started_infra_not_a_hang() {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
+            PodStatus,
+        };
+        let fetch_exited = |code: i32| ContainerStatus {
+            name: WORKSPACE_INIT_CONTAINER.into(),
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: code,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // The step container exists but never ran — it is `waiting: PodInitializing`.
+        let step_waiting = ContainerStatus {
+            name: STEP_CONTAINER.into(),
+            state: Some(ContainerState {
+                waiting: Some(ContainerStateWaiting {
+                    reason: Some("PodInitializing".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pod = |phase: &str, code: i32| Pod {
+            status: Some(PodStatus {
+                phase: Some(phase.into()),
+                container_statuses: Some(vec![step_waiting.clone()]),
+                init_container_statuses: Some(vec![fetch_exited(code)]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let never_started = ExecState::Failed {
+            exit_code: None,
+            class: FailureClass::Infra {
+                never_started: true,
+            },
+        };
+        // Transient (1) and permanent (2) both land here: the class is about
+        // whether a side effect was possible, not about why the fetch failed.
+        assert_eq!(pod_state(&pod("Failed", 1)), never_started);
+        assert_eq!(pod_state(&pod("Failed", 2)), never_started);
+        // And before the phase flips: an init container that exited non-zero under
+        // `restartPolicy: Never` is never retried, so there is nothing to wait for.
+        assert_eq!(pod_state(&pod("Pending", 1)), never_started);
+        // A fetcher that SUCCEEDED is not a failure signal.
+        assert_eq!(pod_state(&pod("Pending", 0)), ExecState::Pending);
+    }
+
+    /// The narrowness of `workspace_fetch_failed` is load-bearing: the egress
+    /// barrier and the results sidecar are ALSO `init_container_statuses` entries,
+    /// they are terminated by the kubelet when the Pod ends, and they routinely
+    /// exit non-zero (137) for a step that ran and produced a real verdict.
+    /// Reading them as provisioning failures would report `never_started: true`
+    /// for a step that had side effects — the one thing that classification exists
+    /// to get right (ADR-0047).
+    #[test]
+    fn a_dying_sidecar_is_not_a_failed_workspace_fetch() {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus,
+        };
+        let killed = |name: &str| ContainerStatus {
+            name: name.into(),
+            state: Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 137,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let pod = Pod {
+            status: Some(PodStatus {
+                phase: Some("Failed".into()),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: STEP_CONTAINER.into(),
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 1,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                init_container_statuses: Some(vec![
+                    killed(WORKSPACE_EGRESS_CONTAINER),
+                    killed("scarab-results-egress"),
+                    killed("service-0"),
+                    // The fetcher itself SUCCEEDED.
+                    ContainerStatus {
+                        name: WORKSPACE_INIT_CONTAINER.into(),
+                        state: Some(ContainerState {
+                            terminated: Some(ContainerStateTerminated {
+                                exit_code: 0,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(workspace_fetch_failed(&pod).is_none());
+        assert_eq!(
+            pod_state(&pod),
+            ExecState::Failed {
+                exit_code: Some(1),
+                class: FailureClass::Step,
+            },
+            "the step's own verdict, not a sidecar's exit code"
+        );
+    }
+
     // git-bug b04697f (dogfood): "clone, then build IN the workspace" — the single
     // most common CI shape — must be able to WRITE the CAS-restored `/workspace`.
     //
-    // The control plane materializes the CAS tree as its own uid/gid (65532) and
-    // makes it group-writable at feed time, while the ADR-0039 baseline drops ALL
+    // The workspace arrives owned by uid/gid 65532 — the FETCHER's uid now
+    // (ADR-0061 s3-feed), the control plane's before that — and is made
+    // group-writable at feed time, while the ADR-0039 baseline drops ALL
     // capabilities — `DAC_OVERRIDE` included — so *group membership* is the whole
     // mechanism, even for an admitted `run_as_root` step at uid 0. Assert that
     // membership is granted explicitly on every workspace Pod, and that it holds
     // when a uid-pinning sidecar service (ADR-0058) takes the Pod's `fsGroup`.
+    //
+    // The widening itself (`chmod -R g+rwX` + setgid dirs) moved INTO the fetcher
+    // and is tested there:
+    // `crates/scarab-workspace-client/src/bin/scarab-wsfetch.rs::widening_grants_the_group_exactly_what_a_step_needs`.
     #[test]
     fn workspace_steps_are_always_members_of_the_workspace_group() {
         use scarab_pipeline::ServiceSpec;
         let step = step_with_attempt("run-1", "build", "a1");
+        let fetch = sample_fetch();
         let workspace_pod = |spec: &StepSpec| {
             build_pod(
                 "scarab-x",
@@ -4816,6 +5614,7 @@ mod tests {
                 DEFAULT_STEP_TIMEOUT_SECS,
                 true,
                 DEFAULT_CLONE_IMAGE,
+                Some(&fetch),
             )
         };
 
@@ -4878,6 +5677,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         )
         .spec
         .unwrap();
@@ -4914,6 +5714,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
             "ghcr.io/acme/scarab-clone@sha256:abc",
+            None,
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
         // The canonical image, never the author's; entrypoint from the image.
@@ -4975,6 +5776,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             true,
             "img",
+            None,
         );
         let c = &pod.spec.as_ref().unwrap().containers[0];
         assert!(c
@@ -5007,6 +5809,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         assert_eq!(
             pod.spec.as_ref().unwrap().active_deadline_seconds,
@@ -5024,6 +5827,7 @@ mod tests {
             DEFAULT_STEP_TIMEOUT_SECS,
             false,
             DEFAULT_CLONE_IMAGE,
+            None,
         );
         assert_eq!(
             pod.spec.as_ref().unwrap().active_deadline_seconds,
