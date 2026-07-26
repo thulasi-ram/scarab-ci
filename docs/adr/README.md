@@ -20,7 +20,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0001](0001-ci-as-durable-execution.md) | CI as durable execution (the wedge) + non-goals | Accepted |
 | [0002](0002-durability-model.md) | Durability model: durable DAG orchestrator + at-least-once steps | Accepted |
 | [0003](0003-durability-substrate-postgres.md) | Durability substrate: own it — DBOS pattern on Postgres (Rust) | Accepted |
-| [0004](0004-execution-topology.md) | Execution topology: pod-per-step + content-addressed workspace | Accepted |
+| [0004](0004-execution-topology.md) | Execution topology: pod-per-step + content-addressed workspace | Accepted (data path superseded by 0061) |
 | [0005](0005-tenancy-and-k8s-only.md) | Tenancy & deployment; Kubernetes as the only backend | Accepted |
 | [0006](0006-pipeline-ontology.md) | Pipeline ontology: flat recursive DAG | Accepted |
 | [0007](0007-data-passing-model.md) | Data-passing model: Workspace / Result / Artifact / Cache | Accepted |
@@ -75,6 +75,7 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0058](0058-runtime-service-containers.md) | Runtime service containers: co-located **Sidecar** (default, fenced-by-inheritance) + Run-scoped **Shared** (opt-in `uses:`, per-Take instance, unfenced) — not DAG nodes (amends 0008) | Accepted |
 | [0059](0059-tick-fault-isolation.md) | Per-run scheduler-tick fault isolation (one poison Run can't stall the fleet) + bounded per-Run failures → dead-letter (generalizes 0058 Fix A/B) | Accepted |
 | [0060](0060-org-settings-connections-and-secret-management.md) | Global Settings surface: connection lifecycle (Forgejo onboarding + GitHub observe/re-sync), org/env secret editing via the effective-status matrix, IaC-or-UI connections with single-owner precedence | Accepted |
+| [0061](0061-workspace-data-path.md) | Workspace data path: per-AZ workspace service + Scarab node driver with lazy materialisation; control plane leaves the data path (supersedes 0004's data path, not its topology) | Accepted |
 
 > For *features* deliberately deferred until demand appears (as opposed to ADRs
 > to be written), see [`docs/followups.md`](../followups.md).
