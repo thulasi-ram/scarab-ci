@@ -7,6 +7,17 @@
 # Every step is REAL: the commands run against this workspace, the build builds a
 # Dockerfile that exists, and deploy/notify run a real image.
 #
+# Both evidence channels are exercised on purpose, so a broken one is visible:
+#   - RESULTS (ADR-0041/0042) — small typed values, written as
+#     /scarab/results/<name>.json, interpolated downstream as
+#     ${{ outputs.<step>.<name> }}. `version` emits a string, a sha and a count;
+#     `deploy` ASSERTS each one resolved. The `build` step also emits an `image`
+#     result natively (BuildKit --metadata-file).
+#   - ARTIFACTS (ADR-0052) — files of record under /scarab/artifacts/, selected
+#     by `artifacts:` globs and downloadable at /v1/runs/{id}/artifacts. `lint`
+#     publishes its fmt/clippy reports, each `test` leg its own cargo log, and
+#     `version` a version.txt.
+#
 # Dispatching it locally (`just local-helm`, then POST .../dispatch):
 #   - Use ref `main`. `deploy` is `when: event.branch == 'main'`, so on a PR it
 #     and `notify` correctly SKIP — dispatch main to exercise the whole DAG.
@@ -108,10 +119,17 @@ steps:
       - -c
       - |
         set -euxo pipefail
+        mkdir -p /scarab/artifacts
         # Scoped to crates that ARE rustfmt-clean: this workspace as a whole is
         # not, and a repo-wide `cargo fmt` would churn ~90 unrelated files.
-        cargo fmt -p scarab-identity -p scarab-pipeline -- --check
-        cargo clippy -p scarab-identity -p scarab-pipeline
+        # `tee` so the report is a published artifact, not just scrollback;
+        # `pipefail` above keeps the step's verdict the CHECK's, not tee's.
+        cargo fmt -p scarab-identity -p scarab-pipeline -- --check 2>&1 | tee /scarab/artifacts/fmt.log
+        cargo clippy -p scarab-identity -p scarab-pipeline 2>&1 | tee /scarab/artifacts/clippy.log
+    # ARTIFACTS OF RECORD (ADR-0052): globs over what the step wrote to
+    # /scarab/artifacts/. Browse them at /v1/runs/{id}/artifacts.
+    artifacts:
+      - "*.log"
 
   # --- matrix (ADR-0023) + shared-service uses + sidecar service (ADR-0058) --
   # + retry (ADR-0047). Fans across crate x mode (minus one excluded combo).
@@ -156,7 +174,13 @@ steps:
         # cluster-wide, the sidecar on this Pod's own localhost.
         timeout 30 bash -c 'until (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null; do sleep 1; done'
         timeout 30 bash -c 'until (exec 3<>/dev/tcp/localhost/6379) 2>/dev/null; do sleep 1; done'
-        cargo ${{ matrix.mode }} -p ${{ matrix.crate }}
+        mkdir -p /scarab/artifacts
+        # Named per instance, so the three legs publish three DISTINCT artifacts
+        # rather than racing over one name — the matrix-artifact proof.
+        cargo ${{ matrix.mode }} -p ${{ matrix.crate }} 2>&1 \
+          | tee "/scarab/artifacts/${{ matrix.mode }}-${{ matrix.crate }}.log"
+    artifacts:
+      - "*.log"
 
   # --- named step result consumed downstream (ADR-0041) ---------------------
   # This step publishes a `tag` result at runtime (results API, ADR-0042); the
@@ -182,11 +206,32 @@ steps:
       - -c
       - |
         set -euxo pipefail
+        mkdir -p /scarab/artifacts
         # Belt-and-braces against git's ownership guard: this step runs as a
         # different uid than the clone (which owns the tree as 65532).
         git config --global --add safe.directory /workspace
         # This repo carries no tags, so --always falls back to the short SHA.
-        git -C /workspace describe --tags --always > /scarab/results/tag
+        tag=$(git -C /workspace describe --tags --always)
+        sha=$(git -C /workspace rev-parse HEAD)
+        commits=$(git -C /workspace rev-list --count HEAD)
+
+        # RESULTS (ADR-0041/0042). The trusted egress sidecar drains
+        # `<name>.json` and NOTHING ELSE, and each file must hold valid JSON —
+        # the result name is the filename minus `.json`. Writing a bare
+        # `/scarab/results/tag` (as this sample used to) silently publishes
+        # nothing: the sidecar logs "no results to drain" and the step still
+        # passes, so `${{ outputs.version.tag }}` downstream resolves empty.
+        printf '"%s"\n' "$tag"     > /scarab/results/tag.json      # JSON string
+        printf '"%s"\n' "$sha"     > /scarab/results/commit.json   # JSON string
+        printf '%s\n'   "$commits" > /scarab/results/commits.json  # JSON number
+
+        # ARTIFACTS: the same facts as a file of record, to contrast the two
+        # channels — results are small typed values the DAG can interpolate,
+        # artifacts are files you download afterwards.
+        printf 'tag=%s\ncommit=%s\ncommits=%s\n' "$tag" "$sha" "$commits" \
+          > /scarab/artifacts/version.txt
+    artifacts:
+      - "*.txt"
 
   # --- build step (ADR-0018): rootless BuildKit image build -----------------
   # + resources (ADR-0055). The author names no image/command (the blessed
@@ -228,6 +273,8 @@ steps:
       - [RELEASE_TAG, "${{ inputs.image_tag }}"]
       - [TARGET_ENV, "${{ inputs.deploy_env }}"]
       - [PREV_VERSION, "${{ outputs.version.tag }}"]
+      - [PREV_COMMIT, "${{ outputs.version.commit }}"]
+      - [COMMIT_COUNT, "${{ outputs.version.commits }}"]
     command:
       - sh
       - -c
@@ -237,7 +284,17 @@ steps:
         # three RESOLVED, not that anything ships — so assert the cross-step
         # one is non-empty rather than trusting the echo.
         echo "deploying tag=$RELEASE_TAG env=$TARGET_ENV prev=$PREV_VERSION"
+        echo "from commit=$PREV_COMMIT (#$COMMIT_COUNT on this history)"
+        # Assert every interpolation RESOLVED rather than trusting the echo — an
+        # unpublished result interpolates to empty and would otherwise pass
+        # silently. This is what catches a broken results channel.
         test -n "$PREV_VERSION"
+        test -n "$PREV_COMMIT"
+        test -n "$COMMIT_COUNT"
+        # The 40-char commit proves a STRING result survived round-trip, and the
+        # digits prove a NUMBER one did.
+        test "${#PREV_COMMIT}" -eq 40
+        echo "$COMMIT_COUNT" | grep -qE '^[0-9]+$'
 
   # --- invoke (ADR-0038): inline a library pipeline with typed inputs -------
   - id: notify

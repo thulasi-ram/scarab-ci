@@ -1785,6 +1785,25 @@ impl Db for PostgresDb {
             .collect())
     }
 
+    async fn forget_workspace_root(&self, root: &str) -> Result<u32, DbError> {
+        // BOTH arms of the mark set (ADR-0056): the step_runs denorm and every
+        // attempt's own copy. Clearing one arm only would leave the other still
+        // reporting the dead root, so the warning would survive the self-heal.
+        let mut cleared = 0u64;
+        for sql in [
+            "UPDATE step_runs SET output_snapshot = NULL WHERE output_snapshot = $1",
+            "UPDATE attempts SET output_snapshot = NULL WHERE output_snapshot = $1",
+        ] {
+            cleared += sqlx::query(sql)
+                .bind(root)
+                .execute(self.pool())
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+        }
+        Ok(cleared as u32)
+    }
+
     async fn lease(&self, resource: &str, owner: &str, ttl_ms: i64) -> Result<Lease, DbError> {
         // Acquire or renew, taking over only an expired lease. The holder's own
         // re-request is a RENEWAL and must EXTEND `expires_at` (the port
