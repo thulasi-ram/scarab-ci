@@ -19,6 +19,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 _img_repo="${IMAGE_REPOSITORY:-}"
 _img_clone="${SCARAB_CLONE_IMAGE:-}"
 _img_sidecar="${SCARAB_SIDECAR_IMAGE:-}"
+_img_wsfetch="${SCARAB_WSFETCH_IMAGE:-}"
 
 # Load .env. It is authoritative (file-wins) for durable config + secrets: a
 # stale ambient value — e.g. a direnv-loaded .env.local — must NOT silently
@@ -44,6 +45,7 @@ fi
 [ -n "$_img_repo" ] && export IMAGE_REPOSITORY="$_img_repo"
 [ -n "$_img_clone" ] && export SCARAB_CLONE_IMAGE="$_img_clone"
 [ -n "$_img_sidecar" ] && export SCARAB_SIDECAR_IMAGE="$_img_sidecar"
+[ -n "$_img_wsfetch" ] && export SCARAB_WSFETCH_IMAGE="$_img_wsfetch"
 
 # HARD GUARD: only ever touch the local colima cluster, never an ACME EKS ctx.
 ctx="$(kubectl config current-context)"
@@ -157,6 +159,10 @@ workspace:
   replicaCount: 1
   persistence:
     size: "${WS_PV_SIZE}"
+  # The ADR-0061 s3-feed fetcher. `just local-helm local` builds it from the tree
+  # like the other three images; otherwise it tracks the published tag.
+  # ⚠ DELETE ME with the node driver (git-bug 0628369).
+  fetcherImage: "${SCARAB_WSFETCH_IMAGE:-ghcr.io/thulasi-ram/scarab-wsfetch:edge}"
 secrets:
   databaseUrl: "${SCARAB_DATABASE_URL}"
   masterKey: "${SCARAB_MASTER_KEY}"

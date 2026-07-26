@@ -237,6 +237,17 @@ workspace:
   # Where the warm tier lives inside the container — the PVC's mount point, and
   # the value of SCARAB_WORKSPACE_DATA_DIR.
   dataDir: /var/lib/scarab/cas
+  # The workspace FETCHER image (ADR-0061 s3-feed): the init container every Step
+  # with `needs:` runs to pull its input snapshots from the service. Digest-pin in
+  # production, exactly as with scarab.cloneImage.
+  #
+  # ⚠ This is a temporally-ordered STEPPING STONE, not the design. It is EAGER —
+  # it copies the whole snapshot onto every fresh node — and the CSI/FUSE node
+  # driver replaces it, at which point this value, docker/wsfetch/ and the
+  # executor's WorkspaceFetch all disappear together (git-bug 0628369). While this
+  # is set, `eager_fetch_total` on the server is climbing and the stone is
+  # load-bearing.
+  fetcherImage: ghcr.io/thulasi-ram/scarab-wsfetch:edge
   persistence:
     # The warm tier is bounded by SPACE (cold is bounded by time). LRU eviction
     # is NOT implemented yet, so until it is, watch the

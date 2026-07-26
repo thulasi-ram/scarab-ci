@@ -267,21 +267,48 @@ ws_host="$(kubectl run "ws-discover-$$" -n scarab \
            | sed -n 's/^SCARAB_WS_HOST=//p' | tr -d '\r' | head -n 1)"
 kubectl delete pod "ws-discover-$$" -n scarab --ignore-not-found --wait=false >/dev/null 2>&1 || true
 if [ -z "$ws_host" ] || [ "$ws_host" = none ]; then
+  # A HARD GATE, not a warning — and this is the promotion the previous version's
+  # own comment promised "once the fetcher lands" (ADR-0061 D2.3 guard #3).
+  #
+  # It landed. Every Step with `needs:` is now provisioned by an init container
+  # that dials this URL, and there is no control-plane feed to fall back on. A
+  # stack that comes up "usable" without a Pod-reachable workspace service is a
+  # stack where every chained pipeline fails at its second step — which is a
+  # confusing red run twenty minutes later instead of one clear error here.
   {
-    echo "warning: no Pod-reachable address for the workspace service was found."
-    echo "         Tried: $ws_candidates (port $ws_port)"
-    echo "         The stack is usable — nothing in the data path dials this URL"
-    echo "         yet — but the ADR-0061 fetcher will not work until it does."
-    echo "         Next option: run the workspace service as a Deployment + PVC"
-    echo "         inside kind, as deploy/local-helm does for Postgres and MinIO."
+    echo "error: no Pod-reachable address for the workspace service was found."
+    echo "  Tried: $ws_candidates (port $ws_port)"
+    echo "  Since ADR-0061 s3-feed this is FATAL: a Step that inherits a workspace"
+    echo "  is provisioned by an init container that dials this URL, and the old"
+    echo "  control-plane 'kubectl exec' feed is deleted, not kept as a fallback."
+    echo "  So a stack without it cannot run any pipeline with more than one step."
+    echo "  Next option: run the workspace service as a Deployment + PVC inside"
+    echo "  kind, as deploy/local-helm does for Postgres and MinIO."
   } >&2
-  # Set it anyway, to the first candidate, so the startup report names something
-  # rather than nothing. It is wrong, and the warning above says so.
-  ws_host="${ws_candidates%% *}"
-else
-  echo "    a Pod reached the workspace service at http://$ws_host:$ws_port"
+  rm -f "$here/workspace.pid"
+  kill "$workspace_pid" 2>/dev/null || true
+  exit 1
 fi
+echo "    a Pod reached the workspace service at http://$ws_host:$ws_port"
 export SCARAB_WORKSPACE_URL="http://$ws_host:$ws_port"
+
+# The fetcher image (ADR-0061 s3-feed). kind cannot pull from the host's docker
+# daemon, so proc mode builds it once and `kind load`s it — the same reason the
+# clone image has to be dealt with explicitly here. Skipped when the image is
+# already in the node, so a re-run of `just up` is cheap.
+#
+# ⚠ DELETE ME with the node driver (git-bug 0628369), together with
+# docker/wsfetch/ and the executor's WorkspaceFetch.
+export SCARAB_WSFETCH_IMAGE="${SCARAB_WSFETCH_IMAGE:-scarab-wsfetch:dev}"
+if [ "${SCARAB_WSFETCH_SKIP_BUILD:-0}" != 1 ]; then
+  echo "==> building + loading the workspace fetcher image ($SCARAB_WSFETCH_IMAGE)"
+  if ! docker image inspect "$SCARAB_WSFETCH_IMAGE" >/dev/null 2>&1; then
+    docker build -q -t "$SCARAB_WSFETCH_IMAGE" -f "$root/docker/wsfetch/Dockerfile" "$root" >/dev/null
+  else
+    echo "    reusing the local image (docker rmi $SCARAB_WSFETCH_IMAGE to force a rebuild)"
+  fi
+  kind load docker-image "$SCARAB_WSFETCH_IMAGE" --name "$cluster" >/dev/null
+fi
 
 echo "==> starting scarab-server (converged) in the background"
 nohup "$root/target/debug/scarab-server" --role converged --serve \

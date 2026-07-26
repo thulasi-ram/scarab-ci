@@ -76,6 +76,11 @@ data:
          SCARAB_ROLE with an explicit `env` entry, which wins over envFrom. */}}
   SCARAB_WORKSPACE_URL: {{ include "scarab.workspaceUrl" . | quote }}
   SCARAB_WORKSPACE_DATA_DIR: {{ .Values.workspace.dataDir | quote }}
+  {{- /* The fetcher image (ADR-0061 s3-feed): the init container every Step with
+         `needs:` runs to pull its inputs from the service above. Set even though
+         the server has its own default, so a chart-pinned digest is possible.
+         ⚠ DELETE ME with the node driver (git-bug 0628369). */}}
+  SCARAB_WSFETCH_IMAGE: {{ .Values.workspace.fetcherImage | quote }}
   {{- end }}
   {{- if .Values.secrets.resultsTokenSecret }}
   SCARAB_SIDECAR_IMAGE: {{ .Values.scarab.sidecarImage | quote }}

@@ -81,13 +81,17 @@ local-helm ref="edge":
     set -euo pipefail
     owner=ghcr.io/thulasi-ram
     if [ "{{ref}}" = "local" ]; then
-      echo "==> building server + clone + sidecar from the working tree"
+      echo "==> building server + clone + sidecar + wsfetch from the working tree"
       docker build -t scarab-server:dogfood-local -f docker/server/Dockerfile .
       docker build -t scarab-clone:dogfood docker/clone
       docker build -t scarab-results-sidecar:dogfood docker/sidecar
+      # The ADR-0061 s3-feed fetcher. Context is the repo root: it is a bin target
+      # of crates/scarab-workspace-client. ⚠ goes away with the node driver (0628369).
+      docker build -t scarab-wsfetch:dogfood -f docker/wsfetch/Dockerfile .
       IMAGE_REPOSITORY=scarab-server \
       SCARAB_CLONE_IMAGE=scarab-clone:dogfood \
       SCARAB_SIDECAR_IMAGE=scarab-results-sidecar:dogfood \
+      SCARAB_WSFETCH_IMAGE=scarab-wsfetch:dogfood \
         bash deploy/local-helm/deploy.sh dogfood-local
     else
       echo "==> pulling + deploying published images @ {{ref}} (ghcr, pullPolicy Always)"
@@ -95,6 +99,7 @@ local-helm ref="edge":
       IMAGE_PULL_POLICY=Always \
       SCARAB_CLONE_IMAGE="$owner/scarab-clone:{{ref}}" \
       SCARAB_SIDECAR_IMAGE="$owner/scarab-results-sidecar:{{ref}}" \
+      SCARAB_WSFETCH_IMAGE="$owner/scarab-wsfetch:{{ref}}" \
         bash deploy/local-helm/deploy.sh {{ref}}
     fi
 
