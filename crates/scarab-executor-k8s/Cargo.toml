@@ -30,6 +30,13 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 scarab-storage-s3 = { workspace = true }
+# The live workspace tier (tests/cluster.rs) points the executor's `Cas` at the
+# REAL ADR-0061 workspace service, because since s3-feed the Step Pod's fetcher
+# reads from that service and a test whose CAS was a host tempdir would pass only
+# because the feed never happened. A dev-dependency, so nothing in production
+# links it — and no dependency cycle: this crate is only in
+# scarab-workspace-client's OWN dev-dependencies (via scarab-server).
+scarab-workspace-client = { workspace = true }
 # The live orphan-Pod teardown regression (tests/cluster.rs) drives the REAL
 # executor through the engine's supersede-teardown path over the in-memory Db.
 scarab-testkit = { workspace = true }

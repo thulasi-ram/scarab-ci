@@ -105,6 +105,93 @@ fn opted_in() -> Option<String> {
     Some(std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()))
 }
 
+/// The ADR-0061 workspace service this tier drives, and the `Cas` that MUST be
+/// the same store.
+///
+/// # Why a fixture, and why it is one object
+///
+/// Since s3-feed there is no control-plane feed: a Step with `needs:` is
+/// provisioned by an init container that dials the workspace service. So a live
+/// test of the workspace flow needs the two halves to agree about *where the
+/// content is*, and the cheap way to guarantee that is to make them literally the
+/// same endpoint:
+///
+/// - the executor's `Cas` (used by the **drain**, and by the test itself) is a
+///   [`WorkspaceClient`], which implements `Cas` precisely so a control plane can
+///   be pointed at the service with no call-site change;
+/// - the Pod's fetcher dials the same service.
+///
+/// These tests used to hand the executor an `S3Storage::local` on a **tempdir of
+/// the test host**, which the fetcher could never see. Keeping that would have
+/// left a test that passes only because the feed never happened.
+///
+/// # Two URLs, deliberately
+///
+/// `SCARAB_TEST_WORKSPACE_URL` is host-facing (the test process is the control
+/// plane); `SCARAB_TEST_WORKSPACE_POD_URL` is what a Pod dials, and in proc mode
+/// they differ — the host reaches loopback, a Pod cannot (see the long note in
+/// `deploy/local-proc/up.sh`). It defaults to the host URL, which is right in
+/// Helm mode where there is one in-cluster Service.
+///
+/// # Not run, and said plainly
+///
+/// This whole tier is `#[ignore]` + `SCARAB_TEST_KUBE`-gated and was **not
+/// executed** for the s3-feed change: it needs a live cluster plus a reachable
+/// workspace service plus the fetcher image loaded into the node.
+struct WorkspaceFixture {
+    /// The service, behind `Cas`. What the executor drains into and what the test
+    /// reads back.
+    cas: std::sync::Arc<dyn scarab_storage::Cas>,
+    /// What the Step Pod's fetcher is told.
+    fetch: scarab_executor_k8s::WorkspaceFetch,
+}
+
+fn workspace_fixture() -> Option<WorkspaceFixture> {
+    let Ok(url) = std::env::var("SCARAB_TEST_WORKSPACE_URL") else {
+        eprintln!(
+            "skipping: set SCARAB_TEST_WORKSPACE_URL (host-facing), \
+             SCARAB_TEST_WORKSPACE_SECRET and SCARAB_TEST_WSFETCH_IMAGE. Since ADR-0061 \
+             s3-feed a Step with `needs:` is provisioned by an init container that dials \
+             the workspace service, so there is nothing to test without one."
+        );
+        return None;
+    };
+    let Ok(secret) = std::env::var("SCARAB_TEST_WORKSPACE_SECRET") else {
+        eprintln!("skipping: SCARAB_TEST_WORKSPACE_SECRET is not set");
+        return None;
+    };
+    let Ok(image) = std::env::var("SCARAB_TEST_WSFETCH_IMAGE") else {
+        eprintln!(
+            "skipping: set SCARAB_TEST_WSFETCH_IMAGE to a scarab-wsfetch image present in \
+             the cluster (proc mode: `just up` builds + kind-loads scarab-wsfetch:dev)"
+        );
+        return None;
+    };
+    let pod_url = std::env::var("SCARAB_TEST_WORKSPACE_POD_URL").unwrap_or_else(|_| url.clone());
+
+    // The test process stands in for the control plane, so it mints itself a
+    // BROWSE token — not root-limited, because it reads and writes arbitrary
+    // snapshots. A Pod never gets one of these; the executor mints each Pod a
+    // `read` token scoped to exactly that Step's inputs.
+    use scarab_executor_k8s::workspace_token;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let token = workspace_token::mint(
+        secret.as_bytes(),
+        &workspace_token::browse_claims(now + 3_600),
+    );
+    Some(WorkspaceFixture {
+        cas: std::sync::Arc::new(scarab_workspace_client::WorkspaceClient::new(&url, token)),
+        fetch: scarab_executor_k8s::WorkspaceFetch {
+            url: pod_url,
+            token_secret: secret.into_bytes(),
+            fetcher_image: image,
+        },
+    })
+}
+
 /// A per-invocation unique run id: live tests re-launch by fence, so a fixed
 /// id would re-attach to a leftover Pod from a previous invocation whose CAS
 /// (a tempdir) is gone.
@@ -325,27 +412,25 @@ async fn log_stream_tails_pod_stdout() {
     exec.cancel(&h).await.expect("cancel cleans up the pod");
 }
 
-/// Live workspace flow (ADR-0029/0045 keystone): step A writes a file into
-/// /workspace, its workspace is snapshotted into the CAS (Executor::output
-/// returns the root), and step B (`needs: [A]`) has it materialized and reads
-/// it back. Also proves restart determinism: re-running A yields the SAME
-/// CAS root. `#[ignore]`d + gated on SCARAB_TEST_KUBE.
+/// Live workspace flow (ADR-0029/0045 keystone, now ADR-0061 s3-feed): step A
+/// writes a file into /workspace, its workspace is snapshotted into the CAS
+/// (Executor::output returns the root), and step B (`needs: [A]`) has it
+/// materialized and reads it back. Also proves restart determinism: re-running A
+/// yields the SAME CAS root. `#[ignore]`d + gated on SCARAB_TEST_KUBE.
+///
+/// **Step B is now the acceptance test for the fetcher**, not for a control-plane
+/// tar tunnel: the only way B can see A's file is if the init container dialled
+/// the workspace service and materialised the snapshot itself.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn workspace_flows_from_a_to_b_through_the_cas() {
-    use scarab_storage::Cas;
     let Some(ns) = opted_in() else { return };
+    let Some(ws) = workspace_fixture() else { return };
 
     let client = kube::Client::try_default().await.expect("kube client");
-    // SCARAB_TEST_CAS_DIR pins the CAS for post-mortem inspection; default is
-    // a tempdir that lives for the duration of the test.
-    let tmp = tempfile::tempdir().expect("cas dir");
-    let cas_dir = std::env::var("SCARAB_TEST_CAS_DIR")
-        .unwrap_or_else(|_| tmp.path().to_string_lossy().into_owned());
-    std::fs::create_dir_all(&cas_dir).expect("cas dir");
-    let cas: std::sync::Arc<dyn Cas> =
-        std::sync::Arc::new(scarab_storage_s3::S3Storage::local(&cas_dir).expect("local cas"));
-    let exec = K8sExecutor::with_client(ns, client).with_workspace_cas(cas);
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_service(ws.fetch.clone());
 
     let step_run = |id: &str, attempt: &str| StepRun {
         run: RunId("run-ws".into()),
@@ -443,6 +528,170 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
     }
 }
 
+/// LIVE: a Step whose input snapshot does not exist must get a **verdict**, not a
+/// hang (ADR-0061 s3-feed).
+///
+/// This is only reachable now. The `busybox` doorstop the fetcher replaced could
+/// not fail — it spun on a marker file — so a missing input was discovered by the
+/// control plane and mapped to `DriveErr::InputMissing`. The discovery moved into
+/// the Pod, and this test is what proves the replacement classification is
+/// equivalent: `Infra { never_started: true }` (the step's process never ran, so
+/// no side effect is possible; bounded auto-retry then dead-letters).
+///
+/// Kind-tier and not unit-testable: the *unit* test pins `pod_state`'s reading of
+/// a Pod fixture, but that a real fetcher exits non-zero, and that the kubelet
+/// then reports the Pod the way the fixture claims, is exactly the
+/// "reports success but structurally cannot work" seam a cluster is needed for.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
+    let Some(ns) = opted_in() else { return };
+    let Some(ws) = workspace_fixture() else { return };
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_service(ws.fetch.clone());
+
+    let step = StepRun {
+        run: RunId(unique_run("run-ws-missing")),
+        step: StepId("consume".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+            outcome: AttemptOutcome::Running,
+        }],
+        needs: vec![StepId("produce".into())],
+        gate_kind: None,
+    };
+    // A well-formed but absent snapshot root: 64 hex chars, so it passes the
+    // service's path guard and gets a genuine 404 rather than a 400.
+    let spec = StepSpec {
+        image: "busybox:1.36".into(),
+        command: vec!["sh".into(), "-c".into(), "echo should-never-run".into()],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: true,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(120),
+        workspace_inputs: vec!["f".repeat(64)],
+        workspace_outputs: vec![],
+        clone: None,
+        build: None,
+        artifacts: vec![],
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
+        services: Vec::new(),
+        uses: Vec::new(),
+        matrix_values: Default::default(),
+    };
+
+    let h = exec.launch(&step, &spec).await.expect("launch");
+    assert_eq!(
+        poll_to_terminal(&exec, &h, 120).await,
+        Some(ExecState::Failed {
+            exit_code: None,
+            class: FailureClass::Infra {
+                never_started: true
+            },
+        }),
+        "a fetch that cannot find its input must fail the attempt fast — the old \
+         doorstop would have waited for a feed that never came"
+    );
+    exec.cancel(&h).await.expect("cleanup");
+}
+
+/// LIVE: a Step that inherits a workspace when no workspace service is configured
+/// is **refused at launch** (ADR-0061 s3-feed, fail-closed).
+///
+/// The tempting alternative is to let the Pod run with an empty `/workspace`. That
+/// does not fail — it produces a *wrong answer*, and the Attempt then claims in
+/// the durable record to have tested a tree that was never there, which is the one
+/// thing this product may not do (CONTEXT.md §2). There is deliberately no
+/// fallback to the deleted control-plane feed (ADR-0061 D2.3).
+///
+/// No cluster work happens here beyond connecting, but it lives in this tier
+/// because it asserts on the real `Executor::launch`.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured() {
+    let Some(ns) = opted_in() else { return };
+    let client = kube::Client::try_default().await.expect("kube client");
+    let tmp = tempfile::tempdir().expect("cas dir");
+    let cas: std::sync::Arc<dyn scarab_storage::Cas> = std::sync::Arc::new(
+        scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local cas"),
+    );
+    // Workspace CAS wired, NO workspace service.
+    let exec = K8sExecutor::with_client(ns, client).with_workspace_cas(cas);
+
+    let step = StepRun {
+        run: RunId(unique_run("run-ws-unconfigured")),
+        step: StepId("consume".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+            outcome: AttemptOutcome::Running,
+        }],
+        needs: vec![StepId("produce".into())],
+        gate_kind: None,
+    };
+    let mut spec = StepSpec {
+        image: "busybox:1.36".into(),
+        command: vec!["true".into()],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: true,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(60),
+        workspace_inputs: vec!["a".repeat(64)],
+        workspace_outputs: vec![],
+        clone: None,
+        build: None,
+        artifacts: vec![],
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
+        services: Vec::new(),
+        uses: Vec::new(),
+        matrix_values: Default::default(),
+    };
+    let err = exec
+        .launch(&step, &spec)
+        .await
+        .expect_err("must refuse, not create a Pod with an empty workspace");
+    assert!(
+        format!("{err:?}").contains("no workspace service is configured"),
+        "{err:?}"
+    );
+    // No Pod was created — the refusal is BEFORE any effect.
+    let pods: kube::Api<k8s_openapi::api::core::v1::Pod> = kube::Api::namespaced(
+        kube::Client::try_default().await.expect("kube client"),
+        &std::env::var("SCARAB_TEST_KUBE_NS").unwrap_or_else(|_| "default".to_string()),
+    );
+    assert!(
+        pods.get_opt(&pod_name(&step))
+            .await
+            .expect("get pod")
+            .is_none(),
+        "a refused launch must leave nothing behind"
+    );
+
+    // The same step with no inputs launches fine — every `clone` step and every
+    // first step in a pipeline has this shape, and they must not need a service.
+    spec.workspace_inputs = vec![];
+    let h = exec.launch(&step, &spec).await.expect("launch without inputs");
+    exec.cancel(&h).await.expect("cleanup");
+}
+
 /// LIVE per-path publishing (`outputs:`, ADR-0007): the egress leg prunes the
 /// published snapshot to the declared paths, and a dependent materializes only
 /// those. Kind-tier because the prune runs in `drive_workspace` off the Pod
@@ -452,16 +701,17 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn declared_outputs_publish_only_those_paths_through_the_cas() {
-    use scarab_storage::Cas;
     let Some(ns) = opted_in() else { return };
+    let Some(ws) = workspace_fixture() else { return };
     let run_id = unique_run("run-ws-out");
 
     let client = kube::Client::try_default().await.expect("kube client");
-    let tmp = tempfile::tempdir().expect("cas dir");
-    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
-        scarab_storage_s3::S3Storage::local(tmp.path()).expect("local cas"),
-    );
-    let exec = K8sExecutor::with_client(ns, client).with_workspace_cas(cas);
+    // The pruned root must be readable BY THE FETCHER, so the executor's `Cas` is
+    // the workspace service — a host tempdir would leave step B unable to see
+    // anything and the assertion below would pass for the wrong reason.
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_service(ws.fetch.clone());
 
     let step_run = |id: &str| StepRun {
         run: RunId(run_id.clone()),
@@ -583,7 +833,6 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn clone_step_produces_a_source_workspace() {
-    use scarab_storage::Cas;
     let run_id = unique_run("run-clone");
     let Some(ns) = opted_in() else { return };
     let Ok(clone_image) = std::env::var("SCARAB_TEST_CLONE_IMAGE") else {
@@ -591,14 +840,15 @@ async fn clone_step_produces_a_source_workspace() {
         return;
     };
     let sha = std::env::var("SCARAB_TEST_CLONE_SHA").expect("SCARAB_TEST_CLONE_SHA");
+    // The downstream `needs: [checkout]` step at the bottom of this test is fed by
+    // the fetcher, so this test needs the service too.
+    let Some(ws) = workspace_fixture() else { return };
+    let cas = ws.cas.clone();
 
     let client = kube::Client::try_default().await.expect("kube client");
-    let tmp = tempfile::tempdir().expect("cas dir");
-    let cas_dir = tmp.path().to_string_lossy().into_owned();
-    let cas: std::sync::Arc<dyn Cas> =
-        std::sync::Arc::new(scarab_storage_s3::S3Storage::local(&cas_dir).expect("local cas"));
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(cas.clone())
+        .with_workspace_service(ws.fetch.clone())
         .with_clone_image(&clone_image);
 
     let step = StepRun {
@@ -698,9 +948,10 @@ async fn clone_step_produces_a_source_workspace() {
         command: vec![
             "sh".into(),
             "-c".into(),
-            // -c safe.directory: the workspace is materialized by the init
-            // container's uid, the step runs as the image's — same situation
-            // every CI runner handles for authored git use.
+            // -c safe.directory: the workspace is materialized by the FETCHER's
+            // uid (ADR-0061 s3-feed; the control plane's before that), the step
+            // runs as the image's — same situation every CI runner handles for
+            // authored git use.
             format!(
                 "ls /workspace | head -5; \
                  head=$(git -C /workspace -c safe.directory=/workspace rev-parse HEAD); \
@@ -750,7 +1001,6 @@ async fn clone_step_produces_a_source_workspace() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn clone_depth_full_exposes_history() {
-    use scarab_storage::Cas;
     let run_id = unique_run("run-clone-full");
     let Some(ns) = opted_in() else { return };
     let Ok(clone_image) = std::env::var("SCARAB_TEST_CLONE_IMAGE") else {
@@ -758,14 +1008,14 @@ async fn clone_depth_full_exposes_history() {
         return;
     };
     let sha = std::env::var("SCARAB_TEST_CLONE_SHA").expect("SCARAB_TEST_CLONE_SHA");
+    // The history check downstream inherits the checkout, so it is fed by the
+    // fetcher (ADR-0061 s3-feed).
+    let Some(ws) = workspace_fixture() else { return };
 
     let client = kube::Client::try_default().await.expect("kube client");
-    let tmp = tempfile::tempdir().expect("cas dir");
-    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
-        scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local cas"),
-    );
     let exec = K8sExecutor::with_client(ns, client)
-        .with_workspace_cas(cas.clone())
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_service(ws.fetch.clone())
         .with_clone_image(&clone_image);
 
     let step = StepRun {
@@ -977,23 +1227,24 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn build_step_builds_and_pushes_to_a_local_registry() {
-    use scarab_storage::Cas;
     let Some(ns) = opted_in() else { return };
     let Ok(registry) = std::env::var("SCARAB_TEST_REGISTRY") else {
         eprintln!("skipping: set SCARAB_TEST_REGISTRY to an in-cluster registry host:port");
         return;
     };
+    // The build step inherits its context as a workspace input, so the fetcher
+    // provisions it (ADR-0061 s3-feed).
+    let Some(ws) = workspace_fixture() else { return };
     let run_id = unique_run("run-build");
 
     let client = kube::Client::try_default().await.expect("kube client");
-    let tmp = tempfile::tempdir().expect("cas dir");
-    let cas: std::sync::Arc<dyn Cas> = std::sync::Arc::new(
-        scarab_storage_s3::S3Storage::local(tmp.path().to_str().unwrap()).expect("local cas"),
-    );
-    let exec = K8sExecutor::with_client(ns, client).with_workspace_cas(cas.clone());
+    let cas = ws.cas.clone();
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(cas.clone())
+        .with_workspace_service(ws.fetch.clone());
 
     // The build context: a trivial Dockerfile, ingested as the upstream
-    // (checkout) workspace.
+    // (checkout) workspace — through the SERVICE, so the fetcher can read it back.
     let ctx = tempfile::tempdir().expect("context dir");
     std::fs::write(
         ctx.path().join("Dockerfile"),
