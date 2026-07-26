@@ -26,6 +26,15 @@ jobs:
       - name: Free runner disk space
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
+          # $AGENT_TOOLSDIRECTORY is /opt/hostedtoolcache, and `helm/kind-action`
+          # below installs kind THROUGH it: deleting it without putting the
+          # (empty) directory back fails the action outright — "Cache directory
+          # '/opt/hostedtoolcache' does not exist" — before a single test runs.
+          # Recreating it keeps the ~8GB the tree needs and the kind install.
+          if [ -n "${AGENT_TOOLSDIRECTORY:-}" ]; then
+            sudo mkdir -p "$AGENT_TOOLSDIRECTORY"
+            sudo chown "$(id -u):$(id -g)" "$AGENT_TOOLSDIRECTORY"
+          fi
           sudo docker system prune -af >/dev/null 2>&1 || true
           df -h /
       - uses: actions/checkout@v4
