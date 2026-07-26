@@ -243,13 +243,22 @@ contract_test!(attempt_non_downgrade, recorded_evidence_is_never_downgraded);
 //    EXTENDS the lease; a peer takes over only after expiry.
 //
 //    Both stores expire on wall-clock time (postgres `now()`, the fake
-//    `Instant`), not the Clock port, so this uses short real TTLs + sleeps
-//    with generous margins rather than FakeClock.
+//    `Instant`), not the Clock port, so this races real time rather than
+//    driving a FakeClock. Two rules keep it honest under load: every deadline
+//    is an ABSOLUTE offset from one start instant (a chain of `sleep(d)`
+//    folds each step's overhead into the next), and every margin is a
+//    FRACTION of the TTL rather than a fixed few hundred ms. The original
+//    800ms/500ms version left 300ms of slack and flaked under `cargo
+//    llvm-cov`, whose instrumented round trips cost ~500ms: the lease really
+//    had expired and `b` really did win, so a stalled runner reported itself
+//    as a lease-semantics bug.
 // ---------------------------------------------------------------------------
 
 async fn lease_grant_renew_and_takeover(db: &dyn Db) {
-    let ttl = 800_i64;
+    let ttl = 2_000_i64;
+    let ms = |n: i64| tokio::time::Duration::from_millis(n as u64);
     let res = "scheduler";
+    let start = tokio::time::Instant::now();
 
     // Grant.
     let l = db.lease(res, "a", ttl).await.unwrap();
@@ -259,22 +268,33 @@ async fn lease_grant_renew_and_takeover(db: &dyn Db) {
     let l = db.lease(res, "b", ttl).await.unwrap();
     assert_eq!(l.owner, "a", "an unexpired lease must not change hands");
 
-    // Renewal extends: renew at ~500ms, probe at ~1000ms — past the ORIGINAL
-    // expiry (800ms) but inside the renewed one (~1300ms). If renewal did not
-    // extend, `b` would win here.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Renew at 0.5·ttl — comfortably inside the original window.
+    tokio::time::sleep_until(start + ms(ttl / 2)).await;
     let l = db.lease(res, "a", ttl).await.unwrap();
     assert_eq!(l.owner, "a", "the holder must be able to renew");
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let renewed_at = tokio::time::Instant::now();
+
+    // Probe at 1.25·ttl: past the ORIGINAL expiry (1.0·ttl) but inside the
+    // renewed one (~1.5·ttl). If renewal did not extend, `b` would win here.
+    tokio::time::sleep_until(start + ms(ttl + ttl / 4)).await;
     let l = db.lease(res, "b", ttl).await.unwrap();
+    // Sampled AFTER the probe returned, so it over-counts the true gap: if
+    // even this upper bound sits inside the TTL, the lease was certainly live
+    // when the store evaluated it, and `a` must still hold it.
+    let since_renewal = renewed_at.elapsed();
+    assert!(
+        since_renewal < ms(ttl),
+        "precondition lost to scheduling: the probe landed {since_renewal:?} after \
+         the renewal, past the renewed {ttl}ms expiry — the runner stalled, so this \
+         says nothing about lease semantics"
+    );
     assert_eq!(
         l.owner, "a",
         "a renewed lease must be EXTENDED past the original expiry"
     );
 
-    // Takeover after expiry: wait out the renewed lease (expires ~1300ms;
-    // we are at ~1000ms), then a peer wins.
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    // Takeover: 2.0·ttl is a half-TTL past the renewed expiry (~1.5·ttl).
+    tokio::time::sleep_until(start + ms(2 * ttl)).await;
     let l = db.lease(res, "b", ttl).await.unwrap();
     assert_eq!(l.owner, "b", "an expired lease must be taken over");
 }
