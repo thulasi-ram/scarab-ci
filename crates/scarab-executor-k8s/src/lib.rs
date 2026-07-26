@@ -603,9 +603,10 @@ impl K8sExecutor {
     ///   through its page cache — s2 measured that tmpdir round-trip *growing* to
     ///   ~4.7 s as the CAS leg got faster, so it had to be removed rather than
     ///   accelerated;
-    /// - a **partial** tree can no longer be published as a Step's authoritative
-    ///   snapshot (git-bug `a3e7845`): a failed fetch fails the init container and
-    ///   the Step never runs.
+    /// - a **partial** tree can no longer be published on the FEED side (git-bug
+    ///   `a3e7845`): a failed fetch fails the init container and the Step never
+    ///   runs. The drain side had the same hole and it was NOT closed by deleting
+    ///   the feed — see below.
     ///
     /// s0 priced the deleted tunnel at 4–15% of a Step boundary, so this is not
     /// sold as a performance win. It is the prerequisite for lazy materialisation,
@@ -613,7 +614,11 @@ impl K8sExecutor {
     ///
     /// The **drain** tunnel (and the third `exec` tar inside
     /// [`harvest_artifacts`](Self::harvest_artifacts)) are still here on purpose:
-    /// s3-drain is a separately-ticketed slice (git-bug `7f05f39`).
+    /// s3-drain is a separately-ticketed slice (git-bug `7f05f39`). What they are
+    /// no longer allowed to do is publish a tree they cannot prove is whole:
+    /// [`exec_capture_stdout`](Self::exec_capture_stdout) frames every captured
+    /// stream and refuses an incomplete one, so a `tar` cut short is a withheld
+    /// verdict rather than a green Attempt over a partial snapshot.
     async fn drive_workspace(
         &self,
         pods: &Api<Pod>,
@@ -835,19 +840,35 @@ impl K8sExecutor {
         // Step boundary (it runs for every terminated step, any exit code), so it
         // belongs in the same budget as the workspace legs.
         let t_leg = std::time::Instant::now();
+        // `|| true` used to swallow tar's exit status here — it existed for the
+        // "no artifacts directory" case, and paid for it by making a tar that died
+        // mid-stream indistinguishable from one that had nothing to say. The
+        // absent-directory case is now asked explicitly, so the failure of a tar
+        // that DID run propagates (git-bug `a3e7845`); an `if` with no `else` exits
+        // 0, so the sentinel still lands when there is nothing to harvest.
         let out = self
             .exec_capture_stdout(
                 pods,
                 name,
                 WORKSPACE_EGRESS_CONTAINER,
-                &format!("tar -cf - -C {ARTIFACTS_MOUNT_PATH} . 2>/dev/null || true"),
+                &format!(
+                    "if [ -d {ARTIFACTS_MOUNT_PATH} ]; \
+                     then tar -cf - -C {ARTIFACTS_MOUNT_PATH} . 2>/dev/null; fi"
+                ),
             )
             .await?;
         let exec_drain_ms = t_leg.elapsed().as_millis();
         let drain_tar_bytes = out.len() as u64;
         let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
         if !out.is_empty() {
-            let _ = unpack_dir(&out, tmp.path()); // an empty dir tars to nothing
+            // …and the unpack error propagates too. It was `let _ =`, whose comment
+            // ("an empty dir tars to nothing") describes a case the `is_empty`
+            // guard above already handles — so the discard only ever hid a real
+            // corrupt/truncated archive, and hid it in the leg that indexes a
+            // failed step's ONLY evidence. A harvest error is transient by
+            // construction (see the call site), so propagating it delays the
+            // verdict; discarding it published an empty index as the truth.
+            unpack_dir(&out, tmp.path())?;
         }
 
         let t_upload = std::time::Instant::now();
@@ -951,17 +972,67 @@ impl K8sExecutor {
             stdin.shutdown().await.ok();
             drop(stdin);
         }
-        // Best-effort join: when this exec's command releases a wait-loop
-        // (touching a marker), the container exits immediately and the exec's
-        // status frame is torn down with it — a benign race. The workspace
-        // state machine is idempotent and derived from the Pod, so a feed
-        // that truly failed leaves the init container running and the next
-        // poll simply retries.
-        let _ = proc.join().await;
+        // Best-effort join, but no longer SILENT. When this exec's command releases
+        // a wait-loop (touching a marker), the container exits immediately and the
+        // exec's status frame is torn down with it — a benign race, so an error
+        // here must not be a verdict. What makes tolerating it safe is that this
+        // call carries no DATA: its whole effect is one `touch`, the state machine
+        // is derived from the Pod, and a release that did not happen leaves the
+        // egress container running so the next poll re-issues it. That is the
+        // opposite of `exec_capture_stdout`, whose bytes ARE the evidence and which
+        // therefore fails closed (git-bug `a3e7845`).
+        //
+        // It is logged because "tolerated" and "invisible" are different things: a
+        // release failing every poll until the step times out used to leave no
+        // trace at all naming this exec.
+        if let Err(e) = proc.join().await {
+            tracing::debug!(
+                pod = %pod,
+                container = %container,
+                "exec join failed after a control command; the Pod-derived state \
+                 machine will re-issue it on the next poll: {e}"
+            );
+        }
         Ok(())
     }
 
-    /// Run `sh -c cmd` in `container`, capturing its stdout.
+    /// Run `sh -c cmd` in `container` and capture its stdout **only if the
+    /// capture is provably complete** (git-bug `a3e7845`).
+    ///
+    /// # Why this is not "read the stream and trust it"
+    ///
+    /// Both callers hand the bytes straight to [`unpack_dir`], and one of them
+    /// then publishes the result as a Step's authoritative Workspace Snapshot. A
+    /// `tar` that dies partway — the egress container OOM-killed, node pressure,
+    /// `SIGPIPE` at a 512-byte record boundary — produces a stdout stream that is
+    /// **truncated but not an error**: `tar::Archive::unpack` treats a short read
+    /// as end-of-archive and unpacks a *partial tree*, `Cas::ingest` hashes it
+    /// happily, and the Attempt goes green claiming a snapshot that is missing
+    /// files. That is silent data loss, and the class of thing CONTEXT.md §2 says
+    /// this product may not do. The tolerance for a transient `workspace: broken
+    /// pipe` in the kind tier (~1-in-9, git-bug `a0b42ad`) is the evidence that
+    /// the trigger is real and not theoretical.
+    ///
+    /// # Two guards, and why neither alone is enough
+    ///
+    /// 1. **The remote command's exit status.** `AttachedProcess::join()` reports
+    ///    only websocket/task failures — the remote `Status` frame arrives on a
+    ///    separate channel that only [`kube::api::AttachedProcess::take_status`]
+    ///    can see, so the previous code could not have noticed a `tar` that
+    ///    exited non-zero. Note `take_status` MUST be called before `join`, which
+    ///    drops the receiver.
+    /// 2. **A sentinel appended to the stream itself.** `cmd && printf SENTINEL`
+    ///    means the sentinel is on stdout *after* the payload, and only if the
+    ///    command succeeded. So a stream missing its sentinel is truncated (or
+    ///    the command failed) — detectable even when the status frame is lost,
+    ///    which is exactly the case the status check cannot cover. The nonce makes
+    ///    it unforgeable by the captured content and unmistakable for a leftover
+    ///    from an earlier exec.
+    ///
+    /// It **fails closed**: no complete capture, no `Ok`. The callers turn that
+    /// into `DriveErr::Transient`, which holds the egress barrier shut, withholds
+    /// the verdict, and re-drains on the next poll — a delayed verdict instead of
+    /// a wrong one.
     async fn exec_capture_stdout(
         &self,
         pods: &Api<Pod>,
@@ -970,14 +1041,18 @@ impl K8sExecutor {
         cmd: &str,
     ) -> Result<Vec<u8>, String> {
         use tokio::io::AsyncReadExt as _;
+        let sentinel = stream_sentinel();
+        let framed = framed_command(cmd, &sentinel);
         let params = AttachParams::default()
             .container(container)
             .stdout(true)
             .stderr(false);
         let mut proc = pods
-            .exec(pod, ["sh", "-c", cmd], &params)
+            .exec(pod, ["sh", "-c", framed.as_str()], &params)
             .await
             .map_err(|e| format!("exec in {container}: {e}"))?;
+        // Before `join`, which takes the status receiver away.
+        let status = proc.take_status();
         let mut out = Vec::new();
         if let Some(mut stdout) = proc.stdout() {
             stdout
@@ -986,8 +1061,76 @@ impl K8sExecutor {
                 .map_err(|e| e.to_string())?;
         }
         proc.join().await.map_err(|e| format!("exec join: {e}"))?;
-        Ok(out)
+
+        // Guard 1. A `Failure` status is decisive; an ABSENT status is not, because
+        // the frame can legitimately be torn down with the container (see
+        // `exec_with_stdin`) — and the sentinel below already proves completeness
+        // on its own, so refusing on a missing frame would only add false reds.
+        let status = match status {
+            Some(fut) => fut.await,
+            None => None,
+        };
+        if let Some(s) = &status {
+            if s.status.as_deref() != Some("Success") {
+                return Err(format!(
+                    "exec in {container} reported failure: status={:?} reason={:?} message={:?}",
+                    s.status, s.reason, s.message
+                ));
+            }
+        }
+        // Guard 2. The sentinel, which is the one that catches a stream cut short.
+        strip_stream_sentinel(out, &sentinel).map_err(|e| {
+            format!(
+                "{e} (container {container}, remote status {:?}) — refusing to unpack a stream \
+                 whose completeness cannot be established (git-bug a3e7845)",
+                status.as_ref().map(|s| s.status.clone())
+            )
+        })
     }
+}
+
+/// A per-exec end-of-stream sentinel for [`framed_command`].
+///
+/// Unique per call — wall clock plus a process-wide counter — so it can be
+/// neither forged by the captured bytes nor confused with an earlier exec's.
+/// It is a framing marker, not a secret; unguessability is not the property
+/// being bought, uniqueness is.
+fn stream_sentinel() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("__scarab-eos-{nanos:x}-{seq:x}__")
+}
+
+/// Wrap `cmd` so its stdout is terminated by `sentinel` **only on success**.
+///
+/// `&&` is the whole mechanism: if `cmd` fails or is killed, `printf` never runs
+/// and the stream has no sentinel. Trailing bytes after a tar archive are
+/// harmless — a tar reader stops at the two zero blocks — but they are stripped
+/// anyway by [`strip_stream_sentinel`] before anything unpacks the payload.
+fn framed_command(cmd: &str, sentinel: &str) -> String {
+    format!("{cmd} && printf '%s' '{sentinel}'")
+}
+
+/// Verify `out` ends with `sentinel` and return the payload without it.
+///
+/// The inverse of [`framed_command`], and the truncation detector: a payload that
+/// does not end in its own sentinel was cut short (or its command failed), and
+/// must never reach [`unpack_dir`].
+fn strip_stream_sentinel(mut out: Vec<u8>, sentinel: &str) -> Result<Vec<u8>, String> {
+    let marker = sentinel.as_bytes();
+    if !out.ends_with(marker) {
+        return Err(format!(
+            "captured stream is incomplete: {} bytes, no end-of-stream sentinel",
+            out.len()
+        ));
+    }
+    out.truncate(out.len() - marker.len());
+    Ok(out)
 }
 
 /// Minimal artifact glob (ADR-0052): `*` matches any run of characters
@@ -6391,6 +6534,162 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(pod_state(&pod), ExecState::Pending);
+        }
+    }
+
+    /// The drain's completeness guard (git-bug `a3e7845`).
+    ///
+    /// These are unit tests of [`strip_stream_sentinel`] and [`framed_command`]
+    /// rather than of a live drain, and that is the point: the hazard is not a
+    /// Kubernetes behaviour, it is that **a truncated tar is a valid tar**. Prove
+    /// that once, in-process, and the guard that stands in front of it is pinned
+    /// for every caller. The live tier's job is the wiring, not the arithmetic.
+    mod stream_framing {
+        use super::*;
+
+        /// One tar entry: a 512-byte header plus its payload padded to 512, for the
+        /// sub-512-byte files below. Cutting the stream at a multiple of this is
+        /// cutting it at a record boundary, which is what a killed `tar` does.
+        const ENTRY_BYTES: usize = 1024;
+
+        /// A tar of three small files, entries appended in a KNOWN order so the
+        /// truncation offsets below are arithmetic rather than guesswork.
+        fn tar_of_three_files() -> Vec<u8> {
+            let mut builder = tar::Builder::new(Vec::new());
+            for name in ["a.txt", "b.txt", "c.txt"] {
+                let body = format!("contents of {name}\n").into_bytes();
+                let mut header = tar::Header::new_gnu();
+                header.set_path(name).expect("path");
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, body.as_slice()).expect("append");
+            }
+            builder.into_inner().expect("finish")
+        }
+
+        fn unpack_count(bytes: &[u8]) -> Result<usize, String> {
+            let out = tempfile::tempdir().expect("tmp");
+            unpack_dir(bytes, out.path())?;
+            Ok(std::fs::read_dir(out.path())
+                .expect("read_dir")
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_file())
+                .count())
+        }
+
+        /// THE HAZARD, demonstrated rather than asserted about. A tar stream cut at
+        /// a 512-byte record boundary — an OOM-killed egress container, node
+        /// pressure, a `SIGPIPE` — unpacks **without error** into a tree that is
+        /// missing files. Nothing downstream can tell that apart from a small
+        /// workspace: `Cas::ingest` hashes what it is given, and the Attempt
+        /// publishes it as its authoritative snapshot with a green verdict.
+        ///
+        /// If this test ever starts failing because the `tar` crate learned to
+        /// reject a short archive, that is good news — but the guard below is what
+        /// this codebase relies on, not that.
+        #[test]
+        fn a_truncated_tar_unpacks_into_a_partial_tree_without_erroring() {
+            let full = tar_of_three_files();
+            assert_eq!(unpack_count(&full), Ok(3), "the whole archive has 3 files");
+
+            // Keep the first entry's header + payload and nothing else.
+            assert!(full.len() > ENTRY_BYTES);
+            let truncated = full[..ENTRY_BYTES].to_vec();
+
+            let partial = unpack_count(&truncated).expect(
+                "a truncated tar is a VALID tar to the reader — this is the silent data loss",
+            );
+            assert!(
+                partial < 3,
+                "the truncated stream must have produced fewer files than it claimed to carry, \
+                 got {partial}"
+            );
+        }
+
+        /// The regression test for `a3e7845`: the same truncated stream, now framed,
+        /// is refused **before** anything unpacks it. Fail-closed — the caller turns
+        /// this into a transient drive error, which withholds the verdict rather
+        /// than publishing a partial root.
+        #[test]
+        fn a_truncated_capture_is_rejected_before_it_can_be_unpacked() {
+            let sentinel = stream_sentinel();
+            let full = tar_of_three_files();
+            // What the wire delivers when `tar` dies partway: a prefix of the
+            // payload, and — because `framed_command` joins with `&&` — no
+            // sentinel, because `printf` never ran.
+            let truncated = full[..ENTRY_BYTES].to_vec();
+
+            let err = strip_stream_sentinel(truncated, &sentinel)
+                .expect_err("an unterminated stream must not be handed back as a payload");
+            assert!(
+                err.contains("incomplete"),
+                "the error must name the reason: {err}"
+            );
+        }
+
+        /// An empty capture is the same defect, not a benign empty workspace: a
+        /// drain that produced nothing at all still owes its sentinel.
+        #[test]
+        fn an_empty_capture_is_rejected() {
+            let sentinel = stream_sentinel();
+            assert!(strip_stream_sentinel(Vec::new(), &sentinel).is_err());
+        }
+
+        /// A complete capture yields the payload byte-for-byte — the sentinel is
+        /// framing, and must not survive into the bytes that get unpacked.
+        #[test]
+        fn a_complete_capture_round_trips_to_the_exact_payload() {
+            let sentinel = stream_sentinel();
+            let payload = tar_of_three_files();
+            let mut wire = payload.clone();
+            wire.extend_from_slice(sentinel.as_bytes());
+
+            let stripped = strip_stream_sentinel(wire, &sentinel).expect("complete");
+            assert_eq!(stripped, payload);
+            assert_eq!(unpack_count(&stripped), Ok(3));
+        }
+
+        /// A sentinel that merely *appears* in the payload proves nothing: the guard
+        /// is about the stream's END. (Contrived — the marker is unique per exec —
+        /// but it is the property being claimed, so it is the property tested.)
+        #[test]
+        fn a_sentinel_in_the_middle_does_not_satisfy_the_guard() {
+            let sentinel = stream_sentinel();
+            let mut wire = sentinel.as_bytes().to_vec();
+            wire.extend_from_slice(b"...more bytes were still arriving...");
+            assert!(strip_stream_sentinel(wire, &sentinel).is_err());
+        }
+
+        /// The `&&` is the mechanism, so it is asserted: a shape that ran `printf`
+        /// unconditionally would emit a sentinel for a `tar` that had just died,
+        /// which is precisely the bug wearing the fix's clothes.
+        #[test]
+        fn the_framed_command_emits_the_sentinel_only_on_success() {
+            let framed = framed_command("tar -cf - -C /workspace .", "__mark__");
+            assert_eq!(
+                framed,
+                "tar -cf - -C /workspace . && printf '%s' '__mark__'",
+                "the payload command must gate the sentinel"
+            );
+            assert!(!framed.contains(';'), "`;` would run printf regardless");
+        }
+
+        /// Unique per call: a leftover sentinel from an earlier exec on the same Pod
+        /// must never be able to vouch for this one's stream.
+        #[test]
+        fn sentinels_are_unique_per_capture() {
+            let a = stream_sentinel();
+            let b = stream_sentinel();
+            assert_ne!(a, b);
+            // Shell-safe inside the single quotes `framed_command` puts them in.
+            for s in [&a, &b] {
+                assert!(
+                    s.bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'),
+                    "{s} must not need shell quoting"
+                );
+            }
         }
     }
 }

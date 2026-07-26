@@ -19,9 +19,15 @@
 //! - the control plane no longer buffers and re-writes the whole workspace
 //!   through its page cache (s2 measured that tmpdir round-trip *growing* to
 //!   ~4.7 s once the CAS leg got faster — it has to be removed, not accelerated);
-//! - the `exec` tar path could publish a **partial tree** as a Step's
-//!   authoritative snapshot (git-bug `a3e7845`); a failed fetch here fails the
-//!   init container, so the Step never starts;
+//! - on the **feed** side, the `exec` tar path could hand a Step a partial tree
+//!   and let it run; a failed fetch here fails the init container instead, so the
+//!   Step never starts. That is the feed half of git-bug `a3e7845` and only the
+//!   feed half — the **drain** kept its own version of the hazard (a truncated
+//!   `tar -cf -` unpacking cleanly into a partial tree that then gets published
+//!   as an Attempt's authoritative snapshot) long after this binary landed, and
+//!   it is closed separately, in the executor's
+//!   `exec_capture_stdout`, by framing the captured stream and refusing an
+//!   incomplete one. Deleting the feed did not close the class;
 //! - and it is the prerequisite for **lazy materialisation** (ADR-0061 part 2),
 //!   which *is* the load-bearing part.
 //!
