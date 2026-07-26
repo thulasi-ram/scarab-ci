@@ -21,6 +21,12 @@
 //! the same workspace shape — so the `concurrency=1` row IS the pre-slice serial
 //! behaviour and the table is a true before/after of one variable.
 //!
+//! That equivalence was checked, not assumed: this harness was also run from a
+//! detached worktree at the pre-s2 commit, whose code has no concurrency at all.
+//! It reported cold ingest 12277 ms / materialize 10145 ms against `c=1`'s
+//! 12168 ms / 9649 ms — 1% and 5%. Re-verify it the same way if you ever need to
+//! trust the `c=1` column as a baseline again.
+//!
 //! Three legs are timed separately because s0 found they behave differently:
 //! **cold ingest** (every blob uploaded), **warm ingest** (every blob already
 //! present — s0 finding 3 was that this saved no wall-clock, because

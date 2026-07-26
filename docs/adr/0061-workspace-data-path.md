@@ -245,6 +245,125 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   checkout; one machine, loopback object storage, no cross-AZ latency; and the measured binary
   also carried the in-progress s7 metadata-fidelity work, which adds per-file syscalls (not
   round-trips) to both CAS legs. None of that touches the ordering — the gap is 6–20×.
+- **Concurrency in the CAS legs — s2, the slice s0's numbers created. DONE; it moved the
+  bottleneck out of object storage entirely.** s0's own consequence paragraph names this:
+  *"concurrency and batching in the CAS legs are worth more today than the tunnel deletion,
+  and are cheap enough to be worth doing even before the service exists."* Both legs now run
+  with bounded parallelism (`SCARAB_CAS_CONCURRENCY`, default 32), and both emit the byte/dedup
+  counters s0 explicitly could not obtain from outside — `Cas::ingest` hashes and does its own
+  `head`/`put` per blob *internally*, so a decorator could separate neither hashing from
+  storage nor bytes-uploaded from bytes-deduped-away. Harvest everything with:
+
+  ```
+  just logs | grep ws-timing            # the whole Step boundary
+  just logs | grep ws-timing | grep cas=   # just the two CAS legs
+  ```
+
+  **Re-measured on the stack, same shape as s0** — proc mode, kind on colima, MinIO on loopback,
+  the same two `produce → consume → verify` chains at a constant 8.19 MB and the same two file
+  counts. Each row is the mean over that run's legs of that kind (2–4 legs per row), with
+  `SCARAB_CAS_CONCURRENCY` at its default 32:
+
+  | leg | files | `exec` tunnel | server tar | **CAS** | total | CAS share | s0's CAS | CAS speed-up | boundary speed-up |
+  |---|---|---|---|---|---|---|---|---|---|
+  | feed  | 2000 | 539 ms | 4680 ms | **1866 ms** | 7095 ms | **26%** (was 83%) | 11581 ms | **6.2×** | 2.0× |
+  | drain | 2000 | 362 ms | 878 ms | **5563 ms** | 6824 ms | **81%** (was 87%) | 8867 ms | **1.6×** | 1.5× |
+  | feed  | 250 | 481 ms | 364 ms | **780 ms** | 1628 ms | **47%** (was 81%) | 2300 ms | **2.9×** | 1.7× |
+  | drain | 250 | 155 ms | 130 ms | **971 ms** | 1278 ms | **75%** (was 88%) | 1960 ms | **2.0×** | 1.8× |
+
+  Read the *shares*, not only the multipliers. **`materialize` is no longer the dominant cost of a
+  feed leg** — 83% → 26% at 2000 files. `ingest` improved far less and is still 75–81% of a drain;
+  the counters say exactly why, and it is not the object store (below).
+
+  One number moved the *wrong* way and is reported because it changes an argument: **the feed
+  leg's `tar_pack` rose from 1102 ms to ~4700 ms.** Nothing in that code changed. The server
+  writes the whole workspace into a tmpdir and immediately tars it back out; when `materialize`
+  took 11.6 s, page-cache writeback completed underneath it, and now that it takes 1.9 s,
+  `pack_dir` pays that cost instead. So **the feed-leg boundary improved 2.0×, not 6.2×** — and
+  that is a case for part 3 which s0's numbers did not contain: the tmpdir round-trip is a
+  write-then-read of the entire workspace through the page cache, and its cost does not disappear
+  when you make one half of it faster. It has to be *removed*, not accelerated.
+
+  **Controlled A/B, in-process** — the two CAS legs alone, *not* a Step boundary, and labelled as
+  such because a shared dev machine moves stack numbers by up to 6× (the first attempt at the
+  table above, taken at load average 22, reported `cas_materialize` 12471 ms and `tar_pack`
+  21838 ms; it was discarded). Same harness
+  (`crates/scarab-storage-s3/tests/throughput.rs`, `SCARAB_BENCH_CAS=1`), same fixture shape,
+  release build, real MinIO on loopback. **"Before" is the actual pre-s2 commit**, run from a
+  detached worktree — not an inference from a knob:
+
+  | leg | before (pre-s2 commit, serial) | after, c=1 | after, c=32 | speed-up |
+  |---|---|---|---|---|
+  | cold `ingest` | 12277 ms | 12094 ms | **4540 ms** | **2.7×** |
+  | `materialize` | 10145 ms | 2958 ms | **1096 ms** | **9.3×** |
+
+  The `c=1` column matching the pre-s2 commit to within 1% (`ingest`) is the check that this is
+  one variable: at one in-flight request the new code *is* the old behaviour. `materialize` at
+  `c=1` is already 3.4× faster because the syscall fix below is independent of concurrency.
+
+  | scaling with the in-flight limit | c=1 | c=8 | c=32 | c=128 |
+  |---|---|---|---|---|
+  | cold `ingest` | 12094 ms | 4668 ms | 4540 ms | 3710 ms |
+  | `materialize` | 2958 ms | 1587 ms | 1096 ms | 1129 ms |
+
+  Both flatten by c=32, which is why that is the default: past it, the round-trips are already
+  hidden behind the serial local-filesystem work described next, and the only thing a higher
+  limit still buys is peak memory. A *remote* object store, with a real network in the path,
+  would move that knee to the right — hence a knob and not a constant.
+
+  **The counters relocated the bottleneck, and this is the finding that matters most.** With the
+  round-trips overlapped, `store_ms` — a sum over concurrent requests, so it legitimately exceeds
+  the leg's wall clock; the *ratio* is the reading — runs 15–90× the leg's duration. **The object
+  store is now essentially hidden.** What is left is `fs_ms`: the local filesystem on the control
+  plane. On the stack, 2000 files:
+
+  ```
+  cas="ingest"      files=2000 fs_ms=4965 store_ms=97388 hash_ms=378 total_ms=5660   # 88% local FS
+  cas="materialize" files=2000 fs_ms=973  store_ms=30490 hash_ms=360 total_ms=1655   # 59% local FS
+  ```
+
+  **The CAS legs are no longer round-trip-bound.** Three consequences, and none of them is "add
+  more concurrency":
+
+  1. `materialize` was doing five syscalls and three path lookups per file — `fs::write`, then a
+     *reopen* for `futimens`, then a path `chmod`. One open handle does all three, in the same
+     write→mtime→mode order s7 requires. Fixed here: `fs_ms` 7261 → 870 ms at c=1 — and that is
+     the whole of `materialize`'s 3.4× gain *before any concurrency*, which is why the write leg
+     ends up 4× cheaper than the read leg despite moving the same bytes.
+  2. What remains is `std::fs` called from inside the futures, and `buffer_unordered` polls every
+     in-flight future from **one** task — so local I/O is serialised even though the network is
+     not. Moving the read/write halves onto a blocking pool is the next win. Deliberately left
+     out: it makes this adapter require a runtime to be present, a real coupling to decide on its
+     own merits rather than as a side effect of a perf change.
+  3. At 250 files, `hash_ms` is 340–348 ms of a ~500–970 ms leg — 36–67%. That is a *debug* build
+     (`just up` builds debug; the release harness hashes the same 8.19 MB in ~30 ms), so it is an
+     artefact, not a finding. It is recorded because it is the shape of the third bottleneck: once
+     storage and the filesystem are dealt with, SHA-256 over the whole workspace is what is left,
+     and that is a per-byte cost no concurrency removes — only not re-hashing unchanged content
+     does, i.e. the overlay-diff drain already listed below.
+
+  **s0's finding 3 survives, and the counters replace its explanation.** A fully-deduped drain
+  still costs what a cold one does — 5660 ms vs 5637 ms at 2000 files, 937 ms vs 968 ms at 250 —
+  but *not* for the reason s0 gave. It is no longer the `head`-per-file: with the round-trips
+  overlapped those are nearly free (`objects_present=2040, bytes_put=5431`, and `store_ms` is
+  hidden either way). It is that 88% of the leg is reading every file off local disk in order to
+  hash it, and dedup cannot avoid a read whose redundancy it has not yet discovered. The only
+  thing that fixes it is not walking unchanged content at all — the **overlay diff for the drain**
+  below. Two independent measurements have now landed on that slice. (An in-process run *did*
+  show a deduped ingest 4× faster; that harness re-ingests the same directory immediately, so it
+  measures a hot page cache as much as dedup. The stack numbers are the ones to believe.)
+
+  A measurement bug the new counters caught in the harness itself, recorded because it is the
+  kind that silently produces a flattering number: the fixture salt did not include the pid, so
+  a second invocation against the same bucket reported `objects_put=41 objects_present=2000` on
+  what it called a *cold* ingest. Nothing outside the CAS could have seen that.
+
+  **Cost of the concurrency, stated plainly.** A blob is still buffered whole, so peak memory is
+  now roughly `concurrency × largest blob` where it used to be `1 × largest blob`. At the default
+  32 that is nothing for the KB–MB files a checkout is made of and fatal for a workspace holding
+  a 500 MB artefact. Mitigated today only by documentation and by `SCARAB_CAS_CONCURRENCY` being
+  lowerable; the real fix is a byte budget beside the count budget, or streaming blob bodies
+  instead of buffering them — the same primitive ADR-0029's deferred sub-file chunking needs.
 - ~~**mtime fidelity across the CAS.**~~ **Answered (s7) — it did not, and now it does.**
   Measured, not reasoned about: the CAS tree entry carried only `name` and `target`, so a
   round-trip silently dropped every mode (an executable came back `0644`) and every mtime
