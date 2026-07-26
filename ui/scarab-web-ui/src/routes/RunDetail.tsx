@@ -23,11 +23,16 @@ import {
   artifactUrl,
   repoForgeUrl,
   listServices,
+  fetchRerunPlan,
+  pinWorkspaces,
+  unpinWorkspaces,
   type RunStatus,
   type RunEvent,
   type StepStatus,
   type Artifact,
   type Service,
+  type RerunPlan,
+  type RetentionInfo,
 } from "../api/client";
 import { eventParts, eventCategory, EVENT_GLYPH } from "../events";
 import {
@@ -42,6 +47,15 @@ import {
 } from "../takes";
 import { stripTries as stripTriesOf } from "../attempts";
 import { approvableGates, gateBlockers } from "../gates";
+import {
+  isWidened,
+  pinLabel,
+  pinTitle,
+  rerunLabel,
+  rerunTitle,
+  retentionNote,
+  widenedNote,
+} from "../workspace-retention";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
@@ -102,6 +116,14 @@ export default function RunDetail() {
   const [rerunning, setRerunning] = createSignal<string | null>(null);
   const [retrying, setRetrying] = createSignal<string | null>(null);
   const [cancelling, setCancelling] = createSignal(false);
+  // ADR-0061 s5. The rerun PREVIEW for the selected step: whether expired
+  // workspace snapshots widen the rerun upstream, resolved before the click so
+  // the button can say which it is (ADR-0027 — smart never means mysterious).
+  const [plan, setPlan] = createSignal<RerunPlan | null>(null);
+  // The workspace-snapshot pin, mirrored locally so the toggle is optimistic
+  // about nothing: it re-renders from what the pin endpoint actually returned.
+  const [pinState, setPinState] = createSignal<RetentionInfo | null>(null);
+  const [pinning, setPinning] = createSignal(false);
   const [shellOpen, setShellOpen] = createSignal(false);
   // The viewed Take (1-based), or null = latest. Only a CLOSED take is a
   // time-travel view; selecting the latest take clears back to live. Driven by
@@ -380,6 +402,55 @@ export default function RunDetail() {
     setSelAttempt(null);
   });
 
+  // Fetch the rerun PREVIEW for the selected step (ADR-0061 s5). Lazy and
+  // per-selection rather than folded into the run resource: the preview asks the
+  // object store whether each input snapshot is still there, which is far too
+  // expensive to put on a 1.2s poll. Restricted to a TERMINAL run because a run
+  // that has not settled is never GC-eligible (ADR-0050), so its snapshots cannot
+  // have expired and there is nothing to widen — one fewer request on a live
+  // run's hot path, for a case that cannot arise.
+  createEffect(() => {
+    const step = sel();
+    const r = run();
+    const settled = r ? isTerminal(r.status) : false;
+    if (!step || isServiceSel() || !settled || timeTraveling()) {
+      setPlan(null);
+      return;
+    }
+    const forRun = id();
+    void fetchRerunPlan(forRun, step)
+      .then((p) => {
+        // Ignore a late answer for a selection the user has moved off.
+        if (sel() === step && id() === forRun) setPlan(p);
+      })
+      // A failed preview must NOT relabel or block the rerun: unknown is not
+      // "expired". Fall back to the plain label.
+      .catch(() => setPlan(null));
+  });
+
+  // The retention promise: the server's value, overlaid by whatever the pin
+  // endpoint last returned, so the toggle reflects the write instead of waiting
+  // for the next poll.
+  const retention = (): RetentionInfo | null =>
+    pinState() ?? run()?.workspace_retention ?? null;
+
+  async function onTogglePin() {
+    const r = retention();
+    if (!r) return;
+    setPinning(true);
+    try {
+      setPinState(r.pinned ? await unpinWorkspaces(id()) : await pinWorkspaces(id()));
+    } finally {
+      setPinning(false);
+    }
+  }
+  // A different run drops the local overlay, so a stale pin state never bleeds
+  // across navigation.
+  createEffect(() => {
+    void id();
+    setPinState(null);
+  });
+
   async function onRerun(step: string) {
     setRerunning(step);
     try {
@@ -588,8 +659,15 @@ export default function RunDetail() {
                   <Icon icon="rotate-cw" size={13} /> {retrying() ? "retrying…" : "Retry step"}
                 </button>
               </Show>
+              {/* The rerun label is NOT a constant (ADR-0061 s5): when the
+                  selected step's input workspace snapshots have expired, rerunning
+                  that step alone is impossible, so the button says which it is —
+                  "Inputs expired — this re-runs from clone" — and names the whole
+                  scope in its title. A rerun that quietly re-ran the pipeline from
+                  the start would be exactly the mystery ADR-0027 forbids. */}
               <button
                 class="btn btn-ghost btn-sm"
+                classList={{ widened: isWidened(plan()) }}
                 onClick={() => sel() && !isServiceSel() && onRerun(sel()!)}
                 disabled={
                   rerunning() !== null ||
@@ -608,11 +686,11 @@ export default function RunDetail() {
                         ? "a shared service isn't a step — select a step to rerun"
                         : prereqBlocker(sel())
                           ? `blocked — prerequisite ${prereqBlocker(sel())} failed; rerun that first`
-                          : `rerun ${sel()} and everything downstream — forks a new version`
+                          : rerunTitle(plan(), sel()!, retention()?.retention_days)
                 }
               >
                 <Icon icon="rotate-ccw" size={13} />{" "}
-                {rerunning() ? "rerunning…" : "Rerun pipeline from this step"}
+                {rerunning() ? "rerunning…" : rerunLabel(plan())}
               </button>
               {/* One contextual slot: while the run is ACTIVE (on latest) the
                   useful lifecycle action is to STOP it → "Cancel run" (danger);
@@ -660,7 +738,48 @@ export default function RunDetail() {
                 <Icon icon="terminal" size={13} />{" "}
                 {selectedRunning() ? "Debug shell" : "Debug pod"}
               </button>
+              {/* The manual PIN (ADR-0061 s5): "keep this Run's workspaces", for an
+                  investigation that would otherwise be raced by the retention
+                  sweeper. Acts on the time-bounded archive only — the title says so
+                  rather than letting a reader assume it also pins a cache. */}
+              <Show when={retention()}>
+                {(wr) => (
+                  <button
+                    class="btn btn-ghost btn-sm"
+                    classList={{ pinned: wr().pinned }}
+                    onClick={() => void onTogglePin()}
+                    disabled={pinning()}
+                    title={pinTitle(wr())}
+                  >
+                    <Icon icon={wr().pinned ? "pin-off" : "pin"} size={13} />{" "}
+                    {pinning() ? "…" : pinLabel(wr())}
+                  </button>
+                )}
+              </Show>
             </div>
+            {/* The widened scope, stated WITHOUT a hover: a rerun that quietly
+                grew is still a surprise, even if the tooltip would have explained
+                it (ADR-0027 — smart never means mysterious). */}
+            <Show when={widenedNote(plan())}>
+              {(note) => (
+                <p class="subtle rd-widened">
+                  <Icon icon="alert-triangle" size={12} /> {note()}
+                </p>
+              )}
+            </Show>
+            {/* The cold tier's TIME bound, said out loud (ADR-0061 s5). Shown only
+                once the promise matters — a pinned run, or one whose window has
+                lapsed; a run comfortably inside its window needs no notice. */}
+            <Show when={retention()} keyed>
+              {(wr) => (
+                <Show when={wr.pinned || wr.expired}>
+                  <p class="subtle rd-retention">
+                    <Icon icon={wr.pinned ? "pin" : "clock"} size={12} />{" "}
+                    {retentionNote(wr, isTerminal(run()!.status))}
+                  </p>
+                </Show>
+              )}
+            </Show>
 
             {/* Provenance bar (ADR-0057 A·2): the SAME two-line body as a runs-
                 list row — the Headline on top, an icon-chip fact strip beneath

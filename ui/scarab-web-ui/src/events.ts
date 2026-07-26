@@ -31,6 +31,12 @@ export function describeEvent(e: RunEvent): string {
       return `${s(v.target)} retried${v.by ? ` by ${s(v.by)}` : ""} — same version`;
     case "AttemptReadopted":
       return `${s(v.step)} — re-adopted after control-plane restart`;
+    // ADR-0061 s5: keeping a run's workspaces past the retention window costs
+    // storage, so both directions are recorded and both name who asked.
+    case "RunWorkspacePinned":
+      return `Workspaces pinned${v.by ? ` by ${s(v.by)}` : ""} — kept past the retention window`;
+    case "RunWorkspaceUnpinned":
+      return `Workspaces unpinned${v.by ? ` by ${s(v.by)}` : ""} — back to the retention window`;
     default:
       return tag;
   }
@@ -99,6 +105,11 @@ export function eventCategory(e: RunEvent): EventCat {
       return "run";
     case "AttemptReadopted":
       return "recover";
+    // A retention decision, not an execution event: `info` keeps it in the rail
+    // without dressing it up as something that ran.
+    case "RunWorkspacePinned":
+    case "RunWorkspaceUnpinned":
+      return "info";
     default:
       return "info";
   }

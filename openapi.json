@@ -1771,6 +1771,50 @@
         }
       }
     },
+    "/v1/runs/{id}/steps/{step}/rerun-plan": {
+      "get": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Preview a rerun/retry of a step: the resolved scope, and whether expired\nWorkspace Snapshots widened it (ADR-0061 s5).",
+        "operationId": "rerun_plan",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "step",
+            "in": "path",
+            "description": "step id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RerunPlanResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such run or step"
+          }
+        }
+      }
+    },
     "/v1/runs/{id}/steps/{step}/results": {
       "get": {
         "tags": [
@@ -2018,6 +2062,75 @@
           },
           "404": {
             "description": "no such file or browse disabled"
+          }
+        }
+      }
+    },
+    "/v1/runs/{id}/workspace-pin": {
+      "post": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "**Pin** this run's Workspace Snapshots (ADR-0061 s5): keep them past the cold\ntier's retention TTL, so an investigation is not raced by the GC sweeper.",
+        "description": "The pin acts on the cold tier's **time** bound only. It says nothing about the\nwarm workspace service, which is bounded by space and evicts least-recently-\nused by design — a warm miss is slower, never wrong, so there is nothing there\nto protect. Idempotent; recorded with who pinned it and when.",
+        "operationId": "pin_run_workspace",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "pinned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceRetentionDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such run"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Runs"
+        ],
+        "summary": "Release the [pin](pin_run_workspace), returning this run's Workspace Snapshots\nto the ordinary retention window. Idempotent.",
+        "operationId": "unpin_run_workspace",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "run id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "pin released",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceRetentionDto"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no such run"
           }
         }
       }
@@ -2716,6 +2829,29 @@
           }
         }
       },
+      "ExpiredInputDto": {
+        "type": "object",
+        "description": "One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5).",
+        "required": [
+          "consumer",
+          "produced_by",
+          "root"
+        ],
+        "properties": {
+          "consumer": {
+            "type": "string",
+            "description": "The step whose input workspace is incomplete."
+          },
+          "produced_by": {
+            "type": "string",
+            "description": "The upstream step that produced the missing snapshot."
+          },
+          "root": {
+            "type": "string",
+            "description": "The CAS merkle root the store no longer holds."
+          }
+        }
+      },
       "GrantedPermissionDto": {
         "type": "object",
         "description": "A permission the forge reports as granted.",
@@ -2994,6 +3130,51 @@
           }
         }
       },
+      "RerunPlanResponse": {
+        "type": "object",
+        "description": "`GET …/steps/{step}/rerun-plan` body: what a rerun/retry of this step would\nactually execute — **before** the user confirms it (ADR-0061 s5, and\nADR-0027's rule that smart never means mysterious).\n\nA read-only dry run. The interesting case is a widened one: a Run reopened\nafter its Workspace Snapshots expired cannot rerun just the step you pointed\nat, because the inputs that step consumes no longer exist — so the scope\nexpands upstream to regenerate them, in the limit back to `clone`. That is a\nbigger action than the button implies, so it has to be visible first.",
+        "required": [
+          "target",
+          "invalidated",
+          "widened",
+          "starts_from",
+          "expired_inputs"
+        ],
+        "properties": {
+          "expired_inputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExpiredInputDto"
+            },
+            "description": "Each expired input that caused the widening: the consuming step, the step\nthat produced the missing snapshot, and its CAS root."
+          },
+          "invalidated": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Every step that would re-execute, sorted — the invalidation set after any\nwidening."
+          },
+          "starts_from": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The steps the rerun effectively **starts from** (no dependency inside the\nset). `[target]` on an ordinary rerun; on a widened one this is the phrase\nthe affordance says out loud — \"this re-runs from *clone*\"."
+          },
+          "target": {
+            "type": "string",
+            "description": "The step the plan is for."
+          },
+          "widened": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The subset of `invalidated` present only because a Workspace Snapshot\nexpired: upstream steps dragged in to regenerate data. Empty on an\nordinary rerun."
+          }
+        }
+      },
       "ResyncResultDto": {
         "type": "object",
         "description": "`POST /v1/connections/{id}/resync` body: what reconciliation changed.",
@@ -3036,7 +3217,8 @@
         "required": [
           "id",
           "status",
-          "steps"
+          "steps",
+          "workspace_retention"
         ],
         "properties": {
           "id": {
@@ -3083,6 +3265,10 @@
               "null"
             ],
             "description": "The run **Headline** (ADR-0057) — the one human line saying what this run\nis about (a push's commit subject; later a PR title / dispatch reason),\ndisambiguated by the trigger kind. Display/audit only; absent when the\ntrigger carried no headline and on runs created before headline-stamping."
+          },
+          "workspace_retention": {
+            "$ref": "#/components/schemas/WorkspaceRetentionDto",
+            "description": "This run's **Workspace Snapshot** retention promise (ADR-0061 s5) — the\ncold tier's time bound, made explicit rather than left implicit in a\nsweeper's config, plus any manual pin over it."
           }
         }
       },
@@ -3568,6 +3754,54 @@
           "path": {
             "type": "string",
             "description": "The path listed (empty string = snapshot root)."
+          }
+        }
+      },
+      "WorkspaceRetentionDto": {
+        "type": "object",
+        "description": "The cold-tier retention promise over one Run's **Workspace Snapshots**\n(ADR-0061 s5).\n\nADR-0061 gives Workspace Snapshots two tiers with two policies. The warm\nworkspace service is bounded by **space** (LRU) and promises nothing — a miss\nthere is slower, never wrong. Object storage is the cold tier, bounded by\n**time**, and *that* is the guarantee a user is given. Everything in this DTO\ndescribes the cold tier only; nothing here can or should say anything about\nthe warm tier.",
+        "required": [
+          "retention_days",
+          "expired",
+          "pinned"
+        ],
+        "properties": {
+          "expired": {
+            "type": "boolean",
+            "description": "The promise has **lapsed**: this run is terminal, unpinned, and past its\nwindow, so its snapshots may already have been swept. Not the same as\n\"gone\" — GC is periodic and content is shared, so data often outlives the\npromise. The honest word for it is *expired*, not *deleted*, and a rerun\nresolves the difference by checking the store."
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When this run's Workspace Snapshots stop being promised (epoch millis).\n`None` while the run is **non-terminal**: a run that has not settled —\nincluding one suspended on a gate for weeks — is never GC-eligible\nregardless of age (ADR-0050), so no expiry applies yet. Also `None` while\n**pinned**, because a pin holds the window open indefinitely."
+          },
+          "pinned": {
+            "type": "boolean",
+            "description": "A human **pinned** this run's Workspace Snapshots — hold them past the\nwindow for an investigation."
+          },
+          "pinned_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When it was pinned, epoch millis."
+          },
+          "pinned_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Who pinned it (`None` when unpinned, or when auth is off)."
+          },
+          "retention_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The retention window in days — what the GC sweeper actually enforces.",
+            "minimum": 0
           }
         }
       }

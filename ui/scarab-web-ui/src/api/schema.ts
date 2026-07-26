@@ -1022,6 +1022,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/runs/{id}/steps/{step}/rerun-plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Preview a rerun/retry of a step: the resolved scope, and whether expired
+         *     Workspace Snapshots widened it (ADR-0061 s5).
+         */
+        get: operations["rerun_plan"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/runs/{id}/steps/{step}/results": {
         parameters: {
             query?: never;
@@ -1112,6 +1132,34 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/runs/{id}/workspace-pin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * **Pin** this run's Workspace Snapshots (ADR-0061 s5): keep them past the cold
+         *     tier's retention TTL, so an investigation is not raced by the GC sweeper.
+         * @description The pin acts on the cold tier's **time** bound only. It says nothing about the
+         *     warm workspace service, which is bounded by space and evicts least-recently-
+         *     used by design — a warm miss is slower, never wrong, so there is nothing there
+         *     to protect. Idempotent; recorded with who pinned it and when.
+         */
+        post: operations["pin_run_workspace"];
+        /**
+         * Release the [pin](pin_run_workspace), returning this run's Workspace Snapshots
+         *     to the ordinary retention window. Idempotent.
+         */
+        delete: operations["unpin_run_workspace"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1550,6 +1598,15 @@ export interface components {
              */
             ref: string;
         };
+        /** @description One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5). */
+        ExpiredInputDto: {
+            /** @description The step whose input workspace is incomplete. */
+            consumer: string;
+            /** @description The upstream step that produced the missing snapshot. */
+            produced_by: string;
+            /** @description The CAS merkle root the store no longer holds. */
+            root: string;
+        };
         /** @description A permission the forge reports as granted. */
         GrantedPermissionDto: {
             level: string;
@@ -1716,6 +1773,43 @@ export interface components {
             /** @description Branches first, then tags; each group name-sorted. */
             refs: components["schemas"]["RefDto"][];
         };
+        /**
+         * @description `GET …/steps/{step}/rerun-plan` body: what a rerun/retry of this step would
+         *     actually execute — **before** the user confirms it (ADR-0061 s5, and
+         *     ADR-0027's rule that smart never means mysterious).
+         *
+         *     A read-only dry run. The interesting case is a widened one: a Run reopened
+         *     after its Workspace Snapshots expired cannot rerun just the step you pointed
+         *     at, because the inputs that step consumes no longer exist — so the scope
+         *     expands upstream to regenerate them, in the limit back to `clone`. That is a
+         *     bigger action than the button implies, so it has to be visible first.
+         */
+        RerunPlanResponse: {
+            /**
+             * @description Each expired input that caused the widening: the consuming step, the step
+             *     that produced the missing snapshot, and its CAS root.
+             */
+            expired_inputs: components["schemas"]["ExpiredInputDto"][];
+            /**
+             * @description Every step that would re-execute, sorted — the invalidation set after any
+             *     widening.
+             */
+            invalidated: string[];
+            /**
+             * @description The steps the rerun effectively **starts from** (no dependency inside the
+             *     set). `[target]` on an ordinary rerun; on a widened one this is the phrase
+             *     the affordance says out loud — "this re-runs from *clone*".
+             */
+            starts_from: string[];
+            /** @description The step the plan is for. */
+            target: string;
+            /**
+             * @description The subset of `invalidated` present only because a Workspace Snapshot
+             *     expired: upstream steps dragged in to regenerate data. Empty on an
+             *     ordinary rerun.
+             */
+            widened: string[];
+        };
         /** @description `POST /v1/connections/{id}/resync` body: what reconciliation changed. */
         ResyncResultDto: {
             /** @description Repos the forge reports that Scarab did not have bound — now bound. */
@@ -1766,6 +1860,12 @@ export interface components {
              *     trigger carried no headline and on runs created before headline-stamping.
              */
             trigger_title?: string | null;
+            /**
+             * @description This run's **Workspace Snapshot** retention promise (ADR-0061 s5) — the
+             *     cold tier's time bound, made explicit rather than left implicit in a
+             *     sweeper's config, plus any manual pin over it.
+             */
+            workspace_retention: components["schemas"]["WorkspaceRetentionDto"];
         };
         /**
          * @description One run in the list view: identity, status, creation time (epoch millis),
@@ -2063,6 +2163,53 @@ export interface components {
             entries: components["schemas"]["WorkspaceEntryDto"][];
             /** @description The path listed (empty string = snapshot root). */
             path: string;
+        };
+        /**
+         * @description The cold-tier retention promise over one Run's **Workspace Snapshots**
+         *     (ADR-0061 s5).
+         *
+         *     ADR-0061 gives Workspace Snapshots two tiers with two policies. The warm
+         *     workspace service is bounded by **space** (LRU) and promises nothing — a miss
+         *     there is slower, never wrong. Object storage is the cold tier, bounded by
+         *     **time**, and *that* is the guarantee a user is given. Everything in this DTO
+         *     describes the cold tier only; nothing here can or should say anything about
+         *     the warm tier.
+         */
+        WorkspaceRetentionDto: {
+            /**
+             * @description The promise has **lapsed**: this run is terminal, unpinned, and past its
+             *     window, so its snapshots may already have been swept. Not the same as
+             *     "gone" — GC is periodic and content is shared, so data often outlives the
+             *     promise. The honest word for it is *expired*, not *deleted*, and a rerun
+             *     resolves the difference by checking the store.
+             */
+            expired: boolean;
+            /**
+             * Format: int64
+             * @description When this run's Workspace Snapshots stop being promised (epoch millis).
+             *     `None` while the run is **non-terminal**: a run that has not settled —
+             *     including one suspended on a gate for weeks — is never GC-eligible
+             *     regardless of age (ADR-0050), so no expiry applies yet. Also `None` while
+             *     **pinned**, because a pin holds the window open indefinitely.
+             */
+            expires_at?: number | null;
+            /**
+             * @description A human **pinned** this run's Workspace Snapshots — hold them past the
+             *     window for an investigation.
+             */
+            pinned: boolean;
+            /**
+             * Format: int64
+             * @description When it was pinned, epoch millis.
+             */
+            pinned_at?: number | null;
+            /** @description Who pinned it (`None` when unpinned, or when auth is off). */
+            pinned_by?: string | null;
+            /**
+             * Format: int32
+             * @description The retention window in days — what the GC sweeper actually enforces.
+             */
+            retention_days: number;
         };
     };
     responses: never;
@@ -3648,6 +3795,37 @@ export interface operations {
             };
         };
     };
+    rerun_plan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+                /** @description step id */
+                step: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RerunPlanResponse"];
+                };
+            };
+            /** @description no such run or step */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     get_step_results: {
         parameters: {
             query?: {
@@ -3818,6 +3996,66 @@ export interface operations {
                 content?: never;
             };
             /** @description no such file or browse disabled */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    pin_run_workspace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description pinned */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceRetentionDto"];
+                };
+            };
+            /** @description no such run */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    unpin_run_workspace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description run id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description pin released */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceRetentionDto"];
+                };
+            };
+            /** @description no such run */
             404: {
                 headers: {
                     [name: string]: unknown;
