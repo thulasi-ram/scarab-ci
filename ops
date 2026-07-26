@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1785106832,"nonce":"B3lr1XcC8dKL30Op9jOTBXvxyW4=","status":2}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1785106855,"nonce":"DoEtKPdvB6xhb56rTVtH3C1POE4=","title":"NOT A BUG (closed): image.yml does rebuild scarab-wsfetch — push-to-main has no paths filter","was":"MED: published scarab-wsfetch:edge can be older than the fetcher's source — image.yml only watches docker/wsfetch/**"}]}
