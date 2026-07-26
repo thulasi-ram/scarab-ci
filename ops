@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1785087895,"nonce":"DAyqZvRa0VvVDSpjHwAp1YuMMZk=","added":["dogfood"],"removed":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":2,"timestamp":1785087961,"nonce":"qzaWWSU5bs6UmSZ+2R34fzvrQZ8=","title":"version step fails with class `Step` but no Pod is ever created","was":"The `version` step of `.scarab/dogfood.yaml` settles as `failed` with failure"}]}
