@@ -528,6 +528,100 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
     }
 }
 
+/// LIVE ADR-0061 part 4 (s4): at the **instant** `Succeeded` is first observed,
+/// the Attempt's Workspace Snapshot must already be durable and readable.
+///
+/// The unit tests pin the *rule* (`settled_state` / `workspace_snapshot_lost`)
+/// against Pod fixtures. This pins the *ordering* against the real thing, which is
+/// what the rule is about: `drive_workspace` ingests, patches
+/// `scarab.io/workspace-root`, and only then releases the egress barrier, so the
+/// first `Succeeded` a caller can see is already backed by content the store
+/// holds. A green verdict whose snapshot is not yet (or never) durable is a claim
+/// the durable record cannot back (CONTEXT.md §2).
+///
+/// Deliberately asserted on the FIRST terminal observation, not after a settle
+/// loop: polling until the root appears would test nothing at all.
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_green() {
+    let Some(ns) = opted_in() else { return };
+    let Some(ws) = workspace_fixture() else { return };
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_service(ws.fetch.clone());
+
+    let step = StepRun {
+        run: RunId(unique_run("run-ws-durable")),
+        step: StepId("produce".into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+            outcome: AttemptOutcome::Running,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let spec = StepSpec {
+        image: "busybox:1.36".into(),
+        command: vec![
+            "sh".into(),
+            "-c".into(),
+            "mkdir -p /workspace/dist && echo durable > /workspace/dist/evidence.txt".into(),
+        ],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: true,
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(120),
+        workspace_inputs: vec![],
+        workspace_outputs: vec![],
+        clone: None,
+        build: None,
+        artifacts: vec![],
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
+        services: Vec::new(),
+        uses: Vec::new(),
+        matrix_values: Default::default(),
+    };
+
+    let h = exec.launch(&step, &spec).await.expect("launch");
+    assert_eq!(
+        poll_to_terminal(&exec, &h, 120).await,
+        Some(ExecState::Succeeded)
+    );
+
+    // 1. The verdict carries a root. Without ADR-0061 part 4's rule a Pod whose
+    //    barrier died could report Succeeded with `output() == None`, and the
+    //    engine records the output only `if Some` and finalises the step anyway.
+    let root = exec
+        .output(&h)
+        .await
+        .expect("output")
+        .expect("Succeeded must carry a workspace snapshot root");
+
+    // 2. And the root is really THERE — in the store, not merely named. This is the
+    //    difference between "we wrote an annotation" and "the evidence is safe".
+    let entries = ws
+        .cas
+        .tree_entries(&scarab_storage::TreeHash(root.clone()))
+        .await
+        .expect("the snapshot named by a green Attempt must be readable");
+    assert!(
+        entries.iter().any(|e| e.name == "dist"),
+        "the snapshot must contain what the step wrote: {entries:?}"
+    );
+
+    exec.cancel(&h).await.expect("cleanup");
+}
+
 /// LIVE: a Step whose input snapshot does not exist must get a **verdict**, not a
 /// hang (ADR-0061 s3-feed).
 ///

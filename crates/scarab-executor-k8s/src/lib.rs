@@ -1102,17 +1102,105 @@ fn step_terminated_exit(pod: &Pod) -> Option<i32> {
 /// config failure or a lost Pod must never be masked as Running — and the
 /// scheduler's next poll drives settle to done, so this is deterministic rather
 /// than a sleep. Withholding is bounded by the engine's step-timeout backstop.
+/// A **third** rule, added by ADR-0061 part 4 (s4). See
+/// [`workspace_snapshot_lost`] — the short version is that the two rules above
+/// withhold `Succeeded` while the sidecar *proxy* says the settle is in flight,
+/// and this one refuses `Succeeded` outright when the sidecar is gone and the
+/// settle's *product* is not there.
 fn settled_state(pod: &Pod, harvesting: bool) -> ExecState {
     let state = pod_state(pod);
     let settling = init_container_running(pod, WORKSPACE_EGRESS_CONTAINER);
     match state {
         ExecState::Succeeded if settling => ExecState::Running,
+        // ADR-0061 part 4: an Attempt is not `Succeeded` until its Workspace
+        // Snapshot is durable. The sidecar being gone is not proof that it is —
+        // see `workspace_snapshot_lost`.
+        ExecState::Succeeded if workspace_snapshot_lost(pod) => ExecState::Failed {
+            exit_code: None,
+            // The step's process DID run, so a side effect is possible: the
+            // engine's retry has to be the at-least-once kind (CONTEXT.md §2),
+            // not the "safe, it never started" kind.
+            class: FailureClass::Infra {
+                never_started: false,
+            },
+        },
         ExecState::Failed {
             class: FailureClass::Step,
             ..
         } if settling && artifact_harvest_owed(pod, harvesting) => ExecState::Running,
         other => other,
     }
+}
+
+/// Is this a Pod on the workspace flow?
+///
+/// Derived from the Pod's **spec** — the egress barrier container exists — rather
+/// than from an annotation. Two reasons: it survives a control-plane restart with
+/// no in-memory state, and it does not re-create the conflation git-bug 7f05f39
+/// was about (an annotation whose *presence* meant one thing and whose
+/// *emptiness* meant another).
+fn is_workspace_pod(pod: &Pod) -> bool {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.init_containers.as_ref())
+        .into_iter()
+        .flatten()
+        .any(|c| c.name == WORKSPACE_EGRESS_CONTAINER)
+}
+
+/// Did this Pod's Workspace Snapshot get lost? (ADR-0061 part 4.)
+///
+/// True when a workspace Pod's step exited **0**, its egress sidecar is **gone**,
+/// and `scarab.io/workspace-root` was never recorded. That combination means the
+/// snapshot does not exist and never will: the workspace lived on the Pod's
+/// `emptyDir`, the barrier that held the Pod open for the drain has been released
+/// or killed, and there is nothing left to drain.
+///
+/// # Why this is not already covered by withholding
+///
+/// [`settled_state`]'s first rule withholds `Succeeded` while the sidecar is
+/// running, on the reasoning that `drive_workspace` releases the sidecar only
+/// *after* patching the root. That is true of the release, and it is not true of
+/// every way a sidecar can die:
+///
+/// - the node vanishes (spot reclaim, the case ADR-0061 part 4 is written about) —
+///   the kubelet stops reporting, and whatever status was last observed is what
+///   `settled_state` sees;
+/// - the Pod is deleted and the 600 s `terminationGracePeriodSeconds` elapses, so
+///   the kubelet **SIGKILL**s a sidecar that was deliberately ignoring SIGTERM;
+/// - anything else that kills the container out from under the barrier.
+///
+/// In each of those the sidecar has terminated without the annotation, so the
+/// proxy says "settled" while the product is absent. Reporting `Succeeded` there
+/// puts a claim in the durable record that the record cannot back — a step marked
+/// green with no evidence, and dependents launched against a snapshot that does
+/// not exist. That is the one thing this product may not do (CONTEXT.md §2), and
+/// it is worth restating that the engine will not catch it downstream: on
+/// `Succeeded` it records `output()` *if `Some`* and finalises the step either way
+/// (`scheduler.rs`, the `ExecState::Succeeded` arm).
+///
+/// # Why a failure and not more withholding
+///
+/// Withholding forever would hang the Run, and there is nothing to wait for: the
+/// drain leg is gated on the sidecar being alive, so a dead sidecar means the
+/// snapshot can never appear. ADR-0061 part 4 names the answer — *"missing/late
+/// durability report = infrastructure failure class → retry"*. So the verdict is
+/// `Infra { never_started: false }`, the attempt's budget is consumed, and a
+/// bounded retry re-runs the step on (probably) another node. A step that keeps
+/// losing its node keeps failing and dead-letters, which is honest.
+///
+/// A **failed** step is deliberately not covered: its workspace is not an output
+/// (`drive_workspace` snapshots successful steps only), so there is no snapshot to
+/// owe. Its *artifacts* are owed, and [`artifact_harvest_owed`] is that rule.
+fn workspace_snapshot_lost(pod: &Pod) -> bool {
+    is_workspace_pod(pod)
+        && step_terminated_exit(pod) == Some(0)
+        && !init_container_running(pod, WORKSPACE_EGRESS_CONTAINER)
+        && !pod
+            .metadata
+            .annotations
+            .as_ref()
+            .is_some_and(|a| a.get(ANNOTATION_WS_ROOT).is_some_and(|v| !v.is_empty()))
 }
 
 /// Whether the settle leg still owes an artifact harvest for this Pod (ADR-0052)
@@ -5005,6 +5093,20 @@ mod tests {
     /// sidecar either still running or terminated, and the harvested-artifact
     /// annotation optionally recorded.
     fn settling_pod(phase: &str, exit: i32, egress_running: bool, harvested: bool) -> Pod {
+        // `snapshotted: true` is the normal case for the artifact-barrier tests:
+        // they are about the artifact index, and a green settle records the
+        // workspace root first. The ADR-0061 part 4 tests use the raw builder to
+        // say otherwise.
+        settling_pod_with(phase, exit, egress_running, harvested, true)
+    }
+
+    fn settling_pod_with(
+        phase: &str,
+        exit: i32,
+        egress_running: bool,
+        harvested: bool,
+        snapshotted: bool,
+    ) -> Pod {
         use k8s_openapi::api::core::v1::{
             ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStatus,
             PodStatus,
@@ -5041,12 +5143,33 @@ mod tests {
                     .to_string(),
             );
         }
+        if snapshotted {
+            annotations.insert(
+                ANNOTATION_WS_ROOT.to_string(),
+                "a".repeat(64),
+            );
+        }
         Pod {
             metadata: ObjectMeta {
                 name: Some("scarab-x".into()),
                 annotations: (!annotations.is_empty()).then_some(annotations),
                 ..Default::default()
             },
+            // The SPEC matters now: `is_workspace_pod` derives "is this on the
+            // workspace flow?" from the egress barrier container's presence here,
+            // not from an annotation (git-bug 7f05f39).
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: STEP_CONTAINER.to_string(),
+                    ..Default::default()
+                }],
+                init_containers: Some(vec![Container {
+                    name: WORKSPACE_EGRESS_CONTAINER.to_string(),
+                    restart_policy: Some("Always".to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
             status: Some(PodStatus {
                 phase: Some(phase.into()),
                 container_statuses: Some(vec![terminated(STEP_CONTAINER, exit)]),
@@ -5075,6 +5198,169 @@ mod tests {
         assert_eq!(
             settled_state(&settling_pod("Succeeded", 0, false, true), true),
             ExecState::Succeeded
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-0061 part 4 (s4): an Attempt is not `Succeeded` until its Workspace
+    // Snapshot is durable.
+    // ------------------------------------------------------------------
+
+    /// The load-bearing case, and the one ADR-0061 part 4 is written about: on spot
+    /// a node vanishes between "the Step exited 0" and "its evidence is safe".
+    ///
+    /// The pre-existing withholding rule reasons from a **proxy** — the egress
+    /// sidecar is still running, therefore the settle is in flight — and that proxy
+    /// is only sound for the way `drive_workspace` *releases* the sidecar. A node
+    /// that disappears, or a 600 s termination grace that expires and SIGKILLs a
+    /// sidecar deliberately ignoring SIGTERM, terminates it with no root recorded.
+    /// The proxy then says "settled" while the product is absent, and `Succeeded`
+    /// would be a claim the durable record cannot back: the step goes green with no
+    /// evidence, and the engine will not catch it (on `Succeeded` it records
+    /// `output()` *if `Some`* and finalises either way).
+    #[test]
+    fn succeeded_is_refused_when_the_snapshot_was_lost_with_the_pod() {
+        // Step exited 0, sidecar gone, NO workspace root ⇒ the snapshot is gone.
+        let lost = settling_pod_with("Succeeded", 0, false, true, false);
+        assert!(workspace_snapshot_lost(&lost));
+        assert_eq!(
+            settled_state(&lost, true),
+            ExecState::Failed {
+                exit_code: None,
+                // The process RAN, so a side effect is possible: the retry is the
+                // at-least-once kind (CONTEXT.md §2), not "safe, it never started".
+                class: FailureClass::Infra {
+                    never_started: false
+                },
+            },
+            "green with no evidence is the one verdict this product may not issue"
+        );
+
+        // The same Pod WITH the root recorded is the ordinary green path.
+        let settled = settling_pod_with("Succeeded", 0, false, true, true);
+        assert!(!workspace_snapshot_lost(&settled));
+        assert_eq!(settled_state(&settled, true), ExecState::Succeeded);
+    }
+
+    /// It must not become a way to hang a Run either. While the sidecar is alive
+    /// the FIRST rule still applies — withhold as `Running`, because the drain is
+    /// genuinely in flight and the next poll drives it — and the failure verdict is
+    /// reached only once the sidecar is gone, i.e. once the snapshot provably
+    /// cannot appear. Withholding is bounded by `activeDeadlineSeconds` on the Pod
+    /// and by the engine's timeout backstop; this rule is bounded by the sidecar's
+    /// life.
+    #[test]
+    fn a_drain_still_in_flight_is_withheld_not_failed() {
+        let draining = settling_pod_with("Succeeded", 0, true, false, false);
+        assert_eq!(
+            settled_state(&draining, true),
+            ExecState::Running,
+            "the drain has not run yet — this is not a lost snapshot, it is a pending one"
+        );
+    }
+
+    /// A **failed** step owes no snapshot: `drive_workspace` snapshots successful
+    /// steps only, because a failed step's workspace is not an output. Its
+    /// artifacts ARE owed, and that is `artifact_harvest_owed`'s rule — this one
+    /// must not reclassify a step's own failure as infra, which would burn the
+    /// infra retry budget and mislabel a developer's broken build as an operator
+    /// problem.
+    #[test]
+    fn a_failed_step_owes_no_snapshot() {
+        let failed = settling_pod_with("Failed", 1, false, true, false);
+        assert!(!workspace_snapshot_lost(&failed));
+        assert_eq!(
+            settled_state(&failed, true),
+            ExecState::Failed {
+                exit_code: Some(1),
+                class: FailureClass::Step,
+            }
+        );
+    }
+
+    /// A non-workspace Pod (no CAS wired when it was built, so no egress barrier in
+    /// its spec) has no snapshot to owe and must pass through untouched. Derived
+    /// from the SPEC rather than an annotation — a control-plane restart has no
+    /// in-memory state, and an annotation whose presence means one thing and whose
+    /// emptiness means another is the conflation git-bug 7f05f39 was about.
+    #[test]
+    fn a_non_workspace_pod_owes_no_snapshot() {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStatus, PodStatus,
+        };
+        let pod = Pod {
+            spec: Some(PodSpec {
+                containers: vec![Container {
+                    name: STEP_CONTAINER.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                phase: Some("Succeeded".into()),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: STEP_CONTAINER.into(),
+                    state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            exit_code: 0,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!is_workspace_pod(&pod));
+        assert!(!workspace_snapshot_lost(&pod));
+        assert_eq!(settled_state(&pod, false), ExecState::Succeeded);
+    }
+
+    /// An EMPTY workspace still has a root — the empty tree's hash — so a step that
+    /// produced nothing is `Succeeded`, not "snapshot lost". The distinction is
+    /// between *no annotation* and *an annotation naming an empty tree*, and only
+    /// the first is a lost snapshot.
+    #[test]
+    fn an_empty_but_recorded_snapshot_is_not_a_lost_one() {
+        let mut pod = settling_pod_with("Succeeded", 0, false, true, false);
+        pod.metadata.annotations.as_mut().unwrap().insert(
+            ANNOTATION_WS_ROOT.to_string(),
+            // Whatever `ingest` returns for an empty directory: still a root.
+            "e".repeat(64),
+        );
+        assert!(!workspace_snapshot_lost(&pod));
+        assert_eq!(settled_state(&pod, true), ExecState::Succeeded);
+
+        // …whereas an EMPTY-STRING annotation is not a root and must not pass. The
+        // annotation is only ever written from a real `Snapshot.root`, so this is
+        // belt-and-braces against a future writer that "clears" it.
+        pod.metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(ANNOTATION_WS_ROOT.to_string(), String::new());
+        assert!(workspace_snapshot_lost(&pod));
+    }
+
+    /// A platform verdict about a green-looking Pod must not be reclassified. If
+    /// the Pod reports `Failed`/`DeadlineExceeded`, that is the verdict — the
+    /// snapshot rule only ever intercepts `Succeeded`, so a wedged drain that runs
+    /// the Pod past its `activeDeadlineSeconds` surfaces as `Timeout` (which is
+    /// bounded and honest) rather than as this rule's infra failure.
+    #[test]
+    fn the_snapshot_rule_only_intercepts_succeeded() {
+        let mut pod = settling_pod_with("Failed", 137, false, true, false);
+        pod.status.as_mut().unwrap().reason = Some("DeadlineExceeded".into());
+        assert_eq!(
+            settled_state(&pod, true),
+            ExecState::Failed {
+                exit_code: Some(137),
+                class: FailureClass::Timeout,
+            },
+            "a wedged drain that outlives the step deadline is a Timeout, not a lost \
+             snapshot — and never a Succeeded"
         );
     }
 
