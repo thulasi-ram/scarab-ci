@@ -48,6 +48,18 @@ spec:
             - secretRef:
                 name: {{ include "scarab.secretName" . }}
                 optional: true
+          {{- if .Values.secrets.oauthClientSecret.name }}
+          # The OAuth client secret (ADR-0049) comes from a Secret you manage
+          # out-of-band, by reference — it never passes through Helm values. An
+          # explicit `env` entry wins over the `envFrom` above, so this also
+          # overrides any SCARAB_OAUTH_CLIENT_SECRET in the referenced Secret.
+          env:
+            - name: SCARAB_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.oauthClientSecret.name | quote }}
+                  key: {{ .Values.secrets.oauthClientSecret.key | quote }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 8080
