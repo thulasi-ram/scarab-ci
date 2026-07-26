@@ -1,0 +1,47 @@
+{"timestamp":"2026-07-26T19:34:45.630766Z","level":"INFO","fields":{"message":"startup: role: Workspace"},"target":"scarab_server"}
+startup: role: Workspace
+{"timestamp":"2026-07-26T19:34:45.630993Z","level":"INFO","fields":{"message":"startup: addr: 0.0.0.0:8081"},"target":"scarab_server"}
+startup: addr: 0.0.0.0:8081
+{"timestamp":"2026-07-26T19:34:45.631012Z","level":"INFO","fields":{"message":"startup: database: NONE — data-plane role, no durable core (ADR-0061)"},"target":"scarab_server"}
+startup: database: NONE — data-plane role, no durable core (ADR-0061)
+{"timestamp":"2026-07-26T19:34:45.631048Z","level":"INFO","fields":{"message":"startup: object store: s3 bucket=scarab-logs endpoint=http://127.0.0.1:9000"},"target":"scarab_server"}
+startup: object store: s3 bucket=scarab-logs endpoint=http://127.0.0.1:9000
+{"timestamp":"2026-07-26T19:34:45.631064Z","level":"INFO","fields":{"message":"startup: executor: K8s (namespace=scarab, driver off — role does not drive)"},"target":"scarab_server"}
+startup: executor: K8s (namespace=scarab, driver off — role does not drive)
+{"timestamp":"2026-07-26T19:34:45.631079Z","level":"INFO","fields":{"message":"startup: step timeout default: 3600s (ADR-0047; per-step `timeout:` overrides)"},"target":"scarab_server"}
+startup: step timeout default: 3600s (ADR-0047; per-step `timeout:` overrides)
+{"timestamp":"2026-07-26T19:34:45.631093Z","level":"INFO","fields":{"message":"startup: public url: http://localhost:8080 (run deep-links, ADR-0046)"},"target":"scarab_server"}
+startup: public url: http://localhost:8080 (run deep-links, ADR-0046)
+{"timestamp":"2026-07-26T19:34:45.631108Z","level":"INFO","fields":{"message":"startup: clone image: ghcr.io/thulasi-ram/scarab-clone:edge (ADR-0045)"},"target":"scarab_server"}
+startup: clone image: ghcr.io/thulasi-ram/scarab-clone:edge (ADR-0045)
+{"timestamp":"2026-07-26T19:34:45.631121Z","level":"INFO","fields":{"message":"startup: forge: registry-routed; github auth token mode (dev; set SCARAB_GITHUB_APP_ID for App auth) (ADR-0046)"},"target":"scarab_server"}
+startup: forge: registry-routed; github auth token mode (dev; set SCARAB_GITHUB_APP_ID for App auth) (ADR-0046)
+{"timestamp":"2026-07-26T19:34:45.631135Z","level":"INFO","fields":{"message":"startup: secrets store: enabled (envelope encryption, ADR-0014; KEK EPHEMERAL)"},"target":"scarab_server"}
+startup: secrets store: enabled (envelope encryption, ADR-0014; KEK EPHEMERAL)
+{"timestamp":"2026-07-26T19:34:45.631148Z","level":"INFO","fields":{"message":"startup: auth: DISABLED — SCARAB_DEV_INSECURE (all callers are Owner)"},"target":"scarab_server"}
+startup: auth: DISABLED — SCARAB_DEV_INSECURE (all callers are Owner)
+{"timestamp":"2026-07-26T19:34:45.631160Z","level":"INFO","fields":{"message":"startup: results egress: disabled (ADR-0042)"},"target":"scarab_server"}
+startup: results egress: disabled (ADR-0042)
+{"timestamp":"2026-07-26T19:34:45.631172Z","level":"INFO","fields":{"message":"startup: workspace service: SERVING (ADR-0061; warm tier /Users/thulasiram/workspace/personal/scrarab-ci/.scarab/workspace-cas, cold = object store above)"},"target":"scarab_server"}
+startup: workspace service: SERVING (ADR-0061; warm tier /Users/thulasiram/workspace/personal/scrarab-ci/.scarab/workspace-cas, cold = object store above)
+{"timestamp":"2026-07-26T19:34:45.631186Z","level":"INFO","fields":{"message":"startup: github webhook: disabled"},"target":"scarab_server"}
+startup: github webhook: disabled
+{"timestamp":"2026-07-26T19:34:45.631198Z","level":"INFO","fields":{"message":"startup: forgejo webhook: disabled"},"target":"scarab_server"}
+startup: forgejo webhook: disabled
+{"timestamp":"2026-07-26T19:34:45.631209Z","level":"INFO","fields":{"message":"startup: gate release tokens: disabled"},"target":"scarab_server"}
+startup: gate release tokens: disabled
+{"timestamp":"2026-07-26T19:34:45.631220Z","level":"INFO","fields":{"message":"startup: oidc issuer: disabled"},"target":"scarab_server"}
+startup: oidc issuer: disabled
+{"timestamp":"2026-07-26T19:34:45.631231Z","level":"INFO","fields":{"message":"startup: config-owned connections: none (ADR-0060 part D; authoritative, read-only in the UI)"},"target":"scarab_server"}
+startup: config-owned connections: none (ADR-0060 part D; authoritative, read-only in the UI)
+{"timestamp":"2026-07-26T19:34:45.631286Z","level":"WARN","fields":{"message":"⚠ AUTH DISABLED — no authenticator; ALL callers are treated as Owner (SCARAB_DEV_INSECURE=1, dev only)"},"target":"scarab_server"}
+⚠ AUTH DISABLED — no authenticator; ALL callers are treated as Owner (SCARAB_DEV_INSECURE=1, dev only)
+{"timestamp":"2026-07-26T19:34:45.631306Z","level":"WARN","fields":{"message":"⚠ EPHEMERAL SECRET KEY — SCARAB_MASTER_KEY unset; secrets written this boot CANNOT be decrypted after a restart (SCARAB_DEV_INSECURE=1, dev only)"},"target":"scarab_server"}
+⚠ EPHEMERAL SECRET KEY — SCARAB_MASTER_KEY unset; secrets written this boot CANNOT be decrypted after a restart (SCARAB_DEV_INSECURE=1, dev only)
+{"timestamp":"2026-07-26T19:34:45.636943Z","level":"INFO","fields":{"message":"workspace service listening (ADR-0061 data plane; no Postgres, no secrets store)","addr":"0.0.0.0:8081","warm_dir":"/Users/thulasiram/workspace/personal/scrarab-ci/.scarab/workspace-cas"},"target":"scarab_server::workspaced"}
+workspace service listening on 0.0.0.0:8081
+{"timestamp":"2026-07-26T19:39:59.991719Z","level":"WARN","fields":{"message":"workspace service: 401 — no workspace token presented","header":"x-scarab-workspace-token"},"target":"scarab_server::workspaced"}
+{"timestamp":"2026-07-26T19:40:40.823225Z","level":"WARN","fields":{"message":"workspace service: 401 — no workspace token presented","header":"x-scarab-workspace-token"},"target":"scarab_server::workspaced"}
+{"timestamp":"2026-07-26T19:40:58.250397Z","level":"WARN","fields":{"message":"workspace service: 401 — no workspace token presented","header":"x-scarab-workspace-token"},"target":"scarab_server::workspaced"}
+{"timestamp":"2026-07-26T19:41:37.129480Z","level":"WARN","fields":{"message":"workspace service: 401 — no workspace token presented","header":"x-scarab-workspace-token"},"target":"scarab_server::workspaced"}
+{"timestamp":"2026-07-26T19:41:37.135095Z","level":"WARN","fields":{"message":"workspace service: 400 — blob body does not hash to its address","claimed":"6a94f6b366441ac202746a8715a7010be6e8c3b3766cc8431ea375a32a0d752b","actual":"d121be3103007b41edf96f8262925f8c7d61894afe9a041843b631f69445bc57"},"target":"scarab_server::workspaced"}
