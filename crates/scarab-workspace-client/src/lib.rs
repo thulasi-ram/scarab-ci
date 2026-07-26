@@ -63,13 +63,46 @@ const CONCURRENCY: usize = 16;
 /// to stay under it.
 const HAVE_CHUNK: usize = 5_000;
 
+/// Where a request's workspace token comes from.
+///
+/// Two shapes because there are two kinds of client and they have opposite
+/// lifetimes:
+///
+/// - a **Step Pod** gets one token, minted for its fence with an `exp` past its
+///   own deadline, delivered as a tmpfs file. It is [`Fixed`](TokenSource::Fixed)
+///   and it outlives every request the Pod will make;
+/// - the **control plane** is a process that runs for weeks and mints tokens for
+///   *itself* (`Scope::Browse`). A fixed token there would be either a
+///   credential that expires mid-life — 401s appearing a day after a deploy, from
+///   nothing the operator changed — or a permanent bearer credential, which is
+///   the exact wart ADR-0061 refused to inherit from the results token. So it
+///   supplies a [`Minted`](TokenSource::Minted) closure instead and gets a
+///   short-lived token per request.
+enum TokenSource {
+    Fixed(String),
+    /// Called once per request. Minting is an HMAC over ~40 bytes, i.e. free
+    /// next to the round trip it authenticates, so there is no cache and
+    /// therefore no staleness window.
+    Minted(Arc<dyn Fn() -> String + Send + Sync>),
+}
+
+impl TokenSource {
+    fn get(&self) -> String {
+        match self {
+            TokenSource::Fixed(t) => t.clone(),
+            TokenSource::Minted(f) => f(),
+        }
+    }
+}
+
 /// A client of one workspace service.
 pub struct WorkspaceClient {
     http: reqwest::Client,
     base: String,
-    /// The workspace token, presented on every request. Read from the tmpfs file
-    /// the executor mounts, never from an env var value.
-    token: String,
+    /// The workspace token, presented on every request. Inside a Pod it is read
+    /// from the tmpfs file the executor mounts, never from an env var value; in
+    /// the control plane it is minted per request (see [`TokenSource`]).
+    token: TokenSource,
 }
 
 #[derive(Serialize)]
@@ -89,10 +122,31 @@ struct HaveResponse {
 impl WorkspaceClient {
     /// A client for `base` (e.g. `http://scarab-workspace`) presenting `token`.
     pub fn new(base: impl Into<String>, token: impl Into<String>) -> Self {
+        Self::with_source(base, TokenSource::Fixed(token.into()))
+    }
+
+    /// A client that **mints a fresh token per request**.
+    ///
+    /// The control plane's constructor. `mint` is called on every request and
+    /// must return a complete wire-form token; the caller owns the scope, the
+    /// TTL and the HMAC secret, because this crate deliberately does not depend
+    /// on the token codec (which lives in `scarab-executor-k8s`, beside the
+    /// executor that also mints Pod tokens — one codec, one place).
+    ///
+    /// This is what keeps a long-lived process from holding a long-lived bearer
+    /// credential: see [`TokenSource`].
+    pub fn with_minted_token(
+        base: impl Into<String>,
+        mint: impl Fn() -> String + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_source(base, TokenSource::Minted(Arc::new(mint)))
+    }
+
+    fn with_source(base: impl Into<String>, token: TokenSource) -> Self {
         Self {
             http: reqwest::Client::new(),
             base: base.into().trim_end_matches('/').to_string(),
-            token: token.into(),
+            token,
         }
     }
 
@@ -115,10 +169,9 @@ impl WorkspaceClient {
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.http.request(method, self.url(path)).header(
-            scarab_storage_workspace_token_header(),
-            self.token.clone(),
-        )
+        self.http
+            .request(method, self.url(path))
+            .header(scarab_storage_workspace_token_header(), self.token.get())
     }
 
     /// Turn a transport failure into a `Backend` error, never into a `NotFound`.
