@@ -49,6 +49,27 @@ down:
 logs:
     tail -f deploy/local-proc/server.log
 
+# The workspace service (ADR-0061) is a SECOND process of the same binary, run by
+# `just up` with --role workspace, so its output never appears in `just logs`. A
+# warm-tier warning ("warm tier full — serving from cold") or a 401 from a Step
+# lands in its log, not the server's.
+
+# Tail the workspace service's log (ADR-0061).
+workspace-logs:
+    tail -f deploy/local-proc/workspace.log
+
+# `warm_used_bytes` is the gauge that matters: LRU eviction is NOT implemented
+# yet, so that number against the volume size is the entire budget. Readiness
+# here means warm writable + cold reachable — deliberately not the control
+# plane's database check.
+
+# Readiness + gauges of the local workspace service (ADR-0061).
+workspace-status port="8081":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "== /readyz =="; curl -sf "http://127.0.0.1:{{port}}/readyz" || echo "NOT READY"
+    echo; echo "== /metrics =="; curl -sf "http://127.0.0.1:{{port}}/metrics"
+
 # Requires deploy/local-helm/.env and kube context `colima`. Usage:
 #   just local-helm             # pull + deploy the latest ghcr `edge`
 #   just local-helm sha-abc123  # pull + deploy a specific published SHA

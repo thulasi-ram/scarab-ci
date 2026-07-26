@@ -155,19 +155,38 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
                                     · priority · backpressure   │
                                                                 ▼ (outbox)
                                     [executor role]  Executor port
-                                    ├─ scarab-executor-k8s  ── Pod per Step
-                                    └─ scarab-executor-local ─ kind/local
-                                                                │
-   Postgres  ◀── state tables + append-only event log ──────────┤
-   Object store (S3/MinIO) ◀── workspace (merkle CAS) · logs · artifacts · cache
+                                    ├─ scarab-executor-k8s  ── Pod per Step ──┐
+                                    └─ scarab-executor-local ─ kind/local     │
+                                                                │             │ root hashes only
+   Postgres  ◀── state tables + append-only event log ──────────┤             │ (tens of bytes)
+                                                                              ▼
+                                          [workspace role]  the workspace service (ADR-0061)
+                                          warm merkle CAS on a PersistentVolume, one per
+                                          failure domain · bounded by SPACE · no Postgres
+                                                                              │
+   Object store (S3/MinIO) ◀── logs · artifacts · cache ◀──────────────────────┘
+                            ◀── Workspace Snapshots: the COLD archive, bounded by TIME
 ```
 
-- **One binary, many roles** (`scarab-server --role converged|api|scheduler|executor|webhook`).
+- **One binary, many roles**
+  (`scarab-server --role converged|api|scheduler|executor|webhook|workspace`).
   Postgres (outbox) is the coordination bus; no service-to-service RPC required internally.
+  `workspace` is the one **data-plane** role: it never connects to Postgres and never runs
+  a migration (ADR-0061), so it keeps serving a Step its inputs through a database outage.
 - **Control-plane / data-plane split:** the durable *brain* records intent ("Step S should
   run"); the *executor* observes it, creates the Pod, watches it, writes back terminal state.
-- **Two stateful dependencies only:** Postgres (state + event log) and an object store
-  (blobs). Nothing else.
+  Bulk **data** does not cross the brain: the control plane exchanges root hashes and Step
+  Pods talk to the workspace service (ADR-0061 supersedes the `kubectl exec` tar tunnel).
+- **Three stateful components — and the third is deliberate.** Postgres (state + event log),
+  an object store (blobs), and the **workspace service**'s persistent volume.
+  [ADR-0004](docs/adr/0004-execution-topology.md) called object storage "the second (and
+  last)"; [ADR-0061](docs/adr/0061-workspace-data-path.md) knowingly adds a third, because
+  one standard path beats a fast path plus a fallback path, and because binding volumes to a
+  long-lived service removes every cost PVCs have when bound to short-lived Step Pods.
+  The two storage tiers carry **different promises**, and that asymmetry is load-bearing:
+  the workspace service's volume is bounded by **space** and promises nothing (a miss is
+  slower, never wrong), while the object store is bounded by **time** (a retention TTL) and
+  **is** the guarantee users are given. Nothing else is stateful.
 
 ## 6. Crate map (hexagonal, domain-first)
 
@@ -186,8 +205,16 @@ scarab-project     Org/Project/Environment + protection rules (Project = governe
 Adapter crates (infra lives here; one per vendor):
 
 ```
-scarab-db-postgres · scarab-forge-github · scarab-secrets-postgres
+scarab-db-postgres · scarab-forge-github · scarab-forge-forgejo · scarab-secrets-postgres
 scarab-storage-s3 · scarab-executor-k8s · scarab-executor-local
+scarab-workspace-client   the workspace service's client (ADR-0061), behind BOTH
+                          scarab-storage ports: `Cas` (so Browse and the executor
+                          can point at the service with no call-site change) and
+                          `ContentSource` (byte ranges, sizes without reads,
+                          batched existence, one-call tree manifests — what a lazy
+                          mount needs and `Cas` structurally cannot express).
+                          Over reqwest, with NO kube dep, so the node driver can
+                          use it without linking the kubernetes executor.
 ```
 
 Testing substrate + composition:
