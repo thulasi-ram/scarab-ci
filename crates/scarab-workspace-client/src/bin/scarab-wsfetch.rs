@@ -93,11 +93,6 @@ const INPUTS_ENV: &str = "SCARAB_WORKSPACE_INPUTS";
 const TARGET_ENV: &str = "SCARAB_WORKSPACE_TARGET";
 const DEFAULT_TARGET: &str = "/workspace";
 
-/// The gid that owns a restored workspace (`WORKSPACE_GID` in the executor).
-/// Not used to chown — this process cannot — but it is the group every Step is
-/// put in, and the reason [`widen_for_the_group`] exists.
-const WORKSPACE_GID: u32 = 65532;
-
 fn main() {
     let code = match run() {
         Ok(()) => 0,
@@ -213,9 +208,13 @@ async fn fetch(
     Ok(())
 }
 
-/// Make the restored workspace writable by group [`WORKSPACE_GID`], and make
-/// directories setgid so files the Step creates stay in that group for the
-/// drain.
+/// Make the restored workspace **group**-writable, and make directories setgid so
+/// files the Step creates stay in that group for the drain.
+///
+/// Which group is not this process's choice: the snapshot lands owned by whatever
+/// gid this container runs as (65532, matching the executor's `WORKSPACE_GID`), and
+/// every Step is put in that group via `supplementalGroups`. So widening the group
+/// bits is exactly and only what makes the workspace writable.
 ///
 /// This is `chmod -R g+rwX` + `find -type d -exec chmod g+s` — verbatim the two
 /// commands the deleted `exec` feed ran, and for verbatim the same reason
@@ -233,7 +232,6 @@ async fn fetch(
 /// widening is a separate, later, additive act. Symlinks are skipped — a link's
 /// own mode is meaningless and `chmod` would follow it out of the workspace.
 fn widen_for_the_group(root: &std::path::Path) -> Result<(), std::io::Error> {
-    let _ = WORKSPACE_GID; // documented above; the chown itself is the kubelet's
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
         let meta = std::fs::symlink_metadata(&path)?;

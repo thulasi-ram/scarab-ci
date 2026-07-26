@@ -1857,12 +1857,9 @@ impl DebugLauncher for K8sExecutor {
                 .workspace_fetch
                 .as_ref()
                 .ok_or(ExecError::Unavailable)?;
-            let (container, token_volume) = workspace_fetch_container(
-                &name,
-                fetch,
-                std::slice::from_ref(&root.to_string()),
-                &ws_mount,
-            );
+            let roots = vec![root.to_string()];
+            let (container, token_volume) =
+                workspace_fetch_container(&name, fetch, &roots, &ws_mount);
             init_containers.push(container);
             volumes.push(token_volume);
         }
