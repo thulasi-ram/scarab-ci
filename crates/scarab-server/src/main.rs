@@ -17,7 +17,7 @@ use clap::Parser;
 
 use scarab_db_postgres::PostgresDb;
 use scarab_engine::{Clock, Db, Executor};
-use scarab_executor_k8s::{K8sExecutor, PlacementConfig, ResultsEgress};
+use scarab_executor_k8s::{K8sExecutor, PlacementConfig, ResultsEgress, WorkspaceFetch};
 use scarab_executor_local::LocalExecutor;
 use scarab_server::config::{Cli, Config, ExecutorKind, Role, StoreConfig};
 use scarab_server::{
@@ -361,6 +361,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .with_artifact_store(store.clone())
                         // Placement (ADR-0055): baseline + PlacementProfile registry.
                         .with_placement(placement.clone());
+                    // The workspace service (ADR-0061 s3-feed): a Step with
+                    // `needs:` is provisioned by an init container that dials it
+                    // directly. Without this the executor REFUSES to launch such a
+                    // step (fail-closed) rather than run it against a silently
+                    // empty /workspace — the old control-plane exec-tar feed is
+                    // deleted, not kept as a fallback.
+                    if let Some(ws) = &config.workspace {
+                        exec = exec.with_workspace_service(WorkspaceFetch {
+                            url: ws.url.clone(),
+                            token_secret: ws.token_secret.clone(),
+                            fetcher_image: ws.fetcher_image.clone(),
+                        });
+                        tracing::info!(
+                            url = %ws.url,
+                            image = %ws.fetcher_image,
+                            "workspace fetcher enabled (ADR-0061 s3-feed; EAGER — the node \
+                             driver replaces this)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "no workspace service configured (SCARAB_WORKSPACE_TOKEN_SECRET \
+                             unset): steps that inherit a workspace will be REFUSED at launch \
+                             (ADR-0061)"
+                        );
+                    }
                     if let Some(egress) = results_egress.clone() {
                         exec = exec.with_results_egress(egress);
                         tracing::info!("results egress sidecar enabled (ADR-0042)");
@@ -472,10 +497,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // step's snapshot. One instance serves both attach and debug-pod.
                 // Placement (ADR-0055) applies here too — a debug Pod must schedule
                 // on the same tainted nodes as the real step.
-                let exec = Arc::new(
-                    exec.with_workspace_cas(workspace_cas.clone())
-                        .with_placement(placement.clone()),
-                );
+                let mut exec = exec
+                    .with_workspace_cas(workspace_cas.clone())
+                    .with_placement(placement.clone());
+                // A debug Pod re-materializes its snapshot through the SAME fetcher
+                // a real step uses (ADR-0061 s3-feed) — the copy-pasted feed it
+                // used to carry is gone (git-bug 64897db). Without a service, a
+                // debug Pod *with* a snapshot reports Unavailable; one without a
+                // snapshot still opens an empty shell.
+                if let Some(ws) = &config.workspace {
+                    exec = exec.with_workspace_service(WorkspaceFetch {
+                        url: ws.url.clone(),
+                        token_secret: ws.token_secret.clone(),
+                        fetcher_image: ws.fetcher_image.clone(),
+                    });
+                }
+                let exec = Arc::new(exec);
                 state = state.with_attacher(exec.clone()).with_debug_launcher(exec);
                 tracing::info!("debug shell: step-attach + debug-pod enabled (k8s exec)");
             }

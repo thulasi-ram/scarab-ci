@@ -28,6 +28,7 @@
 //! | `SCARAB_WORKSPACE_TOKEN_SECRET` | env | enables the workspace service + the token Step Pods present to it (ADR-0061). **Required** under `--role workspace`; deliberately a DIFFERENT secret from `SCARAB_RESULTS_TOKEN_SECRET` |
 //! | `SCARAB_WORKSPACE_URL` | env | base URL of the workspace service; default `http://scarab-workspace` |
 //! | `SCARAB_WORKSPACE_DATA_DIR` | env | the workspace service's **warm tier** directory (its persistent volume); default `./.scarab/workspace-cas`. Only read under `--role workspace` |
+//! | `SCARAB_WSFETCH_IMAGE` | env | the workspace **fetcher** image a Step Pod's init container runs to pull its inputs (ADR-0061 s3-feed); default `ghcr.io/thulasi-ram/scarab-wsfetch:edge`. ⚠ a stepping stone — it dies with the node driver (git-bug 0628369) |
 //! | `SCARAB_GITHUB_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/github` |
 //! | `SCARAB_FORGEJO_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/forgejo` (ADR-0046 — each forge endpoint binds its own secret) |
 //! | `SCARAB_GATE_TOKEN_SECRET` | env | enables external-gate release tokens (ADR-0034) |
@@ -221,6 +222,14 @@ pub struct WorkspaceServiceConfig {
     /// The **warm tier's** directory: the persistent volume the service holds
     /// its content-addressed store on. Only meaningful for `--role workspace`.
     pub data_dir: String,
+    /// The **fetcher** image a Step Pod's init container runs to pull its input
+    /// snapshots from the service (ADR-0061 s3-feed). Digest-pin in production,
+    /// exactly as with `clone_image`.
+    ///
+    /// ⚠ A temporally-ordered stepping stone, not the design: it is *eager*, and
+    /// the CSI/FUSE node driver replaces it — at which point this knob, the image
+    /// and `WorkspaceFetch` all disappear together (git-bug 0628369).
+    pub fetcher_image: String,
 }
 
 /// OIDC issuer settings (selected by `SCARAB_OIDC_ISSUER`). The signing key is
@@ -703,6 +712,11 @@ impl Config {
                     // Dev default beside the object dir; the chart sets
                     // /var/lib/scarab/cas on the PV.
                     .unwrap_or_else(|| "./.scarab/workspace-cas".into()),
+                fetcher_image: env("SCARAB_WSFETCH_IMAGE")
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| {
+                        scarab_executor_k8s::DEFAULT_WSFETCH_IMAGE.to_string()
+                    }),
             }),
             None if matches!(cli.role, Role::Workspace) => {
                 return Err(ConfigError::MissingWorkspaceTokenSecret)
