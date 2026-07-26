@@ -239,10 +239,7 @@ async fn plan_rerun_over(
         let mut output_of: HashMap<StepId, String> = HashMap::new();
         for s in steps {
             let explicit = db.step_inputs(run, &s.step).await?;
-            consumed_of.insert(
-                s.step.clone(),
-                explicit.unwrap_or_else(|| s.needs.clone()),
-            );
+            consumed_of.insert(s.step.clone(), explicit.unwrap_or_else(|| s.needs.clone()));
             if let Some(o) = db.step_output(run, &s.step).await? {
                 output_of.insert(s.step.clone(), o);
             }
@@ -275,9 +272,7 @@ async fn plan_rerun_over(
             }
             // Deterministic order, so the recorded plan and the reported diagnostic
             // do not depend on map iteration order.
-            boundary.sort_by(|a, b| {
-                (&a.0 .0, &a.1 .0, &a.2).cmp(&(&b.0 .0, &b.1 .0, &b.2))
-            });
+            boundary.sort_by(|a, b| (&a.0 .0, &a.1 .0, &a.2).cmp(&(&b.0 .0, &b.1 .0, &b.2)));
             boundary.dedup();
             for (consumer, producer, root) in boundary {
                 let ok = match present.get(&root) {
@@ -453,7 +448,6 @@ pub async fn rerun_step_widened(
         });
     }
     let plan = plan_rerun_over(db, snapshots, run, target, &steps).await?;
-    let invalid: std::collections::HashSet<StepId> = plan.invalidated.iter().cloned().collect();
 
     // The Take boundary (ADR-0056): record the human intervention FIRST, so a
     // Take view — a pure event-log replay up to this event — sees the run
@@ -493,7 +487,7 @@ pub async fn rerun_step_widened(
         }
     }
 
-    rearm_invalidation_set(db, clock, run, target, &plan, &invalid, &steps, by).await?;
+    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by).await?;
     Ok(plan)
 }
 
@@ -547,7 +541,6 @@ pub async fn retry_step_widened(
         });
     }
     let plan = plan_rerun_over(db, snapshots, run, target, &steps).await?;
-    let invalid: std::collections::HashSet<StepId> = plan.invalidated.iter().cloned().collect();
 
     // Attribution/audit fact — NOT a Take boundary (`deriveTakes` ignores it),
     // so the retried attempts land in the current Take's history.
@@ -565,7 +558,7 @@ pub async fn retry_step_widened(
     })
     .await?;
 
-    rearm_invalidation_set(db, clock, run, target, &plan, &invalid, &steps, by).await?;
+    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by).await?;
     Ok(plan)
 }
 
@@ -598,10 +591,14 @@ async fn rearm_invalidation_set(
     run: &RunId,
     target: &StepId,
     plan: &RerunPlan,
-    invalid: &std::collections::HashSet<StepId>,
     steps: &[StepRun],
     by: Option<String>,
 ) -> Result<(), RerunError> {
+    // The set to re-arm comes from the PLAN, not from a second `invalidation_set`
+    // call: the plan is what was recorded on the boundary event and (for a widened
+    // rerun) what the user was shown, so re-deriving it here could only ever
+    // disagree with both.
+    let invalid: std::collections::HashSet<&StepId> = plan.invalidated.iter().collect();
     // Force the explicit target to re-run: clear its stored input signature so
     // admission never mistakes it for an unchanged descendant and skips it
     // (ADR-0027). Its descendants keep their signatures, so they skip-if-unchanged
