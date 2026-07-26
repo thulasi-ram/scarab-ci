@@ -190,3 +190,41 @@ pr-gate n:
 # Compile-check everything.
 check:
     cargo check --workspace
+
+# Reclaim build-cache disk. Cargo NEVER garbage-collects `target/`: every
+# fingerprint change (branch switch, dep bump, feature flag) writes a new
+# artifact and keeps the old one forever. This checkout reached 100 GB — 610k
+# files in target/debug/deps, 88k of them stale `scarab_server-*` variants —
+# purely from two weeks of branch-hopping.
+#
+# `just sweep` prunes artifacts untouched for <days> (default 7) across this
+# checkout AND any git worktrees, which is what keeps it low WITHOUT the full
+# rebuild that `cargo clean` costs. Run it when disk gets tight, or on a cron.
+#
+# Needs cargo-sweep: cargo install cargo-sweep
+sweep days="7":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v cargo-sweep >/dev/null 2>&1; then
+      echo "error: cargo-sweep not installed — run: cargo install cargo-sweep" >&2
+      exit 1
+    fi
+    echo "==> before: $(du -sh target 2>/dev/null | cut -f1) in $PWD/target"
+    # --recursive so sibling worktrees under .workspaces/ and .claude/worktrees/
+    # are swept too; they are the reason the total multiplies.
+    cargo sweep --recursive --time {{days}} .
+    echo "==> after:  $(du -sh target 2>/dev/null | cut -f1)"
+
+# What is actually eating the disk? Prints the build-cache breakdown that the
+# `sweep` recipe exists to fix, newest-worktree-first.
+disk:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "== free =="; df -h /System/Volumes/Data 2>/dev/null | tail -1 || df -h .
+    echo "== target/ in this checkout =="
+    du -sh target 2>/dev/null || echo "  (none)"
+    du -sh target/debug/deps target/debug/incremental 2>/dev/null || true
+    echo "== target/ in git worktrees =="
+    git worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r w; do
+      [ -d "$w/target" ] && du -sh "$w/target" 2>/dev/null || true
+    done

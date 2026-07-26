@@ -74,3 +74,22 @@ tempfile = "3"
 rsa = { version = "0.9", features = ["pem"] }
 kube = { version = "4", default-features = false, features = ["client", "ws", "rustls-tls"] }
 k8s-openapi = { version = "0.28", features = ["latest"] }
+
+# ---------------------------------------------------------------------------
+# Build profiles — tuned for disk, not for a debugger.
+#
+# `target/` grew to 100 GB in this checkout (66 GB of deps, 34 GB of
+# incremental caches) because cargo never garbage-collects: every fingerprint
+# change writes a new artifact and keeps the old one forever. Full DWARF made
+# each of those artifacts as large as possible.
+#
+# `line-tables-only` keeps what we actually read — file and line in panics,
+# backtraces, and nextest failure output — and drops the variable-level debug
+# info we never use (this codebase is debugged through test output, not lldb).
+# CI is stricter still: it sets CARGO_PROFILE_DEV_DEBUG=0, and the env var wins
+# over this, so CI behaviour is unchanged.
+#
+# Attach a debugger by overriding for one run:
+#   CARGO_PROFILE_DEV_DEBUG=2 cargo test -p <crate>
+[profile.dev]
+debug = "line-tables-only"
