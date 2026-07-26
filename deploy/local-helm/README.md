@@ -134,7 +134,7 @@ Convenience (recommended) — `just` picks the image source for you:
 ```sh
 just local-helm             # pull + deploy the latest ghcr `edge` (pullPolicy Always)
 just local-helm sha-<sha>   # pull + deploy a specific published SHA
-just local-helm local       # build server+clone+sidecar from the tree, then deploy
+just local-helm local       # build server+clone+sidecar+wsfetch from the tree, then deploy
 ```
 Or drive the script directly (image source then comes from `.env`):
 ```sh

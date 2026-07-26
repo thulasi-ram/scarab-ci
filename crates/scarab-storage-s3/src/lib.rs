@@ -84,24 +84,21 @@ use scarab_storage::{
 /// longer queue and 4× the peak memory. It is a *floor* for remote object
 /// storage: the further away the store, the higher this should go.
 ///
-/// Override with `SCARAB_CAS_CONCURRENCY` (or [`S3Storage::with_concurrency`]).
-/// Raise it when the object store is far away; lower it when blobs are large,
-/// because peak memory is roughly `concurrency × largest blob`.
+/// Override via [`S3Storage::with_concurrency`], which the composition root
+/// calls with `Config::cas_concurrency` ([`CAS_CONCURRENCY_ENV`]). Raise it when
+/// the object store is far away; lower it when blobs are large, because peak
+/// memory is roughly `concurrency × largest blob`.
 pub const DEFAULT_CAS_CONCURRENCY: usize = 32;
 
 /// The environment variable an operator raises to widen the CAS legs.
+///
+/// This adapter deliberately does **not** read it. It is read once, in
+/// `scarab-server`'s `Config::resolve` (ADR-0048: one documented place for every
+/// `SCARAB_*` knob), which validates it, fails the boot on a junk value, and
+/// prints the live value in `startup_report()` — none of which an ambient
+/// `std::env::var` here could do. The constant lives beside the default so the
+/// knob and the number it overrides stay in one place.
 pub const CAS_CONCURRENCY_ENV: &str = "SCARAB_CAS_CONCURRENCY";
-
-/// [`DEFAULT_CAS_CONCURRENCY`], or whatever `SCARAB_CAS_CONCURRENCY` says.
-/// A junk or zero value falls back to the default rather than degrading the
-/// boundary to the serial behaviour this slice exists to remove.
-fn default_concurrency() -> usize {
-    std::env::var(CAS_CONCURRENCY_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_CAS_CONCURRENCY)
-}
 
 /// An object-store-backed store. Wraps an `object_store` backend behind our port.
 pub struct S3Storage {
@@ -119,7 +116,7 @@ impl S3Storage {
         Self {
             bucket: bucket.into(),
             inner: None,
-            concurrency: default_concurrency(),
+            concurrency: DEFAULT_CAS_CONCURRENCY,
         }
     }
 
@@ -129,7 +126,7 @@ impl S3Storage {
         Self {
             bucket: bucket.into(),
             inner: Some(inner),
-            concurrency: default_concurrency(),
+            concurrency: DEFAULT_CAS_CONCURRENCY,
         }
     }
 

@@ -58,6 +58,12 @@ data:
   {{- with .Values.scarab.stepTimeoutSecs }}
   SCARAB_STEP_TIMEOUT_SECS: {{ . | quote }}
   {{- end }}
+  {{- with .Values.scarab.casConcurrency }}
+  {{- /* ADR-0061 s2. Read by BOTH workloads that touch the CAS: the server's
+         ingest/materialize legs and the workspace StatefulSet sharing this
+         ConfigMap. Peak memory scales with it — see values.yaml. */}}
+  SCARAB_CAS_CONCURRENCY: {{ . | quote }}
+  {{- end }}
   {{- if .Values.secrets.githubAppPemSecret.name }}
   {{- /* File-mounted App PEM (enh 245a99c): the path is not sensitive — only
          the mounted Secret is — so it belongs in the ConfigMap. */}}

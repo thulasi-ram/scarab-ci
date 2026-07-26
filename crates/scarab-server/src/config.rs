@@ -22,6 +22,7 @@
 //! | `SCARAB_S3_REGION` | env | S3 region (default `us-east-1`) |
 //! | `SCARAB_S3_ACCESS_KEY` | env | S3 access key |
 //! | `SCARAB_S3_SECRET_KEY` | env | S3 secret key |
+//! | `SCARAB_CAS_CONCURRENCY` | env | in-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2); default 32. The legs are latency-bound, so this is a *floor* for remote storage — raise it when the store is far away, lower it when blobs are large, because peak memory is roughly `concurrency × largest blob` |
 //! | `SCARAB_RESULTS_TOKEN_SECRET` | env | enables results-egress sidecar + ingest (ADR-0042) |
 //! | `SCARAB_RESULTS_API_URL` | env | base URL the sidecar posts results to |
 //! | `SCARAB_SIDECAR_IMAGE` | env | results-egress sidecar image |
@@ -52,10 +53,15 @@
 //! | `SCARAB_CONNECTIONS` | env | the declarative `connections:` block inline (YAML/JSON, ADR-0060 part D): config-owned forge connections, provisioned at boot and read-only in the UI. Wins over `_FILE` |
 //! | `SCARAB_CONNECTIONS_FILE` | env | path to a file holding the same `connections:` block (the GitOps shape: a ConfigMap mount). A bad path/parse/validation is a boot failure |
 //!
-//! Step-runtime env (`SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`/
-//! `SCARAB_RESULTS*`/`SCARAB_PARAM_*`) is injected *into* step containers by
-//! the executors and is not boot configuration; `SCARAB_SERVER`/`SCARAB_TOKEN`
-//! belong to `scarab` (the CLI client).
+//! Step-runtime env is injected *into* step containers (or their init/sidecar
+//! containers) by the executors and is **not** boot configuration — this table
+//! does not cover it. Today that is `SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`,
+//! `SCARAB_RESULTS*`, `SCARAB_PARAM_*`, and the ADR-0061 workspace-fetch set
+//! (`SCARAB_WORKSPACE_TOKEN_FILE`, `SCARAB_WORKSPACE_URL`,
+//! `SCARAB_SNAPSHOT_ROOTS`, `SCARAB_WORKSPACE_TARGET`) — note that
+//! `SCARAB_WORKSPACE_URL` appears in BOTH lists: the same value is boot config
+//! for this process and injected env for a Step Pod's fetcher.
+//! `SCARAB_SERVER`/`SCARAB_TOKEN` belong to `scarab` (the CLI client).
 
 use base64::Engine;
 use clap::{Parser, ValueEnum};
@@ -419,6 +425,14 @@ pub struct Config {
     /// (ADR-0050 mark-sweep; default 14). Non-terminal runs are always
     /// reachable regardless of age.
     pub retention_workspace_days: u32,
+    /// In-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2);
+    /// default [`scarab_storage_s3::DEFAULT_CAS_CONCURRENCY`].
+    ///
+    /// Resolved *here* rather than by an ambient `std::env::var` in the adapter,
+    /// so it obeys the same three rules as every other knob (ADR-0048): one
+    /// documented place, a junk value fails the boot, and the live value appears
+    /// in [`Config::startup_report`] where an operator can actually read it.
+    pub cas_concurrency: usize,
     /// Config-owned forge connections (ADR-0060 part D), parsed and fully
     /// resolved at boot from `SCARAB_CONNECTIONS[_FILE]`. Empty = every
     /// connection is DB-owned (the pre-0060 world). Each of these is
@@ -527,6 +541,15 @@ pub enum ConfigError {
          of seconds (the global default step deadline, ADR-0047)."
     )]
     InvalidStepTimeout,
+
+    #[error(
+        "SCARAB_CAS_CONCURRENCY is set but invalid — want a positive integer number of \
+         in-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2; default \
+         32). Falling back to the default would silently serve a throughput the \
+         operator did not ask for, which is exactly the kind of quiet substitution \
+         SCARAB_STEP_TIMEOUT_SECS already refuses."
+    )]
+    InvalidCasConcurrency,
 
     #[error(
         "the declarative `connections:` block is invalid (ADR-0060 part D): {0}\n\
@@ -692,6 +715,20 @@ impl Config {
             None => 3_600,
         };
 
+        // ADR-0061 s2's CAS-leg parallelism. Read here, not in the adapter: an
+        // ambient env read there could neither fail the boot nor be reported.
+        let cas_concurrency = match env(scarab_storage_s3::CAS_CONCURRENCY_ENV)
+            .filter(|v| !v.trim().is_empty())
+        {
+            Some(v) => v
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or(ConfigError::InvalidCasConcurrency)?,
+            None => scarab_storage_s3::DEFAULT_CAS_CONCURRENCY,
+        };
+
         // Declarative connections (ADR-0060 part D). Parsed, validated AND
         // credential-resolved here: the whole point of the block is that a boot
         // either has working config-owned connections or refuses.
@@ -787,6 +824,7 @@ impl Config {
                     .ok_or(ConfigError::InvalidRetention)?,
                 None => 14,
             },
+            cas_concurrency,
             connections,
         })
     }
@@ -835,6 +873,16 @@ impl Config {
                 None => "database: NONE — data-plane role, no durable core (ADR-0061)".to_string(),
             },
             format!("object store: {store}"),
+            format!(
+                "cas leg concurrency: {} in-flight round-trips{} (ADR-0061 s2; \
+                 peak memory ≈ concurrency × largest blob)",
+                self.cas_concurrency,
+                if self.cas_concurrency == scarab_storage_s3::DEFAULT_CAS_CONCURRENCY {
+                    " (default)"
+                } else {
+                    " (SCARAB_CAS_CONCURRENCY)"
+                },
+            ),
             format!(
                 "executor: {:?} (namespace={}, driver {})",
                 self.executor,
@@ -1380,6 +1428,63 @@ mod tests {
         assert!(cfg.github_webhook_secret.is_none());
         assert!(cfg.gate_token_secret.is_none());
         assert!(cfg.oidc.is_none());
+    }
+
+    /// `SCARAB_CAS_CONCURRENCY` (ADR-0061 s2) is a real knob, not an ambient env
+    /// read in the adapter: it defaults, it is reported, and — the part that was
+    /// wrong — a junk value FAILS THE BOOT instead of silently substituting 32.
+    /// An operator who typos this knob is asking for a specific throughput; the
+    /// old fallback answered "sure" and served a different one.
+    #[test]
+    fn cas_concurrency_defaults_is_reported_and_refuses_junk() {
+        let base = cli(Some("postgres://l/scarab"));
+
+        let cfg = Config::resolve_from(&base, dev_env(&[])).unwrap();
+        assert_eq!(
+            cfg.cas_concurrency,
+            scarab_storage_s3::DEFAULT_CAS_CONCURRENCY
+        );
+        // Reported, so the live value is answerable from the boot log alone.
+        let report = cfg.startup_report().join("\n");
+        assert!(
+            report.contains("cas leg concurrency: 32 in-flight round-trips (default)"),
+            "the default must be in the startup report: {report}"
+        );
+
+        let cfg = Config::resolve_from(&base, dev_env(&[("SCARAB_CAS_CONCURRENCY", " 96 ")]))
+            .expect("a padded integer is still an integer");
+        assert_eq!(cfg.cas_concurrency, 96);
+        assert!(cfg
+            .startup_report()
+            .join("\n")
+            .contains("cas leg concurrency: 96 in-flight round-trips (SCARAB_CAS_CONCURRENCY)"));
+
+        // Empty is "unset" (a Helm `casConcurrency: ""` renders no key, but an
+        // explicit empty env var must not be a boot failure either).
+        assert_eq!(
+            Config::resolve_from(&base, dev_env(&[("SCARAB_CAS_CONCURRENCY", "")]))
+                .unwrap()
+                .cas_concurrency,
+            scarab_storage_s3::DEFAULT_CAS_CONCURRENCY
+        );
+
+        // Junk and zero both refuse. Zero especially: `with_concurrency` clamps
+        // it to 1, i.e. the serial behaviour ADR-0061 s2 exists to remove — a
+        // 30× slowdown is not a reasonable reading of a typo.
+        for vars in [
+            &[("SCARAB_CAS_CONCURRENCY", "nonsense")] as &'static [(&str, &str)],
+            &[("SCARAB_CAS_CONCURRENCY", "0")],
+            &[("SCARAB_CAS_CONCURRENCY", "-4")],
+            &[("SCARAB_CAS_CONCURRENCY", "32.5")],
+        ] {
+            let bad = vars[0].1;
+            let err = Config::resolve_from(&base, dev_env(vars))
+                .expect_err("junk CAS concurrency must refuse the boot");
+            assert!(
+                matches!(err, ConfigError::InvalidCasConcurrency),
+                "{bad:?} gave {err:?}"
+            );
+        }
     }
 
     #[test]

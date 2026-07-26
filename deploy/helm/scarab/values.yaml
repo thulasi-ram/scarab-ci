@@ -45,6 +45,12 @@ scarab:
   # Global default step deadline in seconds (ADR-0047). Empty => server
   # default (3600). Per-step `timeout:` always overrides.
   stepTimeoutSecs: ""
+  # In-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2).
+  # Empty => server default (32). The legs are latency-bound, so 32 is a FLOOR
+  # for remote object storage — raise it the further away the bucket is. Lower it
+  # when blobs are large: a blob is buffered whole, so peak memory is roughly
+  # `casConcurrency × largest blob`. A non-positive/junk value fails the boot.
+  casConcurrency: ""
 
   # --- declarative forge connections (ADR-0060 part D) --------------------
   # Config-owned connections: provisioned at boot, AUTHORITATIVE, and read-only

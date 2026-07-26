@@ -141,16 +141,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // prod), else a local directory (zero-dependency dev). One S3Storage backs
     // BOTH ports: the log/artifact ObjectStore and the workspace Cas
     // (ADR-0029/0045).
-    let storage = Arc::new(match &config.store {
-        StoreConfig::S3(s3) => S3Storage::s3(
-            s3.bucket.clone(),
-            &s3.endpoint,
-            &s3.region,
-            &s3.access_key,
-            &s3.secret_key,
-        )?,
-        StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
-    });
+    // The CAS-leg parallelism comes from validated config (ADR-0061 s2), not from
+    // an ambient env read inside the adapter — so `startup_report()` above has
+    // already told the operator which value is live.
+    let storage = Arc::new(
+        match &config.store {
+            StoreConfig::S3(s3) => S3Storage::s3(
+                s3.bucket.clone(),
+                &s3.endpoint,
+                &s3.region,
+                &s3.access_key,
+                &s3.secret_key,
+            )?,
+            StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
+        }
+        .with_concurrency(config.cas_concurrency),
+    );
     let store: Arc<dyn ObjectStore> = storage.clone();
     // The COLD tier: object storage, direct. This is the durable one — ADR-0061's
     // retention table gives it a TTL and calls it "the guarantee users are given".

@@ -83,7 +83,7 @@ workspace-status port="8081":
 # Requires deploy/local-helm/.env and kube context `colima`. Usage:
 #   just local-helm             # pull + deploy the latest ghcr `edge`
 #   just local-helm sha-abc123  # pull + deploy a specific published SHA
-#   just local-helm local       # build server+clone+sidecar locally, then deploy
+#   just local-helm local       # build server+clone+sidecar+wsfetch locally, then deploy
 
 # Deploy the Helm dogfood stack on colima; pulls ghcr by default, `local` builds.
 local-helm ref="edge":
