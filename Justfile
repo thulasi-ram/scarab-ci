@@ -41,6 +41,16 @@ up:
 demo:
     bash deploy/local-proc/demo.sh
 
+# `just demo` is ONE step with no `needs:`, so it never crosses a Step boundary and
+# exercises the workspace drain and none of the feed. Since ADR-0061 s3-feed the
+# feed is an init container that dials the workspace service, and this is the
+# cheapest real proof that it works — `consume` asserts on the CONTENT it
+# inherited, so a silently empty /workspace fails it.
+
+# Submit a CHAINED pipeline (produce → consume) — proves the workspace feed leg.
+demo-chain:
+    bash deploy/local-proc/demo-chain.sh
+
 # Tear down the whole stack.
 down:
     bash deploy/local-proc/down.sh

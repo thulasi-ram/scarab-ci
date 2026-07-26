@@ -507,7 +507,24 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         "B read the file A wrote — the workspace flowed through the CAS"
     );
 
-    // --- Restart determinism: a NEW attempt of A yields the SAME root. ---
+    // --- Restart determinism, and what is left of it (git-bug 945b1f4). ---
+    //
+    // This used to assert `root_a == root_a2`: same content, same CAS root, which
+    // is what ADR-0027's content-addressed invalidation is built on. **It no longer
+    // holds, and it is not s3-feed that broke it.** ADR-0061's s7 slice put
+    // `mtime_ms` into the tree entry — deliberately, so cross-Step incremental
+    // compilation stops being degraded — and a tree hash therefore moves with the
+    // wall clock. Measured on this very cluster, the two roots differed in exactly
+    // one field:
+    //
+    //   6ab25ad8… [{"name":"out.txt","target":{"Blob":"d112afe6…"},"mode":420,"mtime_ms":1785098063000}]
+    //   93722441… [{"name":"out.txt","target":{"Blob":"d112afe6…"},"mode":420,"mtime_ms":1785098073000}]
+    //
+    // So the assertion is narrowed to the determinism that DOES survive — the
+    // content address of the file itself — rather than deleted, because a deleted
+    // assertion takes the knowledge with it. The consequence for ADR-0027 (a
+    // producer re-run always invalidates every dependent) is the ticket's, not this
+    // test's.
     let a2 = step_run("a", "a2");
     let ha2 = exec
         .launch(
@@ -518,9 +535,32 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
         .expect("relaunch A");
     assert_eq!(settle(&exec, &ha2).await, ExecState::Succeeded);
     let root_a2 = exec.output(&ha2).await.expect("output").expect("snapshot");
+    let blobs_of = |entries: Vec<scarab_storage::TreeEntry>| {
+        let mut v: Vec<String> = entries
+            .into_iter()
+            .map(|e| match e.target {
+                scarab_storage::TreeTarget::Blob(b) => format!("{}={}", e.name, b.0),
+                scarab_storage::TreeTarget::Tree(t) => format!("{}/{}", e.name, t.0),
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let first = ws
+        .cas
+        .tree_entries(&scarab_storage::TreeHash(root_a.clone()))
+        .await
+        .expect("read A's tree");
+    let second = ws
+        .cas
+        .tree_entries(&scarab_storage::TreeHash(root_a2.clone()))
+        .await
+        .expect("read A2's tree");
     assert_eq!(
-        root_a, root_a2,
-        "same content => same CAS root (deterministic)"
+        blobs_of(first),
+        blobs_of(second),
+        "same content => same BLOB addresses. The ROOT now moves with the mtimes s7 \
+         added (git-bug 945b1f4), which is what breaks ADR-0027 skip-if-unchanged."
     );
 
     for h in [ha, hb, ha2] {
