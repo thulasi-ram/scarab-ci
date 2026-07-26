@@ -4149,5 +4149,32 @@ mod tests {
             ir.steps.iter().any(|s| s.id == "notify/post"),
             "library step inlined"
         );
+
+        // The sample is not just a compile fixture — it is the LOCAL DOGFOOD
+        // TARGET, dispatched against this repo, so the paths it names must
+        // actually exist here. Compilation cannot catch that: a `build:` naming
+        // an absent Dockerfile only fails in-cluster, after the expensive
+        // lint/test legs it depends on have already run.
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for step in ir.steps.iter() {
+            let Some(build) = step.build.as_ref() else {
+                continue;
+            };
+            let context = repo.join(&build.context);
+            assert!(
+                context.is_dir(),
+                "step `{}` builds context `{}`, which is not a directory in this repo",
+                step.id,
+                build.context
+            );
+            // BuildKit resolves `filename` INSIDE the context dir.
+            assert!(
+                context.join(&build.dockerfile).is_file(),
+                "step `{}` names dockerfile `{}`, absent from context `{}`",
+                step.id,
+                build.dockerfile,
+                build.context
+            );
+        }
     }
 }

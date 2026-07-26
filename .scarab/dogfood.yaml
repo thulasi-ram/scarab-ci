@@ -1,7 +1,16 @@
-# Kitchen-sink sample pipeline — a believable build -> test -> deploy flow that
-# happens to exercise most of Scarab's authoring surface. It is validated in CI
-# by `dogfood_sample_compiles` in crates/scarab-pipeline/src/lib.rs, so this file
-# is guaranteed to compile to IR. Read it as a tour of the DSL.
+# Kitchen-sink dogfood pipeline — a believable lint -> test -> build -> deploy
+# flow that exercises most of Scarab's authoring surface AND actually runs green
+# on this repo, so it doubles as the local dogfood target. It is also validated
+# in CI by `dogfood_sample_compiles` in crates/scarab-pipeline/src/lib.rs, so it
+# is guaranteed to compile to IR. Read it as a tour of the DSL you can watch run.
+#
+# Every step is REAL: the commands run against this workspace, the build builds a
+# Dockerfile that exists, and deploy/notify run a real image.
+#
+# Dispatching it locally (`just local-helm`, then POST .../dispatch):
+#   - Use ref `main`. `deploy` is `when: event.branch == 'main'`, so on a PR it
+#     and `notify` correctly SKIP — dispatch main to exercise the whole DAG.
+#   - `approve` is a MANUAL gate: the run parks there until you approve it.
 
 name: Dogfood — kitchen-sink pipeline
 
@@ -34,6 +43,9 @@ interface:
 # --- environment (ADR-0024/0032): pipeline-level ----------------------------
 # An `environment:` makes the whole pipeline a *deploy* — its runs are enforced
 # against the environment's protection rules and opt out of newest-wins cancel.
+# An environment that is REFERENCED but not defined resolves to
+# `Governed { protection: None }` — still a deploy, permissive on rules — so
+# this runs locally without seeding a `production` Environment first.
 environment: production
 
 # --- concurrency (ADR-0011/0032) + budget (ADR-0047) ------------------------
@@ -41,7 +53,9 @@ environment: production
 concurrency:
   group: "deploy-${{ inputs.deploy_env }}"
   policy: cancel-in-progress
-budget: 3600
+# Active-time only (Running intervals), but an uncached in-Pod cargo build is
+# slow and there is no layer caching yet (ADR-0018) — leave real headroom.
+budget: 7200
 
 # --- pipeline-level shared services (ADR-0058): "Shared" --------------------
 # A Run-scoped standalone Postgres reachable cluster-wide at `postgres:5432`,
@@ -74,24 +88,41 @@ steps:
     needs: [checkout]
     security:
       run_as_root: true
-    timeout: 600
-    command: [bash, -c, "cargo fmt --check && cargo clippy"]
+    timeout: 900
+    # The same two traps .scarab/ci.yaml documents. (1) The baseline drops
+    # CAP_DAC_OVERRIDE and /workspace belongs to the clone's uid 65532, so uid 0
+    # cannot write there — send cargo's target dir to a container-owned path.
+    env:
+      - [CARGO_TARGET_DIR, /tmp/scarab-target]
+    command:
+      # (2) `-c`, not `-lc`: a login shell sources /etc/profile and resets PATH,
+      # dropping the rust image's /usr/local/cargo/bin (rustc/cargo vanish).
+      - bash
+      - -c
+      - |
+        set -euxo pipefail
+        # Scoped to crates that ARE rustfmt-clean: this workspace as a whole is
+        # not, and a repo-wide `cargo fmt` would churn ~90 unrelated files.
+        cargo fmt -p scarab-identity -p scarab-pipeline -- --check
+        cargo clippy -p scarab-identity -p scarab-pipeline
 
   # --- matrix (ADR-0023) + shared-service uses + sidecar service (ADR-0058) --
-  # + retry (ADR-0047). Fans across toolchain x features (minus one excluded
-  # combo). `uses: [postgres]` reaches the shared service; a Redis *sidecar*
-  # lives in this step's own Pod at localhost:6379.
+  # + retry (ADR-0047). Fans across crate x mode (minus one excluded combo).
+  # `uses: [postgres]` reaches the shared service; a Redis *sidecar* lives in
+  # this step's own Pod at localhost:6379.
   - id: test
     image: rust:1-bookworm
     needs: [checkout]
     security:
       run_as_root: true
+    timeout: 1800
     matrix:
       dimensions:
-        toolchain: [stable, beta]
-        features: [default, all]
+        crate: [scarab-identity, scarab-pipeline]
+        mode: [check, test]
       exclude:
-        - "toolchain == 'beta' && features == 'all'"
+        # scarab-pipeline's `check` leg adds nothing over its `test` leg.
+        - "crate == 'scarab-pipeline' && mode == 'check'"
     uses: [postgres]
     services:
       # Non-root by default (ADR-0058): pin redis's built-in uid so its emptyDir
@@ -105,9 +136,20 @@ steps:
       on: failure
       max: 2
     env:
+      - [CARGO_TARGET_DIR, /tmp/scarab-target]
       - [DATABASE_URL, "postgres://postgres:test@postgres:5432/app_test"]
       - [REDIS_URL, "redis://localhost:6379"]
-    command: [bash, -c, "cargo test --features ${{ matrix.features }}"]
+    command:
+      - bash
+      - -c
+      - |
+        set -euxo pipefail
+        # Prove BOTH service shapes are genuinely reachable, via bash's /dev/tcp
+        # so no client needs installing: the Shared service by DNS name
+        # cluster-wide, the sidecar on this Pod's own localhost.
+        timeout 30 bash -c 'until (exec 3<>/dev/tcp/postgres/5432) 2>/dev/null; do sleep 1; done'
+        timeout 30 bash -c 'until (exec 3<>/dev/tcp/localhost/6379) 2>/dev/null; do sleep 1; done'
+        cargo ${{ matrix.mode }} -p ${{ matrix.crate }}
 
   # --- named step result consumed downstream (ADR-0041) ---------------------
   # This step publishes a `tag` result at runtime (results API, ADR-0042); the
@@ -118,27 +160,41 @@ steps:
     # alpine is USER root, so opt into the self-service run-as-root grant (like
     # lint/test above) — without it the kubelet refuses the container under the
     # non-root baseline (CreateContainerConfigError). Base alpine ships no git,
-    # so install it before `git describe`. (No `safe.directory` dance needed even
-    # though this step runs as a different uid than the clone: the executor marks
-    # the provisioned workspace git-trusted for every step.)
+    # so install it before `git describe`.
     security:
       run_as_root: true
-    command: [sh, -c, "apk add --no-cache git && git describe --tags --always > /scarab/results/tag"]
+    command:
+      - sh
+      - -c
+      - |
+        set -eux
+        apk add --no-cache git
+        # Belt-and-braces against git's ownership guard: this step runs as a
+        # different uid than the clone (which owns the tree as 65532).
+        git config --global --add safe.directory /workspace
+        # This repo carries no tags, so --always falls back to the short SHA.
+        git -C /workspace describe --tags --always > /scarab/results/tag
 
   # --- build step (ADR-0018): rootless BuildKit image build -----------------
-  # + placement_profiles + resources (ADR-0055). The author names no
-  # image/command (the blessed BuildKit image runs); just what to build.
+  # + resources (ADR-0055). The author names no image/command (the blessed
+  # BuildKit image runs); just what to build. `docker/clone` is a REAL
+  # self-contained context — a small alpine image with no cargo build in it, so
+  # this leg stays fast; `dockerfile:` is resolved inside the context dir.
+  #
+  # NOTE: `placement_profiles: [...]` belongs here too, but an unregistered
+  # profile is a HARD failure ("unknown placement_profile ... not in the
+  # registry"), so it is left off until a profile is seeded for the cluster.
   - id: build
     needs: [lint, test]
     build:
-      context: .
+      context: docker/clone
       dockerfile: Dockerfile
-      image: ghcr.io/acme/app
+      image: ghcr.io/thulasi-ram/scarab-clone
       push: false
-    placement_profiles: [build-nodes]
+    # Sized to fit a single-node colima, not a real build farm.
     resources:
-      cpu_millis: 4000
-      memory_mib: 8192
+      cpu_millis: 1000
+      memory_mib: 2048
 
   # --- gate (ADR-0008): manual approval before deploy -----------------------
   # + gate_expires_after (ADR-0047): fail the gate if unapproved after a day.
@@ -150,14 +206,25 @@ steps:
   # --- deploy: when: conditional (ADR-0033) + inputs/outputs interpolation --
   # Runs only on main; consumes both launch inputs and the `version.tag` result.
   - id: deploy
-    image: ghcr.io/acme/deployer:1.4.2
+    image: alpine:3.20
     needs: [approve, version]
     when: "event.branch == 'main'"
+    security:
+      run_as_root: true
     env:
       - [RELEASE_TAG, "${{ inputs.image_tag }}"]
       - [TARGET_ENV, "${{ inputs.deploy_env }}"]
       - [PREV_VERSION, "${{ outputs.version.tag }}"]
-    command: [sh, -c, "deploy --tag $RELEASE_TAG --env $TARGET_ENV"]
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        # A real command over the interpolated values. The point is that all
+        # three RESOLVED, not that anything ships — so assert the cross-step
+        # one is non-empty rather than trusting the echo.
+        echo "deploying tag=$RELEASE_TAG env=$TARGET_ENV prev=$PREV_VERSION"
+        test -n "$PREV_VERSION"
 
   # --- invoke (ADR-0038): inline a library pipeline with typed inputs -------
   - id: notify
