@@ -20,11 +20,13 @@
 pub mod ports;
 pub mod scheduler;
 
-pub use ports::{Clock, Db, Executor, LogChunks};
+pub use ports::{Clock, Db, Executor, LogChunks, WorkspaceRetention, WorkspaceSnapshots};
 pub use scheduler::{
-    cancel_run_request, record_gate_approval, release_gate, rerun_step, retry_step, RerunError,
-    Scheduler, SchedulerError, SupersedeTeardown, SupersededAttempt, Supervision, TickHealth,
-    CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS, RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
+    cancel_run_request, pin_run_workspace, plan_rerun, record_gate_approval, release_gate,
+    rerun_step, rerun_step_widened, retry_step, retry_step_widened, unpin_run_workspace,
+    ExpiredInput, RerunError, RerunPlan, Scheduler, SchedulerError, SupersedeTeardown,
+    SupersededAttempt, Supervision, TickHealth, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
+    RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
 use serde::{Deserialize, Serialize};
@@ -785,6 +787,15 @@ pub enum EventPayload {
         target: StepId,
         invalidated: Vec<StepId>,
         by: Option<String>,
+        /// The members of `invalidated` that are **upstream** of the target and
+        /// are there only because a Workspace Snapshot they produced is gone
+        /// (ADR-0061 s5): the rerun was *widened* to regenerate expired inputs
+        /// instead of failing a step that could never be provisioned. Empty on
+        /// an ordinary rerun, and on every event recorded before widening
+        /// existed — hence `default`, which is what keeps the read path
+        /// zero-migration (ADR-0022 expand-contract).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        widened: Vec<StepId>,
     },
     /// A human retried a **Failed** step (ADR-0056 amendment 2026-07-22) — an
     /// attribution/audit fact, **NOT a Take boundary**. A Retry re-executes the
@@ -796,6 +807,11 @@ pub enum EventPayload {
         target: StepId,
         invalidated: Vec<StepId>,
         by: Option<String>,
+        /// As on [`RunRerunRequested`](EventPayload::RunRerunRequested): the
+        /// upstream steps dragged in to regenerate expired Workspace Snapshots
+        /// (ADR-0061 s5). Empty on an ordinary retry.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        widened: Vec<StepId>,
     },
     /// A control plane that did not launch this attempt resumed supervising
     /// it (ADR-0047 re-adoption, surfaced by ADR-0056). Same attempt, same
@@ -828,6 +844,20 @@ pub enum EventPayload {
     StepServicesUnready {
         step: StepId,
         reason: String,
+    },
+    /// A human **pinned** this Run's Workspace Snapshots (ADR-0061 s5): keep
+    /// them past the cold tier's retention TTL, for an investigation. The pin is
+    /// a durable fact on the run row; this event is its audit half — who asked
+    /// for the exception and when — mirroring [`GateApproved`](EventPayload::GateApproved).
+    /// `by` is the acting principal (`None` only when auth is off).
+    RunWorkspacePinned {
+        by: Option<String>,
+    },
+    /// A human released the pin, returning this Run's Workspace Snapshots to the
+    /// ordinary TTL. Recorded for the same reason as the pin: an exception that
+    /// costs storage should be attributable in both directions.
+    RunWorkspaceUnpinned {
+        by: Option<String>,
     },
     /// Escape hatch for forward-compatible payloads not yet modelled.
     Raw(serde_json::Value),
@@ -1404,10 +1434,14 @@ mod tests {
                 target,
                 invalidated,
                 by,
+                widened,
             } => {
                 assert_eq!(target, StepId("b".into()));
                 assert_eq!(invalidated, vec![StepId("b".into())]);
                 assert_eq!(by, None);
+                // A pre-ADR-0061 event carries no `widened` key at all; the
+                // `#[serde(default)]` is what keeps the read path zero-migration.
+                assert!(widened.is_empty());
             }
             other => panic!("expected RunRerunRequested, got {other:?}"),
         }

@@ -1762,18 +1762,28 @@ impl Db for PostgresDb {
         // just each step's latest — an old Take's workspace view must never
         // race the sweeper. The step_runs arm is kept for pre-ADR-0056 rows
         // whose attempts carry no snapshot copy.
+        //
+        // `workspace_pinned_at IS NOT NULL` (ADR-0061 s5) is a third disjunct in
+        // the reachability predicate, alongside "non-terminal" and "within TTL".
+        // A pin therefore enters the **mark**, so the whole transitive tree under
+        // a pinned root survives — including subtrees shared with runs that are
+        // themselves collectable. Filtering the delete list instead would keep the
+        // root object and sweep the blobs beneath it, i.e. keep a pointer to
+        // nothing, which is the one outcome a pin must never produce.
         let rows = sqlx::query(
             "SELECT DISTINCT sr.output_snapshot AS root FROM step_runs sr
              JOIN runs r ON r.id = sr.run_id
              WHERE sr.output_snapshot IS NOT NULL
                AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
-                    OR r.updated_at >= $1)
+                    OR r.updated_at >= $1
+                    OR r.workspace_pinned_at IS NOT NULL)
              UNION
              SELECT DISTINCT a.output_snapshot AS root FROM attempts a
              JOIN runs r ON r.id = a.run_id
              WHERE a.output_snapshot IS NOT NULL
                AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
-                    OR r.updated_at >= $1)",
+                    OR r.updated_at >= $1
+                    OR r.workspace_pinned_at IS NOT NULL)",
         )
         .bind(terminal_cutoff.0)
         .fetch_all(self.pool())
@@ -1783,6 +1793,70 @@ impl Db for PostgresDb {
             .into_iter()
             .map(|r| r.get::<String, _>("root"))
             .collect())
+    }
+
+    async fn pin_run_workspace(
+        &self,
+        run: &RunId,
+        by: Option<&str>,
+        at: Timestamp,
+    ) -> Result<bool, DbError> {
+        // Deliberately NOT touching `updated_at`: that column is the run's
+        // lifecycle clock and the TTL cutoff `gc_workspace_roots` compares
+        // against. A pin must not silently re-date the run, or "pinned" and
+        // "settled 5 minutes ago" would become indistinguishable in every view.
+        let n = sqlx::query(
+            "UPDATE runs SET workspace_pinned_at = $2, workspace_pinned_by = $3 WHERE id = $1",
+        )
+        .bind(&run.0)
+        .bind(at.0)
+        .bind(by)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    async fn unpin_run_workspace(&self, run: &RunId) -> Result<bool, DbError> {
+        let n = sqlx::query(
+            "UPDATE runs SET workspace_pinned_at = NULL, workspace_pinned_by = NULL WHERE id = $1",
+        )
+        .bind(&run.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    async fn run_workspace_retention(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::WorkspaceRetention>, DbError> {
+        let row = sqlx::query(
+            "SELECT status, updated_at, workspace_pinned_at, workspace_pinned_by
+             FROM runs WHERE id = $1",
+        )
+        .bind(&run.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        let Some(row) = row else { return Ok(None) };
+        let status: String = row.get("status");
+        Ok(Some(scarab_engine::WorkspaceRetention {
+            // The same terminal vocabulary the mark query filters on, so "on the
+            // TTL clock" means one thing in both places.
+            terminal: matches!(
+                status.as_str(),
+                "succeeded" | "failed" | "cancelled" | "dead_lettered"
+            ),
+            settled_at: Timestamp(row.get::<i64, _>("updated_at")),
+            pinned_at: row
+                .get::<Option<i64>, _>("workspace_pinned_at")
+                .map(Timestamp),
+            pinned_by: row.get::<Option<String>, _>("workspace_pinned_by"),
+        }))
     }
 
     async fn forget_workspace_root(&self, root: &str) -> Result<u32, DbError> {

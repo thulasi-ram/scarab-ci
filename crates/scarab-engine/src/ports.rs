@@ -19,6 +19,56 @@ pub struct Lease {
     pub expires_at: Timestamp,
 }
 
+/// One run's **cold-tier retention facts** for its Workspace Snapshots
+/// (ADR-0061 s5 / ADR-0050).
+///
+/// The cold tier is bounded by **time**, and that bound is the only promise the
+/// product makes about a Workspace Snapshot; the warm workspace service is
+/// bounded by space and promises nothing (a miss there is slower, never wrong).
+/// This carries the two facts a caller needs to state the promise honestly:
+/// when the TTL clock started, and whether a human **pinned** the Run out of the
+/// sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRetention {
+    /// The Run is TERMINAL, so its snapshots are on the TTL clock at all. A
+    /// non-terminal Run — including one suspended on a gate for weeks — is never
+    /// GC-eligible regardless of age (ADR-0050), so its snapshots are promised
+    /// unconditionally.
+    pub terminal: bool,
+    /// The Run's last transition — the instant the cold-tier TTL is measured
+    /// from. Exactly the column [`Db::gc_workspace_roots`] compares against its
+    /// cutoff, so a caller computing "expires at" agrees with the sweeper by
+    /// construction rather than by coincidence.
+    pub settled_at: Timestamp,
+    /// When a human pinned this Run's Workspace Snapshots ("keep this Run's
+    /// workspaces"), if pinned. A pin holds the **cold** tier open past its TTL
+    /// and promises nothing about the warm tier.
+    pub pinned_at: Option<Timestamp>,
+    /// Who pinned it — the audit half of the pin (`None` only when auth is off).
+    pub pinned_by: Option<String>,
+}
+
+/// Whether the **immutable Workspace Snapshot** a DAG edge names can still be
+/// materialised (ADR-0061 s5).
+///
+/// The cold tier is time-bounded, so a snapshot the durable record still
+/// references can legitimately be **gone** — and a Run reopened after its TTL
+/// must degrade gracefully (widen its rerun upstream) rather than fail a Step
+/// that could never have been provisioned. That decision belongs to the engine,
+/// *before* dispatch, which is why the pure domain needs this one bit of truth
+/// about the store behind a port.
+///
+/// A `bool` rather than a `Result` on purpose: only *proof of absence* may widen
+/// a rerun. A transient store error is not proof, and treating it as one would
+/// re-run a whole pipeline on a network blip — so an adapter reports `true`
+/// (assume present) for anything that is not a definitive not-found, and the
+/// executor's own input-missing fail-fast remains the backstop.
+#[async_trait]
+pub trait WorkspaceSnapshots: Send + Sync {
+    /// Is the Workspace Snapshot rooted at `root` still materialisable?
+    async fn snapshot_present(&self, root: &str) -> bool;
+}
+
 /// Opaque handle to a launched unit of execution (a pod, a local process…).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecHandle(pub String);
@@ -647,7 +697,40 @@ pub trait Db: Send + Sync {
     /// non-terminal, so its roots are ALWAYS marked, regardless of age.
     /// Covers EVERY attempt's snapshot, not just each step's latest
     /// (ADR-0056): an old Take's workspace view must never race the GC.
+    ///
+    /// A **pinned** run (ADR-0061 s5 — [`pin_run_workspace`](Db::pin_run_workspace))
+    /// is in the mark set unconditionally, exactly like a non-terminal one. The
+    /// pin belongs *here*, in the mark, and never as a filter over the delete
+    /// list: a pinned root's whole transitive tree — every shared subtree and
+    /// blob under it — must survive, and only marking achieves that.
     async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError>;
+
+    /// **Pin** a Run's Workspace Snapshots (ADR-0061 s5): hold them out of the
+    /// cold-tier sweep past their TTL, for an investigation. Durable and
+    /// auditable — `by` and `at` are recorded, so "who kept this and when" is
+    /// answerable later. Idempotent: re-pinning an already-pinned Run
+    /// re-stamps it. Returns `false` when there is no such Run.
+    ///
+    /// The pin acts on the **cold** tier's *time* bound only. It cannot promise
+    /// anything about the warm workspace service, which is bounded by space and
+    /// evicts LRU by design.
+    async fn pin_run_workspace(
+        &self,
+        run: &RunId,
+        by: Option<&str>,
+        at: Timestamp,
+    ) -> Result<bool, DbError>;
+
+    /// Release a [pin](Db::pin_run_workspace), returning the Run's snapshots to
+    /// the ordinary TTL. Idempotent; `false` when there is no such Run.
+    async fn unpin_run_workspace(&self, run: &RunId) -> Result<bool, DbError>;
+
+    /// One Run's cold-tier retention facts (ADR-0061 s5) — the TTL clock plus
+    /// any pin. `None` when there is no such Run.
+    async fn run_workspace_retention(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<WorkspaceRetention>, DbError>;
 
     /// Forget a workspace-CAS root that GC proved ABSENT from the object store
     /// (ADR-0050): clear every recorded output snapshot equal to `root`,

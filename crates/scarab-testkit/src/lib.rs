@@ -163,6 +163,9 @@ struct InMemoryState {
     slots: HashMap<String, RunId>,
     /// Per-run creation time (for supersede ordering).
     run_created: HashMap<RunId, Timestamp>,
+    /// Per-run Workspace-Snapshot **pin** (ADR-0061 s5): `(by, at)` while pinned,
+    /// absent otherwise — mirrors `runs.workspace_pinned_{at,by}`.
+    workspace_pins: HashMap<RunId, (Option<String>, Timestamp)>,
     /// Per-run supersede key `(repo, ref, pipeline)`.
     supersede_keys: HashMap<RunId, String>,
     /// Per-run project (fairness) and admission priority.
@@ -1500,11 +1503,15 @@ impl Db for InMemoryDb {
 
     async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError> {
         let st = self.state.lock().unwrap();
+        // Third disjunct, matching the Postgres mark query (ADR-0061 s5): a
+        // PINNED run's roots are marked unconditionally, so its whole transitive
+        // tree survives the sweep.
         let run_live = |run: &RunId| {
             st.runs.get(run).is_some_and(|status| {
                 !status.is_terminal()
                     || st.run_created.get(run).copied().unwrap_or(Timestamp(0)).0
                         >= terminal_cutoff.0
+                    || st.workspace_pins.contains_key(run)
             })
         };
         // Latest denorm roots + EVERY attempt's root (ADR-0056): an old
@@ -1524,6 +1531,50 @@ impl Db for InMemoryDb {
         roots.sort();
         roots.dedup();
         Ok(roots)
+    }
+
+    async fn pin_run_workspace(
+        &self,
+        run: &RunId,
+        by: Option<&str>,
+        at: Timestamp,
+    ) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        if !st.runs.contains_key(run) {
+            return Ok(false);
+        }
+        st.workspace_pins
+            .insert(run.clone(), (by.map(str::to_string), at));
+        Ok(true)
+    }
+
+    async fn unpin_run_workspace(&self, run: &RunId) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        if !st.runs.contains_key(run) {
+            return Ok(false);
+        }
+        st.workspace_pins.remove(run);
+        Ok(true)
+    }
+
+    async fn run_workspace_retention(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::WorkspaceRetention>, DbError> {
+        let st = self.state.lock().unwrap();
+        let Some(status) = st.runs.get(run).copied() else {
+            return Ok(None);
+        };
+        let pin = st.workspace_pins.get(run).cloned();
+        Ok(Some(scarab_engine::WorkspaceRetention {
+            terminal: status.is_terminal(),
+            // The fake tracks only creation time, and `gc_workspace_roots` above
+            // already uses it as the TTL clock — so the two agree here too. The
+            // real adapter uses `updated_at` (the settle instant).
+            settled_at: st.run_created.get(run).copied().unwrap_or(Timestamp(0)),
+            pinned_at: pin.as_ref().map(|(_, at)| *at),
+            pinned_by: pin.and_then(|(by, _)| by),
+        }))
     }
 
     async fn forget_workspace_root(&self, root: &str) -> Result<u32, DbError> {

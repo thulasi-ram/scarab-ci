@@ -130,6 +130,9 @@ async fn rerunning_a_middle_step_reruns_only_it_and_descendants() {
                 target,
                 invalidated,
                 by,
+                // Not the subject here — this run has no workspace snapshots, so
+                // ADR-0061 s5 widening can never fire.
+                widened: _,
             } => Some((target.clone(), invalidated.clone(), by.clone())),
             _ => None,
         })
