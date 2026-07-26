@@ -108,6 +108,15 @@ const HAVE_MAX_HASHES: usize = 10_000;
 /// ADR-0029): the service must be able to hold one blob, not one workspace.
 const MAX_BLOB_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
+/// Warm-volume reads that failed with something other than "not there".
+///
+/// Broken out from every other counter because it is the one that says *the
+/// PersistentVolume is bad* — an `EACCES` after a remount-read-only, an `EIO` on
+/// a failing disk. Before this existed, those were indistinguishable from a cache
+/// miss at every content route, while `/readyz` (which write-probes) would have
+/// reported the same volume unready. See [`warm_has`].
+static WARM_READ_FAILED: AtomicU64 = AtomicU64::new(0);
+
 /// How often the warm-tier size gauge is recomputed. Read on `/metrics` from an
 /// atomic rather than measured per scrape: a warm tier is tens of thousands of
 /// files, and walking it on every Prometheus scrape would make the observability
@@ -278,6 +287,7 @@ async fn shutdown_signal() {
 
 /// One error type for the whole surface, so every handler's failure mapping is
 /// in one readable place.
+#[derive(Debug)]
 enum WsError {
     /// No token, a bad MAC, or an expired one. Always 401 to the caller, with
     /// no detail: which check failed goes to the log, never to the wire.
@@ -425,6 +435,54 @@ fn warm_blob_path(state: &WorkspaceState, hash: &str) -> std::path::PathBuf {
     state.warm_dir.join("blobs").join(hash)
 }
 
+fn warm_tree_path(state: &WorkspaceState, hash: &str) -> std::path::PathBuf {
+    state.warm_dir.join("trees").join(hash)
+}
+
+/// Does the warm volume hold this object?
+///
+/// **`Ok(false)` means "not there"; an `Err` means the volume could not answer.**
+/// The two must not be conflated, and conflating them is exactly what
+/// `metadata(..).is_ok()` does: an `EACCES` on a remounted-read-only volume, an
+/// `EIO` on a failing disk and a genuine miss all collapse into `false`. That is
+/// asymmetric with [`readyz`], which deliberately *write*-probes in order to
+/// catch precisely those two failures — a service whose volume has gone bad would
+/// report itself unready while every content route quietly claimed the volume was
+/// merely empty.
+///
+/// Downstream of this the answers are: a miss falls through to cold (slower,
+/// never wrong), and a broken volume is a `500` the client will retry.
+async fn warm_has(path: &std::path::Path) -> Result<bool, WsError> {
+    match tokio::fs::metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(warm_volume_error("stat", path, e)),
+    }
+}
+
+/// Record and log a warm-volume failure that is **not** a miss, and turn it into
+/// a backend error.
+///
+/// A `500` rather than a fall-through to cold, matching
+/// [`scarab_storage::tiered`]'s default for this composition: inside the service
+/// the warm tier is its own PersistentVolume, and serving around a broken volume
+/// would make it indistinguishable from an empty one — which is how a torn CAS
+/// goes unnoticed for a week. A `500` is retried; the counter and the log line are
+/// what an operator acts on.
+fn warm_volume_error(op: &str, path: &std::path::Path, e: std::io::Error) -> WsError {
+    WARM_READ_FAILED.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        op,
+        path = %path.display(),
+        error = %e,
+        kind = ?e.kind(),
+        "workspace service: the warm volume FAILED a read — this is not a cache miss \
+         (ADR-0061). Check the PersistentVolume: /readyz write-probes for the same class \
+         of fault."
+    );
+    WsError::Backend(e.to_string())
+}
+
 /// A `Range: bytes=<first>-<last>` header, if present and well-formed.
 ///
 /// Only the single-range `bytes=first-last` and `bytes=first-` forms are
@@ -477,18 +535,31 @@ async fn get_blob(
     }
 
     let path = warm_blob_path(&state, &hash);
-    if let Ok(file) = tokio::fs::File::open(&path).await {
-        let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-        let mut resp = Body::from_stream(file_chunks(file)).into_response();
-        let h = resp.headers_mut();
-        h.insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/octet-stream"),
-        );
-        if let Ok(v) = axum::http::HeaderValue::from_str(&len.to_string()) {
-            h.insert(axum::http::header::CONTENT_LENGTH, v);
+    match tokio::fs::File::open(&path).await {
+        Ok(file) => {
+            // NOT `unwrap_or(0)`. A `stat` failure on an already-open handle is a
+            // broken volume, and answering `content-length: 0` while then
+            // streaming real bytes is a lie the client cannot detect — reqwest
+            // would report a body length that disagrees with the body.
+            let len = file
+                .metadata()
+                .await
+                .map(|m| m.len())
+                .map_err(|e| warm_volume_error("get_blob metadata", &path, e))?;
+            let mut resp = Body::from_stream(file_chunks(file)).into_response();
+            let h = resp.headers_mut();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/octet-stream"),
+            );
+            if let Ok(v) = axum::http::HeaderValue::from_str(&len.to_string()) {
+                h.insert(axum::http::header::CONTENT_LENGTH, v);
+            }
+            return Ok(resp);
         }
-        return Ok(resp);
+        // A genuine miss: fall through to cold below.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(warm_volume_error("get_blob open", &path, e)),
     }
 
     // Warm miss: pull through cold (and backfill warm on the way).
@@ -512,9 +583,25 @@ async fn ranged_blob(
 ) -> Result<Response, WsError> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    let (data, total) = match tokio::fs::File::open(warm_blob_path(state, hash)).await {
-        Ok(mut file) => {
-            let total = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let warm = warm_blob_path(state, hash);
+    let opened = match tokio::fs::File::open(&warm).await {
+        Ok(file) => Some(file),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(warm_volume_error("ranged_blob open", &warm, e)),
+    };
+    let (data, total) = match opened {
+        Some(mut file) => {
+            // NOT `unwrap_or(0)`. With `total = 0` every range is unsatisfiable,
+            // so this handler would answer `416 content-range: bytes */0` — an
+            // authoritative, terminal "this object is empty" — for a blob that is
+            // not empty. A `500` gets retried; a `416` never does, and the caller
+            // (a lazy mount's `read`) would treat it as end-of-file and silently
+            // serve a truncated workspace.
+            let total = file
+                .metadata()
+                .await
+                .map(|m| m.len())
+                .map_err(|e| warm_volume_error("ranged_blob metadata", &warm, e))?;
             if first >= total {
                 // RFC 9110 §15.5.17: an unsatisfiable range.
                 let mut resp = Response::new(Body::empty());
@@ -536,7 +623,10 @@ async fn ranged_blob(
                 .map_err(|e| WsError::Backend(e.to_string()))?;
             (buf, total)
         }
-        Err(_) => {
+        // Warm miss: pull the whole blob through cold (which backfills warm) and
+        // slice. There is no range read on the cold port — that asymmetry is the
+        // reason `ContentSource` exists.
+        None => {
             let whole = state.cas.get_blob(&BlobHash(hash.to_string())).await?;
             let total = whole.len() as u64;
             if first >= total {
@@ -596,12 +686,18 @@ async fn head_blob(
     authenticate(&state, &headers)?;
     valid_hash(&hash)?;
 
-    let len = match tokio::fs::metadata(warm_blob_path(&state, &hash)).await {
+    let path = warm_blob_path(&state, &hash);
+    let len = match tokio::fs::metadata(&path).await {
         Ok(meta) => meta.len(),
         // Cold-only: there is no size-without-read on the cold port, so this is
         // a full read. Slow, never wrong — and it backfills warm, so the second
         // HEAD is cheap.
-        Err(_) => state.cas.get_blob(&BlobHash(hash)).await?.len() as u64,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            state.cas.get_blob(&BlobHash(hash)).await?.len() as u64
+        }
+        // A broken volume must not answer as a miss: `blob_size` is what a lazy
+        // mount's `getattr` calls, and a wrong size there is a wrong file.
+        Err(e) => return Err(warm_volume_error("head_blob", &path, e)),
     };
     let mut resp = Response::new(Body::empty());
     if let Ok(v) = axum::http::HeaderValue::from_str(&len.to_string()) {
@@ -642,18 +738,40 @@ async fn put_blob(
         )));
     }
 
-    // Already present in warm ⇒ already present in cold, because every write
-    // here goes cold FIRST (ADR-0061 part 4). Skipping the re-upload is the
-    // dedup `Cas::put_blob` would otherwise do with a `head` round trip.
-    if tokio::fs::metadata(warm_blob_path(&state, &hash)).await.is_ok() {
-        return Ok(StatusCode::OK.into_response());
-    }
-
+    // `200 already had it` vs `201 stored` is decided by whether WARM has it —
+    // that is the only cheap existence question available (see `have`) — but the
+    // write happens EITHER WAY.
+    //
+    // This used to `return` early on a warm hit, on the reasoning that "every
+    // write here goes cold FIRST, so warm ⊇ cold". That reasoning was false and
+    // the shortcut it licensed was a latent ADR-0061 part-4 violation. Warm-has +
+    // cold-lacks is reachable by at least three routes:
+    //
+    //   * ADR-0050's GC deletes from the **cold** store through the control
+    //     plane's own `S3Storage`, never through `TieredObjectStore`, so a
+    //     collected blob is gone from cold and still sitting in warm;
+    //   * `TieredObjectStore::put` deliberately **succeeds on a warm failure** —
+    //     which is the correct part-4 behaviour — so content written through this
+    //     service can legitimately be cold-only, and the converse (a cold bucket
+    //     recreated in dev while the warm PV survives) is routine;
+    //   * the warm tier has no eviction at all today, so it only ever accumulates.
+    //
+    // In any of those, the early return answered `200 "already had it"` without
+    // writing cold, and an Attempt could then reach `Succeeded` on a snapshot that
+    // existed only in a tier ADR-0061's own retention table says promises nothing.
+    // The cost of not shortcutting is one idempotent overwrite of identical bytes
+    // — content addressing makes it a no-op semantically — and the client only
+    // PUTs what `have` told it was missing anyway, so this path is rare.
+    let already = warm_has(&warm_blob_path(&state, &hash)).await?;
     state
         .objects
         .put(&format!("blobs/{hash}"), body.to_vec())
         .await?;
-    Ok(StatusCode::CREATED.into_response())
+    Ok(if already {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::CREATED.into_response()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -712,17 +830,21 @@ async fn put_tree(
         )));
     }
 
-    if tokio::fs::metadata(state.warm_dir.join("trees").join(&hash))
-        .await
-        .is_ok()
-    {
-        return Ok(StatusCode::OK.into_response());
-    }
+    // Always write cold, whatever warm holds. See `put_blob` for why the early
+    // return that used to live here was a part-4 violation waiting for a caller —
+    // and it matters MORE for a tree than for a blob, because a tree is the
+    // address an Attempt records as its evidence: a root that exists only in warm
+    // is a snapshot the durable record points at and cannot produce.
+    let already = warm_has(&warm_tree_path(&state, &hash)).await?;
     state
         .objects
         .put(&format!("trees/{hash}"), body.to_vec())
         .await?;
-    Ok(StatusCode::CREATED.into_response())
+    Ok(if already {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::CREATED.into_response()
+    })
 }
 
 /// `GET /v1/cas/trees/{hash}/flat` — the whole subtree in **one** call.
@@ -806,9 +928,13 @@ async fn flatten(state: &WorkspaceState, root: &TreeHash) -> Result<FlatManifest
 /// A blob's size: `stat` the warm file, and only if it is not there pay for a
 /// cold read (which backfills warm, so the next walk is cheap).
 async fn blob_size(state: &WorkspaceState, blob: &BlobHash) -> Result<u64, WsError> {
-    match tokio::fs::metadata(warm_blob_path(state, &blob.0)).await {
+    let path = warm_blob_path(state, &blob.0);
+    match tokio::fs::metadata(&path).await {
         Ok(meta) => Ok(meta.len()),
-        Err(_) => Ok(state.cas.get_blob(blob).await?.len() as u64),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(state.cas.get_blob(blob).await?.len() as u64)
+        }
+        Err(e) => Err(warm_volume_error("flat blob_size", &path, e)),
     }
 }
 
@@ -842,13 +968,27 @@ pub struct HaveResponse {
 /// `object_store`, so a full-key prefix does not match the key itself). So the
 /// only cheap answer available is the warm one.
 ///
-/// The consequence is bounded and never wrong: a blob that lives only in cold is
-/// reported missing, the client re-uploads it, and the write is a no-op in cold
-/// plus a warm fill — which is what we wanted anyway. Because every write
-/// through this service goes cold-first, warm ⊇ everything this service ever
-/// stored; the only content that can be cold-only is content written by the
-/// pre-ADR-0061 control-plane path. Adding `exists` to the port is a filed
-/// follow-up.
+/// The consequence is bounded and never wrong **in the direction that matters**:
+/// a blob that lives only in cold is reported missing, the client re-uploads it,
+/// and the write is an idempotent overwrite in cold plus a warm fill — which is
+/// what we wanted anyway.
+///
+/// This docstring used to justify the narrowing with *"because every write through
+/// this service goes cold-first, warm ⊇ everything this service ever stored"*.
+/// **That is false**, and it was load-bearing for a shortcut in `put_blob` /
+/// `put_tree` that skipped the cold write. `TieredObjectStore::put` deliberately
+/// **succeeds when the warm leg fails** (correctly — ADR-0061 part 4 makes cold
+/// the only load-bearing tier), so content written through this service can be
+/// cold-only *by design*; ADR-0050's GC deletes from cold without touching warm,
+/// so it can be warm-only too; and the warm tier has no eviction, so it only
+/// grows. Neither containment holds in either direction. The honest statement is
+/// the narrow one: **this endpoint answers about the warm tier and nothing else**,
+/// and every caller must treat a "missing" as "upload it" rather than as "cold
+/// does not have it".
+///
+/// Adding `exists` to the `ObjectStore` port — which would let this answer about
+/// the durable set, and would let a `PUT` skip a redundant cold upload — is a
+/// filed follow-up.
 async fn have(
     State(state): State<WorkspaceState>,
     headers: HeaderMap,
@@ -862,20 +1002,21 @@ async fn have(
         )));
     }
 
+    // `warm_has`, not `metadata(..).is_err()`: a broken volume must not report
+    // every object as missing. That direction is not merely wasteful — the client
+    // would re-upload the entire workspace over a volume that cannot store it,
+    // and each PUT would then fail anyway, one round trip at a time.
     let mut missing_blobs = Vec::new();
     for hash in &req.blobs {
         valid_hash(hash)?;
-        if tokio::fs::metadata(warm_blob_path(&state, hash)).await.is_err() {
+        if !warm_has(&warm_blob_path(&state, hash)).await? {
             missing_blobs.push(hash.clone());
         }
     }
     let mut missing_trees = Vec::new();
     for hash in &req.trees {
         valid_hash(hash)?;
-        if tokio::fs::metadata(state.warm_dir.join("trees").join(hash))
-            .await
-            .is_err()
-        {
+        if !warm_has(&warm_tree_path(&state, hash)).await? {
             missing_trees.push(hash.clone());
         }
     }
@@ -949,12 +1090,16 @@ scarab_workspace_warm_full_total {}
 # HELP scarab_workspace_warm_backfill_failed_total Cold reads that could not be re-seeded into warm.
 # TYPE scarab_workspace_warm_backfill_failed_total counter
 scarab_workspace_warm_backfill_failed_total {}
+# HELP scarab_workspace_warm_volume_read_failed_total Warm-volume reads that failed with something other than \"not there\" — a bad PersistentVolume, not a cache miss.
+# TYPE scarab_workspace_warm_volume_read_failed_total counter
+scarab_workspace_warm_volume_read_failed_total {}
 ",
         state.warm_used_bytes.load(Ordering::Relaxed),
         tiered::cold_fallback_total(),
         tiered::warm_write_failed_total(),
         tiered::warm_full_total(),
         tiered::warm_backfill_failed_total(),
+        WARM_READ_FAILED.load(Ordering::Relaxed),
     );
     let mut resp = body.into_response();
     resp.headers_mut().insert(
@@ -1014,6 +1159,92 @@ mod tests {
         assert_eq!(
             hash_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// "Not there" and "the volume could not answer" must not be one answer.
+    ///
+    /// Provoked with `ENOTDIR` rather than `EACCES` because it is portable and
+    /// does not depend on the test process's uid — a chmod-based test passes on a
+    /// laptop and silently stops testing anything under a root CI container.
+    #[tokio::test]
+    async fn a_broken_warm_volume_is_not_reported_as_a_miss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("blobs").join("a".repeat(64));
+        assert!(!warm_has(&missing).await.expect("a miss is not an error"));
+
+        // `blobs` is a FILE, so stat-ing a child of it cannot succeed and cannot
+        // be `NotFound` either.
+        std::fs::write(dir.path().join("blobs"), b"not a directory").unwrap();
+        let err = warm_has(&missing).await;
+        assert!(
+            matches!(err, Err(WsError::Backend(_))),
+            "a volume that cannot answer must be a 500, never a miss"
+        );
+    }
+
+    /// The F6 fix, at the grain it matters: a `PUT` whose content the **warm**
+    /// tier already holds must still reach **cold**.
+    ///
+    /// Cold is the only tier ADR-0061 promises anything about, and warm-has +
+    /// cold-lacks is reachable (GC deletes from cold only; a warm write failure is
+    /// deliberately non-fatal; warm never evicts). The handler used to answer
+    /// `200 "already had it"` and write nothing, which would let an Attempt reach
+    /// `Succeeded` on a snapshot that exists only in a tier that promises nothing.
+    #[tokio::test]
+    async fn a_put_of_content_warm_already_holds_still_writes_cold() {
+        use axum::body::Body;
+        use scarab_storage::ObjectStore;
+        use tower::ServiceExt;
+
+        let warm_dir = tempfile::tempdir().expect("warm");
+        let cold_dir = tempfile::tempdir().expect("cold");
+        let secret = b"workspace-secret".to_vec();
+
+        // Content that warm holds and cold does not — the exact asymmetry the
+        // deleted shortcut assumed away. Written straight onto the volume, which
+        // is how a GC pass or a failed cold leg leaves it.
+        let body = b"content only the cache has".to_vec();
+        let hash = hash_hex(&body);
+        std::fs::create_dir_all(warm_dir.path().join("blobs")).unwrap();
+        std::fs::write(warm_dir.path().join("blobs").join(&hash), &body).unwrap();
+
+        let cold = Arc::new(S3Storage::local(cold_dir.path()).expect("cold store"));
+        assert!(matches!(
+            cold.get(&format!("blobs/{hash}")).await,
+            Err(StorageError::NotFound)
+        ));
+
+        let app = router(warm_dir.path(), cold.clone(), secret.clone()).expect("router");
+        let token = scarab_executor_k8s::workspace_token::mint(
+            &secret,
+            &scarab_executor_k8s::workspace_token::step_claims(
+                scarab_executor_k8s::workspace_token::Fence {
+                    run: "r".into(),
+                    step: "s".into(),
+                    attempt: "a".into(),
+                },
+                i64::MAX / 2,
+                vec![],
+            ),
+        );
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/v1/cas/blobs/{hash}"))
+                    .header(WORKSPACE_TOKEN_HEADER, token)
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        // Warm had it, so the informational status is still `200 already had it`…
+        assert_eq!(resp.status(), StatusCode::OK);
+        // …and the durable tier now holds it, which is the whole point.
+        assert_eq!(
+            cold.get(&format!("blobs/{hash}")).await.expect("cold write"),
+            body
         );
     }
 }
