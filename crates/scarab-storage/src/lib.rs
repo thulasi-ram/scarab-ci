@@ -30,11 +30,82 @@ pub struct StoredObject {
     pub modified_ms: i64,
 }
 
-/// One entry in a tree: a name bound to either a blob or a sub-tree.
+/// The mode file-type bits that mark an entry as a symlink — `S_IFLNK`, which
+/// is git's `120000`. A symlink is a [`TreeTarget::Blob`] whose *content is the
+/// link target path*; the mode is what tells the two apart. Representing it this
+/// way (rather than as a third [`TreeTarget`] variant) is deliberate: content
+/// addressing already stores the target path perfectly well, and every consumer
+/// that walks blobs — GC's mark phase, the browse API — keeps working unchanged.
+pub const MODE_SYMLINK: u32 = 0o120_000;
+
+/// The `S_IFMT` mask selecting the file-type bits out of a mode.
+const MODE_TYPE_MASK: u32 = 0o170_000;
+
+/// One entry in a tree: a name bound to either a blob or a sub-tree, plus the
+/// filesystem metadata that makes a checkout faithful rather than merely
+/// byte-correct.
+///
+/// **Why metadata belongs here and not on the blob** (ADR-0029, ADR-0061):
+/// a blob is addressed by its bytes and nothing else, so identical content
+/// always dedups and always transfers once, however many trees name it with
+/// however many modes and timestamps. The per-*path* facts — this file is
+/// executable, this file was last written at T — are properties of the entry,
+/// exactly as git puts the mode in the tree entry and the content in the blob.
+/// A tree's own hash therefore does move when an mtime moves, which is correct:
+/// two checkouts with different timestamps genuinely are different workspaces to
+/// every build tool that decides what to rebuild by comparing them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeEntry {
     pub name: String,
     pub target: TreeTarget,
+    /// Unix mode: permission bits, plus [`MODE_SYMLINK`] in the file-type bits
+    /// when the entry is a symlink. `None` for trees written before metadata was
+    /// recorded — such an entry materializes with whatever the umask gives,
+    /// which is the pre-metadata behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    /// Last-modified time, unix-ms. `None` for symlinks (there is no portable
+    /// `lutimes` in `std`, so materialization cannot restore it and recording it
+    /// would be a lie) and for pre-metadata trees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_ms: Option<i64>,
+}
+
+impl TreeEntry {
+    /// An entry with no recorded metadata — the shape every tree had before
+    /// mode/mtime existed, and the right constructor for a synthetic tree.
+    pub fn new(name: impl Into<String>, target: TreeTarget) -> Self {
+        Self {
+            name: name.into(),
+            target,
+            mode: None,
+            mtime_ms: None,
+        }
+    }
+
+    /// A symlink entry: `target` is the blob holding the *link target path*.
+    pub fn symlink(name: impl Into<String>, target: BlobHash) -> Self {
+        Self {
+            name: name.into(),
+            target: TreeTarget::Blob(target),
+            mode: Some(MODE_SYMLINK),
+            mtime_ms: None,
+        }
+    }
+
+    /// Whether this entry is a symlink (see [`MODE_SYMLINK`]).
+    pub fn is_symlink(&self) -> bool {
+        matches!(self.mode, Some(m) if m & MODE_TYPE_MASK == MODE_SYMLINK)
+    }
+
+    /// The permission bits to restore, or `None` if none were recorded.
+    /// A symlink has no meaningful permissions of its own.
+    pub fn permissions(&self) -> Option<u32> {
+        if self.is_symlink() {
+            return None;
+        }
+        self.mode.map(|m| m & 0o7777)
+    }
 }
 
 /// What a [`TreeEntry`] points at.
@@ -89,7 +160,11 @@ pub trait Cas: Send + Sync {
     /// Read a tree object's entries by hash — the GC mark walk (ADR-0050).
     async fn tree_entries(&self, hash: &TreeHash) -> Result<Vec<TreeEntry>, StorageError>;
 
-    /// Materialize a tree onto the filesystem at `path`.
+    /// Materialize a tree onto the filesystem at `path`, restoring each entry's
+    /// recorded mode and mtime and recreating symlinks as symlinks. Repeated
+    /// calls into one `path` overlay (merge-in-order, ADR-0007), so a later
+    /// input must be able to replace a read-only file or directory an earlier
+    /// one left behind.
     async fn materialize(&self, tree: &TreeHash, path: &str) -> Result<(), StorageError>;
 
     /// Snapshot the filesystem directory at `path` into the store, returning its
@@ -97,6 +172,13 @@ pub trait Cas: Send + Sync {
     /// let a step's output workspace flow to a dependent's input (ADR-0029).
     /// Files are stored as blobs and directories as trees; only content not
     /// already present is uploaded (dedup).
+    ///
+    /// A round-trip is **metadata-faithful**, not merely byte-faithful: modes
+    /// (including the exec bit), mtimes, empty directories and symlinks all
+    /// survive — the properties the `kubectl exec` `tar` legs ADR-0061 replaces
+    /// happened to preserve. Symlinks are recorded, never followed, so a link
+    /// cycle cannot hang the walk. The root directory's own mode and mtime are
+    /// not recorded (nothing names it); its contents' are.
     async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError>;
 }
 
@@ -178,18 +260,27 @@ pub async fn prune_tree(
                 let pruned = Box::pin(prune_tree(cas, sub, &deeper)).await.map_err(|e| {
                     // Re-root the diagnostic on the authored path.
                     match e {
-                        PruneError::MissingPath(p) => PruneError::MissingPath(format!("{name}/{p}")),
+                        PruneError::MissingPath(p) => {
+                            PruneError::MissingPath(format!("{name}/{p}"))
+                        }
                         other => other,
                     }
                 })?;
                 kept.push(TreeEntry {
                     name,
                     target: TreeTarget::Tree(pruned),
+                    // The directory itself is the same directory — a narrower
+                    // publish must not silently reset its mode or mtime.
+                    mode: entry.mode,
+                    mtime_ms: entry.mtime_ms,
                 });
             }
             // A path reaches *through* something that is a file.
             (TreeTarget::Blob(_), Some(deeper)) => {
-                return Err(PruneError::MissingPath(format!("{name}/{}", deeper.join(","))));
+                return Err(PruneError::MissingPath(format!(
+                    "{name}/{}",
+                    deeper.join(",")
+                )));
             }
         }
     }

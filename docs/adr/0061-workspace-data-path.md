@@ -193,9 +193,18 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   time vs object-storage time vs bytes per edge — is still worth doing before build, but to
   size the payoff, sequence the slices, and settle the parked question of whether a
   second-level node cache earns its place. It cannot rescue the current path.
-- **mtime fidelity across the CAS.** The `tar` legs preserve mtimes and permissions; whether
-  the CAS does is unverified. If it does not, incremental compilation across Steps is already
-  degraded today, independently of this ADR.
+- ~~**mtime fidelity across the CAS.**~~ **Answered (s7) — it did not, and now it does.**
+  Measured, not reasoned about: the CAS tree entry carried only `name` and `target`, so a
+  round-trip silently dropped every mode (an executable came back `0644`) and every mtime
+  (reset to the moment of checkout), and `ingest` *failed outright* on a symlink to a
+  directory. So cross-Step incremental compilation was already degraded today, exactly as
+  suspected, independently of this ADR. Fixed rather than characterised: a tree entry now
+  carries `mode` + `mtime_ms`, and a symlink is a blob holding the link target marked
+  `MODE_SYMLINK` — git's layout. Blobs stay addressed by their bytes alone, so metadata costs
+  no dedup; a *tree* hash does move with an mtime, which is correct, since two checkouts with
+  different timestamps are different workspaces to every tool that compares them.
+  `crates/scarab-storage-s3/tests/fidelity.rs` is the standing proof, and **s3 must keep it
+  passing** — whatever replaces the `tar` legs inherits this contract.
 - **Overlay diff for the drain** — hashing only the writable upper layer (so a Step never
   re-walks an unchanged tree) is the natural partner to lazy reads and needs the same
   privileged mount. Specified as a follow-up slice, not part of the first cut.

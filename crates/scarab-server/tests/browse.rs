@@ -155,22 +155,13 @@ async fn seed_workspace(
     let ci = cas.put_blob(b"on: push\n").await.unwrap();
     let cargo = cas.put_blob(b"[package]\nname = \"x\"\n").await.unwrap();
     let crates = cas
-        .put_tree(vec![TreeEntry {
-            name: "Cargo.toml".into(),
-            target: TreeTarget::Blob(cargo),
-        }])
+        .put_tree(vec![TreeEntry::new("Cargo.toml", TreeTarget::Blob(cargo))])
         .await
         .unwrap();
     let root = cas
         .put_tree(vec![
-            TreeEntry {
-                name: "ci.yaml".into(),
-                target: TreeTarget::Blob(ci),
-            },
-            TreeEntry {
-                name: "crates".into(),
-                target: TreeTarget::Tree(crates),
-            },
+            TreeEntry::new("ci.yaml", TreeTarget::Blob(ci)),
+            TreeEntry::new("crates", TreeTarget::Tree(crates)),
         ])
         .await
         .unwrap();
