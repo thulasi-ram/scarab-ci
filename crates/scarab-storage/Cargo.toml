@@ -9,7 +9,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
-# NOT an infra dep: SHA-256 is a pure function — no I/O, no clock, no sockets.
+# Admitted per ADR-0031 (I/O-free library), NOT infra: SHA-256 is a pure
+# function — no I/O, no clock, no sockets.
 # It is here because the **content address is a domain fact**, not an adapter
 # detail: ADR-0029 defines a snapshot AS the SHA-256 merkle root of its
 # canonical tree bytes. Both adapters (`scarab-storage-s3` and
@@ -17,7 +18,8 @@ async-trait = { workspace = true }
 # and the digest, with a runtime tripwire in `tiered` to detect the two drifting
 # apart. One definition here removes the drift class instead of watching for it.
 sha2 = { workspace = true }
-# NOT an infra dep despite the name: `tracing` is a facade with no I/O, no
+# Admitted per ADR-0031's facade amendment, NOT infra despite the name:
+# `tracing` is a facade with no I/O, no
 # clock and no sockets — without a subscriber every macro compiles to nothing,
 # and the subscriber is installed by the composition root. It is here because
 # `tiered::TieredCas` (ADR-0061) has one behaviour that ONLY exists as a log

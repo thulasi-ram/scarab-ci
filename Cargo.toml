@@ -4,10 +4,11 @@
 #   * Pure domain crates depend ONLY on serde / serde_json / thiserror /
 #     async-trait and on each other. They list NO infra crate (sqlx, kube,
 #     reqwest, object_store, axum, tokio-runtime, aws) in their Cargo.toml.
-#     A further I/O-free library (`tracing`, `sha2`) may be admitted when the
-#     capability is part of the domain rather than of a backend — each one
-#     carries a written justification in the crate's own manifest, next to the
-#     dependency, so the exception is argued rather than assumed.
+#     A further I/O-free library (`cel-interpreter`, `sha2`, `tracing`) may be
+#     admitted per ADR-0031 when the capability is part of the domain rather
+#     than of a backend — see the `allowed inside pure domain crates` block
+#     below, and the justification each admitting crate carries next to its own
+#     dependency line, so the exception is argued rather than assumed.
 #   * Adapter crates pair a domain crate with exactly one infra crate and
 #     hold the stub `impl`s of that domain's ports.
 #   * The purity boundary is enforced by crate dependency edges: an infra
@@ -30,6 +31,22 @@ serde_yaml = "0.9"
 cel-interpreter = { version = "0.10", features = ["json"] }
 thiserror = "2"
 async-trait = "0.1"
+# The I/O-free-library carve-out (ADR-0031, amending ADR-0016). These two sit
+# HERE, not under
+# `infra` below, because a pure crate may name them — the header above and this
+# table have to agree or the boundary is decided by whichever one a reader
+# happens to check. Each admitting crate still argues the exception next to its
+# own dependency line (see `crates/scarab-storage/Cargo.toml`).
+#
+# `sha2`: SHA-256 is a pure function, and ADR-0029 makes the content address a
+# DOMAIN fact — a snapshot *is* the merkle root of its canonical tree bytes.
+sha2 = "0.10"
+# `tracing`: a facade, not a backend. No I/O, no clock, no sockets; without a
+# subscriber every macro compiles to nothing, and the subscriber is installed by
+# the composition root. Admitted so a pure crate whose behaviour only exists as
+# a log line (e.g. `TieredCas`'s loud-but-non-fatal warm-write failure) can be
+# loud instead of silently swallowing.
+tracing = "0.1"
 
 # --- internal crates (path deps) -------------------------------------------
 scarab-engine = { path = "crates/scarab-engine" }
@@ -63,7 +80,9 @@ regex-lite = "0.1"
 flate2 = "1"
 tower = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
-tracing = "0.1"
+# NB `tracing` itself is NOT here — it is a pure-crate-admissible facade, listed
+# in the allowed block above. `tracing-subscriber` IS infra: it is the backend
+# that actually writes, installed only by the composition root.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring", "migrate", "macros", "json"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
@@ -71,7 +90,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "j
 # note in scarab-server/src/main.rs. `ring` matches sqlx's `tls-rustls-ring`.
 rustls = { version = "0.23", features = ["ring"] }
 object_store = { version = "0.14", features = ["aws"] }
-sha2 = "0.10"
+# NB `sha2` is NOT here — see the allowed block above. `hmac` stays: it needs a
+# key, which is a deployment secret, so it belongs to a boundary not a domain.
 hmac = "0.12"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 rand = "0.8"
