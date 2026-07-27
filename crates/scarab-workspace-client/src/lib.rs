@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::StreamExt;
-use scarab_storage::content::{ContentSource, FlatDir, FlatEntry, FlatManifest};
+use scarab_storage::content::{ContentSource, FlatEntry, FlatManifest};
 use scarab_storage::{
     BlobHash, Cas, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget,
 };
@@ -367,18 +367,33 @@ impl Cas for WorkspaceClient {
         // Directories first, parents before children (the manifest guarantees
         // that order). Their mode and mtime are applied at the END, because
         // creating a child bumps a parent's mtime and a restrictive mode applied
-        // now would lock this very walk out of its own subtree.
+        // now would lock this very walk out of its own subtree — so what to
+        // restore is decided here and carried to the deferred pass below.
+        let mut deferred: Vec<(std::path::PathBuf, Option<u32>, Option<i64>)> =
+            Vec::with_capacity(manifest.dirs.len());
         for dir in &manifest.dirs {
             let target = safe_join(&root, &dir.path)?;
+            // Read BEFORE the create, so a directory an earlier input left
+            // read-only is seen as it was rather than as `create_dir_all` finds
+            // it. Same order as `S3Storage::materialize`.
+            let pre = std::fs::metadata(&target)
+                .ok()
+                .map(|m| m.permissions().mode() & 0o7777);
             std::fs::create_dir_all(&target).map_err(io_err)?;
+            let mut restore = dir.mode.map(|m| m & 0o7777);
             // Widen for the walk if an earlier input left it read-only.
-            if let Ok(meta) = std::fs::metadata(&target) {
-                let mode = meta.permissions().mode() & 0o7777;
-                if mode & 0o700 != 0o700 {
-                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode | 0o700))
+            if let Some(cur) = pre {
+                if cur & 0o700 != 0o700 {
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(cur | 0o700))
                         .map_err(io_err)?;
+                    // With no recorded mode, put back exactly what was there.
+                    // Without this the widening is permanent and a pre-metadata
+                    // tree (`FlatDir::mode == None`, a live wire shape) silently
+                    // leaves every restrictive directory at `0o700`.
+                    restore = restore.or(Some(cur));
                 }
             }
+            deferred.push((target, restore, dir.mtime_ms));
         }
 
         // Files, in parallel. This is the leg s0 measured as dominant.
@@ -405,12 +420,12 @@ impl Cas for WorkspaceClient {
             result?;
         }
 
-        // Now the directory metadata, deepest first, for the reason above.
-        let mut dirs: Vec<&FlatDir> = manifest.dirs.iter().collect();
-        dirs.sort_by(|a, b| b.path.cmp(&a.path));
-        for dir in dirs {
-            let target = safe_join(&root, &dir.path)?;
-            apply_metadata(&target, dir.mode.map(|m| m & 0o7777), dir.mtime_ms, true)?;
+        // Now the directory metadata, deepest first, for the reason above. A
+        // descendant always sorts after its ancestor, so descending order is
+        // deepest-first regardless of what order the service listed them in.
+        deferred.sort_by(|a, b| b.0.cmp(&a.0));
+        for (target, mode, mtime_ms) in deferred {
+            apply_metadata(&target, mode, mtime_ms)?;
         }
         Ok(())
     }
@@ -610,34 +625,74 @@ fn write_entry(
         // own mode is meaningless.
         return Ok(());
     }
-    std::fs::write(&target, data).map_err(io_err)?;
-    apply_metadata(&target, entry.mode.map(|m| m & 0o7777), entry.mtime_ms, false)
+    write_file(
+        &target,
+        data,
+        entry.mode.map(|m| m & 0o7777),
+        entry.mtime_ms,
+    )
 }
 
-/// Restore `mtime_ms` then `mode`. Order matters: chmod-ing to `0o400` first
-/// would make it impossible to reopen for the time set.
+fn system_time(ms: i64) -> std::time::SystemTime {
+    let epoch = std::time::SystemTime::UNIX_EPOCH;
+    if ms >= 0 {
+        epoch + std::time::Duration::from_millis(ms as u64)
+    } else {
+        epoch - std::time::Duration::from_millis(ms.unsigned_abs())
+    }
+}
+
+/// Write one file of a checkout with its metadata, through a single open handle.
+///
+/// This is `S3Storage::write_file`, for the same reason: `fs::write` +
+/// reopen-for-`futimens` + path-`chmod` is five syscalls per file, and doing all
+/// three on the handle we already have is three. ADR-0061 s2 recorded that win
+/// against the adapter, and the client is the code path that *replaces* the
+/// adapter on the feed leg — so the win only carries over if it lives here too.
+///
+/// The **ordering** s7 established is unchanged and still load-bearing: write,
+/// then mtime, then mode. A `0o444` file chmod-ed before the time set could not
+/// be reopened, and any write after `set_times` would bump the mtime back to now.
+fn write_file(
+    path: &std::path::Path,
+    data: &[u8],
+    mode: Option<u32>,
+    mtime_ms: Option<i64>,
+) -> Result<(), StorageError> {
+    use std::io::Write;
+    let mut file = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(io_err)?;
+    file.write_all(data).map_err(io_err)?;
+    if let Some(ms) = mtime_ms {
+        file.set_times(std::fs::FileTimes::new().set_modified(system_time(ms)))
+            .map_err(io_err)?;
+    }
+    if let Some(bits) = mode {
+        // `fchmod` on the open handle, not a second path lookup.
+        file.set_permissions(std::fs::Permissions::from_mode(bits))
+            .map_err(io_err)?;
+    }
+    Ok(())
+}
+
+/// Restore `mtime_ms` then `mode` on an existing **directory**. Order matters:
+/// chmod-ing to `0o500` first would make it impossible to reopen for the time
+/// set. Files do not come through here — [`write_file`] does the same two
+/// operations on the handle it already holds.
 fn apply_metadata(
     path: &std::path::Path,
     mode: Option<u32>,
     mtime_ms: Option<i64>,
-    is_dir: bool,
 ) -> Result<(), StorageError> {
     if let Some(ms) = mtime_ms {
-        let epoch = std::time::SystemTime::UNIX_EPOCH;
-        let when = if ms >= 0 {
-            epoch + std::time::Duration::from_millis(ms as u64)
-        } else {
-            epoch - std::time::Duration::from_millis(ms.unsigned_abs())
-        };
-        let file = if is_dir {
-            std::fs::File::open(path).map_err(io_err)?
-        } else {
-            std::fs::File::options()
-                .write(true)
-                .open(path)
-                .map_err(io_err)?
-        };
-        file.set_times(std::fs::FileTimes::new().set_modified(when))
+        // A directory cannot be opened for writing; owning the fd is enough for
+        // `futimens` either way.
+        let dir = std::fs::File::open(path).map_err(io_err)?;
+        dir.set_times(std::fs::FileTimes::new().set_modified(system_time(ms)))
             .map_err(io_err)?;
     }
     if let Some(bits) = mode {

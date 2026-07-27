@@ -225,6 +225,21 @@ async fn a_snapshot_round_trips_through_the_service_with_metadata_intact() {
         std::fs::read_link(out.path().join("link-to-dir")).unwrap(),
         std::path::PathBuf::from("src")
     );
+
+    // The assertion that does not have to be extended when the fixture grows:
+    // re-ingest the checkout and demand the SAME root. Every byte, mode and
+    // mtime — including the *directory* modes and mtimes the assertions above do
+    // not name — is part of the tree hash, so any metadata the restore drops,
+    // reorders, or leaves widened moves this hash. (Copied from
+    // `scarab-storage-s3/tests/hashing.rs`, which guards the adapter the same way.)
+    let again = writer
+        .ingest(out.path().to_str().unwrap())
+        .await
+        .expect("re-ingest the checkout");
+    assert_eq!(
+        again.root, snapshot.root,
+        "materialize → ingest must be a fixed point, or some metadata was lost"
+    );
 }
 
 /// A tree hash written through the service must be the SAME hash the plain
@@ -722,6 +737,11 @@ async fn a_later_snapshot_can_overlay_a_read_only_file_and_a_symlink() {
     )
     .unwrap();
     std::fs::create_dir(first_src.path().join("d")).unwrap();
+    // A file INSIDE the restrictive directory, so `materialize` has to write
+    // into a `0o500` directory within a single call. Without this the deferral
+    // of directory metadata is never exercised: an empty `0o500` directory
+    // materializes fine even if the mode is applied before the files are written.
+    std::fs::write(first_src.path().join("d/kept"), b"from first").unwrap();
     std::fs::set_permissions(
         first_src.path().join("d"),
         std::fs::Permissions::from_mode(0o500),
@@ -759,6 +779,15 @@ async fn a_later_snapshot_can_overlay_a_read_only_file_and_a_symlink() {
         b"from second"
     );
     assert_eq!(std::fs::read(out.path().join("d/inner")).unwrap(), b"inner");
+    // The first input's file inside the read-only directory landed — proof the
+    // `0o500` was NOT applied before its own contents were written.
+    assert_eq!(
+        std::fs::read(out.path().join("d/kept")).unwrap(),
+        b"from first"
+    );
+    // ...and the directory ends at the mode the last input recorded, not at the
+    // `0o700` the walk widened it to.
+    assert_eq!(mode_of(&out.path().join("d")), 0o755);
     // The symlink became a regular file, not a write through the link.
     let meta = std::fs::symlink_metadata(out.path().join("as-link")).unwrap();
     assert!(meta.file_type().is_file());
@@ -766,4 +795,63 @@ async fn a_later_snapshot_can_overlay_a_read_only_file_and_a_symlink() {
         std::fs::read(out.path().join("as-link")).unwrap(),
         b"now a real file"
     );
+
+    // `TempDir::drop` cannot unlink `d/kept` through a `0o500` directory, so it
+    // would silently leak the fixture. Widen it back first.
+    let _ = std::fs::set_permissions(
+        first_src.path().join("d"),
+        std::fs::Permissions::from_mode(0o755),
+    );
+}
+
+/// A directory entry with **no recorded mode** — `FlatDir::mode == None`, the
+/// pre-metadata tree shape `TreeEntry::new` still produces — must come out of an
+/// overlay at the mode it had, not at the `0o700` the walk widens it to.
+///
+/// This is the one path where the two `materialize` implementations disagreed:
+/// the adapter captures the pre-existing mode and restores it when the tree
+/// records none; the client used to widen and then apply `dir.mode`, which for
+/// `None` is "apply nothing" — leaving the directory permanently `0o700`.
+#[tokio::test]
+async fn a_directory_with_no_recorded_mode_is_restored_not_left_widened() {
+    use scarab_storage::{TreeEntry, TreeTarget};
+    use std::os::unix::fs::PermissionsExt;
+
+    let h = Harness::start().await;
+    let writer = h.browse_client();
+
+    // A synthetic tree, built through `put_tree`/`put_blob` rather than `ingest`:
+    // `ingest` always records a mode, so `None` is only reachable this way (and
+    // from any tree written before metadata existed).
+    let blob = writer.put_blob(b"inner").await.unwrap();
+    let sub = writer
+        .put_tree(vec![TreeEntry::new("f", TreeTarget::Blob(blob))])
+        .await
+        .unwrap();
+    let root = writer
+        .put_tree(vec![TreeEntry::new("d", TreeTarget::Tree(sub))])
+        .await
+        .unwrap();
+
+    // The destination already holds a read-only `d` — the state an earlier input
+    // in the same merge (ADR-0007) would have left behind.
+    let out = tempfile::tempdir().unwrap();
+    std::fs::create_dir(out.path().join("d")).unwrap();
+    std::fs::set_permissions(out.path().join("d"), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let reader = h.client_for(&[&root.0]);
+    reader
+        .materialize(&root, out.path().to_str().unwrap())
+        .await
+        .expect("materialize over a read-only directory");
+
+    assert_eq!(std::fs::read(out.path().join("d/f")).unwrap(), b"inner");
+    assert_eq!(
+        mode_of(&out.path().join("d")),
+        0o500,
+        "a tree that records no mode must leave the directory as it found it, \
+         not permanently widened to 0o700"
+    );
+
+    let _ = std::fs::set_permissions(out.path().join("d"), std::fs::Permissions::from_mode(0o755));
 }
