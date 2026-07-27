@@ -105,11 +105,12 @@ export function eventCategory(e: RunEvent): EventCat {
       return "run";
     case "AttemptReadopted":
       return "recover";
-    // A retention decision, not an execution event: `info` keeps it in the rail
-    // without dressing it up as something that ran.
-    case "RunSnapshotsPinned":
-    case "RunSnapshotsUnpinned":
-      return "info";
+    // Everything else — including the ADR-0061 s5 snapshot pin/unpin — is `info`.
+    // Those two used to have their own arms returning `info`, which was dead code
+    // AND untestable: no input could tell the arm from this fall-through, so the
+    // test that "covered" them was pinning this line. The decision they encoded
+    // still holds and is what `default` means here: a category is a claim that
+    // something *ran*, and only the cases above get to make it.
     default:
       return "info";
   }

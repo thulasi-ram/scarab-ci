@@ -129,14 +129,27 @@ impl From<std::io::Error> for FetchError {
     }
 }
 
-fn run() -> Result<(), FetchError> {
-    let target = env_or(TARGET_ENV, DEFAULT_TARGET);
-    let roots: Vec<String> = env_or(ROOTS_ENV, "")
-        .split(',')
+/// Parse `SCARAB_SNAPSHOT_ROOTS` into the merge order to materialise in.
+///
+/// A named function rather than an inline chain in [`run`] specifically so a test
+/// can call **this** — the alternative is a test that re-implements the parse and
+/// asserts on its own copy, which proves nothing about the binary.
+///
+/// Order is ADR-0007 semantics, not presentation: the last root to mention a path
+/// owns it. Sorting or deduping here would silently hand the overlay to the wrong
+/// input. Empties are dropped because the annotation this comes from really does
+/// produce trailing commas and spaces.
+fn parse_roots(raw: &str) -> Vec<String> {
+    raw.split(',')
         .map(str::trim)
         .filter(|r| !r.is_empty())
         .map(str::to_string)
-        .collect();
+        .collect()
+}
+
+fn run() -> Result<(), FetchError> {
+    let target = env_or(TARGET_ENV, DEFAULT_TARGET);
+    let roots: Vec<String> = parse_roots(&env_or(ROOTS_ENV, ""));
 
     // Guard #1 of ADR-0061 D2.3's three anti-calcification guards: this line is
     // printed into every Step Pod's own log, on every Pod, forever — until the
@@ -347,17 +360,27 @@ mod tests {
 
     /// The roots parse is merge-ORDER-preserving and tolerant of the shapes the
     /// annotation actually produces (trailing commas, spaces, an empty value).
+    ///
+    /// This calls [`parse_roots`], the function [`run`] calls. It used to declare
+    /// a closure that re-implemented the same chain and assert on *that*, so the
+    /// production parse was never executed and could have sorted, deduped or
+    /// reversed without turning this red.
     #[test]
     fn inputs_parse_preserves_order_and_drops_empties() {
-        let parse = |s: &str| -> Vec<String> {
-            s.split(',')
-                .map(str::trim)
-                .filter(|r| !r.is_empty())
-                .map(str::to_string)
-                .collect()
-        };
-        assert_eq!(parse("b,a"), vec!["b".to_string(), "a".to_string()]);
-        assert_eq!(parse(""), Vec::<String>::new());
-        assert_eq!(parse(" b , ,a,"), vec!["b".to_string(), "a".to_string()]);
+        // Descending, so a parse that sorted would be caught rather than
+        // accidentally agreeing with the input order.
+        assert_eq!(parse_roots("b,a"), vec!["b".to_string(), "a".to_string()]);
+        assert_eq!(parse_roots(""), Vec::<String>::new());
+        assert_eq!(
+            parse_roots(" b , ,a,"),
+            vec!["b".to_string(), "a".to_string()]
+        );
+        // Merge order is ADR-0007 semantics: the LAST root to mention a path owns
+        // it, so a repeated root is not a duplicate to collapse — deduping "a" out
+        // of `a,b,a` would hand the overlay to `b` instead.
+        assert_eq!(
+            parse_roots("a,b,a"),
+            vec!["a".to_string(), "b".to_string(), "a".to_string()]
+        );
     }
 }
