@@ -380,6 +380,20 @@ pr-gate n:
 check:
     cargo check --workspace
 
+# Re-assert the substrate facts ADR-0062 rests on (kube context must be `colima`).
+#
+# ADR-0062 picks its design because of a handful of kernel and PodSecurity
+# behaviours — Bidirectional needs privilege, `baseline` already forbids it,
+# `restricted` forbids inline `nfs:` but allows a PVC, overlayfs copy-up leaves
+# the lower layer intact, a hardlink shares its inode, metacopy does not help.
+# Every one of those is a property of a kernel version or an admission plugin, so
+# a colima/k3s bump can invalidate the ADR's reasoning WITHOUT ANY CODE CHANGING.
+#
+# This asserts them and fails loudly, naming the ADR section that would have to
+# be rewritten. It is not a demo: it prints no number it does not check.
+adr0062-substrate:
+    bash scripts/adr0062_substrate.sh
+
 # Reclaim build-cache disk. Cargo NEVER garbage-collects `target/`: every
 # fingerprint change (branch switch, dep bump, feature flag) writes a new
 # artifact and keeps the old one forever. This checkout reached 100 GB — 610k
