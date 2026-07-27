@@ -259,14 +259,48 @@ spec:
       else
         echo "NFS_EXPORT_MOUNT=no"
       fi
-      # (d) metacopy: is a metadata-only change really metadata-only?
+      # (d) metacopy. Use a BIG lower file: on a 17-byte file, ext4's 4 KiB
+      # minimum allocation is indistinguishable from a real data copy, and
+      # reading `size` (which metacopy preserves by design) as evidence of a copy
+      # is how this script's first version reached the wrong conclusion. Compare
+      # ALLOCATED BLOCKS against the file size instead.
       echo "METACOPY_PARAM=$(cat /sys/module/overlay/parameters/metacopy 2>/dev/null || echo absent)"
-      if mount -t overlay overlay -o lowerdir=/d/farm,upperdir=/d/upper2,workdir=/d/work2,index=on,metacopy=on /d/merged 2>/dev/null; then
-        chmod 755 /d/merged/src/main.rs
-        echo "METACOPY_UPPER_SIZE=$(stat -c %s /d/upper2/src/main.rs 2>/dev/null || echo missing)"
+      mkdir -p /d/bigfarm/src
+      dd if=/dev/zero of=/d/cas/bigblob bs=1M count=8 2>/dev/null
+      chmod 644 /d/cas/bigblob; ln /d/cas/bigblob /d/bigfarm/src/big.bin
+      if mount -t overlay overlay -o lowerdir=/d/bigfarm,upperdir=/d/upper2,workdir=/d/work2,index=on,metacopy=on /d/merged 2>/dev/null; then
+        chmod 755 /d/merged/src/big.bin
+        echo "METACOPY_UPPER_SIZE=$(stat -c %s /d/upper2/src/big.bin 2>/dev/null || echo missing)"
+        echo "METACOPY_UPPER_BLOCKS=$(stat -c %b /d/upper2/src/big.bin 2>/dev/null || echo missing)"
         umount /d/merged
       else
-        echo "METACOPY_UPPER_SIZE=mount-failed"
+        echo "METACOPY_UPPER_SIZE=mount-failed"; echo "METACOPY_UPPER_BLOCKS=mount-failed"
+      fi
+      # (e) THE fact that actually forbids metacopy for a Workspace Export: it is
+      # mutually exclusive with nfs_export, and an Export must be exportable.
+      # This, not the module parameter, is why the Farm cannot use hardlinks.
+      rm -rf /d/upper3 /d/work3; mkdir -p /d/upper3 /d/work3
+      if mount -t overlay overlay -o lowerdir=/d/farm,upperdir=/d/upper3,workdir=/d/work3,index=on,nfs_export=on,metacopy=on /d/merged 2>/tmp/mc; then
+        echo "NFSEXPORT_PLUS_METACOPY=mounted"; umount /d/merged
+      else
+        echo "NFSEXPORT_PLUS_METACOPY=refused"
+      fi
+      # (f) rename(2) of an inherited DIRECTORY without redirect_dir. Build tools
+      # do this constantly; EXDEV here is author-visible substrate knowledge.
+      echo "REDIRECT_DIR_PARAM=$(cat /sys/module/overlay/parameters/redirect_dir 2>/dev/null || echo absent)"
+      mkdir -p /d/rfarm/ld/sub && echo x > /d/rfarm/ld/sub/f
+      rm -rf /d/upper4 /d/work4; mkdir -p /d/upper4 /d/work4
+      if mount -t overlay overlay -o lowerdir=/d/rfarm,upperdir=/d/upper4,workdir=/d/work4,index=on,nfs_export=on /d/merged 2>/dev/null; then
+        if mv /d/merged/ld /d/merged/nd 2>/tmp/mv; then echo "DIRRENAME_NO_REDIRECT=ok"; else echo "DIRRENAME_NO_REDIRECT=failed"; fi
+        umount /d/merged
+      else
+        echo "DIRRENAME_NO_REDIRECT=mount-failed"
+      fi
+      rm -rf /d/upper5 /d/work5; mkdir -p /d/upper5 /d/work5
+      if mount -t overlay overlay -o lowerdir=/d/rfarm,upperdir=/d/upper5,workdir=/d/work5,index=on,nfs_export=on,redirect_dir=on /d/merged 2>/dev/null; then
+        echo "REDIRECTDIR_WITH_NFSEXPORT=mounted"; umount /d/merged
+      else
+        echo "REDIRECTDIR_WITH_NFSEXPORT=refused"
       fi
 EOF
 kubectl delete pod -n "$NS" scarab-adr0062-probe-kernel --ignore-not-found --wait=true >/dev/null 2>&1
@@ -294,11 +328,31 @@ echo "  kernel=$(get KERNEL) node fs=$(get NODEFS)"
 [ "$(get NFS_EXPORT_MOUNT)" = "yes" ] \
   && ok "index=on,nfs_export=on mounts (the exportable form)" \
   || bad "nfs_export overlay" "yes -- an Export cannot be served without it"
-MC=$(get METACOPY_UPPER_SIZE)
-if [ "$MC" != "0" ]; then
-  ok "metacopy=on did NOT give a metadata-only copy-up (upper size $MC, param $(get METACOPY_PARAM)) -- hardlink Farms stay rejected"
+# metacopy: informational, NOT a pass/fail. It does work (an 8 MiB lower file
+# copies up as metadata only), and the first version of this script concluded the
+# opposite by reading `size` -- which metacopy preserves by design -- as evidence
+# of a data copy. What decides the design is (e) below, not this.
+MC_SZ=$(get METACOPY_UPPER_SIZE); MC_BLK=$(get METACOPY_UPPER_BLOCKS)
+if [ "$MC_SZ" != "mount-failed" ] && [ "$MC_BLK" != "missing" ] && [ "$MC_BLK" -lt 1024 ] 2>/dev/null; then
+  echo "  NOTE  metacopy IS effective here (8 MiB lower, upper size $MC_SZ but only $MC_BLK blocks allocated, param $(get METACOPY_PARAM)) -- so metacopy is available to part 5's NODE-side overlay, which carries no nfs_export"
 else
-  bad "metacopy" "a non-zero upper size. It is 0, meaning metacopy now WORKS here -- a hardlink Farm may be viable again and ADR-0062's Open section must be revisited. Note it would still require a per-node module parameter, which the constraint forbids requiring"
+  echo "  NOTE  metacopy ineffective or unavailable here (size $MC_SZ, blocks $MC_BLK, param $(get METACOPY_PARAM))"
+fi
+# THE load-bearing fact: an Export must be exportable, and nfs_export excludes
+# metacopy. That is what forbids a hardlink Farm on the service side.
+[ "$(get NFSEXPORT_PLUS_METACOPY)" = "refused" ] \
+  && ok "nfs_export=on + metacopy=on is refused (conflicting options) -- so a Workspace Export cannot use metacopy, and the Farm cannot use hardlinks" \
+  || bad "nfs_export+metacopy" "refused. It MOUNTED, which means an Export could combine them -- a hardlink Farm becomes viable on the service side and ADR-0062 part 1's Farm-build ladder must be revisited"
+# rename(2) of an inherited directory: EXDEV without redirect_dir, and build
+# tools do this constantly. redirect_dir=on is therefore not optional.
+[ "$(get REDIRECTDIR_WITH_NFSEXPORT)" = "mounted" ] \
+  && ok "redirect_dir=on coexists with nfs_export=on (unlike metacopy) -- the fix for inherited-directory renames is available" \
+  || bad "redirect_dir+nfs_export" "the combination to mount. Without it an inherited directory rename returns EXDEV inside an Export, which is author-visible substrate knowledge the governing principle forbids"
+DR=$(get DIRRENAME_NO_REDIRECT)
+if [ "$DR" = "failed" ]; then
+  echo "  NOTE  renaming an inherited directory FAILS without redirect_dir (param $(get REDIRECT_DIR_PARAM)) -- expected, and why redirect_dir=on is required. Note \`mv\` may mask this by copying the subtree, which silently turns the change set into a full copy of an inherited tree."
+else
+  echo "  NOTE  inherited-directory rename reported '$DR' without redirect_dir (param $(get REDIRECT_DIR_PARAM)) -- if \`mv\` fell back to a recursive copy this reads as success while re-ingesting the whole subtree"
 fi
 
 # ---------------------------------------------------------------------------

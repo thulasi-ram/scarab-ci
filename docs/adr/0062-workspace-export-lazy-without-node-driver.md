@@ -194,6 +194,22 @@ there is nothing to copy back. Reads fault over the network only for what the St
 Delivery **as a PVC rather than an inline `nfs:` volume is load-bearing**, not stylistic: the table
 above shows inline `nfs:` is denied at `restricted` and the PVC is not.
 
+**The Export mount carries `redirect_dir=on`, and that is a correctness requirement rather than a
+tuning choice.** Without it, `rename(2)` of a directory that exists only in the lower layer returns
+**`EXDEV`** — measured: `rename failed: Cross-device link`, with the module default `redirect_dir=N`.
+Directory renames are not exotic; git, cargo, npm, pip and maven all do them, and today they work
+because `/workspace` is a plain `emptyDir`. An Export that broke them would hand authors "Invalid
+cross-device link" as substrate knowledge, which the governing principle forbids. Worse, `mv`
+*masks* it by recursively copying the subtree, so the failure mode is not an error but a **silent
+full copy of an inherited tree** — which then lands in the upper layer and makes "the change set is
+the upper layer, exactly" re-ingest a tree nothing changed. Verified that `redirect_dir=on` coexists
+with `nfs_export=on` (unlike `metacopy`, above), so the fix is available.
+
+**This forces part 3's reader to support `trusted.overlay.redirect`, not refuse it.** A directory
+rename under `redirect_dir=on` records the old path in that xattr, so a change-set reader that
+treats `redirect` as unsupported would refuse every renamed directory. The two halves have to agree,
+and the ADR previously implied they could each be decided alone.
+
 **3. The change set is the upper layer, exactly.**
 An `overlayfs` upper directory contains precisely the paths the Step touched, put there by the
 kernel. The drain reads the upper, hashes only those files, folds them into the CAS and returns a
@@ -274,10 +290,46 @@ so they are two ladders, not one:
 | writable copy of the Farm | nothing | stat cache — `(size, mtime)` approximation |
 
 Every live rung produces an identical tree, and the slowest is a **local** copy at disk speed
-instead of 50 000 network round-trips. So refusing the service its capability costs speed and
-change-set exactness — never correctness, and never a second code path. **A build must report which
-rung it took**; a benchmark that silently drops a rung reports a number the real deployment would
-never produce.
+instead of 50 000 network round-trips. **A build must report which rung it took**; a benchmark that
+silently drops a rung reports a number the real deployment would never produce.
+
+**What refusing the capability actually costs.** The first version of this sentence said "never
+correctness, and never a second code path", which was wrong on both halves and was corrected once to
+say the rungs differ in *correctness*. That was true of the stat cache **as first built** and is no
+longer true of it, so here is the settled position.
+
+`(size, mtime)` alone has a hole that is not a race but a **determinism**: any writer that preserves
+both length and timestamp — `cp -p`, `touch -r`, `rsync -a`, `tar -xp` — defeats it every time,
+reproducibly, and those are ordinary CI operations rather than pathological ones. A racily-clean
+check does not help, because nothing about it is racy.
+
+**`ctime` closes it, and this is why git's index records more than size and mtime.** No syscall sets
+ctime; `utimensat` *bumps* it as a side effect. So comparing the observed ctime against the moment
+materialisation completed catches every one of those writers. Verified on APFS, ext4, tmpfs and an
+overlayfs upper: `rewrite+utimensat`, `cp -p`, `touch -r` and `tar -xpf` all moved ctime past the
+capture; a pure read did not.
+
+Two things that only measurement would have produced, both now contractual. The mtime cutoff needs a
+one-second slack for coarse filesystems and **the ctime cutoff must not have one** — materialisation
+finishes in the milliseconds *before* the capture, so a slack there puts every file inside the
+untrusted window and the cache degrades to hashing everything (measured: every file re-read, nothing
+ever reused). The asymmetry is principled: the mtime cutoff compares a *recorded producer timestamp*
+against a different clock, while the ctime cutoff compares two readings of *the same* clock
+milliseconds apart. And the capture must be stamped **at least a millisecond after** the last file is
+written, or millisecond truncation leaves materialisation's final files inside the capture's own tick.
+
+So the rungs do not differ in correctness. They differ in **what their correctness rests on**: the
+upper layer is the kernel's own record of what was touched, while the stat cache is sound only given
+an unforgeable ctime, a capture stamped after materialisation, a filesystem whose ctime is not coarse,
+and a Step that cannot move the clock backwards (ADR-0039 drops **ALL** capabilities, so no
+`CAP_SYS_TIME`). Those assumptions hold in every configuration Scarab ships, and they are assumptions
+where the exact path has none. It remains **two drains**, which 0061 part 1 would still count against
+this design; the defence is that only one of them is ever used in a cluster, and the other exists
+where there is no Export to read — the local executor.
+
+The threat model is worth stating plainly, because it bounds all of this: the stat cache guards
+against **accident, not malice**. A Step that deliberately forges timestamps to poison its own change
+set corrupts only its own fenced evidence.
 
 **The Farm rung is per-file, not per-build.** A clone can fail on an individual file while
 succeeding on its neighbours, so `Mixed` is a real outcome and the *counters* — how many were
@@ -425,6 +477,71 @@ per Step is the same order of object churn.
   Rejected as unsafe in this direction: a wrong guess does not fail, it succeeds with a file
   missing. Write-side inference is a different and safe proposition and is what the stat cache is.
 
+## Red-team findings this ADR does not yet answer
+
+A red team was run against this ADR before code rested on it, with a live cluster. It confirmed the
+design's load-bearing claims — an overlay **does** survive being exported and re-read through a
+second fresh client with modes and mtimes intact, `/workspace` **does** stay put, per-Step PV/PVC
+churn **is** cheap (80 objects in 2.3 s, 40 PVs `Bound` in under 5 s, no quota trouble), and PSA
+`restricted` **does** admit an unprivileged Pod with an NFS-backed PVC *including the bind*. The
+PVC-as-envelope argument is sound.
+
+It also found the following, which are recorded here rather than quietly fixed because several change
+what the design must do. Each is filed.
+
+1. **kubelet needs an NFS client on every Step node — CONFIRMED, and it dents the headline claim.**
+   The delivery path had never actually been mounted. When it was: PV bound, PSA admitted the Pod,
+   the scheduler placed it, then kubelet failed with *"you might need a /sbin/mount.nfs helper
+   program"* and the Pod hung in `ContainerCreating` **forever**. The colima node has no `nfs-utils`.
+   So "the Pod needs nothing and kubelet does the mount" is true of *privilege* and false of
+   *packages*: an NFS-sourced PV requires an NFS client on each node that runs a Step. That is not a
+   DaemonSet and not something Scarab installs, but it **is** a per-node prerequisite, and it must be
+   stated as one — it is present on most distributions and its absence on minimal images
+   (Bottlerocket, hardened AMIs) is a real risk. It also means the s9 spike cannot run on `just up`
+   or `local-helm` until the colima VM gets `nfs-common`.
+2. **Evicting a Farm under a live Export is silent corruption — CONFIRMED, and worse than "must not
+   happen".** With lower entries deleted while the overlay was mounted, `ls` of the merged directory
+   returned **empty** while `cat` of already-cached paths still returned content, and a write into the
+   vanished directory returned **rc=0**. A Step would see an empty tree, build nothing, and exit 0 —
+   the fail-silently class this ADR rejects read-set inference for. Nothing refcounts Farms against
+   live Exports today, and the `actimeo` argument ("the lower layer is immutable by construction")
+   inherits the same assumption. Reaping is therefore a correctness mechanism, not housekeeping.
+3. **Part 3's "no network in the path" collides with 0061 part 4 — CONFIRMED (documents).** Folding a
+   change set into the CAS on the service's own disk lands it in the **warm** tier, and 0061 part 4
+   requires durability before `Succeeded` while 0061 explicitly forbids making warm load-bearing for
+   durability. So either part 4 weakens or a cold upload stays on the critical path — and this ADR
+   books neither. Unbooked cost, exactly what 0061's own "price of seeding the warm tier" section
+   exists to avoid repeating.
+4. **`fsGroup` does not survive an NFS volume — PLAUSIBLE, strong, and possibly a blocker for part 2.**
+   The executor sets `fs_group: WORKSPACE_GID` and comments that the restored `/workspace` is "owned
+   by `WORKSPACE_GID` and only group-writable". The in-tree NFS plugin reports `Managed: false`, so
+   kubelet applies **no** fsGroup ownership. Write access then rests on AUTH_SYS uid/gid against the
+   modes 0061 s7 preserves exactly — and `0644` is not group-writable. **The Step may be unable to
+   write to its own Workspace.** This ADR discusses AUTH_SYS only in the context of the fence and
+   never as an access-control problem for the Step itself.
+5. **The fence is weaker than the word "capability" implies — PLAUSIBLE.** A userspace NFSv4 client
+   needs no privilege, no PV and no kubelet, and can assert any uid; a probe mounted with
+   `noresvport`, so the privileged-port defence never engaged. First-mount pinning pins the **node**,
+   because kubelet does the mounting — so co-tenant Steps on one node share an identity. And path
+   secrecy is the only remaining barrier while the path sits in a **cluster-scoped PV object** and in
+   the node's `/proc/mounts`. "Structurally the same capability as the HMAC token" overstates it: the
+   token is per-Pod and unreadable by other Pods; this is not. Needs a real answer — `resvport`, a
+   NetworkPolicy, per-Step uid squashing — or an honest downgrade of the claim.
+6. **Revocation and restart are unhandled — CONFIRMED.** Revoking an export under a live client gives
+   `ESTALE` then `EACCES`, and `nfsd` start logs a **90-second grace period** plus *"Unable to
+   initialize client recovery tracking … Is nfsdcld running?"*. This ADR handles a dead daemon but not
+   revocation racing a Pod already in SIGTERM grace, nor the post-restart grace window, nor `nfsdcld`
+   as a dependency.
+7. **Part 4's zone preference has no merge story with 0055 — PLAUSIBLE.** `affinity` appears nowhere
+   in the Rust sources, and a placement overlay is applied as a block, so whichever writer goes last
+   replaces the other's affinity wholesale. A preference Scarab adds and an overlay the operator owns
+   cannot both survive without a defined merge.
+8. **The s9 spike as specified cannot falsify the design — PLAUSIBLE.** Operations-per-second under
+   latency exercises none of: `EXDEV`/redirect correctness, whiteout and opaque handling in the drain,
+   eviction under a live mount, restart with live Exports, or cross-AZ behaviour. Its rung guard
+   covers reflink and `overlayfs` but not `redirect_dir`, not which drain ran, and not whether the
+   mount was actually NFS. A spike shaped only to produce a number will produce one.
+
 ## Open — deliberately not decided here
 
 - **Operations-per-second under latency, measured, for a `cargo`-shaped write workload against a
@@ -437,26 +554,38 @@ per Step is the same order of object churn.
   now on the critical path rather than beside it.
 - **`overlayfs` with an NFS mount as `lowerdir`**, which part 5 requires. Documented as working
   with caveats; unverified here, and load-bearing for the accelerator only.
-- ~~**Whether `overlayfs` `metacopy=on` can restore a hardlink Farm.**~~ **Measured; it cannot.**
-  The hope was that `metacopy` — metadata-only copy-up, keeping the lower's data by reference — would
-  let a Farm go back to free hardlinks with an upper carrying the per-snapshot mode and mtime, on any
-  filesystem including ext4. On the dogfood kernel (6.8.0), `metacopy=on` **mounts and then does a
-  full data copy-up anyway**, for a `chmod` alone with no timestamp change at all:
+- ~~**Whether `overlayfs` `metacopy=on` can restore a hardlink Farm.**~~ **Answered: not for a
+  Workspace Export — but the first answer recorded here was wrong, and the correction matters.**
+
+  **What was wrong.** This ADR briefly claimed `metacopy=on` "mounts and then does a full data
+  copy-up anyway", citing `upper entry size 17, blocks 8` on a 17-byte file. That is not evidence of
+  a data copy: `metacopy` **preserves `size` by design**, and 8 blocks is ext4's 4 KiB minimum
+  allocation. Re-run on an 8 MiB lower file the answer inverts — `size=8388608` with **8 blocks
+  allocated** and `trusted.overlay.metacopy=""` on the upper entry. **`metacopy` works, from the
+  mount option alone, with the module parameter still `N`.** A hardlink Farm under `metacopy` was
+  also verified safe: link count 2, CAS blob still `644`, merged view reading `755`.
+
+  The claim that the module parameter made it "accepted and ineffective" was also a **category
+  error**: the service-side overlay is mounted on the *workspace service*, so a module parameter
+  would be one node — the one the constraint already permits — not every Step node.
+
+  **The real reason it cannot be used, which is a different fact entirely:**
 
   ```
-  /sys/module/overlay/parameters/metacopy : N
-  mount -o index=on,metacopy=on           : MOUNTED
-  chmod 755 through the overlay           → CAS blob unchanged (644), correct
-                                          → upper entry size 17, blocks 8   ← the DATA was copied
+  mount -o index=on,nfs_export=on,metacopy=on  →  refused: conflicting options
   ```
 
-  The mount option is accepted and ineffective because the feature is disabled at the module level.
-  That is the deciding fact rather than a detail: enabling it means setting
-  `/sys/module/overlay/parameters/metacopy` **on every node that runs a Step**, which is precisely
-  the node-level dependency the constraint exists to refuse. So even a kernel where it worked for
-  timestamps would not be something Scarab may require. Recorded because the *shape* recurs — a
-  mount option that validates, does nothing, and would have silently produced a Farm with wrong
-  mtimes.
+  An Export must be **exportable**, and `nfs_export` and `metacopy` are mutually exclusive. So on the
+  service side the Farm cannot use hardlinks, and part 1's reflink-or-copy stands — for this reason,
+  not the one first written down.
+
+  **And it opens something.** Part 5's node-side accelerator mounts an overlay with **no
+  `nfs_export`**, so `metacopy` *is* available there. That is worth following up rather than burying:
+  it would let the accelerator's upper carry metadata with no data copy.
+
+  Kept in full because the mistake is the reusable part. The first probe measured a real thing and the
+  conclusion drawn from it was unsound, for the third time in this ADR's short life — and each time
+  the tell was the same, a probe whose result was read as answering a question it had not asked.
 - **Automatic Cache detection for lockfile-derived trees** — recognising `node_modules`, `.venv`,
   vendored `~/.m2` and the pip/uv caches from their lockfiles and routing them through
   [0007](0007-data-passing-model.md)'s **Cache** instead of the Workspace, so that less is subject
