@@ -93,8 +93,14 @@ async fn run_detail_states_the_cold_tier_time_bound() {
     assert_eq!(
         wr["expires_at"],
         7 * DAY_MS,
-        "the promise is settled_at + window, measured from the same column GC keys on"
+        "the promise is settled_at + window"
     );
+    // NOT a test of *which* column the promise is keyed on. `InMemoryDb` reports
+    // creation time (see its `run_snapshot_retention`) while the real adapter
+    // reads `updated_at`, and here the two are the same number — so this
+    // assertion would pass against either. That claim needs Postgres, and it has
+    // it: `retention.rs::the_retention_promise_is_keyed_on_updated_at_not_created_at`
+    // forces the two columns a hundred days apart.
     assert_eq!(wr["expired"], false);
     assert_eq!(wr["pinned"], false);
 }
@@ -303,4 +309,117 @@ async fn rerun_plan_previews_the_scope_before_the_button_is_pressed() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The widened plan over the wire, with **non-empty** `widened` and
+/// `expired_inputs`.
+///
+/// The test above pins the empty case, which every field of the projection
+/// satisfies vacuously: `widened: []` and `expired_inputs: []` are what a DTO
+/// that dropped the fields entirely, or that swapped `consumer` and
+/// `produced_by`, would also produce. And the mapping is what the affordance
+/// reads out loud — "*test* will re-run too, because *build*'s workspace
+/// expired". Naming the wrong step there is a plausible bug that no engine-level
+/// test can catch, because the engine's `ExpiredInput` is correct: the risk lives
+/// entirely in the projection.
+#[tokio::test]
+async fn a_widened_rerun_plan_names_the_consumer_and_the_producer_over_the_wire() {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock: Arc<FakeClock> = Arc::new(FakeClock::new(0));
+    let run = RunId("r-widen".into());
+
+    // A `clone → build → test` chain. A real CAS, not a stub: the whole question
+    // is whether a snapshot is actually absent, and only a store can answer that.
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    db.record_transition(&run, RunStatus::Pending, RunStatus::Running)
+        .await
+        .unwrap();
+    db.record_transition(&run, RunStatus::Running, RunStatus::Succeeded)
+        .await
+        .unwrap();
+    let mut prev: Option<StepId> = None;
+    for name in ["clone", "build", "test"] {
+        let step = StepId(name.to_string());
+        let needs: Vec<StepId> = prev.clone().into_iter().collect();
+        db.create_step_run(&run, &step, None, &needs, Timestamp(0))
+            .await
+            .unwrap();
+        prev = Some(step);
+    }
+
+    let cas_dir = tempfile::tempdir().unwrap();
+    let cas: Arc<dyn scarab_storage::Cas> = Arc::new(
+        scarab_storage_s3::S3Storage::local(cas_dir.path().to_str().unwrap()).unwrap(),
+    );
+    // `clone`'s snapshot is really there; `build`'s really is not. So rerunning
+    // `test` has to walk back exactly one step — far enough to be non-empty,
+    // short enough that "the whole chain" would be a visibly different answer.
+    let live = {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("src.txt"), b"cloned").unwrap();
+        cas.ingest(dir.path().to_str().unwrap()).await.unwrap().root.0
+    };
+    const SWEPT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    db.set_step_output(
+        &run,
+        &StepId("clone".into()),
+        &scarab_engine::AttemptId("a1".into()),
+        &live,
+        None,
+    )
+    .await
+    .unwrap();
+    db.set_step_output(
+        &run,
+        &StepId("build".into()),
+        &scarab_engine::AttemptId("a1".into()),
+        SWEPT,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let app = router(state(db.clone(), clock.clone()).with_workspace_cas(cas));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/runs/r-widen/steps/test/rerun-plan")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let plan = body_json(resp).await;
+
+    assert_eq!(plan["target"], "test");
+    assert_eq!(
+        plan["invalidated"],
+        serde_json::json!(["build", "test"]),
+        "the target plus the ancestor that regenerates its input"
+    );
+    assert_eq!(
+        plan["widened"],
+        serde_json::json!(["build"]),
+        "the widened subset is the ancestor alone — it must NOT include the target,          or the copy would say a plain rerun was widened"
+    );
+    assert_eq!(
+        plan["starts_from"],
+        serde_json::json!(["build"]),
+        "the run restarts from build, not from test"
+    );
+    assert_eq!(
+        plan["expired_inputs"],
+        serde_json::json!([{
+            // `test` is the step whose INPUT is incomplete; `build` is the step
+            // that PRODUCED the missing snapshot. Swapping the two reads as
+            // "build will re-run because test's workspace expired", which is
+            // backwards and, in a chain, blames a step that is downstream of the
+            // problem.
+            "consumer": "test",
+            "produced_by": "build",
+            "root": SWEPT,
+        }]),
+        "the diagnostic names both ends of the missing edge, and which is which"
+    );
 }

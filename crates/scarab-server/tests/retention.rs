@@ -961,3 +961,169 @@ async fn a_rerun_with_live_inputs_stays_narrow() {
 
     tdb.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------
+// The retention PROMISE the run resource states (ADR-0061 s5) — real Postgres.
+// ---------------------------------------------------------------------------
+
+/// `expires_at` is `updated_at + window`, and `updated_at` is a column only the
+/// real adapter has.
+///
+/// `snapshots_pin_api.rs` asserts the same arithmetic, but over `InMemoryDb`,
+/// whose `run_snapshot_retention` reports **creation** time. There
+/// `created_at == updated_at` by construction, so that assertion cannot tell
+/// which column the promise is keyed on — and `updated_at` is the one the GC
+/// sweeper's cutoff compares against. A run created on Monday and settled on
+/// Friday has two very different answers, so this fixture forces the two columns
+/// a hundred days apart and then asks the real HTTP surface.
+///
+/// Three shapes, because the promise is as much about when it is *withheld*:
+/// terminal (on the clock), non-terminal at any age (never on it, ADR-0050), and
+/// pinned (held open indefinitely).
+#[tokio::test]
+async fn the_retention_promise_is_keyed_on_updated_at_not_created_at() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt; // oneshot
+
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = PostgresDb::with_pool(tdb.pool.clone());
+    pg.migrate().await.unwrap();
+
+    const CREATED: i64 = 0;
+    const SETTLED: i64 = 100 * DAY_MS;
+    const WINDOW_DAYS: u32 = 7;
+
+    for (id, terminal) in [
+        ("promise-terminal", true),
+        ("promise-open", false),
+        ("promise-pinned", true),
+    ] {
+        let run = RunId(id.into());
+        pg.create_run(&run, 1, 1, Timestamp(CREATED)).await.unwrap();
+        pg.record_transition(&run, RunStatus::Pending, RunStatus::Running)
+            .await
+            .unwrap();
+        pg.record_transition(
+            &run,
+            RunStatus::Running,
+            if terminal {
+                RunStatus::Succeeded
+            } else {
+                RunStatus::Suspended
+            },
+        )
+        .await
+        .unwrap();
+        pg.create_step_run(&run, &StepId("s1".into()), None, &[], Timestamp(CREATED))
+            .await
+            .unwrap();
+        // `record_transition` stamps `updated_at` with wall-clock now, which is
+        // neither reproducible nor far enough from `created_at` to be a
+        // discriminating fixture. Pin it to a known settle instant instead.
+        sqlx::query("UPDATE runs SET updated_at = $2 WHERE id = $1")
+            .bind(&run.0)
+            .bind(SETTLED)
+            .execute(&tdb.pool)
+            .await
+            .unwrap();
+    }
+    // Pinned AFTER the settle, and deliberately not at the settle instant: a pin
+    // must not re-date the run.
+    pg.pin_run_snapshots(
+        &RunId("promise-pinned".into()),
+        Some("alice"),
+        Timestamp(SETTLED + DAY_MS),
+    )
+    .await
+    .unwrap();
+
+    // The fixture's whole point, asserted rather than assumed: if these two ever
+    // coincide, every assertion below stops distinguishing the two columns and
+    // this test degenerates into the in-memory one.
+    let (created, updated): (i64, i64) = sqlx::query_as(
+        "SELECT created_at, updated_at FROM runs WHERE id = 'promise-terminal'",
+    )
+    .fetch_one(&tdb.pool)
+    .await
+    .unwrap();
+    assert_eq!(created, CREATED);
+    assert_eq!(updated, SETTLED);
+    assert_ne!(created, updated, "the fixture must keep the two columns apart");
+
+    // Two days after settling: inside a 7-day window.
+    let now = SETTLED + 2 * DAY_MS;
+    let db: Arc<dyn Db> = Arc::new(pg);
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(now));
+    let logs = Arc::new(scarab_server::LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let app = scarab_server::router(
+        scarab_server::AppState::new(db, clock, logs)
+            .with_snapshot_retention_days(WINDOW_DAYS),
+    );
+
+    let retention_of = |id: &'static str| {
+        let app = app.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/v1/runs/{id}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{id}");
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["snapshot_retention"]
+                .clone()
+        }
+    };
+
+    // 1. Terminal, unpinned: on the clock, measured from `updated_at`.
+    let wr = retention_of("promise-terminal").await;
+    assert_eq!(wr["retention_days"], WINDOW_DAYS);
+    assert_eq!(
+        wr["expires_at"],
+        SETTLED + (WINDOW_DAYS as i64) * DAY_MS,
+        "the promise is settled_at + window, and settled_at is the `updated_at` \
+         column the sweeper keys on — NOT `created_at`, which would answer {}",
+        CREATED + (WINDOW_DAYS as i64) * DAY_MS
+    );
+    assert_eq!(wr["expired"], false);
+    assert_eq!(wr["pinned"], false);
+
+    // 2. Non-terminal, aged well past any window: no expiry is promised at all.
+    sqlx::query("UPDATE runs SET updated_at = 0 WHERE id = 'promise-open'")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    let wr = retention_of("promise-open").await;
+    assert!(
+        wr.get("expires_at").is_none(),
+        "a run that has not settled is never GC-eligible, at any age (ADR-0050), \
+         so quoting a date for it would be a lie the sweeper does not tell: {wr}"
+    );
+    assert_eq!(wr["expired"], false);
+
+    // 3. Pinned: the window is held open, so there is no date to quote.
+    let wr = retention_of("promise-pinned").await;
+    assert!(
+        wr.get("expires_at").is_none(),
+        "a pin holds the window open indefinitely: {wr}"
+    );
+    assert_eq!(wr["pinned"], true);
+    assert_eq!(wr["pinned_by"], "alice");
+    assert_eq!(wr["pinned_at"], SETTLED + DAY_MS);
+    assert_eq!(wr["expired"], false);
+
+    tdb.cleanup().await;
+}
