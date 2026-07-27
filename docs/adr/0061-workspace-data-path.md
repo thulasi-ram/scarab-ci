@@ -1,8 +1,17 @@
 # 0061. Workspace data path: workspace service + node driver, lazy materialisation
 
-- **Status:** Accepted
+- **Status:** Accepted — **part 2 (the node driver) superseded by
+  [0062](0062-workspace-export-lazy-without-node-driver.md)**
 - **Date:** 2026-07-26
 - **Deciders:** thulasi.ram (architect)
+
+> **Read this first.** A constraint arrived after acceptance — *no DaemonSet from Scarab at all,
+> privileged or not* — which forbids **part 2**'s node driver. The goal part 2 exists for (lazy
+> reads, so a Step moves what it reads rather than what it inherits, with the author declaring
+> nothing) is **not** withdrawn; 0062 reaches it a different way. Parts 1, 3 and 4 stand
+> unchanged. Three claims below are amended in place and marked: part 2 itself, the "privileged
+> node driver becomes an install prerequisite" consequence, and the "cross-AZ traffic is confined
+> to the archive drain" consequence.
 
 ## Context
 
@@ -94,6 +103,19 @@ privileged mount, which an unprivileged Pod cannot arrange for itself.
 
 Service and driver are **one component in two halves** (server and client), not two concepts.
 
+> **⚠️ Part 2 is SUPERSEDED by [0062](0062-workspace-export-lazy-without-node-driver.md).** A
+> later deployment constraint — *no DaemonSet from Scarab at all* — forbids shipping a node
+> driver, and the paragraph above then argued the goal was unreachable. **That argument is
+> wrong, and its own last clause is why.** "An unprivileged Pod cannot arrange a privileged
+> mount for itself" is true and irrelevant: in Kubernetes the privileged mounter is **kubelet**,
+> which mounts on a Pod's behalf, so an unprivileged Pod can hold an intercepting filesystem at
+> `/workspace` without any capability. 0062 keeps the goal — lazy reads, a read-only lower and a
+> writable upper, nothing declared by the author — and moves the mechanism to a **Workspace
+> Export**: `overlayfs` over a hardlink **Snapshot Farm** on the service's own disk, delivered
+> to the Pod as a PersistentVolumeClaim. The lazy read is unchanged; the driver is gone. The
+> "one component in two halves" framing survives with the client half now being kubelet's mount
+> rather than our code.
+
 **3. The control plane leaves the data path.** The server exchanges **root hashes** — tens of
 bytes. Helper containers become Scarab-owned images rather than `busybox` doorstops. The
 `kubectl exec` tar tunnel is deleted.
@@ -144,9 +166,14 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 - **A third stateful component.** [0004](0004-execution-topology.md) called object storage
   "the second (and last)". That is now wrong, deliberately. Accepted because one standard
   path beats a fast path plus a fallback path.
-- **A privileged node driver becomes an install prerequisite** — including on `kind` and
-  colima, so the dogfood exercises the real thing. Note this is a *larger* ask than
-  Woodpecker's (which needs only a default StorageClass) and should be honest in the docs.
+- ~~**A privileged node driver becomes an install prerequisite**~~ — **withdrawn with part 2
+  ([0062](0062-workspace-export-lazy-without-node-driver.md)).** It was booked here as an
+  honest cost and it is now a forbidden one. 0062 replaces it with a privileged **workspace
+  service** Pod — one operator-installed StatefulSet on the node Scarab's server already runs
+  on, not a component on every node — and makes even that *preferred rather than required*, since
+  the Farm degrades to a `reflink` or plain local copy without the capability. The comparison to
+  Woodpecker's "only a default StorageClass" no longer applies in our favour or against us: what
+  an operator must accept is one stateful component, which is what they were installing anyway.
 - **The implicit inherit-everything default stays**, and `outputs:` ([0007](0007-data-passing-model.md))
   stays a *precision* tool — for cache keys, safe fan-out and restricting what flows — never
   a performance tax. Laziness plus content addressing is the automatic version of a narrow
@@ -170,6 +197,14 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   Step Pods talk only to their own zone's service. (In-region object storage is typically
   free per byte; EC2-to-EC2 across AZs is not. The cost was never "object storage" — it was
   the zone boundary.)
+
+  **Amended by [0062](0062-workspace-export-lazy-without-node-driver.md) part 4: "confined" is
+  too strong.** A Workspace Export lives on *one* replica's disk and the volume must be named in
+  the Pod spec before the scheduler places anything, so "Step Pods talk only to their own zone's
+  service" cannot be an invariant without hard-pinning every Step to a zone — which would fight
+  the spot capacity this ADR names as the operating environment. 0062 makes zone affinity a
+  **preference**: in-zone when capacity allows, cross-AZ when it does not, priced and never
+  wrong. The sentence should be read as the intent, not the guarantee.
 - **Object storage stays generic.** Scarab names no product and makes no single-zone /
   multi-zone / storage-class call. That is the operator's cost model, not ours.
 - **Version skew** between server, service and driver becomes a supported concern.
@@ -527,6 +562,17 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
 - **Overlay diff for the drain** — hashing only the writable upper layer (so a Step never
   re-walks an unchanged tree) is the natural partner to lazy reads and needs the same
   privileged mount. Specified as a follow-up slice, not part of the first cut.
+
+  **Answered by [0062](0062-workspace-export-lazy-without-node-driver.md) part 3, and the "same
+  privileged mount" premise was wrong.** The upper layer does not have to be on the *node*. With
+  the `overlayfs` mount on the workspace service — over a hardlink Snapshot Farm, verified on
+  ext4 — the upper directory holds precisely the paths the Step touched, put there by the kernel,
+  and the drain reads it locally with no network in the path. So the drain becomes **exact rather
+  than approximate**, which also retires the hazard in the unprivileged approximation that was
+  going to be built instead (a `(size, mtime)` stat cache, whose failure mode is silently
+  publishing a stale hash on an mtime race). The stat cache remains the right drain for
+  configurations with no Export — the local executor, and the lower rungs of 0062's privilege
+  ladder — where it is a fallback and not the mechanism.
 
 ## References
 

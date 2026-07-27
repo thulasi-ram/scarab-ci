@@ -75,7 +75,8 @@ old one — never by editing history (mirrors our version-tolerance principle).
 | [0058](0058-runtime-service-containers.md) | Runtime service containers: co-located **Sidecar** (default, fenced-by-inheritance) + Run-scoped **Shared** (opt-in `uses:`, per-Take instance, unfenced) — not DAG nodes (amends 0008) | Accepted |
 | [0059](0059-tick-fault-isolation.md) | Per-run scheduler-tick fault isolation (one poison Run can't stall the fleet) + bounded per-Run failures → dead-letter (generalizes 0058 Fix A/B) | Accepted |
 | [0060](0060-org-settings-connections-and-secret-management.md) | Global Settings surface: connection lifecycle (Forgejo onboarding + GitHub observe/re-sync), org/env secret editing via the effective-status matrix, IaC-or-UI connections with single-owner precedence | Accepted |
-| [0061](0061-workspace-data-path.md) | Workspace data path: per-AZ workspace service + Scarab node driver with lazy materialisation; control plane leaves the data path (supersedes 0004's data path, not its topology) | Accepted |
+| [0061](0061-workspace-data-path.md) | Workspace data path: per-AZ workspace service + Scarab node driver with lazy materialisation; control plane leaves the data path (supersedes 0004's data path, not its topology) | Accepted (**part 2, the node driver, superseded by 0062**) |
+| [0062](0062-workspace-export-lazy-without-node-driver.md) | Workspace Export: lazy materialisation with no DaemonSet — `overlayfs` over a hardlink Snapshot Farm on the workspace service, mounted by kubelet as a per-Step PVC; the change set is the upper layer; optional node-side write accelerator | Accepted |
 
 > For *features* deliberately deferred until demand appears (as opposed to ADRs
 > to be written), see [`docs/followups.md`](../followups.md).
