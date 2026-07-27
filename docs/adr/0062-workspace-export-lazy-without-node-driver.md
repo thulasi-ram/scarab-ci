@@ -120,11 +120,36 @@ plain overlay (lowerdir = the farm)   : MOUNTED
 overlay + index=on,nfs_export=on      : MOUNTED   # exportable over NFS
 ```
 
-`reflink` is therefore **not** a requirement. `overlayfs` copy-up *uses* reflink when the
-underlying filesystem offers it, so XFS or btrfs is a free speed-up (block-granularity copy-up
-rather than whole-file) and ext4 is a correct, working configuration. This matters concretely: the
-local dogfood disk is ext4, so a design that depended on reflink would have had a fast path the
-dogfood could never exercise — the exact shape of false-green this repo has been bitten by.
+**A hardlink cannot carry per-snapshot metadata, and that is the real constraint on the Farm.**
+This was measured *after* the paragraph above was first written, and it corrects it:
+
+```
+set the snapshot's recorded mtime on the FARM entry → CAS blob mtime moved too
+chmod 755 the farm entry                            → CAS blob mode changed too
+reflink (APFS clonefile) instead of hardlink        → CAS blob metadata independent
+```
+
+A hardlink is a second *name* for one inode, and mode and mtime live on the inode. [0061](0061-workspace-data-path.md)
+s7 made mode/mtime fidelity a pinned contract (`crates/scarab-storage-s3/tests/fidelity.rs`) after
+measuring that dropping it silently degraded cross-Step incremental compilation, and s8 rejected
+letting a first-writer's timestamp win for a shared blob. So restoring a snapshot's metadata onto a
+hardlinked farm entry would **mutate the CAS blob** — the precise corruption this design claims to
+prevent — and two snapshots sharing content but not timestamps would fight over it.
+
+**Therefore the Farm materialises by `reflink` where the filesystem offers it and by plain copy
+where it does not; hardlinks are not the mechanism.** The earlier claim that "reflink is a bonus,
+not a dependency" is withdrawn. What survives is the part that matters: even the copy rung is a
+**local** copy at disk speed, against 4–6 ms per file of network round-trip in the measured status
+quo — for 50 000 files that is seconds versus minutes. The ordering argument is untouched; only the
+size of the win moves, and only on filesystems without reflink.
+
+The verified `overlayfs` result above still stands on its own terms — **copy-up does not modify the
+lower layer**, so a Farm built by any rung is safe against a Step writing through it. That was what
+the probe tested; it did not test metadata, and saying so is the point.
+
+This inverts one warning and it is worth keeping the corrected form: the local dogfood disk is
+**ext4**, which has no reflink, so the dogfood exercises the **copy** rung and the reflink rung is
+the one it cannot reach. Any benchmark must therefore state which rung it took.
 
 ## The governing principle, unchanged
 
@@ -139,18 +164,24 @@ configurations below produced it. Where the substrate is expensive, the system p
 
 **Five parts.**
 
-**1. A Snapshot Farm — the CAS given tree shape, for free.**
+**1. A Snapshot Farm — the CAS given tree shape, without leaving the disk.**
 The workspace service materialises a Workspace Snapshot into a directory tree on **its own disk**
-whose entries are **hardlinks to CAS blobs**. No bytes are copied and no round-trip is made. A
-Farm is **immutable and read-only**, keyed by snapshot root, built once and **shared by every Step
-that inherits that snapshot** — so fan-out costs nothing. The Farm is a warm-tier cache object:
-bounded by space, LRU-evicted, and a miss is slower and never wrong.
+whose entries are **`reflink` clones of CAS blobs where the filesystem supports it, and local copies
+where it does not**. Either way **no round-trip is made and nothing crosses a network.** A Farm is
+**immutable and read-only**, keyed by snapshot root, built once and **shared by every Step that
+inherits that snapshot** — so fan-out costs nothing. The Farm is a warm-tier cache object: bounded
+by space, LRU-evicted, and a miss is slower and never wrong.
 
-This is where the per-file cost goes to die. 0061 measured the CAS legs at 4–6 ms per file against
-*loopback* object storage; a hardlink is a local metadata operation in the tens of microseconds.
-For a 50 000-file `node_modules` or `target/` that is the difference between **minutes and about a
-second**, and it is a property of the **CAS**, not of any transport: the hardlink is only free
-because the store already holds exactly one copy of each content on the same filesystem.
+Not hardlinks: see the measurement above — a hardlink shares its inode, so restoring a snapshot's
+mode and mtime onto a farm entry mutates the CAS blob, and 0061 s7 makes that fidelity a pinned
+contract.
+
+This is where the per-file cost goes to die, and the reason is the **CAS**, not the transport: the
+store already holds exactly one copy of each content **on the same filesystem as the Farm**, so
+building a tree never has to ask the network for a byte. 0061 measured the CAS legs at 4–6 ms per
+file against *loopback* object storage. A reflink is a local metadata operation in the tens of
+microseconds; a local copy is disk bandwidth. For a 50 000-file `node_modules` or `target/` that is
+**about a second on reflink, a few seconds on a plain copy, and minutes today.**
 
 **2. A Workspace Export — the Step's Workspace, mounted by kubelet.**
 Per Step, the service mounts `overlayfs` with the Farm as **lowerdir** and a per-Step directory as
@@ -209,15 +240,25 @@ StatefulSet** — the exception storage operators are routinely granted, on the 
 explicitly permits — and it is *preferred*, not required. The interface is "give me a tree-shaped
 writable view of a snapshot on the service's disk", with three backends:
 
-| backend | privilege | cost on ext4 | change set |
-|---|---|---|---|
-| hardlink Farm + `overlayfs` | service pod needs `CAP_SYS_ADMIN` | **free** | **exact** (the upper) |
-| `cp --reflink=auto` per file | none | local copy (~GB/s) | stat cache |
-| plain copy per file | none | local copy | stat cache |
+The two axes are independent — how the Farm is built, and whether an `overlayfs` sits on top of it —
+so they are two ladders, not one:
 
-All three produce an identical tree, and even the last rung is a **local** copy at disk speed
+| Farm build | needs | cost, 50k files | metadata fidelity |
+|---|---|---|---|
+| `reflink` clone per blob | XFS (reflink=1), btrfs, APFS | **~1 s**, no bytes | exact |
+| plain local copy per blob | nothing | seconds, at disk bandwidth | exact |
+| ~~hardlink per blob~~ | — | free | **unsafe — mutates the CAS blob** |
+
+| Export build | needs | change set |
+|---|---|---|
+| `overlayfs`, Farm as lower | service pod `CAP_SYS_ADMIN` | **exact** (the upper layer) |
+| writable copy of the Farm | nothing | stat cache — `(size, mtime)` approximation |
+
+Every live rung produces an identical tree, and the slowest is a **local** copy at disk speed
 instead of 50 000 network round-trips. So refusing the service its capability costs speed and
-change-set exactness — never correctness, and never a second code path.
+change-set exactness — never correctness, and never a second code path. **A build must report which
+rung it took**; a benchmark that silently drops a rung reports a number the real deployment would
+never produce.
 
 ### Vocabulary
 
@@ -322,10 +363,18 @@ per Step is the same order of object churn.
   And it puts the per-file cost back on the wire: EFS charges roughly a millisecond per metadata
   operation, where a Snapshot Farm charges tens of microseconds locally. Running our own server is
   what buys the Farm; a managed one cannot be given hardlinks into our CAS.
-- **Depending on `reflink` for the Farm.** Rejected after measurement: ext4 has no reflink, the
-  dogfood disk is ext4, and a design whose fast path the dogfood cannot exercise is a false-green
-  generator. `overlayfs` over a hardlink farm needs no reflink and *uses* it where present, which
-  makes XFS a bonus rather than a dependency.
+- **A hardlink Farm, so the Farm is free on every filesystem.** This is what the ADR originally
+  decided and it is **withdrawn on measurement**: mode and mtime live on the inode, a hardlink is a
+  second name for one inode, so writing a snapshot's recorded metadata onto a farm entry mutates the
+  CAS blob. 0061 s7 pinned that fidelity after measuring real damage from losing it, and s8 rejected
+  first-writer-wins timestamps for shared content. Kept in the record because the mistake is
+  reusable: the `overlayfs` probe verified that copy-up does not modify the lower layer and was read
+  as verifying the Farm was safe, which it never tested. **A probe proves what it exercised.**
+- **A metadata-variant hardlink pool** — one materialised copy per distinct `(content, mode, mtime)`
+  and hardlinks from there, so repeats are free. Rejected for the first cut: mtimes vary per file in
+  a real build, so the sharing rate collapses toward one copy per file and the pool buys complexity
+  rather than speed. Worth revisiting only if measurement shows real trees cluster into few distinct
+  metadata variants.
 - **A custom NFS server implementing copy-on-write in userspace**, so a hardlink farm could be
   exported directly with no `overlayfs` and no `CAP_SYS_ADMIN`. Technically sound — we would break
   the link on first write ourselves — and rejected because it means writing the CoW semantics the
@@ -363,6 +412,26 @@ per Step is the same order of object churn.
   now on the critical path rather than beside it.
 - **`overlayfs` with an NFS mount as `lowerdir`**, which part 5 requires. Documented as working
   with caveats; unverified here, and load-bearing for the accelerator only.
+- ~~**Whether `overlayfs` `metacopy=on` can restore a hardlink Farm.**~~ **Measured; it cannot.**
+  The hope was that `metacopy` — metadata-only copy-up, keeping the lower's data by reference — would
+  let a Farm go back to free hardlinks with an upper carrying the per-snapshot mode and mtime, on any
+  filesystem including ext4. On the dogfood kernel (6.8.0), `metacopy=on` **mounts and then does a
+  full data copy-up anyway**, for a `chmod` alone with no timestamp change at all:
+
+  ```
+  /sys/module/overlay/parameters/metacopy : N
+  mount -o index=on,metacopy=on           : MOUNTED
+  chmod 755 through the overlay           → CAS blob unchanged (644), correct
+                                          → upper entry size 17, blocks 8   ← the DATA was copied
+  ```
+
+  The mount option is accepted and ineffective because the feature is disabled at the module level.
+  That is the deciding fact rather than a detail: enabling it means setting
+  `/sys/module/overlay/parameters/metacopy` **on every node that runs a Step**, which is precisely
+  the node-level dependency the constraint exists to refuse. So even a kernel where it worked for
+  timestamps would not be something Scarab may require. Recorded because the *shape* recurs — a
+  mount option that validates, does nothing, and would have silently produced a Farm with wrong
+  mtimes.
 - **Automatic Cache detection for lockfile-derived trees** — recognising `node_modules`, `.venv`,
   vendored `~/.m2` and the pip/uv caches from their lockfiles and routing them through
   [0007](0007-data-passing-model.md)'s **Cache** instead of the Workspace, so that less is subject
