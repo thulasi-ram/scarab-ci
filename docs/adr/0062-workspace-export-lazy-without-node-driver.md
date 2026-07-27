@@ -199,6 +199,25 @@ An `overlayfs` upper directory contains precisely the paths the Step touched, pu
 kernel. The drain reads the upper, hashes only those files, folds them into the CAS and returns a
 new snapshot root — **all on the service's own local disk, with no network in the path.**
 
+**Reading a change set must fail closed on missing privilege, and the reason is nastier than it
+looks.** An upper layer records deletions as whiteouts (a character device with `rdev == 0`) and
+wholesale directory replacements as the `trusted.overlay.opaque` xattr. `trusted.*` xattrs are
+readable only with `CAP_SYS_ADMIN` — and the kernel answers an unprivileged read with **`ENODATA`,
+which is indistinguishable from "the attribute is not set"** (measured while implementing s2:
+kernel 6.8.0, an unprivileged reader saw *nothing* on an upper that demonstrably carried the
+markers). So a drain that merely *tried* to read them would report "no opaque directories, no
+renames", be believed, and publish a snapshot missing every deletion. The reader therefore checks
+its own effective capabilities up front and **refuses** rather than answering. A silent "nothing
+changed" is the worst available failure and it is one syscall away from being the default.
+
+Two further measured refinements, because they decide what has to be supported rather than
+tolerated. A **file** rename is exact — it appears as a whiteout plus a full copy, with no
+`redirect` — so only **directory** renames need refusing; and `redirect_dir=on` *is* honoured when
+passed at mount time even though the module default is off, unlike `metacopy` below, so the refusal
+path is reachable in production rather than theoretical. Copy-up also stamps `origin` on files and
+`impure` on their parent directories, which must be tolerated as bookkeeping — treat them as
+unsupported markers and every real drain fails on its first edited file.
+
 This is not an optimisation of the drain, it is a different kind of answer. 0061's deferred
 overlay-diff drain (git-bug `66fc0e3`) wanted this and believed it needed a privileged mount on
 the node. A **stat cache** — comparing each file's `(size, mtime)` against the input manifest,
@@ -259,6 +278,12 @@ instead of 50 000 network round-trips. So refusing the service its capability co
 change-set exactness — never correctness, and never a second code path. **A build must report which
 rung it took**; a benchmark that silently drops a rung reports a number the real deployment would
 never produce.
+
+**The Farm rung is per-file, not per-build.** A clone can fail on an individual file while
+succeeding on its neighbours, so `Mixed` is a real outcome and the *counters* — how many were
+cloned, how many copied — are the reportable truth rather than a single label. Discovered while
+implementing s1; the two-rung table above reads as if a build picks one rung and keeps it, and that
+is a simplification.
 
 ### Vocabulary
 
