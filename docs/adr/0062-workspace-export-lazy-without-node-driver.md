@@ -275,6 +275,32 @@ consequences the drain must honour, each of which fails *silently* if it does no
   must be **resolved, not rejected**, or the design refuses precisely the renames part 2 requires
   it to support.
 
+**Durability is not local, and the cold upload stays on the critical path.** The paragraph above
+says the fold happens "with no network in the path", which is true of the *fold* and was allowed to
+imply something false about the *Attempt*. The service's own disk **is the warm tier**, and
+[0061](0061-workspace-data-path.md) part 4 requires a Workspace Snapshot to be durable before an
+Attempt is `Succeeded`, while 0061's retention table says warm is bounded by space, evicts, and
+promises nothing. 0061 also rejected exactly the shortcut this wording invited: *"writing warm-first
+and letting the service tier onward would make the warm tier load-bearing for durability, which part
+4 forbids."*
+
+**Decided: 0061 part 4 stands verbatim.** A change set is folded into the CAS locally *and then
+uploaded to cold before the Attempt may reach `Succeeded`*. A Step that exits 0 whose service dies
+immediately afterwards must not leave a green Attempt whose evidence is gone, and warm cannot promise
+otherwise — so a green Attempt always has its snapshot in the tier that makes a promise.
+
+The reason this is affordable, and it is the whole argument: **what gets uploaded is now only the
+change set.** Today's drain ships the *entire* workspace over the `exec` tar tunnel whether it
+changed or not. So an Export that folds locally and then uploads what the Step actually wrote moves
+**strictly less** than the status quo, while keeping a durability guarantee the status quo also has.
+The cold leg is a real cost and it is booked here rather than discovered in a benchmark: it is one
+upload per Step, sized by the change set, on the critical path to `Succeeded`.
+
+Two consequences worth naming. The upload cannot be skipped for content cold already holds without an
+existence primitive on the `ObjectStore` port, which is a filed gap — so the first implementation
+pays for content cold may already have. And the *laziness* this ADR buys is on the **read** side; the
+write side is bounded by the change set, not by interception, which is why part 5 exists.
+
 This is not an optimisation of the drain, it is a different kind of answer. 0061's deferred
 overlay-diff drain (git-bug `66fc0e3`) wanted this and believed it needed a privileged mount on
 the node. A **stat cache** — comparing each file's `(size, mtime)` against the input manifest,
@@ -594,6 +620,10 @@ what the design must do. Each is filed.
    durability. So either part 4 weakens or a cold upload stays on the critical path — and this ADR
    books neither. Unbooked cost, exactly what 0061's own "price of seeding the warm tier" section
    exists to avoid repeating.
+
+   **Answered: part 4 stands verbatim and the cold upload is on the critical path**, booked in part 3
+   above. The claim that moved is "no network in the path", which was true of the fold and false of
+   the Attempt.
 4. **`fsGroup` does not survive an NFS volume — PLAUSIBLE, strong, and possibly a blocker for part 2.**
    The executor sets `fs_group: WORKSPACE_GID` and comments that the restored `/workspace` is "owned
    by `WORKSPACE_GID` and only group-writable". The in-tree NFS plugin reports `Managed: false`, so
