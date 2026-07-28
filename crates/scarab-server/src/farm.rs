@@ -63,6 +63,50 @@
 //! after the rename. It is deliberately **not** made read-only by chmod — the mode
 //! bits inside a Farm are the snapshot's own, and forcing extra ones on top would
 //! break the fidelity contract this module exists to honour.
+//!
+//! # Leases: a Farm under a live Export must not be evictable
+//!
+//! A Farm is a cache object and cache objects get evicted, so "a miss is slower and
+//! never wrong" is the whole licence for evicting one. **That licence does not extend
+//! to a Farm something has already mounted**, and the cost of assuming it did was
+//! measured while red-teaming ADR-0062 rather than argued:
+//!
+//! ```text
+//! delete the lower entries while the overlay is mounted →
+//!   ls   of the merged directory : EMPTY
+//!   cat  of an already-read path : still returns content
+//!   write into the vanished dir  : rc=0
+//! ```
+//!
+//! So a Step whose Farm is evicted mid-run sees an empty tree, builds nothing, and
+//! **exits 0**. Not an error to retry — a green Attempt with no work in it, which is
+//! the fail-silently class ADR-0062 rejects read-set inference for, arriving through
+//! the back door. Eviction is therefore a *correctness* mechanism here and not
+//! housekeeping, and [`SnapshotFarm::evict`] fails closed.
+//!
+//! A [`FarmLease`] is one file at
+//! `<farms_dir>/`[`LEASES_DIR`]`/<root>/<holder>`. Three properties earn that shape:
+//!
+//! - **It is beside the Farm, never inside it.** A Farm *is* the `overlayfs`
+//!   lowerdir, so a bookkeeping file within it would appear in the Step's own
+//!   `/workspace` and — worse — would be a path the change-set reader then had to
+//!   have an opinion about. Scarab's own state must not be visible in a Workspace.
+//! - **It survives this process.** A lease held only in memory is released by
+//!   `SIGKILL`, which is precisely when the Export outlives the process that made
+//!   it; the restart sweep needs on-disk holders to reconcile against.
+//! - **It is not a count.** The holder's name is in the file name, so `evict`'s
+//!   refusal can say *which* Exports are in the way, and a double-release cannot
+//!   decrement a shared integer twice.
+//!
+//! Lease and evict race, and the race is closed by ordering rather than by a lock:
+//! [`SnapshotFarm::lease`] writes its file **before** confirming the Farm is built,
+//! while [`SnapshotFarm::evict`] renames the Farm out of its key **before**
+//! re-reading the holders. Every interleaving then ends in one of two safe states —
+//! evict refuses, or lease reports [`FarmError::NotBuilt`] and leaves nothing behind.
+//! What cannot happen is a lease being held over bytes that are already gone.
+//! `a_farm_cannot_be_evicted_under_a_live_lease` and
+//! `a_lease_taken_while_a_farm_is_being_evicted_does_not_survive_it` are the
+//! regressions.
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -85,6 +129,20 @@ use scarab_storage_s3::restore_dir_metadata;
 /// [`SnapshotFarm::is_built`], and a warm-tier sweeper may delete it once no
 /// process owns it.
 pub const STAGING_PREFIX: &str = ".building-";
+
+/// The directory holding every Farm's lease files, as a child of the farms
+/// directory: `<farms_dir>/`[`LEASES_DIR`]`/<root>/<holder>`.
+///
+/// Dotted, so it can never collide with a Farm's key — a key is 64 lowercase hex
+/// ([`valid_address`]) and this is not. **A warm-tier sweeper walking the farms
+/// directory must therefore treat only 64-hex names as Farms**; this and
+/// [`STAGING_PREFIX`] and [`EVICTING_PREFIX`] are the three names it must skip.
+pub const LEASES_DIR: &str = ".leases";
+
+/// The name prefix a Farm wears while it is being evicted — renamed out of its key
+/// so no new [`SnapshotFarm::lease`] can attach to it, and deleted immediately
+/// after. Residue under this prefix is a crashed eviction and is safe to delete.
+pub const EVICTING_PREFIX: &str = ".evicting-";
 
 /// Which rung of ADR-0062's Farm ladder a build actually took.
 ///
@@ -200,6 +258,25 @@ pub enum FarmError {
     },
     #[error("farm build did not complete: {0}")]
     Join(String),
+    /// [`SnapshotFarm::evict`] refusing, because something is still mounted on this
+    /// Farm. Names the holders rather than counting them, so an operator reading the
+    /// log learns *which* Exports are in the way.
+    #[error(
+        "farm {root} is still leased by {}: {}",
+        holders.len(),
+        holders.join(", ")
+    )]
+    Leased { root: String, holders: Vec<String> },
+    /// A lease was asked for a Farm that is not built — or that stopped being built
+    /// while the lease was being taken, which is eviction winning the race. Either
+    /// way the caller's move is the same: build it, then lease it again.
+    #[error("no farm is built for {0}")]
+    NotBuilt(String),
+    /// A lease holder's name becomes a file name, so it is checked exactly as a tree
+    /// entry name is ([`safe_name`]) — an Export id is generated, not authored, so
+    /// this rejects nothing a healthy caller produces.
+    #[error("lease holder is not a single safe path segment: {0:?}")]
+    UnsafeHolder(String),
 }
 
 fn io(op: &'static str, path: &Path, source: std::io::Error) -> FarmError {
@@ -219,6 +296,38 @@ pub struct SnapshotFarm {
     warm_dir: PathBuf,
     farms_dir: PathBuf,
     allow_reflink: bool,
+    /// Runs inside [`SnapshotFarm::evict`], between withdrawing the Farm and
+    /// re-reading its holders. See [`WithdrawHook`].
+    #[cfg(test)]
+    withdraw_hook: WithdrawHook,
+}
+
+/// A test-only seam into the one window in [`SnapshotFarm::evict`] that no thread
+/// schedule reaches reliably.
+///
+/// The guard being tested fires when a lease file appears *after* eviction's first
+/// holders read and *before* its rename — a window a few syscalls wide. A
+/// thread-timing test for it passes whether or not the guard exists (measured: 64
+/// rounds of `spawn`-versus-`evict` never once overlapped), which is worse than no
+/// test, because it reads as coverage. This makes the interleaving exact.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct WithdrawHook(Option<std::sync::Arc<dyn Fn() + Send + Sync>>);
+
+#[cfg(test)]
+impl WithdrawHook {
+    fn call(&self) {
+        if let Some(hook) = &self.0 {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for WithdrawHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "set" } else { "unset" })
+    }
 }
 
 /// Distinguishes concurrent staging directories within one process; the pid
@@ -239,6 +348,8 @@ impl SnapshotFarm {
             warm_dir,
             farms_dir,
             allow_reflink: true,
+            #[cfg(test)]
+            withdraw_hook: WithdrawHook::default(),
         }
     }
 
@@ -249,7 +360,17 @@ impl SnapshotFarm {
             warm_dir: warm_dir.into(),
             farms_dir: farms_dir.into(),
             allow_reflink: true,
+            #[cfg(test)]
+            withdraw_hook: WithdrawHook::default(),
         }
+    }
+
+    /// Install [`WithdrawHook`] — the test-only seam into [`Self::evict`]'s race
+    /// window.
+    #[cfg(test)]
+    fn with_withdraw_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.withdraw_hook = WithdrawHook(Some(std::sync::Arc::new(hook)));
+        self
     }
 
     /// Force the [`FarmRung::Copy`] rung even where the filesystem can clone.
@@ -371,6 +492,153 @@ impl SnapshotFarm {
         };
         build.log();
         Ok(build)
+    }
+
+    /// Where `root`'s lease files live. See [`LEASES_DIR`] on why beside and not
+    /// inside.
+    pub fn leases_dir_of(&self, root: &TreeHash) -> Result<PathBuf, FarmError> {
+        Ok(self.farms_dir.join(LEASES_DIR).join(valid_address(&root.0)?))
+    }
+
+    /// Claim `root`'s Farm on behalf of `holder`, so [`Self::evict`] will refuse it.
+    ///
+    /// `holder` identifies the thing that would break if the bytes vanished — an
+    /// Export id. Re-leasing under the same holder is idempotent (one holder, one
+    /// file), so a retry does not accumulate claims and a release cannot over-release.
+    ///
+    /// **The lease file is written before the built check, and that order is the race
+    /// closure** rather than an implementation detail — see the module docs. A Farm
+    /// that is not built (or that eviction is in the middle of taking away) is
+    /// [`FarmError::NotBuilt`], with the just-written file cleaned up.
+    pub fn lease(&self, root: &TreeHash, holder: &str) -> Result<FarmLease, FarmError> {
+        let dir = self.leases_dir_of(root)?;
+        let holder = safe_holder(holder)?;
+        std::fs::create_dir_all(&dir).map_err(|e| io("create the leases directory", &dir, e))?;
+        let path = dir.join(holder);
+        // `create`, not `create_new`: the same holder leasing twice is one claim.
+        File::create(&path).map_err(|e| io("write a lease", &path, e))?;
+
+        // Only now ask whether there is anything to hold. An eviction that renamed
+        // the Farm away before this point is reported as a miss; one that renamed it
+        // away after this point re-reads the holders and finds this file.
+        match self.is_built(root) {
+            Ok(true) => Ok(FarmLease {
+                path,
+                root: root.clone(),
+                holder: holder.to_string(),
+                released: false,
+            }),
+            Ok(false) => {
+                let _ = std::fs::remove_file(&path);
+                Err(FarmError::NotBuilt(root.0.clone()))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                Err(e)
+            }
+        }
+    }
+
+    /// Who currently holds `root`'s Farm, sorted. Empty is the common answer.
+    ///
+    /// A missing leases directory is no holders, not an error — nothing has ever
+    /// leased this Farm. Any other read failure *is* an error: an unreadable leases
+    /// directory answered as "nobody" is how the silent corruption above gets in.
+    pub fn holders(&self, root: &TreeHash) -> Result<Vec<String>, FarmError> {
+        let dir = self.leases_dir_of(root)?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io("read the leases directory", &dir, e)),
+        };
+        let mut holders = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| io("read a lease", &dir, e))?;
+            if let Some(name) = entry.file_name().to_str() {
+                holders.push(name.to_string());
+            }
+        }
+        holders.sort();
+        Ok(holders)
+    }
+
+    /// Whether anything holds `root`'s Farm.
+    pub fn is_leased(&self, root: &TreeHash) -> Result<bool, FarmError> {
+        Ok(!self.holders(root)?.is_empty())
+    }
+
+    /// Evict `root`'s Farm, returning the bytes freed. **Refuses while leased.**
+    ///
+    /// Idempotent: evicting a Farm that is not built frees nothing and is `Ok(0)`.
+    ///
+    /// The holders are read twice, either side of renaming the Farm out of its key,
+    /// and the rename is what makes the second read meaningful: once the key is gone,
+    /// [`Self::lease`]'s built check fails, so no new holder can appear after it. A
+    /// holder that appears *between* the two reads is caught by the second one and
+    /// the Farm is renamed back.
+    ///
+    /// If that restoring rename itself fails the Farm is left under an
+    /// [`EVICTING_PREFIX`] name and reported as [`FarmError::Io`]. That loses a cache
+    /// object, not data — a Farm is reconstructible from the CAS at any time — and it
+    /// is the one outcome here that is neither eviction nor refusal, so it is loud.
+    pub fn evict(&self, root: &TreeHash) -> Result<u64, FarmError> {
+        let farm_path = self.path_of(root)?;
+        let holders = self.holders(root)?;
+        if !holders.is_empty() {
+            return Err(FarmError::Leased {
+                root: root.0.clone(),
+                holders,
+            });
+        }
+        if !self.is_built(root)? {
+            return Ok(0);
+        }
+
+        let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+        let evicting = self.farms_dir.join(format!(
+            "{EVICTING_PREFIX}{}-{}-{seq}",
+            root.0,
+            std::process::id()
+        ));
+        match std::fs::rename(&farm_path, &evicting) {
+            Ok(()) => {}
+            // Another evictor got there first, or the Farm went away underneath.
+            // Both are "there is nothing here to free".
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(io("withdraw the farm for eviction", &farm_path, e)),
+        }
+
+        // A lease that appeared after the first read is caught here. This second read
+        // is the **safety** guard and the first one is only a fast path: without it
+        // the sequence `evict reads no holders` → `lease writes its file` → `lease
+        // sees the key still present and returns a live lease` → `evict deletes`
+        // leaves a holder over bytes that are gone, which is the corruption this
+        // module exists to prevent. `a_lease_written_between_evictions_two_reads_is_
+        // honoured` is the regression, and it needs the withdraw hook below to reach
+        // this window at all.
+        #[cfg(test)]
+        self.withdraw_hook.call();
+
+        let holders = self.holders(root)?;
+        if !holders.is_empty() {
+            std::fs::rename(&evicting, &farm_path)
+                .map_err(|e| io("restore a farm leased mid-eviction", &evicting, e))?;
+            return Err(FarmError::Leased {
+                root: root.0.clone(),
+                holders,
+            });
+        }
+
+        // Nothing can reach these bytes now: the key is gone and no lease survived.
+        let freed = tree_bytes(&evicting);
+        std::fs::remove_dir_all(&evicting).map_err(|e| io("delete an evicted farm", &evicting, e))?;
+        // Best-effort: an empty leases directory for a Farm that no longer exists is
+        // residue, and failing an otherwise-complete eviction over it would be worse
+        // than leaving it for the next sweep.
+        if let Ok(dir) = self.leases_dir_of(root) {
+            let _ = std::fs::remove_dir(&dir);
+        }
+        Ok(freed)
     }
 
     fn reused(&self, root: &TreeHash, path: PathBuf, started: Instant) -> FarmBuild {
@@ -563,6 +831,72 @@ struct Counts {
     bytes: u64,
 }
 
+/// A live claim on one Farm's bytes, held for as long as something depends on them.
+///
+/// Released on drop, and also released by the on-disk sweep if this process dies
+/// first — the file is the lease and this value is only the handle to it. Dropping is
+/// best-effort by necessity (`Drop` cannot fail), which is exactly why the durable
+/// half exists: [`SnapshotFarm::holders`] is the truth, and a lease whose Export is
+/// gone is reconciled by the restart sweep rather than trusted to a destructor that
+/// `SIGKILL` skips.
+#[derive(Debug)]
+pub struct FarmLease {
+    path: PathBuf,
+    root: TreeHash,
+    holder: String,
+    released: bool,
+}
+
+impl FarmLease {
+    /// The snapshot root whose Farm this holds.
+    pub fn root(&self) -> &TreeHash {
+        &self.root
+    }
+
+    /// Who holds it — the name in the lease file.
+    pub fn holder(&self) -> &str {
+        &self.holder
+    }
+
+    /// Release now rather than at end of scope, reporting failure.
+    ///
+    /// The same work as the [`Drop`] impl, except that a caller settling an Export can
+    /// see an `EIO` here. Dropping is silent because it has nowhere to put an error.
+    pub fn release(mut self) -> Result<(), FarmError> {
+        let result = match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            // Already released, or swept. The post-condition holds either way.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io("release a lease", &self.path, e)),
+        };
+        // `self` still drops at the end of this scope; the flag is what stops the
+        // destructor retrying the same unlink and warning about it. (`mem::forget`
+        // would also do that, and would leak these allocations on every settle.)
+        self.released = true;
+        result
+    }
+}
+
+impl Drop for FarmLease {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                // Loud, because the consequence is a Farm that can never be evicted
+                // and therefore a warm tier that fills up.
+                tracing::warn!(
+                    root = %self.root.0,
+                    holder = %self.holder,
+                    error = %e,
+                    "could not release a snapshot farm lease; the farm will not be evictable until it is swept"
+                );
+            }
+        }
+    }
+}
+
 /// A content address, or [`FarmError::BadAddress`]: exactly 64 lowercase hex
 /// characters, so it cannot be `..`, absolute, or anything else that escapes the
 /// directory it is joined onto.
@@ -592,6 +926,50 @@ fn safe_name<'a>(tree: &TreeHash, name: &'a str) -> Result<&'a str, FarmError> {
         });
     }
     Ok(name)
+}
+
+/// A lease holder's name as one path segment, or [`FarmError::UnsafeHolder`].
+///
+/// Same rule as [`safe_name`] and the same reason — this string is joined onto a path
+/// — with one addition: a holder may not start with `.`, so a holder can never be
+/// mistaken for [`LEASES_DIR`], [`STAGING_PREFIX`] or [`EVICTING_PREFIX`] residue by a
+/// sweeper reading these directories by name.
+fn safe_holder(holder: &str) -> Result<&str, FarmError> {
+    if holder.is_empty()
+        || holder.starts_with('.')
+        || holder.contains('/')
+        || holder.contains('\0')
+    {
+        return Err(FarmError::UnsafeHolder(holder.to_string()));
+    }
+    Ok(holder)
+}
+
+/// Total bytes of the regular files under `dir`, descending no symlink.
+///
+/// Sizing an evicted Farm, so it reports what the warm tier got back. `DirEntry`'s
+/// `metadata` is `lstat` (not the traversing free function), which matters here more
+/// than on the flat `blobs/`+`trees/` volume `workspaced::dir_size` walks: a Farm is a
+/// materialised tree and holds a snapshot's symlinks as symlinks, so descending them
+/// would double-count an aliased subtree and would not terminate on a link to `.` or
+/// to an ancestor.
+fn tree_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for item in read.flatten() {
+            let Ok(meta) = item.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(item.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
 }
 
 /// The mode a fresh `File::create` gets on this volume — i.e. `0o666 & !umask`.
@@ -1514,5 +1892,290 @@ mod tests {
             "{err}"
         );
         assert!(!farm.is_built(&root).expect("is_built"));
+    }
+
+    // ---- leases (ADR-0062 s8's correctness half; git-bug cba7165) ----
+
+    /// **The measured silent corruption, made impossible.** Deleting a Farm under a
+    /// live overlay gives the Step an empty `ls`, writes that return rc=0, and an
+    /// exit 0 with nothing built. So a leased Farm must refuse to be evicted, the
+    /// refusal must name the holder, and the bytes must still be there afterwards.
+    #[tokio::test]
+    async fn a_farm_cannot_be_evicted_under_a_live_lease() {
+        let tmp = TempDir::new().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        let (_cas, root) = warm_with_fixture(&warm, &tmp.path().join("src")).await;
+        let farm = SnapshotFarm::new(&warm);
+        let built = farm.build(&root).await.expect("build");
+
+        let lease = farm.lease(&root, "export-abc123").expect("lease");
+        assert_eq!(lease.root(), &root);
+        assert_eq!(farm.holders(&root).expect("holders"), ["export-abc123"]);
+        assert!(farm.is_leased(&root).expect("is_leased"));
+
+        let err = farm.evict(&root).expect_err("a leased farm must not be evicted");
+        match &err {
+            FarmError::Leased { root: r, holders } => {
+                assert_eq!(*r, root.0);
+                assert_eq!(holders, &["export-abc123"]);
+            }
+            other => panic!("expected Leased, got {other}"),
+        }
+        // The refusal must name the holder in its message too — this is what an
+        // operator reads when the warm tier will not shrink.
+        assert!(
+            err.to_string().contains("export-abc123"),
+            "the refusal must name the holder: {err}"
+        );
+
+        assert!(farm.is_built(&root).expect("is_built"));
+        assert_eq!(
+            std::fs::read(built.path.join("plain.txt")).expect("read through the farm"),
+            b"plain",
+            "the lower layer must still hold its bytes"
+        );
+    }
+
+    /// Releasing the last lease hands the Farm back to the evictor, and the eviction
+    /// reports what it freed — the number a warm-tier space bound is driven by.
+    #[tokio::test]
+    async fn releasing_the_last_lease_makes_a_farm_evictable_and_reports_the_bytes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        let (_cas, root) = warm_with_fixture(&warm, &tmp.path().join("src")).await;
+        let farm = SnapshotFarm::new(&warm);
+        let built = farm.build(&root).await.expect("build");
+        let on_disk = tree_bytes(&built.path);
+        assert!(on_disk > 0, "the fixture has file bytes");
+
+        let one = farm.lease(&root, "export-one").expect("lease one");
+        let two = farm.lease(&root, "export-two").expect("lease two");
+        assert_eq!(farm.holders(&root).expect("holders").len(), 2);
+
+        one.release().expect("release one");
+        assert!(
+            farm.evict(&root).is_err(),
+            "one remaining holder is still a holder"
+        );
+
+        two.release().expect("release two");
+        assert!(farm.holders(&root).expect("holders").is_empty());
+
+        let freed = farm.evict(&root).expect("an unleased farm evicts");
+        assert_eq!(freed, on_disk, "eviction must report the bytes it freed");
+        assert!(!farm.is_built(&root).expect("is_built"));
+        assert!(
+            !farm.leases_dir_of(&root).expect("leases dir").exists(),
+            "an evicted farm leaves no leases directory behind"
+        );
+    }
+
+    /// Dropping a lease releases it, because the common path is a guard held for the
+    /// life of an Export and never explicitly released.
+    #[tokio::test]
+    async fn a_dropped_lease_is_released() {
+        let tmp = TempDir::new().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        let (_cas, root) = warm_with_fixture(&warm, &tmp.path().join("src")).await;
+        let farm = SnapshotFarm::new(&warm);
+        farm.build(&root).await.expect("build");
+
+        {
+            let _lease = farm.lease(&root, "export-scoped").expect("lease");
+            assert!(farm.is_leased(&root).expect("is_leased"));
+        }
+        assert!(
+            !farm.is_leased(&root).expect("is_leased"),
+            "the lease must not outlive its guard"
+        );
+        farm.evict(&root).expect("evictable once the guard is gone");
+    }
+
+    /// **A lease must never be visible inside the Farm.** A Farm is the `overlayfs`
+    /// lowerdir, so a bookkeeping file within it would show up in the Step's own
+    /// `/workspace` and in the change set the drain reads back.
+    #[tokio::test]
+    async fn a_lease_is_beside_the_farm_and_never_inside_it() {
+        let tmp = TempDir::new().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        let (_cas, root) = warm_with_fixture(&warm, &tmp.path().join("src")).await;
+        let farm = SnapshotFarm::new(&warm);
+        let built = farm.build(&root).await.expect("build");
+
+        let before = facts(&built.path);
+        let _lease = farm.lease(&root, "export-invisible").expect("lease");
+
+        assert_eq!(
+            facts(&built.path),
+            before,
+            "leasing changed what a Step would see in its workspace"
+        );
+        let leases = farm.leases_dir_of(&root).expect("leases dir");
+        assert!(leases.exists(), "the lease is on disk");
+        assert!(
+            !leases.starts_with(&built.path),
+            "{} must not be under the farm at {}",
+            leases.display(),
+            built.path.display()
+        );
+    }
+
+    /// One holder is one claim, so a retried prepare cannot accumulate leases that
+    /// nothing will ever release.
+    #[tokio::test]
+    async fn re_leasing_under_the_same_holder_is_one_claim() {
+        let tmp = TempDir::new().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        let (_cas, root) = warm_with_fixture(&warm, &tmp.path().join("src")).await;
+        let farm = SnapshotFarm::new(&warm);
+        farm.build(&root).await.expect("build");
+
+        let first = farm.lease(&root, "export-same").expect("first");
+        let second = farm.lease(&root, "export-same").expect("second");
+        assert_eq!(farm.holders(&root).expect("holders"), ["export-same"]);
+
+        first.release().expect("release the first handle");
+        drop(second);
+        assert!(farm.holders(&root).expect("holders").is_empty());
+    }
+
+    /// A lease on a Farm that is not built is a reported miss, and it leaves no file
+    /// behind — otherwise a failed prepare would pin a Farm that never existed and
+    /// the space bound could never reclaim it.
+    #[tokio::test]
+    async fn leasing_an_unbuilt_farm_is_a_miss_and_leaves_nothing_behind() {
+        let tmp = TempDir::new().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        std::fs::create_dir_all(&warm).expect("mkdir warm");
+        let farm = SnapshotFarm::new(&warm);
+        let root = TreeHash("d".repeat(64));
+
+        let err = farm
+            .lease(&root, "export-nothing")
+            .expect_err("nothing to lease");
+        assert!(matches!(&err, FarmError::NotBuilt(h) if *h == root.0), "{err}");
+        assert!(
+            farm.holders(&root).expect("holders").is_empty(),
+            "a failed lease must not leave a holder behind"
+        );
+    }
+
+    /// A holder name becomes a file name, so it is checked like a tree entry name —
+    /// and additionally may not be dotted, or a sweeper reading these directories by
+    /// name could not tell a holder from its own residue.
+    #[tokio::test]
+    async fn an_unsafe_lease_holder_is_refused() {
+        let tmp = TempDir::new().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        let (_cas, root) = warm_with_fixture(&warm, &tmp.path().join("src")).await;
+        let farm = SnapshotFarm::new(&warm);
+        farm.build(&root).await.expect("build");
+
+        for bad in ["", "..", ".", "a/b", "../../etc/passwd", ".leases", "a\0b"] {
+            let err = farm
+                .lease(&root, bad)
+                .expect_err(&format!("{bad:?} must be refused"));
+            assert!(
+                matches!(err, FarmError::UnsafeHolder(_)),
+                "{bad:?} produced {err}"
+            );
+        }
+        assert!(
+            farm.holders(&root).expect("holders").is_empty(),
+            "a refused holder must not reach the disk"
+        );
+    }
+
+    /// Evicting what is not there frees nothing and is not an error — a space bound
+    /// races its own candidate list, and two evictors picking the same Farm is normal.
+    #[tokio::test]
+    async fn evicting_a_farm_that_is_not_built_frees_nothing() {
+        let tmp = TempDir::new().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        std::fs::create_dir_all(&warm).expect("mkdir warm");
+        let farm = SnapshotFarm::new(&warm);
+        assert_eq!(farm.evict(&TreeHash("e".repeat(64))).expect("no-op"), 0);
+    }
+
+    /// **Race half one: a Farm withdrawn for eviction cannot be leased.**
+    ///
+    /// Deterministic, because the withdrawn state is just a rename and this test can
+    /// perform it. This is what makes `lease`'s "write the file, *then* check built"
+    /// order safe: a lease that lands after eviction has taken the key away discovers
+    /// it and cleans up after itself, so nothing is left pinning a deleted Farm.
+    #[tokio::test]
+    async fn a_farm_withdrawn_for_eviction_cannot_be_leased() {
+        let tmp = TempDir::new().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        let (_cas, root) = warm_with_fixture(&warm, &tmp.path().join("src")).await;
+        let farm = SnapshotFarm::new(&warm);
+        let built = farm.build(&root).await.expect("build");
+
+        // Exactly what `evict` does before it deletes anything.
+        let withdrawn = farm.farms_dir().join(format!("{EVICTING_PREFIX}{}-x-0", root.0));
+        std::fs::rename(&built.path, &withdrawn).expect("withdraw the farm");
+
+        let err = farm
+            .lease(&root, "export-late")
+            .expect_err("a withdrawn farm must not be leasable");
+        assert!(matches!(&err, FarmError::NotBuilt(h) if *h == root.0), "{err}");
+        assert!(
+            farm.holders(&root).expect("holders").is_empty(),
+            "a lease that lost the race must not leave a holder pinning a deleted farm"
+        );
+    }
+
+    /// **Race half two: a lease written inside eviction's own window is honoured.**
+    ///
+    /// The window is between eviction's first holders read and its rename — a few
+    /// syscalls wide, and a thread-timing test for it passes whether or not the guard
+    /// exists (measured: 64 rounds of `spawn`-versus-`evict` never overlapped once).
+    /// So the interleaving is made exact with [`WithdrawHook`], which writes the lease
+    /// file the way a racing `lease` call would have.
+    ///
+    /// Without the post-withdraw holders read, eviction deletes the Farm here and the
+    /// holder survives over bytes that no longer exist — a Step with an empty
+    /// `/workspace` that exits 0.
+    #[tokio::test]
+    async fn a_lease_written_between_evictions_two_reads_is_honoured() {
+        let tmp = TempDir::new().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        let (_cas, root) = warm_with_fixture(&warm, &tmp.path().join("src")).await;
+
+        let racer = SnapshotFarm::new(&warm);
+        let leases = racer.leases_dir_of(&root).expect("leases dir");
+        let farm = SnapshotFarm::new(&warm).with_withdraw_hook(move || {
+            // A `lease` call that got its file down while the key was still in place.
+            std::fs::create_dir_all(&leases).expect("mkdir leases");
+            std::fs::write(leases.join("export-racer"), b"").expect("write the lease");
+        });
+        let built = farm.build(&root).await.expect("build");
+
+        let err = farm
+            .evict(&root)
+            .expect_err("a lease inside the window must stop the eviction");
+        match &err {
+            FarmError::Leased { holders, .. } => assert_eq!(holders, &["export-racer"]),
+            other => panic!("expected Leased, got {other}"),
+        }
+
+        assert!(
+            farm.is_built(&root).expect("is_built"),
+            "the farm must be restored to its key, not left withdrawn"
+        );
+        assert_eq!(
+            std::fs::read(built.path.join("plain.txt")).expect("read through the restored farm"),
+            b"plain",
+            "the restored farm must still hold its bytes"
+        );
+        assert!(
+            !farm
+                .farms_dir()
+                .read_dir()
+                .expect("read farms dir")
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(EVICTING_PREFIX)),
+            "a refused eviction must leave no withdrawn residue"
+        );
     }
 }
