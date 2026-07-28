@@ -1111,6 +1111,17 @@ scarab_workspace_warm_volume_read_failed_total {}
 
 /// Total bytes under `dir`, following no symlinks. Blocking; called from
 /// `spawn_blocking`.
+///
+/// **`DirEntry::metadata` is `lstat`, not `stat`** — unlike the free
+/// `fs::metadata`, it does not traverse a link — and that is load-bearing rather
+/// than incidental now that ADR-0062 puts Snapshot Farms under
+/// `<warm_dir>/farms`. The warm tier used to hold only `blobs/` and `trees/`,
+/// flat directories of regular files, so there was no link here to follow. A Farm
+/// is a materialised *tree* and recreates a snapshot's symlinks as symlinks
+/// (`farm::SnapshotFarm::fill`), so this walk now meets them, and swapping in the
+/// traversing call would cost two ways: a link to a directory inside the same
+/// Farm counts that subtree twice, and a link to `.` or to an ancestor makes this
+/// loop without bound, wedging the task that owns the warm-size metric.
 fn dir_size(dir: &std::path::Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![dir.to_path_buf()];
@@ -1119,7 +1130,9 @@ fn dir_size(dir: &std::path::Path) -> u64 {
             continue;
         };
         for item in read.flatten() {
-            // `symlink_metadata`: never follow a link out of the warm volume.
+            // `lstat`, per the note above. A symlink is then neither a dir nor a
+            // file here, so it is skipped: its own bytes are the target path,
+            // which the blob it was built from already accounts for.
             let Ok(meta) = item.metadata() else { continue };
             if meta.is_dir() {
                 stack.push(item.path());
@@ -1159,6 +1172,35 @@ mod tests {
         assert_eq!(
             hash_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// The warm-size walk must not descend a symlink, because ADR-0062's Farms
+    /// put symlinks on the warm volume for the first time.
+    ///
+    /// `alias` points at a sibling directory, so a walk that follows it counts
+    /// `nested/big` twice and reports 2024. That is the assertion, because it
+    /// fails cleanly.
+    ///
+    /// The **worse** case is deliberately not fixtured here: a link to `.` or to
+    /// an ancestor makes a following walk recurse without bound, and a test for
+    /// it would *hang* under the mutation it is meant to catch rather than fail.
+    /// The one `lstat` excludes both; only one of them can be asserted on.
+    /// (A mutual pair — `a -> b`, `b -> a` — is not the unbounded case: the
+    /// kernel answers `ELOOP` and even the following walk skips it.)
+    #[test]
+    fn the_warm_size_walk_does_not_descend_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/big"), vec![b'x'; 1000]).unwrap();
+        std::fs::write(root.join("small"), vec![b'y'; 24]).unwrap();
+        std::os::unix::fs::symlink("nested", root.join("alias")).unwrap();
+
+        assert_eq!(
+            dir_size(root),
+            1024,
+            "only the two real files count: a followed `alias` reports 2024"
         );
     }
 
