@@ -219,6 +219,25 @@ An `overlayfs` upper directory contains precisely the paths the Step touched, pu
 kernel. The drain reads the upper, hashes only those files, folds them into the CAS and returns a
 new snapshot root — **all on the service's own local disk, with no network in the path.**
 
+**"Hashes only those files" is true of the snapshot *root* and false of the *content identity*, and
+that was measured by building the fold rather than reasoned about here.** The two coordinates are
+not symmetric: a **root** is an address, so an untouched subtree can be carried forward by naming
+its hash and nothing needs reading. A **content identity** is not an address — nothing is stored
+under one and nothing can be fetched by one (see [CONTEXT.md](../../CONTEXT.md) §4.2) — so a subtree
+carried by hash has a *known root* and an **unknown identity**, and every rebuilt directory level
+must walk its untouched siblings to compute theirs: one `tree_entries` per directory, recursively.
+
+The consequence is shaped opposite to intuition and is worth stating plainly, because it inverts
+which edit is cheap: **a change deep in the tree costs little and a change near the root costs an
+identity walk of most of the parent.** Editing `README.md` at the workspace root is the expensive
+case, not editing one file under `target/`.
+
+This is local work against the warm tier, so "no network in the path" stands unharmed — but it is
+work, and an ADR whose entire argument is about per-file cost should not have left it unbooked. The
+fold memoises within one settle, which bounds it to one walk per directory rather than one per
+reference; that is a constant factor, not a structural fix. The structural fix is a persisted
+`snapshot root → content identity` index in the warm tier, which is filed rather than decided here.
+
 **Reading a change set must fail closed on missing privilege, and the reason is nastier than it
 looks.** An upper layer records deletions as whiteouts (a character device with `rdev == 0`) and
 wholesale directory replacements as the `trusted.overlay.opaque` xattr. `trusted.*` xattrs are
@@ -309,11 +328,40 @@ so they are two ladders, not one:
 | Export build | needs | change set |
 |---|---|---|
 | `overlayfs`, Farm as lower | service pod `CAP_SYS_ADMIN` | **exact** (the upper layer) |
-| writable copy of the Farm | nothing | stat cache — `(size, mtime)` approximation |
+| writable copy of the Farm | nothing | stat cache — `(size, mtime, ctime)` approximation |
 
 Every live rung produces an identical tree, and the slowest is a **local** copy at disk speed
 instead of 50 000 network round-trips. **A build must report which rung it took**; a benchmark that
 silently drops a rung reports a number the real deployment would never produce.
+
+Two corrections to that paragraph, both found while building the rungs.
+
+**"Identical tree" has one exception, and it is a refusal rather than a wrong tree.** The copy rung
+*reads* the Farm and the overlay rung never does — it only names it as a lowerdir and lets the kernel
+read it. So a Farm entry whose recorded mode denies read to the service's uid (a `0o000` file, which
+the fidelity contract obliges the Farm to reproduce faithfully) builds on the overlay rung and
+**fails** on the copy rung. Loud, and therefore acceptable; recorded because "identical" invited the
+opposite assumption.
+
+**The rung table above is missing a row, and the omission looks accidental.** The *Farm* ladder's top
+rung is `reflink`, and a Farm and its Exports live on **one filesystem** by construction — part 1
+puts farms on the warm volume precisely so a clone cannot cross a filesystem boundary. So "a writable
+copy of the Farm" could be a **CoW clone** of it: nearly free, metadata-exact per entry, and correct
+for exactly the reason the overlay rung is correct, since copy-on-write independence is what a reflink
+provides. That would make the unprivileged Export rung nearly as cheap as the privileged one wherever
+the filesystem clones, which materially weakens the case for `CAP_SYS_ADMIN` being *preferred*. What
+it would not change is the change set: that stays the stat-cache approximation, which remains the real
+reason to prefer the overlay. Filed, not built.
+
+**And the two columns of this table must not be independently reachable.** The change-set column is
+not a note about what the drain *tends* to do, it is a constraint on what it *can* do: an upper layer
+read from the copy rung reports every inherited file as written and **no deletion at all**, because
+nothing on that disk distinguishes the two. Reading it as an overlay upper therefore publishes a
+snapshot in which everything the Step deleted has silently returned. This shipped as a real defect —
+the seam carried an overlay-marker value across both rungs — and the fix was to make the wrong
+pairing unrepresentable in the type rather than to document against it. The lesson generalises to
+every row of every ladder in this ADR: **if two rungs need different drains, the rung must choose the
+drain.**
 
 **What refusing the capability actually costs.** The first version of this sentence said "never
 correctness, and never a second code path", which was wrong on both halves and was corrected once to
@@ -530,6 +578,16 @@ what the design must do. Each is filed.
    the fail-silently class this ADR rejects read-set inference for. Nothing refcounts Farms against
    live Exports today, and the `actimeo` argument ("the lower layer is immutable by construction")
    inherits the same assumption. Reaping is therefore a correctness mechanism, not housekeeping.
+
+   **Addressed in s4, and the same failure turned out to have a second route this finding did not
+   name.** Farms now carry on-disk leases and an eviction fails closed while one is held. But an
+   *empty tree served to a Step* does not require an eviction at all: a **service restart** destroys
+   the overlay mount with the old mount namespace, and an Export whose record is then adopted from
+   disk points at a `merged/` directory that is no longer a mountpoint — empty, writable, rc=0, exit
+   0. Identical symptom, no Farm touched. So the invariant to hold is not "do not evict a leased
+   Farm" but **"never hand out a Workspace that is not backed by what its record says"**, which
+   costs a mountpoint check at claim time and a re-mount on adoption. Recorded because the narrower
+   framing is what let it hide: the guard was built, tested, and the hole was beside it.
 3. **Part 3's "no network in the path" collides with 0061 part 4 — CONFIRMED (documents).** Folding a
    change set into the CAS on the service's own disk lands it in the **warm** tier, and 0061 part 4
    requires durability before `Succeeded` while 0061 explicitly forbids making warm load-bearing for
@@ -567,6 +625,18 @@ what the design must do. Each is filed.
    mount was actually NFS. A spike shaped only to produce a number will produce one.
 
 ## Open — deliberately not decided here
+
+- **The exact path has never executed, and every green test exercises the approximate one.** This is
+  the most important caveat on this ADR's status and it is easy to miss, because the code is written,
+  reviewed and tested. Part 3's argument — that the rungs "do not differ in correctness" because the
+  upper layer is the kernel's own record — rests entirely on the **overlay** rung. Reaching it needs
+  a privileged Linux host with a Rust toolchain, which nothing in this repo's loop has: the dogfood
+  node has no Rust, GitHub Actions is quota-blocked, and darwin cannot mount `overlayfs` at all. So
+  the mount, the resulting upper layer, and `read_change_set` against a real one are all unexecuted,
+  while the **copy** rung — whose change set is the `(size, mtime, ctime)` approximation — is what
+  every passing test covers. A reader should treat "the change set is exact" as *designed and
+  unverified*, not as *working*. Tracked as the tier problem rather than as a bug in any one slice
+  (git-bug `0ad393c`), because the missing thing is a place to run it.
 
 - **Operations-per-second under latency, measured, for a `cargo`-shaped write workload against a
   real in-cluster Export.** This is the one unpriced number in the design and it is the number that
