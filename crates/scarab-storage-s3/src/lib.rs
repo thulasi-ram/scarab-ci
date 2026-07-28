@@ -68,8 +68,12 @@ use std::time::Instant;
 use async_trait::async_trait;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore as OsObjectStore, ObjectStoreExt};
+use scarab_storage::statcache::{
+    DrainTally, Observed, Reason as StatReason, StatCache, Verdict,
+};
 use scarab_storage::{
-    BlobHash, Cas, ObjectStore, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget,
+    system_time_from_unix_ms, BlobHash, Cas, ObjectStore, Snapshot, StorageError, TreeEntry,
+    TreeHash, TreeTarget,
 };
 
 /// How many object-store round-trips a single CAS leg keeps in flight.
@@ -237,6 +241,9 @@ struct Stored {
 #[derive(Default)]
 struct Counters {
     files: u64,
+    /// Files whose blob hash came from the stat-cache baseline, so they were
+    /// never read, hashed, or asked about (ADR-0062 part 3).
+    blobs_reused: u64,
     trees: u64,
     objects_put: u64,
     objects_present: u64,
@@ -287,6 +294,13 @@ enum WalkEntry {
     Blob {
         name: String,
         path: std::path::PathBuf,
+        /// Byte length from the walk's `lstat`. Not part of a tree entry — it is
+        /// here for the stat cache, which compares it against the baseline's
+        /// (ADR-0062 part 3).
+        size: u64,
+        /// Inode-change time from the same `lstat`. Also not part of a tree
+        /// entry, and for the same reason — see [`ctime_ms`].
+        ctime_ms: Option<i64>,
         mode: u32,
         mtime_ms: Option<i64>,
     },
@@ -355,6 +369,8 @@ fn walk(
             entries.push(WalkEntry::Blob {
                 name,
                 path: item.path(),
+                size: meta.len(),
+                ctime_ms: ctime_ms(&meta),
                 mode: meta.permissions().mode() & 0o7777,
                 mtime_ms: mtime_ms(&meta),
             });
@@ -366,6 +382,19 @@ fn walk(
 
 fn missing(what: &str) -> StorageError {
     StorageError::Backend(format!("internal: {what} was not resolved during ingest"))
+}
+
+/// A walked path as a [`StatCache`] keys it: workspace-relative, `/`-separated,
+/// no leading slash — the `FlatEntry` convention.
+///
+/// A path that is somehow not under `root` falls back to itself, which cannot
+/// match any baseline key and so re-reads the file. That is the safe direction,
+/// and it is the only direction this function is allowed to be wrong in.
+fn relative(root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 impl S3Storage {
@@ -422,12 +451,28 @@ impl S3Storage {
     /// `tar` legs this replaces preserved both, an executable that returns
     /// `0644` cannot be run, and cargo/make/tsc decide what to rebuild by
     /// comparing timestamps.
-    async fn ingest_tree(&self, root: std::path::PathBuf) -> Result<Snapshot, StorageError> {
+    ///
+    /// With a `baseline` (ADR-0062 part 3), phase 2 skips a file the baseline
+    /// still vouches for **entirely**: no read, no hash, and no `head` either —
+    /// the blob is reachable from the input snapshot the baseline describes, so a
+    /// drain that could not trust it to be stored could not have trusted the
+    /// checkout it was handed. That is the whole win; ADR-0061 measured the
+    /// read-to-hash at 88% of a drain leg, and the round-trip is the other thing
+    /// it went after. Phase 3 is untouched: the tree entry is always built from
+    /// what the walk saw on disk, never from the baseline, so a file whose mode
+    /// moved while its bytes stood still gets the same blob and a **different**
+    /// entry.
+    async fn ingest_tree(
+        &self,
+        root: std::path::PathBuf,
+        baseline: Option<&StatCache>,
+    ) -> Result<(Snapshot, DrainTally), StorageError> {
         use futures::StreamExt;
 
         let started = Instant::now();
         let limit = self.concurrency;
         let mut counters = Counters::default();
+        let mut tally = DrainTally::default();
 
         // --- Phase 1: walk. Local syscalls only, nothing in flight. ----------
         let t = Instant::now();
@@ -447,17 +492,56 @@ impl S3Storage {
         for (d, dir) in arena.iter().enumerate() {
             for (e, entry) in dir.entries.iter().enumerate() {
                 match entry {
-                    WalkEntry::Blob { path, .. } => {
-                        jobs.push((d, e, BlobSource::File(path.clone())))
+                    WalkEntry::Blob {
+                        path,
+                        size,
+                        ctime_ms,
+                        mtime_ms,
+                        ..
+                    } => {
+                        // With no baseline every file is read, which is exactly
+                        // what every drain did before ADR-0062 part 3 — spelled
+                        // as a verdict so the one tally covers both modes.
+                        let verdict = match baseline {
+                            Some(cache) => cache.verdict(
+                                &relative(&root, path),
+                                &Observed {
+                                    size: *size,
+                                    mtime_ms: *mtime_ms,
+                                    ctime_ms: *ctime_ms,
+                                    is_symlink: false,
+                                },
+                            ),
+                            None => Verdict::Rehash(StatReason::Unknown),
+                        };
+                        // Each counter is incremented *in the arm that takes the
+                        // action it names*, never from the verdict alone, so
+                        // `hashed == 0` cannot be true of a drain that queued a
+                        // read anyway.
+                        match verdict {
+                            Verdict::Reuse(blob) => {
+                                tally.reused += 1;
+                                hashes[d][e] = Some(blob);
+                            }
+                            Verdict::Rehash(_) => {
+                                tally.hashed += 1;
+                                jobs.push((d, e, BlobSource::File(path.clone())));
+                            }
+                        }
                     }
                     WalkEntry::Symlink { dest, .. } => {
+                        // A symlink's "content" is the link target the walk
+                        // already read — never trusted from a baseline (nothing
+                        // records a link's mtime), never a content read either.
+                        tally.links += 1;
                         jobs.push((d, e, BlobSource::Link(dest.clone())))
                     }
                     WalkEntry::Dir { .. } => {}
                 }
             }
         }
-        counters.files = jobs.len() as u64;
+        counters.files = tally.total();
+        counters.blobs_reused = tally.reused;
 
         let mut stream = futures::stream::iter(jobs)
             .map(|(d, e, src)| async move {
@@ -575,6 +659,12 @@ impl S3Storage {
         tracing::info!(
             cas = "ingest",
             files = counters.files,
+            // ADR-0062's "a build must report which rung it took", for the drain:
+            // `blobs_reused` is how much of the read-to-hash the stat cache
+            // actually bought, and `0` with a baseline wired is a live signal
+            // that it is buying nothing.
+            baseline = baseline.is_some(),
+            blobs_reused = counters.blobs_reused,
             trees = counters.trees,
             objects_put = counters.objects_put,
             objects_present = counters.objects_present,
@@ -593,11 +683,51 @@ impl S3Storage {
             .next()
             .flatten()
             .ok_or_else(|| missing("the root tree"))?;
-        Ok(Snapshot {
-            root,
-            identity: identities.into_iter().next().flatten(),
-        })
+        Ok((
+            Snapshot {
+                root,
+                identity: identities.into_iter().next().flatten(),
+            },
+            tally,
+        ))
     }
+
+    /// Snapshot a directory tree the way [`Cas::ingest`] does, but skipping the
+    /// read-and-hash of every file the `baseline` still vouches for — the
+    /// **no-Export drain** of ADR-0062 part 3.
+    ///
+    /// `baseline` describes the *input* snapshot this Workspace was materialised
+    /// from, and **when that was true**. Its correctness argument, and the one
+    /// way to break it, are in [`scarab_storage::statcache`]; the short version is
+    /// that a stale "unchanged" silently publishes the wrong bytes under the
+    /// right hash, so the comparison re-reads on any doubt at all.
+    ///
+    /// Returns the snapshot and a [`DrainTally`] — what the drain actually did,
+    /// which is the only honest way to assert that an untouched checkout cost
+    /// nothing.
+    pub async fn ingest_with_baseline(
+        &self,
+        path: &str,
+        baseline: &StatCache,
+    ) -> Result<(Snapshot, DrainTally), StorageError> {
+        self.ingest_tree(std::path::PathBuf::from(path), Some(baseline))
+            .await
+    }
+}
+
+/// A file's **inode-change** time as unix-ms — `st_ctime`/`st_ctime_nsec`.
+///
+/// Not part of a tree entry and never will be: a ctime describes *this
+/// checkout's inode*, not the Workspace Snapshot the checkout came from. It
+/// exists for the stat cache, where it is the only timestamp userspace cannot
+/// forge (see `scarab_storage::statcache`) — `utimensat` moves an mtime anywhere
+/// but bumps ctime to now while doing it, and there is no syscall for ctime at
+/// all.
+fn ctime_ms(meta: &std::fs::Metadata) -> Option<i64> {
+    use std::os::unix::fs::MetadataExt;
+    meta.ctime()
+        .checked_mul(1_000)?
+        .checked_add(meta.ctime_nsec() / 1_000_000)
 }
 
 /// A file's mtime as unix-ms, or `None` if the platform will not report one.
@@ -612,40 +742,104 @@ fn mtime_ms(meta: &std::fs::Metadata) -> Option<i64> {
     }
 }
 
-/// A unix-ms timestamp as a `SystemTime`. Pre-epoch values are negative and go
-/// backwards rather than being dropped.
-fn system_time(ms: i64) -> std::time::SystemTime {
-    let epoch = std::time::SystemTime::UNIX_EPOCH;
-    if ms >= 0 {
-        epoch + std::time::Duration::from_millis(ms as u64)
-    } else {
-        epoch - std::time::Duration::from_millis(ms.unsigned_abs())
-    }
-}
-
-/// Restore `mtime_ms` then `mode` on an existing **directory**. Order matters:
-/// chmod-ing to `0o500` first would make it impossible to reopen for the time
-/// set. Failures are surfaced, not swallowed — a silently-unfaithful checkout is
-/// the exact class of bug ADR-0061 s7 exists to close.
+/// Restore `mtime_ms` then `mode` on an existing **directory** — and the one
+/// statement, for the whole workspace, of the order those writes happen in.
 ///
-/// Files do not come through here: [`write_file`] does the same two operations on
-/// the handle it already holds (see the syscall note there).
-fn apply_metadata(
+/// # Why the order is what it is (ADR-0061 s7)
+///
+/// A faithful checkout restores three things per path — content, mtime, mode —
+/// and the sequence is forced, not chosen. The two halves fail *differently*, and
+/// keeping them straight is the difference between a loud bug and a silent one:
+///
+/// 1. **Content before mtime — the silent one.** Writing bytes bumps the mtime to
+///    *now*, so a time set before the last write is simply undone by that write,
+///    with no error anywhere; the checkout is merely wrong, and a build tool then
+///    rebuilds (or skips) the wrong things. For a *directory* the "content" is its
+///    *children*: creating an entry bumps the parent's mtime. That is why every
+///    caller of this function defers the whole directory pass until each
+///    descendant exists, and then walks the directories **deepest-last** — the
+///    `mtime` argument here is worthless if the subtree is not finished.
+/// 2. **mtime before mode — the loud one.** `futimens` needs an open fd, and
+///    `File::open` on a directory needs the owner *read* bit. Restore the mode
+///    first and a directory recorded `0o300` / `0o111` can no longer be opened at
+///    all, so the time set fails outright. `chmod`, by contrast, needs no fd and
+///    no permission it is about to remove, so it is safe last and only last.
+///
+/// **A correction worth keeping**, because both prior copies of this helper
+/// carried it: the stock example for (2) used to be "a `0o500` directory (or a
+/// `0o444` file) could not be reopened". That is false — `0o500` and `0o444` both
+/// grant read, so the reopen succeeds and mode-first works by luck. The real
+/// trigger is the *absence of read*, which is rarer, which is exactly why this
+/// order needs writing down rather than rediscovering.
+///
+/// The standing proof is `scarab_server::farm`'s
+/// `directory_metadata_is_applied_deepest_last`, which ingests a `0o300`
+/// directory and so goes red if these two blocks swap. `tests/fidelity.rs` pins
+/// the surrounding contract — file mode, file mtime, empty directories, symlinks
+/// across a round-trip — but note that it does **not** cover this swap: its
+/// fixture records no directory that denies read. Failures here are surfaced,
+/// never swallowed, for the same reason the order matters — a silently
+/// unfaithful checkout is the class of bug s7 exists to close.
+///
+/// Files do not come through here: `write_file` does all three steps on the
+/// single handle it already holds (see the syscall note there), and the workspace
+/// service's snapshot farm (ADR-0062) does (1) by cloning or copying and then
+/// (2) on the entry's own handle. **The farm calls this function for its
+/// directories** rather than keeping the copy it was written with: two copies of
+/// an order-sensitive contract is two places to tidy and one place to notice.
+pub fn restore_dir_metadata(
     path: &std::path::Path,
     mode: Option<u32>,
     mtime_ms: Option<i64>,
-) -> Result<(), StorageError> {
+) -> Result<(), MetadataError> {
     if let Some(ms) = mtime_ms {
         // A directory cannot be opened for writing; owning the fd is enough for
         // `futimens` either way.
-        let dir = std::fs::File::open(path).map_err(io_err)?;
-        dir.set_times(std::fs::FileTimes::new().set_modified(system_time(ms)))
-            .map_err(io_err)?;
+        let dir = std::fs::File::open(path).map_err(|e| MetadataError {
+            op: "reopen a directory to set its mtime",
+            source: e,
+        })?;
+        dir.set_times(std::fs::FileTimes::new().set_modified(system_time_from_unix_ms(ms)))
+            .map_err(|e| MetadataError {
+                op: "set the mtime of a directory",
+                source: e,
+            })?;
     }
     if let Some(bits) = mode {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).map_err(io_err)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).map_err(|e| {
+            MetadataError {
+                op: "set the mode of a directory",
+                source: e,
+            }
+        })?;
     }
     Ok(())
+}
+
+/// Which step of a metadata restore failed, and the errno behind it.
+///
+/// Deliberately **not** a [`StorageError`]: [`restore_dir_metadata`] is called
+/// from two crates with two error vocabularies (here it becomes a
+/// `StorageError`; in the snapshot farm it becomes a `FarmError` carrying the
+/// operation and the path), so the shared helper reports *what* failed and lets
+/// each caller say it in its own words.
+#[derive(Debug)]
+pub struct MetadataError {
+    /// A stable phrase naming the failed operation, for a caller's message.
+    pub op: &'static str,
+    pub source: std::io::Error,
+}
+
+impl std::fmt::Display for MetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not {}: {}", self.op, self.source)
+    }
+}
+
+impl std::error::Error for MetadataError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Write one file of a checkout with its metadata, through a single open handle.
@@ -656,9 +850,8 @@ fn apply_metadata(
 /// is five syscalls per file (`open`, `write`, `close`, `open`, `futimens`,
 /// `chmod`); doing all three on the handle we already have is three. The
 /// *ordering* that s7 established is unchanged and still load-bearing:
-/// **write, then mtime, then mode** — a `0o444` file chmod-ed before the time set
-/// could not be reopened, and any write after `set_times` would bump the mtime
-/// straight back to now.
+/// **write, then mtime, then mode** — see [`restore_dir_metadata`] for why each
+/// step forces the next.
 fn write_file(
     path: &std::path::Path,
     data: &[u8],
@@ -674,7 +867,7 @@ fn write_file(
         .map_err(io_err)?;
     file.write_all(data).map_err(io_err)?;
     if let Some(ms) = mtime_ms {
-        file.set_times(std::fs::FileTimes::new().set_modified(system_time(ms)))
+        file.set_times(std::fs::FileTimes::new().set_modified(system_time_from_unix_ms(ms)))
             .map_err(io_err)?;
     }
     if let Some(bits) = mode {
@@ -906,12 +1099,11 @@ impl Cas for S3Storage {
         }
 
         // --- Phase 3: directory metadata, last and sequentially. -------------
-        // mtime then mode, deepest first. Order is load-bearing twice over: a
-        // parent's mtime is only final once its children exist, and chmod-ing
-        // before the time set would lock out the time set.
+        // mtime then mode, deepest first — see `restore_dir_metadata`, which owns
+        // the argument for that order and is shared with the snapshot farm.
         let t = Instant::now();
         for (dir, mode, mtime) in dirs.into_iter().rev() {
-            apply_metadata(&dir, mode, mtime)?;
+            restore_dir_metadata(&dir, mode, mtime).map_err(|e| io_err(e.source))?;
         }
         counters.fs_ns += elapsed_ns(t);
 
@@ -931,6 +1123,13 @@ impl Cas for S3Storage {
     }
 
     async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
-        self.ingest_tree(std::path::PathBuf::from(path)).await
+        // No baseline: every file is read and hashed, unchanged behaviour. The
+        // baseline-aware drain is [`S3Storage::ingest_with_baseline`] — an
+        // inherent method, not a widening of the port, because a caller that has
+        // no input manifest (Browse, GC, the `clone` step's first snapshot) has
+        // nothing to pass and should not be made to say so.
+        self.ingest_tree(std::path::PathBuf::from(path), None)
+            .await
+            .map(|(snapshot, _tally)| snapshot)
     }
 }

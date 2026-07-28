@@ -96,7 +96,11 @@ local-helm ref="edge":
       docker build -t scarab-clone:dogfood docker/clone
       docker build -t scarab-results-sidecar:dogfood docker/sidecar
       # The ADR-0061 s3-feed fetcher. Context is the repo root: it is a bin target
-      # of crates/scarab-workspace-client. ⚠ goes away with the node driver (0628369).
+      # of crates/scarab-workspace-client. Under ADR-0062 it stops being how a Step
+      # in a cluster gets its inputs (a Workspace Export is), but it does NOT go
+      # away — it stays the path for the local executor and any mode without an
+      # Export. The old note here said the node driver would delete it; that driver
+      # is gone (git-bug 0628369, closed as superseded).
       docker build -t scarab-wsfetch:dogfood -f docker/wsfetch/Dockerfile .
       IMAGE_REPOSITORY=scarab-server \
       SCARAB_CLONE_IMAGE=scarab-clone:dogfood \
@@ -393,6 +397,51 @@ check:
 # be rewritten. It is not a demo: it prints no number it does not check.
 adr0062-substrate:
     bash scripts/adr0062_substrate.sh
+
+# LIVE proof of ADR-0062 part 3: mount a REAL overlayfs, write/delete/replace/
+# rename through it, and assert the change set read out of the upper layer is
+# exactly what the Step did (crates/scarab-server/tests/changeset_overlay.rs).
+#
+# Everything in `changeset.rs`'s unit tests is a claim about what the KERNEL puts
+# in an upper directory. This is the only place that claim meets a kernel — so it
+# needs Linux, CAP_SYS_ADMIN (to mount, and to read `trusted.overlay.*` at all)
+# and an upperdir on a real disk filesystem. It cannot run on darwin and it
+# cannot run in CI, and it FAILS LOUDLY rather than skipping when it cannot:
+# `SCARAB_TEST_OVERLAY` unset behind `--ignored` is now a panic, because a tier
+# that reports PASS having executed nothing is the exact defect 505f313 repaired.
+#
+# The binary is built as YOU and only executed under sudo — `sudo cargo test`
+# would leave root-owned artifacts all over target/.
+#
+# Usage: `just overlay-tests` | `just overlay-tests /mnt/scratch` (upperdir).
+overlay-tests dir="/var/tmp/scarab-overlay":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "$(uname -s)" != "Linux" ]; then
+      echo "REFUSING: this host is $(uname -s). \`overlayfs\` and the \`trusted.overlay.*\` xattr" >&2
+      echo "namespace are LINUX KERNEL features — there is nothing here for this tier to prove," >&2
+      echo "and a recipe that shrugged and exited 0 would be the failure it exists to prevent." >&2
+      echo "Run it on a Linux host: a VM, a kind/colima node, or 'docker run --privileged'." >&2
+      exit 2
+    fi
+    dir="{{dir}}"
+    mkdir -p "$dir"
+    # An overlay upperdir cannot live on tmpfs, and it cannot be stacked on an
+    # overlay rootfs (ADR-0062 measured both). Caught here rather than as an
+    # inscrutable `mount: wrong fs type` two minutes into the run.
+    fstype=$(stat -f -c %T "$dir")
+    case "$fstype" in
+      tmpfs|ramfs|overlayfs|overlay)
+        echo "REFUSING: $dir is on $fstype, which cannot serve as an overlayfs upperdir." >&2
+        echo "Point the recipe at a real ext4/xfs/btrfs directory: just overlay-tests /mnt/scratch" >&2
+        exit 2 ;;
+    esac
+    echo "==> upperdir $dir ($fstype), kernel $(uname -r)"
+    bin=$(cargo test -p scarab-server --test changeset_overlay --no-run --message-format=json \
+      | python3 -c "import sys, json; a = [m['executable'] for m in map(json.loads, sys.stdin) if m.get('reason') == 'compiler-artifact' and m.get('executable') and m.get('target', {}).get('name') == 'changeset_overlay']; print(a[-1] if a else '')")
+    [ -n "$bin" ] || { echo "could not locate the changeset_overlay test binary" >&2; exit 1; }
+    run=(env SCARAB_TEST_OVERLAY=1 SCARAB_TEST_OVERLAY_DIR="$dir" "$bin" --ignored --nocapture --test-threads=1)
+    if [ "$(id -u)" = 0 ]; then "${run[@]}"; else sudo "${run[@]}"; fi
 
 # Reclaim build-cache disk. Cargo NEVER garbage-collects `target/`: every
 # fingerprint change (branch switch, dep bump, feature flag) writes a new

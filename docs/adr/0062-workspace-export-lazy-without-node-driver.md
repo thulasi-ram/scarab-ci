@@ -105,7 +105,8 @@ default data path depend on being permitted to weaken the posture of our own nam
 org that takes PSA seriously blocks with Kyverno or Gatekeeper. A default path resting on that is
 not a path.
 
-**A hardlink farm under `overlayfs` works on ext4, and protects the store.** One privileged pod,
+**`overlayfs` on ext4 protects its lower layer — but read the next block before concluding
+anything about hardlinks from this one.** One privileged pod,
 directories on a real ext4 volume (`overlayfs` cannot be stacked on the container rootfs, which is
 itself `overlayfs`):
 
@@ -203,12 +204,15 @@ cross-device link" as substrate knowledge, which the governing principle forbids
 *masks* it by recursively copying the subtree, so the failure mode is not an error but a **silent
 full copy of an inherited tree** — which then lands in the upper layer and makes "the change set is
 the upper layer, exactly" re-ingest a tree nothing changed. Verified that `redirect_dir=on` coexists
-with `nfs_export=on` (unlike `metacopy`, above), so the fix is available.
+with `nfs_export=on` — which `metacopy` does not, that being the actual reason `metacopy` is
+unavailable to an Export — so the fix is available.
 
 **This forces part 3's reader to support `trusted.overlay.redirect`, not refuse it.** A directory
 rename under `redirect_dir=on` records the old path in that xattr, so a change-set reader that
 treats `redirect` as unsupported would refuse every renamed directory. The two halves have to agree,
-and the ADR previously implied they could each be decided alone.
+and the ADR previously implied they could each be decided alone — it even said in part 3 that "only
+directory renames need refusing" while part 2 required supporting them, which is the shape of
+mistake that ships as a defect rather than a disagreement.
 
 **3. The change set is the upper layer, exactly.**
 An `overlayfs` upper directory contains precisely the paths the Step touched, put there by the
@@ -226,13 +230,31 @@ renames", be believed, and publish a snapshot missing every deletion. The reader
 its own effective capabilities up front and **refuses** rather than answering. A silent "nothing
 changed" is the worst available failure and it is one syscall away from being the default.
 
-Two further measured refinements, because they decide what has to be supported rather than
+Two further measured refinements, because they decide what has to be supported rather than merely
 tolerated. A **file** rename is exact — it appears as a whiteout plus a full copy, with no
-`redirect` — so only **directory** renames need refusing; and `redirect_dir=on` *is* honoured when
-passed at mount time even though the module default is off, unlike `metacopy` below, so the refusal
-path is reachable in production rather than theoretical. Copy-up also stamps `origin` on files and
-`impure` on their parent directories, which must be tolerated as bookkeeping — treat them as
-unsupported markers and every real drain fails on its first edited file.
+`redirect` — so `redirect` is a **directory** phenomenon only, and a `redirect` on anything else is
+a shape we do not understand and must refuse. And `redirect_dir=on` *is* honoured when passed at
+mount time even though the module default is off, so a directory rename really does reach the drain
+in production. Copy-up also stamps `origin` on files and `impure` on their parent directories, which
+must be **tolerated as bookkeeping** — treat them as unsupported markers and every real drain fails
+on its first edited file.
+
+**So a change set is not quite "the upper layer".** It is the upper layer **plus a graft
+instruction**, and the graft is the one thing in it that means nothing on its own: a renamed
+directory's `redirect` names a path in the **parent snapshot**, not in the upper. Three
+consequences the drain must honour, each of which fails *silently* if it does not:
+
+- **Resolve grafts before deletions.** A rename also whiteouts the old path, so a drain that
+  applied deletions first would delete the graft's own source.
+- **Every other path is a merged-view path**, including the renamed directory's own — its upper
+  name *is* its new name. Only `redirect` is in parent-snapshot coordinates, and mixing the two
+  silently grafts the wrong subtree.
+- **Redirects compose.** A relative `redirect` under an already-renamed ancestor resolves against
+  that ancestor's **lower** coordinate, not its merged one; resolving against the merged parent
+  grafts nothing and loses a subtree without erroring. A leading `/` is the kernel's encoding for
+  *overlay-root*-relative, which is how a cross-parent rename is recorded — so an absolute redirect
+  must be **resolved, not rejected**, or the design refuses precisely the renames part 2 requires
+  it to support.
 
 This is not an optimisation of the drain, it is a different kind of answer. 0061's deferred
 overlay-diff drain (git-bug `66fc0e3`) wanted this and believed it needed a privileged mount on
@@ -339,8 +361,10 @@ is a simplification.
 
 ### Vocabulary
 
-**Snapshot Farm** — the immutable, shared, tree-shaped hardlink view of one Workspace Snapshot on
-the workspace service's disk. Defined here and **deliberately kept out of
+**Snapshot Farm** — the immutable, shared, tree-shaped view of one Workspace Snapshot on the
+workspace service's disk, built by `reflink` where the filesystem offers it and by local copy where
+it does not. (Not hardlinks — see the measurement above; the first draft of this ADR said hardlinks
+and was wrong.) Defined here and **deliberately kept out of
 [CONTEXT.md](../../CONTEXT.md)**: it is a cache implementation, not domain language, and the
 glossary is a glossary.
 

@@ -48,7 +48,8 @@ use async_trait::async_trait;
 use futures::stream::StreamExt;
 use scarab_storage::content::{ContentSource, FlatEntry, FlatManifest};
 use scarab_storage::{
-    BlobHash, Cas, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget,
+    system_time_from_unix_ms, BlobHash, Cas, Snapshot, StorageError, TreeEntry, TreeHash,
+    TreeTarget,
 };
 use serde::{Deserialize, Serialize};
 
@@ -633,15 +634,6 @@ fn write_entry(
     )
 }
 
-fn system_time(ms: i64) -> std::time::SystemTime {
-    let epoch = std::time::SystemTime::UNIX_EPOCH;
-    if ms >= 0 {
-        epoch + std::time::Duration::from_millis(ms as u64)
-    } else {
-        epoch - std::time::Duration::from_millis(ms.unsigned_abs())
-    }
-}
-
 /// Write one file of a checkout with its metadata, through a single open handle.
 ///
 /// This is `S3Storage::write_file`, for the same reason: `fs::write` +
@@ -668,7 +660,7 @@ fn write_file(
         .map_err(io_err)?;
     file.write_all(data).map_err(io_err)?;
     if let Some(ms) = mtime_ms {
-        file.set_times(std::fs::FileTimes::new().set_modified(system_time(ms)))
+        file.set_times(std::fs::FileTimes::new().set_modified(system_time_from_unix_ms(ms)))
             .map_err(io_err)?;
     }
     if let Some(bits) = mode {
@@ -692,7 +684,7 @@ fn apply_metadata(
         // A directory cannot be opened for writing; owning the fd is enough for
         // `futimens` either way.
         let dir = std::fs::File::open(path).map_err(io_err)?;
-        dir.set_times(std::fs::FileTimes::new().set_modified(system_time(ms)))
+        dir.set_times(std::fs::FileTimes::new().set_modified(system_time_from_unix_ms(ms)))
             .map_err(io_err)?;
     }
     if let Some(bits) = mode {

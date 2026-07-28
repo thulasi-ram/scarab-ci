@@ -11,12 +11,19 @@
 //!
 //! Bodies are stubs; real backends (S3, local FS…) live in adapters.
 
+use std::time::{Duration, SystemTime};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 /// The data-plane content port (ADR-0061): byte ranges, sizes, batched
 /// existence and one-call tree manifests. Additive — [`Cas`] is unchanged.
 pub mod content;
+/// The stat cache (ADR-0062 part 3): which files a drain may skip re-reading,
+/// by comparing `(size, mtime)` against the input manifest it materialised.
+/// The **no-Export fallback** — conservative by construction, never the
+/// mechanism where an `overlayfs` upper layer can give the change set exactly.
+pub mod statcache;
 /// Warm-then-cold tiering (ADR-0061): the workspace service's volume in front
 /// of the cold object-storage archive.
 pub mod tiered;
@@ -174,6 +181,31 @@ impl Snapshot {
     /// skipped. Wasteful, never wrong.
     pub fn comparison(&self) -> &TreeHash {
         self.identity.as_ref().unwrap_or(&self.root)
+    }
+}
+
+/// A [`TreeEntry::mtime_ms`] as a [`SystemTime`] — what every checkout writer
+/// hands to `futimens` when it restores an entry's recorded time. Pre-epoch
+/// values are negative and go *backwards* from the epoch rather than being
+/// dropped.
+///
+/// **Here, not in each adapter.** The unix-ms encoding is a property of
+/// [`TreeEntry`], so its inverse belongs beside it: three checkout writers
+/// (`scarab-storage-s3`, `scarab-workspace-client`, and the workspace service's
+/// snapshot farm) each carried a byte-identical copy of this, and a `+`/`-` sign
+/// slip in one of them is a silently wrong timestamp in exactly one code path.
+///
+/// Pure arithmetic despite the type, so it stays inside ADR-0031's I/O ban:
+/// [`SystemTime::UNIX_EPOCH`] is a constant, not a clock read. *Applying* the
+/// result to a file is filesystem I/O and stays in the adapters — see
+/// `scarab_storage_s3::restore_dir_metadata` for the one shared statement of the
+/// order those writes must happen in.
+pub fn system_time_from_unix_ms(ms: i64) -> SystemTime {
+    let epoch = SystemTime::UNIX_EPOCH;
+    if ms >= 0 {
+        epoch + Duration::from_millis(ms as u64)
+    } else {
+        epoch - Duration::from_millis(ms.unsigned_abs())
     }
 }
 
