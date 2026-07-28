@@ -53,6 +53,9 @@ pub mod clone_executor;
 pub mod config;
 pub mod connections_config;
 pub mod converged;
+/// ADR-0062 part 2: the **Workspace Export** — the per-Attempt, writable view a
+/// Step Pod receives *as* its Workspace, and the capability that addresses it.
+pub mod export;
 /// ADR-0062 part 1: the **Snapshot Farm** — one Workspace Snapshot given tree
 /// shape on the service's own disk, by `reflink` where the filesystem offers it
 /// and a local copy where it does not. Never hardlinks: a hardlink shares its
@@ -66,6 +69,9 @@ pub mod oauth;
 pub mod oidc;
 pub mod retention;
 pub mod secret_executor;
+/// ADR-0062 part 3: folding an Attempt's **change set** back into the CAS — how a
+/// Workspace Export settles into a new Workspace Snapshot.
+pub mod settle;
 /// `--role workspace`: the ADR-0061 workspace service. Its own router, its own
 /// `/readyz`, and NO durable core — see the module docs.
 pub mod workspaced;
