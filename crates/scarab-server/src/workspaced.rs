@@ -74,30 +74,94 @@
 //!
 //! Every 401 emits a `tracing::warn!` naming the run and step. The results
 //! endpoint (ADR-0042) emits nothing on failure; that is a gap, not a pattern.
+//!
+//! ## The Workspace Export lifecycle lives here too (ADR-0062)
+//!
+//! [`crate::farm`], [`crate::export`], [`crate::changeset`] and [`crate::settle`]
+//! are four modules with no callers until this one composes them. What that
+//! composition *is*, in one line: **a Farm is built from the warm CAS, an Export
+//! is prepared over it, a Step writes into it, and settling folds what it wrote
+//! back into the CAS and uploads it to cold.**
+//!
+//! ### Two credentials, and they are not interchangeable
+//!
+//! | | presented by | to | carries |
+//! |---|---|---|---|
+//! | **workspace token** (`x-scarab-workspace-token`) | the control plane, and a Step Pod | *this HTTP API* | an HMAC'd fence |
+//! | **Export capability** ([`crate::export::ExportCapability`]) | the *mount* — kubelet, on a Step Pod's behalf | the (not yet existing) NFS server | 256 unguessable bits |
+//!
+//! Every `/v1/exports/*` route below is authenticated with the **token**, because
+//! that is the primitive this service already trusts and because prepare, settle
+//! and revoke are things the *control plane* asks for. The capability is not an API
+//! credential: it is the *address* of a mount, and it appears in exactly two places
+//! here — the body of a `POST /v1/exports` response (the control plane needs it to
+//! write the PersistentVolume's export path) and the body of a
+//! `POST /v1/exports/claim` request (which models first-client pinning until an
+//! `nfsd` exists to do it for real). It reaches **no log line, no error body and no
+//! `Debug`**; [`crate::export::ExportCapability`] enforces that half, and this
+//! module's job is not to undo it by logging one.
+//!
+//! Honest gap, written down rather than implied: these routes take *any* valid
+//! workspace token, exactly as `/v1/cas` writes do, so a Step's own token can drive
+//! the lifecycle of another Step's Export. Narrowing them to
+//! [`Scope::Browse`](scarab_executor_k8s::workspace_token::Scope) — the control
+//! plane's own scope — is the tightening, and it is a filed follow-up rather than
+//! something to assume from the code.
+//!
+//! ### Everything in [`ExportRegistry`] is blocking, and that shapes every handler
+//!
+//! A registry is shared behind a `std::sync::Mutex`, and the copy rung's tree copy
+//! is seconds of local syscalls. So `prepare`, `claim`, `revoke` and `sweep` all run
+//! inside [`tokio::task::spawn_blocking`], and the `Mutex` is never held across an
+//! `.await`. The one exception is
+//! [`ExportRegistry::settle_inputs`](crate::export::ExportRegistry::settle_inputs),
+//! which performs **no I/O at all** (lock, clone three fields, unlock) and whose
+//! return value *borrows the registry* — which `spawn_blocking`'s `'static` bound
+//! forbids. That borrow is the point: the returned value is an RAII guard, and while
+//! it lives no reap can delete the upper layer the fold is reading.
+//!
+//! ### Durability is not local (ADR-0062 part 3, ADR-0061 part 4)
+//!
+//! **A settle does not report success until the new snapshot is in cold.** The fold
+//! itself is local — that is part 3's whole argument — but the service's own disk
+//! *is* the warm tier, and ADR-0061's retention table says warm promises nothing. So
+//! a green Attempt whose evidence sits only in warm is a durable record making a
+//! claim it cannot back. See [`settle_export`] for which store handle each drain
+//! writes through and why that is sufficient rather than merely intended.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use scarab_executor_k8s::workspace_token::{
-    self, WorkspaceClaims, WorkspaceTokenError, WORKSPACE_TOKEN_HEADER,
+    self, Fence, WorkspaceClaims, WorkspaceTokenError, WORKSPACE_TOKEN_HEADER,
 };
 use scarab_storage::content::{FlatDir, FlatEntry, FlatManifest};
+use scarab_storage::statcache::StatCache;
 use scarab_storage::tiered::{TieredCas, TieredObjectStore};
 use scarab_storage::{
-    BlobHash, Cas, ObjectStore, StorageError, TreeEntry, TreeHash, TreeTarget,
+    BlobHash, Cas, ObjectStore, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget,
 };
 use scarab_storage_s3::S3Storage;
 
+use crate::changeset;
 use crate::config::{Config, Role, StoreConfig};
+use crate::export::{
+    ExportCapability, ExportError, ExportHandle, ExportRegistry, ExportRung, PrepareRequest,
+    SettleDrain, EXPORTS_SUBDIR,
+};
+use crate::farm::{FarmError, SnapshotFarm};
+use crate::settle;
 
 /// How many hashes one `POST /v1/cas/have` may ask about. The client chunks;
 /// an uncapped batch is a trivially-mounted amplification.
@@ -123,24 +187,91 @@ static WARM_READ_FAILED: AtomicU64 = AtomicU64::new(0);
 /// more expensive than the thing observed.
 const WARM_SIZE_REFRESH_SECS: u64 = 60;
 
-/// Everything the service handlers need. Cheap to clone (all `Arc`).
+/// How often the Export sweep runs (ADR-0062: *"a leaked Export is a leaked
+/// directory and a leaked capability"*).
+///
+/// Minutes rather than seconds because a sweep is a `read_dir` plus one record
+/// parse per Export, and the thing it collects — an expired capability — is bounded
+/// by the Step deadline that produced it, not by how promptly we notice. Minutes
+/// rather than hours because the directory it reclaims is on a volume with no
+/// eviction (git-bug `24476bc`) and because an Export that outlived its Step is
+/// holding a `FarmLease` that keeps a whole Farm un-evictable.
+const EXPORT_SWEEP_SECS: u64 = 120;
+
+/// Everything the service handlers need. Cheap to clone (all `Arc`, plus a
+/// [`SnapshotFarm`] which is two paths and a flag).
 #[derive(Clone)]
 struct WorkspaceState {
-    /// Warm-then-cold, for the tree walks `/flat` needs.
+    /// Warm-then-cold, for the tree walks `/flat` needs — **and the store the
+    /// change-set fold writes through**, which is what puts a settled snapshot in
+    /// cold before this service reports it. See [`settle_export`].
     cas: Arc<TieredCas>,
     /// Warm-then-cold **raw keyed bytes** — the verbatim path. See the module
     /// docs on why this is not `Cas`.
     objects: Arc<TieredObjectStore>,
-    /// The warm tier alone, for the readiness write probe.
-    warm: Arc<dyn ObjectStore>,
-    /// The cold tier alone, for the readiness reachability probe.
-    cold: Arc<dyn ObjectStore>,
+    /// The warm tier alone: the readiness write probe, and the cache leg of the
+    /// re-ingest drain. Concrete rather than `dyn ObjectStore` because
+    /// `S3Storage::ingest_with_baseline` — ADR-0062's no-Export drain — is not on
+    /// either port and cannot be: a `StatCache` is a drain's input, not a store's.
+    warm: Arc<S3Storage>,
+    /// The cold tier alone: the readiness reachability probe, and **the durable leg
+    /// of the re-ingest drain**. Same reason it is concrete.
+    cold: Arc<S3Storage>,
     /// The warm volume's root on disk. The service reaches it directly to
     /// stream blob bodies and to `stat` sizes — neither of which [`Cas`] can
     /// express (see [`scarab_storage::content`]).
     warm_dir: std::path::PathBuf,
     token_secret: Arc<Vec<u8>>,
     warm_used_bytes: Arc<AtomicU64>,
+    /// The Snapshot Farm over the same warm volume (ADR-0062 part 1). Held by value
+    /// because it is `Clone` and holds no state — the Farms *are* the state, and they
+    /// are directories.
+    farm: SnapshotFarm,
+    /// The Export lifecycle (ADR-0062 part 2). `Arc` because every method on it is
+    /// blocking and therefore runs inside a `spawn_blocking` that needs an owned
+    /// `'static` handle.
+    exports: Arc<ExportRegistry>,
+    /// `handle → the unix-ms instant that Export's writable tree finished being
+    /// materialised` — the **stat cache's capture instant**, and the one input to
+    /// the copy rung's drain that nothing else on the path can supply.
+    ///
+    /// [`StatCache`]'s contract is asymmetric and only one direction is safe: a
+    /// capture stamped *too early* makes every file un-reusable (wasteful, never
+    /// wrong), while one stamped *too late* publishes a stale hash. Nothing in
+    /// [`crate::export`]'s seam carries such an instant — `ExportRecord::prepared_at`
+    /// is whole seconds and is stamped *before* the copy — so it is captured here,
+    /// after `prepare` has returned, and it is deliberately never rounded up.
+    ///
+    /// **In memory, so a restart forgets it**, and a forgotten capture degrades to
+    /// `0`: every file re-read, nothing reused. That is the safe direction, it is
+    /// logged when it happens, and the honest fix is a millisecond capture persisted
+    /// in the Export record — a change to [`crate::export`] and therefore not made
+    /// here.
+    captures: Arc<Mutex<BTreeMap<ExportHandle, i64>>>,
+}
+
+impl WorkspaceState {
+    /// A poisoned map is still a consistent map — same argument
+    /// `ExportRegistry::index` makes — and refusing every settle for the rest of the
+    /// process's life would turn one unrelated panic into an outage.
+    fn captures(&self) -> std::sync::MutexGuard<'_, BTreeMap<ExportHandle, i64>> {
+        self.captures.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record when an Export's writable tree finished materialising. Called with a
+    /// clock reading taken **after** `prepare` returned; see [`Self::captures`].
+    fn remember_capture(&self, handle: ExportHandle, captured_at_ms: i64) {
+        self.captures().insert(handle, captured_at_ms);
+    }
+
+    fn forget_capture(&self, handle: &ExportHandle) {
+        self.captures().remove(handle);
+    }
+
+    /// The capture instant for `handle`, or `None` if this process never made it.
+    fn capture_of(&self, handle: &ExportHandle) -> Option<i64> {
+        self.captures().get(handle).copied()
+    }
 }
 
 /// Serve the workspace service. Called from the composition root **before** it
@@ -190,34 +321,22 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 /// grain of this feature is *the HTTP surface over a real `TieredCas`* — a test
 /// that could only reach the handlers by calling them directly would be testing
 /// something else.
+///
+/// **The signature is deliberately unchanged by ADR-0062.** The Farm and the Export
+/// registry are both derived from `warm_dir` — a Farm on any other filesystem
+/// silently demotes every build off the reflink rung, and an Export must be able to
+/// `rename(2)` into place beside it — so there is nothing for a caller to pass. The
+/// two new startup failures (farm residue, registry adoption) are reported as
+/// [`StorageError::Backend`] rather than widening the error type, because a warm
+/// volume that cannot answer either question is the same class of fault
+/// `S3Storage::local` already reports here.
 pub fn router(
     warm_dir: impl AsRef<std::path::Path>,
     cold: Arc<S3Storage>,
     token_secret: Vec<u8>,
 ) -> Result<Router, StorageError> {
-    // Warm tier: a local-filesystem `Cas` over the persistent volume. NO new
-    // adapter is needed for this — `S3Storage::local` is already a local
-    // filesystem store behind the same two ports.
     let warm_dir = warm_dir.as_ref().to_path_buf();
-    let warm_store = Arc::new(S3Storage::local(&warm_dir)?);
-
-    let warm_cas: Arc<dyn Cas> = warm_store.clone();
-    let cold_cas: Arc<dyn Cas> = cold.clone();
-    let warm_objects: Arc<dyn ObjectStore> = warm_store;
-    let cold_objects: Arc<dyn ObjectStore> = cold;
-
-    let state = WorkspaceState {
-        cas: Arc::new(TieredCas::new(warm_cas, cold_cas)),
-        objects: Arc::new(TieredObjectStore::new(
-            warm_objects.clone(),
-            cold_objects.clone(),
-        )),
-        warm: warm_objects,
-        cold: cold_objects,
-        warm_dir: warm_dir.clone(),
-        token_secret: Arc::new(token_secret),
-        warm_used_bytes: Arc::new(AtomicU64::new(0)),
-    };
+    let state = open_state(&warm_dir, cold, token_secret)?;
 
     // The warm-tier size gauge (ADR-0061): LRU eviction is deferred, so this
     // number climbing towards the volume size IS the operator's only warning
@@ -235,7 +354,170 @@ pub fn router(
         });
     }
 
+    // The Export reaper (ADR-0062: *"per-Step PV/PVC objects and per-Step exports
+    // are a reaping obligation"*). Same shape as the gauge loop above — a
+    // `tokio::spawn` that never returns, doing its blocking work in
+    // `spawn_blocking` — and work-first rather than sleep-first on purpose: the
+    // `unusable` Exports and the residue `open` just *named* are exactly what
+    // nothing else will ever collect, and `open` deliberately deletes nothing.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                sweep_exports_once(&state).await;
+                tokio::time::sleep(std::time::Duration::from_secs(EXPORT_SWEEP_SECS)).await;
+            }
+        });
+    }
+
     Ok(build_router(state))
+}
+
+/// Everything [`router`] needs, built once — and **the only constructor**, so the
+/// tests below get the same wiring the binary does rather than a plausible-looking
+/// second copy of it.
+fn open_state(
+    warm_dir: &std::path::Path,
+    cold: Arc<S3Storage>,
+    token_secret: Vec<u8>,
+) -> Result<WorkspaceState, StorageError> {
+    // Warm tier: a local-filesystem `Cas` over the persistent volume. NO new
+    // adapter is needed for this — `S3Storage::local` is already a local
+    // filesystem store behind the same two ports.
+    let warm_store = Arc::new(S3Storage::local(warm_dir)?);
+
+    let warm_cas: Arc<dyn Cas> = warm_store.clone();
+    let cold_cas: Arc<dyn Cas> = cold.clone();
+    let warm_objects: Arc<dyn ObjectStore> = warm_store.clone();
+    let cold_objects: Arc<dyn ObjectStore> = cold.clone();
+
+    // ADR-0062 parts 1 and 2, in the order their invariants require: residue is
+    // swept before anything is adopted over it, and the registry re-leases the Farms
+    // its adopted Exports depend on.
+    let farm = SnapshotFarm::new(warm_dir);
+    let exports = open_export_lifecycle(warm_dir, &farm)?;
+
+    Ok(WorkspaceState {
+        cas: Arc::new(TieredCas::new(warm_cas, cold_cas)),
+        objects: Arc::new(TieredObjectStore::new(warm_objects, cold_objects)),
+        warm: warm_store,
+        cold,
+        warm_dir: warm_dir.to_path_buf(),
+        token_secret: Arc::new(token_secret),
+        warm_used_bytes: Arc::new(AtomicU64::new(0)),
+        farm,
+        exports,
+        captures: Arc::new(Mutex::new(BTreeMap::new())),
+    })
+}
+
+/// Sweep the Farm's residue and adopt every Export on disk — **once, at startup.**
+///
+/// Both halves are startup-only by contract, and for the same reason: a pid in a
+/// residue name says who made it, not whether that process is still running, so a
+/// freshly-started process is the one moment at which everything under those prefixes
+/// is abandoned *by definition*.
+///
+/// **Nothing here is routine.** A non-zero residue sweep means a process died
+/// mid-build or mid-eviction; an adopted Export means Steps were in flight when this
+/// service last died and their clients may still hold mounts; an `unusable` one means
+/// an Export exists that can never be served. Each is logged at a level that says so,
+/// and a *zero* result is logged at `debug` so the quiet case does not train an
+/// operator to ignore the loud one.
+fn open_export_lifecycle(
+    warm_dir: &std::path::Path,
+    farm: &SnapshotFarm,
+) -> Result<Arc<ExportRegistry>, StorageError> {
+    match farm.sweep_residue() {
+        Ok(residue) if residue.directories == 0 => {
+            tracing::debug!(farm = "sweep-residue", "no snapshot farm residue at startup")
+        }
+        Ok(residue) => tracing::warn!(
+            farm = "sweep-residue",
+            directories = residue.directories,
+            bytes = residue.bytes,
+            "deleted snapshot farm residue at startup — a build or an eviction did not \
+             finish, so a previous workspace service process died in the middle of one \
+             (ADR-0062 part 1). This is a crash signal, not housekeeping."
+        ),
+        // Not survivable: the farms directory is where every Export's lower layer
+        // comes from, and a volume that cannot be read is not one to start serving
+        // Exports over.
+        Err(e) => {
+            return Err(StorageError::Backend(format!(
+                "could not sweep snapshot farm residue under {}: {e}",
+                warm_dir.display()
+            )))
+        }
+    }
+
+    let (registry, report) = ExportRegistry::open(warm_dir.join(EXPORTS_SUBDIR), farm.clone())
+        .map_err(|e| {
+            StorageError::Backend(format!(
+                "could not open the workspace export registry under {}: {e}",
+                warm_dir.display()
+            ))
+        })?;
+
+    if report.adopted.is_empty()
+        && report.orphans.is_empty()
+        && report.unusable.is_empty()
+        && report.released_leases.is_empty()
+    {
+        tracing::debug!(
+            export = "open",
+            "no workspace exports on disk at startup — nothing outlived the last process"
+        );
+    } else {
+        tracing::warn!(
+            export = "open",
+            adopted = report.adopted.len(),
+            orphans = report.orphans.len(),
+            unusable = report.unusable.len(),
+            released_leases = report.released_leases.len(),
+            handles = ?report.adopted,
+            unusable_handles = ?report.unusable,
+            "workspace exports outlived the process that prepared them (ADR-0062). \
+             `adopted` are live capabilities this process now owns and will expire; \
+             `unusable` can never be served and will be reaped; `released_leases` were \
+             pinning Snapshot Farms nothing accounted for. All of it is a crash signal."
+        );
+    }
+    Ok(Arc::new(registry))
+}
+
+/// One pass of the Export reaper: reap what expired, delete what is residue, and
+/// forget the capture instants of everything that went away.
+///
+/// The capture map is reconciled against [`ExportRegistry::live_handles`] rather than
+/// against the sweep's own `reaped` list, because a reap can also happen through
+/// `DELETE /v1/exports/{handle}` and through `open`'s adoption failures. Retaining
+/// only what the registry still calls live is the one rule that cannot leak.
+async fn sweep_exports_once(state: &WorkspaceState) {
+    let registry = state.exports.clone();
+    let now = now_secs();
+    let report = match tokio::task::spawn_blocking(move || registry.sweep(now)).await {
+        Ok(report) => report,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "the workspace export sweep task did not complete; expired exports and their \
+                 farm leases will not be reclaimed until the next pass"
+            );
+            return;
+        }
+    };
+    if !report.failures.is_empty() {
+        tracing::warn!(
+            export = "sweep",
+            failures = ?report.failures,
+            "the workspace export sweep could not finish some of its work — each of these is \
+             a directory, a capability or a farm lease that is still leaked"
+        );
+    }
+    let live: std::collections::BTreeSet<ExportHandle> =
+        state.exports.live_handles().into_iter().collect();
+    state.captures().retain(|handle, _| live.contains(handle));
 }
 
 fn build_router(state: WorkspaceState) -> Router {
@@ -251,8 +533,22 @@ fn build_router(state: WorkspaceState) -> Router {
         // far too small; the warm volume is the real bound.
         .layer(DefaultBodyLimit::max(MAX_BLOB_BYTES));
 
+    // ADR-0062's Export lifecycle. Every one of these is a **control-plane**
+    // operation authenticated by a workspace token — see the module docs on why a
+    // capability is not an API credential.
+    //
+    // The capability never appears in a URL. It is in a response body once
+    // (`POST /v1/exports`) and in a request body once (`POST /v1/exports/claim`),
+    // because a path segment is logged by every proxy between here and there.
+    let exports = Router::new()
+        .route("/v1/exports", get(list_exports).post(prepare_export))
+        .route("/v1/exports/claim", post(claim_export))
+        .route("/v1/exports/{handle}", delete(revoke_export))
+        .route("/v1/exports/{handle}/settle", post(settle_export));
+
     Router::new()
         .merge(cas)
+        .merge(exports)
         // Unauthenticated, exactly like the control plane's: a probe that needs
         // a credential cannot report the credential being wrong.
         .route("/healthz", get(healthz))
@@ -299,6 +595,71 @@ enum WsError {
     /// body, or too many hashes.
     BadRequest(String),
     Backend(String),
+    /// An [`ExportRegistry`] refusal (ADR-0062). Never carries a capability —
+    /// [`ExportError`]'s own contract — so this is safe to `Debug` and safe to log.
+    Export(ExportError),
+    /// A drain refused: the change-set read, or the fold, or the re-ingest. Always a
+    /// `500`, always logged with the handle, and **never a reap** — the upper layer is
+    /// the Attempt's only evidence and the retry needs it.
+    Drain {
+        handle: ExportHandle,
+        detail: String,
+    },
+}
+
+/// The wire status and the **log reason** for one Export refusal.
+///
+/// A pure function, and that is what makes ADR-0062's fence property testable
+/// without capturing logs: *"an expired or wrong-client capability must not be
+/// indistinguishable from a missing one in the logs, even where the HTTP status is
+/// deliberately the same."* Three refusals here answer the same `404` on purpose — a
+/// capability that says "this one exists but has expired" is an oracle a holder of a
+/// guessed address should not get — and three different reasons, because an operator
+/// reading an incident needs to know which.
+fn export_refusal(error: &ExportError) -> (StatusCode, &'static str) {
+    match error {
+        // The 404 family. Same body, same status, different reasons.
+        ExportError::MalformedCapability => (StatusCode::NOT_FOUND, "malformed-capability"),
+        ExportError::NoSuchExport(_) => (StatusCode::NOT_FOUND, "no-such-export"),
+        ExportError::Expired { .. } => (StatusCode::NOT_FOUND, "expired"),
+        ExportError::PinnedToAnotherClient { .. } => {
+            (StatusCode::NOT_FOUND, "pinned-to-another-client")
+        }
+        ExportError::Farm(FarmError::MissingBlob(_) | FarmError::MissingTree(_)) => {
+            (StatusCode::NOT_FOUND, "farm-source-missing")
+        }
+        // A caller bug rather than a fence event: the client identity is the caller's
+        // to supply and an empty one cannot pin anything.
+        ExportError::EmptyClient => (StatusCode::BAD_REQUEST, "empty-client"),
+        // Conflicts: the request is well-formed and this service will not do it *now*.
+        ExportError::RungUnavailable { .. } => (StatusCode::CONFLICT, "rung-unavailable"),
+        ExportError::Settling { .. } => (StatusCode::CONFLICT, "settling"),
+        ExportError::Farm(FarmError::NotBuilt(_)) => (StatusCode::CONFLICT, "farm-not-built"),
+        ExportError::Farm(FarmError::Leased { .. }) => (StatusCode::CONFLICT, "farm-leased"),
+        // The Export exists and cannot be served. `503`, not `500`: an unmounted
+        // `merged/` is precisely the state a re-mount could fix, and handing it out
+        // would give a Step an empty workspace it builds nothing from and exits 0.
+        ExportError::NotMounted { .. } => (StatusCode::SERVICE_UNAVAILABLE, "not-mounted"),
+        ExportError::Io { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "io"),
+        ExportError::CorruptRecord { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "corrupt-record"),
+        ExportError::Mount { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "mount"),
+        ExportError::Unmount { .. } => (StatusCode::INTERNAL_SERVER_ERROR, "unmount"),
+        ExportError::Farm(_) => (StatusCode::INTERNAL_SERVER_ERROR, "farm-error"),
+    }
+}
+
+/// What a client is told, which is deliberately less than the log knows.
+///
+/// The 404 family gets **one** body for all of it, so the wire cannot be used to tell
+/// "expired" from "never existed" from "somebody else's". Everything else answers
+/// with the error's own `Display`, which carries handles, paths and counts and — by
+/// [`ExportError`]'s construction — never a capability.
+fn export_refusal_body(error: &ExportError, status: StatusCode) -> String {
+    if status == StatusCode::NOT_FOUND {
+        "no such workspace export".to_string()
+    } else {
+        error.to_string()
+    }
 }
 
 impl IntoResponse for WsError {
@@ -316,6 +677,32 @@ impl IntoResponse for WsError {
                 tracing::error!(error = %m, "workspace service backend error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "storage backend error").into_response()
             }
+            WsError::Export(e) => {
+                let (status, reason) = export_refusal(&e);
+                // One line per refusal, carrying the reason the status hides. `%e` is
+                // safe: no `ExportError` variant carries a capability.
+                if status.is_server_error() {
+                    tracing::error!(export = "refused", reason, error = %e, "workspace export refused");
+                } else {
+                    tracing::warn!(export = "refused", reason, error = %e, "workspace export refused");
+                }
+                (status, export_refusal_body(&e, status)).into_response()
+            }
+            WsError::Drain { handle, detail } => {
+                tracing::error!(
+                    export = "settle",
+                    handle = %handle,
+                    error = %detail,
+                    "a workspace export drain FAILED — the export is deliberately NOT reaped, so \
+                     its upper layer is still the Attempt's evidence and a retry can read it \
+                     again (ADR-0062 part 3)"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "the workspace export could not be settled",
+                )
+                    .into_response()
+            }
         }
     }
 }
@@ -327,6 +714,57 @@ impl From<StorageError> for WsError {
             other => WsError::Backend(other.to_string()),
         }
     }
+}
+
+impl From<ExportError> for WsError {
+    fn from(e: ExportError) -> Self {
+        WsError::Export(e)
+    }
+}
+
+impl From<FarmError> for WsError {
+    fn from(e: FarmError) -> Self {
+        // Through `ExportError::Farm` rather than a second mapping: a Farm failure
+        // reaching this API is always a Farm failure *of an Export*, and one table is
+        // one place to read.
+        WsError::Export(ExportError::Farm(e))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The clock
+// ---------------------------------------------------------------------------
+
+/// Unix seconds now.
+///
+/// **This role has no `Clock` port** (see the module docs), and every expiry it
+/// enforces — the workspace token's, and an Export capability's — is an absolute unix
+/// second computed elsewhere and *checked* here. So the clock reading is not injected
+/// from the wire and must not be: a caller that could name `now` could name one before
+/// its own credential expired.
+///
+/// That is also why nothing here needs a clock seam to be testable. Expiry is asserted
+/// by choosing an `exp` in the past, not by moving the clock.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Unix milliseconds now — the grain [`StatCache`]'s capture instant is in.
+///
+/// Seconds are not enough for that one: a capture truncated to the second boundary
+/// sits *before* the writes it is supposed to follow, so nothing is ever reusable. It
+/// is only ever read **after** the work it vouches for has finished; see
+/// [`WorkspaceState::captures`] for why the other direction would be unsafe rather
+/// than merely wasteful.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -350,11 +788,7 @@ fn authenticate(state: &WorkspaceState, headers: &HeaderMap) -> Result<Workspace
             );
             WsError::Unauthorized
         })?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    workspace_token::verify(&state.token_secret, raw, now).map_err(|e| {
+    workspace_token::verify(&state.token_secret, raw, now_secs()).map_err(|e| {
         // The claims are unverified in the failure case, so nothing from the
         // token is logged except which check failed — a forged token must not
         // be able to write arbitrary text into our logs.
@@ -1027,6 +1461,659 @@ async fn have(
 }
 
 // ---------------------------------------------------------------------------
+// The Workspace Export lifecycle (ADR-0062)
+// ---------------------------------------------------------------------------
+
+/// `POST /v1/exports` — build the Farm if it is not built, then prepare an Export
+/// over it.
+///
+/// The two are one route on purpose. ADR-0062 part 1 makes a Farm *the* lower layer of
+/// every Export of that snapshot, and
+/// [`ExportRegistry::prepare`](crate::export::ExportRegistry::prepare) takes a
+/// `FarmLease` before it reads a byte — so a prepare against an unbuilt Farm is
+/// `FarmError::NotBuilt` and the caller's only move would be "build it, then ask
+/// again". Doing that round trip over HTTP would buy nothing and would let a Farm be
+/// evicted in between.
+///
+/// A build is idempotent and shared: the second Step to inherit a snapshot pays one
+/// `stat`, which is the fan-out property part 1 exists for.
+#[derive(Deserialize)]
+pub struct PrepareExportRequest {
+    pub run: String,
+    pub step: String,
+    pub attempt: String,
+    /// The parent Workspace Snapshot's root — the Farm's key and the overlay's lower
+    /// layer.
+    pub parent_root: String,
+    /// The parent's **content identity**, when the store that ingested it computed
+    /// one. Carried because it cannot be recovered here: an untouched Step has to
+    /// reproduce its input's identity, and rediscovering it means walking the whole
+    /// parent tree. Absent is the documented pre-identity degradation — wasteful,
+    /// never wrong.
+    #[serde(default)]
+    pub parent_identity: Option<String>,
+    /// Absolute unix seconds, from
+    /// [`capability_expiry`](crate::export::capability_expiry) against the Step's own
+    /// timeout. **Not a duration** — this role has no clock it can defend, which is
+    /// the same reason a workspace token carries an absolute `exp`.
+    pub exp: i64,
+    /// Which rung to build on. Omitted means
+    /// [`ExportRung::best_available`] — *"ask explicitly and then report what you
+    /// got"*, which is what the response's `rung` is for. A rung named explicitly is
+    /// never silently degraded: an unavailable one is a `409`.
+    #[serde(default)]
+    pub rung: Option<ExportRung>,
+}
+
+/// What a prepare answers. **`export_path` is the capability** — see the module docs.
+#[derive(Serialize)]
+pub struct PreparedExportDto {
+    /// The Export's location and log identity: `sha256(capability)`. Safe anywhere.
+    pub handle: String,
+    /// **The secret.** The NFS export pathname a per-Step PersistentVolume carries.
+    /// The one place a capability crosses this API outbound, and the reason it is in a
+    /// body rather than a header or a path.
+    pub export_path: String,
+    pub exp: i64,
+    /// The Export rung actually taken (ADR-0062: *"a build must report which rung it
+    /// took"*).
+    pub rung: String,
+    /// The Farm rung actually taken, and its per-file counters. Per-file rather than
+    /// per-build because a clone can fail on one entry and succeed on its neighbours,
+    /// so `Mixed` is a real outcome and the counters are the reportable truth.
+    pub farm_rung: String,
+    pub farm_reused: bool,
+    pub farm_reflinked: u64,
+    pub farm_copied: u64,
+    /// File entries copied into the writable tree — zero on the overlay rung, which
+    /// copies nothing.
+    pub files: u64,
+    pub bytes: u64,
+    pub elapsed_ms: u64,
+}
+
+async fn prepare_export(
+    State(state): State<WorkspaceState>,
+    headers: HeaderMap,
+    Json(req): Json<PrepareExportRequest>,
+) -> Result<Response, WsError> {
+    let claims = authenticate(&state, &headers)?;
+    valid_hash(&req.parent_root)?;
+    if let Some(identity) = &req.parent_identity {
+        valid_hash(identity)?;
+    }
+    let rung = req.rung.unwrap_or_else(ExportRung::best_available);
+    let parent = Snapshot {
+        root: TreeHash(req.parent_root.clone()),
+        identity: req.parent_identity.clone().map(TreeHash),
+    };
+
+    let build = state.farm.build(&parent.root).await?;
+
+    let request = PrepareRequest {
+        fence: Fence {
+            run: req.run,
+            step: req.step,
+            attempt: req.attempt,
+        },
+        parent,
+        exp: req.exp,
+        rung,
+        now: now_secs(),
+    };
+    let registry = state.exports.clone();
+    // `spawn_blocking`: the copy rung copies a whole tree, and the registry's index is
+    // a `std::sync::Mutex`.
+    let prepared = tokio::task::spawn_blocking(move || registry.prepare(request))
+        .await
+        .map_err(|e| WsError::Backend(format!("the export prepare task did not complete: {e}")))??;
+
+    // The stat cache's capture instant, read **after** the writable tree exists and
+    // deliberately never rounded up. See `WorkspaceState::captures`: early is
+    // wasteful, late publishes a stale hash, and this is the only place on the path
+    // that knows when materialisation finished.
+    state.remember_capture(prepared.handle.clone(), now_ms());
+
+    tracing::info!(
+        export = "prepare",
+        handle = %prepared.handle,
+        run = %claims.fence.run,
+        step = %claims.fence.step,
+        rung = prepared.rung.as_str(),
+        farm_rung = build.rung.as_str(),
+        farm_reused = build.reused,
+        "workspace export prepared for a step"
+    );
+
+    let dto = PreparedExportDto {
+        handle: prepared.handle.to_string(),
+        export_path: prepared.export_path(),
+        exp: prepared.exp,
+        rung: prepared.rung.as_str().to_string(),
+        farm_rung: build.rung.as_str().to_string(),
+        farm_reused: build.reused,
+        farm_reflinked: build.reflinked,
+        farm_copied: build.copied,
+        files: prepared.files,
+        bytes: prepared.bytes,
+        elapsed_ms: prepared.elapsed_ms.min(u128::from(u64::MAX)) as u64,
+    };
+    Ok((StatusCode::CREATED, Json(dto)).into_response())
+}
+
+/// `POST /v1/exports/claim` — present a capability, and pin the first client.
+///
+/// **This is the one route whose credential is the capability**, and it exists because
+/// there is no `nfsd` yet: with no mount to observe, first-client pinning is modelled
+/// where it can be, and this is where a real NFS server would call into. The workspace
+/// token is still required — the capability authorises *the Export*, the token
+/// authenticates *the caller of this API*, and collapsing the two would make an
+/// unauthenticated endpoint out of the one that hands back a workspace path.
+///
+/// Deliberately **not** `Debug`: a `{:?}` of a request carrying a capability is
+/// exactly the leak [`ExportCapability`]'s redacted `Debug` exists to prevent, and a
+/// derived one here would route around it. (Axum's own `Json` rejection text names the
+/// field and position of a malformed body, never its value.)
+#[derive(Deserialize)]
+pub struct ClaimExportRequest {
+    /// **The secret.** Parsed for shape before it is used for anything, and it never
+    /// reaches a log line or an error body.
+    pub capability: String,
+    /// Who is mounting. A node or Pod name, not a secret — an operator reading a
+    /// pinning refusal needs to know who is fighting over the mount.
+    pub client: String,
+}
+
+#[derive(Serialize)]
+pub struct ClaimedExportDto {
+    pub handle: String,
+    /// The directory the Step's `/workspace` resolves to.
+    pub workspace: String,
+    pub parent_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_identity: Option<String>,
+    pub rung: String,
+    pub exp: i64,
+    pub client: String,
+    /// Whether *this* call did the pinning. A remount by the same client is `false`
+    /// and is not an error.
+    pub first_claim: bool,
+}
+
+async fn claim_export(
+    State(state): State<WorkspaceState>,
+    headers: HeaderMap,
+    Json(req): Json<ClaimExportRequest>,
+) -> Result<Json<ClaimedExportDto>, WsError> {
+    authenticate(&state, &headers)?;
+    // Shape first, and the error carries nothing: a rejected capability is a
+    // secret-shaped string from an untrusted client.
+    let capability = ExportCapability::parse(&req.capability)?;
+    let client = req.client;
+    let now = now_secs();
+    let registry = state.exports.clone();
+    let claimed = tokio::task::spawn_blocking(move || registry.claim(&capability, &client, now))
+        .await
+        .map_err(|e| WsError::Backend(format!("the export claim task did not complete: {e}")))??;
+
+    Ok(Json(ClaimedExportDto {
+        handle: claimed.handle.to_string(),
+        workspace: claimed.workspace_dir.display().to_string(),
+        parent_root: claimed.parent.root.0.clone(),
+        parent_identity: claimed.parent.identity.as_ref().map(|id| id.0.clone()),
+        rung: claimed.rung.as_str().to_string(),
+        exp: claimed.exp,
+        client: claimed.client,
+        first_claim: claimed.first_claim,
+    }))
+}
+
+/// The change-set fold's cost. `settle::SettleTally`, on the wire.
+#[derive(Serialize)]
+pub struct ChangeSetTallyDto {
+    pub blobs_stored: u64,
+    pub trees_written: u64,
+    pub trees_read: u64,
+    pub identities_walked: u64,
+    pub grafted: u64,
+    pub deleted: u64,
+    pub written_paths: usize,
+    pub directories: usize,
+}
+
+/// The re-ingest drain's cost. `statcache::DrainTally`, on the wire — and
+/// `reused == 0` with a baseline wired is the live signal that the stat cache is
+/// buying nothing.
+#[derive(Serialize)]
+pub struct ReingestTallyDto {
+    pub hashed: u64,
+    pub reused: u64,
+    pub links: u64,
+    /// How many paths the baseline vouched for, and from when. `captured_at_ms == 0`
+    /// means this process never made the Export (a restart) and therefore trusts
+    /// nothing — every file re-read, never wrong.
+    pub baseline_paths: usize,
+    pub captured_at_ms: i64,
+}
+
+/// What a settle answers.
+#[derive(Serialize)]
+pub struct SettledExportDto {
+    pub handle: String,
+    /// The new Workspace Snapshot's root — the address an Attempt records.
+    pub root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// Which drain read the Export back: `change-set` (the overlay rung's exact upper
+    /// layer) or `re-ingest` (the copy rung's `(size, mtime, ctime)` approximation).
+    /// The rung chose it, not the caller.
+    pub drain: &'static str,
+    /// **Always `true` when this response exists.** The field is here because a caller
+    /// deciding whether an Attempt may be `Succeeded` should be able to read the
+    /// promise rather than infer it from a `200`.
+    pub durable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_set: Option<ChangeSetTallyDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reingest: Option<ReingestTallyDto>,
+    pub elapsed_ms: u64,
+}
+
+/// `POST /v1/exports/{handle}/settle` — fold what the Step wrote back into the CAS,
+/// **and get it into cold before answering.**
+///
+/// # How the durability decision is enforced, per drain
+///
+/// ADR-0062 part 3 settles this: *"a change set is folded into the CAS locally and then
+/// uploaded to cold before the Attempt may reach `Succeeded`"*. Two drains, two
+/// mechanisms, and neither is a promise this function makes on its own account:
+///
+/// - **The change-set fold writes through [`TieredCas`]**, whose every `put_blob` and
+///   `put_tree` is `cold.put(..).await?` *first* and warm second, with the warm leg's
+///   failure counted rather than propagated (`scarab_storage::tiered`: *"cold first:
+///   this is the leg that licenses `Succeeded`"*). So a `200` from this route means
+///   every blob and every tree the fold wrote is in the durable tier — not queued for
+///   it. An untouched Step writes nothing and returns its input snapshot verbatim,
+///   which was already durable as somebody else's output.
+///   **Untouched sub-trees are carried by hash and never written**, and they are
+///   durable for the same reason: they are the parent's, and the parent was durable
+///   before the Attempt that produced it succeeded.
+/// - **The re-ingest drain has no tiered twin**, because `ingest_with_baseline` is not
+///   on the `Cas` port and cannot be (a `StatCache` is a drain's input, not a store's).
+///   So the two legs are written out here in the same order and with the same error
+///   handling `TieredCas::ingest` uses: **cold first, awaited, its error is the
+///   caller's**; then warm, best-effort, with a root disagreement reported. Two walks
+///   of the tree, which is exactly what `TieredCas::ingest` already pays on every Step
+///   boundary today.
+///
+/// # Settle strictly before revoke, and never a reap on failure
+///
+/// [`SettleInputs`](crate::export::SettleInputs) is an RAII guard: while it lives,
+/// `revoke` and the background `sweep` refuse this Export with
+/// `ExportError::Settling`, so a sweep whose `exp` has just passed cannot
+/// `remove_dir_all` the upper layer this fold is reading. A *fully* deleted upper
+/// errors; a **partially** emptied one reads back as "the Step wrote nothing" and
+/// publishes silently, which is why the guard is a refusal and not a race to lose.
+///
+/// **This route never reaps.** A settle is idempotent — the fold is content-addressed,
+/// so reading the same upper twice publishes the same root — and a settle that reaped
+/// would make a lost response unrecoverable: the caller retries, gets
+/// `no-such-export`, and the Attempt has no root. The reap is
+/// `DELETE /v1/exports/{handle}`, which the caller issues once it has durably recorded
+/// the snapshot, with the sweep as the backstop for the caller that never comes back.
+///
+/// One thing here is a workaround and not a design: the change-set fold cannot be
+/// `.await`-ed inline, because its future is not provably `Send` and axum requires one
+/// that is. [`fold_change_set`] carries the whole explanation and the one-line fix that
+/// would retire it.
+async fn settle_export(
+    State(state): State<WorkspaceState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+) -> Result<Json<SettledExportDto>, WsError> {
+    authenticate(&state, &headers)?;
+    let handle = parse_handle(&handle)?;
+    let started = Instant::now();
+
+    // The guard, taken before a single byte of the evidence is read and held until
+    // the fold has finished with it. Not in `spawn_blocking`: it does no I/O (lock,
+    // clone, unlock) and its return value borrows the registry, which `'static`
+    // forbids. See the module docs.
+    let inputs = state.exports.settle_inputs(&handle)?;
+    let parent = inputs.parent.clone();
+    let drain = inputs.drain.clone();
+
+    let dto = match drain {
+        SettleDrain::ChangeSet { upper, markers } => {
+            let bad = |detail: String| WsError::Drain {
+                handle: handle.clone(),
+                detail,
+            };
+            let walked = upper.clone();
+            // A whole-tree `read_dir` plus a `listxattr` per entry: blocking syscalls,
+            // and on `node_modules` a lot of them.
+            let change = tokio::task::spawn_blocking(move || {
+                changeset::read_change_set(&walked, markers)
+            })
+            .await
+            .map_err(|e| bad(format!("the change-set read task did not complete: {e}")))?
+            .map_err(|e| bad(e.to_string()))?;
+            let written_paths = change.written.len();
+            let directories = change.directories.len();
+
+            // `state.cas` — the tiered store — and not `state.warm`. **This one
+            // argument is the durability decision**: every `put_blob` and `put_tree`
+            // inside the fold is a cold write, awaited, before it returns.
+            let settled = fold_change_set(state.cas.clone(), parent.clone(), upper, change)
+                .await
+                .map_err(|e| bad(format!("the change-set fold failed: {e}")))?
+                .map_err(|e| bad(e.to_string()))?;
+
+            SettledExportDto {
+                handle: handle.to_string(),
+                root: settled.snapshot.root.0.clone(),
+                identity: settled.snapshot.identity.as_ref().map(|id| id.0.clone()),
+                drain: "change-set",
+                durable: true,
+                change_set: Some(ChangeSetTallyDto {
+                    blobs_stored: settled.tally.blobs_stored,
+                    trees_written: settled.tally.trees_written,
+                    trees_read: settled.tally.trees_read,
+                    identities_walked: settled.tally.identities_walked,
+                    grafted: settled.tally.grafted,
+                    deleted: settled.tally.deleted,
+                    written_paths,
+                    directories,
+                }),
+                reingest: None,
+                elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            }
+        }
+        SettleDrain::Reingest { workspace } => {
+            let bad = |detail: String| WsError::Drain {
+                handle: handle.clone(),
+                detail,
+            };
+            let Some(path) = workspace.to_str().map(str::to_string) else {
+                return Err(bad(format!(
+                    "the export's workspace path {} is not UTF-8, and `ingest` takes a `&str`",
+                    workspace.display()
+                )));
+            };
+
+            // The baseline's *content*: what the parent snapshot said each path held.
+            // `flatten` is this service's own walk of a snapshot it already holds — the
+            // same one `/flat` answers with — so the baseline is built from the manifest
+            // rather than from a second idea of what the parent contains.
+            let manifest = flatten(&state, &parent.root).await?;
+            let captured_at_ms = state.capture_of(&handle).unwrap_or_else(|| {
+                tracing::warn!(
+                    export = "settle",
+                    handle = %handle,
+                    "this process did not prepare this export, so it does not know when its \
+                     workspace finished materialising; draining with a baseline that vouches for \
+                     NOTHING. Every file is re-read — wasteful, never wrong (ADR-0062: the copy \
+                     rung's change set is a `(size, mtime, ctime)` approximation, and the \
+                     approximation is only sound against a capture instant taken after \
+                     materialisation)"
+                );
+                0
+            });
+
+            let (snapshot, tally, baseline_paths) = reingest_cold_then_warm(
+                state.cold.clone(),
+                state.warm.clone(),
+                path,
+                manifest,
+                captured_at_ms,
+                handle.clone(),
+            )
+            .await
+            .map_err(|e| bad(format!("the cold re-ingest failed: {e}")))?;
+
+            SettledExportDto {
+                handle: handle.to_string(),
+                root: snapshot.root.0.clone(),
+                identity: snapshot.identity.as_ref().map(|id| id.0.clone()),
+                drain: "re-ingest",
+                durable: true,
+                change_set: None,
+                reingest: Some(ReingestTallyDto {
+                    hashed: tally.hashed,
+                    reused: tally.reused,
+                    links: tally.links,
+                    baseline_paths,
+                    captured_at_ms,
+                }),
+                elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            }
+        }
+    };
+
+    // Explicitly, and only now: the evidence was pinned for the whole fold. Dropping
+    // it here rather than letting it fall out of scope is the ordering stated as code.
+    drop(inputs);
+    tracing::info!(
+        export = "settle",
+        handle = %dto.handle,
+        drain = dto.drain,
+        root = %dto.root,
+        durable = dto.durable,
+        total_ms = dto.elapsed_ms,
+        "workspace export settled — the snapshot is in the cold tier, so the Attempt may be \
+         reported Succeeded (ADR-0062 part 3 / ADR-0061 part 4)"
+    );
+    Ok(Json(dto))
+}
+
+#[derive(Serialize)]
+pub struct ReapedExportDto {
+    pub handle: String,
+    /// `false` when there was nothing there, which is not an error: a reap is
+    /// idempotent, and a caller retrying after a lost response is the normal case.
+    pub existed: bool,
+}
+
+/// `DELETE /v1/exports/{handle}` — revoke and reap: unmount, delete the directory and
+/// the record, release the Farm lease.
+///
+/// Issued by the caller **after** it has durably recorded the settled snapshot. It
+/// refuses with `409 settling` while a drain holds the evidence, which is the guard in
+/// [`settle_export`] doing its job rather than a race to retry around.
+async fn revoke_export(
+    State(state): State<WorkspaceState>,
+    headers: HeaderMap,
+    Path(handle): Path<String>,
+) -> Result<Json<ReapedExportDto>, WsError> {
+    authenticate(&state, &headers)?;
+    let handle = parse_handle(&handle)?;
+    let registry = state.exports.clone();
+    let reaping = handle.clone();
+    let reaped = tokio::task::spawn_blocking(move || registry.revoke(&reaping))
+        .await
+        .map_err(|e| WsError::Backend(format!("the export revoke task did not complete: {e}")))??;
+    // Only after the reap succeeded. A capture forgotten while its Export still lives
+    // would silently downgrade a later settle to "trust nothing".
+    state.forget_capture(&handle);
+    Ok(Json(ReapedExportDto {
+        handle: reaped.handle.to_string(),
+        existed: reaped.existed,
+    }))
+}
+
+#[derive(Serialize)]
+pub struct LiveExportsDto {
+    pub handles: Vec<String>,
+}
+
+/// `GET /v1/exports` — the live Exports this replica knows about.
+///
+/// Not decoration. ADR-0062 makes rolling this service a **drain-then-roll**
+/// operation: a Step mounts one replica, so an upgrade must stop accepting new Exports
+/// and wait for the in-flight ones. This is the list that says when the waiting is
+/// over, and it answers from the in-memory index — the authority on *live* — rather
+/// than from the disk, which also holds Exports that could not be adopted.
+async fn list_exports(
+    State(state): State<WorkspaceState>,
+    headers: HeaderMap,
+) -> Result<Json<LiveExportsDto>, WsError> {
+    authenticate(&state, &headers)?;
+    Ok(Json(LiveExportsDto {
+        handles: state
+            .exports
+            .live_handles()
+            .iter()
+            .map(|handle| handle.to_string())
+            .collect(),
+    }))
+}
+
+/// The change-set fold against the **tiered** store — the durability decision, in one
+/// signature: this is the only place the change-set drain names a store, and the store
+/// it names is [`TieredCas`](scarab_storage::tiered::TieredCas), whose every write is
+/// cold-first and awaited.
+///
+/// # Why it runs on a blocking thread, which is NOT a design choice
+///
+/// [`settle::settle_change_set`]'s future is **not provably `Send`** on rustc 1.97
+/// stable. Its `apply_written` maps a `buffer_unordered` over `&Job<'_>` — a borrow of
+/// a value that itself has a lifetime parameter — and rustc's higher-ranked check on
+/// that shape gives up:
+///
+/// ```text
+/// error: implementation of `Iterator` is not general enough
+///   note: `Iterator` would have to be implemented for `std::slice::Iter<'_, Job<'_>>`
+///   note: ...but `Iterator` is actually implemented for `std::slice::Iter<'0, Job<'_>>`
+/// error: implementation of `Send` is not general enough
+///   note: `Send` would have to be implemented for the type `&BlobHash`
+/// ```
+///
+/// Every one of the seven types it names is `Send`; this is rust#102211's family and not
+/// a real unsoundness. But axum requires a handler's future to be `Send`, and none of
+/// the call-site dodges reach it — `Box::pin` still names the future's type, coercing to
+/// `Pin<Box<dyn Future + Send>>` still has to *prove* `Send` to coerce, owning every
+/// parameter does not help, and `fn assert_send<T: Send>(_: T)` fails on it too. The
+/// obligation is inside `settle.rs` and so is the fix.
+///
+/// So the fold is driven on a thread that never has to be `Send`: `spawn_blocking` for
+/// the thread, `Handle::block_on` to drive an `!Send` future on it. Two consequences,
+/// both real and neither silent:
+///
+/// - **It occupies a blocking-pool thread for the duration of the fold**, including its
+///   cold-tier round trips. The pool is 512 threads by default and a settle is one per
+///   Attempt, so this is a cost rather than a limit — but it is a cost the correct
+///   version of this function would not pay.
+/// - **`Handle::block_on` cannot itself drive the IO driver of a `current_thread`
+///   runtime.** It does not need to here: the service binary runs on a multi-threaded
+///   runtime, and under `#[tokio::test]` the test's own `Runtime::block_on` is driving
+///   it while this awaits. Worth knowing, because it is the one configuration in which
+///   this workaround would stall where a plain `.await` would not.
+///
+/// **The one-line fix belongs in `settle.rs`**: give `Job` no lifetime parameter
+/// (`comps: Vec<String>` instead of `Vec<&'c str>`), or `buffer_unordered` over owned
+/// job values rather than `jobs.iter()`. Either removes the nested region the checker
+/// chokes on, and then this becomes `settle_change_set(&*cas, ..).await` in the handler
+/// and this whole function goes away. It is deliberately **not** done here.
+async fn fold_change_set(
+    cas: Arc<TieredCas>,
+    parent: Snapshot,
+    upper: std::path::PathBuf,
+    change: changeset::ChangeSet,
+) -> Result<Result<settle::Settled, settle::SettleError>, tokio::task::JoinError> {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(settle::settle_change_set(&*cas, &parent, &upper, &change))
+    })
+    .await
+}
+
+/// The re-ingest drain, tiered by hand: **cold first and awaited, then warm
+/// best-effort.**
+///
+/// `TieredCas::ingest` already does exactly this for the untargeted drain, and this is
+/// the same ordering for the baseline-aware one — which has no tiered twin, because
+/// `ingest_with_baseline` is not on the `Cas` port and should not be: a [`StatCache`]
+/// is a *drain's* input, not a store's. The two walks are the same two walks the status
+/// quo pays.
+///
+/// - **Cold decides success.** It is the only tier ADR-0061 promises anything about, so
+///   its error is the caller's and a `Succeeded` Attempt can never rest on warm.
+/// - **Warm is a cache and its failure is a `warn`, not an error** — but a louder
+///   `warn` than the generic one, because the next [`SnapshotFarm`] over this root
+///   reads blobs *straight off the warm volume*, so a missed warm leg is a Farm build
+///   that has to refill from cold first.
+/// - **A root disagreement between the two walks means the tree moved underneath
+///   them**, and the cold root is the one returned because it is the durable one.
+///
+/// One note on what a baseline `Reuse` means across tiers, because it is an assumption
+/// and not a proof: a reused blob is *not written* by either leg. That is sound against
+/// cold because the reused hash comes from the **parent snapshot's** manifest and the
+/// parent was durable before the Attempt that produced it succeeded. Against warm it
+/// rests on the parent's blobs still being on the volume — which the Farm build for
+/// this very Export already required — and the failure mode if that ever stops holding
+/// is a loud `FarmError::MissingBlob` on the *next* Step, not a wrong snapshot.
+///
+/// It is a separate function so that the two legs and their asymmetry read as one thing
+/// rather than as two calls a future editor could reorder. The [`StatCache`] is *built
+/// here* from the manifest rather than passed in, so the one genuinely large value on
+/// this path (a `BTreeMap` entry per file in the parent snapshot) is moved and never
+/// cloned; `baseline_paths` comes back in the tuple because the caller reports it.
+///
+/// Unlike [`fold_change_set`] this one needs no `spawn_blocking`: `ingest_with_baseline`
+/// has the same internal `buffer_unordered` shape but over **owned** jobs, so its future
+/// is provably `Send` and awaits inline. Which is also the evidence that the fix for the
+/// fold belongs in `settle.rs`: the adapter next door already does it the working way.
+async fn reingest_cold_then_warm(
+    cold: Arc<S3Storage>,
+    warm: Arc<S3Storage>,
+    path: String,
+    manifest: FlatManifest,
+    captured_at_ms: i64,
+    handle: ExportHandle,
+) -> Result<(Snapshot, scarab_storage::statcache::DrainTally, usize), StorageError> {
+    let baseline = StatCache::from_manifests([&manifest], captured_at_ms);
+    let baseline_paths = baseline.len();
+    let path = path.as_str();
+    let baseline = &baseline;
+
+    let (snapshot, tally) = cold.ingest_with_baseline(path, baseline).await?;
+
+    match warm.ingest_with_baseline(path, baseline).await {
+        Ok((warm_snapshot, _)) if warm_snapshot.root != snapshot.root => tracing::warn!(
+            export = "settle",
+            handle = %handle,
+            cold = %snapshot.root.0,
+            warm = %warm_snapshot.root.0,
+            "the two re-ingest walks of one export produced different roots — the workspace \
+             changed underneath them, so warm holds an unrelated snapshot. The COLD root is the \
+             one returned, because it is the durable one."
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            export = "settle",
+            handle = %handle,
+            error = %e,
+            "the warm leg of a re-ingest failed; the snapshot IS durable in cold, so this is a \
+             cache miss to come rather than a failed step — but the next Snapshot Farm over this \
+             root reads the WARM volume, so it will have to be refilled from cold first"
+        ),
+    }
+    Ok((snapshot, tally, baseline_paths))
+}
+
+/// An Export handle as it may appear in a URL: exactly 64 lowercase hex chars.
+///
+/// [`ExportHandle::parse`] is the single statement of that rule and it is called, not
+/// re-implemented — a second copy of the 64-hex check is a second thing to get wrong,
+/// and this one also becomes a path segment. A handle is not a secret, so unlike a
+/// capability its rejection may say what was wrong.
+fn parse_handle(raw: &str) -> Result<ExportHandle, WsError> {
+    ExportHandle::parse(raw).ok_or_else(|| {
+        WsError::BadRequest("an export handle is 64 lowercase hex characters".into())
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Health / metrics
 // ---------------------------------------------------------------------------
 
@@ -1289,4 +2376,782 @@ mod tests {
             body
         );
     }
+
+    // -----------------------------------------------------------------------
+    // ADR-0062 — the Export lifecycle, over the real router
+    // -----------------------------------------------------------------------
+
+    /// 2001-02-03T04:05:06Z, `fidelity.rs`'s constant, in unix-**ms**.
+    ///
+    /// Distinctly old on purpose, and load-bearing for the stat-cache assertions
+    /// rather than decorative: the baseline distrusts any mtime at or after
+    /// `captured_at - MTIME_GRANULARITY_SLACK_MS`, so a fixture whose files carry
+    /// "whatever the filesystem wrote just now" would be re-hashed for the *racy*
+    /// reason and a test asserting reuse would fail for a reason that is not the one
+    /// under test.
+    const PARENT_MTIME_MS: i64 = 981_173_106_000;
+
+    /// The parent Workspace Snapshot's contents, as `(path, bytes)` plus one symlink
+    /// and one nested directory. Stated once because three tests assert against it.
+    fn parent_files() -> [(&'static str, &'static [u8]); 4] {
+        [
+            ("keep.txt", b"inherited"),
+            ("run.sh", b"#!/bin/sh\necho hi\n"),
+            ("dir/inner.txt", b"inner"),
+            ("dir/other.txt", b"other"),
+        ]
+    }
+
+    /// A real warm volume, a real cold store, a real `WorkspaceState` built by the
+    /// **shipped constructor**, and a parent snapshot ingested into both tiers.
+    ///
+    /// No fakes anywhere: `S3Storage::local` on two tempdirs, a real `SnapshotFarm`, a
+    /// real `ExportRegistry`, real HMAC tokens, and the router `router()` itself
+    /// returns. The state is exposed as well as the router because two of the
+    /// assertions below are about things no HTTP route reveals — whether an Export is
+    /// still in the index, and whether a settle is refused underneath.
+    struct ExportHarness {
+        tmp: tempfile::TempDir,
+        state: WorkspaceState,
+        cold: Arc<S3Storage>,
+        parent: Snapshot,
+        token: String,
+    }
+
+    impl ExportHarness {
+        async fn start() -> Self {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let warm_dir = tmp.path().join("warm");
+            let cold_dir = tmp.path().join("cold");
+            std::fs::create_dir_all(&warm_dir).expect("mkdir warm");
+            std::fs::create_dir_all(&cold_dir).expect("mkdir cold");
+
+            // The parent snapshot's source tree, with the old mtimes the stat cache
+            // needs to be able to trust anything at all.
+            let src = tmp.path().join("src");
+            for (path, bytes) in parent_files() {
+                let at = src.join(path);
+                std::fs::create_dir_all(at.parent().expect("has a parent")).expect("mkdir -p");
+                std::fs::write(&at, bytes).expect("write");
+            }
+            std::os::unix::fs::symlink("keep.txt", src.join("link.txt")).expect("symlink");
+            for (path, _) in parent_files() {
+                let when = std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_millis(PARENT_MTIME_MS as u64);
+                std::fs::File::open(src.join(path))
+                    .expect("open to set the mtime")
+                    .set_times(std::fs::FileTimes::new().set_modified(when))
+                    .expect("set mtime");
+            }
+
+            let cold = Arc::new(S3Storage::local(&cold_dir).expect("cold store"));
+            let state = open_state(&warm_dir, cold.clone(), b"export-secret".to_vec())
+                .expect("open the workspace state");
+
+            // Ingested through the TIERED store, so the parent is durable in cold and
+            // present in warm — which is what a real predecessor Step would have left,
+            // and what the Farm build below reads.
+            let parent = state
+                .cas
+                .ingest(src.to_str().expect("utf-8"))
+                .await
+                .expect("ingest the parent snapshot");
+            assert!(
+                parent.identity.is_some(),
+                "a real ingest folds a content identity; without one the identity \
+                 assertions below would compare None to None"
+            );
+
+            let token = workspace_token::mint(
+                b"export-secret",
+                &workspace_token::browse_claims(i64::MAX / 2),
+            );
+            Self {
+                tmp,
+                state,
+                cold,
+                parent,
+                token,
+            }
+        }
+
+        /// One request against a freshly-built router over the same state. A fresh
+        /// router per call because `oneshot` consumes the service; the state — and
+        /// therefore the registry, the index and the captures — is shared.
+        async fn call(
+            &self,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, String) {
+            use tower::ServiceExt;
+            let mut builder = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(WORKSPACE_TOKEN_HEADER, &self.token);
+            let body = match body {
+                Some(json) => {
+                    builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+                    Body::from(serde_json::to_vec(&json).expect("serialize"))
+                }
+                None => Body::empty(),
+            };
+            let response = build_router(self.state.clone())
+                .oneshot(builder.body(body).expect("request"))
+                .await
+                .expect("response");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        }
+
+        async fn json(
+            &self,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> serde_json::Value {
+            let (status, text) = self.call(method, uri, body).await;
+            assert!(
+                status.is_success(),
+                "{method} {uri} answered {status}: {text}"
+            );
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{text:?} is not JSON: {e}"))
+        }
+
+        fn prepare_body(&self) -> serde_json::Value {
+            serde_json::json!({
+                "run": "run-1",
+                "step": "build",
+                "attempt": "a1",
+                "parent_root": self.parent.root.0,
+                "parent_identity": self.parent.identity.as_ref().map(|id| &id.0),
+                // Comfortably live, and an absolute unix second as the API requires.
+                "exp": now_secs() + 3_600,
+                "rung": "copy",
+            })
+        }
+
+        /// Prepare on the **copy** rung — the only rung this host offers, and the one
+        /// ADR-0062's acceptance criterion for this slice names. Answers
+        /// `(handle, capability, workspace_dir)`.
+        async fn prepare(&self) -> (ExportHandle, String, std::path::PathBuf) {
+            let dto = self
+                .json("POST", "/v1/exports", Some(self.prepare_body()))
+                .await;
+            let handle = ExportHandle::parse(dto["handle"].as_str().expect("handle"))
+                .expect("the response's handle is 64 hex");
+            let export_path = dto["export_path"].as_str().expect("export_path").to_string();
+            let capability = export_path
+                .strip_prefix('/')
+                .expect("an export path is /{capability}")
+                .to_string();
+            let workspace = self
+                .state
+                .exports
+                .exports_dir()
+                .join(handle.as_str())
+                .join(crate::export::UPPER_DIR);
+            (handle, capability, workspace)
+        }
+    }
+
+    /// `lstat`-walk a checkout into `(path → (bytes-or-link-target, mode))`, never
+    /// following a link.
+    ///
+    /// Used to compare a **materialised** snapshot against the directory a Step left.
+    /// It describes a tree; it does not reproduce any logic under test.
+    fn tree_contents(root: &std::path::Path) -> BTreeMap<String, (Vec<u8>, u32)> {
+        fn walk(
+            root: &std::path::Path,
+            dir: &std::path::Path,
+            out: &mut BTreeMap<String, (Vec<u8>, u32)>,
+        ) {
+            let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+                .expect("read_dir")
+                .map(|e| e.expect("entry").path())
+                .collect();
+            paths.sort();
+            for path in paths {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::symlink_metadata(&path).expect("lstat");
+                let key = path
+                    .strip_prefix(root)
+                    .expect("under root")
+                    .to_string_lossy()
+                    .to_string();
+                let mode = meta.permissions().mode() & 0o7777;
+                if meta.file_type().is_symlink() {
+                    let target = std::fs::read_link(&path).expect("readlink");
+                    out.insert(key, (target.as_os_str().as_encoded_bytes().to_vec(), mode));
+                } else if meta.is_dir() {
+                    out.insert(key, (Vec::new(), mode));
+                    walk(root, &path, out);
+                } else {
+                    out.insert(key, (std::fs::read(&path).expect("read"), mode));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// **The acceptance test for this slice.** A Step gets an Export, writes into it,
+    /// **deletes an inherited file**, and settles — and the published snapshot is
+    /// exactly the tree it left, readable from the **cold** tier alone.
+    ///
+    /// Both halves are the ADR:
+    ///
+    /// - *"the change set is what the Step wrote"* has a failure mode where a deletion
+    ///   silently returns, and the whole `SettleDrain`-per-rung type exists because
+    ///   reading a copy-rung tree as an overlay upper does exactly that. Deleting
+    ///   `run.sh` is how this notices.
+    /// - *"a change set is folded into the CAS locally and then uploaded to cold before
+    ///   the Attempt may reach `Succeeded`"* is asserted by materialising the settled
+    ///   root through a store that can see **only** the cold directory. Warm cannot
+    ///   help it; if the cold leg had not run, there is nothing there to read.
+    #[tokio::test]
+    async fn a_step_publishes_exactly_what_it_left_including_a_deletion_and_cold_can_serve_it() {
+        let h = ExportHarness::start().await;
+        let (handle, _capability, workspace) = h.prepare().await;
+
+        // Exactly what a Step does: edit, add, delete.
+        std::fs::write(workspace.join("keep.txt"), b"the step rewrote this").expect("rewrite");
+        std::fs::write(workspace.join("added.txt"), b"the step added this").expect("add");
+        std::fs::remove_file(workspace.join("run.sh")).expect("the step deleted this");
+        let left_behind = tree_contents(&workspace);
+
+        let settled = h
+            .json(
+                "POST",
+                &format!("/v1/exports/{handle}/settle"),
+                Some(serde_json::json!({})),
+            )
+            .await;
+        assert_eq!(settled["drain"], "re-ingest", "the copy rung chose the drain");
+        assert_eq!(settled["durable"], true);
+        let root = TreeHash(settled["root"].as_str().expect("root").to_string());
+        assert_ne!(
+            root.0, h.parent.root.0,
+            "the Step changed three things, so the address must move — otherwise this \
+             fixture would pass for a settle that published its input"
+        );
+
+        // THE DURABILITY ASSERTION. `h.cold` is `S3Storage::local(<cold dir>)` — the
+        // cold directory and nothing else: no warm tier to fall back to, no tiering, no
+        // cache. If the cold leg had not run there is nothing here to read.
+        let out = h.tmp.path().join("from-cold");
+        h.cold
+            .materialize(&root, out.to_str().expect("utf-8"))
+            .await
+            .expect(
+                "the settled snapshot must be readable from COLD ALONE — ADR-0062 part 3: a green \
+                 Attempt always has its snapshot in the tier that makes a promise",
+            );
+
+        assert_eq!(
+            tree_contents(&out),
+            left_behind,
+            "the published snapshot must BE the tree the Step left: the rewrite, the addition, \
+             the untouched files, the symlink — and NOT `run.sh`, which it deleted"
+        );
+        assert!(
+            !tree_contents(&out).contains_key("run.sh"),
+            "the deleted file came back. That is the silent failure ADR-0062 makes the rung choose \
+             the drain to prevent, and it is the one this assertion exists for"
+        );
+    }
+
+    /// The stat-cache baseline is real: the untouched files of the parent snapshot are
+    /// **reused unread**, and only what the Step touched is hashed.
+    ///
+    /// This is the assertion that proves the *capture instant* — the one input to the
+    /// copy rung's drain that nothing in `export`'s seam carries and that this module
+    /// therefore has to own. Forget it and every file is re-read: never wrong, and
+    /// `reused == 0` is the only thing that would say so.
+    #[tokio::test]
+    async fn the_reingest_drain_reuses_the_files_the_step_never_touched() {
+        let h = ExportHarness::start().await;
+        let (handle, _capability, workspace) = h.prepare().await;
+        std::fs::write(workspace.join("keep.txt"), b"touched").expect("rewrite");
+
+        let settled = h
+            .json(
+                "POST",
+                &format!("/v1/exports/{handle}/settle"),
+                Some(serde_json::json!({})),
+            )
+            .await;
+        let reingest = &settled["reingest"];
+
+        assert_eq!(
+            reingest["baseline_paths"].as_u64(),
+            Some(5),
+            "the baseline is built from the PARENT's flat manifest: four files plus the symlink"
+        );
+        assert!(
+            reingest["captured_at_ms"].as_i64().unwrap_or(0) > 0,
+            "a capture instant of 0 is the degraded 'trust nothing' path; this Export was \
+             prepared by this very process, so its materialisation instant is known"
+        );
+        assert_eq!(
+            reingest["hashed"].as_u64(),
+            Some(1),
+            "exactly the one file the Step rewrote is read and hashed"
+        );
+        assert_eq!(
+            reingest["reused"].as_u64(),
+            Some(3),
+            "and the three the Step never touched come out of the baseline UNREAD — which is \
+             what the capture instant buys, and what a forgotten one silently loses"
+        );
+        assert_eq!(
+            reingest["links"].as_u64(),
+            Some(1),
+            "a symlink is never 'reused': nothing records a link's mtime, so there is no pair to \
+             compare (and its target was read by the walk either way)"
+        );
+    }
+
+    /// **Settle strictly before revoke.** While a drain holds the evidence, a reap is
+    /// refused — with a status that says "come back", not one that says "gone".
+    ///
+    /// Driven through the registry's own guard rather than through a contrived race:
+    /// the window a race would need is a few syscalls wide, and a timing test for it
+    /// would pass whether or not the guard existed. Holding a real `SettleInputs` is
+    /// the same state the fold is in, made exact.
+    #[tokio::test]
+    async fn a_reap_is_refused_while_a_drain_is_reading_the_evidence() {
+        let h = ExportHarness::start().await;
+        let (handle, _capability, _workspace) = h.prepare().await;
+
+        let inputs = h
+            .state
+            .exports
+            .settle_inputs(&handle)
+            .expect("take the settle guard");
+
+        let (status, body) = h.call("DELETE", &format!("/v1/exports/{handle}"), None).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a reap underneath an in-flight drain must be a 409 the caller retries, not a 404 \
+             and not a success: the upper layer it would delete is the Attempt's evidence"
+        );
+        assert!(
+            body.contains("being settled"),
+            "the refusal must say why — a partially deleted upper reads back as 'the Step wrote \
+             nothing' and publishes silently: {body}"
+        );
+
+        // And once the drain lets go, the same call succeeds. Without this the test
+        // would also pass against a `revoke` that refused unconditionally.
+        drop(inputs);
+        let reaped = h
+            .json("DELETE", &format!("/v1/exports/{handle}"), None)
+            .await;
+        assert_eq!(reaped["existed"], true);
+    }
+
+    /// A settle that fails must leave the Export **live**, or the evidence is gone and
+    /// the Attempt cannot retry.
+    ///
+    /// The failure is injected by replacing the writable tree with a *file*, so the
+    /// re-ingest's walk gets `ENOTDIR`. Portable, and not uid-dependent — a
+    /// chmod-based version passes on a laptop and silently stops testing anything in a
+    /// root CI container.
+    ///
+    /// **What mutating this test revealed, recorded because it is the more interesting
+    /// half.** Adding `let _ = state.exports.revoke(&handle)` to the failure path leaves
+    /// this test *green* — because the `SettleInputs` guard is still alive at that point
+    /// and `revoke` refuses it with `ExportError::Settling`. The invariant only breaks
+    /// when the guard is released **first**, which is the mutation that does kill this
+    /// test. So the guard is not belt-and-braces over a careful handler: it is the thing
+    /// that makes the careless handler safe too.
+    #[tokio::test]
+    async fn a_settle_that_fails_does_not_reap_the_export() {
+        let h = ExportHarness::start().await;
+        let (handle, _capability, workspace) = h.prepare().await;
+        std::fs::remove_dir_all(&workspace).expect("remove the writable tree");
+        std::fs::write(&workspace, b"not a directory").expect("put a file in its place");
+
+        let (status, _body) = h
+            .call(
+                "POST",
+                &format!("/v1/exports/{handle}/settle"),
+                Some(serde_json::json!({})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let live = h.json("GET", "/v1/exports", None).await;
+        assert_eq!(
+            live["handles"],
+            serde_json::json!([handle.to_string()]),
+            "the export must still be live after a failed settle — reaping here deletes the only \
+             evidence the Attempt has, and its retry would then have nothing to read"
+        );
+        assert!(
+            h.state
+                .exports
+                .exports_dir()
+                .join(handle.as_str())
+                .join(crate::export::RECORD_FILE)
+                .exists(),
+            "and its record must still be on disk, or a restart could not adopt it either"
+        );
+    }
+
+    /// The fence's log/wire split, as a property of a pure function.
+    ///
+    /// ADR-0062: an expired or wrong-client capability must not be distinguishable
+    /// from a missing one **in the logs**, even where the HTTP status is deliberately
+    /// the same. So: one status, one body, three reasons. Asserted here rather than by
+    /// capturing `tracing` output because a log-capture test in this crate has to warm
+    /// every callsite first (`tracing` caches `Interest` process-wide) and would then
+    /// be asserting on a string rather than on the decision.
+    #[test]
+    fn three_different_refusals_share_one_status_and_one_body_and_no_reason() {
+        let handle = ExportHandle::parse(&"ab".repeat(32)).expect("a handle");
+        let refusals = [
+            ExportError::NoSuchExport(handle.clone()),
+            ExportError::Expired {
+                handle: handle.clone(),
+                exp: 10,
+                now: 20,
+            },
+            ExportError::PinnedToAnotherClient {
+                handle: handle.clone(),
+                pinned: "node-a".into(),
+                presented: "node-b".into(),
+            },
+            ExportError::MalformedCapability,
+        ];
+        let mut reasons = Vec::new();
+        for error in &refusals {
+            let (status, reason) = export_refusal(error);
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{reason} must answer the same status as every other miss, or the fence is an \
+                 oracle for whether a guessed address exists"
+            );
+            assert_eq!(
+                export_refusal_body(error, status),
+                "no such workspace export",
+                "{reason} must answer the same BODY too — an expired export naming its own exp on \
+                 the wire tells a holder of a guessed address that it guessed right"
+            );
+            reasons.push(reason);
+        }
+        let distinct: std::collections::BTreeSet<&&str> = reasons.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            reasons.len(),
+            "…and each must be a DIFFERENT reason in the log, or an incident cannot tell an \
+             expired capability from somebody else's: {reasons:?}"
+        );
+
+        // The other half of the same table: a refusal that is not a miss must not be
+        // laundered into one.
+        let (status, reason) = export_refusal(&ExportError::Settling {
+            handle,
+            in_flight: 1,
+        });
+        assert_eq!(status, StatusCode::CONFLICT, "{reason}");
+    }
+
+    /// A prepare **builds the Farm it is about to lease**, and reports which rung it
+    /// took.
+    ///
+    /// The two are one route because a lease of an unbuilt Farm is `FarmError::NotBuilt`
+    /// and the caller's only move would be a second round trip during which the Farm
+    /// could be evicted. The rung is reported because ADR-0062 says a build that
+    /// silently drops a rung reports a number the real deployment never produces.
+    #[tokio::test]
+    async fn a_prepare_builds_the_farm_it_leases_and_reports_the_rungs() {
+        let h = ExportHarness::start().await;
+        let farm_path = h
+            .state
+            .farm
+            .path_of(&h.parent.root)
+            .expect("a farm path for a real root");
+        assert!(
+            !farm_path.exists(),
+            "nothing has built this Farm yet, so the assertion below is about the prepare"
+        );
+
+        let dto = h
+            .json("POST", "/v1/exports", Some(h.prepare_body()))
+            .await;
+
+        assert!(
+            farm_path.join("keep.txt").exists(),
+            "the prepare must have built the Farm at {}, or its own lease would have been \
+             refused with `no farm is built`",
+            farm_path.display()
+        );
+        assert_eq!(dto["rung"], "copy", "the Export rung actually taken");
+        assert_eq!(dto["farm_reused"], false, "this Farm was built, not reused");
+        assert_eq!(
+            dto["farm_reflinked"].as_u64().unwrap_or(0) + dto["farm_copied"].as_u64().unwrap_or(0),
+            4,
+            "four file entries were placed, by whichever rung this filesystem offers — the \
+             counters are the reportable truth because a clone can fail per file"
+        );
+        assert!(
+            ["reflink", "copy", "mixed"].contains(&dto["farm_rung"].as_str().unwrap_or("")),
+            "a build must name its rung: {}",
+            dto["farm_rung"]
+        );
+
+        // And the second Export over the same snapshot pays one `stat` — the fan-out
+        // property part 1 exists for.
+        let second = h
+            .json("POST", "/v1/exports", Some(h.prepare_body()))
+            .await;
+        assert_eq!(second["farm_reused"], true);
+        assert_ne!(second["handle"], dto["handle"]);
+    }
+
+    /// First-client pinning, over HTTP: the capability round-trips, a remount by the
+    /// same client is idempotent, and a **different** client is refused without the
+    /// wire admitting the Export exists.
+    #[tokio::test]
+    async fn a_capability_claims_once_per_client_and_a_second_client_is_refused_blindly() {
+        let h = ExportHarness::start().await;
+        let (handle, capability, workspace) = h.prepare().await;
+
+        let claim = |client: &str| {
+            serde_json::json!({ "capability": capability, "client": client })
+        };
+        let first = h
+            .json("POST", "/v1/exports/claim", Some(claim("node-a")))
+            .await;
+        assert_eq!(first["handle"], handle.to_string(), "address → location");
+        assert_eq!(first["first_claim"], true);
+        assert_eq!(
+            first["workspace"],
+            workspace.display().to_string(),
+            "and the claim leads to the writable tree the Step will see"
+        );
+
+        let again = h
+            .json("POST", "/v1/exports/claim", Some(claim("node-a")))
+            .await;
+        assert_eq!(
+            again["first_claim"], false,
+            "a remount by the pinned client is idempotent, not an error"
+        );
+
+        let (status, body) = h
+            .call("POST", "/v1/exports/claim", Some(claim("node-b")))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a second client must be refused — and refused the same way a miss is, so holding a \
+             capability somebody else pinned tells you nothing"
+        );
+        assert!(
+            !body.contains("node-a"),
+            "the refusal must not name the pinned client on the wire: {body}"
+        );
+
+        // A capability that is not one is refused identically, and the error carries
+        // nothing back — a rejected capability is a secret-shaped string.
+        let (status, _) = h
+            .call(
+                "POST",
+                "/v1/exports/claim",
+                Some(serde_json::json!({ "capability": "far-too-short", "client": "node-a" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Startup does the two things nothing else will ever do: **sweep the Farm's
+    /// residue** and **adopt every Export on disk**.
+    ///
+    /// Both are startup-only by contract, so if `router()` does not do them at
+    /// construction they never happen. Driven through `router()` itself rather than
+    /// through the pieces, because "the composition root calls them" is the whole
+    /// claim.
+    #[tokio::test]
+    async fn startup_sweeps_farm_residue_and_opens_the_export_registry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let warm_dir = tmp.path().join("warm");
+        let cold_dir = tmp.path().join("cold");
+        std::fs::create_dir_all(&cold_dir).expect("mkdir cold");
+
+        // What a process killed mid-build leaves behind: a staging directory under the
+        // Farm's own prefix, with bytes in it. Nothing else in the system collects it.
+        let residue = warm_dir
+            .join("farms")
+            .join(format!("{}dead-build", crate::farm::STAGING_PREFIX));
+        std::fs::create_dir_all(&residue).expect("mkdir residue");
+        std::fs::write(residue.join("half-a-tree"), vec![b'x'; 512]).expect("write residue");
+        // And a directory at a name that is not an Export handle, which `open` must
+        // notice rather than adopt.
+        let stranger = warm_dir.join(EXPORTS_SUBDIR).join("not-a-handle");
+        std::fs::create_dir_all(&stranger).expect("mkdir stranger");
+
+        let cold = Arc::new(S3Storage::local(&cold_dir).expect("cold store"));
+        let _router = router(&warm_dir, cold, b"export-secret".to_vec()).expect("router");
+
+        assert!(
+            !residue.exists(),
+            "the Farm's staging residue must be swept at startup — it is startup-only by \
+             contract, so a composition root that skips it leaks the directory forever"
+        );
+        assert!(
+            warm_dir.join(EXPORTS_SUBDIR).is_dir(),
+            "and the export registry must have been opened over the volume"
+        );
+        assert!(
+            stranger.exists(),
+            "`open` is a census and not a janitor: it names an unrecognised directory rather than \
+             deleting something it has not reasoned about (the sweep is what deletes)"
+        );
+    }
+
+    /// The **change-set** drain: it folds through the tiered store, so its output is in
+    /// cold — and it survives being driven on a blocking thread.
+    ///
+    /// Two things, and the second is why this test exists at its own grain rather than
+    /// riding on the acceptance test above.
+    ///
+    /// - **Nothing else here reaches this drain.** `SettleDrain::ChangeSet` comes only
+    ///   from `ExportRung::Overlay`, and that rung needs `CAP_SYS_ADMIN` on a Linux
+    ///   kernel, which this host is not — so every route-level test above takes the
+    ///   copy rung's re-ingest. ADR-0062 books that as *"the exact path has never
+    ///   executed"* (git-bug `0ad393c`) and it stays true of the *mount*; what is
+    ///   testable without privilege is the **fold and its store**, because a whiteout is
+    ///   a path to the fold and never a file it reads.
+    /// - **The `spawn_blocking` + `Handle::block_on` workaround is a real concurrency
+    ///   construct** and the one configuration it could stall in is a `current_thread`
+    ///   runtime — which is exactly what `#[tokio::test]` gives. So this test is also the
+    ///   proof that the workaround does not deadlock or panic where it is used.
+    ///
+    /// The change set is built through `changeset`'s **own** plumbing (`entry_change` +
+    /// `absorb`), never by hand-constructing `Written`/`Directory` values: this ADR's
+    /// history has two test helpers that re-implemented what they were checking, and a
+    /// third would hide the same hole again.
+    #[tokio::test]
+    async fn the_change_set_fold_writes_through_the_tiered_store_and_reaches_cold() {
+        use crate::changeset::{entry_change, ChangeSet, EntryFacts, EntryType};
+
+        let h = ExportHarness::start().await;
+        // An upper layer as a Step's overlay would leave one: one edit, one whiteout
+        // over an inherited file. `run.sh` is a path here and not a file — a whiteout is
+        // a character device this test cannot `mknod`, and the fold never reads one.
+        let upper = h.tmp.path().join("upper");
+        std::fs::create_dir_all(&upper).expect("mkdir upper");
+        std::fs::write(upper.join("keep.txt"), b"the step rewrote this").expect("write");
+
+        let mut change = ChangeSet::default();
+        for (path, facts) in [
+            ("keep.txt", EntryFacts::plain(EntryType::File)),
+            ("run.sh", EntryFacts::whiteout()),
+        ] {
+            let entry = entry_change(std::path::Path::new(path), std::path::Path::new(""), &facts)
+                .expect("a shape the classifier supports");
+            let _ = change.absorb(entry, std::path::Path::new(""));
+        }
+        change.sort();
+
+        let settled = fold_change_set(
+            h.state.cas.clone(),
+            h.parent.clone(),
+            upper.clone(),
+            change,
+        )
+        .await
+        .expect("the fold must not panic or stall on the blocking thread it is driven on")
+        .expect("fold the change set");
+
+        assert_eq!(
+            settled.tally.blobs_stored, 1,
+            "exactly the change set: the one rewritten file, and NOT the three the Step never \
+             touched"
+        );
+        assert_eq!(settled.tally.deleted, 1, "the whiteout was applied");
+
+        // The durability decision for THIS drain: `fold_change_set` names `TieredCas`,
+        // whose every put is cold-first and awaited, so the cold directory alone can
+        // produce the whole snapshot.
+        let out = h.tmp.path().join("fold-from-cold");
+        h.cold
+            .materialize(&settled.snapshot.root, out.to_str().expect("utf-8"))
+            .await
+            .expect(
+                "the folded snapshot must be readable from COLD ALONE — this is the store handle \
+                 the change-set drain is given, and it is the whole of how ADR-0062 part 3's \
+                 durability decision is enforced on this path",
+            );
+        let published = tree_contents(&out);
+        assert_eq!(
+            published.get("keep.txt").map(|(bytes, _)| bytes.as_slice()),
+            Some(b"the step rewrote this".as_slice()),
+            "the edit is published"
+        );
+        assert!(
+            !published.contains_key("run.sh"),
+            "and the whiteout dropped the inherited file rather than republishing it: {:?}",
+            published.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            published.contains_key("dir/inner.txt"),
+            "while the untouched subtree is carried across by hash — and is in cold because it \
+             was the parent's, and the parent was durable before the Attempt that produced it"
+        );
+    }
+
+    /// The reaper actually reaps, and the capture map does not outlive what it
+    /// describes.
+    ///
+    /// The background loop is one `sleep` around this function, so this is the whole of
+    /// its behaviour with the timer taken out — a test that waited two minutes for the
+    /// loop would be testing `tokio::time`.
+    #[tokio::test]
+    async fn the_reaper_collects_an_expired_export_and_forgets_its_capture() {
+        let h = ExportHarness::start().await;
+        // An Export whose capability has already expired. `exp` is an absolute unix
+        // second the caller computes, so expiry is expressed by choosing one in the
+        // past — no clock to move, which is why this role needs no `Clock`.
+        let mut body = h.prepare_body();
+        body["exp"] = serde_json::json!(now_secs() - 1);
+        let dto = h.json("POST", "/v1/exports", Some(body)).await;
+        let handle = ExportHandle::parse(dto["handle"].as_str().expect("handle")).expect("handle");
+        assert_eq!(
+            h.state.capture_of(&handle),
+            h.state.capture_of(&handle),
+            "sanity: the capture lookup is stable"
+        );
+        assert!(
+            h.state.capture_of(&handle).is_some(),
+            "the prepare recorded a capture instant for it"
+        );
+
+        sweep_exports_once(&h.state).await;
+
+        assert!(
+            h.state.exports.live_handles().is_empty(),
+            "an expired Export is a leaked directory, a leaked capability and a Farm lease that \
+             keeps a whole Farm un-evictable"
+        );
+        assert_eq!(
+            h.state.capture_of(&handle),
+            None,
+            "and its capture instant goes with it, or the map grows for the life of the process"
+        );
+        assert!(
+            h.state.farm.holders(&h.parent.root).expect("holders").is_empty(),
+            "the Farm lease is released, so the warm tier can reclaim the Farm"
+        );
+    }
 }
+
