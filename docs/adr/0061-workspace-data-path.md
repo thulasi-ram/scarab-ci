@@ -135,6 +135,28 @@ can vanish between "the Step exited 0" and "its evidence is safe". Declaring suc
 durability puts a claim in the durable record that the record cannot back — the one thing
 this product may not do.
 
+> **Amended by [0064](0064-durability-tiering-and-the-write-path.md) (2026-07-28) — conditional on
+> the tiers a deployment actually has.** The rule above is unconditional, and the retention table
+> below says warm "promises none", so an Attempt succeeding on warm alone contradicts it. 0064 allows
+> exactly that **where no independent cold tier is configured** — and the test is `st_dev` of the cold
+> directory against the warm one, because `StoreConfig::LocalDir` may point at the warm volume itself,
+> in which case "written to cold" licenses nothing. A second PVC is a real cold tier; a `LocalDir`
+> beside the CAS is not.
+>
+> **The invariant survives; the mechanism weakens.** This paragraph's own reasoning is that the
+> product may not put a claim in the record that the record cannot back. Cold-before-`Succeeded` was a
+> mechanism for that, not the point of it. A deployment that *declares* "durability here is warm's"
+> and then succeeds on warm makes a smaller, true claim — so 0064 requires the degraded guarantee to be
+> stated at startup **and stamped on the Attempt**, since a deployment's tiers change over time while
+> its old records do not. What this paragraph was really protecting against is the **silent** version,
+> and disclosure removes it.
+>
+> The related prohibition three paragraphs into "the price of seeding the warm tier" — that writing
+> warm-first and letting the service tier onward makes warm load-bearing for durability — **still
+> stands**. 0064 writes warm-first for *one batched flush* that is synchronous with respect to
+> `Succeeded`; it does not tier onward asynchronously. Warm is the write path, cold remains the promise
+> wherever it exists.
+
 ### Vocabulary
 
 [CONTEXT.md](../../CONTEXT.md) previously used **Workspace** for two different things. They
@@ -155,6 +177,23 @@ Two tiers, two policies, so eviction can never break a promise:
 |---|---|---|
 | workspace service (warm) | **space** — evict least-recently-used | none; a miss is slower, never wrong |
 | object storage (cold) | **time** — retention TTL, as Artifacts already are | this is the guarantee users are given |
+
+> **Amended 2026-07-28 by [0063](0063-step-logs-on-the-data-depot.md) and
+> [0064](0064-durability-tiering-and-the-write-path.md).** Three corrections, and the first is the one
+> that matters:
+>
+> - **"A miss is slower, never wrong" is true only of re-derivable content.** It holds for Workspace
+>   Snapshots, because a miss refetches from cold or widens a rerun. It is **false for Step logs**,
+>   which 0063 puts on this tier and which cannot be re-derived at all — re-running a Step produces
+>   *different* logs. So logs carry their own promise on this tier: pinned against eviction until a
+>   durable sink acknowledges them where one exists, and where none exists, evicted **loudly** so the
+>   absence is visible in the record rather than looking like a Step that printed nothing.
+> - **Warm is not always promise-free.** Where no independent cold tier is configured (0064's `st_dev`
+>   test), warm is the only tier there is, and it carries whatever the operator's volume provides. The
+>   guarantee is then stated and stamped rather than absent.
+> - **"Workspace service" is now the Data Depot** (0063). It hosts the CAS, Snapshot Farms, Workspace
+>   Exports, the log namespace, and Cache — so a tier table row named after one tenant no longer
+>   describes it.
 
 Plus a manual **pin** ("keep this Run's workspaces") for investigations, and **graceful
 degradation**: expired inputs widen a rerun's scope and say so, rather than failing. Rerun
