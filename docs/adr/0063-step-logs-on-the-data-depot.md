@@ -193,6 +193,32 @@ of the existing one — a decision for then, not a rename now.
   stop implying it measures only the CAS (git-bug `1a9df08`, which already covers the Farm half of
   the same drift).
 
+## Open — deliberately not decided here
+
+**Whether logs already in the object store stay readable after the move.** [0013](0013-history-and-observability.md)'s
+arrangement puts bodies in the object store and offsets in Postgres. This ADR redirects both the write
+and the read to the Depot, so for an Attempt written *before* the move the offsets stay valid and the
+bytes stay exactly where they are — in a store the read path no longer consults. Nothing is
+corrupted. The logs simply become unreachable, and part 5 reports them, correctly, as gone.
+
+Three candidates, none chosen:
+
+1. **Serve pre-migration Attempts from the old store**, flagged on the index row. A permanent second
+   read path for a set of rows that only shrinks.
+2. **Copy the bytes onto the Depot once**, at startup or as a one-shot job — with the usual
+   restart-safety and partial-copy questions a migration always brings.
+3. **Declare pre-migration logs dropped** and let part 5 report them honestly.
+
+**Why this can wait:** nothing is released, so the affected population is dogfood Runs, and part 5
+already makes the outcome honest rather than mysterious — which is the property whose absence made
+this worth raising at all. **Why it must not be lost:** the cheap moment is *before* the write path
+moves, when a migration is a copy of a small store. Afterwards it is a copy plus a reconciliation
+against logs that have since been written, pinned and swept.
+
+**Whoever lands the slice decides this by default.** Implementing [0063](0063-step-logs-on-the-data-depot.md)
+part 1 without reading this section selects option 3, silently. That is an acceptable outcome and an
+unacceptable way to arrive at it, so `72dfe6f` says so out loud.
+
 ## References
 
 - [0013](0013-history-and-observability.md) — the log pipeline: chunked gzipped blobs + Postgres offset index
