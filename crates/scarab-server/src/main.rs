@@ -175,14 +175,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    literal reading of "a warm miss is slower, never wrong". Note this is
     //    the OPPOSITE of a Step Pod, which must fail closed: a Pod has no
     //    credentials, by design (ADR-0042).
-    //  * **writes go cold first**, so a cold failure is an error (an Attempt
-    //    cannot reach `Succeeded` on a non-durable snapshot — part 4) while a
-    //    service failure is `Ok` plus a warning plus a counter.
-    //  * **the drain therefore populates the warm tier on write.** Without this
-    //    the warm tier is filled only by the service's own read-path backfill, so
-    //    the first fetch of every snapshot is a guaranteed cold miss — and in a
-    //    DAG most edges are consumed once, immediately after being produced. The
-    //    volume would earn nothing until a second consumer appeared.
+    //  * **writes through THIS handle go cold first**, so a cold failure is an
+    //    error while a service failure is `Ok` plus a warning plus a counter.
+    //  * **a write through this handle therefore populates the warm tier too.**
+    //    Without it the warm tier is filled only by the service's own read-path
+    //    backfill, so the first fetch of every snapshot is a guaranteed cold miss
+    //    — and in a DAG most edges are consumed once, immediately after being
+    //    produced. The volume would earn nothing until a second consumer appeared.
+    //
+    // **Cold-first is this handle's ordering and not the system's**, which is worth
+    // being exact about now that the two differ. ADR-0064 part 1 makes the *Data
+    // Depot's* own write path warm-first plus one batched archival flush that the
+    // settle response waits for — that is where a Step's evidence is drained, and
+    // it keeps ADR-0061 part 4's guarantee by awaiting the flush rather than by
+    // ordering each blob. Here, warm is the Depot **over HTTP**, and inverting the
+    // order would make a Depot outage fail every Step that could otherwise have
+    // produced a perfectly durable snapshot. That availability question is
+    // unresolved and deliberately not answered here; retiring this handle in favour
+    // of the service's own path is git-bug `212bb13`, not ADR-0064 slice 1.
     //
     // The token is minted **per request**, in `browse` scope, for this process's
     // own use (`workspace_token::browse_claims`). Per-request rather than once at
@@ -210,7 +220,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(
                 url = %ws.url,
                 "workspace snapshots: warm = the workspace service, cold = the object store \
-                 (ADR-0061 D1.6; reads fall through to cold, writes are cold-first)"
+                 (ADR-0061 D1.6; reads fall through to cold, and writes THROUGH THIS HANDLE are \
+                 cold-first — the Depot's own drain is warm-first plus a batched flush, ADR-0064)"
             );
             Arc::new(
                 scarab_storage::tiered::TieredCas::new(Arc::new(client), cold_cas)

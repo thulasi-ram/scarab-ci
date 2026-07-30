@@ -8,6 +8,60 @@
 //! [`prune_tree`](crate::prune_tree), which already lives here as a free
 //! function over `&dyn Cas`.
 //!
+//! # As of ADR-0064, cold-first-per-blob is one of TWO write mechanisms — this is one of them
+//!
+//! [ADR-0064](../../../docs/adr/0064-durability-tiering-and-the-write-path.md)
+//! replaces cold-first-per-blob with warm-first-plus-one-batched-flush, but only
+//! for the Data Depot's own drain (`scarab-server`'s settle path): that drain no
+//! longer tiers through this type **at all**. It writes warm directly, on its
+//! own disk, and performs one batched archival flush to cold afterward — one
+//! walk, no network round-trip per object. `TieredCas` itself keeps the
+//! cold-first ordering documented below, unchanged, because its two live
+//! instances do not share the Depot drain's topology:
+//!
+//! - the control plane's instance
+//!   (`crates/scarab-server/src/main.rs:216`) has **warm = `WorkspaceClient`
+//!   over HTTP to the Depot**;
+//! - the Depot's own instance
+//!   (`crates/scarab-server/src/workspaced.rs:401`) has **warm =
+//!   `S3Storage::local(dir)`**, a local directory.
+//!
+//! ADR-0064's "one walk, no network" is therefore only true of the Depot's own
+//! instance's *drain*, and even there only because that code path stopped
+//! calling into this module — the instance still exists, still cold-first, for
+//! whatever else still uses it (reads, GC, tests).
+//!
+//! **The control plane's instance is a different story, and it is worth being
+//! precise about rather than lumping it in with "whatever else still uses
+//! it": its `ingest` leg is the live write path for every non-Export Step,
+//! today.** `drive_workspace(cas: &dyn Cas)` calls `.ingest(...)` at
+//! `crates/scarab-executor-k8s/src/lib.rs:671`; the `cas` it receives is this
+//! module's `TieredCas`, wired in via `with_workspace_cas`
+//! (`crates/scarab-executor-k8s/src/lib.rs:217`) from
+//! `crates/scarab-server/src/main.rs:216`. That call is trait-object dispatch
+//! — `dyn Cas` — which is why a textual grep for `TieredCas::ingest` turns up
+//! nothing: the caller is real, it is just spelled `cas.ingest(...)` at the
+//! call site, not `TieredCas::ingest(...)`. Every non-Export Step still goes
+//! through this method and still pays both walks and the per-blob cold round
+//! trip documented below — that is not legacy behaviour and it is not
+//! test-only.
+//!
+//! Given that, warm-first on the control plane would mean a network round
+//! trip per object to the Depot on every write, and — worse — it would make
+//! a Depot outage fail every workspace Step, which is exactly why this
+//! instance opted into
+//! [`fall_through_on_warm_error`](TieredCas::fall_through_on_warm_error) on the
+//! read side in the first place. Whether the control plane should keep a write
+//! leg of its own at all is a real, **unresolved** question, not an oversight in
+//! this file — it is tracked as git-bug `212bb13` ("delete the exec tar tunnel;
+//! server exchanges root hashes only"), and retiring it is that ticket's job,
+//! not this slice's. Until it lands, the second walk below is a real, paid
+//! cost, and ADR-0061's filed port change
+//! (`docs/adr/0061-workspace-data-path.md:585-591`) is still wanted.
+//!
+//! What follows describes the ordering this type still uses, for both of its
+//! remaining instances.
+//!
 //! # The write order is COLD FIRST, and that is not an accident
 //!
 //! ADR-0061's retention table gives the two tiers *different promises*:
@@ -35,7 +89,10 @@
 //! Warm and cold are awaited **sequentially**, cold first, rather than
 //! concurrently: `futures` is not an allowed dependency of a pure domain crate,
 //! and the caller is already behind a drain barrier, so the extra latency buys
-//! the correct ordering for free.
+//! the correct ordering for free. That trade is only paid by whichever caller
+//! still routes writes through this type (see above) — it is exactly the
+//! per-object cost ADR-0064 removes from the Data Depot's own drain by not
+//! calling into `TieredCas` for it at all.
 //!
 //! # Reads
 //!
@@ -66,6 +123,51 @@
 //! HTTP adapter flattens both into [`StorageError::Backend`] (deliberately — it
 //! must never report a connection failure as `NotFound`, or an unreachable
 //! service would look like an empty one).
+//!
+//! # The canonicalisation-skew tripwire (`put_tree`/`tree_entries`) cannot fire in production, as written
+//!
+//! Both methods compare the hash warm returned against the hash cold returned
+//! and log/count a disagreement as a broken protocol (see the inline comments
+//! at the two call sites below). Their story is that this catches two
+//! *differently-versioned binaries* disagreeing on canonical form — plausible on
+//! its face, since the control plane's warm tier is a separate process reached
+//! over HTTP. It is not true of the code as it stands: the hash a tree is filed
+//! under is computed **client-side**. `WorkspaceClient::put_tree` calls
+//! `scarab_storage::canonical_tree` directly
+//! (`crates/scarab-workspace-client/src/lib.rs:331-335`) — the very function
+//! this crate exports, statically linked into and executed by the **control
+//! plane's own process**, not by whatever binary the Depot happens to be
+//! running. `cold.put_tree` computes the same hash via the same function in
+//! that same process. So `warm_hash` and `hash` are two calls to one compiled
+//! function on one input; they cannot disagree today, on either instance. This
+//! is a known limitation, recorded honestly rather than silently: the tripwire
+//! is not deleted here, because a client built against a stale `scarab-storage`
+//! talking to a newer Depot is a real (if narrower and differently-shaped)
+//! hazard than the one currently documented at the call sites, and the
+//! counters/logging cost nothing while idle.
+//!
+//! // TODO(git-bug): re-derive what hazard this tripwire actually guards against
+//! // now that canonicalisation is known to run client-side (client/library skew,
+//! // not server-version skew), or decide deliberately that it is not worth
+//! // keeping — rather than leaving the call sites' doc comments asserting a
+//! // scenario that cannot occur.
+//!
+//! # Read-path backfill into warm is deliberately best-effort — never fatal
+//!
+//! `get_blob` and `tree_entries` write the value they just served from cold back
+//! into warm before returning (the calls to `self.warm.put_blob`/`put_tree` in
+//! their cold-fallback arms below), so the *next* read is a warm hit instead of
+//! another cold round-trip. That write's failure is counted
+//! ([`WARM_BACKFILL_FAILED`]) and logged, never propagated: **a cold read that
+//! already satisfied the caller must not become a failure because refilling the
+//! cache afterward didn't stick.** This is not incidental — it is the same
+//! "warm promises nothing" invariant the write path enforces, applied to reads,
+//! and it is worth being explicit about here because the callers depending on it
+//! are load-bearing: `tree_entries` backfill sits under ADR-0050's GC mark walk,
+//! and both methods sit under Browse. A future "make warm-first" change must
+//! not make either backfill write fatal, or a full or unreachable warm volume
+//! would turn into failed Browse requests and a GC that cannot complete its mark
+//! phase — the opposite of what warm being "just a cache" is supposed to buy.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -248,7 +350,14 @@ impl TieredCas {
 #[async_trait]
 impl Cas for TieredCas {
     async fn put_blob(&self, data: &[u8]) -> Result<BlobHash, StorageError> {
-        // Cold first: this is the leg that licenses `Succeeded`.
+        // Cold first: this is the leg that licenses `Succeeded` — for whichever
+        // caller still writes through THIS type. As of ADR-0064 that is no
+        // longer every write in the system: the Data Depot's own drain writes
+        // warm directly and flushes cold in one batch instead of calling
+        // through here (see the module docs for why the two remaining
+        // `TieredCas` instances still order it this way). For those instances,
+        // cold's error is the caller's error and warm's failure is a counted,
+        // swallowed cache miss.
         let hash = self.cold.put_blob(data).await?;
         if let Err(e) = self.warm.put_blob(data).await {
             note_warm_write_failure("put_blob", &e);
@@ -284,20 +393,27 @@ impl Cas for TieredCas {
                 // would file the same snapshot under two addresses and every
                 // lookup would half-work.
                 //
-                // **This is reachable, and the reason is version skew.** In the
-                // control plane the warm tier is not a local directory — it is
-                // the workspace *service*, over HTTP, and the canonicalisation
-                // that produced `warm_hash` ran in whatever binary is deployed
-                // there. One image per Helm release makes skew unlikely, not
-                // impossible (a split install, a rollback mid-roll, an operator
-                // pinning `scarab.workspaceUrl` at a different release). ADR-0061
-                // s8 books exactly this: the canonical form now lives in
-                // `scarab-storage` so two *compiled-together* copies cannot
-                // disagree, "the tripwire is kept for version skew between
-                // deployed binaries, which is a different hazard."
+                // **This is NOT reachable in production as written, and the
+                // "version skew" story below the old version of this comment
+                // used to tell is wrong.** In the control plane the warm tier is
+                // the workspace *service*, over HTTP — but `warm_hash` is not
+                // computed there: `WorkspaceClient::put_tree` calls
+                // `scarab_storage::canonical_tree` **client-side**
+                // (`crates/scarab-workspace-client/src/lib.rs:331-335`), in this
+                // same process, using this same statically-linked crate. `hash`
+                // (from `self.cold.put_tree` above) runs the identical function
+                // in the identical process. Two calls to one compiled function on
+                // one input cannot disagree, so this arm cannot fire today on
+                // either `TieredCas` instance. See the module docs, "The
+                // canonicalisation-skew tripwire ... cannot fire in production,
+                // as written", for the full accounting and a `TODO(git-bug)` for
+                // what to do about it — kept rather than deleted because a
+                // client built against a stale `scarab-storage` is a real,
+                // narrower hazard than the one this comment used to claim.
                 //
-                // `disagreeing_canonicalisation_between_tiers_is_reported` covers
-                // it.
+                // `disagreeing_canonicalisation_between_tiers_is_reported` drives
+                // this arm with a deliberately-skewed test double, precisely
+                // because no real pair of tiers can reach it.
                 WARM_WRITE_FAILED.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     cold = %hash.0,
@@ -319,10 +435,13 @@ impl Cas for TieredCas {
                 self.note_warm_read_miss("tree_entries", &e);
                 let entries = self.cold.tree_entries(hash).await?;
                 match self.warm.put_tree(entries.clone()).await {
-                    // Same tripwire as `put_tree`, and here it matters more: a
-                    // backfill that lands under a different address is not a
-                    // backfill, it is a leak, and every later read would still
-                    // miss warm.
+                    // Same tripwire as `put_tree` — and, per the module docs,
+                    // equally unreachable in production today, for the same
+                    // reason: `warm_hash` here comes from the same client-side
+                    // `canonical_tree` call as `*hash`. Kept anyway because here
+                    // it would matter more if it ever did fire: a backfill that
+                    // lands under a different address is not a backfill, it is a
+                    // leak, and every later read would still miss warm.
                     Ok(warm_hash) if warm_hash != *hash => {
                         WARM_BACKFILL_FAILED.fetch_add(1, Ordering::Relaxed);
                         tracing::error!(
@@ -374,16 +493,49 @@ impl Cas for TieredCas {
         }
     }
 
-    /// Snapshot `path` into **both** tiers. Cold decides success.
+    /// Snapshot `path` into **both** tiers, for whichever caller still drives a
+    /// whole-tree ingest through `TieredCas` rather than writing warm directly
+    /// and flushing cold in a batch. Cold decides success, for that caller —
+    /// same rule as `put_blob`/`put_tree`, and the same caveat about who that
+    /// caller now is: see the module docs.
     ///
-    /// # This walks the directory twice, and that is the cheapest shape available
+    /// # This walks the directory twice — the Depot's drain stopped paying for that, but the control plane's per-Step write still does
     ///
-    /// The drain calls this (the control plane's workspace `Cas` is a
-    /// `TieredCas` whose warm tier is the workspace service), so the second walk
-    /// is paid on every Step boundary and must be justified rather than
-    /// apologised for. It is not free: ADR-0061's s2 measurement puts the drain
-    /// leg at **88% local filesystem** — reading every file in order to hash it —
-    /// so a second walk roughly doubles the leg.
+    /// **As of [ADR-0064](../../../docs/adr/0064-durability-tiering-and-the-write-path.md),
+    /// the Data Depot's own drain (`scarab-server`'s settle path) no longer
+    /// drives through this method.** It now writes warm directly, on its own
+    /// disk, and performs one batched cold flush afterward: one walk, no
+    /// network, and no second independent walk to ever disagree with the
+    /// first. That removes precisely the cost this section justifies below —
+    /// but only for that one caller.
+    ///
+    /// **It is not true more broadly, and this is the one place in this file
+    /// worth being emphatic about it: `TieredCas::ingest` is still on the live
+    /// write path for every non-Export Step.** `drive_workspace(cas: &dyn
+    /// Cas)` calls `.ingest(...)` at
+    /// `crates/scarab-executor-k8s/src/lib.rs:671`; the `cas` it receives is
+    /// the control plane's `TieredCas`, wired in via `with_workspace_cas`
+    /// (same file, line 217) from `crates/scarab-server/src/main.rs:216`. The
+    /// call is trait-object dispatch, which is why grepping for
+    /// `TieredCas::ingest` finds nothing — the caller is real, just not
+    /// spelled out at the call site. Every one of those Steps pays both walks
+    /// and the per-blob cold round trip below, today, in production.
+    /// `TieredCas::ingest` is not being kept around merely because this
+    /// module's own tests and `scarab-workspace-client`'s round-trip tests
+    /// happen to exercise it — they do, but that is incidental, not the
+    /// reason it cannot be deleted. Retiring the control plane's write leg
+    /// entirely is git-bug `212bb13` (see the module docs above); until that
+    /// lands, this method is load-bearing and the root-disagreement tripwire
+    /// below is live code, not dead weight kept out of caution. What follows
+    /// explains why the double walk was, and for this caller still is, the
+    /// right shape:
+    ///
+    /// The reasoning: the control plane's per-Step write path calls this (its
+    /// workspace `Cas` is a `TieredCas` whose warm tier is the workspace
+    /// service), so the second walk is paid on every Step boundary and has to
+    /// be justified rather than apologised for. It is not free: ADR-0061's s2
+    /// measurement puts this leg at **88% local filesystem** — reading every
+    /// file in order to hash it — so a second walk roughly doubles it.
     ///
     /// The two alternatives are both worse:
     ///
@@ -403,22 +555,34 @@ impl Cas for TieredCas {
     ///   service outage would then fail Steps that could have produced a
     ///   perfectly durable snapshot.
     ///
-    /// So the ordering here is forced and the second walk is the price. Removing
-    /// it needs a `Cas` that can write one walk to two backends, or an `ingest`
-    /// that returns the tree it built so a tiered impl could seed warm at merkle
-    /// grain **with the adapter's concurrency** — both are port changes, filed
-    /// rather than smuggled in here.
+    /// So, for as long as `drive_workspace`'s per-Step ingest is what drives
+    /// writes through this type — which today it still is — the ordering is
+    /// forced and the second walk is the price paid for it. ADR-0064 removed
+    /// the need to pay it at all *for the Depot's own drain*, by moving that
+    /// one caller to warm-direct-plus-batched-flush instead of finding a
+    /// cheaper way to pay it through this method. It did not touch the
+    /// control plane's caller. There is no port change recorded here to
+    /// eliminate the second walk on the control plane, because doing that is
+    /// git-bug `212bb13`'s job — retiring the write leg entirely — not a
+    /// cheaper redesign of this method to keep a write leg that may not need
+    /// to exist.
     ///
-    /// Dedup does bound the *network* half: `warm.ingest` uploads only what the
-    /// warm tier says it is missing, so a re-drain of unchanged content moves no
-    /// bytes at all. Only genuinely new content is written to cold twice — once
-    /// by this method's cold leg, once by the service's own cold-first `PUT` —
-    /// because neither `ObjectStore` nor the wire protocol has an existence
-    /// primitive that would let either side skip (see the workspace service's
-    /// `have` handler).
+    /// Dedup bounds the *network* half today, for the caller that still pays
+    /// it: `warm.ingest` uploads only what the warm tier says it is missing,
+    /// so a re-drive of unchanged content moves no bytes at all. Only
+    /// genuinely new content is written to cold twice — once by this method's
+    /// cold leg, once by the service's own cold-first `PUT` — because neither
+    /// `ObjectStore` nor the wire protocol has an existence primitive that
+    /// would let either side skip (see the workspace service's `have`
+    /// handler). That specific trade-off is now historical for the Depot's
+    /// own drain, which no longer calls this — but it is live, not
+    /// historical, for `drive_workspace`'s per-Step ingest on the control
+    /// plane's instance.
     async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
-        // Cold is the durability leg (part 4), so it goes first and its error is
-        // the caller's error.
+        // Cold is the durability leg (part 4) for whichever caller still drives
+        // a whole-tree ingest through THIS type (module docs: as of ADR-0064
+        // the Depot's drain no longer does), so it goes first here and its
+        // error is that caller's error.
         let snapshot = self.cold.ingest(path).await?;
         match self.warm.ingest(path).await {
             Ok(warm) if warm.root != snapshot.root => {

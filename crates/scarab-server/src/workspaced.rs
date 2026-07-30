@@ -120,16 +120,23 @@
 //! forbids. That borrow is the point: the returned value is an RAII guard, and while
 //! it lives no reap can delete the upper layer the fold is reading.
 //!
-//! ### Durability is not local (ADR-0062 part 3, ADR-0061 part 4)
+//! ### Durability is not local (ADR-0062 part 3, ADR-0061 part 4, ADR-0064 part 1)
 //!
 //! **A settle does not report success until the new snapshot is in cold.** The fold
 //! itself is local — that is part 3's whole argument — but the service's own disk
 //! *is* the warm tier, and ADR-0061's retention table says warm promises nothing. So
 //! a green Attempt whose evidence sits only in warm is a durable record making a
-//! claim it cannot back. See [`settle_export`] for which store handle each drain
-//! writes through and why that is sufficient rather than merely intended.
+//! claim it cannot back.
+//!
+//! ADR-0064 part 1 changes *how* the bytes reach cold and nothing about what must be
+//! true first: a drain writes **warm in one local walk**, and then one **batched
+//! archival flush** ([`flush_to_cold`]) puts the whole of it in cold, and the settle
+//! response waits for that flush. Nothing here archives asynchronously — that would
+//! make warm load-bearing for durability, which part 4 forbids and ADR-0064 rejects
+//! by name. See [`settle_export`] for the two drains and why the ordering is
+//! sufficient rather than merely intended.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -202,20 +209,25 @@ const EXPORT_SWEEP_SECS: u64 = 120;
 /// [`SnapshotFarm`] which is two paths and a flag).
 #[derive(Clone)]
 struct WorkspaceState {
-    /// Warm-then-cold, for the tree walks `/flat` needs — **and the store the
-    /// change-set fold writes through**, which is what puts a settled snapshot in
-    /// cold before this service reports it. See [`settle_export`].
+    /// Warm-then-cold, for the tree walks `/flat` needs — and the **holder of the
+    /// two tiers as one thing**, which is why a drain composes its own handle out of
+    /// this one ([`DrainCas::over`]) rather than being handed two legs separately: one
+    /// composition, so the two roles cannot disagree about which disk is which.
+    /// The drain no longer *writes* through the tiering itself (ADR-0064 part 1
+    /// makes it warm-only writes plus a batched flush) but it still **reads** through
+    /// it; see [`DrainCas`] and [`settle_export`].
     cas: Arc<TieredCas>,
     /// Warm-then-cold **raw keyed bytes** — the verbatim path. See the module
     /// docs on why this is not `Cas`.
     objects: Arc<TieredObjectStore>,
-    /// The warm tier alone: the readiness write probe, and the cache leg of the
-    /// re-ingest drain. Concrete rather than `dyn ObjectStore` because
+    /// The warm tier alone: the readiness write probe, and **the tier the re-ingest
+    /// drain walks into** (ADR-0064 part 1 — one walk, local, and its error is the
+    /// caller's). Concrete rather than `dyn ObjectStore` because
     /// `S3Storage::ingest_with_baseline` — ADR-0062's no-Export drain — is not on
     /// either port and cannot be: a `StatCache` is a drain's input, not a store's.
     warm: Arc<S3Storage>,
-    /// The cold tier alone: the readiness reachability probe, and **the durable leg
-    /// of the re-ingest drain**. Same reason it is concrete.
+    /// The cold tier alone: the readiness reachability probe, and **the target of the
+    /// archival flush** that gates a settle. Same reason it is concrete.
     cold: Arc<S3Storage>,
     /// The warm volume's root on disk. The service reaches it directly to
     /// stream blob bodies and to `stat` sizes — neither of which [`Cas`] can
@@ -286,17 +298,26 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     // Cold tier: exactly as the composition root builds it, so the two roles
-    // cannot disagree about where the archive is.
-    let cold_store = Arc::new(match &config.store {
-        StoreConfig::S3(s3) => S3Storage::s3(
-            s3.bucket.clone(),
-            &s3.endpoint,
-            &s3.region,
-            &s3.access_key,
-            &s3.secret_key,
-        )?,
-        StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
-    });
+    // cannot disagree about where the archive is — **including the in-flight limit.**
+    // `with_concurrency` is not decoration here: it is how `SCARAB_CAS_CONCURRENCY`
+    // reaches this role at all, and [`flush_concurrency`] reads the archival flush's
+    // batch width straight off this handle rather than keeping a second copy of the
+    // number. Without the call the knob would be honoured in the control plane
+    // (`main.rs`) and silently ignored in the Depot, which is exactly the drift
+    // ADR-0048's "one documented place" rule exists to prevent.
+    let cold_store = Arc::new(
+        match &config.store {
+            StoreConfig::S3(s3) => S3Storage::s3(
+                s3.bucket.clone(),
+                &s3.endpoint,
+                &s3.region,
+                &s3.access_key,
+                &s3.secret_key,
+            )?,
+            StoreConfig::LocalDir(dir) => S3Storage::local(dir)?,
+        }
+        .with_concurrency(config.cas_concurrency),
+    );
 
     let app = router(&ws.data_dir, cold_store, ws.token_secret.clone())?;
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
@@ -1409,16 +1430,23 @@ pub struct HaveResponse {
 ///
 /// This docstring used to justify the narrowing with *"because every write through
 /// this service goes cold-first, warm ⊇ everything this service ever stored"*.
-/// **That is false**, and it was load-bearing for a shortcut in `put_blob` /
-/// `put_tree` that skipped the cold write. `TieredObjectStore::put` deliberately
-/// **succeeds when the warm leg fails** (correctly — ADR-0061 part 4 makes cold
-/// the only load-bearing tier), so content written through this service can be
-/// cold-only *by design*; ADR-0050's GC deletes from cold without touching warm,
-/// so it can be warm-only too; and the warm tier has no eviction, so it only
-/// grows. Neither containment holds in either direction. The honest statement is
-/// the narrow one: **this endpoint answers about the warm tier and nothing else**,
-/// and every caller must treat a "missing" as "upload it" rather than as "cold
-/// does not have it".
+/// **That is false in both directions**, and it was load-bearing for a shortcut in
+/// `put_blob` / `put_tree` that skipped the cold write. Four independent reasons,
+/// and ADR-0064 added the fourth:
+///
+/// - `TieredObjectStore::put` deliberately **succeeds when the warm leg fails**
+///   (correctly — for the raw-bytes routes cold is still the load-bearing tier),
+///   so content written through this service can be cold-only *by design*;
+/// - ADR-0050's GC deletes from cold without touching warm, so it can be
+///   warm-only too;
+/// - the warm tier has no eviction, so it only grows;
+/// - and the **drain now writes warm first** (ADR-0064 part 1), so between the
+///   drain and its archival flush — and permanently, if that flush failed and the
+///   Attempt was retried elsewhere — warm holds content cold does not.
+///
+/// The honest statement is the narrow one: **this endpoint answers about the warm
+/// tier and nothing else**, and every caller must treat a "missing" as "upload it"
+/// rather than as "cold does not have it".
 ///
 /// Adding `exists` to the `ObjectStore` port — which would let this answer about
 /// the durable set, and would let a `PUT` skip a redundant cold upload — is a
@@ -1708,9 +1736,20 @@ pub struct SettledExportDto {
     /// layer) or `re-ingest` (the copy rung's `(size, mtime, ctime)` approximation).
     /// The rung chose it, not the caller.
     pub drain: &'static str,
-    /// **Always `true` when this response exists.** The field is here because a caller
-    /// deciding whether an Attempt may be `Succeeded` should be able to read the
-    /// promise rather than infer it from a `200`.
+    /// **`durable` means: the archival flush to the cold tier completed.**
+    ///
+    /// Nothing more and nothing less. It is not a claim that this deployment *has* an
+    /// independently-backed cold tier — a `LocalDir` cold store can sit on the warm
+    /// volume, or on the chart's `emptyDir`, and a flush into one of those completes
+    /// perfectly while promising nothing. Disclosing *that* is ADR-0064 parts 3–5 and
+    /// git-bug `981fc6b`, which adds its own field; this one must keep exactly the
+    /// meaning above so that slice does not have to redefine it.
+    ///
+    /// Still `true` on every response that exists, and now for a reason rather than by
+    /// assertion: ADR-0064 makes the write path warm-first, so the flush is a distinct
+    /// phase that is `await`ed before this DTO is built, and a flush that did not
+    /// complete is a `WsError::Drain` with no DTO to carry a `true` at all. The value is
+    /// read off the flush's own tally rather than written here as a literal.
     pub durable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_set: Option<ChangeSetTallyDto>,
@@ -1722,29 +1761,50 @@ pub struct SettledExportDto {
 /// `POST /v1/exports/{handle}/settle` — fold what the Step wrote back into the CAS,
 /// **and get it into cold before answering.**
 ///
-/// # How the durability decision is enforced, per drain
+/// # How the durability decision is enforced (ADR-0064 part 1: warm-first, then flush)
 ///
-/// ADR-0062 part 3 settles this: *"a change set is folded into the CAS locally and then
-/// uploaded to cold before the Attempt may reach `Succeeded`"*. Two drains, two
-/// mechanisms, and neither is a promise this function makes on its own account:
+/// ADR-0062 part 3 settles *what* must be true: *"a change set is folded into the CAS
+/// locally and then uploaded to cold before the Attempt may reach `Succeeded`"*.
+/// ADR-0064 part 1 settles *how the bytes get there*, and it is the same for both
+/// drains, which is the point of it:
 ///
-/// - **The change-set fold writes through [`TieredCas`]**, whose every `put_blob` and
-///   `put_tree` is `cold.put(..).await?` *first* and warm second, with the warm leg's
-///   failure counted rather than propagated (`scarab_storage::tiered`: *"cold first:
-///   this is the leg that licenses `Succeeded`"*). So a `200` from this route means
-///   every blob and every tree the fold wrote is in the durable tier — not queued for
-///   it. An untouched Step writes nothing and returns its input snapshot verbatim,
-///   which was already durable as somebody else's output.
-///   **Untouched sub-trees are carried by hash and never written**, and they are
-///   durable for the same reason: they are the parent's, and the parent was durable
-///   before the Attempt that produced it succeeded.
-/// - **The re-ingest drain has no tiered twin**, because `ingest_with_baseline` is not
-///   on the `Cas` port and cannot be (a `StatCache` is a drain's input, not a store's).
-///   So the two legs are written out here in the same order and with the same error
-///   handling `TieredCas::ingest` uses: **cold first, awaited, its error is the
-///   caller's**; then warm, best-effort, with a root disagreement reported. Two walks
-///   of the tree, which is exactly what `TieredCas::ingest` already pays on every Step
-///   boundary today.
+/// 1. **write warm, in one walk.** The Depot's warm tier is a directory on this
+///    service's own volume, so this leg is local syscalls and no network. Warm's error
+///    is the caller's error — if the snapshot does not exist, there is nothing to
+///    archive and nothing to report. *Reads* on this leg still fall through to cold and
+///    backfill warm; only the writes are warm-only. [`DrainCas`] holds that distinction
+///    and says why it is not symmetry.
+/// 2. **then one batched archival flush to cold**, [`flush_to_cold`], which this route
+///    `await`s before answering. Blobs first, then trees deepest-first, so cold never
+///    holds a reachable tree whose children are absent. A flush that does not complete
+///    is a `500` naming the cold flush, never a `200` with a hedge.
+///
+/// What that replaces is a cold round-trip *per blob*, interleaved into the fold, plus
+/// (on the re-ingest drain) a second independent walk of the whole tree — the 4–6 ms
+/// per file ADR-0061's s0 measured as 81–88% of a Step boundary. What it preserves is
+/// ADR-0061 part 4 exactly: **the Attempt is not settled until the flush completes.**
+/// Warm is the write *path*; cold is still the promise. Nothing is archived
+/// asynchronously and nothing is archived after the response — ADR-0064 rejects that
+/// explicitly, because it would make the warm tier load-bearing for durability.
+///
+/// What the flush covers is easy to get wrong in one direction only — omission — and
+/// every omission has the same failure mode: cold ends up holding a reachable tree whose
+/// child is absent, and the settle reports `durable: true`. So the inventory includes the
+/// blobs the fold **reused** and the sub-trees it took across **by hash**, not only what
+/// it wrote, because warm outlives cold (the GC deletes from cold only; warm has no
+/// eviction) and "the parent was durable once" is not "cold holds it now".
+///
+/// The one thing that legitimately flushes nothing is **an untouched Step**: it writes
+/// nothing and returns its input snapshot verbatim, which was archived before the Attempt
+/// that produced it was allowed to succeed. `settle::FlushSet` states the boundary, and
+/// the one hole still open inside it (blobs reachable only through an inherited
+/// sub-tree).
+///
+/// Note the asymmetry that remains, so nobody reads it as an oversight: the *control
+/// plane's* `TieredCas` — where warm is this service over HTTP — is still cold-first
+/// per write. Making warm authoritative there would let a Depot outage fail every
+/// Step, which is a different decision with a different risk; it is git-bug `212bb13`,
+/// not this route's.
 ///
 /// # Settle strictly before revoke, and never a reap on failure
 ///
@@ -1801,12 +1861,26 @@ async fn settle_export(
             let written_paths = change.written.len();
             let directories = change.directories.len();
 
-            // `state.cas` — the tiered store — and not `state.warm`. **This one
-            // argument is the durability decision**: every `put_blob` and `put_tree`
-            // inside the fold is a cold write, awaited, before it returns.
-            let settled = fold_change_set(state.cas.clone(), parent.clone(), upper, change)
+            // ADR-0064 part 1: the fold's **writes** land on warm alone — one walk,
+            // local syscalls, no round trip per blob — while its **reads** still fall
+            // through to cold and backfill warm, because the tree it reads is the
+            // *parent's* and a warm tier that lost it must not fail a Step that has
+            // already run. [`DrainCas`] is that split, and it is a type rather than a
+            // convention so a write cannot be sent through the tiering by accident. The
+            // durability decision has moved out of this argument and into the flush
+            // below, which is a phase this handler can see rather than an ordering
+            // hidden inside a store.
+            let drain_cas = Arc::new(DrainCas::over(state.cas.clone()));
+            let settled = fold_change_set(drain_cas.clone(), parent.clone(), upper, change)
                 .await
                 .map_err(|e| bad(format!("the change-set fold failed: {e}")))?
+                .map_err(|e| bad(e.to_string()))?;
+
+            // And the archival leg, awaited. The fold handed over its inventory —
+            // every blob its rebuilt trees name, every tree it wrote, and every
+            // untouched sub-tree those name — so this costs no second walk of anything.
+            let flushed = flush_to_cold(&drain_cas.reads, &state.cold, &settled.flush, &handle)
+                .await
                 .map_err(|e| bad(e.to_string()))?;
 
             SettledExportDto {
@@ -1814,7 +1888,7 @@ async fn settle_export(
                 root: settled.snapshot.root.0.clone(),
                 identity: settled.snapshot.identity.as_ref().map(|id| id.0.clone()),
                 drain: "change-set",
-                durable: true,
+                durable: flushed.durable,
                 change_set: Some(ChangeSetTallyDto {
                     blobs_stored: settled.tally.blobs_stored,
                     trees_written: settled.tally.trees_written,
@@ -1860,23 +1934,23 @@ async fn settle_export(
                 0
             });
 
-            let (snapshot, tally, baseline_paths) = reingest_cold_then_warm(
-                state.cold.clone(),
+            let (snapshot, tally, baseline_paths, flushed) = reingest_warm_then_flush(
                 state.warm.clone(),
+                state.cold.clone(),
+                ReadThrough(state.cas.clone()),
                 path,
                 manifest,
                 captured_at_ms,
                 handle.clone(),
             )
-            .await
-            .map_err(|e| bad(format!("the cold re-ingest failed: {e}")))?;
+            .await?;
 
             SettledExportDto {
                 handle: handle.to_string(),
                 root: snapshot.root.0.clone(),
                 identity: snapshot.identity.as_ref().map(|id| id.0.clone()),
                 drain: "re-ingest",
-                durable: true,
+                durable: flushed.durable,
                 change_set: None,
                 reingest: Some(ReingestTallyDto {
                     hashed: tally.hashed,
@@ -1900,8 +1974,9 @@ async fn settle_export(
         root = %dto.root,
         durable = dto.durable,
         total_ms = dto.elapsed_ms,
-        "workspace export settled — the snapshot is in the cold tier, so the Attempt may be \
-         reported Succeeded (ADR-0062 part 3 / ADR-0061 part 4)"
+        "workspace export settled — the snapshot was written warm and then FLUSHED to the cold \
+         tier, and this response waited for the flush, so the Attempt may be reported Succeeded \
+         (ADR-0064 part 1, keeping ADR-0062 part 3 / ADR-0061 part 4)"
     );
     Ok(Json(dto))
 }
@@ -1968,10 +2043,16 @@ async fn list_exports(
     }))
 }
 
-/// The change-set fold against the **tiered** store — the durability decision, in one
-/// signature: this is the only place the change-set drain names a store, and the store
-/// it names is [`TieredCas`](scarab_storage::tiered::TieredCas), whose every write is
-/// cold-first and awaited.
+/// The change-set fold writing the **warm** tier — one walk, local syscalls, and no
+/// round trip per blob (ADR-0064 part 1).
+///
+/// The store is a [`DrainCas`]: warm-only writes, tiered reads. Durability did not move
+/// to warm with the writes — the fold reports its inventory in
+/// [`settle::Settled::flush`] and [`settle_export`] `await`s [`flush_to_cold`] over that
+/// inventory before it answers, so the settle still does not report success until the
+/// snapshot is archived. What changed is that the archival leg is now a phase the handler
+/// can see, one batch wide, instead of a cold `PUT` interleaved into every `put_blob`
+/// inside the fold.
 ///
 /// # Why it runs on a blocking thread, which is NOT a design choice
 ///
@@ -1999,8 +2080,9 @@ async fn list_exports(
 /// the thread, `Handle::block_on` to drive an `!Send` future on it. Two consequences,
 /// both real and neither silent:
 ///
-/// - **It occupies a blocking-pool thread for the duration of the fold**, including its
-///   cold-tier round trips. The pool is 512 threads by default and a settle is one per
+/// - **It occupies a blocking-pool thread for the duration of the fold** — which since
+///   ADR-0064 is local disk work rather than cold-tier round trips, so it is a shorter
+///   occupancy than it used to be. The pool is 512 threads by default and a settle is one per
 ///   Attempt, so this is a cost rather than a limit — but it is a cost the correct
 ///   version of this function would not pay.
 /// - **`Handle::block_on` cannot itself drive the IO driver of a `current_thread`
@@ -2015,7 +2097,7 @@ async fn list_exports(
 /// chokes on, and then this becomes `settle_change_set(&*cas, ..).await` in the handler
 /// and this whole function goes away. It is deliberately **not** done here.
 async fn fold_change_set(
-    cas: Arc<TieredCas>,
+    cas: Arc<DrainCas>,
     parent: Snapshot,
     upper: std::path::PathBuf,
     change: changeset::ChangeSet,
@@ -2027,78 +2109,529 @@ async fn fold_change_set(
     .await
 }
 
-/// The re-ingest drain, tiered by hand: **cold first and awaited, then warm
-/// best-effort.**
+/// The tiered pair as a **read** handle, and nothing else.
 ///
-/// `TieredCas::ingest` already does exactly this for the untargeted drain, and this is
-/// the same ordering for the baseline-aware one — which has no tiered twin, because
-/// `ingest_with_baseline` is not on the `Cas` port and should not be: a [`StatCache`]
-/// is a *drain's* input, not a store's. The two walks are the same two walks the status
-/// quo pays.
+/// Deliberately **not** a [`Cas`]: it forwards the reads a drain and a flush need and
+/// exposes no write at all, which is what keeps "no write goes through the tiering on
+/// this path" a property of the type rather than a rule in a comment. Every method
+/// below is [`TieredCas`]'s, unchanged, and the behaviour that matters is the one they
+/// carry with them: **a warm miss falls through to cold and backfills warm.**
 ///
-/// - **Cold decides success.** It is the only tier ADR-0061 promises anything about, so
-///   its error is the caller's and a `Succeeded` Attempt can never rest on warm.
-/// - **Warm is a cache and its failure is a `warn`, not an error** — but a louder
-///   `warn` than the generic one, because the next [`SnapshotFarm`] over this root
-///   reads blobs *straight off the warm volume*, so a missed warm leg is a Farm build
-///   that has to refill from cold first.
-/// - **A root disagreement between the two walks means the tree moved underneath
-///   them**, and the cold root is the one returned because it is the durable one.
+/// The honest limit of the guarantee: the wrapped handle is a field, and this module
+/// could reach past it. What the type removes is the *accident* — `reads.put_blob(..)`
+/// does not compile, and the only way to write through the tiering is to spell out
+/// `reads.0`, which no reader would take for an ordinary call. Nothing outside this
+/// impl block touches `.0`, and it should stay that way.
+#[derive(Clone)]
+struct ReadThrough(Arc<TieredCas>);
+
+impl ReadThrough {
+    async fn get_blob(&self, hash: &BlobHash) -> Result<Vec<u8>, StorageError> {
+        self.0.get_blob(hash).await
+    }
+
+    async fn tree_entries(&self, hash: &TreeHash) -> Result<Vec<TreeEntry>, StorageError> {
+        self.0.tree_entries(hash).await
+    }
+
+    /// A read of the CAS whose *output* is a directory tree, so it belongs on this side
+    /// of the split: nothing about it writes to a tier.
+    async fn materialize(&self, tree: &TreeHash, path: &str) -> Result<(), StorageError> {
+        self.0.materialize(tree, path).await
+    }
+}
+
+/// The store handle a drain folds through (ADR-0064 part 1): **writes go to warm
+/// alone, reads go through the tiering.**
 ///
-/// One note on what a baseline `Reuse` means across tiers, because it is an assumption
-/// and not a proof: a reused blob is *not written* by either leg. That is sound against
-/// cold because the reused hash comes from the **parent snapshot's** manifest and the
-/// parent was durable before the Attempt that produced it succeeded. Against warm it
-/// rests on the parent's blobs still being on the volume — which the Farm build for
-/// this very Export already required — and the failure mode if that ever stops holding
-/// is a loud `FarmError::MissingBlob` on the *next* Step, not a wrong snapshot.
+/// The two halves answer two different questions and neither can be dropped in favour
+/// of the other:
 ///
-/// It is a separate function so that the two legs and their asymmetry read as one thing
-/// rather than as two calls a future editor could reorder. The [`StatCache`] is *built
-/// here* from the manifest rather than passed in, so the one genuinely large value on
-/// this path (a `BTreeMap` entry per file in the parent snapshot) is moved and never
-/// cloned; `baseline_paths` comes back in the tuple because the caller reports it.
+/// - **Writes are warm-only**, which is the slice. One local walk, no cold round trip
+///   per blob; the durability decision moves out of the store and into
+///   [`flush_to_cold`], a phase [`settle_export`] awaits and an operator can see.
+///   Writing through [`TieredCas`] instead would put cold back on the per-blob path,
+///   which is the cost ADR-0061 measured.
+/// - **Reads are tiered**, and that is a correctness requirement, not symmetry.
+///   `TieredCas` falls back to cold on a warm `NotFound` and backfills warm with what
+///   it found, and **warm-lacks-while-cold-has is a state this system produces on
+///   purpose**: `TieredCas::put_blob` swallows a warm write failure and returns `Ok`,
+///   and a recreated warm PVC starts empty behind a cold tier that is full. A fold
+///   handed the warm leg alone turns that self-healing read into a `500` on a snapshot
+///   cold could have served — and it is the *parent* snapshot a fold reads, so the
+///   Step has already run by then.
+///
+/// Note what is NOT restored by reading through: a warm error that is not `NotFound`
+/// still fails, because this service's `TieredCas` is built without
+/// `fall_through_on_warm_error` — inside the service a bad read is a bad
+/// PersistentVolume, and serving around it would make a torn volume look like an
+/// empty one.
+struct DrainCas {
+    /// **Every write.** The warm leg on its own, with no second tier behind it.
+    warm: Arc<dyn Cas>,
+    /// **Every read.** A [`ReadThrough`], so there is no write method here to reach.
+    reads: ReadThrough,
+}
+
+impl DrainCas {
+    /// Over one [`TieredCas`]'s own two legs, so the writes and the reads cannot end
+    /// up describing different disks.
+    fn over(tiered: Arc<TieredCas>) -> Self {
+        Self {
+            warm: tiered.warm().clone(),
+            reads: ReadThrough(tiered),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Cas for DrainCas {
+    async fn put_blob(&self, data: &[u8]) -> Result<BlobHash, StorageError> {
+        self.warm.put_blob(data).await
+    }
+
+    async fn get_blob(&self, hash: &BlobHash) -> Result<Vec<u8>, StorageError> {
+        self.reads.get_blob(hash).await
+    }
+
+    async fn put_tree(&self, entries: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {
+        self.warm.put_tree(entries).await
+    }
+
+    async fn tree_entries(&self, hash: &TreeHash) -> Result<Vec<TreeEntry>, StorageError> {
+        self.reads.tree_entries(hash).await
+    }
+
+    /// A checkout is a read of the CAS and a write of the *filesystem*, so it goes
+    /// through the tiering like any other read. Unreachable from the fold, which never
+    /// materialises anything; here so the port is honestly implemented rather than
+    /// half-implemented with a `todo!()` waiting for a caller.
+    async fn materialize(&self, tree: &TreeHash, path: &str) -> Result<(), StorageError> {
+        self.reads.materialize(tree, path).await
+    }
+
+    /// A write, so: warm. Unreachable from the fold — the re-ingest drain calls
+    /// `S3Storage::ingest_with_baseline` on the concrete warm handle instead, because a
+    /// baseline is not on this port — and warm-only is the answer that agrees with it.
+    async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
+        self.warm.ingest(path).await
+    }
+}
+
+/// The re-ingest drain, ADR-0064 part 1: **one warm walk, then the archival flush.**
+///
+/// `ingest_with_baseline` has no tiered twin and should not have one — a [`StatCache`]
+/// is a *drain's* input, not a store's — so the tiering for this drain is written out
+/// here. It used to be two independent walks of the same workspace, cold's first and
+/// warm's second, with a tripwire for the case where they disagreed on the root. Both
+/// are gone: there is one walk now, so there are no two answers to disagree, and the
+/// walk is the one against the local volume rather than the one paying a round trip per
+/// file.
+///
+/// - **Warm decides whether there is a snapshot at all.** Its error is the caller's:
+///   nothing was published, so there is nothing to archive and nothing to report.
+/// - **The flush decides whether the snapshot is archived**, and this function does not
+///   return until it has. A flush failure is the caller's error too, and it names the
+///   cold flush — the Step exited 0 and its evidence did not reach the archive, which
+///   is a retryable failure and must not read as a mystery I/O error.
+///
+/// # Why the flush set is a walk here and an inventory there
+///
+/// [`fold_change_set`] gets its flush set for free: the fold knows every address it
+/// touched. This drain does not fold — `ingest_with_baseline` answers with a root and a
+/// tally — so the addresses have to be recovered, and [`flush_set_of`] recovers them by
+/// walking the resulting tree, which is one tree object per directory and no file content
+/// at all. Normally every read of that walk is local, since the ingest above just wrote
+/// the tree to warm; it still goes through [`ReadThrough`] rather than the warm leg,
+/// because a warm tier that lost something cold has must not fail a settle (see
+/// [`DrainCas`]).
+///
+/// The `FlatManifest` this function already receives is *not* that vehicle, and it is
+/// worth saying why rather than leaving it looking like an oversight: a manifest carries
+/// every blob (`FlatEntry::blob`) but its directories are `FlatDir` **paths**, not tree
+/// hashes, so it structurally cannot supply the flush's tree list. Using it for the
+/// blobs and walking for the trees would be two traversals of one tree to answer one
+/// question.
+///
+/// One consequence of the walk, stated because it is a real change: the *reused* blobs
+/// — the ones the baseline vouched for and neither tier wrote — are now offered to cold
+/// as well, where the old cold leg skipped them. That is deliberate and it is the
+/// finding this ordering exists for (see `settle::FlushSet`): warm outlives cold, so
+/// "the parent was durable once" is not "cold holds it now", and the cost of being sure
+/// is one `head` per reused blob.
+///
+/// The [`StatCache`] is *built here* from the manifest rather than passed in, so the one
+/// genuinely large value on this path (a `BTreeMap` entry per file in the parent
+/// snapshot) is moved and never cloned; `baseline_paths` comes back in the tuple because
+/// the caller reports it.
 ///
 /// Unlike [`fold_change_set`] this one needs no `spawn_blocking`: `ingest_with_baseline`
 /// has the same internal `buffer_unordered` shape but over **owned** jobs, so its future
 /// is provably `Send` and awaits inline. Which is also the evidence that the fix for the
 /// fold belongs in `settle.rs`: the adapter next door already does it the working way.
-async fn reingest_cold_then_warm(
-    cold: Arc<S3Storage>,
+async fn reingest_warm_then_flush(
     warm: Arc<S3Storage>,
+    cold: Arc<S3Storage>,
+    reads: ReadThrough,
     path: String,
     manifest: FlatManifest,
     captured_at_ms: i64,
     handle: ExportHandle,
-) -> Result<(Snapshot, scarab_storage::statcache::DrainTally, usize), StorageError> {
+) -> Result<
+    (
+        Snapshot,
+        scarab_storage::statcache::DrainTally,
+        usize,
+        FlushTally,
+    ),
+    WsError,
+> {
     let baseline = StatCache::from_manifests([&manifest], captured_at_ms);
     let baseline_paths = baseline.len();
-    let path = path.as_str();
-    let baseline = &baseline;
 
-    let (snapshot, tally) = cold.ingest_with_baseline(path, baseline).await?;
+    let (snapshot, tally) = warm
+        .ingest_with_baseline(path.as_str(), &baseline)
+        .await
+        .map_err(|e| WsError::Drain {
+            handle: handle.clone(),
+            detail: format!("the warm re-ingest of the export failed: {e}"),
+        })?;
 
-    match warm.ingest_with_baseline(path, baseline).await {
-        Ok((warm_snapshot, _)) if warm_snapshot.root != snapshot.root => tracing::warn!(
-            export = "settle",
-            handle = %handle,
-            cold = %snapshot.root.0,
-            warm = %warm_snapshot.root.0,
-            "the two re-ingest walks of one export produced different roots — the workspace \
-             changed underneath them, so warm holds an unrelated snapshot. The COLD root is the \
-             one returned, because it is the durable one."
-        ),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(
-            export = "settle",
-            handle = %handle,
-            error = %e,
-            "the warm leg of a re-ingest failed; the snapshot IS durable in cold, so this is a \
-             cache miss to come rather than a failed step — but the next Snapshot Farm over this \
-             root reads the WARM volume, so it will have to be refilled from cold first"
-        ),
+    let flush = flush_set_of(&reads, &snapshot.root)
+        .await
+        .map_err(|e| WsError::Drain {
+            handle: handle.clone(),
+            detail: format!(
+                "the re-ingest published {} to the warm tier but its tree could not be walked to \
+                 work out what the cold flush owes: {e}",
+                snapshot.root.0
+            ),
+        })?;
+    let flushed = flush_to_cold(&reads, &cold, &flush, &handle)
+        .await
+        .map_err(|e| WsError::Drain {
+            handle: handle.clone(),
+            detail: e.to_string(),
+        })?;
+
+    Ok((snapshot, tally, baseline_paths, flushed))
+}
+
+/// How many archival offers the flush keeps in flight — **read off the cold handle it
+/// is about to use.**
+///
+/// A cold leg is round-trip-bound, so what matters is having enough requests outstanding
+/// to hide the latency (ADR-0061 s2). The number is not re-picked here for a third time:
+/// it is `S3Storage`'s own in-flight limit for this very store, which means the operator
+/// knob that sets it (`SCARAB_CAS_CONCURRENCY` → `Config::cas_concurrency` →
+/// `S3Storage::with_concurrency`, ADR-0048) reaches the flush without a second piece of
+/// plumbing to forget. A store built without the knob reports
+/// [`scarab_storage_s3::DEFAULT_CAS_CONCURRENCY`], so the fallback is the same default a
+/// constant would have named.
+///
+/// A function rather than a `const` for exactly that reason: a `const` cannot be
+/// configured, and the previous one silently ignored the knob.
+fn flush_concurrency(cold: &S3Storage) -> usize {
+    cold.concurrency()
+}
+
+/// What one completed archival flush cost — and the fact
+/// [`SettledExportDto::durable`] reports.
+#[derive(Debug, Clone, Copy)]
+struct FlushTally {
+    /// **The flush completed.** Always `true` in a tally that exists, because
+    /// [`flush_to_cold`] has no partial success: ADR-0064 is explicit that a partial
+    /// flush must not report success, so every other outcome is an `Err` and produces
+    /// no tally at all. The field exists so that the DTO's promise is *read off the
+    /// flush* rather than restated as a literal at the call site — and so that a future
+    /// slice which does introduce a second outcome (git-bug `981fc6b`: warm-only
+    /// deployments) cannot add it without every caller seeing the type change.
+    durable: bool,
+    /// Blobs offered to cold. Not "uploaded": cold's `put_if_absent` turns a re-offer
+    /// into a `head`, which is exactly what makes a retried flush cheap and idempotent.
+    blobs: u64,
+    /// Trees offered to cold, across every level.
+    trees: u64,
+    elapsed_ms: u64,
+}
+
+/// Why an archival flush did not complete.
+///
+/// Every variant names the tier, the operation and the address, because this is the
+/// error an operator meets when a Step exited 0 and its Attempt failed anyway. ADR-0064:
+/// *"a flush that fails fails the Attempt … so it is a retryable failure that must name
+/// the cause rather than surfacing a mystery I/O error."* A bare
+/// [`StorageError`] would satisfy neither half — it says `NotFound` without saying
+/// *which tier* was asked or *what for*.
+#[derive(Debug, thiserror::Error)]
+enum FlushError {
+    #[error(
+        "the archival flush could not read blob {hash} back off the WARM tier to send it to cold, \
+         so the snapshot is not archived: {source}"
+    )]
+    WarmBlob {
+        hash: String,
+        #[source]
+        source: StorageError,
+    },
+    #[error(
+        "the archival flush could not write blob {hash} to the COLD tier, so the snapshot is not \
+         archived and this Attempt must not be reported Succeeded: {source}"
+    )]
+    ColdBlob {
+        hash: String,
+        #[source]
+        source: StorageError,
+    },
+    #[error(
+        "the archival flush could not read tree {hash} back off the WARM tier to send it to cold, \
+         so the snapshot is not archived: {source}"
+    )]
+    WarmTree {
+        hash: String,
+        #[source]
+        source: StorageError,
+    },
+    #[error(
+        "the archival flush could not write tree {hash} to the COLD tier, so the snapshot is not \
+         archived and this Attempt must not be reported Succeeded: {source}"
+    )]
+    ColdTree {
+        hash: String,
+        #[source]
+        source: StorageError,
+    },
+    #[error(
+        "the archival flush offered {kind} {offered} to the cold tier and cold filed it under \
+         {stored} instead. The two tiers do not agree on how content is addressed, so archiving \
+         this snapshot would file it at an address nothing will look it up by — refusing rather \
+         than reporting a durability that is not reachable"
+    )]
+    Mismatch {
+        kind: &'static str,
+        offered: String,
+        stored: String,
+    },
+}
+
+/// Everything reachable from `root`, as a flush inventory — for the drain that does not
+/// fold and therefore has no incremental answer.
+///
+/// Breadth-first by level so the levels can simply be reversed into
+/// [`settle::FlushSet`]'s deepest-first order; one `tree_entries` per directory and no
+/// file content read at all. Symlinks are blobs here as everywhere else (their content is
+/// the link target), which is why there is no third arm.
+///
+/// **Through the tiering, not off the warm leg.** The walk is normally local — the drain
+/// wrote the tree there moments ago — but warm-lacks-while-cold-has is a state this
+/// system produces deliberately (see [`DrainCas`]), and a settle that `500`s on a
+/// snapshot cold could describe would be an Attempt failed by a cache. [`ReadThrough`]
+/// keeps the fall-through and backfills warm on the way past, so the *next* walk is
+/// local again.
+///
+/// # Duplicates are removed within a level and NEVER across levels
+///
+/// An identical sub-tree reached by two names is one address, and a snapshot with a
+/// fan-out of them (`node_modules`) would otherwise offer it once per name. Removing
+/// those *within* one level is free and safe.
+///
+/// Removing them *across* levels is unsafe, and non-obviously so. Keeping one occurrence
+/// per address globally can invert a parent and its child: if a tree `T` is kept at its
+/// depth-5 occurrence while its child `C` is kept at its depth-3 occurrence, the
+/// deepest-first walk offers `T` before `C` — a cold tree naming an absent child, which
+/// is the one thing this ordering exists to prevent. So the same address may be offered
+/// at several levels, and the cost of that is a `head`.
+async fn flush_set_of(
+    reads: &ReadThrough,
+    root: &TreeHash,
+) -> Result<settle::FlushSet, StorageError> {
+    let mut blobs: HashSet<BlobHash> = HashSet::new();
+    let mut levels: Vec<Vec<TreeHash>> = Vec::new();
+    let mut level: Vec<TreeHash> = vec![root.clone()];
+    while !level.is_empty() {
+        let mut next: HashSet<TreeHash> = HashSet::new();
+        for tree in &level {
+            for entry in reads.tree_entries(tree).await? {
+                match entry.target {
+                    TreeTarget::Blob(blob) => {
+                        blobs.insert(blob);
+                    }
+                    TreeTarget::Tree(sub) => {
+                        next.insert(sub);
+                    }
+                }
+            }
+        }
+        levels.push(level);
+        level = next.into_iter().collect();
     }
-    Ok((snapshot, tally, baseline_paths))
+    Ok(settle::FlushSet {
+        blobs,
+        tree_levels: levels.into_iter().rev().collect(),
+    })
+}
+
+/// **The archival flush** (ADR-0064 part 1): offer one drain's whole output to the cold
+/// tier, in one batched phase, and answer only when all of it is there.
+///
+/// This is the leg that licenses `Succeeded`. It replaced a cold round trip interleaved
+/// into every `put_blob` of the drain — that ordering got the invariant for free and
+/// paid ADR-0061's measured 4–6 ms per file for it; this gets the same invariant by
+/// being `await`ed before the settle answers.
+///
+/// # Blobs, then trees deepest-first
+///
+/// A tree names its children's hashes. So cold must never hold a **reachable tree whose
+/// children are absent** — a later reader cannot tell that state from corruption, and
+/// the CAS GC's mark walk would follow it. Hence two ordered phases, and within the
+/// tree phase one level at a time: the trees inside one level name none of each other,
+/// so they go up together, while a level only starts once the level below it is
+/// archived. It is exactly the grouping `S3Storage::ingest`'s phase 3 makes, for exactly
+/// the same reason.
+///
+/// The ordering is what makes a *failed* flush safe as well as a successful one. Cold
+/// after a failure holds some prefix of the blobs and no tree that names a missing one,
+/// which is a consistent (if incomplete) store rather than a corrupt one.
+///
+/// # There is no partial success, and no cursor
+///
+/// Total success or `Err` — ADR-0064: *"a partial flush must not report success"*.
+/// Nothing records how far a flush got, deliberately: a retry re-offers the whole batch,
+/// and because the CAS is content-addressed and cold's `put_if_absent` turns a re-offer
+/// into a `head`, re-offering is nearly free and always correct. A persisted cursor
+/// would be a second source of truth about durability that could be wrong, in exchange
+/// for saving `head`s.
+///
+/// # It reads rather than being handed bytes — and it reads through the tiering
+///
+/// Warm is local, and warm is where the content *is*: the drain either just wrote a blob
+/// there or reused one that was already there. Threading bytes through from the drain
+/// instead would mean holding a whole change set's content in memory across the fold —
+/// and it could not cover the reused blobs at all, since nothing read them.
+///
+/// The reads go through [`ReadThrough`] rather than the warm leg for the same reason the
+/// fold's do ([`DrainCas`]): a reused blob that warm never received — `TieredCas`
+/// swallows a warm write failure by design — or a recreated warm PVC would otherwise
+/// fail the flush on content cold already holds, or holds and could re-seed warm with.
+/// Cold is the concrete handle, because the tuning knob and (in future) an existence
+/// probe live on the type and not on the port.
+///
+/// # What it still costs, said plainly
+///
+/// Every address in the inventory is read out of warm and hashed twice — once by
+/// `Cas::get_blob`'s integrity check and once by cold's own `store_addressed` — *before*
+/// cold is asked whether it already had it. Asking cold first would skip both for the
+/// overwhelmingly common hit, and that is the shape this should have; it needs an
+/// existence primitive on the cold handle that `scarab-storage-s3` does not expose today
+/// (`put_if_absent` is private to that crate). Deliberately NOT worked around by adding a
+/// defaulted method to the [`Cas`] port: a default that answers "nothing is missing" is
+/// indistinguishable from the legitimate answer and is the silent-skip shape this repo
+/// has been bitten by.
+async fn flush_to_cold(
+    reads: &ReadThrough,
+    cold: &S3Storage,
+    flush: &settle::FlushSet,
+    handle: &ExportHandle,
+) -> Result<FlushTally, FlushError> {
+    use futures::StreamExt;
+
+    let started = Instant::now();
+    let concurrency = flush_concurrency(cold);
+
+    // --- Phase 1: blobs. -----------------------------------------------------
+    {
+        // The stream yields OWNED hashes, not references. A closure returning an
+        // `async move` block that borrows its argument is not general enough over
+        // lifetimes for `buffer_unordered`, and the resulting error surfaces at the
+        // `route(..)` call site rather than here — so keep the clone.
+        let mut stream = futures::stream::iter(flush.blobs.iter().cloned())
+            .map(|hash| async move {
+                let hash = &hash;
+                let bytes = reads.get_blob(hash).await.map_err(|source| {
+                    FlushError::WarmBlob {
+                        hash: hash.0.clone(),
+                        source,
+                    }
+                })?;
+                let stored = cold.put_blob(&bytes).await.map_err(|source| {
+                    FlushError::ColdBlob {
+                        hash: hash.0.clone(),
+                        source,
+                    }
+                })?;
+                if &stored != hash {
+                    return Err(FlushError::Mismatch {
+                        kind: "blob",
+                        offered: hash.0.clone(),
+                        stored: stored.0,
+                    });
+                }
+                Ok::<_, FlushError>(())
+            })
+            .buffer_unordered(concurrency);
+        while let Some(result) = stream.next().await {
+            result?;
+        }
+    }
+
+    // --- Phase 2: trees, deepest level first. --------------------------------
+    for level in &flush.tree_levels {
+        // Owned hashes, for the same lifetime reason as phase 1.
+        let mut stream = futures::stream::iter(level.iter().cloned())
+            .map(|hash| async move {
+                let hash = &hash;
+                // `tree_entries` + `put_tree` rather than the raw bytes, because a
+                // `Cas` is the port both tiers share here. The canonical form lives in
+                // `scarab-storage` and both tiers are this one binary, so the
+                // round-trip cannot change the address — and the check below is what
+                // says so rather than assumes it.
+                let entries = reads.tree_entries(hash).await.map_err(|source| {
+                    FlushError::WarmTree {
+                        hash: hash.0.clone(),
+                        source,
+                    }
+                })?;
+                let stored = cold.put_tree(entries).await.map_err(|source| {
+                    FlushError::ColdTree {
+                        hash: hash.0.clone(),
+                        source,
+                    }
+                })?;
+                if &stored != hash {
+                    return Err(FlushError::Mismatch {
+                        kind: "tree",
+                        offered: hash.0.clone(),
+                        stored: stored.0,
+                    });
+                }
+                Ok::<_, FlushError>(())
+            })
+            .buffer_unordered(concurrency);
+        while let Some(result) = stream.next().await {
+            result?;
+        }
+    }
+
+    let tally = FlushTally {
+        // Reached only when every offer above succeeded, which is the whole of what
+        // this flag means.
+        durable: true,
+        blobs: flush.blobs.len() as u64,
+        trees: flush.tree_count() as u64,
+        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    };
+    tracing::info!(
+        export = "settle",
+        handle = %handle,
+        flush_blobs = tally.blobs,
+        flush_trees = tally.trees,
+        levels = flush.tree_levels.len(),
+        concurrency,
+        total_ms = tally.elapsed_ms,
+        "archival flush complete — every blob and every tree this drain published is in the cold \
+         tier, so the Attempt may be reported Succeeded (ADR-0064 part 1)"
+    );
+    Ok(tally)
 }
 
 /// An Export handle as it may appear in a URL: exactly 64 lowercase hex chars.
@@ -2317,9 +2850,19 @@ mod tests {
     ///
     /// Cold is the only tier ADR-0061 promises anything about, and warm-has +
     /// cold-lacks is reachable (GC deletes from cold only; a warm write failure is
-    /// deliberately non-fatal; warm never evicts). The handler used to answer
+    /// deliberately non-fatal; warm never evicts; and since ADR-0064 the Depot's own
+    /// drain writes warm before it flushes). The handler used to answer
     /// `200 "already had it"` and write nothing, which would let an Attempt reach
     /// `Succeeded` on a snapshot that exists only in a tier that promises nothing.
+    ///
+    /// **ADR-0064 does not touch this route and this assertion is unchanged.** This is
+    /// the *client upload* path — a Step Pod or the control plane pushing raw addressed
+    /// bytes through [`TieredObjectStore`] — and not the Depot's drain. There is no
+    /// batched flush here to defer the cold write to, so the write stays inline and
+    /// cold-decides-success stays this route's ordering. What ADR-0064 changed is
+    /// [`settle_export`], which owns its own flush phase; the two are separate write
+    /// paths and conflating them would put a snapshot in warm with nothing scheduled to
+    /// archive it.
     #[tokio::test]
     async fn a_put_of_content_warm_already_holds_still_writes_cold() {
         use axum::body::Body;
@@ -2475,6 +3018,14 @@ mod tests {
             }
         }
 
+        /// The drain's read handle, composed out of the state's own `TieredCas` exactly
+        /// as [`settle_export`] composes it — so a test driving [`flush_to_cold`]
+        /// directly reads through the same tiering the route does, and cannot
+        /// accidentally prove something about the warm leg alone.
+        fn reads(&self) -> ReadThrough {
+            ReadThrough(self.state.cas.clone())
+        }
+
         /// One request against a freshly-built router over the same state. A fresh
         /// router per call because `oneshot` consumes the service; the state — and
         /// therefore the registry, the index and the captures — is shared.
@@ -2612,7 +3163,8 @@ mod tests {
     /// - *"a change set is folded into the CAS locally and then uploaded to cold before
     ///   the Attempt may reach `Succeeded`"* is asserted by materialising the settled
     ///   root through a store that can see **only** the cold directory. Warm cannot
-    ///   help it; if the cold leg had not run, there is nothing there to read.
+    ///   help it; if the archival flush had not run — or had been allowed to run after
+    ///   the response, which ADR-0064 rejects by name — there is nothing there to read.
     #[tokio::test]
     async fn a_step_publishes_exactly_what_it_left_including_a_deletion_and_cold_can_serve_it() {
         let h = ExportHarness::start().await;
@@ -2672,11 +3224,28 @@ mod tests {
     /// copy rung's drain that nothing in `export`'s seam carries and that this module
     /// therefore has to own. Forget it and every file is re-read: never wrong, and
     /// `reused == 0` is the only thing that would say so.
+    ///
+    /// **Two of this test's premises moved with ADR-0064 part 1 and the numbers did
+    /// not.** The tally now comes from the **warm** walk, because there is only one walk
+    /// — the cold walk that used to report these counters is gone, along with the
+    /// tripwire for the case where the two disagreed on the root. And a `Reuse` no
+    /// longer means "cold was never offered this blob": the archival flush covers every
+    /// blob the resulting snapshot names, reused ones included, which the last assertion
+    /// below is what pins. `a_blob_the_drain_reused_is_still_offered_to_the_cold_flush`
+    /// is the same property at the fold's grain and carries the reasoning.
     #[tokio::test]
     async fn the_reingest_drain_reuses_the_files_the_step_never_touched() {
         let h = ExportHarness::start().await;
         let (handle, _capability, workspace) = h.prepare().await;
         std::fs::write(workspace.join("keep.txt"), b"touched").expect("rewrite");
+        // The blob of a file the Step will NOT touch, deleted from cold before the
+        // settle. The drain will reuse it out of the baseline and read nothing, so the
+        // only thing that can put it back in cold is the flush.
+        let reused_key = format!("blobs/{}", hash_hex(b"inner"));
+        h.cold
+            .delete(&reused_key)
+            .await
+            .expect("evict a reused blob from cold, as ADR-0050's GC would");
 
         let settled = h
             .json(
@@ -2713,6 +3282,20 @@ mod tests {
             Some(1),
             "a symlink is never 'reused': nothing records a link's mtime, so there is no pair to \
              compare (and its target was read by the walk either way)"
+        );
+
+        // …and the blob nothing read is in cold anyway, because the flush offers every
+        // blob the snapshot names. Before ADR-0064 the cold leg skipped exactly these,
+        // on the argument that "the parent was durable once" — which stops being true
+        // the moment the parent ages out of cold while warm, which never evicts, keeps
+        // serving it.
+        assert_eq!(
+            h.cold.get(&reused_key).await.expect(
+                "a blob the drain REUSED must still be offered to cold: warm outlives cold, so \
+                 skipping it publishes a cold tree naming a child cold does not hold and calls \
+                 that success"
+            ),
+            b"inner".to_vec()
         );
     }
 
@@ -3018,11 +3601,19 @@ mod tests {
         );
     }
 
-    /// The **change-set** drain: it folds through the tiered store, so its output is in
-    /// cold — and it survives being driven on a blocking thread.
+    /// The **change-set** drain, ADR-0064 part 1: the fold writes **warm**, the
+    /// **archival flush** is what reaches cold — and it survives being driven on a
+    /// blocking thread.
     ///
-    /// Two things, and the second is why this test exists at its own grain rather than
-    /// riding on the acceptance test above.
+    /// This test used to assert that the fold itself reached cold, because the fold was
+    /// handed a `TieredCas` whose every put was cold-first. That mechanism is gone, so
+    /// the assertion is not weakened but *split in two*, which is strictly stronger: the
+    /// folded snapshot must be readable from **warm alone and NOT from cold** before the
+    /// flush, and from **cold alone** after it. Either half alone would pass against a
+    /// mechanism that wrote both tiers everywhere; together they say which leg did what.
+    ///
+    /// Two more things, and the second is why this test exists at its own grain rather
+    /// than riding on the acceptance test above.
     ///
     /// - **Nothing else here reaches this drain.** `SettleDrain::ChangeSet` comes only
     ///   from `ExportRung::Overlay`, and that rung needs `CAP_SYS_ADMIN` on a Linux
@@ -3036,15 +3627,117 @@ mod tests {
     ///   runtime — which is exactly what `#[tokio::test]` gives. So this test is also the
     ///   proof that the workaround does not deadlock or panic where it is used.
     ///
+    /// The change set comes from [`fold_one_edit`], which builds it through `changeset`'s
+    /// own plumbing rather than by hand — see the note there.
+    #[tokio::test]
+    async fn the_change_set_fold_writes_warm_and_the_flush_is_what_reaches_cold() {
+        let h = ExportHarness::start().await;
+        let settled = fold_one_edit(&h).await;
+
+        assert_eq!(
+            settled.tally.blobs_stored, 1,
+            "exactly the change set: the one rewritten file, and NOT the three the Step never \
+             touched"
+        );
+        assert_eq!(settled.tally.deleted, 1, "the whiteout was applied");
+
+        // Half one: the fold wrote WARM, and only warm. `h.state.warm` and `h.cold` are
+        // each `S3Storage::local` over one directory — no tiering, no fallback — so this
+        // pair of assertions is the ADR-0064 write path stated as an observation.
+        let warm_out = h.tmp.path().join("fold-from-warm");
+        h.state
+            .warm
+            .materialize(&settled.snapshot.root, warm_out.to_str().expect("utf-8"))
+            .await
+            .expect(
+                "the folded snapshot must be readable from WARM ALONE: the fold is handed the warm \
+                 tier and one walk of it is the whole write path (ADR-0064 part 1)",
+            );
+        assert!(
+            matches!(
+                h.cold.tree_entries(&settled.snapshot.root).await,
+                Err(StorageError::NotFound)
+            ),
+            "and it must NOT be in cold yet. The fold does not archive — if this passes because \
+             the fold wrote both tiers, the flush below is dead code and nothing in this service \
+             would notice"
+        );
+
+        // And the GC's damage, applied before the flush so the flush is the only thing
+        // that can undo it: `dir/` is an UNTOUCHED sub-tree this fold took across by
+        // hash, and its **tree object** is deleted from cold while warm keeps it. That is
+        // exactly the reachable state — the CAS GC sweeps cold only (`retention.rs`) and
+        // the warm tier has no eviction at all, so a parent that aged past
+        // `retention_workspace_days` leaves cold without a sub-tree warm still serves.
+        //
+        // Without this the `dir/inner.txt` assertion at the bottom passed for the wrong
+        // reason: the harness ingests the parent through the tiered store, so cold
+        // already held `dir/` and the flush could have omitted it entirely.
+        let inherited_subtree = h
+            .state
+            .warm
+            .tree_entries(&settled.snapshot.root)
+            .await
+            .expect("the folded root is in warm")
+            .into_iter()
+            .filter(|entry| entry.name == "dir")
+            .find_map(|entry| match entry.target {
+                TreeTarget::Tree(hash) => Some(hash),
+                TreeTarget::Blob(_) => None,
+            })
+            .expect("the fold carried `dir` across as a sub-tree of the rebuilt root");
+        h.cold
+            .delete(&format!("trees/{}", inherited_subtree.0))
+            .await
+            .expect("evict the inherited sub-tree from cold, as ADR-0050's GC would");
+
+        // Half two: the flush is what archives it, and then cold alone produces the
+        // whole snapshot — which is what licenses `Succeeded` (ADR-0061 part 4).
+        let handle = ExportHandle::parse(&"cd".repeat(32)).expect("a handle for the log line");
+        let flushed = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
+            .await
+            .expect("the archival flush must complete");
+        assert!(flushed.durable, "a completed flush is what `durable` reports");
+
+        let out = h.tmp.path().join("fold-from-cold");
+        h.cold
+            .materialize(&settled.snapshot.root, out.to_str().expect("utf-8"))
+            .await
+            .expect(
+                "after the flush the folded snapshot must be readable from COLD ALONE — this is \
+                 the whole of how ADR-0062 part 3's durability decision is enforced on this path",
+            );
+        let published = tree_contents(&out);
+        assert_eq!(
+            published.get("keep.txt").map(|(bytes, _)| bytes.as_slice()),
+            Some(b"the step rewrote this".as_slice()),
+            "the edit is published"
+        );
+        assert!(
+            !published.contains_key("run.sh"),
+            "and the whiteout dropped the inherited file rather than republishing it: {:?}",
+            published.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            published.contains_key("dir/inner.txt"),
+            "while the untouched subtree is carried across by hash — and the flush had to put its \
+             TREE OBJECT back in cold, which was deleted above. An inventory that lists only the \
+             trees the fold rebuilt archives a root naming an absent `dir/` and reports \
+             `durable: true`"
+        );
+    }
+
+    /// One edit plus one whiteout, folded into the **warm** tier alone: the change-set
+    /// drain's input and its ADR-0064 output, for the tests that need a real folded
+    /// snapshot together with the flush inventory that belongs to it.
+    ///
     /// The change set is built through `changeset`'s **own** plumbing (`entry_change` +
-    /// `absorb`), never by hand-constructing `Written`/`Directory` values: this ADR's
+    /// `absorb`), never by hand-constructing `Written` / `Directory` values: this ADR's
     /// history has two test helpers that re-implemented what they were checking, and a
     /// third would hide the same hole again.
-    #[tokio::test]
-    async fn the_change_set_fold_writes_through_the_tiered_store_and_reaches_cold() {
+    async fn fold_one_edit(h: &ExportHarness) -> settle::Settled {
         use crate::changeset::{entry_change, ChangeSet, EntryFacts, EntryType};
 
-        let h = ExportHarness::start().await;
         // An upper layer as a Step's overlay would leave one: one edit, one whiteout
         // over an inherited file. `run.sh` is a path here and not a file — a whiteout is
         // a character device this test cannot `mknod`, and the fold never reads one.
@@ -3063,51 +3756,469 @@ mod tests {
         }
         change.sort();
 
-        let settled = fold_change_set(
-            h.state.cas.clone(),
+        fold_change_set(
+            Arc::new(DrainCas::over(h.state.cas.clone())),
             h.parent.clone(),
-            upper.clone(),
+            upper,
             change,
         )
         .await
         .expect("the fold must not panic or stall on the blocking thread it is driven on")
-        .expect("fold the change set");
+        .expect("fold the change set")
+    }
 
+    /// Make the cold tier unusable, the way `farm`'s eviction test and this module's
+    /// broken-volume test do: put a **file** where a key prefix's directory has to be,
+    /// so every open under it is `ENOTDIR`.
+    ///
+    /// Portable and uid-independent, unlike a `chmod` — which passes on a laptop and
+    /// silently stops testing anything inside a root CI container. `prefix` is a key
+    /// prefix (`"blobs"` / `"trees"`) so a test can kill one leg of the flush and leave
+    /// the other working, which is how the *ordering* becomes observable rather than
+    /// just the failure.
+    fn break_cold(h: &ExportHarness, prefix: &str) {
+        let at = h.tmp.path().join("cold").join(prefix);
+        let _ = std::fs::remove_dir_all(&at);
+        std::fs::write(&at, b"not a directory").expect("put a file where the prefix must be");
+    }
+
+    /// **The ticket's requirement, on the RE-INGEST drain only.** Cold is dead, so the
+    /// settle answers `500` and no `durable` reaches the wire.
+    ///
+    /// ADR-0064: *"a flush that fails fails the Attempt"*. The Step exited 0 and the drain
+    /// succeeded — the snapshot really is in warm — and that is exactly the state in
+    /// which reporting success would put a claim in the durable record that the record
+    /// cannot back.
+    ///
+    /// **What this test does NOT cover, said plainly rather than implied away.** It goes
+    /// through `h.prepare()`, which is the **copy** rung, so the drain is
+    /// `SettleDrain::Reingest` and the code exercised is
+    /// [`reingest_warm_then_flush`]'s error mapping. The change-set drain's identical
+    /// mapping in [`settle_export`] is *not* reached from here and cannot be on this host
+    /// — `ExportRung::Overlay` needs `CAP_SYS_ADMIN` on a Linux kernel (git-bug
+    /// `0ad393c`). `a_flush_that_fails_leaves_no_cold_tree_naming_an_absent_child` covers
+    /// that drain's flush failure at the function grain instead.
+    ///
+    /// The `durable` half is also weaker than it looks and is kept for the day that
+    /// changes: a `WsError::Drain` renders a fixed string with no JSON body at all, so
+    /// today the substring simply cannot appear. It becomes a real assertion the moment
+    /// anyone gives the error a structured body, which is the plausible way a `durable`
+    /// field would leak onto a failure response.
+    #[tokio::test]
+    async fn a_settle_whose_cold_flush_fails_does_not_report_durable() {
+        let h = ExportHarness::start().await;
+        let (handle, _capability, workspace) = h.prepare().await;
+        std::fs::write(workspace.join("keep.txt"), b"the step rewrote this").expect("rewrite");
+        break_cold(&h, "blobs");
+
+        let (status, body) = h
+            .call(
+                "POST",
+                &format!("/v1/exports/{handle}/settle"),
+                Some(serde_json::json!({})),
+            )
+            .await;
         assert_eq!(
-            settled.tally.blobs_stored, 1,
-            "exactly the change set: the one rewritten file, and NOT the three the Step never \
-             touched"
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an unarchivable snapshot is a retryable failure, not a settle: {body}"
         );
-        assert_eq!(settled.tally.deleted, 1, "the whiteout was applied");
+        assert!(
+            !body.contains("\"durable\":true") && !body.contains("\"durable\": true"),
+            "and nothing on the wire may say the snapshot is durable — a caller that reads this \
+             field is deciding whether an Attempt may be Succeeded. NOTE this half is trivially \
+             true while `WsError::Drain` renders a plain string; it is a tripwire for a \
+             structured error body, not evidence about today: {body}"
+        );
+        // And the reason the assertion above is weak, pinned rather than described: the
+        // whole body is one fixed sentence, so there is no field on the wire to be wrong.
+        // When someone gives `WsError::Drain` a structured body this fires, and whoever
+        // is holding it then has to look at the `durable` assertion above and make it
+        // mean something. The *cause* is not on the wire at all by design — it is on the
+        // `tracing::error!` line in `WsError`'s `IntoResponse`, because a drain failure
+        // names an internal path.
+        assert_eq!(
+            body, "the workspace export could not be settled",
+            "a drain failure is a fixed string today; changing that is the moment the \
+             `durable` check above stops being trivially true"
+        );
 
-        // The durability decision for THIS drain: `fold_change_set` names `TieredCas`,
-        // whose every put is cold-first and awaited, so the cold directory alone can
-        // produce the whole snapshot.
-        let out = h.tmp.path().join("fold-from-cold");
-        h.cold
-            .materialize(&settled.snapshot.root, out.to_str().expect("utf-8"))
+        // The other half of the same invariant: warm DID get the snapshot, so this is
+        // genuinely the "the fold worked and the archive did not" case and not a fold
+        // that failed for its own reasons.
+        assert!(
+            h.state
+                .warm
+                .get_blob(&BlobHash(hash_hex(b"the step rewrote this")))
+                .await
+                .is_ok(),
+            "the warm write must have happened, or this test is asserting about the wrong failure"
+        );
+    }
+
+    /// A flush that fails partway leaves cold **self-consistent**: no cold tree naming a
+    /// child cold does not hold.
+    ///
+    /// This is what blobs-before-trees buys, and a test that only checked for an `Err`
+    /// would not cover it — the failing and the succeeding flush return the same `Err`
+    /// whichever order the two phases run in. So the blob leg is killed and the **tree**
+    /// leg left working: with the phases in the right order nothing reaches cold at all;
+    /// with them swapped, cold ends up holding the settled root — a reachable tree whose
+    /// blobs are absent, which no later reader can tell from corruption and which the GC's
+    /// mark walk would follow.
+    #[tokio::test]
+    async fn a_flush_that_fails_leaves_no_cold_tree_naming_an_absent_child() {
+        let h = ExportHarness::start().await;
+        let settled = fold_one_edit(&h).await;
+        break_cold(&h, "blobs");
+
+        let handle = ExportHandle::parse(&"ef".repeat(32)).expect("a handle");
+        let err = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
+        .await
+        .expect_err("a cold tier that cannot take a blob must fail the flush");
+        assert!(
+            matches!(err, FlushError::ColdBlob { .. }),
+            "and it must name the cold blob write as the cause rather than surfacing a bare I/O \
+             error: {err}"
+        );
+
+        assert!(
+            matches!(
+                h.cold.tree_entries(&settled.snapshot.root).await,
+                Err(StorageError::NotFound)
+            ),
+            "the failed flush must not have left the settled ROOT in cold: it names blobs cold \
+             does not hold, and a reader cannot tell that from corruption"
+        );
+    }
+
+    /// A flush is **idempotent**: running it twice succeeds twice and the second run
+    /// writes nothing.
+    ///
+    /// ADR-0064 makes this load-bearing rather than incidental — *"the batch must be
+    /// idempotent, because the CAS is content-addressed and a retried flush will
+    /// re-offer the same keys"* — and it is why no partial-flush cursor is persisted: a
+    /// retry re-offers everything and that is cheap.
+    ///
+    /// "Wrote nothing" is *measured* rather than assumed, by corrupting one archived
+    /// blob between the two runs: a flush that re-uploaded would repair it, a flush that
+    /// heads-and-skips leaves the corruption in place. Timestamps would have been the
+    /// obvious probe and are useless here — two runs in one millisecond are
+    /// indistinguishable.
+    #[tokio::test]
+    async fn a_second_flush_of_the_same_snapshot_writes_nothing() {
+        let h = ExportHarness::start().await;
+        let settled = fold_one_edit(&h).await;
+        let handle = ExportHandle::parse(&"ab".repeat(32)).expect("a handle");
+
+        let first = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
             .await
-            .expect(
-                "the folded snapshot must be readable from COLD ALONE — this is the store handle \
-                 the change-set drain is given, and it is the whole of how ADR-0062 part 3's \
-                 durability decision is enforced on this path",
-            );
-        let published = tree_contents(&out);
+            .expect("the first flush");
+
+        // The expectation is a LITERAL, spelled out from the fixture, and not a second
+        // reading of the same `FlushSet` — comparing `second` against `first` cannot fail,
+        // because both tallies are counted off the one inventory both runs were handed.
+        //
+        // `fold_one_edit` rewrites `keep.txt` and whiteouts `run.sh` over the parent in
+        // `parent_files()` plus its `link.txt` symlink. So the rebuilt ROOT is the only
+        // tree this fold wrote, and it names exactly two blobs — the new `keep.txt` and
+        // the inherited `link.txt` symlink target — while `run.sh`'s blob is gone with the
+        // whiteout and `dir/`'s two blobs are named by `dir/` rather than by the root. The
+        // trees are the rebuilt root and the inherited `dir/`.
+        let (want_blobs, want_trees) = (2u64, 2u64);
         assert_eq!(
-            published.get("keep.txt").map(|(bytes, _)| bytes.as_slice()),
-            Some(b"the step rewrote this".as_slice()),
-            "the edit is published"
+            (first.blobs, first.trees, first.durable),
+            (want_blobs, want_trees, true),
+            "the inventory this fixture produces: {} blob addresses and {} trees",
+            settled.flush.blobs.len(),
+            settled.flush.tree_count()
         );
+
+        let key = format!("blobs/{}", hash_hex(b"the step rewrote this"));
+        h.cold
+            .put(&key, b"a byte-for-byte re-upload would repair this".to_vec())
+            .await
+            .expect("corrupt one archived blob");
+
+        let second = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
+            .await
+            .expect("a re-offered flush must succeed, or a retried settle could never go green");
+        assert_eq!(
+            (second.blobs, second.trees, second.durable),
+            (want_blobs, want_trees, true),
+            "the whole inventory is re-offered — nothing records how far the first one got, so a \
+             retry re-offers everything and reports the same durability"
+        );
+        assert_eq!(
+            h.cold.get(&key).await.expect("still there"),
+            b"a byte-for-byte re-upload would repair this".to_vec(),
+            "the second flush must not have re-uploaded: a re-offer of a content-addressed key is \
+             a `head` and nothing more, which is what makes retrying the whole batch cheap"
+        );
+    }
+
+    /// A blob the fold **reused** from the parent snapshot is still offered to cold.
+    ///
+    /// The regression guard for the finding that shaped `settle::FlushSet`. The tempting
+    /// optimisation is to flush only what the fold *wrote*, and it is wrong, because
+    /// warm routinely outlives cold: the CAS GC deletes from cold only, and the warm tier
+    /// has no eviction implemented at all. So a reused blob can be absent from cold, and
+    /// a flush that skipped it would publish a cold tree naming a child cold does not
+    /// hold **and report success** — silently, and only for snapshots whose parent has
+    /// aged past `retention_workspace_days`.
+    ///
+    /// Set up as the GC would leave it: the blob is evicted from cold *before* the flush,
+    /// and the fold never touches that file, so the flush is the only thing that can put
+    /// it back.
+    ///
+    /// The subject is `link.txt`, the parent's symlink at the **root** — inherited, not
+    /// named by the change set, and named directly by the one tree this fold rebuilt. A
+    /// symlink is a blob here as everywhere else: its content is its target path.
+    ///
+    /// That last part is where `settle::FlushSet`'s boundary runs, and it is a boundary
+    /// rather than a guarantee: `blobs` covers what the *rebuilt* trees name, so a blob
+    /// buried inside an untouched sub-tree (`dir/…`) is not in it even though the
+    /// sub-tree's own address now is. That remaining hole is documented on `FlushSet`
+    /// together with what closing it would cost; this test deliberately does not pretend
+    /// to cover it.
+    #[tokio::test]
+    async fn a_blob_the_drain_reused_is_still_offered_to_the_cold_flush() {
+        let h = ExportHarness::start().await;
+        let settled = fold_one_edit(&h).await;
+
+        let inherited = BlobHash(hash_hex(b"keep.txt"));
         assert!(
-            !published.contains_key("run.sh"),
-            "and the whiteout dropped the inherited file rather than republishing it: {:?}",
-            published.keys().collect::<Vec<_>>()
+            settled.flush.blobs.contains(&inherited),
+            "the flush inventory must include the blobs the fold REUSED, not only the one it \
+             stored. `blobs_stored` is {} and the inventory holds {} addresses",
+            settled.tally.blobs_stored,
+            settled.flush.blobs.len()
         );
+
+        let key = format!("blobs/{}", inherited.0);
+        h.cold
+            .delete(&key)
+            .await
+            .expect("evict an inherited blob from cold, as ADR-0050's GC would");
+
+        let handle = ExportHandle::parse(&"ba".repeat(32)).expect("a handle");
+        flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
+            .await
+            .expect("the flush");
+
+        assert_eq!(
+            h.cold.get(&key).await.expect(
+                "the reused blob must be back in cold: it is named by a tree this flush just \
+                 archived, and cold's own heads-then-puts is the only self-heal it has"
+            ),
+            b"keep.txt".to_vec()
+        );
+    }
+
+    /// A sub-tree the fold **inherited** is offered to cold too, and the flush is what
+    /// puts its tree object back.
+    ///
+    /// The same finding as the reused blob, one level up, and the one the tree inventory
+    /// used to miss entirely. `dir/` is untouched, so the fold takes it across by hash and
+    /// writes nothing for it — but the rebuilt root NAMES it, and cold can have swept it
+    /// while warm still serves it (the GC deletes from cold only; warm has no eviction).
+    /// A flush that listed only the trees the fold *wrote* would archive a root pointing
+    /// at an absent `dir/` and report `durable: true`.
+    ///
+    /// Distinct from the acceptance-shaped test above: this one asserts the **inventory**
+    /// names it and at what depth, so it fails at the fold rather than at a `materialize`
+    /// three layers later.
+    #[tokio::test]
+    async fn an_inherited_sub_tree_is_in_the_flush_inventory_below_the_tree_that_names_it() {
+        let h = ExportHarness::start().await;
+        let settled = fold_one_edit(&h).await;
+
+        let inherited = h
+            .state
+            .warm
+            .tree_entries(&settled.snapshot.root)
+            .await
+            .expect("the folded root is in warm")
+            .into_iter()
+            .filter(|entry| entry.name == "dir")
+            .find_map(|entry| match entry.target {
+                TreeTarget::Tree(hash) => Some(hash),
+                TreeTarget::Blob(_) => None,
+            })
+            .expect("the fold carried `dir` across as a sub-tree of the rebuilt root");
+        assert_eq!(
+            settled.tally.trees_written, 1,
+            "sanity: the root is the only tree this fold WROTE, so `dir` below is purely inherited"
+        );
+
+        let levels = &settled.flush.tree_levels;
+        assert_eq!(
+            levels.len(),
+            2,
+            "two depths are reachable through the rebuilt root — itself and `dir` — and one level \
+             means the inherited sub-tree was dropped from the inventory: {levels:?}"
+        );
+        assert_eq!(
+            levels[0],
+            vec![inherited.clone()],
+            "deepest-first, so `dir` is offered FIRST: it must be in cold before the root that \
+             names it is"
+        );
+        assert_eq!(
+            levels[1],
+            vec![settled.snapshot.root.clone()],
+            "and the rebuilt root LAST"
+        );
+
+        // And end to end: the GC's damage, then the flush, then cold alone can read it.
+        h.cold
+            .delete(&format!("trees/{}", inherited.0))
+            .await
+            .expect("evict the inherited sub-tree from cold, as ADR-0050's GC would");
+        let handle = ExportHandle::parse(&"1a".repeat(32)).expect("a handle");
+        flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
+            .await
+            .expect("the flush");
         assert!(
-            published.contains_key("dir/inner.txt"),
-            "while the untouched subtree is carried across by hash — and is in cold because it \
-             was the parent's, and the parent was durable before the Attempt that produced it"
+            h.cold.tree_entries(&inherited).await.is_ok(),
+            "the flush had to put the inherited sub-tree's tree object back in cold — it is the \
+             only thing on this path that can"
         );
+    }
+
+    /// [`flush_set_of`]'s own ordering: **deepest level first**, for the drain that has to
+    /// rediscover its inventory by walking.
+    ///
+    /// The change-set drain gets its levels from the fold and has its own test; this one is
+    /// the *other* producer of a [`settle::FlushSet`], and it produces it breadth-first and
+    /// then reverses. A missing `.rev()` there is invisible to every other test in this
+    /// module — the flush would still succeed against a healthy cold tier, because
+    /// `put_tree` does not check that a child is present — and would only show up as a cold
+    /// tier holding a root over absent children after a *failed* flush.
+    #[tokio::test]
+    async fn the_walked_flush_inventory_is_deepest_level_first() {
+        let h = ExportHarness::start().await;
+
+        // Three levels, so the ordering is a claim about more than "reversed or not": a
+        // two-level fixture passes for a `swap` as well as for a sort.
+        let src = h.tmp.path().join("deep");
+        std::fs::create_dir_all(src.join("a/b")).expect("mkdir -p");
+        std::fs::write(src.join("top.txt"), b"top").expect("write");
+        std::fs::write(src.join("a/mid.txt"), b"mid").expect("write");
+        std::fs::write(src.join("a/b/leaf.txt"), b"leaf").expect("write");
+        let snapshot = h
+            .state
+            .warm
+            .ingest(src.to_str().expect("utf-8"))
+            .await
+            .expect("ingest the fixture into warm");
+
+        fn tree_named(entries: Vec<TreeEntry>, name: &str) -> TreeHash {
+            entries
+                .into_iter()
+                .filter(|entry| entry.name == name)
+                .find_map(|entry| match entry.target {
+                    TreeTarget::Tree(hash) => Some(hash),
+                    TreeTarget::Blob(_) => None,
+                })
+                .unwrap_or_else(|| panic!("the fixture has a directory `{name}`"))
+        }
+        let a = tree_named(
+            h.state
+                .warm
+                .tree_entries(&snapshot.root)
+                .await
+                .expect("the root"),
+            "a",
+        );
+        let b = tree_named(
+            h.state.warm.tree_entries(&a).await.expect("`a`"),
+            "b",
+        );
+
+        let flush = flush_set_of(&h.reads(), &snapshot.root)
+            .await
+            .expect("walk the snapshot for its flush inventory");
+
+        assert_eq!(
+            flush.tree_levels,
+            vec![vec![b], vec![a], vec![snapshot.root.clone()]],
+            "`a/b`, then `a`, then the root — children strictly before parents, or cold holds a \
+             reachable tree naming something absent"
+        );
+        for (what, bytes) in [
+            ("the root's own file", b"top".as_slice()),
+            ("a file one level down", b"mid".as_slice()),
+            ("a file two levels down", b"leaf".as_slice()),
+        ] {
+            assert!(
+                flush.blobs.contains(&BlobHash(hash_hex(bytes))),
+                "the walked inventory must reach every blob, including {what}: it holds {} \
+                 addresses",
+                flush.blobs.len()
+            );
+        }
+    }
+
+    /// [`FlushError::Mismatch`]: cold filed the content under an address the flush did not
+    /// offer, so the flush refuses rather than reporting a durability nothing will find.
+    ///
+    /// Reachable without a test double, because `Cas::tree_entries` on `S3Storage` reads a
+    /// tree object by key and does **not** verify that it canonicalises back to that key
+    /// (unlike `get_blob`, which does). So a tree object filed in warm under an address it
+    /// does not hash to — which is exactly what
+    /// `scarab_storage::tiered`'s backfill tripwire exists to notice — reaches cold, is
+    /// re-canonicalised on the way in, and comes back with a different hash.
+    ///
+    /// The refusal matters because the alternative is silent: `put_tree` would have
+    /// succeeded, cold would hold the content at an address no snapshot names, and the
+    /// settle would report `durable: true` for a root cold cannot resolve.
+    #[tokio::test]
+    async fn a_cold_tier_that_files_content_under_another_address_fails_the_flush() {
+        let h = ExportHarness::start().await;
+
+        // The parent's real tree object, re-filed in warm under an address that is
+        // well-formed and certainly not its own.
+        let bytes = h
+            .state
+            .warm
+            .get(&format!("trees/{}", h.parent.root.0))
+            .await
+            .expect("the parent's tree object is in warm");
+        let wrong = TreeHash("11".repeat(32));
+        h.state
+            .warm
+            .put(&format!("trees/{}", wrong.0), bytes)
+            .await
+            .expect("file a tree under an address it does not hash to");
+
+        let flush = settle::FlushSet {
+            blobs: HashSet::new(),
+            tree_levels: vec![vec![wrong.clone()]],
+        };
+        let handle = ExportHandle::parse(&"2b".repeat(32)).expect("a handle");
+        let err = flush_to_cold(&h.reads(), &h.cold, &flush, &handle)
+            .await
+            .expect_err("a tier disagreement about addressing must fail the flush");
+
+        match err {
+            FlushError::Mismatch {
+                kind,
+                ref offered,
+                ref stored,
+            } => {
+                assert_eq!(kind, "tree");
+                assert_eq!(offered, &wrong.0, "the address the flush offered");
+                assert_eq!(
+                    stored, &h.parent.root.0,
+                    "and the one cold actually filed it under — both in the message, because an \
+                     operator cannot act on `hash mismatch` alone"
+                );
+            }
+            other => panic!(
+                "the flush must refuse with `Mismatch` and not with a bare write error: {other}"
+            ),
+        }
     }
 
     /// The reaper actually reaps, and the capture map does not outlive what it

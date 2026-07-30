@@ -82,8 +82,21 @@
 //! durable before an Attempt may be reported settled* is a durability question
 //! about Attempt evidence, filed as git-bug `cab0f66`, and answering it silently
 //! inside a fold would answer it wrongly and invisibly. A caller that wants both
-//! tiers hands in a tiered `Cas`; a caller that wants only the warm one hands in
-//! the warm one.
+//! tiers hands in a tiered `Cas`; a caller that wants writes on one tier and reads
+//! through both hands in a handle that composes them that way
+//! (`crate::workspaced::DrainCas`).
+//!
+//! ADR-0064 part 1 then makes the workspace service hand in **the warm tier
+//! alone** and archive afterwards, in one batched flush that still gates the
+//! settle response. That is a caller's decision too, and the only thing the fold
+//! owes it is an *inventory*: [`Settled::flush`] reports every address the flush
+//! has to offer cold, which the fold knows for free and which nothing downstream
+//! could recover without re-walking the tree the fold exists to avoid walking.
+//! It is an inventory and not an action — this module still never names a second
+//! tier. "For free" is exact, and worth checking rather than trusting: the rebuilt
+//! trees and the blobs they name fall out of the fold itself, and the *inherited*
+//! sub-tree addresses fall out of the identity walk the fold was already paying for
+//! ([`Fold::identity_of`]). Nothing in here walks anything twice to fill it in.
 //!
 //! # How this is tested
 //!
@@ -104,15 +117,17 @@
 //! whiteout is a *path* to this module and never a file it reads, and a `redirect`
 //! is an xattr `changeset`'s own public API can put into a change set.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
+// `content_identity` is deliberately NOT imported: [`Fold::walk_inherited`] is that
+// recursion with the sub-tree addresses kept rather than discarded, so importing the
+// original beside it would invite a second walk of the tree the first one just read.
 use scarab_storage::{
-    content_identity, content_identity_of, BlobHash, Cas, Snapshot, StorageError, TreeEntry,
-    TreeHash, TreeTarget,
+    content_identity_of, BlobHash, Cas, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget,
 };
 use thiserror::Error;
 
@@ -139,6 +154,113 @@ pub struct Settled {
     /// What the fold actually did. The honest way to assert that an untouched
     /// Step paid nothing, rather than trusting that it did.
     pub tally: SettleTally,
+    /// What a caller archiving this snapshot has to offer the cold tier — see
+    /// [`FlushSet`] for the exact boundary, including the one thing still outside it.
+    /// Empty for an untouched Step, which published its input and owes nothing.
+    pub flush: FlushSet,
+}
+
+/// The inventory an **archival flush** needs (ADR-0064 part 1): what a drain
+/// published, addressed, in the order cold may safely receive it.
+///
+/// The write path is warm-first — one local walk, no per-blob network round trip
+/// — and cold is then offered this whole set in one batched phase which the
+/// settle response waits for. So this type is the seam between "the snapshot
+/// exists" and "the snapshot is archived", and every rule below exists because
+/// breaking it publishes an unbacked claim — an omission from the inventory and a
+/// wrong ordering both end the same way, with cold holding a reachable tree whose
+/// child is absent while the settle reports `durable: true`.
+///
+/// # `blobs` includes the ones the fold REUSED, and that is not slack
+///
+/// The fold takes untouched content across **by hash** and stores nothing for it.
+/// The tempting optimisation is therefore to flush only the blobs this fold wrote
+/// — and it would be wrong, because *a blob the fold reused may be absent from
+/// cold*. Three facts make that reachable rather than theoretical:
+///
+/// - the CAS GC deletes from **cold only** (`crate::retention`'s sweep), and
+/// - the warm tier has no eviction implemented at all
+///   (`scarab_storage::tiered::WarmTier` is a trait with no impl), so warm
+///   routinely outlives cold; and
+/// - a warm write that failed while cold succeeded is `Ok` by design, so the
+///   tiers were never required to agree in the first place.
+///
+/// A flush that skipped reused blobs would then publish a cold *tree* naming
+/// children cold does not hold, **and report success**, the first time a parent
+/// snapshot aged past `retention_workspace_days`. What the reused blobs cost is
+/// one `head` each: cold's `put_if_absent` turns a re-offer into a `head` and
+/// nothing more, and today's `cold.ingest` heads-then-puts every blob on every
+/// drain — which is the *only* self-heal cold has. Including them keeps that
+/// self-heal and pays what the status quo already paid.
+///
+/// # The untouched sub-trees are in `tree_levels`, for the same reason
+///
+/// A rebuilt tree names an untouched sub-directory by **its tree hash** and the fold
+/// stores nothing for it. That hash is a child of a tree this flush publishes, so the
+/// argument above applies to it unchanged, one level up: parent snapshot `P` ages past
+/// `retention_workspace_days`, the GC sweeps `dir/`'s *tree object* out of cold, warm
+/// still holds it (no eviction), a later Step edits one file and this flush publishes a
+/// root naming `dir/`. Omit `dir/` and cold holds a reachable tree with an absent child
+/// and the settle says `durable: true`.
+///
+/// So `tree_levels` holds the rebuilt trees **and** the untouched sub-trees they reach,
+/// each at its true depth. That costs nothing to discover: [`Fold::identity_of`] already
+/// walks every inherited sub-tree named by a rebuilt tree — an identity is not an
+/// address, so there is nothing to look one up by — and the walk that resolves the
+/// identity is the walk that collects the hashes.
+///
+/// # What is NOT in `blobs`, stated as a hole and not as a guarantee
+///
+/// `blobs` is every blob named by a tree the *fold rebuilt*. The blobs named by an
+/// **inherited** sub-tree are not in it, and that is a narrower version of the same
+/// defect rather than a case that is safe: the sweep that removed `dir/`'s tree object
+/// removed the blobs reachable only through it, so re-offering `dir/` can still leave
+/// cold holding a tree whose blobs are absent.
+///
+/// It is left open deliberately and with a measured reason. The identity walk sees those
+/// blob hashes too, so *collecting* them is free — but flushing them is not: the flush
+/// reads each blob out of warm and re-hashes it, so including the whole reachable
+/// closure would read and re-hash **every file in the workspace** at every Step
+/// boundary, which is exactly the per-file cost ADR-0061 measured and ADR-0064 exists to
+/// remove. Closing it needs the flush to be able to ask cold *what it is missing* before
+/// reading anything out of warm, and no public existence primitive on the cold handle
+/// exists to ask with today (`S3Storage::put_if_absent` is private to
+/// `scarab-storage-s3`). Until then this is the honest boundary: strictly better than
+/// omitting the sub-trees, and not yet complete.
+///
+/// # `tree_levels` is deepest-first
+///
+/// A tree names its children's hashes, so cold must never hold a reachable tree
+/// whose children are absent — that state is indistinguishable from corruption to
+/// every later reader. Levels rather than one flat list because the trees *within*
+/// one level name none of each other and so can go up together, which is exactly
+/// the grouping `S3Storage::ingest`'s phase 3 makes for the same reason.
+#[derive(Debug, Clone, Default)]
+pub struct FlushSet {
+    /// Every blob the resulting snapshot's rebuilt trees name — stored *and*
+    /// reused. See the type docs: dropping the reused ones is a silent
+    /// data-loss bug, not a saving. The blobs named by an *inherited* sub-tree
+    /// are not here; the type docs say why, and that it is a hole.
+    pub blobs: HashSet<BlobHash>,
+    /// Every tree the new root reaches through a rebuilt tree, grouped by depth,
+    /// **deepest level first**: the ones this fold wrote *and* the untouched
+    /// sub-trees they name. The untouched ones are in for the same reason the
+    /// reused blobs are — cold sweeps and warm does not, so "the parent archived
+    /// it once" is not "cold holds it now".
+    ///
+    /// A level is a distance from the root, so one address may appear at several
+    /// levels when two names of different lengths reach it. That costs a `head`;
+    /// deduplicating across levels could invert a parent and its own child (the
+    /// note on `crate::workspaced::flush_set_of` works the case through).
+    pub tree_levels: Vec<Vec<TreeHash>>,
+}
+
+impl FlushSet {
+    /// How many trees, across every level. For logs and for the assertion that a
+    /// fold of a small change set flushed a small set.
+    pub fn tree_count(&self) -> usize {
+        self.tree_levels.iter().map(Vec::len).sum()
+    }
 }
 
 /// What one fold cost, counted where the work happens.
@@ -275,6 +397,9 @@ pub async fn settle_change_set(
         return Ok(Settled {
             snapshot: parent.clone(),
             tally: SettleTally::default(),
+            // Nothing to archive: this snapshot IS the parent's, and the parent was
+            // archived before the Attempt that produced it was allowed to succeed.
+            flush: FlushSet::default(),
         });
     }
 
@@ -285,6 +410,8 @@ pub async fn settle_change_set(
         dirs: Vec::new(),
         identities: HashMap::new(),
         tally: SettleTally::default(),
+        blobs: HashSet::new(),
+        trees_by_depth: Vec::new(),
     };
     let inherited = fold.entries_of(&parent.root).await?;
     // The root of the tree being built. Nothing names it, so it carries no mode
@@ -302,8 +429,34 @@ pub async fn settle_change_set(
     fold.apply_written(change).await?;
     fold.apply_deletions(change).await?;
 
-    let (root, identity) = fold.write_dir(0).await?;
+    let (root, identity) = fold.write_dir(0, 0).await?;
     let tally = fold.tally;
+    // The one place the flush's tree ordering is established, so there is one place
+    // to check it: [`Fold::trees_by_depth`] is indexed by depth (the root at 0) and
+    // a flush must offer children before parents.
+    //
+    // Deduplicated **within** a level and never across them. Within a level is free:
+    // a `node_modules` fan-out names one inherited sub-tree under many names, and
+    // offering it once per name buys a `head` per name and nothing else. Across levels
+    // is unsafe, and non-obviously so — keeping one occurrence per address globally can
+    // leave a tree in a shallower level than its own child, which the deepest-first
+    // flush would then offer parent-first. `crate::workspaced::flush_set_of` works the
+    // same case through for the drain that has to rediscover its inventory.
+    let flush = FlushSet {
+        blobs: fold.blobs,
+        tree_levels: fold
+            .trees_by_depth
+            .into_iter()
+            .rev()
+            .map(|level| {
+                let mut seen: HashSet<TreeHash> = HashSet::new();
+                level
+                    .into_iter()
+                    .filter(|hash| seen.insert(hash.clone()))
+                    .collect()
+            })
+            .collect(),
+    };
 
     tracing::info!(
         cas = "settle",
@@ -315,6 +468,8 @@ pub async fn settle_change_set(
         trees_written = tally.trees_written,
         identities_walked = tally.identities_walked,
         grafted = tally.grafted,
+        flush_blobs = flush.blobs.len(),
+        flush_trees = flush.tree_count(),
         concurrency = SETTLE_CONCURRENCY,
         total_ms = started.elapsed().as_millis(),
         "ws-timing"
@@ -326,6 +481,7 @@ pub async fn settle_change_set(
             identity: Some(identity),
         },
         tally,
+        flush,
     })
 }
 
@@ -366,6 +522,24 @@ enum Slot {
     Dir(usize),
 }
 
+/// What one walk of an **inherited** sub-tree yields: the thing the fold needs to
+/// finish the identity fold, and the thing the archival flush needs to not publish a
+/// tree with an absent child. One walk answers both.
+#[derive(Clone)]
+struct Inherited {
+    /// The sub-tree's content identity — not an address, which is why it has to be
+    /// walked for at all (`scarab_storage::content_identity`).
+    identity: TreeHash,
+    /// The sub-tree's own address at index 0, the trees it names at index 1, and so
+    /// on: depths **relative to the sub-tree itself**.
+    ///
+    /// Relative and not absolute, because the same sub-tree can be named at more than
+    /// one absolute depth (and by more than one rebuilt parent) while its shape is the
+    /// same at each. [`Fold::record_inherited`] adds the occurrence's depth to turn
+    /// these back into the absolute levels [`FlushSet::tree_levels`] is expressed in.
+    levels: Vec<Vec<TreeHash>>,
+}
+
 /// The fold's working state: the arena, the identity memo, and the counters.
 struct Fold<'a> {
     cas: &'a dyn Cas,
@@ -376,11 +550,26 @@ struct Fold<'a> {
     parent_root: TreeHash,
     /// Index 0 is the root of the tree being built.
     dirs: Vec<Dir>,
-    /// Tree hash to content identity, for the duration of one fold. A fan-out of
-    /// identical inherited subtrees (`node_modules` is full of them) then costs one
-    /// walk rather than one per name.
-    identities: HashMap<TreeHash, TreeHash>,
+    /// Inherited sub-tree hash to [`Inherited`], for the duration of one fold. A
+    /// fan-out of identical inherited subtrees (`node_modules` is full of them) then
+    /// costs one walk rather than one per name.
+    ///
+    /// It memoises the whole walk result and not just the identity, which is
+    /// load-bearing rather than tidy: a memo hit must still contribute the sub-tree's
+    /// addresses to [`Self::trees_by_depth`] **at this occurrence's depth**, and a
+    /// memo that had thrown the addresses away could only recover them by walking
+    /// again. Remembering the identity alone was the shape that silently dropped a
+    /// second occurrence's levels and could put a parent in a shallower level than
+    /// its own child.
+    identities: HashMap<TreeHash, Inherited>,
     tally: SettleTally,
+    /// [`FlushSet::blobs`] under construction — a set, because a fan-out of one
+    /// blob under many names is one thing to archive.
+    blobs: HashSet<BlobHash>,
+    /// [`FlushSet::tree_levels`] under construction, but indexed by **depth**
+    /// (the root at 0) because that is the coordinate [`Fold::write_dir`] has in
+    /// hand. `settle_change_set` reverses it once, on the way out.
+    trees_by_depth: Vec<Vec<TreeHash>>,
 }
 
 impl Fold<'_> {
@@ -625,6 +814,12 @@ impl Fold<'_> {
             while let Some(result) = stream.next().await {
                 let (i, blob) = result?;
                 self.tally.blobs_stored += 1;
+                // Into the flush inventory here as well as in `write_dir`, and the
+                // two are not redundant: THESE are the blobs whose bytes exist in
+                // the store only because this fold just put them there, so a
+                // refactor that stopped placing one at a merged-view path would
+                // still archive it. `write_dir` is what adds the *reused* ones.
+                self.blobs.insert(blob.clone());
                 blobs[i] = Some(blob);
             }
         }
@@ -673,7 +868,17 @@ impl Fold<'_> {
     /// reachable root must never be published over a tree that is not stored yet
     /// (`ingest`'s phase 3, one grain finer — only the touched path is rebuilt at
     /// all).
-    async fn write_dir(&mut self, idx: usize) -> Result<(TreeHash, TreeHash), SettleError> {
+    ///
+    /// `depth` is this directory's distance from the root (the root is 0) and it
+    /// exists only for [`FlushSet::tree_levels`]: the archival flush has to offer
+    /// cold the same children-before-parents order this recursion already writes
+    /// in, and a depth is what lets it do that a level at a time instead of one
+    /// tree at a time.
+    async fn write_dir(
+        &mut self,
+        idx: usize,
+        depth: usize,
+    ) -> Result<(TreeHash, TreeHash), SettleError> {
         let dir = std::mem::take(&mut self.dirs[idx]);
         let mut entries: BTreeMap<String, TreeEntry> = dir.inherited.unwrap_or_default();
         for name in &dir.removed {
@@ -690,7 +895,7 @@ impl Fold<'_> {
                 }
                 Slot::Dir(child) => {
                     let meta = self.dirs[child].meta;
-                    let (hash, identity) = Box::pin(self.write_dir(child)).await?;
+                    let (hash, identity) = Box::pin(self.write_dir(child, depth + 1)).await?;
                     // A directory the upper holds carries the upper's mode and
                     // mtime — the merged view's own. One only reached on demand
                     // keeps whatever the parent recorded.
@@ -716,16 +921,35 @@ impl Fold<'_> {
         }
 
         let ordered: Vec<TreeEntry> = entries.into_values().collect();
+
+        // Every blob this directory NAMES goes into the flush inventory — the ones
+        // this fold stored *and* the ones it inherited from the parent snapshot
+        // unread. Not "the ones we just wrote": see [`FlushSet::blobs`] for why
+        // narrowing this to newly-written blobs publishes a cold tree with absent
+        // children and calls it a success.
+        for entry in &ordered {
+            if let TreeTarget::Blob(blob) = &entry.target {
+                self.blobs.insert(blob.clone());
+            }
+        }
+
         // The identity fold: a sub-tree contributes its IDENTITY, never its tree
         // hash, or a nested mtime would reach the root through a child and the
         // second digest would buy nothing (`scarab_storage::content_identity_of`).
+        //
+        // This loop is also where every INHERITED sub-tree reaches the flush inventory:
+        // `identity_of` records the sub-tree and everything below it while it is walking
+        // for the identity. Which is why the depth is threaded through the recursion at
+        // all — `depth + 1` is where an entry of *this* directory sits, and a wrong
+        // depth here breaks the flush's children-before-parents guarantee rather than
+        // any identity.
         let mut identity_entries = Vec::with_capacity(ordered.len());
         for entry in &ordered {
             let mut folded = entry.clone();
             if let TreeTarget::Tree(sub) = &entry.target {
                 let identity = match rebuilt.get(&entry.name) {
                     Some(identity) => identity.clone(),
-                    None => self.identity_of(sub).await?,
+                    None => self.identity_of(sub, depth + 1).await?,
                 };
                 folded.target = TreeTarget::Tree(identity);
             }
@@ -735,24 +959,102 @@ impl Fold<'_> {
 
         self.tally.trees_written += 1;
         let hash = self.cas.put_tree(ordered).await?;
+        // Recorded by depth rather than in write order. The write order is already
+        // children-before-parents, so a flat list would be *safe to walk
+        // sequentially* and nothing else; grouping by depth is what lets the flush
+        // send a whole level concurrently without ever having a parent in flight
+        // beside its own child.
+        if self.trees_by_depth.len() <= depth {
+            self.trees_by_depth.resize(depth + 1, Vec::new());
+        }
+        self.trees_by_depth[depth].push(hash.clone());
         Ok((hash, identity))
     }
 
-    /// The content identity of an **inherited** sub-tree, memoised.
+    /// The content identity of an **inherited** sub-tree, memoised — **and, as a side
+    /// effect, that sub-tree's whole tree closure into the flush inventory.**
     ///
     /// Costs one `tree_entries` per directory inside it, sequentially — the walk
     /// `scarab_storage::content_identity` documents as off the default path. It is
     /// on the path here because an untouched sub-tree is deliberately taken by
     /// hash, and an identity is not an address, so there is nothing to look it up
     /// by. See the module docs on the cost and where the fix would live.
-    async fn identity_of(&mut self, tree: &TreeHash) -> Result<TreeHash, SettleError> {
-        if let Some(known) = self.identities.get(tree) {
-            return Ok(known.clone());
+    ///
+    /// `depth` is the **sub-tree's own** distance from the new root (so the caller
+    /// passes its own depth plus one). It is not part of the identity question at all;
+    /// it is here because this walk is the only place the inherited sub-tree hashes
+    /// pass through, and [`FlushSet::tree_levels`] needs them at their true depth or
+    /// the flush can offer a parent before its own child. Every call records — a memo
+    /// *hit* records too, at the new occurrence's depth, which is the whole reason the
+    /// memo remembers levels and not just an identity.
+    async fn identity_of(
+        &mut self,
+        tree: &TreeHash,
+        depth: usize,
+    ) -> Result<TreeHash, SettleError> {
+        if let Some(known) = self.identities.get(tree).cloned() {
+            self.record_inherited(&known, depth);
+            return Ok(known.identity);
         }
         self.tally.identities_walked += 1;
-        let identity = content_identity(self.cas, tree).await?;
-        self.identities.insert(tree.clone(), identity.clone());
-        Ok(identity)
+        let walked = self.walk_inherited(tree).await?;
+        self.identities.insert(tree.clone(), walked.clone());
+        self.record_inherited(&walked, depth);
+        Ok(walked.identity)
+    }
+
+    /// One walk of an inherited sub-tree, yielding both answers it can give.
+    ///
+    /// This is `scarab_storage::content_identity` with the addresses kept instead of
+    /// discarded — deliberately a local copy of that recursion rather than a second
+    /// traversal beside it, because a second traversal would double the fold's one
+    /// super-linear cost to learn something the first one already read. The identity
+    /// arithmetic must stay in step with `content_identity`: a sub-tree contributes its
+    /// **identity**, never its tree hash, or a nested mtime would reach the root
+    /// through a child.
+    ///
+    /// No memo lookup inside the recursion, so the I/O is exactly what
+    /// `content_identity` did — this function is not the place to change that.
+    async fn walk_inherited(&self, tree: &TreeHash) -> Result<Inherited, SettleError> {
+        let entries = self.cas.tree_entries(tree).await?;
+        // Index 0 is this sub-tree itself: it is a tree the flush owes cold, exactly
+        // like the ones the fold wrote.
+        let mut levels: Vec<Vec<TreeHash>> = vec![vec![tree.clone()]];
+        let mut resolved = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let target = match &entry.target {
+                TreeTarget::Tree(sub) => {
+                    let below = Box::pin(self.walk_inherited(sub)).await?;
+                    // The child's relative depth 0 is this tree's relative depth 1.
+                    for (relative, level) in below.levels.into_iter().enumerate() {
+                        let at = relative + 1;
+                        if levels.len() <= at {
+                            levels.resize(at + 1, Vec::new());
+                        }
+                        levels[at].extend(level);
+                    }
+                    TreeTarget::Tree(below.identity)
+                }
+                blob => blob.clone(),
+            };
+            resolved.push(TreeEntry { target, ..entry });
+        }
+        Ok(Inherited {
+            identity: content_identity_of(&resolved)?,
+            levels,
+        })
+    }
+
+    /// Add one occurrence of an inherited sub-tree to the flush inventory, shifting its
+    /// relative levels to where they actually sit under the new root.
+    fn record_inherited(&mut self, walked: &Inherited, depth: usize) {
+        for (relative, level) in walked.levels.iter().enumerate() {
+            let at = depth + relative;
+            if self.trees_by_depth.len() <= at {
+                self.trees_by_depth.resize(at + 1, Vec::new());
+            }
+            self.trees_by_depth[at].extend(level.iter().cloned());
+        }
     }
 }
 
@@ -1186,6 +1488,180 @@ mod tests {
             settled.tally.identities_walked, 1,
             "`empty` was taken by hash, so its identity is the one thing still to be walked for \
              (an identity is not an address)"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_flush_inventory_names_every_reused_blob_and_orders_trees_deepest_first() {
+        // ADR-0064 part 1. The fold writes one tier; the caller archives afterwards, in
+        // one batch, and this is the inventory that batch is driven from. Two invariants
+        // and both fail silently in production:
+        //
+        //  * a REUSED blob must be in it. `keep.txt` and `sub/inner.txt` are the
+        //    parent's and are never written by this fold, but the trees this fold
+        //    publishes NAME them — and warm outlives cold (the GC deletes from cold
+        //    only; warm has no eviction), so "the parent was durable once" does not mean
+        //    cold holds it now. Leaving them out archives a tree with absent children
+        //    and reports success.
+        //  * the tree levels must be DEEPEST FIRST, or the flush offers a parent before
+        //    its own child and cold holds a reachable tree naming something absent.
+        let tmp = TempDir::new().expect("tempdir");
+        let (cas, parent) = parent_of(
+            tmp.path(),
+            &[
+                ("keep.txt", Entry::File("keep", 0o644, PARENT_MS)),
+                ("sub", Entry::Dir(0o755, PARENT_MS)),
+                ("sub/inner.txt", Entry::File("inner", 0o600, PARENT_MS)),
+                ("sub/deep", Entry::Dir(0o755, PARENT_MS)),
+                ("sub/deep/x.txt", Entry::File("before", 0o644, PARENT_MS)),
+            ],
+        )
+        .await;
+
+        let upper = tmp.path().join("upper");
+        build_tree(
+            &upper,
+            &[
+                ("sub", Entry::Dir(0o755, STEP_MS)),
+                ("sub/deep", Entry::Dir(0o755, STEP_MS)),
+                ("sub/deep/x.txt", Entry::File("after", 0o644, STEP_MS)),
+            ],
+        );
+        let change = change_set(&[
+            ("sub", "", EntryFacts::plain(EntryType::Dir)),
+            ("sub/deep", "sub", EntryFacts::plain(EntryType::Dir)),
+            ("sub/deep/x.txt", "sub/deep", EntryFacts::plain(EntryType::File)),
+        ]);
+
+        let settled = settle_change_set(&cas, &parent, &upper, &change)
+            .await
+            .expect("fold the change set");
+        assert_eq!(
+            settled.tally.blobs_stored, 1,
+            "sanity: exactly one blob was WRITTEN, so every other address below is a reuse"
+        );
+
+        // Addresses obtained by re-offering the bytes to the store rather than by
+        // hashing them here: a second copy of the digest in a test is a second thing to
+        // get wrong, and a content-addressed put is idempotent.
+        let written = cas.put_blob(b"after").await.expect("the written blob");
+        let reused_at_root = cas.put_blob(b"keep").await.expect("the root's reused blob");
+        let reused_in_sub = cas.put_blob(b"inner").await.expect("`sub`'s reused blob");
+        for (what, blob) in [
+            ("the blob this fold wrote", &written),
+            ("`keep.txt`, reused and named by the rebuilt ROOT", &reused_at_root),
+            ("`sub/inner.txt`, reused and named by the rebuilt `sub`", &reused_in_sub),
+        ] {
+            assert!(
+                settled.flush.blobs.contains(blob),
+                "the flush inventory must include {what}; it holds {} addresses",
+                settled.flush.blobs.len()
+            );
+        }
+
+        assert_eq!(
+            settled.flush.tree_count(),
+            3,
+            "the root, `sub` and `sub/deep` are rebuilt, and this fixture deliberately has no \
+             INHERITED sub-tree under a rebuilt one for them to be joined by (every directory on \
+             the path was touched): {:?}",
+            settled.flush.tree_levels
+        );
+        assert_eq!(
+            settled.flush.tree_levels.len(),
+            3,
+            "and they are three DIFFERENT levels, not one batch — a flat batch would let a \
+             parent go up beside its own child"
+        );
+        assert_eq!(
+            settled.flush.tree_levels.last(),
+            Some(&vec![settled.snapshot.root.clone()]),
+            "deepest first, so the ROOT is offered LAST. It is the one tree that must not exist \
+             in cold until everything it reaches does"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_flush_inventory_names_inherited_sub_trees_at_their_true_depth() {
+        // The finding this test exists for: a rebuilt tree names an UNTOUCHED sub-tree by
+        // its hash, and that hash used to be in neither half of the inventory. It has to
+        // be, for exactly the reason a reused blob has to be — the GC deletes from cold
+        // only and the warm tier has no eviction, so cold can have swept `top/`'s tree
+        // object while warm still serves it. A flush that omitted it would put a root in
+        // cold naming an absent child and report `durable: true`.
+        //
+        // And it has to be at its TRUE depth, not merely present: the flush offers levels
+        // deepest-first, so `top/mid` filed beside `top` — or `top` filed beside the root
+        // — is a parent offered before its own child, which is the one state the ordering
+        // exists to prevent.
+        let tmp = TempDir::new().expect("tempdir");
+        let (cas, parent) = parent_of(
+            tmp.path(),
+            &[
+                ("edit.txt", Entry::File("before", 0o644, PARENT_MS)),
+                ("top", Entry::Dir(0o755, PARENT_MS)),
+                ("top/mid", Entry::Dir(0o755, PARENT_MS)),
+                ("top/mid/leaf.txt", Entry::File("leaf", 0o644, PARENT_MS)),
+            ],
+        )
+        .await;
+
+        // One file at the ROOT, so the root is the only directory rebuilt and `top/` is
+        // reached by hash — which is what makes the inherited sub-trees the subject.
+        let upper = tmp.path().join("upper");
+        build_tree(&upper, &[("edit.txt", Entry::File("after", 0o644, STEP_MS))]);
+        let change = change_set(&[("edit.txt", "", EntryFacts::plain(EntryType::File))]);
+
+        let settled = settle_change_set(&cas, &parent, &upper, &change)
+            .await
+            .expect("fold the change set");
+        assert_eq!(
+            settled.tally.trees_written, 1,
+            "sanity: the root is the ONLY tree this fold wrote, so every other tree below is one \
+             it inherited by hash"
+        );
+
+        // The two inherited addresses, read out of the parent snapshot rather than
+        // recomputed here — the fold and the assertion must agree about what `top` *is*,
+        // and the parent snapshot is the only authority on that.
+        fn tree_named(entries: Vec<TreeEntry>, name: &str) -> TreeHash {
+            entries
+                .into_iter()
+                .find(|e| e.name == name)
+                .and_then(|e| match e.target {
+                    TreeTarget::Tree(hash) => Some(hash),
+                    TreeTarget::Blob(_) => None,
+                })
+                .unwrap_or_else(|| panic!("the fixture has a directory `{name}`"))
+        }
+        let top = tree_named(
+            cas.tree_entries(&parent.root).await.expect("the parent root"),
+            "top",
+        );
+        let mid = tree_named(cas.tree_entries(&top).await.expect("`top`"), "mid");
+
+        let levels = &settled.flush.tree_levels;
+        assert_eq!(
+            levels.len(),
+            3,
+            "three depths are reachable through the rebuilt root — itself, `top`, `top/mid` — and \
+             a one-level inventory means the inherited sub-trees were dropped: {levels:?}"
+        );
+        assert_eq!(
+            levels[2],
+            vec![settled.snapshot.root.clone()],
+            "deepest-first, so the rebuilt root (depth 0) is the LAST level"
+        );
+        assert_eq!(
+            levels[1],
+            vec![top.clone()],
+            "`top` is inherited and named by the rebuilt root, so it belongs at depth 1 — offered \
+             before the root and after its own child"
+        );
+        assert_eq!(
+            levels[0],
+            vec![mid.clone()],
+            "`top/mid` is inherited two levels down, so it is offered FIRST of all trees"
         );
     }
 
