@@ -54,14 +54,48 @@ enter the database.
 the Depot; replay reads from it. The seam is clean because the tailing process and the storing
 process were already different concerns in one binary.
 
-**5. Logs are space-bounded and evictable, and eviction is loud.** They sit on a bounded volume and
-are evicted under pressure like anything else there. **An Attempt whose logs were evicted must say
-so** — "logs expired" in the UI and in the API, never an empty pane.
+**5. Logs are space-bounded and evictable, and absence is loud.** They sit on a bounded volume and
+are evicted under pressure like anything else there. **An Attempt whose log bytes are gone must say
+so** — "logs are no longer available" in the UI and in the API, never an empty pane.
 [0027](0027-restart-semantics.md)'s rule that smart never means mysterious applies to absence as
 much as to invalidation: a visible gap in the record is acceptable, a blank screen that looks like a
 Step produced no output is not.
 
-**6. External log systems are an additional sink, never the system of record.** Loki,
+**The index asserts, the volume decides, and disagreement is the finding.** The read path has three
+branches, and the third one is the entire mechanism:
+
+| index | bytes | what the reader is told |
+|---|---|---|
+| no chunks | — | the Step genuinely printed nothing — an empty pane, truthfully |
+| chunks | present | serve them |
+| chunks | **absent** | "logs are no longer available" |
+
+**The eviction record explains the third branch; it must never be what triggers it.** Consulting the
+sweeper's record first and streaming whatever is on disk when no row is found inverts this, and it
+fails precisely where it matters: a volume that was lost or reprovisioned was never evicted by
+anybody, so there is no row to find, and the reader gets the blank pane this decision exists to
+prevent. Nor can that case be caught by detecting the loss — **a volume's loss is not observable as
+an event.** A fresh empty volume is indistinguishable from one that never held data; there is no "I
+was lost" bit to read. Absence is therefore the only signal available, which is why it has to be the
+authoritative one. The sweeper's record then turns *"gone"* into *"expired under policy on 3 August"*
+for the cases it knows about — strictly a better message, never a precondition for sending one.
+
+The inverse has shipped in this repo twice already — `redirect_dir`, and the copy rung's `deleted`
+set — both of the form *"the record we consult is empty, therefore nothing happened."* Naming the
+shape here is cheaper than finding it a third time.
+
+**6. The Depot says at boot whether its volume is the one the index describes.** A marker written on
+first init and recorded alongside the index; on boot, a missing or mismatched marker means the volume
+is new. Without it, an operator's only evidence is a trickle of individually unremarkable per-Run
+absences — each correctly reported, none of them saying *the storage under this Depot is not the
+storage this database describes*. This is one loud line at the moment it becomes true, and
+deliberately **not** a claim on any Attempt's record: per-Attempt durability is what tiering carries
+([0064](0064-durability-tiering-and-the-write-path.md) part 5) for the classes that can be
+re-derived. Logs do not carry it. The operator configures a durable sink or does not, and a log that
+is gone is gone for wanted and unwanted reasons alike — a distinction with no available action behind
+it, so the record does not spend a column on it.
+
+**7. External log systems are an additional sink, never the system of record.** Loki,
 VictoriaLogs or an object store may receive a copy for operators who want logs in their existing
 stack. None of them becomes the thing Scarab reads back.
 [CONTEXT.md](../../CONTEXT.md) §4.3 states that *"each Attempt owns its evidence — logs, Results,
@@ -71,18 +105,18 @@ someone else's retention policy, with Scarab's durable record pointing at data i
 nor can verify. That is the same defect as declaring success before durability, and it is refused
 for the same reason.
 
-**7. An un-shipped log is pinned against eviction — when a sink exists.** Where a durable sink is
+**8. An un-shipped log is pinned against eviction — when a sink exists.** Where a durable sink is
 configured, a log chunk that has not yet been acknowledged by at least one sink is not evictable.
 This is the mechanism first proposed for Workspace Snapshots and **rejected there**, because a
 snapshot is re-derivable and a miss is recoverable. For logs it is load-bearing, because there is no
 recompute path. The pin is bounded by the sink keeping up; if it cannot, eviction resumes and says
 so rather than filling the volume — see Consequences.
 
-**8. Logs get their own retention class with a long TTL**, swept as their own class by
+**9. Logs get their own retention class with a long TTL**, swept as their own class by
 [0050](0050-retention-and-gc.md)'s sweeper, as Artifacts already are. They are the cheapest class per
 byte and the one users reach for longest after a Run.
 
-**9. The workspace service is renamed the Data Depot.** It now holds the CAS, Snapshot Farms,
+**10. The workspace service is renamed the Data Depot.** It now holds the CAS, Snapshot Farms,
 Workspace Exports and — with this ADR — the log namespace, with Cache to come
 ([0065](0065-retention-cache-and-rederivation.md)). "Workspace service" named it after **one of its
 tenants**, and the name broke the moment a second kind of data arrived. `warm store` was considered
@@ -124,6 +158,18 @@ of the existing one — a decision for then, not a rename now.
 - **Pin un-shipped logs forever, and backpressure Runs when the volume fills.** Never loses a log.
   Rejected: it converts a storage-configuration mistake into an outage, and trading "CI stops" for
   "logs kept" is the wrong priority. Eviction resumes and says so instead.
+- **Stamp per-Attempt log durability — "were this Attempt's logs ever copied to a sink?"** — the way
+  [0064](0064-durability-tiering-and-the-write-path.md) part 5 stamps snapshot durability, and on the
+  same argument: an operator who adds a sink next month leaves earlier and later Attempts with
+  different guarantees and identical records. **Rejected**, and the asymmetry with 0064 is
+  deliberate. 0064 stamps a class that can be *re-derived*, where knowing "this one was never
+  archived" tells a reader which Runs are worth re-running; for logs there is no recompute path, so
+  the stamp distinguishes two states with the same available action — none. The engine would also be
+  re-litigating a choice it delegated: a warm-only deployment is supported precisely because
+  durability is the operator's cost decision. Part 5's disclosure duty is met by absence being loud
+  at read time and by part 6 being loud at boot. Note the ingredient is nonetheless *present* — part
+  8's pin already requires per-chunk sink-acknowledgement state — so this is a decision about what to
+  put in the record, not about what is affordable.
 
 ## Consequences
 
@@ -136,7 +182,12 @@ of the existing one — a decision for then, not a rename now.
 - **Logs are the one class where eviction is genuine loss.** Everywhere else in the data plane
   eviction is a latency event. This is the asymmetry that earns them the pin and the long TTL.
 - **A deployment with no durable sink can lose an Attempt's logs**, and must say so in the UI and the
-  API rather than showing an empty pane.
+  API rather than showing an empty pane. It says so **without knowing why** — the read path reports
+  what it finds, and only the sweeper's own record can add a reason.
+- **The log read path now depends on a fact it cannot cache.** "Are the bytes there?" has to be
+  answered against the volume on the read, not inferred from the index or from a sweep record. That is
+  a cost per replay — one stat, on a path that is already about to open the file — and it is the price
+  of the third branch being correct for losses nobody recorded.
 - **Two stores on one volume** means the Depot's space accounting covers both. The warm-size gauge
   already walks the volume, so it counts logs the moment they arrive there — its help text needs to
   stop implying it measures only the CAS (git-bug `1a9df08`, which already covers the Farm half of
