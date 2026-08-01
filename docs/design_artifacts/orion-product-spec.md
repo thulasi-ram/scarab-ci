@@ -588,7 +588,9 @@ The owner's concern is correct: this spec as written is multi-year. It is a
   transcript-as-Artifact, CI-as-judge, supersede semantics, Briefing v0 (a
   JSON assembled from data already stored).
 - **The real bet (genuinely new):** the Orion service (a table + a driver
-  loop + the Docket), the metering-proxy sidecar binary, the budget ledger.
+  loop + the Docket) and the budget ledger. ~~The metering-proxy sidecar
+  binary~~ — superseded by §15.6: metering is offloaded to an LLM gateway;
+  Orion mints identities and keeps the ledger.
 - **Deferred until a named user pulls:** Toolkit *UI* (gitops files first —
   the PlacementProfile pattern needs no UI to exist), the Roster (a config
   list first), fleet policies, standing Mandates, A2A, eBPF, crew-in-a-box
@@ -629,6 +631,33 @@ work doesn't relitigate them silently:
   a sharp answer at all times (currently §14).
 - **Surface-area skepticism is standing policy:** the falsification question
   (§15.1) should be re-asked at every scope expansion.
+
+### 15.6 The offload doctrine (owner, 2026-08-01)
+
+The owner pushed the audit one level further: *"agents can run inside and
+have observability hooked, costs manage via LiteLLM — why do we even need to
+support those? The only thing we have to make easy is: run an orchestrator
+at the top and have steps bubble up the right results/context."* Correct,
+and adopted. **Offload the muscle; keep the identity and the ledger.**
+
+| Concern | Offloaded to | What Orion keeps (irreducible) |
+|---|---|---|
+| Budget *enforcement* | an LLM gateway (LiteLLM-class: hard per-key caps, verified shipping) | **mint a gateway key per Turn from the fence** (`m42-t7`), cap it at `min(turn cap, ledger remaining)`, read spend back. The cross-turn **ledger** and the refusal to launch Turn N+1 are Orion's — no gateway can do them. Unbypassability comes from deny-all NetworkPolicy *except the gateway*, which is ours and cheap — not from owning a proxy. |
+| Interior observability | OTel — agents emit their own traces; we inject `TRACEPARENT` + endpoint env | **evidence is not telemetry**: verdict, Results, transcript, changeset stay on Scarab rails (audit must not depend on a span being ingested — Part 1's doctrine). |
+| Tools | v1: the agent image brings its own MCP config; Toolkit *sidecar mechanics* defer with the rest of §12 | scoped secrets + egress NetworkPolicy (both already exist). Per-tool-call audit arrives with Toolkits, when pulled. |
+
+This supersedes §4.4's "metering happens at the tool/model proxy sidecar" —
+the *model* survives (enforcement at a boundary the agent cannot bypass,
+identity by construction), the *implementation* is now someone else's
+software holding an identity we minted. The verified market gap (§9) is
+unchanged and clarified: the gap was never the gateway — it is the **binding
+of gateway enforcement to a first-class run identity with a durable
+cross-turn ledger**. That binding is the product.
+
+Restated core after this cut: **a durable orchestrator at the top (launch,
+verdict, park/wake, ledger, refuse) + the bubble-up contract (Briefing down;
+verdict/Results/transcript/changeset up) + identity minting + the Docket.**
+Everything else is either already-built Scarab or an integration.
 
 ## 16. Open product questions
 
