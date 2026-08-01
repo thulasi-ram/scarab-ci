@@ -143,20 +143,34 @@ fn tier_var(name: &str) -> String {
     }
 }
 
-/// The ADR-0061 workspace service this tier drives, and the `Cas` that MUST be
-/// the same store.
+/// The ADR-0061 workspace service this tier drives, wired with the SAME
+/// topology `main.rs` gives the control plane — because since ADR-0064 the
+/// drain's read and write halves are DIFFERENT handles, and a fixture that
+/// wires only one of them proves the wrong thing.
 ///
-/// # Why a fixture, and why it is one object
+/// # Why a fixture, and why it mirrors `main.rs`
 ///
 /// Since s3-feed there is no control-plane feed: a Step with `needs:` is
 /// provisioned by an init container that dials the workspace service. So a live
 /// test of the workspace flow needs the two halves to agree about *where the
 /// content is*, and the cheap way to guarantee that is to make them literally the
-/// same endpoint:
+/// same endpoint. Concretely, mirroring `main.rs`:
 ///
-/// - the executor's `Cas` (used by the **drain**, and by the test itself) is a
-///   [`WorkspaceClient`], which implements `Cas` precisely so a control plane can
-///   be pointed at the service with no call-site change;
+/// - [`cas`](WorkspaceFixture::cas) is the tiered READ handle — warm = the
+///   Depot over HTTP ([`WorkspaceClient`] behind `Cas`), cold = the object
+///   store, `fall_through_on_warm_error` — what `main.rs` hands to
+///   `with_workspace_cas`;
+/// - [`depot`](WorkspaceFixture::depot) is the SAME client held concretely —
+///   the drain's warm-first WRITE half plus the awaited `flush`, what
+///   `main.rs` hands to `with_workspace_depot`. **Wiring `cas` without this
+///   re-creates a bug this fixture shipped with**: `drive_workspace` then
+///   takes its "the target IS the durable store, nothing to flush" branch
+///   while the Depot's PUTs are warm-only (ADR-0064), so every live drain
+///   landed in an evictable cache and nothing ever reached cold;
+/// - [`cold`](WorkspaceFixture::cold) is a COLD-ONLY handle on the store the
+///   Depot archives into — durability assertions read through THIS, because a
+///   readback through `cas` (or the client) is satisfied by the warm cache and
+///   proves presence, not durability;
 /// - the Pod's fetcher dials the same service.
 ///
 /// These tests used to hand the executor an `S3Storage::local` on a **tempdir of
@@ -185,11 +199,62 @@ fn tier_var(name: &str) -> String {
 /// the panic is keyed on the SAME condition as `opted_in` rather than on a second
 /// opt-out var, because a second var is how this failed the first time.
 struct WorkspaceFixture {
-    /// The service, behind `Cas`. What the executor drains into and what the test
-    /// reads back.
+    /// The tiered READ handle (warm = the service, cold = the object store,
+    /// fall-through) — `with_workspace_cas`, and the test's ordinary readback.
     cas: std::sync::Arc<dyn scarab_storage::Cas>,
+    /// The Depot client, concrete — `with_workspace_depot`: the drain's
+    /// warm-first ingest and the awaited archival `flush`.
+    depot: std::sync::Arc<scarab_workspace_client::WorkspaceClient>,
+    /// COLD ONLY — no warm tier, no fall-through. For durability assertions:
+    /// what this handle cannot read, no flush made durable.
+    cold: std::sync::Arc<dyn scarab_storage::Cas>,
     /// What the Step Pod's fetcher is told.
     fetch: scarab_executor_k8s::WorkspaceFetch,
+}
+
+/// A direct handle on the COLD store the tier's Depot archives into, resolved
+/// exactly as the Depot resolves its own (`config.rs`): `SCARAB_S3_BUCKET` set
+/// → S3/MinIO, else the local object dir. Both runners line up by
+/// construction: `just kube-tests` sources `deploy/local-proc/.env`, so the
+/// test process sees the same `SCARAB_S3_*` MinIO the service was started
+/// with; the CI kind workflow runs the service with the LocalDir default,
+/// whose `./.scarab/objects` is relative to the REPO ROOT (the service's cwd
+/// there) — resolved here from `CARGO_MANIFEST_DIR`, because the test binary's
+/// own cwd is this crate's directory, not the root.
+///
+/// Only ever called once the tier is opted in, so a partial S3 config is a
+/// wiring bug and panics ([`tier_var`]) — never a silent skip.
+fn depot_cold_store() -> std::sync::Arc<dyn scarab_storage::Cas> {
+    match std::env::var("SCARAB_S3_BUCKET").ok().filter(|v| !v.is_empty()) {
+        Some(bucket) => {
+            let endpoint = std::env::var("SCARAB_S3_ENDPOINT").unwrap_or_default();
+            let region =
+                std::env::var("SCARAB_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+            let access_key = tier_var("SCARAB_S3_ACCESS_KEY");
+            let secret_key = tier_var("SCARAB_S3_SECRET_KEY");
+            std::sync::Arc::new(
+                scarab_storage_s3::S3Storage::s3(
+                    bucket,
+                    &endpoint,
+                    &region,
+                    &access_key,
+                    &secret_key,
+                )
+                .expect("cold store handle (S3)"),
+            )
+        }
+        None => {
+            let dir = std::env::var("SCARAB_OBJECT_DIR")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| {
+                    format!("{}/../../.scarab/objects", env!("CARGO_MANIFEST_DIR"))
+                });
+            std::sync::Arc::new(
+                scarab_storage_s3::S3Storage::local(&dir).expect("cold store handle (local dir)"),
+            )
+        }
+    }
 }
 
 fn workspace_fixture() -> Option<WorkspaceFixture> {
@@ -245,8 +310,19 @@ fn workspace_fixture() -> Option<WorkspaceFixture> {
         secret.as_bytes(),
         &workspace_token::browse_claims(now + 3_600),
     );
+    // ONE client, two jobs — exactly `main.rs`: as `Arc<dyn Cas>` it is the
+    // warm tier of the tiered read handle; held concretely it is the drain
+    // handle, because the drain needs `flush`.
+    let depot = std::sync::Arc::new(scarab_workspace_client::WorkspaceClient::new(&url, token));
+    let cold = depot_cold_store();
+    let cas: std::sync::Arc<dyn scarab_storage::Cas> = std::sync::Arc::new(
+        scarab_storage::tiered::TieredCas::new(depot.clone(), cold.clone())
+            .fall_through_on_warm_error(),
+    );
     Some(WorkspaceFixture {
-        cas: std::sync::Arc::new(scarab_workspace_client::WorkspaceClient::new(&url, token)),
+        cas,
+        depot,
+        cold,
         fetch: scarab_executor_k8s::WorkspaceFetch {
             url: pod_url,
             token_secret: secret.into_bytes(),
@@ -495,6 +571,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
     let client = kube::Client::try_default().await.expect("kube client");
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
         .with_workspace_service(ws.fetch.clone());
 
     let step_run = |id: &str, attempt: &str| StepRun {
@@ -667,14 +744,21 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
 ///
 /// The unit tests pin the *rule* (`settled_state` / `workspace_snapshot_lost`)
 /// against Pod fixtures. This pins the *ordering* against the real thing, which is
-/// what the rule is about: `drive_workspace` ingests, patches
-/// `scarab.io/workspace-root`, and only then releases the egress barrier, so the
-/// first `Succeeded` a caller can see is already backed by content the store
-/// holds. A green verdict whose snapshot is not yet (or never) durable is a claim
-/// the durable record cannot back (CONTEXT.md §2).
+/// what the rule is about: `drive_workspace` ingests warm-first, awaits the
+/// archival `flush` (ADR-0064), patches `scarab.io/workspace-root`, and only then
+/// releases the egress barrier, so the first `Succeeded` a caller can see is
+/// already backed by content COLD holds. A green verdict whose snapshot is not
+/// yet (or never) durable is a claim the durable record cannot back
+/// (CONTEXT.md §2).
 ///
 /// Deliberately asserted on the FIRST terminal observation, not after a settle
-/// loop: polling until the root appears would test nothing at all.
+/// loop: polling until the root appears would test nothing at all. And
+/// deliberately read back through a **cold-only** handle, not the tiered one:
+/// since ADR-0064 the drain's PUTs land in the Depot's warm cache, so a tiered
+/// (or client) readback is satisfied by warm and proves presence, not
+/// durability. Mutations this kills: reorder the flush after the annotation
+/// patch, or drop the fixture's `with_workspace_depot` wiring — either way the
+/// closure is not in cold at the instant of green and the cold-only walk fails.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_green() {
@@ -684,6 +768,7 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
     let client = kube::Client::try_default().await.expect("kube client");
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
         .with_workspace_service(ws.fetch.clone());
 
     let step = StepRun {
@@ -742,16 +827,38 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
         .expect("output")
         .expect("Succeeded must carry a workspace snapshot root");
 
-    // 2. And the root is really THERE — in the store, not merely named. This is the
-    //    difference between "we wrote an annotation" and "the evidence is safe".
-    let entries = ws
-        .cas
-        .tree_entries(&scarab_storage::TreeHash(root.clone()))
-        .await
-        .expect("the snapshot named by a green Attempt must be readable");
+    // 2. And the root is really THERE — in the DURABLE tier, not merely named
+    //    and not merely sitting in the Depot's warm cache. Walk the whole
+    //    published closure through the COLD-ONLY handle (no warm, no
+    //    fall-through): every tree must parse and every blob must come back,
+    //    or the flush that licensed this `Succeeded` did not do its job.
+    let mut frontier = vec![scarab_storage::TreeHash(root.clone())];
+    let mut saw_dist = false;
+    let mut blobs_in_cold = 0u32;
+    while let Some(tree) = frontier.pop() {
+        let entries = ws.cold.tree_entries(&tree).await.expect(
+            "a tree in a green Attempt's published closure must be in COLD at the \
+             instant Succeeded is first observed (ADR-0061 part 4 / ADR-0064)",
+        );
+        for entry in entries {
+            saw_dist |= entry.name == "dist";
+            match entry.target {
+                scarab_storage::TreeTarget::Tree(t) => frontier.push(t),
+                scarab_storage::TreeTarget::Blob(b) => {
+                    ws.cold.get_blob(&b).await.expect(
+                        "a blob in a green Attempt's published closure must be in COLD \
+                         at the instant Succeeded is first observed",
+                    );
+                    blobs_in_cold += 1;
+                }
+            }
+        }
+    }
+    assert!(saw_dist, "the snapshot must contain what the step wrote");
     assert!(
-        entries.iter().any(|e| e.name == "dist"),
-        "the snapshot must contain what the step wrote: {entries:?}"
+        blobs_in_cold > 0,
+        "the closure walk must have proven at least one blob durable — an empty \
+         walk would pass over a snapshot that lost its content"
     );
 
     exec.cancel(&h).await.expect("cleanup");
@@ -780,6 +887,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
     let client = kube::Client::try_default().await.expect("kube client");
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
         .with_workspace_service(ws.fetch.clone());
 
     let step = StepRun {
@@ -943,6 +1051,7 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
     // anything and the assertion below would pass for the wrong reason.
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
         .with_workspace_service(ws.fetch.clone());
 
     let step_run = |id: &str| StepRun {
@@ -1079,6 +1188,7 @@ async fn clone_step_produces_a_source_workspace() {
     let client = kube::Client::try_default().await.expect("kube client");
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(cas.clone())
+        .with_workspace_depot(ws.depot.clone())
         .with_workspace_service(ws.fetch.clone())
         .with_clone_image(&clone_image);
 
@@ -1245,6 +1355,7 @@ async fn clone_depth_full_exposes_history() {
     let client = kube::Client::try_default().await.expect("kube client");
     let exec = K8sExecutor::with_client(ns, client)
         .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
         .with_workspace_service(ws.fetch.clone())
         .with_clone_image(&clone_image);
 
@@ -1465,20 +1576,25 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
     let run_id = unique_run("run-build");
 
     let client = kube::Client::try_default().await.expect("kube client");
-    let cas = ws.cas.clone();
     let exec = K8sExecutor::with_client(ns, client)
-        .with_workspace_cas(cas.clone())
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
         .with_workspace_service(ws.fetch.clone());
 
     // The build context: a trivial Dockerfile, ingested as the upstream
-    // (checkout) workspace — through the SERVICE, so the fetcher can read it back.
+    // (checkout) workspace — through the SERVICE, so the fetcher can read it
+    // back. Through the DEPOT CLIENT, not the tiered handle: `TieredCas::ingest`
+    // refuses by design (ADR-0064 — drains write warm, then flush), and warm is
+    // all a fetcher's read needs.
+    use scarab_storage::Cas as _;
     let ctx = tempfile::tempdir().expect("context dir");
     std::fs::write(
         ctx.path().join("Dockerfile"),
         "FROM busybox\nRUN echo scarab-built > /built.txt\n",
     )
     .unwrap();
-    let root = cas
+    let root = ws
+        .depot
         .ingest(ctx.path().to_str().unwrap())
         .await
         .expect("ingest context")

@@ -194,8 +194,11 @@ pub struct CasSweepReport {
     /// Unmarked cold objects deleted.
     pub swept: u32,
     /// Marked objects ABSENT from the cold listing, alarmed at error level:
-    /// cold is silently missing reachable data and only the warm tier is
-    /// keeping reads (and the mark walk itself) green.
+    /// cold is silently missing reachable data. A TREE here is still held by
+    /// warm (the mark walk read every tree through the tiered handle); a BLOB
+    /// is only known *referenced* — the walk never reads blob bodies — so it
+    /// may be missing from BOTH tiers. The alarm probes warm for logged blob
+    /// entries and says which case it found.
     pub residue: Vec<ColdResidue>,
     /// Residue whose first-marking root is younger than the grace window: an
     /// ADR-0064 cold flush may still be in flight, so it is counted and
@@ -223,7 +226,10 @@ const RESIDUE_LOG_CAP: usize = 50;
 ///   the TIERED handle, so an object the warm tier still holds marks clean
 ///   even when cold silently lost it. The residue diff `marked − cold
 ///   listing` (the sweep already lists all of cold) is exactly that hole;
-///   each entry is alarmed with its address and first-marking root.
+///   each entry is alarmed with its address and first-marking root — and, for
+///   blobs (whose bodies the walk never reads), a bounded warm probe decides
+///   whether the alarm says "warm still holds it" or "gone from both tiers",
+///   so the operator is not sent to recover from a tier that has nothing.
 ///   Detection only — the objects stay marked (so the sweep cannot delete
 ///   them) and re-upload-from-warm is a filed follow-up, not this slice.
 pub async fn sweep_cas(
@@ -402,13 +408,42 @@ pub async fn sweep_cas(
     residue.sort_by(|a, b| a.key.cmp(&b.key));
     suppressed_residue.sort_by(|a, b| a.key.cmp(&b.key));
     for r in residue.iter().take(RESIDUE_LOG_CAP) {
-        tracing::error!(
-            object = %r.key,
-            root = %r.root,
-            "cas gc: reachable object MISSING from cold storage (torn cold tier) — only \
-             the warm tier still holds it, and it becomes unrecoverable if that volume \
-             dies; re-upload from warm is a filed follow-up, not automated here"
-        );
+        // Say WHERE the object still is, not just where it is not. Trees are
+        // warm-confirmed by construction — the mark walk read every tree
+        // through the tiered handle to get here — but blob keys were marked
+        // off their parent's entries without ever reading bodies, so a blob in
+        // this list may be missing from BOTH tiers, and an operator sent to
+        // "re-upload from warm" would find nothing there. Probe warm before
+        // alarming (bounded: this loop is already capped at RESIDUE_LOG_CAP).
+        // The probe goes through the tiered handle — a hit is answered by warm
+        // without touching cold, and cold cannot answer for a key its own
+        // listing just said is absent.
+        let warm_holds_it = match r.key.strip_prefix("blobs/") {
+            Some(hash) => cas
+                .get_blob(&scarab_storage::BlobHash(hash.to_string()))
+                .await
+                .is_ok(),
+            None => true, // trees/<h>: the walk itself just read it
+        };
+        if warm_holds_it {
+            tracing::error!(
+                object = %r.key,
+                root = %r.root,
+                "cas gc: reachable object MISSING from cold storage (torn cold tier) — \
+                 the warm tier still holds it, and it becomes unrecoverable if that \
+                 volume dies; re-upload from warm is a filed follow-up, not automated \
+                 here"
+            );
+        } else {
+            tracing::error!(
+                object = %r.key,
+                root = %r.root,
+                "cas gc: reachable blob MISSING from cold storage and NOT readable \
+                 from warm either (evicted, lost, or the warm tier is unreachable) — \
+                 if warm truly lacks it this is data loss with nothing left to \
+                 re-upload, and snapshots under this root cannot fully materialize"
+            );
+        }
     }
     if residue.len() > RESIDUE_LOG_CAP {
         tracing::error!(

@@ -317,12 +317,15 @@ impl WorkspaceClient {
 /// Three outcomes because the Depot's refusals split on exactly one axis,
 /// whether re-driving can help:
 ///
-/// - [`Durable`](FlushOutcome::Durable) — everything reachable from the root is
-///   in cold; the Attempt may be reported `Succeeded`;
-/// - [`Retry`](FlushOutcome::Retry) — transport failures, 5xx, and anything
-///   unrecognised. The Depot answers `503 retryable: true` even for a warm miss,
-///   because the caller's re-driven drain re-uploads what warm lost before it
-///   retries the flush;
+/// - [`Durable`](FlushOutcome::Durable) — a 2xx whose body affirms
+///   `durable: true`: everything reachable from the root is in cold; the
+///   Attempt may be reported `Succeeded`;
+/// - [`Retry`](FlushOutcome::Retry) — transport failures, 5xx, anything
+///   unrecognised — **including a 2xx whose body says `durable: false` or does
+///   not parse**, because durability is read off the response, never assumed
+///   from the status line. The Depot answers `503 retryable: true` even for a
+///   warm miss, because the caller's re-driven drain re-uploads what warm lost
+///   before it retries the flush;
 /// - [`Fatal`](FlushOutcome::Fatal) — the Depot's `422`: the tiers disagree on
 ///   how content is addressed, and no retry converges that. Fail the Attempt
 ///   promptly, with this detail as the cause.
@@ -337,7 +340,29 @@ pub enum FlushOutcome {
 /// [`WorkspaceClient::flush`] beyond transport — is testable without a server.
 fn flush_outcome(status: reqwest::StatusCode, body: &str) -> FlushOutcome {
     if status.is_success() {
-        return FlushOutcome::Durable;
+        // A 2xx alone is NOT the durability claim — the body's `durable` field
+        // is. Today's Depot never answers 200 with anything but `durable: true`
+        // (`FlushTally.durable` documents why: no partial success exists), but
+        // this outcome licenses `Succeeded`, so it must be read off the
+        // response and not assumed from the status line: a future server that
+        // answers `durable: false` (git-bug 981fc6b sketches one — warm-only
+        // deployments), or a proxy's masked 200 with some other body, must
+        // come back `Retry`, never a green Attempt cold cannot back.
+        return match serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("durable").and_then(|d| d.as_bool()))
+        {
+            Some(true) => FlushOutcome::Durable,
+            Some(false) => FlushOutcome::Retry(
+                "workspace service answered success with `durable: false` — the flush \
+                 did not archive the closure to cold"
+                    .into(),
+            ),
+            None => FlushOutcome::Retry(format!(
+                "workspace service answered {status} without a parseable `durable` \
+                 field — refusing to treat the status line alone as durability: {body}"
+            )),
+        };
     }
     // The refusal body is `{"retryable": …, "detail": …}`; the detail is what an
     // operator reads off the failed Attempt. Anything else (a proxy's error
@@ -943,13 +968,16 @@ mod tests {
         );
     }
 
-    /// The flush contract's client half: 2xx → `Durable`, `422` alone → `Fatal`,
-    /// everything else → `Retry` (ADR-0064).
+    /// The flush contract's client half: 2xx + `durable: true` → `Durable`,
+    /// `422` alone → `Fatal`, everything else → `Retry` (ADR-0064).
     ///
     /// Mutations killed: swap the 422/503 arms — a canonicalisation fork would be
     /// re-driven forever, or a Depot blip (or wiped warm tier, which the re-driven
     /// drain heals) would permanently fail an Attempt; drop the `detail`
-    /// extraction — the failed Attempt's cause degrades to a bare status line.
+    /// extraction — the failed Attempt's cause degrades to a bare status line;
+    /// drop the success-body `durable` check (any 2xx → `Durable`) — the
+    /// 2xx+`durable: false` and 2xx+garbage-body cases below would license
+    /// `Succeeded` on a flush that archived nothing.
     #[test]
     fn a_flush_response_is_classified_by_whether_retrying_can_help() {
         assert_eq!(
@@ -982,6 +1010,30 @@ mod tests {
                 "the fallback detail must carry the status: {detail}"
             ),
             other => panic!("an unrecognised failure must be retried, got {other:?}"),
+        }
+        // A 2xx is not itself durability: a server that ANSWERS `durable: false`
+        // must not license `Succeeded`. Today's Depot never does (no partial
+        // success), which is exactly why this is pinned — the day one exists
+        // (warm-only deployments, git-bug 981fc6b), the caller re-drives instead
+        // of recording a green Attempt cold cannot back.
+        match flush_outcome(
+            reqwest::StatusCode::OK,
+            r#"{"durable":false,"blobs":3,"blobs_uploaded":0,"trees":2}"#,
+        ) {
+            FlushOutcome::Retry(detail) => assert!(
+                detail.contains("durable"),
+                "the detail must name the condition: {detail}"
+            ),
+            other => panic!("2xx + durable:false must NOT be Durable, got {other:?}"),
+        }
+        // Same for a 2xx whose body is not the tally shape at all (a proxy's
+        // masked 200): durability is read off the body, never off the status.
+        match flush_outcome(reqwest::StatusCode::OK, "<html>ok</html>") {
+            FlushOutcome::Retry(detail) => assert!(
+                detail.contains("durable") && detail.contains("200"),
+                "the detail must name the missing field and the status: {detail}"
+            ),
+            other => panic!("2xx + unparseable body must NOT be Durable, got {other:?}"),
         }
     }
 

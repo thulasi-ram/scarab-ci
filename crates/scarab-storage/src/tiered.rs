@@ -33,34 +33,35 @@
 //!
 //! **The control plane's instance is a different story, and it is worth being
 //! precise about rather than lumping it in with "whatever else still uses
-//! it": its `ingest` leg is the live write path for every non-Export Step,
-//! today.** `drive_workspace(cas: &dyn Cas)` calls `.ingest(...)` at
-//! `crates/scarab-executor-k8s/src/lib.rs:671`; the `cas` it receives is this
-//! module's `TieredCas`, wired in via `with_workspace_cas`
-//! (`crates/scarab-executor-k8s/src/lib.rs:217`) from
-//! `crates/scarab-server/src/main.rs:216`. That call is trait-object dispatch
-//! — `dyn Cas` — which is why a textual grep for `TieredCas::ingest` turns up
-//! nothing: the caller is real, it is just spelled `cas.ingest(...)` at the
-//! call site, not `TieredCas::ingest(...)`. Every non-Export Step still goes
-//! through this method and still pays both walks and the per-blob cold round
-//! trip documented below — that is not legacy behaviour and it is not
-//! test-only.
+//! it": since ADR-0064's control-plane half (2026-08-01) it is a READ-side
+//! pairing, not a write path.** The drain no longer routes any write through
+//! it. `drive_workspace` ingests WARM-first through the Depot client
+//! (`scarab-workspace-client` — one walk, `/have`-dedup, PUTs land warm-only)
+//! and then awaits ONE `flush(published_root)` RPC, which is what archives the
+//! published closure to cold and licenses `Succeeded`. What this instance
+//! still does is fall-through-and-backfill READS: Browse, the GC mark walk,
+//! the rerun-widening oracle and the drain's own read half all come through
+//! here — plus the refusal at the bottom of this file, where [`Cas::ingest`]
+//! on a `TieredCas` returns an error so nothing can silently route a drain
+//! through it again. (Whether the control plane should keep a per-Step write
+//! leg of its own was git-bug `212bb13`'s open question; the ADR-0064
+//! rewiring answered it — the write leg is the Depot client, and the second
+//! walk this paragraph used to price is no longer paid.)
 //!
-//! Given that, warm-first on the control plane would mean a network round
-//! trip per object to the Depot on every write, and — worse — it would make
-//! a Depot outage fail every workspace Step, which is exactly why this
-//! instance opted into
-//! [`fall_through_on_warm_error`](TieredCas::fall_through_on_warm_error) on the
-//! read side in the first place. Whether the control plane should keep a write
-//! leg of its own at all is a real, **unresolved** question, not an oversight in
-//! this file — it is tracked as git-bug `212bb13` ("delete the exec tar tunnel;
-//! server exchanges root hashes only"), and retiring it is that ticket's job,
-//! not this slice's. Until it lands, the second walk below is a real, paid
-//! cost, and ADR-0061's filed port change
-//! (`docs/adr/0061-workspace-data-path.md:585-591`) is still wanted.
+//! A caution for anyone re-verifying that claim: the old wiring was
+//! trait-object dispatch — `drive_workspace(cas: &dyn Cas)` calling
+//! `cas.ingest(...)` — so a textual grep for `TieredCas::ingest` has never
+//! proven anything about callers, in either direction. Today's call graph is
+//! `drive_workspace` → the Depot client's `ingest` (through the warm/read
+//! `DrainCas` split in `crates/scarab-executor-k8s/src/lib.rs`) → one awaited
+//! `WorkspaceClient::flush`; the READS still arrive here as `dyn Cas`. Follow
+//! the `Arc<dyn Cas>` handles from the composition root
+//! (`crates/scarab-server/src/main.rs`), never a grep.
 //!
 //! What follows describes the ordering this type still uses, for both of its
-//! remaining instances.
+//! remaining instances — reached today by **stray writes** only
+//! (`put_blob`/`put_tree` from anything that is not a drain; the read path's
+//! best-effort backfill writes to warm directly), never by the drains.
 //!
 //! # The write order is COLD FIRST, and that is not an accident
 //!

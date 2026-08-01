@@ -3438,14 +3438,23 @@ mod tests {
             let state = open_state(&warm_dir, cold.clone(), b"export-secret".to_vec())
                 .expect("open the workspace state");
 
-            // Ingested through the TIERED store, so the parent is durable in cold and
-            // present in warm — which is what a real predecessor Step would have left,
-            // and what the Farm build below reads.
-            let parent = state
-                .cas
+            // A real predecessor Step leaves the parent in warm (its drain) AND in
+            // cold (its flush). `TieredCas::ingest` is a deliberate refusal since
+            // ADR-0064, so build that end state the content-addressed way: one
+            // ingest per tier of the same source yields byte-identical objects.
+            let warm_seed = S3Storage::local(&warm_dir).expect("warm seed handle");
+            let parent = warm_seed
                 .ingest(src.to_str().expect("utf-8"))
                 .await
-                .expect("ingest the parent snapshot");
+                .expect("ingest the parent snapshot into warm");
+            let cold_parent = cold
+                .ingest(src.to_str().expect("utf-8"))
+                .await
+                .expect("ingest the parent snapshot into cold");
+            assert_eq!(
+                parent.root, cold_parent.root,
+                "content addressing: same source, same root in both tiers"
+            );
             assert!(
                 parent.identity.is_some(),
                 "a real ingest folds a content identity; without one the identity \
