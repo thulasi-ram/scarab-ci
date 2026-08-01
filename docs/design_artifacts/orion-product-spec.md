@@ -262,20 +262,38 @@ approve/deny fire from the browser with the **user's own token** straight to
 `scarab-server` (Part 4 rule 2 — the audit trail is the product); everything
 updates over SSE, no refresh.
 
-## 8. v1 cut
+## 8. Product horizons (recast 2026-08-01 — owner's instruction)
 
-**In:** finite Mandates; one repo per Mandate; UI + API creation; verdicts
-`continue | wait(approval) | wait(question) | wait(event: ci) | done`;
-done-conditions `pr_merged | checks_green_on | human_confirm`; cumulative
-budgets (tokens/USD/time/turns) with EXHAUSTED + extend; steer between turns;
-Docket (direction A) + Mandate pane + Run detail via `ui/kit`; one official
-agent image (Claude Code runner); the public agent-image contract.
+> Brainstorms think in **end state / MMP / MLP**, never in v1/v2 sequencing.
+> **MVP selection is the owner's decision** and is deliberately absent from
+> this spec. The one property any MVP must preserve: **no chicken-and-egg** —
+> no layer may require another layer's adoption to be worth running (the SOP
+> agent as-a-step works with zero Orion; Orion works with zero Toolkits;
+> each layer is independently valuable).
 
-**Out (named, not forgotten):** standing Mandates (needs the minting rule +
-event subscriptions); fork-from-turn (v1.1 — the data model supports it from
-day one: transcripts are per-turn Artifacts); `@orion` comment-command
-minting; multi-repo Mandates; panes-grid view; fleet analytics; any model
-routing (refused permanently).
+- **End state:** Orion as the multiplexer over repos; the SOP library as an
+  org asset; Toolkits + Roster; **eval-as-CI gating SOP changes** the way
+  tests gate code (an SOP edit triggers its eval matrix — the procedure is
+  code now, so CI judges it); the A2A boundary; `ui/kit` as a public
+  building block.
+- **MMP — marketable:** what a platform team rolls out org-wide and defends
+  to a security review: Mandates + Docket + ledger with gateway-enforced
+  budgets (§15.6), approvals on human tokens, standing SOPs minting finite
+  Mandates, an org-shared SOP library, audit export. Verdicts
+  `continue | wait(approval|question|event|timer) | done`; done-conditions
+  `pr_merged | checks_green_on | human_confirm` growing toward CEL.
+- **MLP — lovable:** one engineer, one afternoon: a red build gets the stock
+  `triage-red-build` SOP — it reads the Briefing (knows attempt 2 failed,
+  holds the flake proof), posts an investigation where every claim carries
+  its Run chip, opens the right follow-up, spends $1.40 of its $5, and the
+  **SOP checklist** shows exactly which procedure steps it walked. Ships
+  with three stock SOPs (triage, dep-bump, doc-drift); setup is one file and
+  one gateway key. Lovable = "it knew" + "it obeyed" + zero infrastructure.
+
+Formerly this section was a "v1 cut" (in/out lists); those lists remain
+useful as a *cost inventory* and moved conceptually to §15.3. Permanent
+refusals (model routing, etc.) live in the exploration doc's refuse list and
+§15.5.
 
 ## 9. Multi-agent topologies and communication (added after discussion)
 
@@ -683,3 +701,84 @@ Everything else is either already-built Scarab or an integration.
 8. **Roster curation flow** — who approves an image onto the Roster, and is
    that approval itself an Environment protection rule or a new org-settings
    surface?
+
+## 17. The SOP agent — interface first, LangGraph as the first adapter
+(decided direction, 2026-08-01)
+
+Scarab ships a **first-party SOP-based agent**. Not only a contract for
+arbitrary agent images — an opinionated official agent whose behaviour is a
+**Standard Operating Procedure**: a human-authored, in-repo, code-reviewed
+procedure document. SOPs are how organizations already encode trust in human
+operators; a pipeline is a procedure for machines, an SOP is a procedure for
+judgment, and both live in `.scarab/`, read at the triggering ref. The
+differentiated sentence: **agents that follow your runbooks, provably.**
+
+### 17.1 Two strata, and the honesty line between them
+
+```markdown
+---                                # TERMS — enforced by Scarab/Orion
+name: triage-red-build
+tools: [repo, ci-evidence]
+budget: { usd: 5, turns: 6 }
+escalate_to: "@platform-oncall"
+---
+## Objective                       # PROCEDURE — followed by the model,
+Classify the failure: flake / infra / regression; open the right follow-up.
+## Procedure                       #   audited by the transcript
+1. Read the failing run's evidence. If content-identity shows prior green
+   on identical inputs → flake.
+2. If flake: quarantine per the quarantine SOP; open PR; link evidence.
+3. If regression: bisect, notify the author. Do NOT attempt a fix.
+## Escalation
+When classification confidence is low, ask (wait) rather than guess.
+```
+
+Frontmatter is **enforced** (budgets, tools, gates — machinery that exists).
+The body is **followed** — and the UI must never let advisory look enforced.
+
+### 17.2 The architecture is the house pattern
+
+**SOP → parsed procedure IR (ours, the stable seam) → `AgentRuntime` port →
+adapters.** First adapter: **LangGraph** — the procedure IR *constructs the
+graph*, so the SOP's control flow is structural, not a prompt suggestion.
+
+| Seam | Ours / theirs | Swappable |
+|---|---|---|
+| SOP format + procedure IR | ours — the interface, versioned like the pipeline IR | no (it is the contract) |
+| `AgentRuntime` | port (house sense: domain-owned interface) | — |
+| LangGraph | first adapter | yes — Claude Agent SDK, raw-loop, CrewAI later |
+| models | via the LLM gateway (§15.6) | yes — gateway concern |
+| tools | MCP | yes |
+
+Key property bought by IR-drives-the-graph: **procedure position is not
+self-reported.** The runner knows the agent is on step 2 because step 2 is a
+graph node. Hence the **SOP checklist** in the Mandate pane / step view —
+procedure steps ticking off live, evidence per step, deviations flagged
+structurally. Possibly the most lovable surface in the product: watching an
+agent execute *your* procedure with proof at each line.
+
+### 17.3 One artifact, both altitudes
+
+- **As a step:** `agent: { sop: .scarab/sops/triage.md }` — inside a
+  pipeline, zero Orion required.
+- **On top of pipeline:** the same SOP is a Mandate's brain; its procedure
+  may launch pipelines (a governed `scarab` MCP tool) and gate for humans.
+  SOP-on-top makes "the agent is a Run" recursive: the orchestrator at the
+  top is itself following a reviewed procedure.
+
+This realizes §8's anti-chicken-egg property: one SOP file + one gateway key
+= a running agent on one repo, valuable alone; Orion makes many manageable;
+Toolkits make them org-curated. Stock library ships with the product:
+`triage-red-build`, `dep-bump`, `doc-drift`.
+
+### 17.4 Consequences
+
+- Eval-as-CI gains its object: **an SOP edit triggers that SOP's eval
+  matrix** — procedures get judged by CI the way code does (§8 end state).
+- The Roster's rows become mostly SOPs, not images — the image is ours; what
+  orgs curate is procedures + terms. Setup moves another layer up.
+- Honest limits, stated: the agent *follows* the procedure — adherence at
+  the graph grain is structural, but judgment inside a step is still a
+  model; the body's prose (e.g. "do NOT attempt a fix") is instruction, not
+  enforcement, unless it maps to a term. Deviation detection flags, it does
+  not prevent.
