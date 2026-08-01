@@ -876,3 +876,150 @@ after the step-level `Suspended` work is scoped honestly).
 5. **The eBPF question is really a DaemonSet question.** ADR-0062 refused a node
    driver for the *data* path. Would you spend it for telemetry? I would not, but it
    is your call and it is the one door §1.5 leaves closed.
+
+---
+
+# Part 4 — The Mandate and the steward (added 2026-08-01, after discussion)
+
+Parts 1–3 were written before a framing conversation that settled several of the
+open questions above. This part records where that landed. **Status: direction
+agreed in discussion; still pre-ADR.** It supersedes Part 2's sequencing where they
+disagree (notably: A3's engine surgery is deferred, possibly forever).
+
+## 4.1 The frame: engine public, AI is the multiplexer
+
+The chosen lens is the Superlogical/libghostty move: keep the craft artifact a
+public building block, and found the product one layer *up* from it, consuming it
+exactly as it was designed to be used. Applied here:
+
+- **`scarab-engine` + `scarab-pipeline` are the libghostty** — pure domain crates,
+  zero infra deps, compiler-enforced (CONTEXT invariant 4). Already extractable.
+- **The AI layer is the multiplexer.** A terminal multiplexer's value is sessions
+  that survive detach, many concurrent, attach-and-steer any one. That is the
+  durable Run, the concurrency model, and `attach_step` — Scarab is already a
+  multiplexer for work; it calls its sessions Runs. The AI product composes them.
+- The owner has said the layer may **be given away free later** — so the seam below
+  must stand on architectural merit (coupling discipline, evolution pace), never on
+  a monetisation boundary.
+
+Six altitudes where AI can sit, with the compass rule that keeps all of them
+honest — **AI may propose; only a Run disposes**:
+
+| # | Altitude | What it is | Verdict |
+|---|---|---|---|
+| 1 | below | advisor to the engine (flake classification via content identity, failure clustering, cost prediction) | build; never load-bearing |
+| 2 | beside | explains Runs over the evidence corpus ("why did this fail") | the daily-habit wedge |
+| 3 | inside | the `agent` Step kind (Part 2's A2) | the governance demo |
+| 4 | above | **the Mandate layer** (this part) | the company |
+| 5 | author | pipeline synthesis / GHA migration | a feature, not a product |
+| 6 | interface | conversational ops over the API | sugar |
+
+## 4.2 The Mandate (decided name; was "Intent")
+
+Named for the *authority*, not the goal — the differentiated content is the bounds:
+budget, tools, approvals, done-condition. Vocabulary:
+
+| Term | Meaning |
+|---|---|
+| **Mandate** | The durable object: goal + terms (token/USD/time/turn budgets, agent image, allowed tools, approval rules) + done-condition + ledger. **Finite** ("upgrade to React 19") or **standing** ("triage every red main build" — wake-condition includes repo events, never terminates). |
+| **Turn** | One **Run** launched under a Mandate. *Simpler than Part 2's A3*: a Turn is a whole Run, not a sub-Attempt grain — no 4-tuple fence, no step-level suspend. |
+| **Transcript** | The append-only record re-fed to each Turn. Stored as evidence in Scarab (each Turn's delta = an **Artifact** of that Run), not in the steward. |
+| **Verdict** | The Turn's structured proposal in its Results: `continue \| wait(reason) \| done`. **A proposal, never a disposition** — only the done-condition, evaluated against external evidence (CI green, PR merged), ends a Mandate. Never let the thing being governed report its own success. |
+
+What a Mandate *does* is deliberately almost nothing — durable bookkeeping around
+an opaque loop, exactly what the engine is for a DAG: (1) holds the contract;
+(2) launches Turns via the existing `on: api` path with transcript-so-far as
+input; (3) consumes Verdicts; (4) parks holding no Pod — "suspended agent" = no
+Run in flight, free by construction; (5) enforces the **cumulative** budget across
+Turns (each Turn-Run has its own; the Mandate refuses to launch turn N+1 past the
+line — the one thing no single Run can do); (6) answers to a human: pause, kill,
+approve, **steer** (inject an instruction into the next Turn's input), **fork from
+turn k** (truncate the Transcript, change something, re-drive — prompt bisection
+on the existing Take instincts).
+
+**Turn-as-Run resolves Part 2's two traps without engine surgery.** Durability
+migrated up a level: a 6-hour agent need not survive node eviction, because the
+Mandate re-drives a fresh Run from the Transcript. Every turn is separately
+admitted, budgeted, and audited — the safer side of §2.2(3)'s ordering trap, by
+construction. The costs are per-turn Pod/admission latency (fine for agent-paced
+work) and noisy Run lists — and "group Runs by Mandate" *is* the product UI, so
+the cost and the product are the same artifact. ADR-0061/0062 are what make
+per-turn workspace re-materialisation affordable. A3's Turn-in-Step surgery
+becomes an optimisation for high-frequency turns, taken only if demanded.
+
+## 4.3 The steward (decided name): a separate module, and what "separate" means
+
+**`scarab-steward`** — a steward manages affairs under delegated authority; plain
+in the way Depot and Farm are plain. Five seam rules, each doing work:
+
+1. **Separate binary, separate crate family.** Not a `--role` on `scarab-server`:
+   the seam is a process boundary, not a CLI flag.
+2. **It speaks only the public API** (REST + SSE), authenticated as a service
+   principal (ADR-0049), RBAC-scoped per Mandate. Invariant 5 weaponised: if the
+   steward can be built on the public API, the engine is *provably* the building
+   block. It will immediately hit the verified gap that `GET /v1/runs/{id}/events`
+   replays-and-closes (no live tail, `lib.rs:1727-1746`) — building the steward
+   forces that fix, which the open product also wants.
+3. **Own storage, no shared tables.** Own schema and migrations for mandates,
+   ledgers, cursors. Grep-test: `mandate` appearing in `scarab-engine` or
+   `scarab-server` is a bug.
+4. **Evidence stays in Scarab; the steward stays thin.** Transcript delta =
+   Artifact, verdict = Result, changeset = workspace outputs — all existing
+   machinery, existing retention. If the steward's database burned down you lose
+   the loop's memory and cumulative budgets, never the evidence.
+5. **Provenance rides the rails that exist.** A Turn-Run's Actor is the mandate's
+   service principal *on behalf of* the creating human; its Headline (ADR-0057) is
+   "Turn 7 — upgrade to React 19". The engine stays Mandate-ignorant.
+
+## 4.4 UI harmony: split by ownership, compose by kit
+
+The tangling worry is real but it is **read-side** tangling: the steward UI must
+*display* Runs (DAG, logs, gates, takes) that the web-ui already renders — it never
+*owns* them. So don't split by page; split by **who owns the object vs who
+composes views of it**, and share the view layer as a kit:
+
+- **`ui/kit` (extract):** the embeddable **run surface** — `RunCard`, `DagView`,
+  `LogPane`, `GateApprovePane`, `TakeFilmstrip` — fed by an API client + props, no
+  routing, no global state. Both apps compose it. Precedent already in-tree:
+  `ui/` is a container of two apps (web-ui + docs-ui) sharing `ui/brand`.
+  Because the web-ui eats the public API (invariant 5), these components are by
+  construction buildable from public data — the kit is the libghostty move applied
+  a second time, one level up. It is also potentially the most broadly reusable
+  open artifact of the lot: an embeddable Run view (a "checks widget") for
+  anyone's dashboard.
+- **`ui/steward-ui` (third app):** panes of Mandates composing run surfaces — a
+  multiplexer composing terminals, literally. The docket view.
+
+Four harmony rules:
+
+1. **Reads compose in the browser.** No server-side joins, no BFF merging, no
+   shared DB. The only cross-system join is: the steward owns mandate → run-ids;
+   the run carries an opaque back-pointer (see rule 3).
+2. **Writes to engine objects go direct, with the human's own token.** Approving a
+   gate or rerunning a step from the steward UI calls `scarab-server` from the
+   browser as *the user* — never proxied through the steward — so the audit trail
+   stays honest. The steward's API accepts writes only to steward objects
+   (create / pause / steer / fork a Mandate).
+3. **Links, not embeds, for full context** — deep-link both directions. Forward:
+   mandate pane → run detail URL. Backward: a generic, optional **`context_url`**
+   on `api`-dispatch provenance (a small ADR-0057 extension; an opaque URL supplied
+   by the API caller) lets the run detail page render "Turn 7 of *upgrade to React
+   19* ↗" without the engine knowing what a Mandate is.
+4. **One identity, one ingress.** Same OIDC session across both UIs; path-routed
+   under one origin (`/mandates` → steward) so cookies and CORS stay trivial.
+   Steward-ui gets the same mock mode treatment as `just ui-mock`.
+
+Because none of this leans on a license boundary, "give it away free later" moves
+nothing: the seam earns its keep as coupling discipline (the steward iterates at
+product-experiment pace; the engine UI at infra pace), and if the steward goes
+free, the kit and the API contract are simply more public surface that was built
+honest from day one.
+
+## 4.5 What this answers from the open questions
+
+Q1: answered — governed-agent framing, with the multiplexer (Mandate layer) as the
+product above it; `positioning.md` still needs its explicit amendment before any
+copy ships. Q2: answered — `agent` as a Step kind stands for altitude 3; altitude
+4 composes Runs and needed no new plane in the engine at all. Q4: answered in
+shape — the steward is deliberately buildable without touching the engine's
+crash/resume proofs. Q3 (1 ms resolution) and Q5 (eBPF/DaemonSet) remain open.
