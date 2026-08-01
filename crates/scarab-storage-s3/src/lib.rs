@@ -407,12 +407,49 @@ impl S3Storage {
     /// Store `bytes` at `key` unless an object already lives there — content
     /// addressing makes a re-store a no-op, so we skip the redundant upload.
     async fn put_if_absent(&self, key: &str, bytes: Vec<u8>) -> Result<bool, StorageError> {
+        if self.has(key).await? {
+            return Ok(false);
+        }
+        self.put(key, bytes).await?;
+        Ok(true)
+    }
+
+    /// Does this store already hold the blob at `hash`? **A pure existence
+    /// probe** — one `head`, no body download and no re-hash. That is the whole
+    /// point: answering the same question through `get_blob` costs a full read
+    /// plus a SHA-256 over every byte (git-bug `38b945e`), which is the per-file
+    /// cost ADR-0061 measured at 81–88% of a drain leg.
+    ///
+    /// `true` means the store durably holds a **completed** object at that
+    /// address, not a torn one: both backends publish atomically — S3's PUT is
+    /// all-or-nothing, and the local backend stages to a temp path and `rename`s
+    /// into place — so an object visible at the final key is a finished upload.
+    /// What a `head` cannot vouch for is the *content*; that is the same trust
+    /// [`Self::put_if_absent`] has always extended when it turned a re-offer
+    /// into a `head`.
+    ///
+    /// Deliberately **not** on the [`Cas`] port, and deliberately without a
+    /// defaulted body anywhere: a default answering "nothing is missing" is
+    /// indistinguishable from the legitimate answer, and that silent-skip shape
+    /// has bitten this repo before. A caller that wants the probe holds the
+    /// concrete `S3Storage`.
+    pub async fn has_blob(&self, hash: &BlobHash) -> Result<bool, StorageError> {
+        self.has(&format!("blobs/{}", hash.0)).await
+    }
+
+    /// [`Self::has_blob`] for a tree object — `trees/<hash>`, the other of the
+    /// two prefixes this store files content-addressed objects under.
+    pub async fn has_tree(&self, hash: &TreeHash) -> Result<bool, StorageError> {
+        self.has(&format!("trees/{}", hash.0)).await
+    }
+
+    /// The one `head`-shaped primitive the typed probes and
+    /// [`Self::put_if_absent`] share. Private: raw keys are this adapter's
+    /// business, and the typed probes are the public surface.
+    async fn has(&self, key: &str) -> Result<bool, StorageError> {
         match self.backend()?.head(&ObjPath::from(key)).await {
-            Ok(_) => Ok(false),
-            Err(object_store::Error::NotFound { .. }) => {
-                self.put(key, bytes).await?;
-                Ok(true)
-            }
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(e) => Err(map_err(e)),
         }
     }

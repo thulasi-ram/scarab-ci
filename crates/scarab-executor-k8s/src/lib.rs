@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogChunks};
 use scarab_engine::{ExecError, Executor, RunId, StepRun, StepSpec};
-use scarab_storage::Cas;
+use scarab_storage::{Cas, StorageError};
 
 /// The step container's name in every step Pod (see [`build_pod`]). The log tail
 /// pins the source to this container so a results-egress sidecar (ADR-0042) never
@@ -148,6 +148,15 @@ pub struct K8sExecutor {
     /// s3-feed). Required for any Step with `needs:` once the workspace flow is
     /// on — there is no control-plane feed path any more.
     workspace_fetch: Option<WorkspaceFetch>,
+    /// The Depot drain handle (ADR-0064 control-plane half): the same workspace
+    /// service `workspace_cas` uses as its warm tier, held concretely because
+    /// the drain needs `flush` — a client capability, not a `Cas` port method.
+    /// When wired, `drive_workspace` ingests WARM-first through this client and
+    /// awaits `flush(published_root)` before annotating the Pod and releasing
+    /// the sidecar. `None` = no Depot (object-store-only dev): the drain
+    /// ingests straight into `workspace_cas`, which IS the cold store then —
+    /// durability is direct and there is nothing to flush.
+    workspace_depot: Option<Arc<scarab_workspace_client::WorkspaceClient>>,
     /// The artifact blob store (ADR-0052). When wired (and the workspace
     /// flow is on), every step Pod gets a `/scarab/artifacts` emptyDir that
     /// is harvested post-step: matching files upload as object blobs and the
@@ -166,6 +175,7 @@ impl K8sExecutor {
             default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
             workspace_cas: None,
             workspace_fetch: None,
+            workspace_depot: None,
             artifact_store: None,
             clone_image: DEFAULT_CLONE_IMAGE.to_string(),
             placement: PlacementConfig::default(),
@@ -180,6 +190,7 @@ impl K8sExecutor {
             default_step_timeout_secs: DEFAULT_STEP_TIMEOUT_SECS,
             workspace_cas: None,
             workspace_fetch: None,
+            workspace_depot: None,
             artifact_store: None,
             clone_image: DEFAULT_CLONE_IMAGE.to_string(),
             placement: PlacementConfig::default(),
@@ -224,6 +235,21 @@ impl K8sExecutor {
     /// fetcher, and no workspace bytes cross the Kubernetes API server.
     pub fn with_workspace_service(mut self, fetch: WorkspaceFetch) -> Self {
         self.workspace_fetch = Some(fetch);
+        self
+    }
+
+    /// Wire the Depot drain handle (ADR-0064 control-plane half): the drain
+    /// then ingests WARM-first through `depot` (one walk, `/have`-dedup),
+    /// prunes against warm-write/tiered-read, and awaits
+    /// `depot.flush(published_root)` — the durability gate — before annotating
+    /// the Pod and releasing the sidecar. Without this the drain writes
+    /// `workspace_cas` directly, which is only correct when that handle IS the
+    /// durable store (no workspace service configured).
+    pub fn with_workspace_depot(
+        mut self,
+        depot: Arc<scarab_workspace_client::WorkspaceClient>,
+    ) -> Self {
+        self.workspace_depot = Some(depot);
         self
     }
 
@@ -584,10 +610,13 @@ impl K8sExecutor {
     ///
     /// **Snapshot (drain)** — once the step container has terminated and the
     /// egress sidecar is still holding the Pod open, tar `/workspace` out
-    /// (successful steps only), `Cas::ingest` it (per-file merkle dedup —
-    /// unchanged blobs upload nothing), patch the root onto the Pod as an
-    /// annotation, harvest the artifacts of record (EVERY terminated step,
-    /// whatever its exit code — a28a173), then release the sidecar.
+    /// (successful steps only), ingest it WARM-first into the Depot (per-file
+    /// merkle dedup — unchanged blobs upload nothing), prune to the authored
+    /// `outputs:`, await `flush(published_root)` — the ADR-0064 durability
+    /// gate: the Depot uploads the closure to cold and only `Durable` lets
+    /// this leg proceed — THEN patch the root onto the Pod as an annotation,
+    /// harvest the artifacts of record (EVERY terminated step, whatever its
+    /// exit code — a28a173), and release the sidecar.
     ///
     /// # The feed leg used to be here, and is gone (ADR-0061 s3-feed)
     ///
@@ -623,7 +652,7 @@ impl K8sExecutor {
         &self,
         pods: &Api<Pod>,
         pod: &Pod,
-        cas: &dyn Cas,
+        cas: &Arc<dyn Cas>,
     ) -> Result<(), DriveErr> {
         let name = pod.metadata.name.clone().ok_or("pod has no name")?;
         let annotations = pod.metadata.annotations.clone().unwrap_or_default();
@@ -647,9 +676,9 @@ impl K8sExecutor {
                     .is_some_and(|v| !v.is_empty());
                 if exit == 0 && !already {
                     // ADR-0061 s0: the other half of the Step boundary — the
-                    // `exec` drain, the server-side unpack, and `Cas::ingest`
+                    // `exec` drain, the server-side unpack, and the ingest
                     // (hash + store, inseparable from out here: `ingest` hashes
-                    // and does its `head`/`put` per blob inside the CAS impl).
+                    // and does its `/have`/`put` per blob inside the CAS impl).
                     let t_leg = std::time::Instant::now();
                     let out = self
                         .exec_capture_stdout(
@@ -666,18 +695,47 @@ impl K8sExecutor {
                     unpack_dir(&out, tmp.path())?;
                     let tar_unpack_ms = t_unpack.elapsed().as_millis();
                     let (files, tree_bytes, walk_ms) = dir_stats(tmp.path());
+                    // ADR-0064 (control-plane half): the drain is WARM-FIRST.
+                    // With a Depot wired, `ingest` lands the snapshot on the
+                    // Depot only — one walk, `/have`-dedup — and durability is
+                    // the separate, awaited `flush` below. Without one, the
+                    // target IS the durable store and writes need no flush.
+                    let drain: Arc<dyn Cas> = match &self.workspace_depot {
+                        Some(depot) => Arc::new(DrainCas {
+                            warm: depot.clone(),
+                            read: cas.clone(),
+                        }),
+                        None => cas.clone(),
+                    };
                     let t_ingest = std::time::Instant::now();
-                    let snapshot = cas
+                    let snapshot = match drain
                         .ingest(tmp.path().to_str().ok_or("tmp path")?)
                         .await
-                        .map_err(|e| format!("ingest: {e}"))?;
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Err(self
+                                .drain_failure(
+                                    pods,
+                                    &name,
+                                    &annotations,
+                                    false,
+                                    format!("ingest: {e}"),
+                                )
+                                .await)
+                        }
+                    };
                     let cas_ingest_ms = t_ingest.elapsed().as_millis();
                     // Per-path publishing (ADR-0007): restrict the published root
                     // to the authored `outputs:` paths. The whole workspace is
                     // still ingested first — blobs are shared, so pruning is a
-                    // tree rebuild that uploads nothing new, and the step's own
-                    // files stay recoverable from the full snapshot if we ever
-                    // want them. A declared path the step did not produce is a
+                    // tree rebuild that uploads nothing new. When a prune
+                    // happens, the UNPRUNED full snapshot is deliberately never
+                    // flushed: it lands warm-only, so it is an evictable cache,
+                    // NOT durable evidence — do not lean on "recoverable from
+                    // the full snapshot" reasoning anywhere downstream
+                    // (ADR-0064; only the published root's closure is
+                    // guaranteed). A declared path the step did not produce is a
                     // permanent contract violation, never a narrower publish.
                     let declared: Vec<String> = annotations
                         .get(ANNOTATION_WS_OUTPUTS)
@@ -699,29 +757,104 @@ impl K8sExecutor {
                     let (published, identity) = if declared.is_empty() {
                         (snapshot.root, snapshot.identity)
                     } else {
-                        let pruned = scarab_storage::prune_tree(cas, &snapshot.root, &declared)
-                            .await
-                            .map_err(|e| match e {
-                                scarab_storage::PruneError::Storage(e) => {
-                                    DriveErr::Transient(format!("prune outputs: {e}"))
-                                }
-                                permanent => DriveErr::OutputContract(format!(
+                        // Prune over the drain handle: reads fall through the
+                        // tiered pair, but the prune-minted trees are WRITES and
+                        // land warm only — the flush below is what makes the
+                        // published closure durable (the CP twin of the Depot's
+                        // own DrainCas split, ADR-0064).
+                        let pruned = match scarab_storage::prune_tree(
+                            drain.as_ref(),
+                            &snapshot.root,
+                            &declared,
+                        )
+                        .await
+                        {
+                            Ok(pruned) => pruned,
+                            Err(scarab_storage::PruneError::Storage(e)) => {
+                                return Err(self
+                                    .drain_failure(
+                                        pods,
+                                        &name,
+                                        &annotations,
+                                        false,
+                                        format!("prune outputs: {e}"),
+                                    )
+                                    .await)
+                            }
+                            Err(permanent) => {
+                                return Err(DriveErr::OutputContract(format!(
                                     "outputs: {permanent} (declared: {})",
                                     declared.join(", ")
-                                )),
-                            })?;
-                        let identity = scarab_storage::content_identity(cas, &pruned)
-                            .await
-                            .map_err(|e| {
-                                DriveErr::Transient(format!("outputs identity: {e}"))
-                            })?;
+                                )))
+                            }
+                        };
+                        let identity = match scarab_storage::content_identity(
+                            drain.as_ref(),
+                            &pruned,
+                        )
+                        .await
+                        {
+                            Ok(identity) => identity,
+                            Err(e) => {
+                                return Err(self
+                                    .drain_failure(
+                                        pods,
+                                        &name,
+                                        &annotations,
+                                        false,
+                                        format!("outputs identity: {e}"),
+                                    )
+                                    .await)
+                            }
+                        };
                         (pruned, Some(identity))
                     };
                     let cas_prune_ms = t_prune.elapsed().as_millis();
+                    // The durability gate (ADR-0061 part 4 as amended by
+                    // ADR-0064): durability is not local, so the batched cold
+                    // upload stays ON the critical path — the Depot walks the
+                    // PUBLISHED root's closure and uploads what cold is
+                    // missing; only `Durable` may release the verdict. Failures
+                    // are classified by `drain_failure`: `Retry` and transport
+                    // errors re-drive, time-bounded; `Fatal` is EvidenceLost
+                    // now (4cf03d7).
+                    let t_flush = std::time::Instant::now();
+                    if let Some(depot) = &self.workspace_depot {
+                        use scarab_workspace_client::FlushOutcome;
+                        match depot.flush(&published).await {
+                            FlushOutcome::Durable => {}
+                            FlushOutcome::Retry(cause) => {
+                                return Err(self
+                                    .drain_failure(
+                                        pods,
+                                        &name,
+                                        &annotations,
+                                        false,
+                                        format!("flush: {cause}"),
+                                    )
+                                    .await)
+                            }
+                            FlushOutcome::Fatal(cause) => {
+                                return Err(self
+                                    .drain_failure(
+                                        pods,
+                                        &name,
+                                        &annotations,
+                                        true,
+                                        format!("flush: {cause}"),
+                                    )
+                                    .await)
+                            }
+                        }
+                    }
+                    let cold_flush_ms = t_flush.elapsed().as_millis();
                     // Record both on the Pod BEFORE releasing the sidecar:
                     // output()/output_identity() read them durably across
                     // control-plane restarts. One patch, so a crash between them
                     // cannot leave a root whose content nobody can compare.
+                    // Ordering with the flush above is load-bearing: the root
+                    // annotation is the durable claim `output()` reports, so it
+                    // may only exist once the closure is provably cold.
                     let patch = serde_json::json!({
                         "metadata": { "annotations": {
                             ANNOTATION_WS_ROOT: published.0,
@@ -744,6 +877,7 @@ impl K8sExecutor {
                         walk_ms,
                         cas_ingest_ms,
                         cas_prune_ms,
+                        cold_flush_ms,
                         outputs = declared.len(),
                         total_ms = t_leg.elapsed().as_millis(),
                         "ws-timing"
@@ -810,6 +944,68 @@ impl K8sExecutor {
             }
         }
         Ok(())
+    }
+
+    /// Classify a failed Depot drain leg (ingest / prune / flush) and keep the
+    /// escalation clock (ADR-0064 / ticket 4cf03d7). The decision itself is
+    /// the pure [`drain_failure_verdict`]; this wrapper supplies its inputs —
+    /// reading, and on the FIRST failure recording, the
+    /// [`ANNOTATION_WS_DRAIN_FIRST_FAILURE`] anchor on the Pod (durable across
+    /// control-plane restarts, so the outage clock neither resets nor is
+    /// lost).
+    ///
+    /// ONLY these drain legs route here. Artifact-harvest failures keep their
+    /// plain-`Transient` loop: an artifact-store blip must never escalate a
+    /// step whose evidence IS durable into `EvidenceLost`.
+    ///
+    /// On a drain that eventually succeeds, the annotation is simply left
+    /// behind: the root annotation gates re-entry to the drain leg, so no
+    /// later poll ever consults the anchor again — stale-but-inert, and no
+    /// cleanup patch is owed.
+    async fn drain_failure(
+        &self,
+        pods: &Api<Pod>,
+        name: &str,
+        annotations: &std::collections::BTreeMap<String, String>,
+        fatal: bool,
+        cause: String,
+    ) -> DriveErr {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let first = annotations
+            .get(ANNOTATION_WS_DRAIN_FIRST_FAILURE)
+            .and_then(|v| v.parse::<i64>().ok());
+        match drain_failure_verdict(fatal, first, now_ms) {
+            DrainVerdict::EvidenceLost => DriveErr::EvidenceLost { cause },
+            DrainVerdict::Transient => {
+                // Idempotent anchor: write only if absent — a later failed
+                // drive must observe the ORIGINAL clock, never restart it.
+                if first.is_none() {
+                    let patch = serde_json::json!({
+                        "metadata": { "annotations": {
+                            ANNOTATION_WS_DRAIN_FIRST_FAILURE: now_ms.to_string(),
+                        } }
+                    });
+                    if let Err(e) = pods
+                        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+                        .await
+                    {
+                        // Escalation is deferred one blip, not disabled: the
+                        // next failed drive retries this write. Losing the
+                        // anchor to the same API-server weather as the drain
+                        // failure itself must not turn into a panic or a
+                        // premature verdict.
+                        eprintln!(
+                            "scarab-executor: could not record drain first-failure \
+                             on pod {name}: {e}"
+                        );
+                    }
+                }
+                DriveErr::Transient(cause)
+            }
+        }
     }
 
     /// Tar `/scarab/artifacts` out of the egress container, filter by the
@@ -1189,13 +1385,107 @@ enum DriveErr {
     /// workspace-relative path) — permanent and author-fixable, so it fails the
     /// step with a developer verdict instead of retrying (ADR-0007 fail-closed).
     OutputContract(String),
+    /// The step ran (and exited 0), but its evidence could not be made durable
+    /// (ADR-0064 / ticket 4cf03d7): the Depot's `flush` said `Fatal`, or the
+    /// drain kept failing past [`WS_DRAIN_ESCALATION_MS`]. The workspace lives
+    /// on the Pod's emptyDir and the Depot cannot take it, so there is nothing
+    /// left to wait for — `poll` fails the Attempt as
+    /// `Infra { never_started: false }` WITH this cause, through the normal
+    /// Failed path (author-gated `retry:` applies), never as a step-budget
+    /// timeout.
+    EvidenceLost { cause: String },
 }
 
 impl std::fmt::Display for DriveErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DriveErr::Transient(s) | DriveErr::OutputContract(s) => f.write_str(s),
+            DriveErr::Transient(s)
+            | DriveErr::OutputContract(s)
+            | DriveErr::EvidenceLost { cause: s } => f.write_str(s),
         }
+    }
+}
+
+/// What a failed drain leg (ingest / prune / flush against the Depot) means
+/// for the Attempt right now — pure over `(fatal, first_failure_ms, now_ms)`,
+/// so tests construct the interleaving instead of scheduling it.
+///
+/// - A `FlushOutcome::Fatal` escalates immediately: the Depot has said the
+///   snapshot can never become durable as-is, so more polling is a lie.
+/// - Anything transient (`FlushOutcome::Retry`, ingest/transport errors) is
+///   re-driven next poll — but bounded by TIME, not by count, anchored on the
+///   [`ANNOTATION_WS_DRAIN_FIRST_FAILURE`] the caller records at the first
+///   failure: past [`WS_DRAIN_ESCALATION_MS`] the verdict is `EvidenceLost`
+///   carrying the LAST cause. Time, not count, because poll cadence is an
+///   operator tunable — a count would make the escalation window drift with
+///   config, and the 4cf03d7 ruling is about wall-clock promptness.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainVerdict {
+    /// Re-drive next poll (and record the first-failure annotation if absent).
+    Transient,
+    /// Fail the Attempt now, with the last cause.
+    EvidenceLost,
+}
+
+fn drain_failure_verdict(fatal: bool, first_failure_ms: Option<i64>, now_ms: i64) -> DrainVerdict {
+    if fatal {
+        return DrainVerdict::EvidenceLost;
+    }
+    match first_failure_ms {
+        Some(first) if now_ms.saturating_sub(first) > WS_DRAIN_ESCALATION_MS => {
+            DrainVerdict::EvidenceLost
+        }
+        _ => DrainVerdict::Transient,
+    }
+}
+
+/// The control-plane twin of the Depot's own drain split (ADR-0064): a `Cas`
+/// whose WRITES go to the warm tier (the Depot, via the workspace client) and
+/// whose READS go through the tiered pair (warm, falling through to cold).
+/// `prune_tree`/`content_identity` run over this during a drain, so
+/// prune-minted trees land warm only — the single awaited `flush` afterwards
+/// is what makes the whole published closure durable, instead of every
+/// `put_tree` paying its own cold round-trip (the double-walk shape ADR-0064
+/// removed).
+struct DrainCas {
+    warm: Arc<dyn Cas>,
+    read: Arc<dyn Cas>,
+}
+
+#[async_trait]
+impl Cas for DrainCas {
+    async fn put_blob(&self, data: &[u8]) -> Result<scarab_storage::BlobHash, StorageError> {
+        self.warm.put_blob(data).await
+    }
+
+    async fn get_blob(&self, hash: &scarab_storage::BlobHash) -> Result<Vec<u8>, StorageError> {
+        self.read.get_blob(hash).await
+    }
+
+    async fn put_tree(
+        &self,
+        entries: Vec<scarab_storage::TreeEntry>,
+    ) -> Result<scarab_storage::TreeHash, StorageError> {
+        self.warm.put_tree(entries).await
+    }
+
+    async fn tree_entries(
+        &self,
+        hash: &scarab_storage::TreeHash,
+    ) -> Result<Vec<scarab_storage::TreeEntry>, StorageError> {
+        self.read.tree_entries(hash).await
+    }
+
+    async fn materialize(
+        &self,
+        tree: &scarab_storage::TreeHash,
+        path: &str,
+    ) -> Result<(), StorageError> {
+        self.read.materialize(tree, path).await
+    }
+
+    async fn ingest(&self, path: &str) -> Result<scarab_storage::Snapshot, StorageError> {
+        self.warm.ingest(path).await
     }
 }
 
@@ -1285,6 +1575,12 @@ fn settled_state(pod: &Pod, harvesting: bool) -> ExecState {
             class: FailureClass::Infra {
                 never_started: false,
             },
+            cause: Some(
+                "workspace snapshot lost: the step exited 0 but its egress sidecar \
+                 died before the drain recorded a root — the emptyDir is gone and \
+                 the snapshot can never be produced (ADR-0061 part 4)"
+                    .to_string(),
+            ),
         },
         ExecState::Failed {
             class: FailureClass::Step,
@@ -1519,7 +1815,7 @@ impl Executor for K8sExecutor {
                 // idempotent and derive ALL state from the Pod itself, so an
                 // adopted Pod after a control-plane restart resumes cleanly.
                 if let Some(cas) = &self.workspace_cas {
-                    match self.drive_workspace(&pods, &pod, cas.as_ref()).await {
+                    match self.drive_workspace(&pods, &pod, cas).await {
                         Ok(()) => {}
                         // Permanent and author-fixable (ADR-0007): the step ran and
                         // exited 0, but did not honor its declared `outputs:`
@@ -1532,6 +1828,28 @@ impl Executor for K8sExecutor {
                             return Ok(ExecState::Failed {
                                 exit_code: None,
                                 class: FailureClass::Config,
+                                cause: Some(msg),
+                            });
+                        }
+                        // The step's evidence could not be made durable and
+                        // never will be / took too long (ADR-0064, 4cf03d7).
+                        // Through the NORMAL Failed path — like OutputContract
+                        // above, NOT `ExecError::Other` — so it presents as a
+                        // prompt, legible infra failure carrying its cause,
+                        // never as a step-budget timeout. Post-start: the step
+                        // DID run, so the author-gated `retry:` budget is the
+                        // at-least-once bound (ADR-0047).
+                        Err(DriveErr::EvidenceLost { cause }) => {
+                            eprintln!(
+                                "scarab-executor: evidence lost for pod {}: {cause}",
+                                handle.0
+                            );
+                            return Ok(ExecState::Failed {
+                                exit_code: None,
+                                class: FailureClass::Infra {
+                                    never_started: false,
+                                },
+                                cause: Some(cause),
                             });
                         }
                         Err(DriveErr::Transient(e)) => {
@@ -2370,6 +2688,23 @@ const ANNOTATION_WS_IDENTITY: &str = "scarab.io/snapshot-identity";
 /// comma-separated. Absent/empty = publish the whole workspace. Read at egress,
 /// so an adopted Pod prunes identically with no in-memory state.
 const ANNOTATION_WS_OUTPUTS: &str = "scarab.io/workspace-outputs";
+/// The Pod annotation recording (epoch ms) the FIRST time this Pod's workspace
+/// drain failed against the Depot (ADR-0064 control-plane half, ticket
+/// 4cf03d7). Written once, only if absent — it anchors the wall-clock bound in
+/// [`drain_failure_verdict`], so a Depot outage escalates to
+/// [`DriveErr::EvidenceLost`] after [`WS_DRAIN_ESCALATION_MS`] instead of
+/// grinding until the step-budget timeout. Durable with the Pod, so a
+/// control-plane restart mid-outage neither resets nor loses the clock. Only
+/// drain-leg failures (ingest / prune / flush against the Depot) touch it;
+/// artifact-harvest failures keep their own transient loop.
+const ANNOTATION_WS_DRAIN_FIRST_FAILURE: &str = "scarab.dev/ws-drain-first-failure-ms";
+/// How long the drain may keep failing transiently before the Attempt is
+/// failed as [`DriveErr::EvidenceLost`]: 5 minutes. Chosen to be longer than a
+/// Depot helm rollout (a routine deploy must never fail Attempts) and far
+/// shorter than a step budget (the default is an hour — the architect's ruling
+/// on 4cf03d7 is that a Depot outage fails Attempts PROMPTLY and LEGIBLY,
+/// never disguised as a step timeout).
+const WS_DRAIN_ESCALATION_MS: i64 = 5 * 60 * 1000;
 /// Grace period for workspace Pods: the egress sidecar ignores SIGTERM and
 /// waits for the control plane to snapshot `/workspace`, bounded by this.
 const WORKSPACE_TERMINATION_GRACE_SECS: i64 = 600;
@@ -3547,13 +3882,19 @@ pub fn pod_state(pod: &Pod) -> ExecState {
             // land on a node that can reach the service. A permanently-missing
             // snapshot simply exhausts that budget and dead-letters, which is what
             // it did before.
-            if exit_code.is_none() && workspace_fetch_failed(pod).is_some() {
-                return ExecState::Failed {
-                    exit_code: None,
-                    class: FailureClass::Infra {
-                        never_started: true,
-                    },
-                };
+            if let Some(fetch_exit) = workspace_fetch_failed(pod) {
+                if exit_code.is_none() {
+                    return ExecState::Failed {
+                        exit_code: None,
+                        class: FailureClass::Infra {
+                            never_started: true,
+                        },
+                        cause: Some(format!(
+                            "workspace fetch init container failed (exit {fetch_exit}) — \
+                             the step's inputs were never provisioned (ADR-0061 s3-feed)"
+                        )),
+                    };
+                }
             }
             // A just-killed Pod can surface `phase: Failed` BEFORE the kubelet
             // finishes writing the verdict — no status reason, no terminated
@@ -3577,6 +3918,7 @@ pub fn pod_state(pod: &Pod) -> ExecState {
             ExecState::Failed {
                 exit_code,
                 class: classify_failed_pod(pod, exit_code),
+                cause: None,
             }
         }
         "Running" => ExecState::Running,
@@ -3595,17 +3937,22 @@ pub fn pod_state(pod: &Pod) -> ExecState {
             // Also checked while Pending: an init container that exited non-zero
             // under `restartPolicy: Never` is never retried by the kubelet, so
             // there is nothing to wait for even before the phase flips to Failed.
-            if workspace_fetch_failed(pod).is_some() {
+            if let Some(fetch_exit) = workspace_fetch_failed(pod) {
                 ExecState::Failed {
                     exit_code: None,
                     class: FailureClass::Infra {
                         never_started: true,
                     },
+                    cause: Some(format!(
+                        "workspace fetch init container failed (exit {fetch_exit}) — \
+                         the step's inputs were never provisioned (ADR-0061 s3-feed)"
+                    )),
                 }
             } else if let Some(class) = terminal_waiting_class(pod) {
                 ExecState::Failed {
                     exit_code: None,
                     class,
+                    cause: None,
                 }
             } else if is_unschedulable(pod) {
                 ExecState::Failed {
@@ -3613,6 +3960,7 @@ pub fn pod_state(pod: &Pod) -> ExecState {
                     class: FailureClass::Infra {
                         never_started: true,
                     },
+                    cause: None,
                 }
             } else {
                 ExecState::Pending
@@ -3893,6 +4241,7 @@ mod tests {
                 id: AttemptId(attempt.into()),
                 started_at: Timestamp(0),
                 failure: None,
+                failure_detail: None,
                 outcome: AttemptOutcome::Running,
             }],
             needs: vec![],
@@ -5271,6 +5620,7 @@ mod tests {
             ExecState::Failed {
                 exit_code: Some(1),
                 class: FailureClass::Step,
+                cause: None,
             }
         );
         assert_eq!(pod_state(&with_phase("Unknown", None)), ExecState::Lost);
@@ -5391,6 +5741,70 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // ADR-0064 control-plane half (ticket 4cf03d7): a failed Depot drain is
+    // Transient — bounded by TIME — and then EvidenceLost. Pure over
+    // (fatal, first_failure_ms, now_ms): the interleavings are constructed,
+    // never scheduled (this repo's concurrency-test lesson).
+    // ------------------------------------------------------------------
+
+    /// A `FlushOutcome::Fatal` escalates IMMEDIATELY, first failure or not:
+    /// the Depot has said this snapshot can never become durable, so one more
+    /// transient lap would only push the truth toward the step-budget timeout.
+    /// Kills the mutation that drops the `if fatal` short-circuit (Fatal would
+    /// then present as a retriable blip until the 5-minute clock ran out).
+    #[test]
+    fn a_fatal_flush_is_evidence_lost_immediately() {
+        // No prior failure recorded — the very first observation.
+        assert_eq!(
+            drain_failure_verdict(true, None, 1_000),
+            DrainVerdict::EvidenceLost
+        );
+        // And equally with a fresh clock already running.
+        assert_eq!(
+            drain_failure_verdict(true, Some(999), 1_000),
+            DrainVerdict::EvidenceLost
+        );
+    }
+
+    /// A transient failure inside the 5-minute window keeps re-driving — both
+    /// on the FIRST failure (no anchor yet: the caller records it) and while
+    /// the anchored clock is still young. Kills the inverted-default mutation
+    /// (escalating on the first blip would fail an Attempt on every Depot
+    /// hiccup and every routine rollout).
+    #[test]
+    fn a_transient_drain_failure_within_the_window_re_drives() {
+        let now = 10 * 60 * 1000;
+        assert_eq!(drain_failure_verdict(false, None, now), DrainVerdict::Transient);
+        // Exactly at the bound is still transient ("past 5 minutes", not "at").
+        assert_eq!(
+            drain_failure_verdict(false, Some(now - WS_DRAIN_ESCALATION_MS), now),
+            DrainVerdict::Transient
+        );
+        assert_eq!(
+            drain_failure_verdict(false, Some(now - WS_DRAIN_ESCALATION_MS + 1), now),
+            DrainVerdict::Transient
+        );
+    }
+
+    /// Past the window the verdict is EvidenceLost (the caller carries the
+    /// LAST cause). Kills the mutation that removes the time bound (a Depot
+    /// outage would then grind transiently until the step budget expired —
+    /// exactly the illegible timeout 4cf03d7 forbids) and the `<`/`>` flip.
+    #[test]
+    fn a_transient_drain_failure_past_the_window_is_evidence_lost() {
+        let now = 60 * 60 * 1000;
+        assert_eq!(
+            drain_failure_verdict(false, Some(now - WS_DRAIN_ESCALATION_MS - 1), now),
+            DrainVerdict::EvidenceLost
+        );
+        // A clock skewed into the future must not underflow into escalation.
+        assert_eq!(
+            drain_failure_verdict(false, Some(now + 1_000), now),
+            DrainVerdict::Transient
+        );
+    }
+
+    // ------------------------------------------------------------------
     // ADR-0061 part 4 (s4): an Attempt is not `Succeeded` until its Workspace
     // Snapshot is durable.
     // ------------------------------------------------------------------
@@ -5412,18 +5826,25 @@ mod tests {
         // Step exited 0, sidecar gone, NO workspace root ⇒ the snapshot is gone.
         let lost = settling_pod_with("Succeeded", 0, false, true, false);
         assert!(workspace_snapshot_lost(&lost));
-        assert_eq!(
-            settled_state(&lost, true),
+        match settled_state(&lost, true) {
             ExecState::Failed {
                 exit_code: None,
                 // The process RAN, so a side effect is possible: the retry is the
                 // at-least-once kind (CONTEXT.md §2), not "safe, it never started".
-                class: FailureClass::Infra {
-                    never_started: false
-                },
-            },
-            "green with no evidence is the one verdict this product may not issue"
-        );
+                class:
+                    FailureClass::Infra {
+                        never_started: false,
+                    },
+                cause: Some(cause),
+            } => assert!(
+                cause.contains("workspace snapshot lost"),
+                "the verdict must carry a legible cause (4cf03d7), got: {cause}"
+            ),
+            other => panic!(
+                "green with no evidence is the one verdict this product may not \
+                 issue — got {other:?}"
+            ),
+        }
 
         // The same Pod WITH the root recorded is the ordinary green path.
         let settled = settling_pod_with("Succeeded", 0, false, true, true);
@@ -5463,6 +5884,7 @@ mod tests {
             ExecState::Failed {
                 exit_code: Some(1),
                 class: FailureClass::Step,
+                cause: None,
             }
         );
     }
@@ -5547,6 +5969,7 @@ mod tests {
             ExecState::Failed {
                 exit_code: Some(137),
                 class: FailureClass::Timeout,
+                cause: None,
             },
             "a wedged drain that outlives the step deadline is a Timeout, not a lost \
              snapshot — and never a Succeeded"
@@ -5564,6 +5987,7 @@ mod tests {
         let failed = ExecState::Failed {
             exit_code: Some(1),
             class: FailureClass::Step,
+            cause: None,
         };
         // Step exited 1, index not yet on the Pod -> withhold, or the evidence
         // is uploaded-but-unindexed forever.
@@ -5607,6 +6031,7 @@ mod tests {
             ExecState::Failed {
                 exit_code: Some(137),
                 class: FailureClass::Timeout,
+                cause: None,
             },
             "a timeout must not be withheld as Running"
         );
@@ -5974,19 +6399,24 @@ mod tests {
             }),
             ..Default::default()
         };
-        let never_started = ExecState::Failed {
+        let never_started = |fetch_exit: i32| ExecState::Failed {
             exit_code: None,
             class: FailureClass::Infra {
                 never_started: true,
             },
+            // The cause names the failed fetch and its exit (4cf03d7).
+            cause: Some(format!(
+                "workspace fetch init container failed (exit {fetch_exit}) — \
+                 the step's inputs were never provisioned (ADR-0061 s3-feed)"
+            )),
         };
         // Transient (1) and permanent (2) both land here: the class is about
         // whether a side effect was possible, not about why the fetch failed.
-        assert_eq!(pod_state(&pod("Failed", 1)), never_started);
-        assert_eq!(pod_state(&pod("Failed", 2)), never_started);
+        assert_eq!(pod_state(&pod("Failed", 1)), never_started(1));
+        assert_eq!(pod_state(&pod("Failed", 2)), never_started(2));
         // And before the phase flips: an init container that exited non-zero under
         // `restartPolicy: Never` is never retried, so there is nothing to wait for.
-        assert_eq!(pod_state(&pod("Pending", 1)), never_started);
+        assert_eq!(pod_state(&pod("Pending", 1)), never_started(1));
         // A fetcher that SUCCEEDED is not a failure signal.
         assert_eq!(pod_state(&pod("Pending", 0)), ExecState::Pending);
     }
@@ -6055,6 +6485,7 @@ mod tests {
             ExecState::Failed {
                 exit_code: Some(1),
                 class: FailureClass::Step,
+                cause: None,
             },
             "the step's own verdict, not a sidecar's exit code"
         );
@@ -6353,6 +6784,7 @@ mod tests {
                 ExecState::Failed {
                     exit_code: None,
                     class: FailureClass::Config,
+                    cause: None,
                 },
                 "{reason} is a permanent config rejection"
             );
@@ -6368,6 +6800,7 @@ mod tests {
                     class: FailureClass::Infra {
                         never_started: true
                     },
+                    cause: None,
                 },
                 "{reason} is (possibly transient) never-started infra"
             );
@@ -6516,6 +6949,7 @@ mod tests {
                     class: FailureClass::Infra {
                         never_started: true
                     },
+                    cause: None,
                 }
             );
         }

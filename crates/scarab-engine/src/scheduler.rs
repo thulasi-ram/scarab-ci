@@ -1651,6 +1651,7 @@ impl<'a> Scheduler<'a> {
                         id: attempt.clone(),
                         started_at: now,
                         failure: None,
+                        failure_detail: None,
                         outcome: AttemptOutcome::Running,
                     },
                 )
@@ -2024,17 +2025,17 @@ impl<'a> Scheduler<'a> {
                     let spec = match self.interpolate_spec(&run, &step, spec).await? {
                         Ok(spec) => spec,
                         // A bad `${{ … }}` reference fails the step before any Pod
-                        // is created (ADR-0041 fail-fast). NOTE: the reason is
-                        // currently dropped, so this surfaces as a bare `step`
-                        // failure with no logs — see follow-up to thread a failure
-                        // message out to the event/attempt grain.
-                        Err(_reason) => {
+                        // is created (ADR-0041 fail-fast). The reason rides the
+                        // attempt/event grain as the failure cause (4cf03d7) — a
+                        // Pod-less failure has no logs, so this IS its evidence.
+                        Err(reason) => {
                             self.finalize_step(
                                 &run,
                                 &step,
                                 &attempt,
                                 StepStatus::Failed,
                                 Some(FailureKind::Step),
+                                Some(reason),
                             )
                             .await?;
                             self.db.mark_dispatched(msg.id).await?;
@@ -2051,6 +2052,7 @@ impl<'a> Scheduler<'a> {
                             id: attempt.clone(),
                             started_at: self.clock.now().await,
                             failure: None,
+                            failure_detail: None,
                             outcome: AttemptOutcome::Running,
                         }],
                         needs: Vec::new(),
@@ -2109,11 +2111,11 @@ impl<'a> Scheduler<'a> {
                             .put_artifacts(&run, &step, &attempt, true, &artifacts, now)
                             .await?;
                     }
-                    self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None)
+                    self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
-                ExecState::Failed { class, .. } => {
+                ExecState::Failed { class, cause, .. } => {
                     // A failed attempt's artifacts are evidence — often THE
                     // evidence (the test report of the failure a retry
                     // recovered from). Harvest them too (ADR-0056), marked
@@ -2135,7 +2137,7 @@ impl<'a> Scheduler<'a> {
                         FailureClass::Timeout => FailureKind::Timeout,
                         FailureClass::Config => FailureKind::Config,
                     };
-                    self.settle_failed_attempt(&run, &step, &attempt, kind)
+                    self.settle_failed_attempt(&run, &step, &attempt, kind, cause)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
@@ -2144,7 +2146,7 @@ impl<'a> Scheduler<'a> {
                 // (assertion-gated retry on a NEW fence, budget consumed).
                 // No artifact harvest: the backend object is gone.
                 ExecState::Lost => {
-                    self.settle_failed_attempt(&run, &step, &attempt, FailureKind::Lost)
+                    self.settle_failed_attempt(&run, &step, &attempt, FailureKind::Lost, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
@@ -2167,8 +2169,14 @@ impl<'a> Scheduler<'a> {
                         let now = self.clock.now().await;
                         if now.0 >= started_at.0 + timeout_ms + TIMEOUT_BACKSTOP_GRACE_MS {
                             let _ = self.executor.cancel(&handle).await;
-                            self.settle_failed_attempt(&run, &step, &attempt, FailureKind::Timeout)
-                                .await?;
+                            self.settle_failed_attempt(
+                                &run,
+                                &step,
+                                &attempt,
+                                FailureKind::Timeout,
+                                None,
+                            )
+                            .await?;
                             self.db.mark_dispatched(msg.id).await?;
                         }
                     }
@@ -2693,12 +2701,17 @@ impl<'a> Scheduler<'a> {
     /// Every retry consumes the attempt budget. A retry re-arms the step to
     /// `Ready`; the next admission claims it and mints a **new Attempt with a
     /// new monotonic fence** — the zombie-fencing mechanism.
+    /// `cause` is the executor's human-readable diagnosis when it reported one
+    /// (ticket 4cf03d7); it rides the attempt row (`failure_detail`) and the
+    /// `AttemptFinished` event, never the retry decision — `kind` alone owns
+    /// policy.
     async fn settle_failed_attempt(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
         kind: FailureKind,
+        cause: Option<String>,
     ) -> Result<(), SchedulerError> {
         // Stale-/self-inflicted-observation guard — evaluated BEFORE any write so
         // a doomed observation never touches the attempt row. Two conditions
@@ -2729,7 +2742,7 @@ impl<'a> Scheduler<'a> {
 
         // Record the classified failure on the (frontier) attempt row (idempotent).
         self.db
-            .set_attempt_failure(run, step, attempt, kind)
+            .set_attempt_failure(run, step, attempt, kind, cause.as_deref())
             .await?;
 
         // The author `retry:` budget is per-Take (ADR-0056): a Rerun opens a new
@@ -2770,9 +2783,9 @@ impl<'a> Scheduler<'a> {
         };
 
         if used < allowed {
-            self.rearm_step(run, step, attempt, kind).await
+            self.rearm_step(run, step, attempt, kind, cause).await
         } else {
-            self.finalize_step(run, step, attempt, StepStatus::Failed, Some(kind))
+            self.finalize_step(run, step, attempt, StepStatus::Failed, Some(kind), cause)
                 .await
         }
     }
@@ -2834,6 +2847,7 @@ impl<'a> Scheduler<'a> {
         step: &StepId,
         attempt: &AttemptId,
         kind: FailureKind,
+        cause: Option<String>,
     ) -> Result<(), SchedulerError> {
         match self
             .db
@@ -2848,6 +2862,7 @@ impl<'a> Scheduler<'a> {
                         step: step.clone(),
                         attempt: attempt.clone(),
                         failure: Some(kind),
+                        cause,
                     },
                     now,
                 )
@@ -2916,6 +2931,7 @@ impl<'a> Scheduler<'a> {
         attempt: &AttemptId,
         to: StepStatus,
         failure: Option<FailureKind>,
+        cause: Option<String>,
     ) -> Result<(), SchedulerError> {
         // Optimistic guard: if a peer already finalized this step, our UPDATE
         // matches zero rows (Conflict) — we skip the duplicate events but still
@@ -2941,7 +2957,7 @@ impl<'a> Scheduler<'a> {
                     StepStatus::Failed => {
                         if let Some(kind) = failure {
                             self.db
-                                .set_attempt_failure(run, step, attempt, kind)
+                                .set_attempt_failure(run, step, attempt, kind, cause.as_deref())
                                 .await?;
                         } else {
                             self.db
@@ -2958,6 +2974,7 @@ impl<'a> Scheduler<'a> {
                         step: step.clone(),
                         attempt: attempt.clone(),
                         failure,
+                        cause,
                     },
                     now,
                 )

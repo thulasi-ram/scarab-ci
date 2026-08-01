@@ -293,6 +293,7 @@ fn step(run_prefix: &str) -> StepRun {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -367,6 +368,7 @@ async fn sleeping_step_is_killed_at_its_deadline() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -503,6 +505,7 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
             id: AttemptId(attempt.into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -691,6 +694,7 @@ async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -786,6 +790,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![StepId("produce".into())],
@@ -824,6 +829,7 @@ async fn a_missing_input_snapshot_fails_the_attempt_instead_of_hanging() {
             class: FailureClass::Infra {
                 never_started: true
             },
+            cause: None,
         }),
         "a fetch that cannot find its input must fail the attempt fast — the old \
          doorstop would have waited for a feed that never came"
@@ -862,6 +868,7 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![StepId("produce".into())],
@@ -946,6 +953,7 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -1040,6 +1048,7 @@ async fn declared_outputs_publish_only_those_paths_through_the_cas() {
         Some(ExecState::Failed {
             exit_code: None,
             class: scarab_engine::ports::FailureClass::Config,
+            cause: None,
         }),
         "an undeclared-but-missing output is a developer verdict, not infra churn"
     );
@@ -1081,6 +1090,7 @@ async fn clone_step_produces_a_source_workspace() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -1160,6 +1170,7 @@ async fn clone_step_produces_a_source_workspace() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![StepId("checkout".into())],
@@ -1245,6 +1256,7 @@ async fn clone_depth_full_exposes_history() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -1297,6 +1309,7 @@ async fn clone_depth_full_exposes_history() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![StepId("checkout".into())],
@@ -1373,6 +1386,7 @@ async fn clone_vanished_sha_fails_fast_with_source_unavailable() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -1480,6 +1494,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![StepId("checkout".into())],
@@ -1528,6 +1543,7 @@ async fn build_step_builds_and_pushes_to_a_local_registry() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -1639,6 +1655,7 @@ async fn results_sidecar_captures_a_named_result_end_to_end() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -1715,6 +1732,7 @@ async fn cancel_tears_down_a_running_pod() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -1794,6 +1812,7 @@ async fn artifacts_are_harvested_post_step() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -1908,6 +1927,7 @@ async fn artifacts_are_harvested_from_a_failed_step() {
         Some(ExecState::Failed {
             exit_code: Some(1),
             class: FailureClass::Step,
+            cause: None,
         }),
         "the harvest must not re-classify or mask the step's own failure"
     );
@@ -1933,6 +1953,7 @@ fn step_run_of(run: &str, step: &str) -> StepRun {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -2046,7 +2067,7 @@ async fn image_pull_failure_fails_the_attempt_fast() {
     let h = exec.launch(&step, &spec).await.expect("launch doomed step");
     let terminal = poll_to_terminal(&exec, &h, 120).await;
     match terminal {
-        Some(ExecState::Failed { exit_code, class }) => {
+        Some(ExecState::Failed { exit_code, class, .. }) => {
             assert_eq!(exit_code, None, "the step process never ran");
             assert_eq!(
                 class,
@@ -2106,6 +2127,7 @@ async fn rerun_supersede_tears_down_the_in_flight_descendant_pod() {
             id: a1.clone(),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![b.clone()],
@@ -2144,6 +2166,7 @@ async fn rerun_supersede_tears_down_the_in_flight_descendant_pod() {
             id: a1.clone(),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         },
     )

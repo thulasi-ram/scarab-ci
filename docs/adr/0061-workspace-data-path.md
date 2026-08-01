@@ -569,10 +569,40 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
     *and* `scarab-workspace-client`, with a runtime tripwire in `tiered` to notice them
     drifting. They now live in `scarab-storage`; the tripwire is kept for version skew between
     deployed binaries, which is a different hazard.
+
+    > **Amended 2026-08-01.** The `TieredCas` tripwire is **removed as unreachable**: both
+    > hashes it compared came from one statically-linked `canonical_tree_bytes` executing in
+    > one process — `WorkspaceClient::put_tree` canonicalises client-side — so no pair of real
+    > tiers could ever disagree, and the "version skew between deployed binaries" it claimed to
+    > guard was never in its comparison. The check now lives where the two binaries genuinely
+    > meet: the Depot's `PUT /v1/cas/trees` re-serialises the parsed body through **its own**
+    > linked `canonical_tree_bytes` and answers a distinct `400` ("canonicalisation skew") on
+    > a byte difference — the client's serialiser versus the Depot's, which is the comparison
+    > the old tripwire pretended to be. This makes the format's evolution rule load-bearing:
+    > the tree format may only evolve by **additive `Option` fields** with
+    > `#[serde(default, skip_serializing_if)]`, so parse → re-serialise stays byte-identical
+    > across one version of skew. A non-additive change breaks mid-rollout PUTs **by design**
+    > (fail-closed at the door, rather than one tree silently filed under two addresses).
 - **The price of seeding the warm tier on the write path — booked, not measured.** Making the
   control plane's snapshot store warm-then-cold (D1.6) is what stops every freshly-drained
   snapshot being a guaranteed cold miss, and it is what makes half the wire protocol live code.
   It is not free, and the costs are recorded here rather than discovered later:
+
+  > **Amended 2026-08-01 by [0064](0064-durability-tiering-and-the-write-path.md) (the
+  > control-plane section).** This bullet's prohibition — point 1's "writing warm-first and
+  > letting the service tier onward would make the warm tier load-bearing for durability,
+  > which part 4 forbids" — is **superseded for the control plane**, whose write leg is now
+  > warm-first too: the Depot's PUT handlers are **warm-only**, and durability is one explicit
+  > `POST /v1/cas/flush` the control plane **awaits before `Succeeded`**. That is not the
+  > "tier onward" this bullet forbade — the flush is synchronous with respect to success and
+  > it is commanded by the caller, not left to the service — so the invariant the prohibition
+  > protected (warm never silently licenses `Succeeded`) survives in the flush contract. The
+  > original reasoning below is kept: it correctly priced the cold-first shape, and points 1–3
+  > describe the shape this amendment retires (point 2's double cold write disappears with it;
+  > the flush's existence probe is the `exists` primitive point 2 filed). The Depot being on
+  > the durability path means a Depot outage **may fail Attempts — promptly and with a named
+  > cause, never as a timeout**; 0064's control-plane section records that as the architect's
+  > accepted trade.
 
   1. **The drain walks its directory twice.** `TieredCas::ingest` hashes to cold (the leg that
      licenses `Succeeded`) and then asks the warm tier to ingest the same directory. s2 measured

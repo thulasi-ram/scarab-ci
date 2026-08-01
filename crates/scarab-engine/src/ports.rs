@@ -109,10 +109,17 @@ pub enum ExecState {
     Succeeded,
     /// Terminal failure, classified by the adapter (ADR-0047). `exit_code` is
     /// the step container's exit code when one exists (`Step` failures); infra
-    /// failures that never produced a verdict carry `None`.
+    /// failures that never produced a verdict carry `None`. `cause` is the
+    /// adapter's human-readable diagnosis when it has one (ticket 4cf03d7 —
+    /// e.g. "cold tier refused: …" from a lost-evidence drain, or an
+    /// `outputs:` contract violation): the class says what POLICY applies,
+    /// the cause says what actually happened. `None` when the class alone is
+    /// the whole story.
     Failed {
         exit_code: Option<i32>,
         class: FailureClass,
+        #[serde(default)]
+        cause: Option<String>,
     },
     /// The backend lost the execution (vanished Pod, node stopped reporting).
     /// Conservatively treated as post-start — it cannot be proven the process
@@ -600,13 +607,17 @@ pub trait Db: Send + Sync {
 
     /// Record the classified failure on a finished attempt (ADR-0047). Also
     /// stamps the attempt's [`AttemptOutcome::Failed`] outcome, so `failure` and
-    /// `outcome` never diverge.
+    /// `outcome` never diverge. `detail` is the executor's human-readable cause
+    /// when it reported one (ticket 4cf03d7) — persisted alongside the class so
+    /// an operator sees WHY, not just which retry policy applied; `None` writes
+    /// NULL (the class alone is the whole story).
     async fn set_attempt_failure(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
         failure: FailureKind,
+        detail: Option<&str>,
     ) -> Result<(), DbError>;
 
     /// Record the terminal (or in-flight) [`AttemptOutcome`] on an attempt
@@ -725,7 +736,17 @@ pub trait Db: Send + Sync {
     /// pin belongs *here*, in the mark, and never as a filter over the delete
     /// list: a pinned root's whole transitive tree — every shared subtree and
     /// blob under it — must survive, and only marking achieves that.
-    async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError>;
+    ///
+    /// Each root travels with the time its reference was **recorded** (the
+    /// EARLIEST recording when several rows share a root). The sweeper's
+    /// torn-cold detection compares this against its grace window: a root
+    /// recorded moments ago may have an ADR-0064 cold flush still in flight,
+    /// so its missing-from-cold objects are counted but not alarmed, while one
+    /// old recording proves the flush had time to land.
+    async fn gc_workspace_roots(
+        &self,
+        terminal_cutoff: Timestamp,
+    ) -> Result<Vec<(String, Timestamp)>, DbError>;
 
     /// **Pin** a Run's Workspace Snapshots (ADR-0061 s5): hold them out of the
     /// cold-tier sweep past their TTL, for an investigation. Durable and

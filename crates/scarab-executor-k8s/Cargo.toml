@@ -27,16 +27,15 @@ futures = { workspace = true }
 # Structured logging (ADR-0053): the `ws-timing` phase breakdown of a Step
 # boundary that ADR-0061 s0 measures. The server installs the subscriber.
 tracing = { workspace = true }
+# The Depot handle for the drain (ADR-0064 control-plane half): warm-first
+# ingest + the awaited `flush` that gates Succeeded. A REAL dependency now, not
+# only the dev one it used to be — `drive_workspace` calls `flush`, which is a
+# concrete client capability, not a `Cas` port method. No cycle: the reverse
+# edge (workspace-client → scarab-server → this crate) is dev-only.
+scarab-workspace-client = { workspace = true }
 
 [dev-dependencies]
 scarab-storage-s3 = { workspace = true }
-# The live workspace tier (tests/cluster.rs) points the executor's `Cas` at the
-# REAL ADR-0061 workspace service, because since s3-feed the Step Pod's fetcher
-# reads from that service and a test whose CAS was a host tempdir would pass only
-# because the feed never happened. A dev-dependency, so nothing in production
-# links it — and no dependency cycle: this crate is only in
-# scarab-workspace-client's OWN dev-dependencies (via scarab-server).
-scarab-workspace-client = { workspace = true }
 # The live orphan-Pod teardown regression (tests/cluster.rs) drives the REAL
 # executor through the engine's supersede-teardown path over the in-memory Db.
 scarab-testkit = { workspace = true }

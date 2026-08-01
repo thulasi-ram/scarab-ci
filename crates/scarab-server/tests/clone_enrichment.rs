@@ -23,6 +23,7 @@ fn step_run(id: &str) -> StepRun {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],

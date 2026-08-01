@@ -47,9 +47,11 @@
 //! If this service ever re-serialised a tree before hashing or storing it, every
 //! tree hash in the system would change the moment `serde_json`'s output shifted
 //! by one byte and nothing would interoperate. That is why tree and blob bodies
-//! go through [`TieredObjectStore`] (raw keyed bytes) rather than
+//! move as **raw keyed bytes** — reads through [`TieredObjectStore`], the PUT
+//! verbs onto the warm store alone (ADR-0064) — rather than through
 //! [`Cas::put_tree`]/[`Cas::tree_entries`], which round-trip through a
-//! `Vec<TreeEntry>`.
+//! `Vec<TreeEntry>`. (`put_tree` does *re-serialise to compare* — the
+//! canonicalisation-skew check — but what it stores is the received bytes.)
 //!
 //! ## Authorization, stated honestly
 //!
@@ -70,7 +72,12 @@
 //! - **writes** accept any valid token. Safe by construction: a
 //!   content-addressed write whose hash this service verified cannot overwrite
 //!   or corrupt anything. The worst case is disk consumption, which is the warm
-//!   tier's bounded resource.
+//!   tier's bounded resource;
+//! - **the archival flush** (`POST /v1/cas/flush`) requires
+//!   [`Scope::Browse`] — the control plane's own scope. Unlike a write it is not
+//!   harmless under any valid token: it commands cold round trips for an
+//!   arbitrary root, which a fenced Step's `Read` token must not be able to do
+//!   at will (cost amplification, not data exposure).
 //!
 //! Every 401 emits a `tracing::warn!` naming the run and step. The results
 //! endpoint (ADR-0042) emits nothing on failure; that is a gap, not a pattern.
@@ -151,7 +158,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use scarab_executor_k8s::workspace_token::{
-    self, Fence, WorkspaceClaims, WorkspaceTokenError, WORKSPACE_TOKEN_HEADER,
+    self, Fence, Scope, WorkspaceClaims, WorkspaceTokenError, WORKSPACE_TOKEN_HEADER,
 };
 use scarab_storage::content::{FlatDir, FlatEntry, FlatManifest};
 use scarab_storage::statcache::StatCache;
@@ -217,8 +224,10 @@ struct WorkspaceState {
     /// makes it warm-only writes plus a batched flush) but it still **reads** through
     /// it; see [`DrainCas`] and [`settle_export`].
     cas: Arc<TieredCas>,
-    /// Warm-then-cold **raw keyed bytes** — the verbatim path. See the module
-    /// docs on why this is not `Cas`.
+    /// Warm-then-cold **raw keyed bytes** — the verbatim path, for **reads**:
+    /// a warm miss falls through to cold and backfills. The PUT verbs stopped
+    /// writing through it (ADR-0064: warm-only; the archival flush is the cold
+    /// writer). See the module docs on why this is not `Cas`.
     objects: Arc<TieredObjectStore>,
     /// The warm tier alone: the readiness write probe, and **the tier the re-ingest
     /// drain walks into** (ADR-0064 part 1 — one walk, local, and its error is the
@@ -550,6 +559,10 @@ fn build_router(state: WorkspaceState) -> Router {
         .route("/v1/cas/trees/{hash}", get(get_tree).put(put_tree))
         .route("/v1/cas/trees/{hash}/flat", get(get_flat))
         .route("/v1/cas/have", post(have))
+        // ADR-0064: the archival flush as an RPC, for the drain that is not this
+        // service's own settle path — the control plane's per-Step write leg
+        // seeds warm through the PUTs above and THIS is what makes it durable.
+        .route("/v1/cas/flush", post(flush_cas))
         // A blob body is a whole file (ADR-0029), so the default 2 MB limit is
         // far too small; the warm volume is the real bound.
         .layer(DefaultBodyLimit::max(MAX_BLOB_BYTES));
@@ -611,6 +624,13 @@ enum WsError {
     Unauthorized,
     /// A valid token that does not name this snapshot root.
     Forbidden,
+    /// A valid token whose **scope** may not drive this operation. Distinct from
+    /// [`Forbidden`](WsError::Forbidden) because the refusal is about what kind of
+    /// caller this is, not which snapshot it asked for: the one user today is the
+    /// flush route, which a fenced Step's `Read` token must not be able to drive —
+    /// an arbitrary-root flush is a cost amplification (cold round trips on demand),
+    /// even though a content-addressed write can corrupt nothing.
+    ScopeForbidden(&'static str),
     NotFound,
     /// The client sent a hash that does not match the bytes, an unparseable
     /// body, or too many hashes.
@@ -692,6 +712,7 @@ impl IntoResponse for WsError {
                 "this token does not name that snapshot root",
             )
                 .into_response(),
+            WsError::ScopeForbidden(m) => (StatusCode::FORBIDDEN, m).into_response(),
             WsError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
             WsError::BadRequest(m) => (StatusCode::BAD_REQUEST, m).into_response(),
             WsError::Backend(m) => {
@@ -1194,32 +1215,25 @@ async fn put_blob(
     }
 
     // `200 already had it` vs `201 stored` is decided by whether WARM has it —
-    // that is the only cheap existence question available (see `have`) — but the
-    // write happens EITHER WAY.
+    // that is the only cheap existence question available (see `have`) — and the
+    // write happens either way: an idempotent overwrite of identical bytes is
+    // cheaper than a shortcut whose premise can go stale.
     //
-    // This used to `return` early on a warm hit, on the reasoning that "every
-    // write here goes cold FIRST, so warm ⊇ cold". That reasoning was false and
-    // the shortcut it licensed was a latent ADR-0061 part-4 violation. Warm-has +
-    // cold-lacks is reachable by at least three routes:
-    //
-    //   * ADR-0050's GC deletes from the **cold** store through the control
-    //     plane's own `S3Storage`, never through `TieredObjectStore`, so a
-    //     collected blob is gone from cold and still sitting in warm;
-    //   * `TieredObjectStore::put` deliberately **succeeds on a warm failure** —
-    //     which is the correct part-4 behaviour — so content written through this
-    //     service can legitimately be cold-only, and the converse (a cold bucket
-    //     recreated in dev while the warm PV survives) is routine;
-    //   * the warm tier has no eviction at all today, so it only ever accumulates.
-    //
-    // In any of those, the early return answered `200 "already had it"` without
-    // writing cold, and an Attempt could then reach `Succeeded` on a snapshot that
-    // existed only in a tier ADR-0061's own retention table says promises nothing.
-    // The cost of not shortcutting is one idempotent overwrite of identical bytes
-    // — content addressing makes it a no-op semantically — and the client only
-    // PUTs what `have` told it was missing anyway, so this path is rare.
+    // **WARM ONLY.** This handler used to write through `TieredObjectStore::put`
+    // — cold first, "always write cold, whatever warm holds" — because the PUT
+    // was the durability leg: ADR-0061 part 4's "an Attempt is not `Succeeded`
+    // until its Workspace Snapshot is durable" was enforced by every upload
+    // paying a cold round trip inline. That invariant has not weakened, it has
+    // MIGRATED (ADR-0064): the **archival flush is the only cold writer** —
+    // `POST /v1/cas/flush` for the control plane's drain, and the settle path's
+    // own [`flush_to_cold`] phase for Exports — and whoever needs `Succeeded`
+    // awaits that flush. A PUT is now a warm seed the flush later archives;
+    // writing cold here again would put the per-object round trip ADR-0061
+    // measured at 81–88% of a Step boundary straight back on the hot path, and
+    // it would do so silently, because nothing would fail.
     let already = warm_has(&warm_blob_path(&state, &hash)).await?;
     state
-        .objects
+        .warm
         .put(&format!("blobs/{hash}"), body.to_vec())
         .await?;
     Ok(if already {
@@ -1255,10 +1269,13 @@ async fn get_tree(
 
 /// `PUT /v1/cas/trees/{hash}` — store canonical tree bytes under their hash.
 ///
-/// The body is parsed **only to validate** that it is a tree this service could
-/// walk; the bytes that get stored are the bytes that arrived. Storing a tree
+/// The body is parsed **only to validate** — that it is a tree this service could
+/// walk, and (via re-serialisation) that it is in this Depot's own canonical form;
+/// the bytes that get stored are the bytes that arrived, verbatim. Storing a tree
 /// nobody can parse would turn a client bug into a `/flat` failure much later,
-/// which is exactly the kind of deferred diagnosis ADR-0048 refuses.
+/// which is exactly the kind of deferred diagnosis ADR-0048 refuses — and storing
+/// one this binary canonicalises differently would fork the address space (see the
+/// skew check below).
 async fn put_tree(
     State(state): State<WorkspaceState>,
     headers: HeaderMap,
@@ -1279,20 +1296,61 @@ async fn put_tree(
             "body hashes to {actual}, not {hash}"
         )));
     }
-    if let Err(e) = serde_json::from_slice::<Vec<TreeEntry>>(&body) {
+    let entries = match serde_json::from_slice::<Vec<TreeEntry>>(&body) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return Err(WsError::BadRequest(format!(
+                "body is not a canonical tree entry list: {e}"
+            )))
+        }
+    };
+
+    // The canonicalisation-skew tripwire (ADR-0061 s8), at the one boundary where
+    // it is a genuine cross-binary comparison. The body was canonicalised by the
+    // CLIENT's linked `scarab_storage::canonical_tree_bytes`; re-serialising the
+    // parsed entries through THIS binary's copy of the same function and comparing
+    // bytes is the client-version-vs-Depot-version check the old `TieredCas`
+    // tripwire claimed to be and could not be (both of its hashes came from one
+    // compiled function in one process — see `scarab_storage::tiered`'s module
+    // docs). A mismatch here means the two binaries disagree on canonical form:
+    // storing the body verbatim would file, under one address, bytes this Depot
+    // can never reproduce from their parse — `/flat` would still walk it, but a
+    // re-serialising reader (the flush's `put_tree` leg, a backfill) would mint a
+    // second address for the same tree and every lookup would half-work. Refused
+    // at the door, fail-closed: the evolution rule on `canonical_tree_bytes`
+    // (additive `Option` fields only) is what keeps this 400 unreachable across a
+    // compatible rollout.
+    let canonical = scarab_storage::canonical_tree_bytes(entries)
+        .map_err(|e| WsError::Backend(format!("re-canonicalising a tree body: {e}")))?;
+    if canonical != body.as_ref() {
+        tracing::error!(
+            claimed = %hash,
+            body_len = body.len(),
+            canonical_len = canonical.len(),
+            "workspace service: 400 — tree canonicalisation SKEW between the client's linked \
+             scarab-storage and this Depot's (ADR-0061 s8)"
+        );
         return Err(WsError::BadRequest(format!(
-            "body is not a canonical tree entry list: {e}"
+            "canonicalisation skew: the body parses as a tree entry list but is not this \
+             Depot's canonical form for it ({} bytes received, {} bytes re-canonicalised). \
+             The client and this Depot link different versions of \
+             scarab_storage::canonical_tree_bytes; the tree format may only evolve by \
+             additive Option fields",
+            body.len(),
+            canonical.len()
         )));
     }
 
-    // Always write cold, whatever warm holds. See `put_blob` for why the early
-    // return that used to live here was a part-4 violation waiting for a caller —
-    // and it matters MORE for a tree than for a blob, because a tree is the
-    // address an Attempt records as its evidence: a root that exists only in warm
-    // is a snapshot the durable record points at and cannot produce.
+    // **WARM ONLY** — the cold write moved to the archival flush; see `put_blob`
+    // for the whole migration story (ADR-0064). It matters MORE for a tree than
+    // for a blob, because a tree is the address an Attempt records as its
+    // evidence — which is exactly why the flush, not the PUT, is what a caller
+    // awaits before reporting `Succeeded`: a root that exists only in warm is a
+    // snapshot the durable record points at and cannot produce, and the flush
+    // completing is the one statement that this is no longer so.
     let already = warm_has(&warm_tree_path(&state, &hash)).await?;
     state
-        .objects
+        .warm
         .put(&format!("trees/{hash}"), body.to_vec())
         .await?;
     Ok(if already {
@@ -1486,6 +1544,139 @@ async fn have(
         missing_blobs,
         missing_trees,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// The archival flush as an RPC (ADR-0064)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct FlushRequest {
+    /// The snapshot root whose whole reachable set must be in cold before this
+    /// route answers success.
+    pub root: String,
+}
+
+/// What one completed flush cost — [`FlushTally`], on the wire.
+#[derive(Debug, Serialize)]
+struct FlushResponse {
+    durable: bool,
+    blobs: u64,
+    blobs_uploaded: u64,
+    trees: u64,
+}
+
+/// Why a flush did not complete, and — the field the caller acts on — whether
+/// re-driving it can ever help.
+#[derive(Debug, Serialize)]
+struct FlushRefusal {
+    retryable: bool,
+    detail: String,
+}
+
+fn flush_refusal(status: StatusCode, retryable: bool, detail: String) -> Response {
+    (status, Json(FlushRefusal { retryable, detail })).into_response()
+}
+
+/// `POST /v1/cas/flush` — archive everything reachable from `root` to cold, and
+/// answer only when all of it is there.
+///
+/// This is [`flush_to_cold`] with an HTTP surface: the same walk
+/// ([`flush_set_of`]), the same ordered phases, the same no-partial-success
+/// contract. It exists for the drain that is **not** this service's own settle
+/// path — the control plane's per-Step write leg, which under ADR-0064 seeds
+/// warm through the PUTs above (now warm-only) and calls this once per drained
+/// snapshot. The part-4 invariant those PUT handlers used to carry — "the cold
+/// write gates `Succeeded`" — lives HERE now: the caller awaits this route
+/// before reporting an Attempt `Succeeded`, exactly as [`settle_export`] awaits
+/// its own flush phase.
+///
+/// # The status codes are a verdict about RETRYING, not a taxonomy of blame
+///
+/// - `200` — the whole reachable set is in cold. Idempotent and cheap to repeat:
+///   a re-offer of an archived snapshot is one `head` per address.
+/// - `422`, `retryable: false` — [`FlushError::Mismatch`]: the two tiers
+///   disagree on how content is addressed. The **only** fatal class; no retry
+///   can converge two binaries that canonicalise differently.
+/// - `503`, `retryable: true` — everything else, **including a warm miss**. A
+///   wiped or evicted warm tier is not fatal here even though this flush cannot
+///   proceed without the bytes: the control plane's drain loop re-drives the
+///   whole leg, and its re-upload (`/have`, then PUTs of what is missing)
+///   re-seeds warm before the retried flush runs — the state is provably
+///   recoverable, and a fatal answer would strand it. Cold IO, warm IO and an
+///   unanswerable existence probe are the same verdict for the same reason.
+///
+/// # `Scope::Browse` only
+///
+/// The PUTs accept any valid token because a content-addressed write with a
+/// verified hash can corrupt nothing. A flush is different in kind: it commands
+/// cold round trips for an arbitrary root, so a fenced Step's `Read` token
+/// driving it at will is a cost amplification. Only the control plane's own
+/// scope may trigger one.
+async fn flush_cas(
+    State(state): State<WorkspaceState>,
+    headers: HeaderMap,
+    Json(req): Json<FlushRequest>,
+) -> Result<Response, WsError> {
+    let claims = authenticate(&state, &headers)?;
+    if !matches!(claims.scope, Scope::Browse) {
+        tracing::warn!(
+            run = %claims.fence.run,
+            step = %claims.fence.step,
+            attempt = %claims.fence.attempt,
+            root = %req.root,
+            "workspace service: 403 — a read-scoped token asked for an archival flush"
+        );
+        return Err(WsError::ScopeForbidden(
+            "the archival flush requires a browse-scoped token",
+        ));
+    }
+    valid_hash(&req.root)?;
+
+    let reads = ReadThrough(state.cas.clone());
+    let root = TreeHash(req.root.clone());
+    // A walk failure — including a root neither tier holds — is retryable: the
+    // caller's re-driven drain re-uploads what warm is missing before it retries
+    // the flush, so "not here yet / not here any more" is a state the retry loop
+    // itself repairs.
+    let flush = match flush_set_of(&reads, &root).await {
+        Ok(flush) => flush,
+        Err(e) => {
+            return Ok(flush_refusal(
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+                format!(
+                    "walking {} for its flush inventory failed — nothing was offered to cold: {e}",
+                    req.root
+                ),
+            ))
+        }
+    };
+    match flush_to_cold(&reads, &state.cold, &flush, &req.root).await {
+        Ok(tally) => Ok((
+            StatusCode::OK,
+            Json(FlushResponse {
+                durable: tally.durable,
+                blobs: tally.blobs,
+                blobs_uploaded: tally.blobs_uploaded,
+                trees: tally.trees,
+            }),
+        )
+            .into_response()),
+        // The one fatal class: the tiers disagree about addressing, and no
+        // re-drive converges that. Everything else is the retryable verdict —
+        // see the handler docs for why a warm miss is deliberately among them.
+        Err(e @ FlushError::Mismatch { .. }) => Ok(flush_refusal(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            false,
+            e.to_string(),
+        )),
+        Err(e) => Ok(flush_refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+            e.to_string(),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2347,9 +2538,16 @@ struct FlushTally {
     /// slice which does introduce a second outcome (git-bug `981fc6b`: warm-only
     /// deployments) cannot add it without every caller seeing the type change.
     durable: bool,
-    /// Blobs offered to cold. Not "uploaded": cold's `put_if_absent` turns a re-offer
-    /// into a `head`, which is exactly what makes a retried flush cheap and idempotent.
+    /// Blobs in the inventory — every address the snapshot reaches, each one either
+    /// probed present in cold or read and uploaded. Not "read": the probe pass
+    /// answers for most of them with one `head` and no warm read at all (git-bug
+    /// `38b945e`).
     blobs: u64,
+    /// Of those, the blobs the probe found cold MISSING — the only ones the flush
+    /// read out of warm and offered with bytes. `blobs - blobs_uploaded` cost one
+    /// `head` each and nothing more, which is what makes a retried flush cheap and
+    /// idempotent: re-offering an already-archived snapshot uploads zero.
+    blobs_uploaded: u64,
     /// Trees offered to cold, across every level.
     trees: u64,
     elapsed_ms: u64,
@@ -2365,6 +2563,18 @@ struct FlushTally {
 /// *which tier* was asked or *what for*.
 #[derive(Debug, thiserror::Error)]
 enum FlushError {
+    #[error(
+        "the archival flush could not ask the COLD tier whether it already holds blob {hash}, so \
+         nothing was read out of warm and the snapshot is not archived. A probe that cannot be \
+         answered must fail the flush: read as \"present\" it would silently skip an upload and \
+         report a durability cold cannot back, read as \"missing\" it would bury a broken cold \
+         tier under a misleading read-and-upload failure: {source}"
+    )]
+    ColdBlobProbe {
+        hash: String,
+        #[source]
+        source: StorageError,
+    },
     #[error(
         "the archival flush could not read blob {hash} back off the WARM tier to send it to cold, \
          so the snapshot is not archived: {source}"
@@ -2513,38 +2723,83 @@ async fn flush_set_of(
 /// fold's do ([`DrainCas`]): a reused blob that warm never received — `TieredCas`
 /// swallows a warm write failure by design — or a recreated warm PVC would otherwise
 /// fail the flush on content cold already holds, or holds and could re-seed warm with.
-/// Cold is the concrete handle, because the tuning knob and (in future) an existence
-/// probe live on the type and not on the port.
+/// Cold is the concrete handle, because the tuning knob and the existence probe live on
+/// the type and not on the port.
 ///
-/// # What it still costs, said plainly
+/// # Cold is asked first, and only the misses are read (git-bug `38b945e`)
 ///
-/// Every address in the inventory is read out of warm and hashed twice — once by
-/// `Cas::get_blob`'s integrity check and once by cold's own `store_addressed` — *before*
-/// cold is asked whether it already had it. Asking cold first would skip both for the
-/// overwhelmingly common hit, and that is the shape this should have; it needs an
-/// existence primitive on the cold handle that `scarab-storage-s3` does not expose today
-/// (`put_if_absent` is private to that crate). Deliberately NOT worked around by adding a
-/// defaulted method to the [`Cas`] port: a default that answers "nothing is missing" is
-/// indistinguishable from the legitimate answer and is the silent-skip shape this repo
-/// has been bitten by.
+/// The blob inventory is probed against cold — [`S3Storage::has_blob`], one `head` per
+/// address, at the same bounded concurrency as everything else — **before anything is
+/// read out of warm**, and only the misses are then read and offered with bytes. The
+/// shape this replaced read every blob out of warm and hashed it twice (once for
+/// `Cas::get_blob`'s integrity check, once in cold's `store_addressed`) just to have
+/// cold's `put_if_absent` answer "already have it": on a 50k-file workspace that is 50k
+/// full reads and 50k SHA-256s per Step boundary — the per-file cost ADR-0061 measured
+/// at 81–88% of a drain leg, reintroduced on the archival leg.
+///
+/// A probe **failure fails the flush**, never a verdict. Read as "present" it would
+/// silently skip an upload and report a durability cold cannot back — the silent-skip
+/// shape this repo has been bitten by, and the reason the probe is a concrete method on
+/// `S3Storage` rather than a defaulted [`Cas`] trait method. Read as "missing" it would
+/// fall back to the read-and-offer path and bury a broken cold tier under a misleading
+/// warm-read or cold-write error.
+///
+/// **Trees are deliberately not probed.** A tree object is one small JSON document per
+/// directory whose warm read is local and cheap, and skipping the re-offer of a present
+/// tree would lose the [`FlushError::Mismatch`] tripwire, which only fires when the
+/// tree is re-canonicalised on its way into cold; `put_if_absent` already turns the
+/// re-offer into the same single `head` a probe would cost.
 async fn flush_to_cold(
     reads: &ReadThrough,
     cold: &S3Storage,
     flush: &settle::FlushSet,
-    handle: &ExportHandle,
+    // What this flush is *for*, for the completion log line: an [`ExportHandle`]
+    // on the settle path, a snapshot root on the `POST /v1/cas/flush` RPC.
+    // `impl Display` rather than the handle type because the RPC has no Export.
+    subject: &(impl std::fmt::Display + Sync),
 ) -> Result<FlushTally, FlushError> {
     use futures::StreamExt;
 
     let started = Instant::now();
     let concurrency = flush_concurrency(cold);
 
-    // --- Phase 1: blobs. -----------------------------------------------------
+    // --- Phase 0: probe cold for the blobs it is missing. ---------------------
+    // Nothing is read out of warm until this pass has answered for the whole
+    // inventory, and a probe that errors fails the flush here — see the doc
+    // above for why neither "present" nor "missing" may stand in for an answer.
+    let missing: Vec<BlobHash> = {
+        // OWNED hashes for the same `buffer_unordered` lifetime reason as the
+        // phases below; unlike them the async block returns its hash, so
+        // ownership simply moves through.
+        let mut stream = futures::stream::iter(flush.blobs.iter().cloned())
+            .map(|hash| async move {
+                let present = cold.has_blob(&hash).await.map_err(|source| {
+                    FlushError::ColdBlobProbe {
+                        hash: hash.0.clone(),
+                        source,
+                    }
+                })?;
+                Ok::<_, FlushError>((hash, present))
+            })
+            .buffer_unordered(concurrency);
+        let mut misses = Vec::new();
+        while let Some(result) = stream.next().await {
+            let (hash, present) = result?;
+            if !present {
+                misses.push(hash);
+            }
+        }
+        misses
+    };
+    let blobs_uploaded = missing.len() as u64;
+
+    // --- Phase 1: the missing blobs, read out of warm and offered with bytes. -
     {
         // The stream yields OWNED hashes, not references. A closure returning an
         // `async move` block that borrows its argument is not general enough over
         // lifetimes for `buffer_unordered`, and the resulting error surfaces at the
-        // `route(..)` call site rather than here — so keep the clone.
-        let mut stream = futures::stream::iter(flush.blobs.iter().cloned())
+        // `route(..)` call site rather than here — so keep the ownership.
+        let mut stream = futures::stream::iter(missing.into_iter())
             .map(|hash| async move {
                 let hash = &hash;
                 let bytes = reads.get_blob(hash).await.map_err(|source| {
@@ -2617,13 +2872,15 @@ async fn flush_to_cold(
         // this flag means.
         durable: true,
         blobs: flush.blobs.len() as u64,
+        blobs_uploaded,
         trees: flush.tree_count() as u64,
         elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
     };
     tracing::info!(
-        export = "settle",
-        handle = %handle,
+        flush = "archival",
+        subject = %subject,
         flush_blobs = tally.blobs,
+        flush_blobs_uploaded = tally.blobs_uploaded,
         flush_trees = tally.trees,
         levels = flush.tree_levels.len(),
         concurrency,
@@ -2845,79 +3102,269 @@ mod tests {
         );
     }
 
-    /// The F6 fix, at the grain it matters: a `PUT` whose content the **warm**
-    /// tier already holds must still reach **cold**.
+    /// ADR-0064 on the *upload* path: a PUT writes **warm only**, and the flush
+    /// RPC is what archives it.
     ///
-    /// Cold is the only tier ADR-0061 promises anything about, and warm-has +
-    /// cold-lacks is reachable (GC deletes from cold only; a warm write failure is
-    /// deliberately non-fatal; warm never evicts; and since ADR-0064 the Depot's own
-    /// drain writes warm before it flushes). The handler used to answer
-    /// `200 "already had it"` and write nothing, which would let an Attempt reach
-    /// `Succeeded` on a snapshot that exists only in a tier that promises nothing.
+    /// This test replaces `a_put_of_content_warm_already_holds_still_writes_cold`,
+    /// whose premise inverted: the PUT used to be the durability leg
+    /// (cold-first through `TieredObjectStore::put`), so warm-has + cold-lacks had
+    /// to be repaired inline. The cold write now belongs to exactly one place —
+    /// the archival flush — and a PUT that still wrote cold would silently put
+    /// the per-object round trip ADR-0061 measured right back on the hot path.
     ///
-    /// **ADR-0064 does not touch this route and this assertion is unchanged.** This is
-    /// the *client upload* path — a Step Pod or the control plane pushing raw addressed
-    /// bytes through [`TieredObjectStore`] — and not the Depot's drain. There is no
-    /// batched flush here to defer the cold write to, so the write stays inline and
-    /// cold-decides-success stays this route's ordering. What ADR-0064 changed is
-    /// [`settle_export`], which owns its own flush phase; the two are separate write
-    /// paths and conflating them would put a snapshot in warm with nothing scheduled to
-    /// archive it.
+    /// Mutation killed: revert either PUT handler to the tiered (cold-first)
+    /// store and the "NOTHING in cold after the PUTs" assertions fail; delete the
+    /// flush leg and the "cold holds both after the flush" assertions fail.
     #[tokio::test]
-    async fn a_put_of_content_warm_already_holds_still_writes_cold() {
-        use axum::body::Body;
+    async fn a_put_writes_warm_only_and_the_flush_rpc_is_what_archives_it() {
         use scarab_storage::ObjectStore;
+
+        let h = ExportHarness::start().await;
+
+        // A NEW blob and a NEW tree naming it, canonicalised exactly as the
+        // client's linked `scarab_storage` would.
+        let blob = b"fresh content the depot has never seen".to_vec();
+        let blob_hash = hash_hex(&blob);
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "fresh.txt",
+            TreeTarget::Blob(BlobHash(blob_hash.clone())),
+        )])
+        .expect("canonical tree");
+
+        let (status, body) = h
+            .put_raw(&format!("/v1/cas/blobs/{blob_hash}"), blob.clone())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = h
+            .put_raw(&format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes.clone())
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // NOTHING reached cold: the PUT is a warm seed, not the durability leg.
+        assert!(
+            matches!(
+                h.cold.get(&format!("blobs/{blob_hash}")).await,
+                Err(StorageError::NotFound)
+            ),
+            "a PUT blob must not write cold — the flush is the only cold writer (ADR-0064)"
+        );
+        assert!(
+            matches!(
+                h.cold.get(&format!("trees/{}", tree_hash.0)).await,
+                Err(StorageError::NotFound)
+            ),
+            "a PUT tree must not write cold either"
+        );
+        // …and both are readable from warm, verbatim.
+        assert_eq!(
+            h.state
+                .warm
+                .get(&format!("blobs/{blob_hash}"))
+                .await
+                .expect("the blob is in warm"),
+            blob
+        );
+        assert_eq!(
+            h.state
+                .warm
+                .get(&format!("trees/{}", tree_hash.0))
+                .await
+                .expect("the tree is in warm"),
+            tree_bytes
+        );
+
+        // The flush RPC is the cold writer, and its tally is the wire's.
+        let flushed = h
+            .json(
+                "POST",
+                "/v1/cas/flush",
+                Some(serde_json::json!({ "root": tree_hash.0 })),
+            )
+            .await;
+        assert_eq!(
+            flushed,
+            serde_json::json!({
+                "durable": true,
+                "blobs": 1,
+                "blobs_uploaded": 1,
+                "trees": 1
+            }),
+            "one new blob probed missing and uploaded, one tree offered"
+        );
+        assert_eq!(
+            h.cold
+                .get(&format!("blobs/{blob_hash}"))
+                .await
+                .expect("the flush archived the blob"),
+            blob
+        );
+        assert!(
+            h.cold.tree_entries(&tree_hash).await.is_ok(),
+            "and the tree — this pair of assertions is what the caller's `Succeeded` now rests on"
+        );
+    }
+
+    /// The flush route's scope gate: a fenced Step's `Read` token must not be
+    /// able to command cold round trips for arbitrary roots.
+    ///
+    /// Mutation killed: drop the `Scope::Browse` check in `flush_cas` and this
+    /// request — a *valid* token over a *real* root — answers `200` instead of
+    /// `403`, because everything past the gate would succeed.
+    #[tokio::test]
+    async fn a_read_scoped_token_cannot_trigger_the_archival_flush() {
         use tower::ServiceExt;
 
-        let warm_dir = tempfile::tempdir().expect("warm");
-        let cold_dir = tempfile::tempdir().expect("cold");
-        let secret = b"workspace-secret".to_vec();
-
-        // Content that warm holds and cold does not — the exact asymmetry the
-        // deleted shortcut assumed away. Written straight onto the volume, which
-        // is how a GC pass or a failed cold leg leaves it.
-        let body = b"content only the cache has".to_vec();
-        let hash = hash_hex(&body);
-        std::fs::create_dir_all(warm_dir.path().join("blobs")).unwrap();
-        std::fs::write(warm_dir.path().join("blobs").join(&hash), &body).unwrap();
-
-        let cold = Arc::new(S3Storage::local(cold_dir.path()).expect("cold store"));
-        assert!(matches!(
-            cold.get(&format!("blobs/{hash}")).await,
-            Err(StorageError::NotFound)
-        ));
-
-        let app = router(warm_dir.path(), cold.clone(), secret.clone()).expect("router");
-        let token = scarab_executor_k8s::workspace_token::mint(
-            &secret,
-            &scarab_executor_k8s::workspace_token::step_claims(
-                scarab_executor_k8s::workspace_token::Fence {
+        let h = ExportHarness::start().await;
+        let step_token = workspace_token::mint(
+            b"export-secret",
+            &workspace_token::step_claims(
+                Fence {
                     run: "r".into(),
                     step: "s".into(),
                     attempt: "a".into(),
                 },
                 i64::MAX / 2,
-                vec![],
+                vec![h.parent.root.0.clone()],
             ),
         );
-        let resp = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("PUT")
-                    .uri(format!("/v1/cas/blobs/{hash}"))
-                    .header(WORKSPACE_TOKEN_HEADER, token)
-                    .body(Body::from(body.clone()))
-                    .unwrap(),
-            )
-            .await
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/cas/flush")
+            .header(WORKSPACE_TOKEN_HEADER, &step_token)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({ "root": h.parent.root.0 }))
+                    .expect("serialize"),
+            ))
             .expect("request");
-        // Warm had it, so the informational status is still `200 already had it`…
-        assert_eq!(resp.status(), StatusCode::OK);
-        // …and the durable tier now holds it, which is the whole point.
+        let response = build_router(h.state.clone())
+            .oneshot(request)
+            .await
+            .expect("response");
         assert_eq!(
-            cold.get(&format!("blobs/{hash}")).await.expect("cold write"),
-            body
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a read-scoped token asking for a flush is a 403 — even for a root it may read"
         );
+    }
+
+    /// The flush route's two refusal classes, told apart by the one field a
+    /// caller acts on.
+    ///
+    /// Mutations killed: map `Mismatch` retryable (the control plane would
+    /// re-drive a canonicalisation fork forever) — the `422`/`retryable: false`
+    /// pair fails; map a walk miss fatal (a wiped warm tier would permanently
+    /// fail an Attempt whose re-driven drain would have healed it) — the
+    /// `503`/`retryable: true` pair fails.
+    #[tokio::test]
+    async fn the_flush_route_tells_fatal_from_retryable() {
+        use scarab_storage::ObjectStore;
+
+        let h = ExportHarness::start().await;
+
+        // A root neither tier holds: the walk fails, and that is RETRYABLE — the
+        // caller's re-driven drain re-uploads via `/have` + PUTs before retrying.
+        let absent = "22".repeat(32);
+        let (status, body) = h
+            .call(
+                "POST",
+                "/v1/cas/flush",
+                Some(serde_json::json!({ "root": absent })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let refusal: serde_json::Value = serde_json::from_str(&body).expect("a JSON refusal");
+        assert_eq!(
+            refusal["retryable"],
+            serde_json::json!(true),
+            "an unwalkable root is a state the retry loop itself repairs: {body}"
+        );
+
+        // A tree mis-filed in warm under an address it does not hash to: cold
+        // re-files it under the real address, `Mismatch` — the ONLY fatal class.
+        let bytes = h
+            .state
+            .warm
+            .get(&format!("trees/{}", h.parent.root.0))
+            .await
+            .expect("the parent's tree object is in warm");
+        let wrong = "11".repeat(32);
+        h.state
+            .warm
+            .put(&format!("trees/{wrong}"), bytes)
+            .await
+            .expect("mis-file a tree, as the old backfill tripwire feared");
+        let (status, body) = h
+            .call(
+                "POST",
+                "/v1/cas/flush",
+                Some(serde_json::json!({ "root": wrong })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let refusal: serde_json::Value = serde_json::from_str(&body).expect("a JSON refusal");
+        assert_eq!(
+            refusal["retryable"],
+            serde_json::json!(false),
+            "an addressing disagreement cannot be retried into agreement: {body}"
+        );
+    }
+
+    /// The canonicalisation-skew tripwire at its new home, the Depot's tree PUT.
+    ///
+    /// The body is valid JSON, hashes to the address it is PUT under, and parses
+    /// to a `Vec<TreeEntry>` — it fails only the re-serialisation comparison,
+    /// which is exactly the cross-binary check: a client whose linked
+    /// `scarab-storage` canonicalises differently produces bytes this Depot's
+    /// own `canonical_tree_bytes` cannot reproduce from their parse.
+    ///
+    /// Mutation killed: delete the re-canonicalisation check in `put_tree` and
+    /// the pretty-printed PUT answers `201` — a stored tree the flush's
+    /// `put_tree` leg would later re-file under a different address.
+    #[tokio::test]
+    async fn a_tree_put_that_is_not_in_canonical_form_is_refused_as_skew() {
+        let h = ExportHarness::start().await;
+        let entries = vec![TreeEntry::new(
+            "a.txt",
+            TreeTarget::Blob(BlobHash("aa".repeat(32))),
+        )];
+
+        // The same tree, serialised NON-canonically: pretty-printed, so it
+        // parses identically and byte-differs. Sanity-check both properties, or
+        // this test could silently assert about a body that is canonical.
+        let skewed = serde_json::to_vec_pretty(&entries).expect("pretty JSON");
+        let canonical =
+            scarab_storage::canonical_tree_bytes(entries.clone()).expect("canonical bytes");
+        assert_ne!(skewed, canonical, "the fixture must not BE canonical");
+        assert_eq!(
+            serde_json::from_slice::<Vec<TreeEntry>>(&skewed).expect("parses"),
+            entries,
+            "and it must still parse to the same entries"
+        );
+
+        let hash = hash_hex(&skewed);
+        let (status, body) = h
+            .put_raw(&format!("/v1/cas/trees/{hash}"), skewed)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a well-hashed, parseable, non-canonical tree must be refused: {body}"
+        );
+        assert!(
+            body.contains("canonicalisation skew"),
+            "and refused with the DISTINCT message, so an operator can tell a version skew \
+             from a corrupt upload: {body}"
+        );
+
+        // The same entries in canonical form, at their own address, are accepted
+        // — without this the test would also pass against a `put_tree` that 400s
+        // everything.
+        let chash = hash_hex(&canonical);
+        let (status, body) = h
+            .put_raw(&format!("/v1/cas/trees/{chash}"), canonical)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
     }
 
     // -----------------------------------------------------------------------
@@ -3049,6 +3496,27 @@ mod tests {
             };
             let response = build_router(self.state.clone())
                 .oneshot(builder.body(body).expect("request"))
+                .await
+                .expect("response");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        }
+
+        /// One raw-bodied `PUT` against the same state — the CAS upload verbs,
+        /// whose bodies are addressed bytes rather than JSON documents.
+        async fn put_raw(&self, uri: &str, body: Vec<u8>) -> (StatusCode, String) {
+            use tower::ServiceExt;
+            let request = axum::http::Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header(WORKSPACE_TOKEN_HEADER, &self.token)
+                .body(Body::from(body))
+                .expect("request");
+            let response = build_router(self.state.clone())
+                .oneshot(request)
                 .await
                 .expect("response");
             let status = response.status();
@@ -3866,6 +4334,12 @@ mod tests {
     /// with them swapped, cold ends up holding the settled root — a reachable tree whose
     /// blobs are absent, which no later reader can tell from corruption and which the GC's
     /// mark walk would follow.
+    ///
+    /// Since git-bug `38b945e` the blob leg fronted by a probe fails at the **probe** —
+    /// a `head` under a `blobs` that is a file is an error, not a `NotFound` — so the
+    /// variant this matches moved from `ColdBlob` to `ColdBlobProbe`. The invariant is
+    /// unchanged: the flush fails before anything reaches cold, and the tree assertion
+    /// below is what still catches a phase swap.
     #[tokio::test]
     async fn a_flush_that_fails_leaves_no_cold_tree_naming_an_absent_child() {
         let h = ExportHarness::start().await;
@@ -3877,8 +4351,8 @@ mod tests {
         .await
         .expect_err("a cold tier that cannot take a blob must fail the flush");
         assert!(
-            matches!(err, FlushError::ColdBlob { .. }),
-            "and it must name the cold blob write as the cause rather than surfacing a bare I/O \
+            matches!(err, FlushError::ColdBlobProbe { .. }),
+            "and it must name the cold-tier probe as the cause rather than surfacing a bare I/O \
              error: {err}"
         );
 
@@ -3927,9 +4401,11 @@ mod tests {
         // trees are the rebuilt root and the inherited `dir/`.
         let (want_blobs, want_trees) = (2u64, 2u64);
         assert_eq!(
-            (first.blobs, first.trees, first.durable),
-            (want_blobs, want_trees, true),
-            "the inventory this fixture produces: {} blob addresses and {} trees",
+            (first.blobs, first.blobs_uploaded, first.trees, first.durable),
+            (want_blobs, 1, want_trees, true),
+            "the inventory this fixture produces: {} blob addresses and {} trees — and exactly \
+             ONE blob uploaded, because the parent was ingested through the tiered store so cold \
+             already held `keep.txt`'s reused blob, while the fold's rewritten content is new",
             settled.flush.blobs.len(),
             settled.flush.tree_count()
         );
@@ -3944,16 +4420,117 @@ mod tests {
             .await
             .expect("a re-offered flush must succeed, or a retried settle could never go green");
         assert_eq!(
-            (second.blobs, second.trees, second.durable),
-            (want_blobs, want_trees, true),
+            (second.blobs, second.blobs_uploaded, second.trees, second.durable),
+            (want_blobs, 0, want_trees, true),
             "the whole inventory is re-offered — nothing records how far the first one got, so a \
-             retry re-offers everything and reports the same durability"
+             retry re-offers everything and reports the same durability — and the probe answers \
+             for ALL of it, so the second flush uploads zero"
         );
         assert_eq!(
             h.cold.get(&key).await.expect("still there"),
             b"a byte-for-byte re-upload would repair this".to_vec(),
             "the second flush must not have re-uploaded: a re-offer of a content-addressed key is \
              a `head` and nothing more, which is what makes retrying the whole batch cheap"
+        );
+    }
+
+    /// **Git-bug `38b945e`'s acceptance test**: a flush whose whole inventory cold
+    /// already holds performs ZERO warm blob reads.
+    ///
+    /// "Zero reads" is *constructed*, not inferred from a counter: after a first flush
+    /// archives everything, every blob body in BOTH tiers is overwritten with bytes
+    /// that do not hash to their address — still **present**, no longer **readable**.
+    /// `get_blob` verifies content against the address on every read (and this
+    /// service's tiering does not serve around a warm error that is not `NotFound`),
+    /// so any blob read through any leg now fails — the sanity assertion in the middle
+    /// pins that — while cold's `head`, the only thing the probe is allowed to cost,
+    /// still answers "present". A second flush that passes is therefore proof that no
+    /// blob was read.
+    ///
+    /// Corrupting rather than deleting is load-bearing: [`ReadThrough`] falls through
+    /// a warm `NotFound` to cold and would quietly serve exactly the read this test
+    /// exists to rule out.
+    ///
+    /// Mutations this kills: delete the probe pass and read-and-offer everything (the
+    /// old shape — every read fails, the flush errors); invert or hardcode the probe's
+    /// verdict so "present" is read anyway (same failure); miscount `blobs_uploaded`
+    /// (the tally assertion says the probe answered for the whole inventory).
+    #[tokio::test]
+    async fn a_flush_whose_inventory_cold_already_holds_reads_no_blob_out_of_warm() {
+        let h = ExportHarness::start().await;
+        let settled = fold_one_edit(&h).await;
+        let handle = ExportHandle::parse(&"3c".repeat(32)).expect("a handle");
+
+        flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
+            .await
+            .expect("the first flush archives the whole inventory");
+
+        for blob in &settled.flush.blobs {
+            let key = format!("blobs/{}", blob.0);
+            for store in [&h.state.warm, &h.cold] {
+                store
+                    .put(&key, b"present in the store, unreadable as content".to_vec())
+                    .await
+                    .expect("corrupt the blob body in place");
+            }
+        }
+        // Sanity for the observable itself: a blob read through the drain's own read
+        // handle must now fail, or a passing flush below proves nothing.
+        let sentinel = settled
+            .flush
+            .blobs
+            .iter()
+            .next()
+            .expect("the fixture's inventory has blobs");
+        assert!(
+            h.reads().get_blob(sentinel).await.is_err(),
+            "corrupting both tiers must make every blob read fail — `get_blob` hashes what it \
+             serves — otherwise this test cannot distinguish a probe from a read"
+        );
+
+        let second = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
+            .await
+            .expect(
+                "a flush whose whole inventory cold already holds must read ZERO blobs out of \
+                 warm: every body in both tiers is unreadable, so any read at all would have \
+                 failed this flush (git-bug 38b945e)",
+            );
+        assert_eq!(
+            (second.blobs, second.blobs_uploaded, second.durable),
+            (2, 0, true),
+            "and the tally says so: the whole inventory was satisfied by the probe alone"
+        );
+    }
+
+    /// A probe the cold tier cannot answer **fails the flush** — it is never read as a
+    /// verdict.
+    ///
+    /// The mutation that matters is probe-error-as-"present": the flush would skip
+    /// every upload, archive the trees over blobs cold does not hold and report
+    /// `durable: true` — the silent-skip shape this repo has been bitten by, and under
+    /// it this `expect_err` panics on an `Ok`. The lesser mutation,
+    /// probe-error-as-"missing", falls back to read-and-offer and dies at the upload
+    /// with `ColdBlob` — a real failure wearing the wrong cause — which is why the
+    /// *variant* is matched and not just the `Err`.
+    ///
+    /// `break_cold` puts a file where the `blobs/` prefix must be, so the probe's
+    /// `head` is an `ENOTDIR`-shaped error and NOT a `NotFound`: exactly the "cannot
+    /// answer" case, distinct from the "answered: missing" case every other test here
+    /// exercises.
+    #[tokio::test]
+    async fn a_cold_tier_that_cannot_answer_the_existence_probe_fails_the_flush() {
+        let h = ExportHarness::start().await;
+        let settled = fold_one_edit(&h).await;
+        break_cold(&h, "blobs");
+
+        let handle = ExportHandle::parse(&"4d".repeat(32)).expect("a handle");
+        let err = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
+            .await
+            .expect_err("a cold tier that cannot say what it holds must fail the flush");
+        assert!(
+            matches!(err, FlushError::ColdBlobProbe { .. }),
+            "and the error must name the probe: \"present\" would be the silent skip, \
+             \"missing\" a fall-back read that fails later blaming the wrong operation: {err}"
         );
     }
 

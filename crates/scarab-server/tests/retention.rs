@@ -355,7 +355,7 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
 
     // Pass 1 — a HUGE grace window: nothing is swept even though the old
     // terminal run is unreachable (in-flight-ingest protection).
-    let swept = sweep_cas(
+    let report = sweep_cas(
         &db,
         &cas,
         &store,
@@ -368,10 +368,19 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
     )
     .await
     .unwrap();
-    assert_eq!(swept, 0, "grace window protects young objects");
+    assert_eq!(report.swept, 0, "grace window protects young objects");
+    // The CLEAN-pass guard for the torn-cold detector's diff DIRECTION
+    // (ticket d4d3b95): cold is full of cold-EXTRA objects right now (the old
+    // run's unreachable snapshot survives only because of grace), and none of
+    // them are residue — residue is marked-minus-cold only. An inverted diff
+    // would light up on exactly this fixture.
+    assert!(
+        report.residue.is_empty() && report.suppressed_residue.is_empty(),
+        "nothing is torn: cold-extra objects are sweep candidates, never residue"
+    );
 
     // Pass 2 — no grace: exactly the old terminal run's UNSHARED objects go.
-    let swept = sweep_cas(
+    let report = sweep_cas(
         &db,
         &cas,
         &store,
@@ -384,7 +393,11 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
     )
     .await
     .unwrap();
-    assert!(swept > 0, "the unreachable workspace was collected");
+    assert!(report.swept > 0, "the unreachable workspace was collected");
+    assert!(
+        report.residue.is_empty() && report.suppressed_residue.is_empty(),
+        "a pass that sweeps garbage is still not a torn one"
+    );
 
     // The suspended (never-collectable) and fresh workspaces materialize fine.
     for (root, file) in [(&suspended_root, "keep.txt"), (&fresh_root, "fresh.txt")] {
@@ -523,9 +536,292 @@ async fn cas_gc_skips_a_dangling_root_instead_of_aborting() {
         !db.gc_workspace_roots(Timestamp(0))
             .await
             .unwrap()
-            .contains(&missing),
+            .iter()
+            .any(|(root, _)| root == &missing),
         "a forgotten root is not walked again"
     );
+
+    tdb.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Torn-cold detection (ticket d4d3b95): the mark walk reads through the TIERED
+// handle, so an object only the warm tier still holds marks clean and the
+// walk's own torn-CAS error can never fire — cold can silently be missing
+// reachable data until the warm volume dies. The sweep's residue diff
+// (marked − cold listing) is the detector.
+// ---------------------------------------------------------------------------
+
+use scarab_storage::tiered::TieredCas;
+use scarab_storage::{TreeHash, TreeTarget};
+
+/// Seed a SUSPENDED (never-collectable, so always-marked) run whose workspace
+/// is the directory at `dir`, present in BOTH tiers. `TieredCas::ingest` is a
+/// deliberate loud refusal since ADR-0064 (drains write warm then flush), so
+/// the both-tiers state is built the content-addressed way: one ingest per
+/// tier of the same directory yields byte-identical objects and one root.
+async fn seed_live_run_with_dir(
+    db: &PostgresDb,
+    warm: &Arc<scarab_storage_s3::S3Storage>,
+    cold: &Arc<scarab_storage_s3::S3Storage>,
+    id: &str,
+    dir: &std::path::Path,
+) -> String {
+    let run = RunId(id.into());
+    db.create_run(&run, 1, 1, Timestamp(0)).await.unwrap();
+    for (from, to) in [
+        (RunStatus::Pending, RunStatus::Running),
+        (RunStatus::Running, RunStatus::Suspended),
+    ] {
+        db.record_transition(&run, from, to).await.unwrap();
+    }
+    db.create_step_run(&run, &StepId("s1".into()), None, &[], Timestamp(0))
+        .await
+        .unwrap();
+    let root = warm.ingest(dir.to_str().unwrap()).await.unwrap().root.0;
+    let cold_root = cold.ingest(dir.to_str().unwrap()).await.unwrap().root.0;
+    assert_eq!(root, cold_root, "content addressing: same dir, same root");
+    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None)
+        .await
+        .unwrap();
+    root
+}
+
+/// The ticket's required test: a REAL torn state — one blob and one inner tree
+/// of a reachable snapshot deleted from COLD ONLY, warm intact — must be
+/// detected by the sweep, naming both the address and the first root that
+/// reaches it; the objects stay marked (never swept) and the root is never
+/// forgotten. Mutations killed: remove the residue diff → `report.residue`
+/// is empty and nothing detects the tear; break the first-root provenance →
+/// the alarm names run A's root (or none) instead of run B's, the only walk
+/// that reaches the torn objects.
+#[tokio::test]
+async fn cas_gc_detects_reachable_objects_missing_from_cold_only() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = PostgresDb::with_pool(tdb.pool.clone());
+    pg.migrate().await.unwrap();
+
+    // The control plane's exact topology: a tiered pair whose warm and cold
+    // tiers are separate real stores, reads falling through warm-first.
+    let warm_dir = tempfile::tempdir().unwrap();
+    let cold_dir = tempfile::tempdir().unwrap();
+    let warm =
+        Arc::new(scarab_storage_s3::S3Storage::local(warm_dir.path().to_str().unwrap()).unwrap());
+    let cold =
+        Arc::new(scarab_storage_s3::S3Storage::local(cold_dir.path().to_str().unwrap()).unwrap());
+    let tiered: Arc<dyn Cas> =
+        Arc::new(TieredCas::new(warm.clone(), cold.clone()).fall_through_on_warm_error());
+    let cold_store: Arc<dyn ObjectStore> = cold.clone();
+
+    // Run A: untorn — so provenance has a WRONG root available to name.
+    let a_dir = tempfile::tempdir().unwrap();
+    std::fs::write(a_dir.path().join("a.txt"), "alpha").unwrap();
+    let root_a = seed_live_run_with_dir(&pg, &warm, &cold, "torn-a", a_dir.path()).await;
+
+    // Run B: a top-level blob AND a subdirectory (an inner tree) to tear.
+    let b_dir = tempfile::tempdir().unwrap();
+    std::fs::write(b_dir.path().join("b.txt"), "beta").unwrap();
+    std::fs::create_dir(b_dir.path().join("sub")).unwrap();
+    std::fs::write(b_dir.path().join("sub").join("inner.txt"), "inner-beta").unwrap();
+    let root_b = seed_live_run_with_dir(&pg, &warm, &cold, "torn-b", b_dir.path()).await;
+
+    // Both roots were recorded LONGER ago than the grace window, so the
+    // suppression below must NOT swallow the alarm (`set_step_output` stamps
+    // `step_runs.updated_at`, the recording clock `gc_workspace_roots` reports).
+    for id in ["torn-a", "torn-b"] {
+        sqlx::query("UPDATE step_runs SET updated_at = 0 WHERE run_id = $1")
+            .bind(id)
+            .execute(&tdb.pool)
+            .await
+            .unwrap();
+    }
+
+    // The torn state: run B's top-level blob and its inner tree vanish from
+    // COLD ONLY. Warm keeps them, so the mark walk (and every read) stays
+    // green — before the residue diff, this pass reported nothing at all.
+    let entries = tiered.tree_entries(&TreeHash(root_b.clone())).await.unwrap();
+    let torn_blob = entries
+        .iter()
+        .find_map(|e| match &e.target {
+            TreeTarget::Blob(b) => Some(b.0.clone()),
+            _ => None,
+        })
+        .expect("root B has a top-level blob");
+    let torn_tree = entries
+        .iter()
+        .find_map(|e| match &e.target {
+            TreeTarget::Tree(t) => Some(t.0.clone()),
+            _ => None,
+        })
+        .expect("root B has an inner tree");
+    cold_store.delete(&format!("blobs/{torn_blob}")).await.unwrap();
+    cold_store.delete(&format!("trees/{torn_tree}")).await.unwrap();
+
+    let db: Arc<dyn Db> = Arc::new(pg);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(now_ms));
+    let report = sweep_cas(
+        &db,
+        &tiered,
+        &cold_store,
+        &clock,
+        "gc-torn",
+        GcConfig {
+            workspace_ttl_ms: 30 * DAY_MS,
+            grace_ms: DAY_MS,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Detection fires, as data: exactly the two torn addresses, each carrying
+    // the root whose walk reached it.
+    let mut expected = vec![format!("blobs/{torn_blob}"), format!("trees/{torn_tree}")];
+    expected.sort();
+    let keys: Vec<String> = report.residue.iter().map(|r| r.key.clone()).collect();
+    assert_eq!(keys, expected, "exactly the two torn objects are residue");
+    for r in &report.residue {
+        assert_eq!(
+            r.root, root_b,
+            "provenance names the root whose walk reaches the object — run B's, never run A's"
+        );
+        assert_ne!(r.root, root_a);
+        assert_eq!(
+            r.root_recorded_at,
+            Timestamp(0),
+            "the entry carries the recording clock the suppression compared against"
+        );
+    }
+    assert!(
+        report.suppressed_residue.is_empty(),
+        "a root older than grace is alarmed, not suppressed"
+    );
+    assert_eq!(report.swept, 0, "everything is reachable — detection deletes nothing");
+    // The operator-visible counter: gauge-like, SET by this pass.
+    assert_eq!(scarab_server::metrics::cas_gc_cold_residue(), 2);
+    assert_eq!(scarab_server::metrics::cas_gc_cold_residue_suppressed(), 0);
+
+    // The residue objects are MARKED, so the sweep cannot have deleted
+    // anything of run B's; warm still holds the torn bytes; and the
+    // dangling-root self-heal did NOT fire — the root read fine (through
+    // warm), so it was never proven dead.
+    assert!(
+        warm.get(&format!("blobs/{torn_blob}")).await.is_ok(),
+        "warm still holds the torn blob (the recovery source the follow-up will use)"
+    );
+    assert!(
+        warm.get(&format!("trees/{torn_tree}")).await.is_ok(),
+        "warm still holds the torn tree"
+    );
+    assert!(
+        cold_store.get(&format!("trees/{root_b}")).await.is_ok(),
+        "the marked root object survives in cold"
+    );
+    assert_eq!(
+        db.step_output(&RunId("torn-b".into()), &StepId("s1".into()))
+            .await
+            .unwrap(),
+        Some(root_b.clone()),
+        "the root is NOT forgotten — forget is only for roots absent from BOTH tiers"
+    );
+    assert!(
+        db.gc_workspace_roots(Timestamp(0))
+            .await
+            .unwrap()
+            .iter()
+            .any(|(root, _)| root == &root_b),
+        "the root stays in the mark set, so the next pass re-detects until repaired"
+    );
+
+    tdb.cleanup().await;
+}
+
+/// Suppression: the SAME torn state under a root recorded moments ago must not
+/// alarm — under ADR-0064 its cold flush may still be in flight — but the hole
+/// is still counted (report + gauge), just at debug level. Mutation killed:
+/// drop the age check → the fresh root's residue lands in `residue` and the
+/// alarmed gauge goes non-zero, a false alarm on every settle.
+#[tokio::test]
+async fn residue_under_a_fresh_root_is_suppressed_not_alarmed() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = PostgresDb::with_pool(tdb.pool.clone());
+    pg.migrate().await.unwrap();
+
+    let warm_dir = tempfile::tempdir().unwrap();
+    let cold_dir = tempfile::tempdir().unwrap();
+    let warm =
+        Arc::new(scarab_storage_s3::S3Storage::local(warm_dir.path().to_str().unwrap()).unwrap());
+    let cold =
+        Arc::new(scarab_storage_s3::S3Storage::local(cold_dir.path().to_str().unwrap()).unwrap());
+    let tiered: Arc<dyn Cas> =
+        Arc::new(TieredCas::new(warm.clone(), cold.clone()).fall_through_on_warm_error());
+    let cold_store: Arc<dyn ObjectStore> = cold.clone();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("fresh.txt"), "just-settled").unwrap();
+    let root = seed_live_run_with_dir(&pg, &warm, &cold, "torn-fresh", dir.path()).await;
+    // Deliberately NOT aged: `set_step_output` stamped `step_runs.updated_at`
+    // with wall-clock now, so the root's recording sits INSIDE the grace
+    // window the sweeper already has (no new knob).
+
+    let entries = tiered.tree_entries(&TreeHash(root.clone())).await.unwrap();
+    let torn_blob = entries
+        .iter()
+        .find_map(|e| match &e.target {
+            TreeTarget::Blob(b) => Some(b.0.clone()),
+            _ => None,
+        })
+        .unwrap();
+    cold_store.delete(&format!("blobs/{torn_blob}")).await.unwrap();
+
+    let db: Arc<dyn Db> = Arc::new(pg);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(now_ms));
+    let report = sweep_cas(
+        &db,
+        &tiered,
+        &cold_store,
+        &clock,
+        "gc-torn-fresh",
+        GcConfig {
+            workspace_ttl_ms: 30 * DAY_MS,
+            grace_ms: DAY_MS,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        report.residue.is_empty(),
+        "no error-level alarm while the flush may still be in flight"
+    );
+    let keys: Vec<String> = report
+        .suppressed_residue
+        .iter()
+        .map(|r| r.key.clone())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![format!("blobs/{torn_blob}")],
+        "the hole is still COUNTED — suppressed, not invisible"
+    );
+    assert_eq!(report.suppressed_residue[0].root, root);
+    assert_eq!(scarab_server::metrics::cas_gc_cold_residue(), 0);
+    assert_eq!(scarab_server::metrics::cas_gc_cold_residue_suppressed(), 1);
 
     tdb.cleanup().await;
 }
@@ -634,7 +930,7 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
     );
 
     // Sweep with no grace: the UNPINNED old run goes, the PINNED one stays.
-    let swept = sweep_cas(
+    let report = sweep_cas(
         &db,
         &cas,
         &store,
@@ -647,7 +943,7 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
     )
     .await
     .unwrap();
-    assert!(swept > 0, "the unpinned expired workspace was collected");
+    assert!(report.swept > 0, "the unpinned expired workspace was collected");
 
     let out = tempfile::tempdir().unwrap();
     cas.materialize(
@@ -811,7 +1107,7 @@ async fn an_expired_input_widens_a_rerun_back_to_clone_instead_of_failing() {
         + 60_000;
     let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(now_ms));
     let db: Arc<dyn Db> = Arc::new(pg);
-    let swept = sweep_cas(
+    let report = sweep_cas(
         &db,
         &cas,
         &store,
@@ -824,7 +1120,7 @@ async fn an_expired_input_widens_a_rerun_back_to_clone_instead_of_failing() {
     )
     .await
     .unwrap();
-    assert!(swept > 0, "the expired run's snapshots were collected");
+    assert!(report.swept > 0, "the expired run's snapshots were collected");
 
     let oracle = CasSnapshots(cas.clone());
     let snapshots: &dyn scarab_engine::WorkspaceSnapshots = &oracle;

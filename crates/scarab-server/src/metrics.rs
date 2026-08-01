@@ -43,6 +43,34 @@ pub fn forge_status_dead_lettered() -> u64 {
     FORGE_STATUS_DEAD_LETTERED.load(Ordering::Relaxed)
 }
 
+/// Marked (reachable) workspace objects the LAST CAS GC pass found MISSING
+/// from cold storage — the torn-cold alarm (ticket d4d3b95). Unlike the
+/// counters above these are **gauge-like: SET per pass, not accumulated**, so
+/// recovery (a repaired cold tier) is visible as the value returning to zero.
+/// Non-zero means reachable data survives only on the warm volume.
+static CAS_GC_COLD_RESIDUE: AtomicU64 = AtomicU64::new(0);
+
+/// Same, for residue the pass SUPPRESSED because its first-marking root is
+/// younger than the grace window (an ADR-0064 cold flush possibly in flight).
+/// Counted so a persistently-young hole is still watchable, just not alarmed.
+static CAS_GC_COLD_RESIDUE_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one CAS GC pass's torn-cold residue (alarmed, suppressed).
+pub fn set_cas_gc_cold_residue(alarmed: u64, suppressed: u64) {
+    CAS_GC_COLD_RESIDUE.store(alarmed, Ordering::Relaxed);
+    CAS_GC_COLD_RESIDUE_SUPPRESSED.store(suppressed, Ordering::Relaxed);
+}
+
+/// Torn-cold residue the last CAS GC pass alarmed on.
+pub fn cas_gc_cold_residue() -> u64 {
+    CAS_GC_COLD_RESIDUE.load(Ordering::Relaxed)
+}
+
+/// Torn-cold residue the last CAS GC pass suppressed as possibly-in-flight.
+pub fn cas_gc_cold_residue_suppressed() -> u64 {
+    CAS_GC_COLD_RESIDUE_SUPPRESSED.load(Ordering::Relaxed)
+}
+
 /// Append the counters to a Prometheus text exposition body.
 pub(crate) fn render(out: &mut String) {
     out.push_str(&format!(
@@ -55,6 +83,17 @@ scarab_forge_status_dead_lettered_total {}
 ",
         forge_status_failures(),
         forge_status_dead_lettered()
+    ));
+    out.push_str(&format!(
+        "# HELP scarab_cas_gc_cold_residue Reachable workspace objects the last GC pass found missing from cold storage (torn cold tier; alarmed).
+# TYPE scarab_cas_gc_cold_residue gauge
+scarab_cas_gc_cold_residue {}
+# HELP scarab_cas_gc_cold_residue_suppressed Torn-cold residue suppressed as possibly an in-flight flush (first-marking root younger than the grace window).
+# TYPE scarab_cas_gc_cold_residue_suppressed gauge
+scarab_cas_gc_cold_residue_suppressed {}
+",
+        cas_gc_cold_residue(),
+        cas_gc_cold_residue_suppressed()
     ));
     // The control plane's own view of the ADR-0061 tiering. The workspace
     // *service* exports the same counters from its own `/metrics`, and both are

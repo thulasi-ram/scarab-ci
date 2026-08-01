@@ -68,6 +68,7 @@ fn attempt(id: &str, started_at: i64) -> Attempt {
         id: AttemptId(id.into()),
         started_at: Timestamp(started_at),
         failure: None,
+        failure_detail: None,
         outcome: AttemptOutcome::Running,
     }
 }
@@ -197,9 +198,15 @@ async fn recorded_evidence_is_never_downgraded(db: &dyn Db) {
     db.record_attempt(&run, &step, &attempt("a1", 100))
         .await
         .unwrap();
-    db.set_attempt_failure(&run, &step, &AttemptId("a1".into()), FailureKind::Step)
-        .await
-        .unwrap();
+    db.set_attempt_failure(
+        &run,
+        &step,
+        &AttemptId("a1".into()),
+        FailureKind::Step,
+        Some("exit 1: tests failed"),
+    )
+    .await
+    .unwrap();
     db.record_attempt(&run, &step, &attempt("a1", 100))
         .await
         .unwrap();
@@ -207,6 +214,10 @@ async fn recorded_evidence_is_never_downgraded(db: &dyn Db) {
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].outcome, AttemptOutcome::Failed);
     assert_eq!(attempts[0].failure, Some(FailureKind::Step));
+    // The human-readable cause (4cf03d7) is evidence too: it survives the
+    // re-drive and reads back verbatim — kills a store that accepts the
+    // detail param and drops it (write not persisted, or read not selected).
+    assert_eq!(attempts[0].failure_detail.as_deref(), Some("exit 1: tests failed"));
 
     // a2: cancelled on purpose; its dying Pod's self-inflicted `Lost` (and any
     // later weaker outcome) must not clobber the intent verdict.
@@ -217,9 +228,15 @@ async fn recorded_evidence_is_never_downgraded(db: &dyn Db) {
     db.set_attempt_outcome(&run, &step, &a2, AttemptOutcome::Cancelled)
         .await
         .unwrap();
-    db.set_attempt_failure(&run, &step, &a2, FailureKind::Lost)
-        .await
-        .unwrap();
+    db.set_attempt_failure(
+        &run,
+        &step,
+        &a2,
+        FailureKind::Lost,
+        Some("self-inflicted teardown"),
+    )
+    .await
+    .unwrap();
     db.set_attempt_outcome(&run, &step, &a2, AttemptOutcome::Succeeded)
         .await
         .unwrap();
@@ -233,6 +250,11 @@ async fn recorded_evidence_is_never_downgraded(db: &dyn Db) {
     assert_eq!(
         a2_row.failure, None,
         "the rejected failure write must not leak its classification"
+    );
+    assert_eq!(
+        a2_row.failure_detail, None,
+        "the rejected failure write must not leak its detail either — the \
+         detail column moves in the SAME guarded UPDATE as the class"
     );
 }
 

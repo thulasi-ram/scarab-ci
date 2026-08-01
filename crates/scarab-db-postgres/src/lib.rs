@@ -95,7 +95,7 @@ impl PostgresDb {
     /// before `a2`. The in-memory `Db` (scarab-testkit) mirrors this exact order.
     pub async fn attempts(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
         let rows = sqlx::query(
-            "SELECT attempt_id, started_at, failure, outcome FROM attempts
+            "SELECT attempt_id, started_at, failure, failure_detail, outcome FROM attempts
              WHERE run_id = $1 AND step_id = $2
              ORDER BY started_at, CAST(substring(attempt_id FROM 2) AS INTEGER)",
         )
@@ -125,6 +125,7 @@ impl PostgresDb {
                     id: AttemptId(r.get::<String, _>("attempt_id")),
                     started_at: Timestamp(r.get::<i64, _>("started_at")),
                     failure,
+                    failure_detail: r.get::<Option<String>, _>("failure_detail"),
                     outcome,
                 })
             })
@@ -1342,8 +1343,9 @@ impl Db for PostgresDb {
         // refreshes (the launch handle is a separate column, written by
         // `set_attempt_handle`), so keep the existing row untouched.
         sqlx::query(
-            "INSERT INTO attempts (run_id, step_id, attempt_id, started_at, failure, outcome)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO attempts
+                 (run_id, step_id, attempt_id, started_at, failure, failure_detail, outcome)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (run_id, step_id, attempt_id) DO NOTHING",
         )
         .bind(&run.0)
@@ -1351,6 +1353,7 @@ impl Db for PostgresDb {
         .bind(&attempt.id.0)
         .bind(attempt.started_at.0)
         .bind(attempt.failure.map(failure_str))
+        .bind(attempt.failure_detail.as_deref())
         .bind(attempt.outcome.as_str())
         .execute(self.pool())
         .await
@@ -1408,9 +1411,11 @@ impl Db for PostgresDb {
         step: &StepId,
         attempt: &AttemptId,
         failure: FailureKind,
+        detail: Option<&str>,
     ) -> Result<(), DbError> {
-        // Record the classification and the `Failed` outcome together so the two
-        // columns never diverge (ADR-0056 amendment). Defense in depth: never
+        // Record the classification, the human-readable cause (4cf03d7) and the
+        // `Failed` outcome together so the columns never diverge (ADR-0056
+        // amendment). Defense in depth: never
         // downgrade a terminal-by-intent outcome — a rerun (`superseded`) or a
         // run cancel (`cancelled`) tore this attempt down on purpose, and the
         // self-inflicted `Lost` its dying Pod reports must not clobber that
@@ -1418,7 +1423,7 @@ impl Db for PostgresDb {
         // outcomes writable — `outcome` is nullable and `NULL NOT IN (…)` is NULL,
         // which would wrongly refuse the legitimate write to a pre-outcome row.
         sqlx::query(
-            "UPDATE attempts SET failure = $4, outcome = $5
+            "UPDATE attempts SET failure = $4, failure_detail = $5, outcome = $6
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3
                AND outcome IS DISTINCT FROM 'superseded'
                AND outcome IS DISTINCT FROM 'cancelled'",
@@ -1427,6 +1432,7 @@ impl Db for PostgresDb {
         .bind(&step.0)
         .bind(&attempt.0)
         .bind(failure_str(failure))
+        .bind(detail)
         .bind(AttemptOutcome::Failed.as_str())
         .execute(self.pool())
         .await
@@ -1783,7 +1789,10 @@ impl Db for PostgresDb {
         Ok(())
     }
 
-    async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError> {
+    async fn gc_workspace_roots(
+        &self,
+        terminal_cutoff: Timestamp,
+    ) -> Result<Vec<(String, Timestamp)>, DbError> {
         // EVERY attempt's snapshot is live while its run is (ADR-0056), not
         // just each step's latest — an old Take's workspace view must never
         // race the sweeper. The step_runs arm is kept for pre-ADR-0056 rows
@@ -1796,20 +1805,32 @@ impl Db for PostgresDb {
         // themselves collectable. Filtering the delete list instead would keep the
         // root object and sweep the blobs beneath it, i.e. keep a pointer to
         // nothing, which is the one outcome a pin must never produce.
+        //
+        // Each root travels with its RECORDING clock — when the reference row
+        // was written. `step_runs.updated_at` is stamped by `set_step_output`
+        // in the same UPDATE that writes the snapshot; attempts carry no write
+        // stamp, so their arm uses `started_at`, which can only be EARLIER
+        // than the recording. `MIN` per root keeps the earliest: one old
+        // recording proves the cold flush (ADR-0064) had time to land, so the
+        // sweeper's torn-cold alarm must not be suppressed merely because a
+        // younger run re-recorded the same root.
         let rows = sqlx::query(
-            "SELECT DISTINCT sr.output_snapshot AS root FROM step_runs sr
-             JOIN runs r ON r.id = sr.run_id
-             WHERE sr.output_snapshot IS NOT NULL
-               AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
-                    OR r.updated_at >= $1
-                    OR r.snapshots_pinned_at IS NOT NULL)
-             UNION
-             SELECT DISTINCT a.output_snapshot AS root FROM attempts a
-             JOIN runs r ON r.id = a.run_id
-             WHERE a.output_snapshot IS NOT NULL
-               AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
-                    OR r.updated_at >= $1
-                    OR r.snapshots_pinned_at IS NOT NULL)",
+            "SELECT root, MIN(at) AS recorded_at FROM (
+                 SELECT sr.output_snapshot AS root, sr.updated_at AS at FROM step_runs sr
+                 JOIN runs r ON r.id = sr.run_id
+                 WHERE sr.output_snapshot IS NOT NULL
+                   AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
+                        OR r.updated_at >= $1
+                        OR r.snapshots_pinned_at IS NOT NULL)
+                 UNION ALL
+                 SELECT a.output_snapshot AS root, a.started_at AS at FROM attempts a
+                 JOIN runs r ON r.id = a.run_id
+                 WHERE a.output_snapshot IS NOT NULL
+                   AND (r.status NOT IN ('succeeded', 'failed', 'cancelled', 'dead_lettered')
+                        OR r.updated_at >= $1
+                        OR r.snapshots_pinned_at IS NOT NULL)
+             ) refs
+             GROUP BY root",
         )
         .bind(terminal_cutoff.0)
         .fetch_all(self.pool())
@@ -1817,7 +1838,12 @@ impl Db for PostgresDb {
         .map_err(db_err)?;
         Ok(rows
             .into_iter()
-            .map(|r| r.get::<String, _>("root"))
+            .map(|r| {
+                (
+                    r.get::<String, _>("root"),
+                    Timestamp(r.get::<i64, _>("recorded_at")),
+                )
+            })
             .collect())
     }
 

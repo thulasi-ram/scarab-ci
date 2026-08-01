@@ -57,6 +57,7 @@ fn failed(class: FailureClass) -> ExecState {
     ExecState::Failed {
         exit_code: None,
         class,
+        cause: None,
     }
 }
 
@@ -332,6 +333,7 @@ async fn infra_exhaustion_dead_letters_but_code_verdict_fails() {
     exec.script_outcome(ExecState::Failed {
         exit_code: Some(2),
         class: FailureClass::Step,
+        cause: None,
     });
     for _ in 0..2 {
         Scheduler::new(&db, &clock, &exec, "sched")

@@ -124,33 +124,15 @@
 //! must never report a connection failure as `NotFound`, or an unreachable
 //! service would look like an empty one).
 //!
-//! # The canonicalisation-skew tripwire (`put_tree`/`tree_entries`) cannot fire in production, as written
+//! # Canonicalisation skew is detected at the Depot's PUT boundary, not here
 //!
-//! Both methods compare the hash warm returned against the hash cold returned
-//! and log/count a disagreement as a broken protocol (see the inline comments
-//! at the two call sites below). Their story is that this catches two
-//! *differently-versioned binaries* disagreeing on canonical form — plausible on
-//! its face, since the control plane's warm tier is a separate process reached
-//! over HTTP. It is not true of the code as it stands: the hash a tree is filed
-//! under is computed **client-side**. `WorkspaceClient::put_tree` calls
-//! `scarab_storage::canonical_tree` directly
-//! (`crates/scarab-workspace-client/src/lib.rs:331-335`) — the very function
-//! this crate exports, statically linked into and executed by the **control
-//! plane's own process**, not by whatever binary the Depot happens to be
-//! running. `cold.put_tree` computes the same hash via the same function in
-//! that same process. So `warm_hash` and `hash` are two calls to one compiled
-//! function on one input; they cannot disagree today, on either instance. This
-//! is a known limitation, recorded honestly rather than silently: the tripwire
-//! is not deleted here, because a client built against a stale `scarab-storage`
-//! talking to a newer Depot is a real (if narrower and differently-shaped)
-//! hazard than the one currently documented at the call sites, and the
-//! counters/logging cost nothing while idle.
-//!
-//! // TODO(git-bug): re-derive what hazard this tripwire actually guards against
-//! // now that canonicalisation is known to run client-side (client/library skew,
-//! // not server-version skew), or decide deliberately that it is not worth
-//! // keeping — rather than leaving the call sites' doc comments asserting a
-//! // scenario that cannot occur.
+//! Cross-binary canonicalisation skew — a client whose linked `scarab-storage`
+//! serialises trees differently from the Depot's — is caught by the Depot's
+//! `PUT /v1/cas/trees` handler, which re-canonicalises the parsed body through
+//! its **own** linked [`crate::canonical_tree_bytes`] and refuses a byte
+//! difference. This type used to carry a warm-vs-cold hash comparison claiming
+//! to be that check; it was unreachable, because both of its hashes came from
+//! one compiled function in one process and could never differ.
 //!
 //! # Read-path backfill into warm is deliberately best-effort — never fatal
 //!
@@ -385,43 +367,11 @@ impl Cas for TieredCas {
 
     async fn put_tree(&self, entries: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {
         let hash = self.cold.put_tree(entries.clone()).await?;
+        // No warm-vs-cold hash comparison here: both hashes would come from one
+        // compiled `canonical_tree_bytes` in this one process and could never
+        // differ. The real cross-binary skew check lives at the Depot's
+        // `PUT /v1/cas/trees` (see the module docs).
         match self.warm.put_tree(entries).await {
-            Ok(warm_hash) if warm_hash != hash => {
-                // Tripwire for the one hazard that would silently break the
-                // whole protocol: a tree hash is the hash of the tree's
-                // *canonical bytes*, so two tiers that canonicalise differently
-                // would file the same snapshot under two addresses and every
-                // lookup would half-work.
-                //
-                // **This is NOT reachable in production as written, and the
-                // "version skew" story below the old version of this comment
-                // used to tell is wrong.** In the control plane the warm tier is
-                // the workspace *service*, over HTTP — but `warm_hash` is not
-                // computed there: `WorkspaceClient::put_tree` calls
-                // `scarab_storage::canonical_tree` **client-side**
-                // (`crates/scarab-workspace-client/src/lib.rs:331-335`), in this
-                // same process, using this same statically-linked crate. `hash`
-                // (from `self.cold.put_tree` above) runs the identical function
-                // in the identical process. Two calls to one compiled function on
-                // one input cannot disagree, so this arm cannot fire today on
-                // either `TieredCas` instance. See the module docs, "The
-                // canonicalisation-skew tripwire ... cannot fire in production,
-                // as written", for the full accounting and a `TODO(git-bug)` for
-                // what to do about it — kept rather than deleted because a
-                // client built against a stale `scarab-storage` is a real,
-                // narrower hazard than the one this comment used to claim.
-                //
-                // `disagreeing_canonicalisation_between_tiers_is_reported` drives
-                // this arm with a deliberately-skewed test double, precisely
-                // because no real pair of tiers can reach it.
-                WARM_WRITE_FAILED.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(
-                    cold = %hash.0,
-                    warm = %warm_hash.0,
-                    "tree canonicalisation DISAGREES between warm and cold tiers — \
-                     the CAS wire format is broken (ADR-0061 D1.3)"
-                );
-            }
             Ok(_) => {}
             Err(e) => note_warm_write_failure("put_tree", &e),
         }
@@ -434,28 +384,11 @@ impl Cas for TieredCas {
             Err(e) if self.warm_read_miss(&e) => {
                 self.note_warm_read_miss("tree_entries", &e);
                 let entries = self.cold.tree_entries(hash).await?;
-                match self.warm.put_tree(entries.clone()).await {
-                    // Same tripwire as `put_tree` — and, per the module docs,
-                    // equally unreachable in production today, for the same
-                    // reason: `warm_hash` here comes from the same client-side
-                    // `canonical_tree` call as `*hash`. Kept anyway because here
-                    // it would matter more if it ever did fire: a backfill that
-                    // lands under a different address is not a backfill, it is a
-                    // leak, and every later read would still miss warm.
-                    Ok(warm_hash) if warm_hash != *hash => {
-                        WARM_BACKFILL_FAILED.fetch_add(1, Ordering::Relaxed);
-                        tracing::error!(
-                            requested = %hash.0,
-                            stored = %warm_hash.0,
-                            "warm backfill re-canonicalised a tree to a DIFFERENT hash — \
-                             refusing to trust the warm tier for it (ADR-0061 D1.3)"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        WARM_BACKFILL_FAILED.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(op = "tree_entries", error = %e, "warm backfill failed");
-                    }
+                // Best-effort backfill, same as `get_blob` — and no hash
+                // comparison on it, for the same reason as `put_tree` above.
+                if let Err(e) = self.warm.put_tree(entries.clone()).await {
+                    WARM_BACKFILL_FAILED.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(op = "tree_entries", error = %e, "warm backfill failed");
                 }
                 Ok(entries)
             }
@@ -493,111 +426,24 @@ impl Cas for TieredCas {
         }
     }
 
-    /// Snapshot `path` into **both** tiers, for whichever caller still drives a
-    /// whole-tree ingest through `TieredCas` rather than writing warm directly
-    /// and flushing cold in a batch. Cold decides success, for that caller —
-    /// same rule as `put_blob`/`put_tree`, and the same caveat about who that
-    /// caller now is: see the module docs.
+    /// `Cas::ingest` is **not tiered** — refused loudly, never half-honored.
     ///
-    /// # This walks the directory twice — the Depot's drain stopped paying for that, but the control plane's per-Step write still does
-    ///
-    /// **As of [ADR-0064](../../../docs/adr/0064-durability-tiering-and-the-write-path.md),
-    /// the Data Depot's own drain (`scarab-server`'s settle path) no longer
-    /// drives through this method.** It now writes warm directly, on its own
-    /// disk, and performs one batched cold flush afterward: one walk, no
-    /// network, and no second independent walk to ever disagree with the
-    /// first. That removes precisely the cost this section justifies below —
-    /// but only for that one caller.
-    ///
-    /// **It is not true more broadly, and this is the one place in this file
-    /// worth being emphatic about it: `TieredCas::ingest` is still on the live
-    /// write path for every non-Export Step.** `drive_workspace(cas: &dyn
-    /// Cas)` calls `.ingest(...)` at
-    /// `crates/scarab-executor-k8s/src/lib.rs:671`; the `cas` it receives is
-    /// the control plane's `TieredCas`, wired in via `with_workspace_cas`
-    /// (same file, line 217) from `crates/scarab-server/src/main.rs:216`. The
-    /// call is trait-object dispatch, which is why grepping for
-    /// `TieredCas::ingest` finds nothing — the caller is real, just not
-    /// spelled out at the call site. Every one of those Steps pays both walks
-    /// and the per-blob cold round trip below, today, in production.
-    /// `TieredCas::ingest` is not being kept around merely because this
-    /// module's own tests and `scarab-workspace-client`'s round-trip tests
-    /// happen to exercise it — they do, but that is incidental, not the
-    /// reason it cannot be deleted. Retiring the control plane's write leg
-    /// entirely is git-bug `212bb13` (see the module docs above); until that
-    /// lands, this method is load-bearing and the root-disagreement tripwire
-    /// below is live code, not dead weight kept out of caution. What follows
-    /// explains why the double walk was, and for this caller still is, the
-    /// right shape:
-    ///
-    /// The reasoning: the control plane's per-Step write path calls this (its
-    /// workspace `Cas` is a `TieredCas` whose warm tier is the workspace
-    /// service), so the second walk is paid on every Step boundary and has to
-    /// be justified rather than apologised for. It is not free: ADR-0061's s2
-    /// measurement puts this leg at **88% local filesystem** — reading every
-    /// file in order to hash it — so a second walk roughly doubles it.
-    ///
-    /// The two alternatives are both worse:
-    ///
-    /// - **A merkle-level copy** (walk the tree, pull each blob from cold, push
-    ///   it to warm) needs no second `stat`, but it moves the bytes over the
-    ///   network *twice more* for genuinely new content, and — decisively — it
-    ///   cannot be made concurrent here. `scarab-storage` is a pure domain crate
-    ///   with no `futures` dependency, so the copy would be one sequential
-    ///   round-trip per file, which is the *exact* pattern ADR-0061's s0
-    ///   measurement identified as the dominant cost and which the ADR forbids
-    ///   the new data path from reproducing. Delegating to `warm.ingest` instead
-    ///   reuses the adapter's own batched, concurrent implementation
-    ///   (`scarab-workspace-client`: one `POST /have`, then parallel uploads of
-    ///   only what is missing).
-    /// - **Writing warm first and letting the service tier onward** makes the
-    ///   warm tier load-bearing for durability, which part 4 forbids: a workspace
-    ///   service outage would then fail Steps that could have produced a
-    ///   perfectly durable snapshot.
-    ///
-    /// So, for as long as `drive_workspace`'s per-Step ingest is what drives
-    /// writes through this type — which today it still is — the ordering is
-    /// forced and the second walk is the price paid for it. ADR-0064 removed
-    /// the need to pay it at all *for the Depot's own drain*, by moving that
-    /// one caller to warm-direct-plus-batched-flush instead of finding a
-    /// cheaper way to pay it through this method. It did not touch the
-    /// control plane's caller. There is no port change recorded here to
-    /// eliminate the second walk on the control plane, because doing that is
-    /// git-bug `212bb13`'s job — retiring the write leg entirely — not a
-    /// cheaper redesign of this method to keep a write leg that may not need
-    /// to exist.
-    ///
-    /// Dedup bounds the *network* half today, for the caller that still pays
-    /// it: `warm.ingest` uploads only what the warm tier says it is missing,
-    /// so a re-drive of unchanged content moves no bytes at all. Only
-    /// genuinely new content is written to cold twice — once by this method's
-    /// cold leg, once by the service's own cold-first `PUT` — because neither
-    /// `ObjectStore` nor the wire protocol has an existence primitive that
-    /// would let either side skip (see the workspace service's `have`
-    /// handler). That specific trade-off is now historical for the Depot's
-    /// own drain, which no longer calls this — but it is live, not
-    /// historical, for `drive_workspace`'s per-Step ingest on the control
-    /// plane's instance.
-    async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
-        // Cold is the durability leg (part 4) for whichever caller still drives
-        // a whole-tree ingest through THIS type (module docs: as of ADR-0064
-        // the Depot's drain no longer does), so it goes first here and its
-        // error is that caller's error.
-        let snapshot = self.cold.ingest(path).await?;
-        match self.warm.ingest(path).await {
-            Ok(warm) if warm.root != snapshot.root => {
-                WARM_WRITE_FAILED.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    cold = %snapshot.root.0,
-                    warm = %warm.root.0,
-                    "warm ingest produced a different root than cold — the directory changed \
-                     under the two walks; warm holds an unrelated snapshot (ADR-0061)"
-                );
-            }
-            Ok(_) => {}
-            Err(e) => note_warm_write_failure("ingest", &e),
-        }
-        Ok(snapshot)
+    /// Both drain paths now write WARM directly and make durability a separate,
+    /// awaited step (ADR-0064): the Depot's own drain writes its local disk and
+    /// batch-flushes cold; the control plane's `drive_workspace` ingests to the
+    /// Depot via `scarab-workspace-client` and awaits `flush` before releasing
+    /// the sidecar. The old override here (cold-first double walk, with a
+    /// root-disagreement tripwire between the two walks) had exactly one
+    /// production caller — `drive_workspace`, via `dyn Cas` — and that caller
+    /// is rewired. Because trait-object dispatch is invisible to grep, a caller
+    /// this crate cannot see could still reach the trait method: returning an
+    /// error makes such a miss fail its Step loudly instead of silently paying
+    /// two walks — or worse, quietly writing a snapshot whose durability nobody
+    /// then flushes.
+    async fn ingest(&self, _path: &str) -> Result<Snapshot, StorageError> {
+        Err(StorageError::Backend(
+            "ingest is not tiered — drains write warm then flush (ADR-0064)".into(),
+        ))
     }
 }
 
@@ -956,61 +802,6 @@ mod tests {
             tiered.get_blob(&blob).await,
             Err(StorageError::Backend(_))
         ));
-    }
-
-    /// The canonicalisation tripwire, reached.
-    ///
-    /// It was previously unreachable in tests because both tiers were built from
-    /// one `FakeCas`, and two instances of one function cannot disagree. In
-    /// production they are not one function: the control plane's warm tier is the
-    /// workspace *service*, over HTTP, canonicalising in whatever binary is
-    /// deployed there (ADR-0061 s8 keeps the tripwire for exactly that skew). So
-    /// the test needs two tiers that really do disagree.
-    #[tokio::test]
-    async fn disagreeing_canonicalisation_between_tiers_is_reported() {
-        /// A `Cas` that files trees under a *different* canonical form — a
-        /// stand-in for a deployed peer built before a canonicalisation change.
-        struct SkewedTrees;
-        #[async_trait]
-        impl Cas for SkewedTrees {
-            async fn put_blob(&self, _: &[u8]) -> Result<BlobHash, StorageError> {
-                Ok(BlobHash("b".into()))
-            }
-            async fn get_blob(&self, _: &BlobHash) -> Result<Vec<u8>, StorageError> {
-                Err(StorageError::NotFound)
-            }
-            async fn put_tree(&self, _: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {
-                Ok(TreeHash("a-different-canonical-form".into()))
-            }
-            async fn tree_entries(&self, _: &TreeHash) -> Result<Vec<TreeEntry>, StorageError> {
-                Err(StorageError::NotFound)
-            }
-            async fn materialize(&self, _: &TreeHash, _: &str) -> Result<(), StorageError> {
-                Ok(())
-            }
-            async fn ingest(&self, _: &str) -> Result<Snapshot, StorageError> {
-                Err(StorageError::NotFound)
-            }
-        }
-
-        let cold = Arc::new(FakeCas::default());
-        let before = warm_write_failed_total();
-        let tiered = TieredCas::new(Arc::new(SkewedTrees), cold.clone());
-        // The caller still gets COLD's address — the only one that is durable and
-        // the only one anything else in the system will look under.
-        let hash = tiered.put_tree(vec![entry("a")]).await.unwrap();
-        assert_eq!(hash, TreeHash(FakeCas::tree_key(&[entry("a")])));
-        // …and the disagreement was recorded rather than shrugged off.
-        assert!(warm_write_failed_total() > before);
-
-        // The backfill half of the same tripwire: a warm write that lands under a
-        // different address is a leak, not a backfill, and every later read would
-        // still miss warm.
-        let root = cold.put_tree(vec![entry("z")]).await.unwrap();
-        let before = warm_backfill_failed_total();
-        let tiered = TieredCas::new(Arc::new(SkewedTrees), cold);
-        assert_eq!(tiered.tree_entries(&root).await.unwrap().len(), 1);
-        assert!(warm_backfill_failed_total() > before);
     }
 
     /// The GC's view of the store is the DURABLE set, never the cache.

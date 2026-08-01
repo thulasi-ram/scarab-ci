@@ -251,6 +251,13 @@ pub struct Attempt {
     pub id: AttemptId,
     pub started_at: Timestamp,
     pub failure: Option<FailureKind>,
+    /// The executor's human-readable cause for a `Failed` attempt (ticket
+    /// 4cf03d7) — e.g. "cold tier refused: connection refused" from a
+    /// lost-evidence drain — alongside the machine-consumed `failure` class.
+    /// `#[serde(default)]` keeps rows/blobs written before the column existed
+    /// decodable; `None` means the class alone is the whole story.
+    #[serde(default)]
+    pub failure_detail: Option<String>,
     /// The recorded terminal (or in-flight) outcome of this attempt (ADR-0056
     /// amendment). `Running` until an outcome is written; `Superseded` and
     /// `Cancelled` are the non-failure terminations that must never render as a
@@ -732,6 +739,12 @@ pub enum EventPayload {
         step: StepId,
         attempt: AttemptId,
         failure: Option<FailureKind>,
+        /// The executor's human-readable cause for the failure, when it
+        /// reported one (ticket 4cf03d7). Explicitly `#[serde(default)]`:
+        /// this event IS persisted in the events table and replayed, so a row
+        /// appended before the field existed must still deserialize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<String>,
     },
     /// A single approval was recorded against a `manual` gate by the named
     /// principal (ADR-0037). Append-only, accumulating — the run stays suspended
@@ -1138,6 +1151,7 @@ impl StepRun {
             id: attempt.clone(),
             started_at: at,
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Running,
         });
         Ok(vec![
@@ -1219,6 +1233,9 @@ impl StepRun {
                     step: self.step.clone(),
                     attempt,
                     failure,
+                    // The pure state machine has no executor to ask; the
+                    // scheduler's settle path is where causes are known.
+                    cause: None,
                 },
                 at,
             ),
@@ -1445,5 +1462,53 @@ mod tests {
             }
             other => panic!("expected RunRerunRequested, got {other:?}"),
         }
+    }
+
+    /// ADR-0064 / ticket 4cf03d7: `AttemptFinished` gained `cause`, and the
+    /// events table replays rows written before it existed. A literal
+    /// pre-`cause` JSON row must still deserialize (with `cause: None`) —
+    /// kills removing the field's `#[serde(default)]`, which would make every
+    /// replay of an old run's log fail at the first finished attempt.
+    #[test]
+    fn attempt_finished_without_cause_still_deserializes() {
+        let old = r#"{"AttemptFinished":{"step":"build","attempt":"a1","failure":{"Infra":{"never_started":false}}}}"#;
+        let payload: EventPayload = serde_json::from_str(old).expect("pre-cause row deserializes");
+        match payload {
+            EventPayload::AttemptFinished {
+                step,
+                attempt,
+                failure,
+                cause,
+            } => {
+                assert_eq!(step, StepId("build".into()));
+                assert_eq!(attempt, AttemptId("a1".into()));
+                assert_eq!(
+                    failure,
+                    Some(FailureKind::Infra {
+                        never_started: false
+                    })
+                );
+                assert_eq!(cause, None, "an old row simply has no recorded cause");
+            }
+            other => panic!("expected AttemptFinished, got {other:?}"),
+        }
+    }
+
+    /// And a cause that IS recorded survives the round-trip — kills a
+    /// `skip_serializing` (unconditional) mutation that would accept the cause
+    /// in memory and lose it in the persisted event.
+    #[test]
+    fn attempt_finished_cause_round_trips() {
+        let payload = EventPayload::AttemptFinished {
+            step: StepId("build".into()),
+            attempt: AttemptId("a2".into()),
+            failure: Some(FailureKind::Infra {
+                never_started: false,
+            }),
+            cause: Some("cold tier refused: connection refused".into()),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        let back: EventPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, payload);
     }
 }

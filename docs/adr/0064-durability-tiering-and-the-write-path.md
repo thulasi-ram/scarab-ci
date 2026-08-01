@@ -119,6 +119,48 @@ This ADR writes warm-first and **does not let the service tier onward asynchrono
 synchronous with respect to `Succeeded`. Warm is the write *path*; cold remains the *promise* wherever
 it exists. Asynchronous archival was considered and rejected — see below.
 
+### The control plane's write leg (added 2026-08-01)
+
+The decision above was built Depot-side first, and its "one walk, no network" phrasing is true of
+exactly one topology: the Depot's own drain, whose warm tier is its local disk. This section extends
+warm-first to the **control plane**, whose warm tier is the Depot *over HTTP*, and states what the
+words mean there — because the same slogan quietly overclaims on that leg.
+
+**Warm-first on the control plane means one deduped HTTP walk plus one flush RPC — not "no
+network".** The per-Step drain uploads through the Depot's PUT verbs (`WorkspaceClient::ingest`: one
+batched `/have`, then parallel PUTs of only what is missing), and then calls **`POST /v1/cas/flush`**
+with the snapshot root. The win over the cold-first shape is real but different from the Depot's: the
+double walk and the double cold write of 0061's "price of seeding the warm tier" bullet go, and the
+cold tier sees one batched, probed flush instead of a round trip per object — but every object still
+crosses the network once to reach the Depot's warm tier.
+
+**The Depot's PUT handlers are warm-only, and the flush RPC is the only cold writer.** The PUTs used
+to write cold-first through `TieredObjectStore::put` — that was the old durability leg, and part 4's
+invariant rode on it. The invariant did not weaken; it **migrated into the flush contract**: "an
+Attempt is not `Succeeded` until its snapshot is durable" is now "the caller awaits the flush — the
+settle path's internal flush phase, or the `/v1/cas/flush` RPC — before reporting `Succeeded`". The
+flush's refusals split on the one axis a caller acts on: `422 retryable: false` for an addressing
+disagreement between the tiers (the only fatal class — no retry converges two binaries that
+canonicalise differently), `503 retryable: true` for everything else, **including a warm miss** — a
+wiped Depot warm tier is recoverable, because the re-driven drain re-uploads via `/have` before the
+retried flush, so answering fatal there would strand a provably repairable state. The flush requires
+the control plane's own token scope (`browse`): unlike a content-addressed PUT it is not harmless
+under any valid token — it commands cold round trips for arbitrary roots.
+
+**A Depot outage MAY fail Attempts — promptly and with a named cause, never as a timeout.** This is
+the availability question 0061 answered by forbidding warm-first on the control plane, decided the
+other way (architect's decision): the Depot is now on the write path *and* the durability path of
+every workspace Step, so when it is down, Steps whose evidence cannot be drained fail, saying so.
+What is bought with that coupling is the end of the double write and of the tar-tunnel-era shape;
+what is kept is legibility — the failure names the Depot and the leg (upload vs flush), and the
+`retryable` verdict tells the caller whether re-driving can ever help. 0061's prohibition is marked
+superseded in place, with the reasoning preserved.
+
+**Reads keep the fall-through.** Nothing here touches the read side: the control plane's `TieredCas`
+still opts into `fall_through_on_warm_error`, so a rolling or unreachable Depot degrades Browse, the
+GC mark walk and rerun widening to *slower*, never *wrong*. The write leg is where the coupling was
+accepted; the read leg still refuses it.
+
 ## Alternatives considered
 
 - **Keep cold-first per blob (status quo).** The invariant comes free and needs no disclosure

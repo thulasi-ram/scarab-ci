@@ -172,8 +172,44 @@ pub struct GcConfig {
 const GC_LEASE: &str = "cas-gc";
 const GC_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
 
-/// One mark-sweep pass over the workspace CAS (ADR-0050). Returns the number
-/// of objects swept. Leader-gated on its own lease.
+/// One reachable object the mark walk could read (through the tiered handle —
+/// which may have been served by the WARM tier) that the cold listing does not
+/// contain: the torn-cold detection of ticket d4d3b95. Every one of these is a
+/// live object one warm-volume failure away from being unrecoverable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdResidue {
+    /// The missing object's cold key (`trees/<hash>` or `blobs/<hash>`).
+    pub key: String,
+    /// The FIRST root whose walk reached the object — where an operator
+    /// starts looking. First-writer-wins is exactly the order the walk's
+    /// shared-subtree short-circuit already imposes, so recording it is free.
+    pub root: String,
+    /// When that root was recorded — the suppression clock.
+    pub root_recorded_at: Timestamp,
+}
+
+/// What one CAS GC pass did — and what it found missing.
+#[derive(Debug, Default)]
+pub struct CasSweepReport {
+    /// Unmarked cold objects deleted.
+    pub swept: u32,
+    /// Marked objects ABSENT from the cold listing, alarmed at error level:
+    /// cold is silently missing reachable data and only the warm tier is
+    /// keeping reads (and the mark walk itself) green.
+    pub residue: Vec<ColdResidue>,
+    /// Residue whose first-marking root is younger than the grace window: an
+    /// ADR-0064 cold flush may still be in flight, so it is counted and
+    /// logged at debug level, never alarmed.
+    pub suppressed_residue: Vec<ColdResidue>,
+}
+
+/// Bound on per-object residue error lines in one pass — the alarm must not
+/// become a thousand-line spam when a whole volume tears.
+const RESIDUE_LOG_CAP: usize = 50;
+
+/// One mark-sweep pass over the workspace CAS (ADR-0050). Returns what it did
+/// and what it found missing ([`CasSweepReport`]). Leader-gated on its own
+/// lease; a non-leader replica returns an empty report.
 ///
 /// - **Mark**: walk every root the Db reports reachable (all non-terminal
 ///   runs + terminal runs within TTL), collecting `trees/<h>` + `blobs/<h>`.
@@ -183,6 +219,13 @@ const GC_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
 ///   wedge GC forever, and the Db then FORGETS that root so the skip is
 ///   reported once rather than on every pass forever.
 /// - **Sweep**: delete unmarked objects older than the grace window.
+/// - **Torn-cold detection** (ticket d4d3b95): the mark walk reads through
+///   the TIERED handle, so an object the warm tier still holds marks clean
+///   even when cold silently lost it. The residue diff `marked − cold
+///   listing` (the sweep already lists all of cold) is exactly that hole;
+///   each entry is alarmed with its address and first-marking root.
+///   Detection only — the objects stay marked (so the sweep cannot delete
+///   them) and re-upload-from-warm is a filed follow-up, not this slice.
 pub async fn sweep_cas(
     db: &Arc<dyn Db>,
     cas: &Arc<dyn scarab_storage::Cas>,
@@ -190,13 +233,13 @@ pub async fn sweep_cas(
     clock: &Arc<dyn Clock>,
     owner: &str,
     cfg: GcConfig,
-) -> Result<u32, String> {
+) -> Result<CasSweepReport, String> {
     let lease = db
         .lease(GC_LEASE, owner, GC_LEASE_TTL_MS)
         .await
         .map_err(|e| e.to_string())?;
     if lease.owner != owner {
-        return Ok(0);
+        return Ok(CasSweepReport::default());
     }
     let now = clock.now().await;
 
@@ -207,56 +250,77 @@ pub async fn sweep_cas(
         .map_err(|e| e.to_string())?;
     // Which hashes came straight from the Db, as opposed to being discovered
     // under a parent tree: only a ROOT is a reference the Db can forget.
-    let root_set: std::collections::HashSet<String> = roots.iter().cloned().collect();
-    let mut marked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let root_set: std::collections::HashSet<String> =
+        roots.iter().map(|(h, _)| h.clone()).collect();
+    // Marked key → index (into `roots`) of the FIRST root whose walk reached
+    // it. Walking per-root and recording provenance only on first insertion
+    // keeps the shared-subtree short-circuit — and thus the walk cost —
+    // exactly what it was; the provenance is the order the dedup already chose.
+    let mut marked: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Keys the walk itself proved absent from BOTH tiers (dangling roots, torn
+    // inner trees). Each is reported on its own path below and must not ALSO
+    // surface as cold residue: residue means "warm still has it, cold does
+    // not", and these have neither.
+    let mut walk_missing: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut dangling_roots: Vec<String> = Vec::new();
-    let mut frontier: Vec<String> = roots;
-    while let Some(hash) = frontier.pop() {
-        if !marked.insert(format!("trees/{hash}")) {
-            continue; // shared subtree already walked (the dedup win)
-        }
-        let entries = match cas
-            .tree_entries(&scarab_storage::TreeHash(hash.clone()))
-            .await
-        {
-            Ok(entries) => entries,
-            // A MISSING tree is a dangling reference (e.g. a run recorded before
-            // the object store was switched, whose blobs were wiped): the
-            // subtree doesn't exist, so there is nothing under it to mark and
-            // skipping it cannot endanger the sweep — anything it would have
-            // referenced is itself absent (and thus already garbage). Log and
-            // continue, so one lost object can't wedge GC forever. ANY OTHER
-            // error may be transient over a tree that DOES exist, where an
-            // unmarked-but-live blob could then be swept — stay conservative
-            // and abort the pass (a missed mark must never delete a live object).
-            Err(scarab_storage::StorageError::NotFound) if root_set.contains(&hash) => {
-                tracing::warn!(
-                    tree = %hash,
-                    "cas gc: root tree missing (dangling reference) — forgetting"
-                );
-                dangling_roots.push(hash);
-                continue;
+    for (root_idx, (root, _)) in roots.iter().enumerate() {
+        let mut frontier: Vec<String> = vec![root.clone()];
+        while let Some(hash) = frontier.pop() {
+            let key = format!("trees/{hash}");
+            if marked.contains_key(&key) {
+                continue; // shared subtree already walked (the dedup win)
             }
-            Err(scarab_storage::StorageError::NotFound) => {
-                // NOT a root: a parent tree that DOES exist referenced this
-                // subtree, so the CAS is partially torn rather than merely
-                // stale. There is nothing under it to mark (so the sweep stays
-                // safe) and no Db reference to forget — but unlike a stale root
-                // this is real corruption, so say so at a louder level.
-                tracing::error!(
-                    tree = %hash,
-                    "cas gc: inner tree missing under a live parent (torn CAS) — skipping"
-                );
-                continue;
-            }
-            Err(e) => return Err(format!("mark walk of tree {hash}: {e} — aborting pass")),
-        };
-        for entry in entries {
-            match entry.target {
-                scarab_storage::TreeTarget::Blob(b) => {
-                    marked.insert(format!("blobs/{}", b.0));
+            marked.insert(key.clone(), root_idx);
+            let entries = match cas
+                .tree_entries(&scarab_storage::TreeHash(hash.clone()))
+                .await
+            {
+                Ok(entries) => entries,
+                // A MISSING tree is a dangling reference (e.g. a run recorded before
+                // the object store was switched, whose blobs were wiped): the
+                // subtree doesn't exist, so there is nothing under it to mark and
+                // skipping it cannot endanger the sweep — anything it would have
+                // referenced is itself absent (and thus already garbage). Log and
+                // continue, so one lost object can't wedge GC forever. ANY OTHER
+                // error may be transient over a tree that DOES exist, where an
+                // unmarked-but-live blob could then be swept — stay conservative
+                // and abort the pass (a missed mark must never delete a live object).
+                //
+                // NOTE this NotFound came through the TIERED read: it means BOTH
+                // tiers miss the tree. A root that cold lost but warm still holds
+                // reads fine here, is never pushed to `dangling_roots`, and so is
+                // never forgotten — it surfaces as residue below instead.
+                Err(scarab_storage::StorageError::NotFound) if root_set.contains(&hash) => {
+                    tracing::warn!(
+                        tree = %hash,
+                        "cas gc: root tree missing (dangling reference) — forgetting"
+                    );
+                    walk_missing.insert(key);
+                    dangling_roots.push(hash);
+                    continue;
                 }
-                scarab_storage::TreeTarget::Tree(t) => frontier.push(t.0),
+                Err(scarab_storage::StorageError::NotFound) => {
+                    // NOT a root: a parent tree that DOES exist referenced this
+                    // subtree, so the CAS is partially torn rather than merely
+                    // stale. There is nothing under it to mark (so the sweep stays
+                    // safe) and no Db reference to forget — but unlike a stale root
+                    // this is real corruption, so say so at a louder level.
+                    tracing::error!(
+                        tree = %hash,
+                        "cas gc: inner tree missing under a live parent (torn CAS) — skipping"
+                    );
+                    walk_missing.insert(key);
+                    continue;
+                }
+                Err(e) => return Err(format!("mark walk of tree {hash}: {e} — aborting pass")),
+            };
+            for entry in entries {
+                match entry.target {
+                    scarab_storage::TreeTarget::Blob(b) => {
+                        marked.entry(format!("blobs/{}", b.0)).or_insert(root_idx);
+                    }
+                    scarab_storage::TreeTarget::Tree(t) => frontier.push(t.0),
+                }
             }
         }
     }
@@ -280,14 +344,19 @@ pub async fn sweep_cas(
     }
 
     // --- Sweep. --------------------------------------------------------
+    // The listing is COLD's, and it is complete (`S3Storage::list_objects`
+    // collects the full paginated stream) — so it doubles as the durable-set
+    // census the residue diff below needs.
     let mut swept = 0u32;
+    let mut in_cold: std::collections::HashSet<String> = std::collections::HashSet::new();
     for prefix in ["trees/", "blobs/"] {
         let objects = store
             .list_objects(prefix)
             .await
             .map_err(|e| e.to_string())?;
         for obj in objects {
-            if marked.contains(&obj.key) {
+            if marked.contains_key(&obj.key) {
+                in_cold.insert(obj.key);
                 continue;
             }
             if now.0 - obj.modified_ms < cfg.grace_ms {
@@ -300,10 +369,78 @@ pub async fn sweep_cas(
             swept += 1;
         }
     }
+
+    // --- Torn-cold detection (ticket d4d3b95). --------------------------
+    // Residue is `marked − cold listing`, and ONLY that direction: cold-extra
+    // objects are the ordinary sweep candidates above, never residue. Every
+    // entry here read fine through the tiered handle (i.e. warm still holds
+    // it) yet is absent from the durable tier — one warm-volume failure from
+    // unrecoverable. The objects stay marked, so the sweep above cannot have
+    // deleted them, and their roots were never proven dead, so the self-heal
+    // above cannot have forgotten them. Detection only in this slice.
+    let mut residue: Vec<ColdResidue> = Vec::new();
+    let mut suppressed_residue: Vec<ColdResidue> = Vec::new();
+    for (key, root_idx) in &marked {
+        if in_cold.contains(key) || walk_missing.contains(key) {
+            continue;
+        }
+        let (root, recorded_at) = &roots[*root_idx];
+        let item = ColdResidue {
+            key: key.clone(),
+            root: root.clone(),
+            root_recorded_at: *recorded_at,
+        };
+        // A root recorded moments ago may have its cold flush still in flight
+        // (ADR-0064): count it, but do not cry wolf. Deliberately the SAME
+        // window the sweep already trusts for in-flight ingests — no new knob.
+        if now.0 - recorded_at.0 < cfg.grace_ms {
+            suppressed_residue.push(item);
+        } else {
+            residue.push(item);
+        }
+    }
+    residue.sort_by(|a, b| a.key.cmp(&b.key));
+    suppressed_residue.sort_by(|a, b| a.key.cmp(&b.key));
+    for r in residue.iter().take(RESIDUE_LOG_CAP) {
+        tracing::error!(
+            object = %r.key,
+            root = %r.root,
+            "cas gc: reachable object MISSING from cold storage (torn cold tier) — only \
+             the warm tier still holds it, and it becomes unrecoverable if that volume \
+             dies; re-upload from warm is a filed follow-up, not automated here"
+        );
+    }
+    if residue.len() > RESIDUE_LOG_CAP {
+        tracing::error!(
+            total = residue.len(),
+            logged = RESIDUE_LOG_CAP,
+            "cas gc: more torn-cold residue than the per-pass log cap"
+        );
+    }
+    for r in &suppressed_residue {
+        tracing::debug!(
+            object = %r.key,
+            root = %r.root,
+            root_recorded_at = r.root_recorded_at.0,
+            "cas gc: cold residue under a root younger than the grace window — possibly \
+             an ADR-0064 flush still in flight; suppressed"
+        );
+    }
+    // Gauge-like, SET per pass rather than accumulated, so a repaired cold
+    // tier is visible as the value returning to zero.
+    crate::metrics::set_cas_gc_cold_residue(
+        residue.len() as u64,
+        suppressed_residue.len() as u64,
+    );
+
     if swept > 0 {
         tracing::info!(swept, marked = marked.len(), "cas gc pass complete");
     }
-    Ok(swept)
+    Ok(CasSweepReport {
+        swept,
+        residue,
+        suppressed_residue,
+    })
 }
 
 /// Spawn the background sweeper: one retention pass + one CAS GC pass every

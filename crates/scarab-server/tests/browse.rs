@@ -259,6 +259,7 @@ async fn run_detail_exposes_attempt_list_for_reruns() {
             failure: Some(FailureKind::Infra {
                 never_started: false,
             }),
+            failure_detail: None,
             outcome: AttemptOutcome::Failed,
         },
     )
@@ -271,6 +272,7 @@ async fn run_detail_exposes_attempt_list_for_reruns() {
             id: AttemptId("a2".into()),
             started_at: Timestamp(20),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Succeeded,
         },
     )
@@ -311,6 +313,7 @@ async fn step_logs_scope_by_attempt() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(10),
             failure: Some(FailureKind::Step),
+            failure_detail: None,
             outcome: AttemptOutcome::Failed,
         },
     )
@@ -323,6 +326,7 @@ async fn step_logs_scope_by_attempt() {
             id: AttemptId("a2".into()),
             started_at: Timestamp(20),
             failure: None,
+            failure_detail: None,
             outcome: AttemptOutcome::Succeeded,
         },
     )

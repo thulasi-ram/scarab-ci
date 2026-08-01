@@ -162,37 +162,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // retention table gives it a TTL and calls it "the guarantee users are given".
     let cold_cas: Arc<dyn scarab_storage::Cas> = storage;
 
-    // The workspace `Cas` this process hands to Browse, the GC mark walk, the
-    // rerun-widening oracle, the drain and the debug pod (ADR-0061 D1.6).
-    //
-    // WARM = the workspace service, over HTTP. COLD = the object store above,
-    // direct. That composition is not a nicety, it is the three answers D1.6
-    // gives, in one type:
-    //
-    //  * **reads fall through to cold** when the service is unreachable. This
-    //    process already holds object-store credentials, so going direct crosses
-    //    no trust boundary and creates no second data path for Steps — the
-    //    literal reading of "a warm miss is slower, never wrong". Note this is
-    //    the OPPOSITE of a Step Pod, which must fail closed: a Pod has no
-    //    credentials, by design (ADR-0042).
-    //  * **writes through THIS handle go cold first**, so a cold failure is an
-    //    error while a service failure is `Ok` plus a warning plus a counter.
-    //  * **a write through this handle therefore populates the warm tier too.**
-    //    Without it the warm tier is filled only by the service's own read-path
-    //    backfill, so the first fetch of every snapshot is a guaranteed cold miss
-    //    — and in a DAG most edges are consumed once, immediately after being
-    //    produced. The volume would earn nothing until a second consumer appeared.
-    //
-    // **Cold-first is this handle's ordering and not the system's**, which is worth
-    // being exact about now that the two differ. ADR-0064 part 1 makes the *Data
-    // Depot's* own write path warm-first plus one batched archival flush that the
-    // settle response waits for — that is where a Step's evidence is drained, and
-    // it keeps ADR-0061 part 4's guarantee by awaiting the flush rather than by
-    // ordering each blob. Here, warm is the Depot **over HTTP**, and inverting the
-    // order would make a Depot outage fail every Step that could otherwise have
-    // produced a perfectly durable snapshot. That availability question is
-    // unresolved and deliberately not answered here; retiring this handle in favour
-    // of the service's own path is git-bug `212bb13`, not ADR-0064 slice 1.
+    // The Depot client (ADR-0061/0064): ONE client, two jobs. As `Arc<dyn Cas>`
+    // it is the warm tier of the tiered READ handle below; held concretely it
+    // is also the executor's DRAIN handle, because the drain needs `flush` —
+    // a client capability, not a `Cas` port method.
     //
     // The token is minted **per request**, in `browse` scope, for this process's
     // own use (`workspace_token::browse_claims`). Per-request rather than once at
@@ -200,11 +173,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // would start 401-ing a day later from nothing anyone changed, and minting
     // one with no meaningful expiry would rebuild the results token's wart that
     // ADR-0061 D1.4 refused to inherit.
-    let workspace_cas: Arc<dyn scarab_storage::Cas> = match &config.workspace {
-        Some(ws) => {
+    let depot_client: Option<Arc<scarab_workspace_client::WorkspaceClient>> =
+        config.workspace.as_ref().map(|ws| {
             use scarab_executor_k8s::workspace_token;
             let secret = ws.token_secret.clone();
-            let client = scarab_workspace_client::WorkspaceClient::with_minted_token(
+            Arc::new(scarab_workspace_client::WorkspaceClient::with_minted_token(
                 ws.url.clone(),
                 move || {
                     let now = std::time::SystemTime::now()
@@ -216,22 +189,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &workspace_token::browse_claims(now + BROWSE_TOKEN_TTL_SECS),
                     )
                 },
-            );
+            ))
+        });
+
+    // The workspace `Cas` this process hands to Browse, the GC mark walk, the
+    // rerun-widening oracle and the debug pod (ADR-0061 D1.6) — and the READ
+    // half of the executor's drain.
+    //
+    // WARM = the workspace service, over HTTP. COLD = the object store above,
+    // direct. **This is a read-and-repair handle now, not a write path**
+    // (ADR-0064 control-plane half):
+    //
+    //  * **reads fall through to cold** when the service is unreachable. This
+    //    process already holds object-store credentials, so going direct crosses
+    //    no trust boundary and creates no second data path for Steps — the
+    //    literal reading of "a warm miss is slower, never wrong". Note this is
+    //    the OPPOSITE of a Step Pod, which must fail closed: a Pod has no
+    //    credentials, by design (ADR-0042).
+    //  * **the drain does NOT write through it.** The old shape ingested every
+    //    Step's snapshot cold-first through this handle and re-walked the
+    //    directory for warm (`TieredCas::ingest`, now deleted — it refuses
+    //    loudly if anything still reaches it through `dyn Cas`). The drain is
+    //    warm-first via `depot_client` above — one walk, `/have`-dedup, and
+    //    prune-minted trees land warm only — followed by ONE awaited
+    //    `flush(published_root)`: the Depot uploads the closure to cold and
+    //    only `Durable` releases the verdict. ADR-0061 part 4's guarantee is
+    //    kept by awaiting the flush, not by ordering each blob; a Depot outage
+    //    fails Attempts promptly and legibly (`Infra` + cause, time-bounded —
+    //    ticket 4cf03d7), never as a step-budget timeout.
+    //  * **stray writes** (`put_blob`/`put_tree` from anything that is not the
+    //    drain) keep the old cold-first rule: cold decides success, a warm
+    //    failure is a warning plus a counter.
+    let workspace_cas: Arc<dyn scarab_storage::Cas> = match &depot_client {
+        Some(client) => {
             tracing::info!(
-                url = %ws.url,
+                url = %config.workspace.as_ref().map(|ws| ws.url.as_str()).unwrap_or_default(),
                 "workspace snapshots: warm = the workspace service, cold = the object store \
-                 (ADR-0061 D1.6; reads fall through to cold, and writes THROUGH THIS HANDLE are \
-                 cold-first — the Depot's own drain is warm-first plus a batched flush, ADR-0064)"
+                 (ADR-0061 D1.6 reads fall through to cold; the drain is warm-first + one \
+                 awaited cold flush on the Depot, ADR-0064)"
             );
             Arc::new(
-                scarab_storage::tiered::TieredCas::new(Arc::new(client), cold_cas)
+                scarab_storage::tiered::TieredCas::new(client.clone(), cold_cas)
                     .fall_through_on_warm_error(),
             )
         }
         // No service configured: the object store IS the whole store. The
         // executor already refuses to launch a step that inherits a workspace in
-        // this state (fail-closed), so this path serves Browse and GC over
-        // pre-ADR-0061 snapshots and nothing else.
+        // this state (fail-closed) and its drain writes this handle directly
+        // (durable by construction, nothing to flush), so this path serves
+        // Browse and GC over pre-ADR-0061 snapshots and drain-less dev.
         None => cold_cas,
     };
     let logs = Arc::new(LogService::new(store.clone(), db.clone()));
@@ -444,6 +450,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .with_default_step_timeout_secs(config.step_timeout_secs)
                         // Workspace flow (ADR-0029/0045): materialize `needs`
                         // into /workspace, snapshot it back after the step.
+                        // This is the drain's READ half (tiered, falls through
+                        // to cold); the WRITE half is the Depot handle below.
                         .with_workspace_cas(workspace_cas.clone())
                         // The canonical clone image (ADR-0045).
                         .with_clone_image(config.clone_image.clone())
@@ -464,6 +472,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             token_secret: ws.token_secret.clone(),
                             fetcher_image: ws.fetcher_image.clone(),
                         });
+                        // The drain's WRITE half + durability gate (ADR-0064):
+                        // warm-first ingest through the Depot client and one
+                        // awaited flush per published root.
+                        if let Some(client) = &depot_client {
+                            exec = exec.with_workspace_depot(client.clone());
+                        }
                         tracing::info!(
                             url = %ws.url,
                             image = %ws.fetcher_image,

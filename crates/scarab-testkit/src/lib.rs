@@ -1153,6 +1153,7 @@ impl Db for InMemoryDb {
                     id: attempt,
                     started_at: Timestamp(0),
                     failure: None,
+                    failure_detail: None,
                     outcome: AttemptOutcome::Running,
                 });
             }
@@ -1236,6 +1237,7 @@ impl Db for InMemoryDb {
         step: &StepId,
         attempt: &AttemptId,
         failure: FailureKind,
+        detail: Option<&str>,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
         if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
@@ -1248,8 +1250,10 @@ impl Db for InMemoryDb {
                     a.outcome,
                     AttemptOutcome::Superseded | AttemptOutcome::Cancelled
                 ) {
-                    // Failure and outcome move together (ADR-0056 amendment).
+                    // Failure, cause and outcome move together (ADR-0056
+                    // amendment; 4cf03d7) — mirrors the single postgres UPDATE.
                     a.failure = Some(failure);
+                    a.failure_detail = detail.map(str::to_string);
                     a.outcome = AttemptOutcome::Failed;
                 }
             }
@@ -1526,7 +1530,10 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
-    async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError> {
+    async fn gc_workspace_roots(
+        &self,
+        terminal_cutoff: Timestamp,
+    ) -> Result<Vec<(String, Timestamp)>, DbError> {
         let st = self.state.lock().unwrap();
         // Third disjunct, matching the Postgres mark query (ADR-0061 s5): a
         // PINNED run's roots are marked unconditionally, so its whole transitive
@@ -1539,23 +1546,41 @@ impl Db for InMemoryDb {
                     || st.snapshot_pins.contains_key(run)
             })
         };
+        // The pair's second half is the root's RECORDING clock — the sweeper's
+        // torn-cold suppression window. The fake keeps no per-row write stamp,
+        // so it reports run creation time, the same clock its TTL arm above
+        // already uses; earliest wins when several runs share a root, matching
+        // the Postgres `MIN` (one old recording proves the flush had time).
+        let recorded = |run: &RunId| st.run_created.get(run).copied().unwrap_or(Timestamp(0));
         // Latest denorm roots + EVERY attempt's root (ADR-0056): an old
         // Take's workspace must never race the sweeper.
-        let mut roots: Vec<String> = st
-            .steps
-            .iter()
-            .filter(|((run, _), rec)| rec.output.is_some() && run_live(run))
-            .filter_map(|(_, rec)| rec.output.clone())
-            .chain(
-                st.attempt_evidence
-                    .iter()
-                    .filter(|((run, _, _), e)| e.output.is_some() && run_live(run))
-                    .filter_map(|(_, e)| e.output.clone()),
-            )
-            .collect();
-        roots.sort();
-        roots.dedup();
-        Ok(roots)
+        let mut roots: std::collections::BTreeMap<String, Timestamp> =
+            std::collections::BTreeMap::new();
+        let mut note = |root: &String, at: Timestamp| {
+            roots
+                .entry(root.clone())
+                .and_modify(|t| {
+                    if at.0 < t.0 {
+                        *t = at;
+                    }
+                })
+                .or_insert(at);
+        };
+        for ((run, _), rec) in &st.steps {
+            if let Some(root) = &rec.output {
+                if run_live(run) {
+                    note(root, recorded(run));
+                }
+            }
+        }
+        for ((run, _, _), e) in &st.attempt_evidence {
+            if let Some(root) = &e.output {
+                if run_live(run) {
+                    note(root, recorded(run));
+                }
+            }
+        }
+        Ok(roots.into_iter().collect())
     }
 
     async fn pin_run_snapshots(

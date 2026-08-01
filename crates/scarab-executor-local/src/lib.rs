@@ -117,7 +117,11 @@ fn state_of(status: std::process::ExitStatus) -> ExecState {
                 never_started: false,
             },
         };
-        ExecState::Failed { exit_code, class }
+        ExecState::Failed {
+            exit_code,
+            class,
+            cause: None,
+        }
     }
 }
 
@@ -247,6 +251,7 @@ impl Executor for LocalExecutor {
                         let state = ExecState::Failed {
                             exit_code: None,
                             class: FailureClass::Timeout,
+                            cause: None,
                         };
                         *slot = Proc::Done(state.clone());
                         Ok(state)
@@ -271,6 +276,7 @@ impl Executor for LocalExecutor {
                     class: FailureClass::Infra {
                         never_started: false,
                     },
+                    cause: None,
                 }),
             );
         }

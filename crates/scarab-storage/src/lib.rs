@@ -231,6 +231,22 @@ pub fn sha256_hex(data: &[u8]) -> String {
 /// stored was computed over exactly these bytes; a change orphans every stored
 /// snapshot at once. `scarab-storage-s3/tests/hashing.rs` pins the result
 /// against independently-derived literals.
+///
+/// # The evolution rule, and it is load-bearing
+///
+/// The tree format may only evolve by **additive `Option` fields** carrying
+/// `#[serde(default, skip_serializing_if = "Option::is_none")]` — the shape
+/// `mode` and `mtime_ms` already have on [`TreeEntry`]. The Data Depot's
+/// `PUT /v1/cas/trees` refuses any body that does not survive
+/// parse → re-serialise **byte-identically** through *its* linked copy of this
+/// function (the cross-binary canonicalisation-skew tripwire, ADR-0061 s8).
+/// Additive-`Option`-with-skip is exactly what keeps that round trip
+/// byte-identical across one version of skew: an old client's body simply lacks
+/// the new field, the new Depot parses it as `None` and skips it on the way
+/// back out, and the bytes match. A non-additive change — a required field, a
+/// renamed one, a default that serialises — makes mid-rollout PUTs fail with a
+/// `400` **by design**: fail-closed at the door beats two binaries silently
+/// filing one tree under two addresses.
 pub fn canonical_tree_bytes(mut entries: Vec<TreeEntry>) -> Result<Vec<u8>, StorageError> {
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     serde_json::to_vec(&entries).map_err(|e| StorageError::Backend(e.to_string()))
