@@ -881,6 +881,11 @@ after the step-level `Suspended` work is scoped honestly).
 
 # Part 4 — The Mandate and the steward (added 2026-08-01, after discussion)
 
+> **Naming update:** "the steward" has since been nicknamed **Orion**; the
+> product specification lives in
+> [orion-product-spec.md](orion-product-spec.md). Architecture below is
+> unchanged — read "steward" as Orion.
+
 Parts 1–3 were written before a framing conversation that settled several of the
 open questions above. This part records where that landed. **Status: direction
 agreed in discussion; still pre-ADR.** It supersedes Part 2's sequencing where they
