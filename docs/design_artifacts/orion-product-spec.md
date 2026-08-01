@@ -782,3 +782,38 @@ Toolkits make them org-curated. Stock library ships with the product:
   model; the body's prose (e.g. "do NOT attempt a fix") is instruction, not
   enforcement, unless it maps to a term. Deviation detection flags, it does
   not prevent.
+
+### 17.5 Composition: the SOP library and rasterization (owner-decided, 2026-08-01)
+
+SOPs **compose**, and the composition model is a linked document vault, not a
+package system:
+
+- **SOPs live in their own repo(s)** — an org runbook vault of plain markdown
+  + frontmatter + wikilinks, **Obsidian-compatible as-is**. `.scarab/` stays
+  workflows + repo-scoped stuff; pipeline YAML carries only a reference
+  (`sop: runbooks//triage-red-build`, or `./sops/local.md` for repo-scoped).
+  The vault is read via existing ForgeConnection machinery; which projects
+  may consume which libraries is an org-settings mapping (ADR-0060 surface).
+- **Two link semantics, two resolution times.** Transclusion
+  (`![[quarantine-flaky-test]]`) *becomes procedure* — compiled into the
+  graph eagerly. Reference (`[[deploy-rollback-notes]]`) *stays knowledge* —
+  fetched on demand mid-run through the briefing MCP tool, at the same
+  pinned SHA (the agent never sees a mixed-version vault).
+- **Rasterization happens at mint/creation, never lazily mid-run:** resolve
+  the root against ONE vault SHA → walk transclusions transitively (cycle
+  detection + depth cap — the `inline_invokes` algorithm applied to docs) →
+  the **rasterized procedure** → procedure IR → the runtime graph. Recorded
+  as evidence on the Run ({root, repo_sha, raster_hash} + bytes) and
+  delivered to the agent *as bytes* — doc fetching is control-plane-side, so
+  the agent never holds forge credentials. Fail-closed: a broken link is a
+  creation error, not a turn-7 surprise.
+- **The update boundary is minting.** Standing Mandates re-rasterize per
+  minted Mandate (always the latest vetted SOP); a running Mandate keeps its
+  snapshot, with an explicit re-pin steer verb for exceptions. The vault has
+  its own CI, so **eval-as-CI runs where the SOPs live**; consumers mint
+  from a vetted tip.
+- **Terms never widen.** A transcluded SOP's frontmatter terms are
+  *requirements checked against the root's envelope*, never additions: child
+  needs tool `gh`, envelope lacks it → rasterization error at mint.
+  Composition narrows or fails; it cannot escalate (ADR-0039's
+  grants-are-ceilings applied to documents).
