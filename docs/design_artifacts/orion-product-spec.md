@@ -277,7 +277,95 @@ day one: transcripts are per-turn Artifacts); `@orion` comment-command
 minting; multi-repo Mandates; panes-grid view; fleet analytics; any model
 routing (refused permanently).
 
-## 9. Open product questions
+## 9. Multi-agent topologies and communication (added after discussion)
+
+**Can multiple agents be part of a step? Yes — three topologies**, and choosing
+between them is a latency/evidence trade the author makes, not a limitation:
+
+| Topology | Shape | Communication | Evidence grain | When |
+|---|---|---|---|---|
+| **T1 Crew-in-a-step** | a multi-agent framework (CrewAI/LangGraph/AutoGen) inside one image | in-process — the framework's problem | one opaque Step | ad-hoc delegation, debate, dynamic speaker selection |
+| **T2 Agents as tool sidecars** | orchestrator agent = main container; helper agents = **Sidecar services speaking MCP on localhost** | localhost HTTP/MCP, zero cross-Pod networking | **per-agent**: each sidecar has its own metering proxy, egress allowlist, and per-tool-call audit entries | a lead agent consulting specialists; per-specialist budgets |
+| **T3 Agents as DAG peers** | each agent its own Step | edges only: Results + Workspace Snapshots + Artifacts | full: per-agent Attempts, retries, reruns | planner → workers → reviewer; anything worth governing separately |
+
+The T2 insight is the load-bearing one: **an agent is a tool that thinks.** The
+tools-as-sidecar-services design (deny-all NetworkPolicy, secrets held by the
+sidecar, metering at the proxy) needed no modification to admit helper agents —
+a helper agent is an MCP server whose implementation happens to call a model.
+Multiple agents per Step with *individually enforced* budgets, fenced by
+inheritance, dying with the Attempt.
+
+**The communication doctrine.** Converse in the Pod; hand off on the edge; fan
+out with matrix; and if parallel steps seem to need to chat, the design is
+telling you to co-locate them.
+
+- **Are Results enough between agents?** Between *edge-connected* agents, the
+  vocabulary is already complete and typed: **Results** (small structured
+  values — precisely the "structured handoff" the field converged on),
+  **Workspace Snapshots** (bulk shared context, content-addressed and
+  attested — a *versioned* blackboard, which beats a live one for audit),
+  **Artifacts** (records), **gates** (the human channel). What this cannot do
+  is mid-flight dialogue — deliberately.
+- **Why no parallel-step chatter:** two live agents mid-conversation are not
+  independently re-executable. A rerun of "step B, which was halfway through a
+  negotiation with step A" has no coherent semantics — it is ADR-0058's
+  unfenced-mutable-state warning applied to conversation. The Attempt boundary
+  is the honest unit; conversations must live inside one.
+- **The escape hatch already exists and is honestly labelled:** a **Shared
+  service** (ADR-0058) can host a live blackboard/message bus for opt-in
+  steps — explicitly unfenced, author's contract. If you reach for it for
+  agent chatter, prefer T1/T2.
+
+**What people are looking for in this space** (prior-knowledge assessment,
+verifiable on request): the 2024 peer-to-peer multi-agent hype cooled;
+practice converged on **orchestrator-worker with structured, typed handoffs
+and full-context handovers** — peer chatter fragments context (Cognition's
+"Don't Build Multi-Agents" argument; Anthropic's own multi-agent research
+favoured orchestrator-worker for parallelisable tasks). The asks that
+survived: typed handoffs (= Results), shared context (= Snapshots), parallel
+fan-out with joins (= matrix + join policies), human interrupts (= gates),
+durable resume (= Turns/Mandates), per-agent cost and tracing (= sidecar
+metering + the span projection), cross-vendor interop (**A2A** — relevant
+someday at the *Orion boundary*, a Mandate exposed/consumed as an A2A task,
+never inside the DAG). Scarab's grain matches where practice landed, not
+where the hype was.
+
+## 10. Cold starts and the latency budget
+
+Pod-per-Step (and per-Turn) decomposes as:
+
+| Leg | Cost | Mitigation |
+|---|---|---|
+| Pod schedule | ~1–2 s | fine at agent pace |
+| Image pull | 0 if node-cached; 10–60 s cold | slim official runner images; pre-pull via PlacementProfile-targeted nodes; registry mirror; lazy-pull snapshotters (operator-level) |
+| Workspace materialise | sub-second | **already solved** — this is exactly what ADR-0061/0062 built (warm CAS, Snapshot Farm, lazy overlayfs Exports) |
+| Agent runtime boot | author's container | official images ship compiled/slim |
+| **Context re-feed** | tokens + $ + latency to replay the transcript | **the real agent cold start** — see below |
+
+The dominant cost is not the Pod — it is re-feeding the Transcript each Turn.
+Three mitigations, in order:
+
+1. **Turn coarseness is the author's dial, and the verdict vocabulary already
+   enforces the right shape:** a Turn ends when the agent *needs the world or a
+   human* (`wait(...)`), not on a timer and not per think-act cycle. A Turn may
+   contain hundreds of model calls. Coarse turns amortise everything above.
+2. **Provider prompt caching** covers bursts (turns minutes apart share the
+   transcript prefix); it does not survive a three-day gate, and the design
+   should not pretend it does.
+3. **Compaction in the contract:** the verdict may carry a compacted state
+   summary alongside the delta, so Turn N+1 re-feeds a digest + recent tail
+   rather than the full history. The full Transcript remains the evidence; the
+   digest is an optimisation, never the record.
+
+And the boundary statement: when someone needs sub-second agent loops, that is
+not a Turn — it is T1/T2 *inside* a Step, where the loop is process-local and
+free. Pod-per-Turn buys durability, governance and evidence at the price of
+seconds; in-step loops buy speed at the price of opacity. Both are offered;
+neither is disguised as the other. **Warm pod pools are refused for now** —
+they fight namespace-per-run isolation and the trust model; revisit only if
+real Mandates show turn latency as the binding pain.
+
+## 11. Open product questions
 
 1. **Docket direction** — A (inbox-first) vs B (panes grid) vs A-with-B-toggle.
 2. **Notifications** — is the Docket enough, or does WAITING·YOU page you in
