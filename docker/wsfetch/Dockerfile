@@ -1,12 +1,17 @@
 # syntax=docker/dockerfile:1
 #
-# scarab-wsfetch — the ADR-0061 s3-feed workspace fetcher image.
+# scarab-wsfetch — the ADR-0061 workspace helper image: fetch, hold, drain.
 #
-# The init container in every Step Pod that has `needs:`. It materialises the
-# Step's input Workspace Snapshots straight from the workspace service and exits.
-# It replaces a `busybox:1.36` doorstop that did nothing but spin on a marker
-# file while the control plane tar-streamed the workspace in over the Kubernetes
-# API server.
+# Three containers wear this image now (one binary, three subcommands):
+#   - the FETCH init container (`scarab-wsfetch`, bare == `fetch`): materialises
+#     the Step's input Workspace Snapshots straight from the workspace service
+#     and exits. Replaced the busybox doorstop the control plane tar-streamed
+#     the workspace into over the Kubernetes API server;
+#   - the EGRESS hold (`scarab-wsfetch hold`): ignores SIGTERM and waits for
+#     the CP's egress-done marker — replacing the busybox `sh` loop
+#     (WORKSPACE_HELPER_IMAGE), which died on TERM;
+#   - the in-Pod DRAIN (`scarab-wsfetch drain`, exec'd by the CP in the egress
+#     container): ingests /workspace to the Depot and posts the DrainRecord.
 #
 # ⚠ ADR-0061 s3-feed: DELETE ME with the node driver (git-bug 0628369).
 # This image is a temporally-ordered STEPPING STONE, not a fallback. It is eager
@@ -55,15 +60,31 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # with TLS must not have to rebuild this image.
 FROM debian:bookworm-slim AS runtime
 
+# `tar` is named EXPLICITLY even though Debian marks it Priority: required
+# (present in slim already): during a control-plane/image skew an OLD control
+# plane still drains the egress container with `kubectl exec … tar -cf -`, and
+# this image is what that exec lands in. A base-image change that quietly
+# dropped tar would break exactly and only the skew window — the worst place
+# to discover it. `command -v tar` makes the requirement fail the BUILD.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        tar \
     && rm -rf /var/lib/apt/lists/* \
+    && command -v tar \
     && useradd --system --uid 65532 --user-group \
         --home-dir /home/scarab --create-home --shell /usr/sbin/nologin scarab \
     && mkdir -p /workspace /scarab/secrets
 
 COPY --from=builder /usr/local/bin/scarab-wsfetch /usr/local/bin/scarab-wsfetch
 
+# USER 65532 is the FETCH container's posture (ADR-0039 restricted baseline)
+# and stays the image default — unchanged. The EGRESS container overrides it:
+# the new executor PINS `run_as_user: 0` in that container's securityContext
+# (root-read is the privilege the drain has always had — the busybox drain ran
+# as root), and a PodSpec `runAsUser` beats an image USER, so nothing here
+# fights it. What "root-runnable" required of this image: no
+# `run_as_non_root`-style assumption baked in, and a binary + tar readable and
+# executable by any uid — both true (0755 under /usr).
 USER 65532
 ENV HOME=/home/scarab \
     SCARAB_WORKSPACE_TARGET=/workspace

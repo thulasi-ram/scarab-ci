@@ -219,6 +219,38 @@ const WARM_SIZE_REFRESH_SECS: u64 = 60;
 /// holding a `FarmLease` that keeps a whole Farm un-evictable.
 const EXPORT_SWEEP_SECS: u64 = 120;
 
+/// Where each fence's **write ledger** lives, under the Depot data dir beside
+/// `exports/`: one file per fence, one tree hash per line, appended on every
+/// `PUT /v1/cas/trees/{hash}` a fence-claimed token makes (git-bug `212bb13`).
+///
+/// The ledger is what lets a drain *prove* the root it publishes is content its
+/// own fence wrote, rather than a hash it learned — a content address is not a
+/// secret, so "names the hash" must not be "owns the snapshot". Disk is the
+/// truth and the only copy: a Depot restart must not forget a fence's writes
+/// before the control plane has consumed that fence's drain record.
+const LEDGERS_SUBDIR: &str = "ledgers";
+
+/// Where each fence's **drain record** lives: `drains/{fence-key}/record.json`,
+/// mirroring `exports/{handle}/record.json` — the key is a SHA-256 of the fence
+/// (see [`fence_key`]), so an arbitrary `{run, step, attempt}` can never become
+/// more than one safe path segment.
+const DRAINS_SUBDIR: &str = "drains";
+
+/// The stored drain record's format version. Same contract as
+/// [`crate::export::RECORD_VERSION`]: a future reader refuses what it would
+/// mis-parse, rather than guessing.
+const DRAIN_RECORD_VERSION: u32 = 1;
+
+/// How long fence residue — a write ledger, a drain record — may sit before the
+/// sweep collects it. The bound is the credential's, not a guess: no workspace
+/// token outlives [`workspace_token::WORKSPACE_TOKEN_MAX_TTL_SECS`] plus its
+/// grace, so a ledger this old can never again be extended or read by the fence
+/// that owns it, and a record this old belongs to an Attempt the control plane
+/// long ago classified (its 5-minute drain clock is three orders of magnitude
+/// shorter). Sweeping a ledger only *re-restricts* reads — the safe direction.
+const FENCE_RESIDUE_TTL_SECS: i64 =
+    workspace_token::WORKSPACE_TOKEN_MAX_TTL_SECS + workspace_token::WORKSPACE_TOKEN_GRACE_SECS;
+
 /// Everything the service handlers need. Cheap to clone (all `Arc`, plus a
 /// [`SnapshotFarm`] which is two paths and a flag).
 #[derive(Clone)]
@@ -691,6 +723,66 @@ async fn sweep_exports_once(state: &WorkspaceState) {
     let live: std::collections::BTreeSet<ExportHandle> =
         state.exports.live_handles().into_iter().collect();
     state.captures().retain(|handle, _| live.contains(handle));
+
+    // Fence residue (git-bug `212bb13`), on the same cadence and the same TTL
+    // discipline as the Export residue above: write ledgers and drain records
+    // older than any token that could still touch them. Failure here leaks a
+    // small file until the next pass, so it is logged and never fatal.
+    let warm_dir = state.warm_dir.clone();
+    match tokio::task::spawn_blocking(move || sweep_fence_residue(&warm_dir, now)).await {
+        Ok((0, 0)) => {}
+        Ok((ledgers, records)) => tracing::info!(
+            ledgers,
+            records,
+            "swept expired fence residue — write ledgers and drain records no live \
+             token can reach (git-bug 212bb13)"
+        ),
+        Err(e) => tracing::error!(
+            error = %e,
+            "the fence-residue sweep task did not complete; stale ledgers and drain \
+             records will wait for the next pass"
+        ),
+    }
+}
+
+/// Collect fence residue older than [`FENCE_RESIDUE_TTL_SECS`]: ledger files
+/// under `ledgers/`, record directories under `drains/`. Answers
+/// `(ledgers_removed, records_removed)`.
+///
+/// Staleness is the entry's own mtime — an append refreshes a ledger's, a record
+/// rewrite refreshes its directory's — so only residue *nothing has touched* for
+/// a whole token lifetime goes. An unreadable mtime is treated as fresh: the
+/// failure mode of keeping is a small leaked file, of deleting a live fence's
+/// ledger it is a 403 on that fence's own read-back.
+fn sweep_fence_residue(warm_dir: &std::path::Path, now: i64) -> (u64, u64) {
+    let cutoff = now - FENCE_RESIDUE_TTL_SECS;
+    let stale = |path: &std::path::Path| -> bool {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs() as i64) < cutoff)
+            .unwrap_or(false)
+    };
+    let mut ledgers = 0u64;
+    if let Ok(entries) = std::fs::read_dir(warm_dir.join(LEDGERS_SUBDIR)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if stale(&path) && std::fs::remove_file(&path).is_ok() {
+                ledgers += 1;
+            }
+        }
+    }
+    let mut records = 0u64;
+    if let Ok(entries) = std::fs::read_dir(warm_dir.join(DRAINS_SUBDIR)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if stale(&path) && std::fs::remove_dir_all(&path).is_ok() {
+                records += 1;
+            }
+        }
+    }
+    (ledgers, records)
 }
 
 fn build_router(state: WorkspaceState) -> Router {
@@ -723,9 +815,21 @@ fn build_router(state: WorkspaceState) -> Router {
         .route("/v1/exports/{handle}", delete(revoke_export))
         .route("/v1/exports/{handle}/settle", post(settle_export));
 
+    // The drain rendezvous (git-bug `212bb13`): the in-Pod drain POSTs its record
+    // with its own fence-claimed token, the control plane GETs it with Browse.
+    // The fence in the record's address comes from the *claims* on the POST —
+    // there is no path or body fence to mismatch. The GET addresses the record
+    // by its FENCE KEY, never by `{run}/{step}/{attempt}` path segments: a step
+    // id may contain `/` (invoke-namespaced steps are `{prefix}/{id}`), which no
+    // segment-per-field route can ever match.
+    let drains = Router::new()
+        .route("/v1/drains", post(post_drain))
+        .route("/v1/drains/{fence_key}", get(get_drain));
+
     Router::new()
         .merge(cas)
         .merge(exports)
+        .merge(drains)
         // ADR-0064 parts 3–5: which backing licenses `Succeeded` here.
         // Authenticated (browse scope), unlike the probes below — see `get_tier`.
         .route("/v1/tier", get(get_tier))
@@ -995,24 +1099,165 @@ fn authenticate(state: &WorkspaceState, headers: &HeaderMap) -> Result<Workspace
     })
 }
 
-/// Authenticate, then check the token names this snapshot root.
-fn authorize_tree(
+/// The fence a token *carries*, as opposed to the placeholder every token has.
+///
+/// A Step's `Read` token is fenced by construction ([`workspace_token::step_claims`]);
+/// the control plane's Browse token holds `-/-/-` and no fence-keyed decision —
+/// a ledger append, a drain record's address, the prepare fence comparison —
+/// may ever be made from that placeholder.
+fn fence_claim(claims: &WorkspaceClaims) -> Option<&Fence> {
+    match claims.scope {
+        Scope::Read => Some(&claims.fence),
+        Scope::Browse => None,
+    }
+}
+
+/// Refuse everything that is a **control-plane** operation to any token that is
+/// not the control plane's own scope. Same gate `flush_cas` and `get_tier`
+/// state inline; the Export lifecycle and the drain-record read joined it
+/// (git-bug `212bb13` — before this, *any* valid Step token could prepare,
+/// claim, settle or revoke another fence's Export, a cross-fence DoS).
+fn require_browse(claims: &WorkspaceClaims, refusal: &'static str) -> Result<(), WsError> {
+    if matches!(claims.scope, Scope::Browse) {
+        return Ok(());
+    }
+    tracing::warn!(
+        run = %claims.fence.run,
+        step = %claims.fence.step,
+        attempt = %claims.fence.attempt,
+        refusal,
+        "workspace service: 403 — a fenced token asked for a control-plane operation"
+    );
+    Err(WsError::ScopeForbidden(refusal))
+}
+
+/// One fence as one safe path segment: SHA-256 over a length-prefixed encoding,
+/// lowercase hex — mirroring how an [`ExportHandle`] is `sha256(capability)`.
+/// Length prefixes, not separators: no `{run, step, attempt}` an adapter can
+/// mint may collide with or escape into another's key.
+///
+/// Delegates to [`scarab_workspace_client::drain_fence_key`] — the SAME bytes
+/// the control plane hashes to address `GET /v1/drains/{fence_key}` — so the
+/// record's storage key and its lookup key are one function, not two copies.
+fn fence_key(fence: &Fence) -> String {
+    scarab_workspace_client::drain_fence_key(&fence.run, &fence.step, &fence.attempt)
+}
+
+fn ledger_path(state: &WorkspaceState, fence: &Fence) -> std::path::PathBuf {
+    state.warm_dir.join(LEDGERS_SUBDIR).join(fence_key(fence))
+}
+
+fn drain_record_dir(state: &WorkspaceState, fence: &Fence) -> std::path::PathBuf {
+    state.warm_dir.join(DRAINS_SUBDIR).join(fence_key(fence))
+}
+
+/// This fence's write ledger, read **from disk** — the disk is the only copy,
+/// deliberately: a restart must not forget what a fence wrote while the fence's
+/// drain record is still unconsumed. An absent file is an empty ledger; a file
+/// that cannot be read is the warm volume failing, never a miss (same rule as
+/// [`warm_has`]).
+async fn read_ledger(
+    state: &WorkspaceState,
+    fence: &Fence,
+) -> Result<HashSet<String>, WsError> {
+    let path = ledger_path(state, fence);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(text) => Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
+        Err(e) => Err(warm_volume_error("read ledger", &path, e)),
+    }
+}
+
+/// Append one tree hash to a fence's write ledger. One line per PUT; duplicates
+/// are harmless (the reader is a set). A failure fails the PUT — the client's
+/// re-PUT is idempotent, and a tree stored without its ledger line would 422
+/// that fence's own drain record later, which is the worse diagnosis.
+async fn ledger_append(
+    state: &WorkspaceState,
+    fence: &Fence,
+    hash: &str,
+) -> Result<(), WsError> {
+    use tokio::io::AsyncWriteExt;
+    let dir = state.warm_dir.join(LEDGERS_SUBDIR);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| warm_volume_error("mkdir ledgers", &dir, e))?;
+    let path = ledger_path(state, fence);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+        .map_err(|e| warm_volume_error("open ledger", &path, e))?;
+    file.write_all(format!("{hash}\n").as_bytes())
+        .await
+        .map_err(|e| warm_volume_error("append ledger", &path, e))?;
+    file.flush()
+        .await
+        .map_err(|e| warm_volume_error("flush ledger", &path, e))?;
+    Ok(())
+}
+
+/// Which tree-reading route is asking [`authorize_tree`] — threaded explicitly,
+/// because the two routes read *different amounts of content* under one hash and
+/// the ledger arm may only vouch for one of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeRead {
+    /// `GET /v1/cas/trees/{hash}` — the single tree's verbatim bytes.
+    Single,
+    /// `GET /v1/cas/trees/{hash}/flat` — a server-side walk of everything
+    /// reachable from the hash (tiered, with cold fall-through).
+    Flat,
+}
+
+/// Authenticate, then check the token may read this tree: the snapshot roots it
+/// was minted with, or — for a fenced token, on the **single-tree GET only** —
+/// a tree **its own fence wrote** (the write ledger, git-bug `212bb13`: the
+/// drain canonicalises trees locally and its residual read-backs are of trees
+/// it just PUT, which are in no roots claim because they did not exist at mint
+/// time).
+///
+/// The ledger arm deliberately does NOT authorize `/flat`. `put_tree` appends
+/// the ledger without verifying a tree's children exist or are the fence's own
+/// — a content address is not a secret, so a fence can PUT a parent naming a
+/// FOREIGN tree hash it merely learned. The ledger therefore vouches only for
+/// the exact bytes that fence uploaded (the single GET of the ledgered hash),
+/// never for a server-side walk of everything reachable from them: `/flat`
+/// requires the roots claim or Browse. Both production fenced readers are
+/// unaffected — the fetch init container calls `/flat` WITH roots claims, and
+/// the drain helper never calls `/flat` (MemoCas plus single GETs).
+async fn authorize_tree(
     state: &WorkspaceState,
     headers: &HeaderMap,
     hash: &str,
+    read: TreeRead,
 ) -> Result<WorkspaceClaims, WsError> {
     let claims = authenticate(state, headers)?;
-    if !claims.may_read_tree(hash) {
-        tracing::warn!(
-            run = %claims.fence.run,
-            step = %claims.fence.step,
-            attempt = %claims.fence.attempt,
-            tree = %hash,
-            "workspace service: 403 — tree root is not in this token's roots claim"
-        );
-        return Err(WsError::Forbidden);
+    if claims.may_read_tree(hash) {
+        return Ok(claims);
     }
-    Ok(claims)
+    if read == TreeRead::Single {
+        if let Some(fence) = fence_claim(&claims) {
+            if read_ledger(state, fence).await?.contains(hash) {
+                return Ok(claims);
+            }
+        }
+    }
+    tracing::warn!(
+        run = %claims.fence.run,
+        step = %claims.fence.step,
+        attempt = %claims.fence.attempt,
+        tree = %hash,
+        flat = read == TreeRead::Flat,
+        "workspace service: 403 — tree root is in neither this token's roots claim nor \
+         (for a single-tree GET) its fence's write ledger"
+    );
+    Err(WsError::Forbidden)
 }
 
 /// A content hash as it may appear in a URL: exactly 64 lowercase hex chars.
@@ -1402,7 +1647,7 @@ async fn get_tree(
     headers: HeaderMap,
     Path(hash): Path<String>,
 ) -> Result<Response, WsError> {
-    authorize_tree(&state, &headers, &hash)?;
+    authorize_tree(&state, &headers, &hash, TreeRead::Single).await?;
     valid_hash(&hash)?;
     let bytes = state.objects.get(&format!("trees/{hash}")).await?;
     let mut resp = bytes.into_response();
@@ -1428,7 +1673,7 @@ async fn put_tree(
     Path(hash): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<Response, WsError> {
-    authenticate(&state, &headers)?;
+    let claims = authenticate(&state, &headers)?;
     valid_hash(&hash)?;
 
     let actual = hash_hex(&body);
@@ -1499,6 +1744,18 @@ async fn put_tree(
         .warm
         .put(&format!("trees/{hash}"), body.to_vec())
         .await?;
+
+    // The write ledger (git-bug `212bb13`): a fence-claimed PUT is that fence
+    // *owning* this tree — it is what authorises the fence's own read-back of a
+    // tree no roots claim names, and what a drain record's validation demands
+    // membership in. Appended after the warm write so the ledger never vouches
+    // for a tree warm does not hold; failure fails the PUT (the re-PUT is
+    // idempotent), because a stored-but-unledgered tree would fail this fence's
+    // drain record later with a worse diagnosis.
+    if let Some(fence) = fence_claim(&claims) {
+        ledger_append(&state, fence, &hash).await?;
+    }
+
     Ok(if already {
         StatusCode::OK.into_response()
     } else {
@@ -1524,7 +1781,7 @@ async fn get_flat(
     headers: HeaderMap,
     Path(hash): Path<String>,
 ) -> Result<Json<FlatManifest>, WsError> {
-    authorize_tree(&state, &headers, &hash)?;
+    authorize_tree(&state, &headers, &hash, TreeRead::Flat).await?;
     valid_hash(&hash)?;
     Ok(Json(flatten(&state, &TreeHash(hash)).await?))
 }
@@ -1861,6 +2118,326 @@ async fn flush_cas(
 }
 
 // ---------------------------------------------------------------------------
+// The drain rendezvous (git-bug 212bb13)
+// ---------------------------------------------------------------------------
+
+/// Why an in-Pod drain did not publish. `kind` is the classifier's key on the
+/// control plane — `OutputContract` is the one Fatal(Config) class; the other
+/// two stay transient — so the strings are the wire contract, verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DrainErrorKind {
+    OutputContract,
+    Ingest,
+    RecordPost,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainErrorDto {
+    pub kind: DrainErrorKind,
+    pub detail: String,
+}
+
+/// What one in-Pod drain reports — the record the control plane classifies
+/// **record-first**: the exec's status frame can be lost, this cannot, because
+/// it is persisted here before the POST answers 200.
+///
+/// Exact wire shape pinned by git-bug `212bb13`'s stage-1 contract; the fence
+/// it belongs to is deliberately NOT in the body — it comes from the POSTing
+/// token's own claims, so there is nothing to mismatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrainRecord {
+    /// The ingested root. Must be in the posting fence's write ledger.
+    pub root: String,
+    /// The pruned (published) root, when pruning changed anything. When present
+    /// it is the effective root the closure validation walks.
+    #[serde(default)]
+    pub pruned_root: Option<String>,
+    #[serde(default)]
+    pub identity: Option<String>,
+    pub files: u64,
+    pub tree_bytes: u64,
+    pub blobs_uploaded: u64,
+    pub bytes_uploaded: u64,
+    pub have_hits: u64,
+    pub ingest_ms: u64,
+    pub prune_ms: u64,
+    /// Absent = success. A success record is write-once (`409` on a second
+    /// POST); an error record may be overwritten by any later POST.
+    #[serde(default)]
+    pub error: Option<DrainErrorDto>,
+}
+
+/// The on-disk envelope around a [`DrainRecord`]: versioned like
+/// [`crate::export::RECORD_VERSION`] so a future reader refuses rather than
+/// mis-parses, and carrying the fence in clear because the directory name is a
+/// hash of it — a record an operator finds on disk must say whose it is.
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredDrainRecord {
+    version: u32,
+    run: String,
+    step: String,
+    attempt: String,
+    posted_at: i64,
+    record: DrainRecord,
+}
+
+/// Read the stored drain record for `fence`, or `None`. A file that exists and
+/// does not parse is an error, never silently "absent" — absence licenses a
+/// fresh POST, and a corrupt record must not be overwritable by accident.
+async fn read_drain_record(
+    state: &WorkspaceState,
+    fence: &Fence,
+) -> Result<Option<StoredDrainRecord>, WsError> {
+    read_drain_record_by_key(state, &fence_key(fence)).await
+}
+
+/// [`read_drain_record`] addressed by the [`fence_key`] directly — the GET
+/// route's resolution: the key IS the record's address, no fence parsing.
+async fn read_drain_record_by_key(
+    state: &WorkspaceState,
+    key: &str,
+) -> Result<Option<StoredDrainRecord>, WsError> {
+    let path = state
+        .warm_dir
+        .join(DRAINS_SUBDIR)
+        .join(key)
+        .join(crate::export::RECORD_FILE);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(warm_volume_error("read drain record", &path, e)),
+    };
+    let stored: StoredDrainRecord = serde_json::from_slice(&bytes).map_err(|e| {
+        WsError::Backend(format!(
+            "the drain record at {} is not one: {e}",
+            path.display()
+        ))
+    })?;
+    if stored.version > DRAIN_RECORD_VERSION {
+        return Err(WsError::Backend(format!(
+            "the drain record at {} is version {} and this reader speaks {}",
+            path.display(),
+            stored.version,
+            DRAIN_RECORD_VERSION
+        )));
+    }
+    Ok(Some(stored))
+}
+
+/// The verdict of a drain record's server-side validation: complete, or the
+/// **first missing address** — which is the whole detail a 422 carries, because
+/// the drain that gets it back needs to know what to re-upload or re-PUT.
+enum ClosureVerdict {
+    Complete,
+    Missing(String),
+}
+
+/// Validate a success record's closure against **warm and the fence's ledger**
+/// — warm-only reads on purpose: the drain *just wrote* warm (warm-only PUTs),
+/// so a cold-only tree here is not a slow path, it is a tree this fence never
+/// wrote, i.e. a ledger miss wearing a different hat. Bounded like
+/// [`flush_set_of`]: BFS with a visited set, hashes only in memory.
+async fn validate_drain_closure(
+    state: &WorkspaceState,
+    ledger: &HashSet<String>,
+    effective_root: &str,
+) -> Result<ClosureVerdict, WsError> {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = vec![effective_root.to_string()];
+    let mut blobs: HashSet<String> = HashSet::new();
+    while let Some(tree) = queue.pop() {
+        if !visited.insert(tree.clone()) {
+            continue;
+        }
+        if !ledger.contains(&tree) {
+            return Ok(ClosureVerdict::Missing(format!(
+                "tree {tree} is not in this fence's write ledger"
+            )));
+        }
+        let bytes = match state.warm.get(&format!("trees/{tree}")).await {
+            Ok(bytes) => bytes,
+            Err(StorageError::NotFound) => {
+                return Ok(ClosureVerdict::Missing(format!(
+                    "tree {tree} is not in the warm tier"
+                )))
+            }
+            Err(e) => return Err(WsError::Backend(e.to_string())),
+        };
+        let entries: Vec<TreeEntry> = serde_json::from_slice(&bytes).map_err(|e| {
+            WsError::Backend(format!("tree {tree} in warm does not parse: {e}"))
+        })?;
+        for entry in entries {
+            match entry.target {
+                TreeTarget::Blob(blob) => {
+                    blobs.insert(blob.0);
+                }
+                TreeTarget::Tree(sub) => queue.push(sub.0),
+            }
+        }
+    }
+    for blob in blobs {
+        if !warm_has(&warm_blob_path(state, &blob)).await? {
+            return Ok(ClosureVerdict::Missing(format!(
+                "blob {blob} is not in the warm tier"
+            )));
+        }
+    }
+    Ok(ClosureVerdict::Complete)
+}
+
+/// `POST /v1/drains` — an in-Pod drain deposits its record, and the answer is
+/// the deposit having *happened*: persisted on disk, keyed by the **token's**
+/// fence, before the 200.
+///
+/// Validation before persistence, in the pinned order (git-bug `212bb13`):
+/// the named roots must be in this fence's write ledger; the effective root's
+/// whole closure must be readable in warm (trees also ledgered, blobs present);
+/// only then is the record written. A `422` names the first missing address. An
+/// **error** record skips the closure validation entirely — it exists precisely
+/// because the ingest may not have happened, and refusing it would erase the
+/// one classification (`OutputContract`) the control plane must not lose.
+async fn post_drain(
+    State(state): State<WorkspaceState>,
+    headers: HeaderMap,
+    Json(record): Json<DrainRecord>,
+) -> Result<Response, WsError> {
+    let claims = authenticate(&state, &headers)?;
+    // Step-id charset is unvalidated (workspace_token.rs:473 pins that `/`, `|` etc.
+    // are legal) — safe here only because the record's address is the length-prefixed
+    // [`fence_key`] hash, never the raw fields as path or filename components.
+    let Some(fence) = fence_claim(&claims).cloned() else {
+        return Err(WsError::ScopeForbidden(
+            "a drain record is posted with the draining step's own fence-claimed token; \
+             a browse token reads records, it does not write them",
+        ));
+    };
+
+    // Write-once for success: a stale retry must never overwrite a newer good
+    // record. Checked before the (possibly expensive) closure walk.
+    if let Some(existing) = read_drain_record(&state, &fence).await? {
+        if existing.record.error.is_none() {
+            tracing::warn!(
+                run = %fence.run,
+                step = %fence.step,
+                attempt = %fence.attempt,
+                "workspace service: 409 — a success drain record already exists for this fence"
+            );
+            return Ok((
+                StatusCode::CONFLICT,
+                "a success drain record already exists for this fence",
+            )
+                .into_response());
+        }
+    }
+
+    if record.error.is_none() {
+        valid_hash(&record.root)?;
+        if let Some(pruned) = &record.pruned_root {
+            valid_hash(pruned)?;
+        }
+        if let Some(identity) = &record.identity {
+            valid_hash(identity)?;
+        }
+
+        let ledger = read_ledger(&state, &fence).await?;
+        let refusal = |detail: String| {
+            tracing::warn!(
+                run = %fence.run,
+                step = %fence.step,
+                attempt = %fence.attempt,
+                detail = %detail,
+                "workspace service: 422 — drain record refused"
+            );
+            (StatusCode::UNPROCESSABLE_ENTITY, detail).into_response()
+        };
+        if !ledger.contains(&record.root) {
+            return Ok(refusal(format!(
+                "root {} is not in this fence's write ledger",
+                record.root
+            )));
+        }
+        if let Some(pruned) = &record.pruned_root {
+            if !ledger.contains(pruned) {
+                return Ok(refusal(format!(
+                    "pruned_root {pruned} is not in this fence's write ledger"
+                )));
+            }
+        }
+        let effective = record.pruned_root.as_deref().unwrap_or(&record.root);
+        match validate_drain_closure(&state, &ledger, effective).await? {
+            ClosureVerdict::Complete => {}
+            ClosureVerdict::Missing(detail) => return Ok(refusal(detail)),
+        }
+    }
+
+    // Persist, then 200. Written to a temp name and renamed so a crash mid-write
+    // leaves either the old record or the new one, never a torn parse.
+    let dir = drain_record_dir(&state, &fence);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| warm_volume_error("mkdir drain record", &dir, e))?;
+    let stored = StoredDrainRecord {
+        version: DRAIN_RECORD_VERSION,
+        run: fence.run.clone(),
+        step: fence.step.clone(),
+        attempt: fence.attempt.clone(),
+        posted_at: now_secs(),
+        record,
+    };
+    let bytes = serde_json::to_vec(&stored)
+        .map_err(|e| WsError::Backend(format!("serialising a drain record: {e}")))?;
+    let tmp = dir.join(".tmp-record.json");
+    let path = dir.join(crate::export::RECORD_FILE);
+    tokio::fs::write(&tmp, &bytes)
+        .await
+        .map_err(|e| warm_volume_error("write drain record", &tmp, e))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| warm_volume_error("rename drain record", &path, e))?;
+
+    tracing::info!(
+        run = %fence.run,
+        step = %fence.step,
+        attempt = %fence.attempt,
+        success = stored.record.error.is_none(),
+        root = %stored.record.root,
+        "drain record deposited (git-bug 212bb13)"
+    );
+    Ok(StatusCode::OK.into_response())
+}
+
+/// `GET /v1/drains/{fence_key}` — the control plane reads a fence's drain
+/// record for its record-first classification. The address is the [`fence_key`]
+/// — the exact key the POST stored the record under, computed by the caller
+/// via `scarab_workspace_client::drain_fence_key` — never `{run}/{step}/{attempt}`
+/// path segments: a step id may contain `/` (invoke-namespaced steps), so a
+/// segment-per-field route 404s forever on precisely those fences, and the
+/// classifier's "no record" verdict must mean *no drain happened*, not *the
+/// route could not spell the question*. Browse only: the record carries
+/// another fence's addresses, and a Step has no business reading it. `404`
+/// when absent, which is a verdict the caller acts on (no record + exit hint
+/// decides transient-vs-fatal), so absence must be exact, never a guess over
+/// a parse failure.
+async fn get_drain(
+    State(state): State<WorkspaceState>,
+    headers: HeaderMap,
+    Path(fence_key): Path<String>,
+) -> Result<Response, WsError> {
+    let claims = authenticate(&state, &headers)?;
+    require_browse(
+        &claims,
+        "drain records are read by the control plane (browse scope)",
+    )?;
+    // A fence key is a SHA-256 in lowercase hex — the same shape as a content
+    // hash, and the same guard keeps it a single safe path component.
+    valid_hash(&fence_key)?;
+    match read_drain_record_by_key(&state, &fence_key).await? {
+        Some(stored) => Ok(Json(stored.record).into_response()),
+        None => Err(WsError::NotFound),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The Workspace Export lifecycle (ADR-0062)
 // ---------------------------------------------------------------------------
 
@@ -1938,6 +2515,34 @@ async fn prepare_export(
     Json(req): Json<PrepareExportRequest>,
 ) -> Result<Response, WsError> {
     let claims = authenticate(&state, &headers)?;
+    // A token that carries a fence may not prepare in another fence's name —
+    // checked before the scope gate so the sharper refusal is the one an
+    // operator sees, and kept even though the gate below already excludes every
+    // fenced token: the comparison is the defence that survives if the gate is
+    // ever loosened (git-bug `212bb13`, red-team finding). A Browse token
+    // carries no fence claim and passes — the control plane prepares on behalf
+    // of every Step, which is exactly why the body names the fence at all.
+    if let Some(fence) = fence_claim(&claims) {
+        if fence.run != req.run || fence.step != req.step || fence.attempt != req.attempt {
+            tracing::warn!(
+                run = %fence.run,
+                step = %fence.step,
+                attempt = %fence.attempt,
+                asked_run = %req.run,
+                asked_step = %req.step,
+                asked_attempt = %req.attempt,
+                "workspace service: 403 — a fenced token asked to prepare an export in \
+                 another fence's name"
+            );
+            return Err(WsError::ScopeForbidden(
+                "the request names a fence that is not the token's own",
+            ));
+        }
+    }
+    require_browse(
+        &claims,
+        "preparing a workspace export is a control-plane operation (browse scope)",
+    )?;
     valid_hash(&req.parent_root)?;
     if let Some(identity) = &req.parent_identity {
         valid_hash(identity)?;
@@ -2045,7 +2650,11 @@ async fn claim_export(
     headers: HeaderMap,
     Json(req): Json<ClaimExportRequest>,
 ) -> Result<Json<ClaimedExportDto>, WsError> {
-    authenticate(&state, &headers)?;
+    let claims = authenticate(&state, &headers)?;
+    require_browse(
+        &claims,
+        "claiming a workspace export is a control-plane operation (browse scope)",
+    )?;
     // Shape first, and the error carries nothing: a rejected capability is a
     // secret-shaped string from an untrusted client.
     let capability = ExportCapability::parse(&req.capability)?;
@@ -2210,7 +2819,11 @@ async fn settle_export(
     headers: HeaderMap,
     Path(handle): Path<String>,
 ) -> Result<Json<SettledExportDto>, WsError> {
-    authenticate(&state, &headers)?;
+    let claims = authenticate(&state, &headers)?;
+    require_browse(
+        &claims,
+        "settling a workspace export is a control-plane operation (browse scope)",
+    )?;
     let handle = parse_handle(&handle)?;
     let started = Instant::now();
 
@@ -2392,7 +3005,11 @@ async fn revoke_export(
     headers: HeaderMap,
     Path(handle): Path<String>,
 ) -> Result<Json<ReapedExportDto>, WsError> {
-    authenticate(&state, &headers)?;
+    let claims = authenticate(&state, &headers)?;
+    require_browse(
+        &claims,
+        "revoking a workspace export is a control-plane operation (browse scope)",
+    )?;
     let handle = parse_handle(&handle)?;
     let registry = state.exports.clone();
     let reaping = handle.clone();
@@ -2424,7 +3041,11 @@ async fn list_exports(
     State(state): State<WorkspaceState>,
     headers: HeaderMap,
 ) -> Result<Json<LiveExportsDto>, WsError> {
-    authenticate(&state, &headers)?;
+    let claims = authenticate(&state, &headers)?;
+    require_browse(
+        &claims,
+        "listing workspace exports is a control-plane operation (browse scope)",
+    )?;
     Ok(Json(LiveExportsDto {
         handles: state
             .exports
@@ -3904,6 +4525,529 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // git-bug 212bb13 — the write ledger and the drain rendezvous
+    // -----------------------------------------------------------------------
+
+    /// The drain-record GET's URI for a fence — addressed by the [`fence_key`],
+    /// exactly as `scarab_workspace_client::drain_record` computes it.
+    fn drains_uri(run: &str, step: &str, attempt: &str) -> String {
+        format!(
+            "/v1/drains/{}",
+            scarab_workspace_client::drain_fence_key(run, step, attempt)
+        )
+    }
+
+    /// A minimal success-shaped drain record body naming `root`.
+    fn drain_record_body(root: &str) -> serde_json::Value {
+        serde_json::json!({
+            "root": root,
+            "pruned_root": null,
+            "identity": null,
+            "files": 1,
+            "tree_bytes": 100,
+            "blobs_uploaded": 1,
+            "bytes_uploaded": 16,
+            "have_hits": 0,
+            "ingest_ms": 5,
+            "prune_ms": 1,
+            "error": null
+        })
+    }
+
+    /// A fenced PUT lands in that fence's write ledger, and the ledger is a
+    /// read authority: the fence reads back the tree it just wrote even though
+    /// no roots claim names it (it did not exist at mint time), while another
+    /// fence is still refused.
+    ///
+    /// Mutations killed: drop the ledger arm in `authorize_tree` (or the append
+    /// in `put_tree`) and the owner's read-back answers 403; widen the arm past
+    /// the token's own fence and the OTHER fence's 403 assertion fails.
+    #[tokio::test]
+    async fn a_fenced_tree_put_is_ledgered_and_authorizes_that_fences_own_read_back() {
+        let h = ExportHarness::start().await;
+        let token = h.step_token("r1", "build", "a1");
+
+        let blob = b"the drain wrote this".to_vec();
+        let blob_hash = hash_hex(&blob);
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "out.txt",
+            TreeTarget::Blob(BlobHash(blob_hash.clone())),
+        )])
+        .expect("canonical tree");
+        let (status, body) = h
+            .put_raw_as(&token, &format!("/v1/cas/blobs/{blob_hash}"), blob)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = h
+            .put_raw_as(&token, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let (status, body) = h
+            .call_as(&token, "GET", &format!("/v1/cas/trees/{}", tree_hash.0), None)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the fence must read back the tree its own PUT ledgered: {body}"
+        );
+
+        let other = h.step_token("r2", "build", "a1");
+        let (status, _) = h
+            .call_as(&other, "GET", &format!("/v1/cas/trees/{}", tree_hash.0), None)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "another fence holds neither the root claim nor the ledger line"
+        );
+    }
+
+    /// The ledger arm authorizes ONLY the single-tree GET of the exact ledgered
+    /// hash — never `/flat`. `put_tree` appends the ledger without verifying a
+    /// tree's children, so a fence can PUT a parent naming a FOREIGN tree hash
+    /// it merely learned; if the ledger vouched for `/flat`, that one PUT would
+    /// let the fence walk the whole foreign subtree server-side (tiered, cold
+    /// fall-through). A roots-claim token keeps `/flat` — the fetch init
+    /// container's path — so the restriction cannot regress the feed.
+    ///
+    /// Mutation killed: dropping the `TreeRead` restriction in `authorize_tree`
+    /// (letting the ledger arm answer for `/flat`) turns the 403 below into a
+    /// 200 over content this fence never wrote.
+    #[tokio::test]
+    async fn a_ledgered_parent_naming_a_foreign_tree_gets_single_reads_but_never_flat() {
+        let h = ExportHarness::start().await;
+
+        // A foreign fence's content: a blob and the tree naming it.
+        let foreign = h.step_token("r0", "seed", "a1");
+        let blob = b"not yours".to_vec();
+        let blob_hash = hash_hex(&blob);
+        let (foreign_tree, foreign_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "secret.txt",
+            TreeTarget::Blob(BlobHash(blob_hash.clone())),
+        )])
+        .expect("canonical foreign tree");
+        let (status, body) = h
+            .put_raw_as(&foreign, &format!("/v1/cas/blobs/{blob_hash}"), blob)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = h
+            .put_raw_as(
+                &foreign,
+                &format!("/v1/cas/trees/{}", foreign_tree.0),
+                foreign_bytes,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // The probing fence PUTs a parent that NAMES the foreign tree. The PUT
+        // is legal (children are deliberately unverified) and ledgers the
+        // parent for this fence.
+        let prober = h.step_token("r1", "build", "a1");
+        let (parent_tree, parent_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "stolen",
+            TreeTarget::Tree(foreign_tree.clone()),
+        )])
+        .expect("canonical parent tree");
+        let (status, body) = h
+            .put_raw_as(
+                &prober,
+                &format!("/v1/cas/trees/{}", parent_tree.0),
+                parent_bytes,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        // The single GET of the exact ledgered hash: the drain's read-back,
+        // still authorized.
+        let (status, body) = h
+            .call_as(
+                &prober,
+                "GET",
+                &format!("/v1/cas/trees/{}", parent_tree.0),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the ledger must still authorize the single GET of the ledgered hash: {body}"
+        );
+
+        // `/flat` of the same ledgered hash: refused — the walk would cross
+        // into the foreign subtree.
+        let (status, body) = h
+            .call_as(
+                &prober,
+                "GET",
+                &format!("/v1/cas/trees/{}/flat", parent_tree.0),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a ledger line must not authorize a /flat walk: {body}"
+        );
+
+        // A roots-claim token (the fetch init container's shape) keeps `/flat`.
+        let flat_reader = workspace_token::mint(
+            b"export-secret",
+            &workspace_token::step_claims(
+                Fence {
+                    run: "r9".into(),
+                    step: "reader".into(),
+                    attempt: "a1".into(),
+                },
+                i64::MAX / 2,
+                vec![parent_tree.0.clone()],
+            ),
+        );
+        let (status, body) = h
+            .call_as(
+                &flat_reader,
+                "GET",
+                &format!("/v1/cas/trees/{}/flat", parent_tree.0),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a roots-claim token must keep /flat — that is the feed path: {body}"
+        );
+    }
+
+    /// `/have` never appends the ledger: a probe naming hashes is a question,
+    /// not a write, and a `/have`-ledger would let any fence launder foreign
+    /// hashes into read authority (the exact reason the drain's tree dedup is
+    /// disabled client-side). Proven at both grains — `authorize_tree` still
+    /// refuses the probed hash, and the fence's ledger itself does not contain
+    /// it.
+    ///
+    /// Mutation killed: a future append-on-have in the `/have` handler.
+    #[tokio::test]
+    async fn a_have_probe_never_appends_the_ledger() {
+        let h = ExportHarness::start().await;
+
+        // Foreign content, present in warm.
+        let foreign = h.step_token("r0", "seed", "a1");
+        let foreign_root = seed_fenced_snapshot(&h, &foreign).await;
+
+        // The probing fence asks /have about it (answer: not missing) …
+        let prober = h.step_token("r1", "build", "a1");
+        let (status, body) = h
+            .call_as(
+                &prober,
+                "POST",
+                "/v1/cas/have",
+                Some(serde_json::json!({ "blobs": [], "trees": [foreign_root] })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !body.contains(&foreign_root),
+            "warm holds the foreign tree, so /have must not report it missing: {body}"
+        );
+
+        // … and gains nothing: the read is still refused, and the ledger file
+        // itself lacks the hash.
+        let (status, _) = h
+            .call_as(
+                &prober,
+                "GET",
+                &format!("/v1/cas/trees/{foreign_root}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a /have probe must not mint read authority"
+        );
+        let ledger = read_ledger(
+            &h.state,
+            &Fence {
+                run: "r1".into(),
+                step: "build".into(),
+                attempt: "a1".into(),
+            },
+        )
+        .await
+        .expect("read the prober's ledger");
+        assert!(
+            !ledger.contains(&foreign_root),
+            "the /have probe must leave no ledger line behind"
+        );
+    }
+
+    /// A drain record naming a root the fence never wrote is refused, naming
+    /// the address. The parent snapshot IS in warm — that is the point: content
+    /// existing is not content *owned*, or any Step could publish any snapshot
+    /// whose hash it learned.
+    ///
+    /// Mutation killed: drop the ledger-membership validation in `post_drain`
+    /// and this cross-fence hash-naming answers 200.
+    #[tokio::test]
+    async fn a_drain_record_naming_an_unledgered_root_is_refused_naming_it() {
+        let h = ExportHarness::start().await;
+        let token = h.step_token("r1", "build", "a1");
+        let (status, body) = h
+            .call_as(
+                &token,
+                "POST",
+                "/v1/drains",
+                Some(drain_record_body(&h.parent.root.0)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body.contains(&h.parent.root.0) && body.contains("ledger"),
+            "the refusal must name the first missing address: {body}"
+        );
+    }
+
+    /// A drain record whose blob closure is incomplete in warm is refused: the
+    /// tree is PUT (and ledgered) but the blob it names never arrived.
+    ///
+    /// Mutation killed: validate trees only — drop the blob-presence loop in
+    /// `validate_drain_closure` — and this answers 200 over a snapshot the
+    /// Depot cannot serve.
+    #[tokio::test]
+    async fn a_drain_record_with_an_incomplete_blob_closure_is_refused() {
+        let h = ExportHarness::start().await;
+        let token = h.step_token("r1", "build", "a1");
+
+        let missing_blob = hash_hex(b"never uploaded");
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "gone.txt",
+            TreeTarget::Blob(BlobHash(missing_blob.clone())),
+        )])
+        .expect("canonical tree");
+        let (status, body) = h
+            .put_raw_as(&token, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let (status, body) = h
+            .call_as(
+                &token,
+                "POST",
+                "/v1/drains",
+                Some(drain_record_body(&tree_hash.0)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body.contains(&missing_blob),
+            "the refusal must name the absent blob: {body}"
+        );
+    }
+
+    /// PUT one fence's complete little snapshot — blob, then tree — and answer
+    /// its root. The 200s are asserted inside.
+    async fn seed_fenced_snapshot(h: &ExportHarness, token: &str) -> String {
+        let blob = b"drained output".to_vec();
+        let blob_hash = hash_hex(&blob);
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "result.txt",
+            TreeTarget::Blob(BlobHash(blob_hash.clone())),
+        )])
+        .expect("canonical tree");
+        let (status, body) = h
+            .put_raw_as(token, &format!("/v1/cas/blobs/{blob_hash}"), blob)
+            .await;
+        assert!(status.is_success(), "seed blob: {body}");
+        let (status, body) = h
+            .put_raw_as(token, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .await;
+        assert!(status.is_success(), "seed tree: {body}");
+        tree_hash.0.clone()
+    }
+
+    /// A success record is write-once; an error record is not.
+    ///
+    /// Mutations killed: drop the 409 arm in `post_drain` and the second
+    /// success POST answers 200 (a stale retry overwriting a good record);
+    /// seal error records too and the error→success upgrade answers 409,
+    /// stranding the retried drain that finally worked.
+    #[tokio::test]
+    async fn a_success_record_is_write_once_and_an_error_record_is_overwritable() {
+        let h = ExportHarness::start().await;
+
+        // Fence 1: success, then a stale retry.
+        let f1 = h.step_token("r1", "build", "a1");
+        let root = seed_fenced_snapshot(&h, &f1).await;
+        let (status, body) = h
+            .call_as(&f1, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = h
+            .call_as(&f1, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a second success POST for the same fence must 409: {body}"
+        );
+
+        // Fence 2: an error record first — no closure to validate — then the
+        // retried drain's success record over it.
+        let f2 = h.step_token("r1", "build", "a2");
+        let error_record = serde_json::json!({
+            "root": "", "pruned_root": null, "identity": null,
+            "files": 0, "tree_bytes": 0, "blobs_uploaded": 0, "bytes_uploaded": 0,
+            "have_hits": 0, "ingest_ms": 0, "prune_ms": 0,
+            "error": { "kind": "Ingest", "detail": "the depot hung up" }
+        });
+        let (status, body) = h
+            .call_as(&f2, "POST", "/v1/drains", Some(error_record))
+            .await;
+        assert_eq!(status, StatusCode::OK, "an error record deposits: {body}");
+        let root2 = seed_fenced_snapshot(&h, &f2).await;
+        let (status, body) = h
+            .call_as(&f2, "POST", "/v1/drains", Some(drain_record_body(&root2)))
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a success record must overwrite an error record: {body}"
+        );
+        let record = h.json("GET", &drains_uri("r1", "build", "a2"), None).await;
+        assert_eq!(record["root"], serde_json::json!(root2));
+        assert!(
+            record["error"].is_null(),
+            "the stored record is the success, not the error: {record}"
+        );
+    }
+
+    /// The record read is Browse-gated, and the record survives a Depot
+    /// restart — the disk is the truth, because the control plane may not have
+    /// consumed it yet when the process dies.
+    ///
+    /// Mutations killed: drop the Browse gate on `get_drain` and the fence
+    /// token's read answers 200 (another fence's addresses served to a Pod);
+    /// hold records in memory instead of on disk and the re-opened state 404s.
+    #[tokio::test]
+    async fn a_drain_record_is_browse_read_only_and_survives_a_restart() {
+        use tower::ServiceExt;
+
+        let h = ExportHarness::start().await;
+        let f1 = h.step_token("r1", "build", "a1");
+        let root = seed_fenced_snapshot(&h, &f1).await;
+        let (status, body) = h
+            .call_as(&f1, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, _) = h
+            .call_as(&f1, "GET", &drains_uri("r1", "build", "a1"), None)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a fence token must not read drain records — Browse only"
+        );
+        let record = h.json("GET", &drains_uri("r1", "build", "a1"), None).await;
+        assert_eq!(record["root"], serde_json::json!(root));
+
+        // The restart: a NEW state over the SAME directories, exactly as the
+        // binary would reopen them.
+        let reopened = open_state(
+            &h.tmp.path().join("warm"),
+            h.cold.clone(),
+            b"export-secret".to_vec(),
+            DurabilityTier::SeparateVolume,
+        )
+        .expect("reopen the workspace state over the same volume");
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(drains_uri("r1", "build", "a1"))
+            .header(WORKSPACE_TOKEN_HEADER, &h.token)
+            .body(Body::empty())
+            .expect("request");
+        let response = build_router(reopened)
+            .oneshot(request)
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a restart must not forget a drain record the control plane has not consumed"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let record: serde_json::Value = serde_json::from_slice(&bytes).expect("record JSON");
+        assert_eq!(record["root"], serde_json::json!(root));
+    }
+
+    /// Every `/v1/exports*` verb now requires `Scope::Browse` — before this,
+    /// any valid Step token could prepare, claim, settle, list or revoke
+    /// another fence's Export (the cross-fence Export DoS this slice closes).
+    ///
+    /// Mutation killed: drop any one route's gate and that leg answers
+    /// something other than the scope 403 (prepare would 201 and build a Farm
+    /// on a Step's say-so).
+    #[tokio::test]
+    async fn every_export_route_refuses_a_fenced_token() {
+        let h = ExportHarness::start().await;
+        // The token's own fence matches the body, so the SCOPE gate — not the
+        // mismatch check — is what must refuse prepare.
+        let token = h.step_token("run-1", "build", "a1");
+        let handle = "ab".repeat(32);
+
+        for (method, uri, body) in [
+            ("POST", "/v1/exports".to_string(), Some(h.prepare_body())),
+            (
+                "POST",
+                "/v1/exports/claim".to_string(),
+                Some(serde_json::json!({ "capability": "x", "client": "n" })),
+            ),
+            ("GET", "/v1/exports".to_string(), None),
+            (
+                "POST",
+                format!("/v1/exports/{handle}/settle"),
+                None,
+            ),
+            ("DELETE", format!("/v1/exports/{handle}"), None),
+        ] {
+            let (status, refusal) = h.call_as(&token, method, &uri, body).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {uri} must be Browse-gated: {refusal}"
+            );
+            assert!(
+                refusal.contains("control-plane operation"),
+                "{method} {uri} must be refused by the scope gate itself: {refusal}"
+            );
+        }
+    }
+
+    /// The red team's prepare check: a fenced token naming a fence that is not
+    /// its own is refused as a MISMATCH — the sharper refusal, surviving even
+    /// if the Browse gate were ever loosened. A Browse token carries no fence
+    /// claim and passes; every other export test in this module is that arm.
+    ///
+    /// Mutation killed: drop the fence-vs-body comparison in `prepare_export`
+    /// and this falls through to the generic scope refusal — the body
+    /// assertion fails.
+    #[tokio::test]
+    async fn a_prepare_naming_another_fence_is_refused_as_a_mismatch() {
+        let h = ExportHarness::start().await;
+        let token = h.step_token("run-1", "build", "a1");
+        let mut body = h.prepare_body();
+        body["attempt"] = serde_json::json!("someone-elses-attempt");
+        let (status, refusal) = h.call_as(&token, "POST", "/v1/exports", Some(body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refusal}");
+        assert!(
+            refusal.contains("not the token's own"),
+            "the mismatch must be the refusal, not the generic scope gate: {refusal}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // ADR-0062 — the Export lifecycle, over the real router
     // -----------------------------------------------------------------------
 
@@ -4026,6 +5170,23 @@ mod tests {
             ReadThrough(self.state.cas.clone())
         }
 
+        /// A fenced Step token over the harness's secret, naming the parent root
+        /// — the token an in-Pod drain holds (git-bug `212bb13` fixtures).
+        fn step_token(&self, run: &str, step: &str, attempt: &str) -> String {
+            workspace_token::mint(
+                b"export-secret",
+                &workspace_token::step_claims(
+                    Fence {
+                        run: run.into(),
+                        step: step.into(),
+                        attempt: attempt.into(),
+                    },
+                    i64::MAX / 2,
+                    vec![self.parent.root.0.clone()],
+                ),
+            )
+        }
+
         /// One request against a freshly-built router over the same state. A fresh
         /// router per call because `oneshot` consumes the service; the state — and
         /// therefore the registry, the index and the captures — is shared.
@@ -4035,11 +5196,23 @@ mod tests {
             uri: &str,
             body: Option<serde_json::Value>,
         ) -> (StatusCode, String) {
+            let token = self.token.clone();
+            self.call_as(&token, method, uri, body).await
+        }
+
+        /// [`Self::call`], but as whoever holds `token` — the fence-scoped legs.
+        async fn call_as(
+            &self,
+            token: &str,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, String) {
             use tower::ServiceExt;
             let mut builder = axum::http::Request::builder()
                 .method(method)
                 .uri(uri)
-                .header(WORKSPACE_TOKEN_HEADER, &self.token);
+                .header(WORKSPACE_TOKEN_HEADER, token);
             let body = match body {
                 Some(json) => {
                     builder = builder.header(axum::http::header::CONTENT_TYPE, "application/json");
@@ -4061,11 +5234,17 @@ mod tests {
         /// One raw-bodied `PUT` against the same state — the CAS upload verbs,
         /// whose bodies are addressed bytes rather than JSON documents.
         async fn put_raw(&self, uri: &str, body: Vec<u8>) -> (StatusCode, String) {
+            let token = self.token.clone();
+            self.put_raw_as(&token, uri, body).await
+        }
+
+        /// [`Self::put_raw`], but as whoever holds `token`.
+        async fn put_raw_as(&self, token: &str, uri: &str, body: Vec<u8>) -> (StatusCode, String) {
             use tower::ServiceExt;
             let request = axum::http::Request::builder()
                 .method("PUT")
                 .uri(uri)
-                .header(WORKSPACE_TOKEN_HEADER, &self.token)
+                .header(WORKSPACE_TOKEN_HEADER, token)
                 .body(Body::from(body))
                 .expect("request");
             let response = build_router(self.state.clone())

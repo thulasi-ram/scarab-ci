@@ -2898,6 +2898,7 @@ dependencies = [
  "async-trait",
  "axum",
  "futures",
+ "libc",
  "reqwest",
  "scarab-executor-k8s",
  "scarab-server",

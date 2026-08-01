@@ -1,10 +1,22 @@
-//! `scarab-wsfetch` — the ADR-0061 s3-feed workspace fetcher.
+//! `scarab-wsfetch` — the ADR-0061 workspace helper: `fetch` (default),
+//! `hold`, and `drain`.
 //!
-//! One short-lived init container per Step Pod. It reads the Step's input
-//! **Workspace Snapshot** roots from its own environment, presents the tmpfs
-//! workspace token, and materialises each root — **in order** — into
-//! `/workspace`. Then it exits. There is no marker file, no wait loop, and no
-//! `kubectl exec` anywhere in the path.
+//! Three modes, one binary, because they are the three lives of the same
+//! credential and the same client:
+//!
+//! - **`fetch`** (and a bare invocation — see [`main`]): the s3-feed init
+//!   container. Reads the Step's input **Workspace Snapshot** roots from its
+//!   own environment, presents the tmpfs workspace token, and materialises
+//!   each root — **in order** — into `/workspace`. Then it exits. No marker
+//!   file, no wait loop, no `kubectl exec` anywhere in the path.
+//! - **`hold`**: the egress doorstop (stage-1 drain). Ignores SIGTERM and
+//!   waits for the control plane's egress-done marker — replacing the busybox
+//!   `sh` loop, which died on TERM and silently destroyed the drain window.
+//! - **`drain`**: the in-Pod drain. Ingests `/workspace` to the Depot's warm
+//!   tier, prunes to declared `outputs:` in-process, and posts a
+//!   [`DrainRecord`](scarab_workspace_client::DrainRecord) as the LAST act —
+//!   the Depot is the rendezvous, and the control plane exchanges root hashes
+//!   only, never bytes over `exec`.
 //!
 //! # What this replaces, and why it is not a performance story
 //!
@@ -82,8 +94,10 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use scarab_storage::{StorageError, TreeHash};
-use scarab_workspace_client::WorkspaceClient;
+use scarab_storage::{PruneError, StorageError, TreeHash};
+use scarab_workspace_client::{
+    DrainErrorKind, DrainErrorRecord, DrainRecord, IngestReport, MemoCas, WorkspaceClient,
+};
 
 /// The env var naming the tmpfs file holding the workspace token. Must agree
 /// with `scarab_executor_k8s::workspace_token::WORKSPACE_TOKEN_FILE_ENV`;
@@ -100,19 +114,92 @@ const ROOTS_ENV: &str = "SCARAB_SNAPSHOT_ROOTS";
 const TARGET_ENV: &str = "SCARAB_WORKSPACE_TARGET";
 const DEFAULT_TARGET: &str = "/workspace";
 
+/// Default egress-done marker for `hold`. Must agree with
+/// `scarab_executor_k8s`'s `egress_done_marker()` —
+/// `{CTL_MOUNT_PATH}/egress-done` with `CTL_MOUNT_PATH = "/scarab-ctl"` —
+/// duplicated as a literal for the same reason as [`TOKEN_FILE_ENV`]: this
+/// binary must not link the kubernetes executor to poll a file. The executor
+/// passes `--marker` explicitly; this default is the skew-safety net.
+const DEFAULT_EGRESS_DONE_MARKER: &str = "/scarab-ctl/egress-done";
+
+/// `drain` exit codes (stage-1 contract). 0 = record posted.
+const EXIT_DRAIN_TRANSIENT: i32 = 10;
+const EXIT_DRAIN_OUTPUT_CONTRACT: i32 = 11;
+const EXIT_DRAIN_RECORD_POST: i32 = 12;
+
 fn main() {
-    let code = match run() {
-        Ok(()) => 0,
-        Err(FetchError::Permanent(msg)) => {
-            eprintln!("scarab-wsfetch: PERMANENT: {msg}");
-            2
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        // A BARE invocation is `fetch`, and must stay so for skew safety: the
+        // fetch init container runs this image with no argv (the image's
+        // entrypoint IS the fetcher; the executor overrides nothing), and
+        // during a control-plane/image skew an old executor keeps doing that.
+        // The explicit word exists so a NEW executor can be unambiguous.
+        None | Some("fetch") => {
+            let code = match run() {
+                Ok(()) => 0,
+                Err(FetchError::Permanent(msg)) => {
+                    eprintln!("scarab-wsfetch: PERMANENT: {msg}");
+                    2
+                }
+                Err(FetchError::Transient(msg)) => {
+                    eprintln!("scarab-wsfetch: {msg}");
+                    1
+                }
+            };
+            std::process::exit(code);
         }
-        Err(FetchError::Transient(msg)) => {
-            eprintln!("scarab-wsfetch: {msg}");
-            1
+        Some("hold") => hold(&args[1..]),
+        Some("drain") => std::process::exit(drain_main(&args[1..])),
+        Some(other) => {
+            eprintln!(
+                "scarab-wsfetch: unknown subcommand {other:?} — expected `fetch` (default), \
+                 `hold`, or `drain`. If the control plane passed this, this image is older \
+                 than the executor driving it (image/CP skew)."
+            );
+            std::process::exit(2);
         }
-    };
-    std::process::exit(code);
+    }
+}
+
+/// `scarab-wsfetch hold` — the egress doorstop (stage-1 drain).
+///
+/// Keeps the Pod's egress init container alive across the Step's own
+/// termination so the control plane can run the drain inside it, then exits 0
+/// when the marker appears. Two properties are the entire job:
+///
+/// - **SIGTERM is ignored** — `SIG_IGN`, not a handler: there is nothing to
+///   do on TERM except NOT die. The busybox `sh` loop this replaces died on
+///   TERM, and a hold that dies on TERM silently destroys the drain window
+///   (the workspace vanishes with the Pod before the drain ran).
+/// - **The marker is the only exit.** No timeout here: the Pod's own
+///   `activeDeadlineSeconds` / deletion (SIGKILL) is the backstop, and a
+///   second clock in this loop would just race the control plane's.
+fn hold(args: &[String]) -> ! {
+    let marker = flag_value(args, "--marker")
+        .unwrap_or_else(|| DEFAULT_EGRESS_DONE_MARKER.to_string());
+    // Safety: single-threaded, before anything else — setting a disposition
+    // to SIG_IGN (not a handler fn) is async-signal-trivial.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+    println!("scarab-wsfetch: hold — SIGTERM ignored, waiting for {marker}");
+    loop {
+        if std::path::Path::new(&marker).exists() {
+            println!("scarab-wsfetch: hold — {marker} present, releasing");
+            std::process::exit(0);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// The value after `flag` in `args`, if present. No clap: two flags across two
+/// subcommands do not buy a dependency in an init-container binary.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 enum FetchError {
@@ -286,6 +373,242 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// drain — the in-Pod half of the stage-1 drain
+// ---------------------------------------------------------------------------
+
+/// `scarab-wsfetch drain --workspace /workspace [--outputs <path>]…`
+///
+/// Ingest → prune+identity in-process → POST the [`DrainRecord`] LAST. The
+/// record is the rendezvous: the control plane classifies record-first, so
+/// nothing here is authoritative except what lands on the Depot — the exit
+/// code is a hint (`0` posted, `10` transient, `11` output contract, `12`
+/// record POST failed after a successful ingest).
+///
+/// Depot URL and token file come from the same envs `fetch` uses
+/// ([`URL_ENV`], [`TOKEN_FILE_ENV`]): same Pod, same tmpfs Secret, same
+/// service — only the direction differs.
+fn drain_main(args: &[String]) -> i32 {
+    let mut workspace = env_or(TARGET_ENV, DEFAULT_TARGET);
+    let mut outputs: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--workspace" => match it.next() {
+                Some(v) => workspace = v.clone(),
+                None => {
+                    eprintln!("scarab-wsfetch: drain: --workspace needs a value");
+                    return EXIT_DRAIN_TRANSIENT;
+                }
+            },
+            "--outputs" => match it.next() {
+                Some(v) => outputs.push(v.clone()),
+                None => {
+                    eprintln!("scarab-wsfetch: drain: --outputs needs a value");
+                    return EXIT_DRAIN_TRANSIENT;
+                }
+            },
+            other => {
+                // A flag this binary does not know means the control plane is
+                // newer than this image. Transient (the CP's 5-min clock
+                // bounds it), and the message names the real cause.
+                eprintln!(
+                    "scarab-wsfetch: drain: unrecognised argument {other:?} — probable \
+                     image/CP skew (this image is older than the executor driving it)"
+                );
+                return EXIT_DRAIN_TRANSIENT;
+            }
+        }
+    }
+    let base = match std::env::var(URL_ENV) {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            eprintln!("scarab-wsfetch: drain: {URL_ENV} is not set");
+            return EXIT_DRAIN_TRANSIENT;
+        }
+    };
+    let token_file = match std::env::var(TOKEN_FILE_ENV) {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            eprintln!("scarab-wsfetch: drain: {TOKEN_FILE_ENV} is not set");
+            return EXIT_DRAIN_TRANSIENT;
+        }
+    };
+    let client = match WorkspaceClient::from_token_file(&base, &token_file) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("scarab-wsfetch: drain: workspace token: {e}");
+            return EXIT_DRAIN_TRANSIENT;
+        }
+    };
+    // Multi-thread for the same reason as `fetch`: the ingest overlaps
+    // hashing/reading with uploads.
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("scarab-wsfetch: drain: tokio runtime: {e}");
+            return EXIT_DRAIN_TRANSIENT;
+        }
+    };
+    runtime.block_on(run_drain(&client, &workspace, &outputs))
+}
+
+async fn run_drain(client: &WorkspaceClient, workspace: &str, outputs: &[String]) -> i32 {
+    let t_ingest = std::time::Instant::now();
+    // EACCES/EPERM anywhere in the walk surfaces HERE as a hard error — the
+    // scan propagates every read_dir/read/metadata failure, it never skips a
+    // file it cannot read (a skipped file would publish a silently narrower
+    // snapshot as the Attempt's authoritative evidence).
+    //
+    // The DRAIN variant: trees are PUT unconditionally so every tree of the
+    // closure enters this fence's write ledger (only a PUT appends it), or
+    // the record POST below would 422 on any incremental workspace.
+    let report = match client.drain_ingest_report(workspace).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("scarab-wsfetch: drain: ingest {workspace}: {e}");
+            return EXIT_DRAIN_TRANSIENT;
+        }
+    };
+    let ingest_ms = t_ingest.elapsed().as_millis() as u64;
+    let IngestReport {
+        snapshot,
+        trees,
+        files,
+        tree_bytes,
+        blobs_uploaded,
+        bytes_uploaded,
+        have_hits,
+    } = report;
+    println!(
+        "scarab-wsfetch: drain — ingested {workspace}: root={} files={files} \
+         blobs_uploaded={blobs_uploaded} bytes_uploaded={bytes_uploaded} \
+         have_hits={have_hits} ingest_ms={ingest_ms}",
+        snapshot.root.0
+    );
+
+    // Prune + identity IN-PROCESS: tree read-backs come from the scan's own
+    // canonical bytes via `MemoCas` — zero HTTP tree GETs on the hot path.
+    // The prune-minted trees are real writes through the client, so the
+    // Depot's warm tier and this fence's write ledger hold everything the
+    // posted record names.
+    let memo = MemoCas::new(client, trees);
+    let t_prune = std::time::Instant::now();
+    let (pruned_root, identity) = if outputs.is_empty() {
+        // `ingest` folded the identity for free; nothing to walk.
+        (None, snapshot.identity.as_ref().map(|t| t.0.clone()))
+    } else {
+        let pruned = match scarab_storage::prune_tree(&memo, &snapshot.root, outputs).await {
+            Ok(pruned) => pruned,
+            Err(e) => match classify_prune(e, outputs) {
+                PruneVerdict::Transient(detail) => {
+                    eprintln!("scarab-wsfetch: drain: {detail}");
+                    return EXIT_DRAIN_TRANSIENT;
+                }
+                PruneVerdict::OutputContract(detail) => {
+                    // Post the error record best-effort, then exit 11 either
+                    // way: the CP is record-first, and its no-record +
+                    // exit-hint-11 arm is the designed fallback when this
+                    // POST cannot land.
+                    let rec = DrainRecord {
+                        root: snapshot.root.0.clone(),
+                        pruned_root: None,
+                        identity: None,
+                        files,
+                        tree_bytes,
+                        blobs_uploaded,
+                        bytes_uploaded,
+                        have_hits,
+                        ingest_ms,
+                        prune_ms: t_prune.elapsed().as_millis() as u64,
+                        error: Some(DrainErrorRecord {
+                            kind: DrainErrorKind::OutputContract,
+                            detail: detail.clone(),
+                        }),
+                    };
+                    if let Err(e) = client.post_drain_record(&rec).await {
+                        eprintln!(
+                            "scarab-wsfetch: drain: OutputContract error record POST failed \
+                             (the exit code carries the verdict instead): {e}"
+                        );
+                    }
+                    eprintln!("scarab-wsfetch: drain: OUTPUT CONTRACT: {detail}");
+                    return EXIT_DRAIN_OUTPUT_CONTRACT;
+                }
+            },
+        };
+        // A pruned root is a different tree, so its identity has to be walked
+        // — over the memo, where every tree it can name already sits.
+        let identity = match scarab_storage::content_identity(&memo, &pruned).await {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("scarab-wsfetch: drain: outputs identity: {e}");
+                return EXIT_DRAIN_TRANSIENT;
+            }
+        };
+        (Some(pruned.0), Some(identity.0))
+    };
+    let prune_ms = t_prune.elapsed().as_millis() as u64;
+
+    // The record goes LAST: by the time the Depot validates it, every address
+    // it names is already in warm and in this fence's ledger.
+    let rec = DrainRecord {
+        root: snapshot.root.0.clone(),
+        pruned_root: pruned_root.clone(),
+        identity,
+        files,
+        tree_bytes,
+        blobs_uploaded,
+        bytes_uploaded,
+        have_hits,
+        ingest_ms,
+        prune_ms,
+        error: None,
+    };
+    match client.post_drain_record(&rec).await {
+        Ok(()) => {
+            println!(
+                "scarab-wsfetch: drain — record posted: root={} pruned_root={} prune_ms={prune_ms}",
+                rec.root,
+                pruned_root.as_deref().unwrap_or("-"),
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!(
+                "scarab-wsfetch: drain: record POST failed after successful ingest \
+                 (the snapshot is in warm; only the rendezvous is missing): {e}"
+            );
+            EXIT_DRAIN_RECORD_POST
+        }
+    }
+}
+
+/// How one [`PruneError`] maps onto the drain's exit codes.
+enum PruneVerdict {
+    /// Exit 10 — the walk could not be performed (storage/transport).
+    Transient(String),
+    /// Exit 11 — the walk was performed and the declaration is unsatisfiable.
+    OutputContract(String),
+}
+
+/// Mirrors `drive_workspace`'s prune arms EXACTLY (the `outputs:` leg of
+/// `crates/scarab-executor-k8s/src/lib.rs`, the two `match` arms on
+/// `prune_tree`'s error): `PruneError::Storage` → the transient
+/// `drain_failure` class, with the same `prune outputs: …` prefix;
+/// `MissingPath`/`UnsafePath` → `DriveErr::OutputContract`, with the same
+/// `outputs: … (declared: …)` sentence — so the operator reads identical
+/// wording whichever side classified it.
+fn classify_prune(err: PruneError, declared: &[String]) -> PruneVerdict {
+    match err {
+        PruneError::Storage(e) => PruneVerdict::Transient(format!("prune outputs: {e}")),
+        permanent => PruneVerdict::OutputContract(format!(
+            "outputs: {permanent} (declared: {})",
+            declared.join(", ")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +679,61 @@ mod tests {
             0o400,
             "the symlink's target must be untouched"
         );
+    }
+
+    /// The drain's exit-11 classification, at the fn grain (the process exit
+    /// is just `match` + `return`): a declared path the step did not produce
+    /// — and an unsafe one — are OutputContract; a storage failure is
+    /// transient. Mirrors the CP's arms in `drive_workspace`.
+    ///
+    /// Mutation killed: swapping the arms. Transient-for-MissingPath would
+    /// re-drive a permanent contract violation until the 5-min clock dead-
+    /// letters it as Transient (wrong verdict, wrong operator story);
+    /// OutputContract-for-Storage would turn a Depot blip into a permanent
+    /// config failure of the Attempt.
+    #[test]
+    fn a_missing_declared_output_is_a_contract_violation_and_a_storage_error_is_not() {
+        let declared = vec!["dist".to_string(), "report.xml".to_string()];
+        match classify_prune(PruneError::MissingPath("dist".into()), &declared) {
+            PruneVerdict::OutputContract(detail) => {
+                // The CP's exact sentence shape, so both sides read the same.
+                assert!(detail.starts_with("outputs: "), "{detail}");
+                assert!(detail.contains("dist"), "{detail}");
+                assert!(detail.contains("(declared: dist, report.xml)"), "{detail}");
+            }
+            PruneVerdict::Transient(d) => panic!("MissingPath must be OutputContract, got Transient({d})"),
+        }
+        match classify_prune(PruneError::UnsafePath("../escape".into()), &declared) {
+            PruneVerdict::OutputContract(_) => {}
+            PruneVerdict::Transient(d) => panic!("UnsafePath must be OutputContract, got Transient({d})"),
+        }
+        match classify_prune(
+            PruneError::Storage(StorageError::Backend("connection refused".into())),
+            &declared,
+        ) {
+            PruneVerdict::Transient(detail) => {
+                assert!(detail.starts_with("prune outputs: "), "{detail}");
+            }
+            PruneVerdict::OutputContract(d) => {
+                panic!("a storage failure must be Transient, got OutputContract({d})")
+            }
+        }
+    }
+
+    /// The hold marker default must be the executor's `egress_done_marker()`
+    /// literal — `--marker` overrides it, absence falls back. Honestly: this
+    /// test pins only THIS binary's copy of the literal; it kills a typo in
+    /// the duplicated path constant only in tandem with the executor-side
+    /// test that pins `/scarab-ctl/egress-done` against `egress_done_marker()`
+    /// (`crates/scarab-executor-k8s/src/lib.rs`). Either literal drifting
+    /// alone fails its own side's assert; the PAIR is what guarantees a
+    /// skew-window hold does not wait forever on a file the CP never touches.
+    #[test]
+    fn the_hold_marker_defaults_to_the_executors_egress_done_path() {
+        assert_eq!(DEFAULT_EGRESS_DONE_MARKER, "/scarab-ctl/egress-done");
+        let args = vec!["--marker".to_string(), "/tmp/other".to_string()];
+        assert_eq!(flag_value(&args, "--marker").as_deref(), Some("/tmp/other"));
+        assert_eq!(flag_value(&[], "--marker"), None);
     }
 
     /// The roots parse is merge-ORDER-preserving and tolerant of the shapes the

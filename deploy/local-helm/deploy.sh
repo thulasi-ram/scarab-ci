@@ -268,19 +268,25 @@ EOF
     ;;
 esac
 
-# The s3-feed fetcher runs as an init container in every Step Pod that has
-# "needs:". A missing fetcher image does NOT break this deploy — it breaks *runs*,
-# later, quietly: every such Step sits in Init:ImagePullBackOff while this script
-# has already printed "Deployed." Check it here, where the message can say so.
-# (⚠ this whole check goes away with the node driver, git-bug 0628369.)
+# The wsfetch image rides in EVERY workspace Step Pod since ADR-0061 s3-drain:
+# the s3-feed fetcher init container (Steps with "needs:") and the egress
+# helper (`scarab-wsfetch hold` / the in-Pod `drain`) on all of them. A missing
+# image does NOT break this deploy — it breaks *runs*, later, quietly: every
+# workspace Step sits in Init:ImagePullBackOff while this script has already
+# printed "Deployed." Check it here, where the message can say so. An image
+# that EXISTS but predates s3-drain fails differently and legibly: a stale
+# wsfetch has no subcommands, so the drain exec ignores its argv, runs fetch
+# and exits 0 with NO drain record — and the Attempt fails promptly as a
+# Config error naming the skew.
 if ! ensure_image "$WSFETCH_IMAGE"; then
   cat >&2 <<EOF
 refusing: cannot obtain the workspace fetcher image
     $WSFETCH_IMAGE
 
 This would NOT have failed the deploy — it would have failed every RUN, after
-the fact: the ADR-0061 s3-feed fetcher is the init container of every Step Pod
-that inherits a workspace, so each one would sit in Init:ImagePullBackOff long
+the fact: the wsfetch image is the fetcher init container of every Step Pod
+that inherits a workspace AND the egress drain helper of every workspace Step
+(ADR-0061 s3-drain), so each one would sit in Init:ImagePullBackOff long
 after this script printed "Deployed."
 
 \`ghcr.io/thulasi-ram/scarab-wsfetch:edge\` does not exist until image.yml

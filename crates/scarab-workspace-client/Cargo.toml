@@ -20,6 +20,11 @@ serde_json = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }
 tracing = { workspace = true }
+# `scarab-wsfetch hold` must SIG_IGN SIGTERM — a hold that dies on TERM
+# silently destroys the drain window. One unsafe `libc::signal` call is the
+# smallest thing that does it; signal-hook would drag in a handler thread this
+# doorstop has no use for.
+libc = "0.2"
 
 # The ADR-0061 s3-feed fetcher (`docker/wsfetch/`): the init container that
 # materialises a Step's input snapshots straight from the workspace service,

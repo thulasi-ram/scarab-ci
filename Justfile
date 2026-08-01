@@ -95,12 +95,18 @@ local-helm ref="edge":
       docker build -t scarab-server:dogfood-local -f docker/server/Dockerfile .
       docker build -t scarab-clone:dogfood docker/clone
       docker build -t scarab-results-sidecar:dogfood docker/sidecar
-      # The ADR-0061 s3-feed fetcher. Context is the repo root: it is a bin target
-      # of crates/scarab-workspace-client. Under ADR-0062 it stops being how a Step
-      # in a cluster gets its inputs (a Workspace Export is), but it does NOT go
-      # away — it stays the path for the local executor and any mode without an
-      # Export. The old note here said the node driver would delete it; that driver
-      # is gone (git-bug 0628369, closed as superseded).
+      # The ADR-0061 wsfetch image — TWO jobs since s3-drain: the s3-feed fetcher
+      # init container AND the egress helper every workspace Pod carries
+      # (`scarab-wsfetch hold` + the in-Pod `drain` the control plane execs).
+      # Context is the repo root: it is a bin target of
+      # crates/scarab-workspace-client. Under ADR-0062 the Export replaces the
+      # in-cluster FEED, but this image does NOT go away — it stays the fetch
+      # path for modes without an Export and the drain helper regardless (the
+      # old node-driver deletion note, git-bug 0628369, is closed as
+      # superseded). Rollout order: this image must land BEFORE a control
+      # plane that expects the drain helper — a stale image makes every drain
+      # exit 0 with NO record, a prompt Config failure naming the skew (see
+      # deploy/helm values comment).
       docker build -t scarab-wsfetch:dogfood -f docker/wsfetch/Dockerfile .
       IMAGE_REPOSITORY=scarab-server \
       SCARAB_CLONE_IMAGE=scarab-clone:dogfood \

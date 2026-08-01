@@ -324,6 +324,173 @@ impl WorkspaceClient {
             })
     }
 
+    /// Publish the in-Pod drain's outcome — `POST /v1/drains` (stage-1 drain).
+    ///
+    /// The Depot is the rendezvous: the helper posts this record LAST, after
+    /// every byte it names is already in warm, and the control plane reads it
+    /// back with [`drain_record`](Self::drain_record) instead of trusting an
+    /// exec's exit code. The fence comes from the token's claims alone — there
+    /// is deliberately nothing in the path or body to mismatch.
+    ///
+    /// Any non-2xx is an error here, including the Depot's 409 (a success
+    /// record already exists for this fence — a stale retry must never
+    /// overwrite a newer good one) and its 422 (the record names an address
+    /// the fence's ledger or warm tier cannot back). The caller's move on
+    /// failure is exit 12; classification is record-first on the control
+    /// plane, so the exit code is only a hint.
+    pub async fn post_drain_record(&self, rec: &DrainRecord) -> Result<(), StorageError> {
+        let resp = self
+            .request(reqwest::Method::POST, "/v1/drains")
+            .json(rec)
+            .send()
+            .await
+            .map_err(Self::transport)?;
+        if !resp.status().is_success() {
+            return Err(Self::status_error(resp).await);
+        }
+        Ok(())
+    }
+
+    /// Read one fence's drain record — `GET /v1/drains/{fence_key}`, where the
+    /// key is [`drain_fence_key`] over the fence coordinates.
+    ///
+    /// The key, never path segments: a step id may contain `/` (every
+    /// invoke-namespaced step is `{prefix}/{id}`, `scarab-pipeline`), so
+    /// `/v1/drains/{run}/{step}/{attempt}` would produce 4+ segments, match no
+    /// route, and turn an existing record into a permanent 404.
+    ///
+    /// The control plane's half of the rendezvous (the route wants
+    /// `Scope::Browse`; this fn just presents whatever token the client holds).
+    /// `Ok(None)` is the Depot's 404 — no drain has recorded anything for this
+    /// fence — and it is an answer, not an error: the CP's classification
+    /// treats "no record" differently from "cannot ask".
+    pub async fn drain_record(
+        &self,
+        run: &str,
+        step: &str,
+        attempt: &str,
+    ) -> Result<Option<DrainRecord>, StorageError> {
+        let key = drain_fence_key(run, step, attempt);
+        let resp = self
+            .request(reqwest::Method::GET, &format!("/v1/drains/{key}"))
+            .send()
+            .await
+            .map_err(Self::transport)?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(Self::status_error(resp).await);
+        }
+        resp.json()
+            .await
+            .map(Some)
+            .map_err(|e| StorageError::Backend(format!("malformed drain record: {e}")))
+    }
+
+    /// [`Cas::ingest`] with the receipts — the drain helper's ingest.
+    ///
+    /// Additive over `ingest` (which now delegates here): same scan, same
+    /// batched `/have`, same warm-only PUTs, same root. What it adds:
+    ///
+    /// - the scan's **canonical tree bytes**, children before parents — the
+    ///   exact bytes whose hashes address the snapshot. [`MemoCas`] serves
+    ///   `tree_entries` read-backs from these, so the in-Pod prune+identity walk
+    ///   costs zero HTTP tree GETs;
+    /// - the tallies a [`DrainRecord`] carries. `have_hits` counts the distinct
+    ///   hashes (blobs and trees) the Depot already had — the dedup that made
+    ///   the batched `/have` worth building.
+    ///
+    /// Errors are the same class as `ingest`'s, and an `EACCES`/`EPERM` during
+    /// the walk is a hard error from `scan_dir`, never a silent skip — the
+    /// scan's `read_dir`/`read`/`metadata` failures all propagate.
+    pub async fn ingest_report(&self, path: &str) -> Result<IngestReport, StorageError> {
+        self.ingest_report_inner(path, true).await
+    }
+
+    /// [`ingest_report`](Self::ingest_report) for the **drain**: every scan
+    /// tree is `PUT` unconditionally — the tree-level `/have` dedup is
+    /// deliberately skipped (blob dedup is kept exactly as is).
+    ///
+    /// Why: the Depot appends a fence's write ledger ONLY on an actual
+    /// `PUT /v1/cas/trees/{hash}` — never on a `/have` hit, because a
+    /// `/have`-ledger would let a probe launder foreign hashes into the ledger
+    /// and defeat the exfiltration protection. A dedup-skipped unchanged
+    /// sub-tree would therefore never enter this fence's ledger, and the
+    /// drain-record closure validation would 422 on every incremental
+    /// workspace. Trees are small and a PUT requires the bytes, which is what
+    /// preserves the security argument. `have_hits` consequently counts
+    /// **blobs only** here — the tree question is never asked.
+    pub async fn drain_ingest_report(&self, path: &str) -> Result<IngestReport, StorageError> {
+        self.ingest_report_inner(path, false).await
+    }
+
+    async fn ingest_report_inner(
+        &self,
+        path: &str,
+        dedup_trees: bool,
+    ) -> Result<IngestReport, StorageError> {
+        let scan = scan_dir(std::path::Path::new(path))?;
+
+        // One question for every blob, then upload only the misses.
+        let blob_hashes: Vec<String> = scan.blobs.keys().cloned().collect();
+        let (missing_blobs, _) = self.missing_hashes(&blob_hashes, &[]).await?;
+        let blob_hits = (blob_hashes.len() - missing_blobs.len()) as u64;
+        let uploads: Vec<(String, BlobSource)> = missing_blobs
+            .into_iter()
+            .filter_map(|hash| scan.blobs.get(&hash).cloned().map(|src| (hash, src)))
+            .collect();
+        let blobs_uploaded = uploads.len() as u64;
+        let results: Vec<Result<u64, StorageError>> = futures::stream::iter(uploads)
+            .map(|(hash, source)| async move {
+                let data = read_blob_source(&source).await?;
+                let len = data.len() as u64;
+                self.put_bytes("blobs", &hash, data).await?;
+                Ok(len)
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect()
+            .await;
+        let mut bytes_uploaded = 0u64;
+        for result in results {
+            bytes_uploaded += result?;
+        }
+
+        // Trees are already canonicalised bottom-up by the scan, so the root
+        // hash is known before a single byte is uploaded. In drain mode
+        // (`dedup_trees == false`) every tree is PUT whether or not warm has
+        // it: only a PUT reaches the fence's write ledger, and the drain
+        // record's closure validation reads that ledger.
+        let tree_hits = if dedup_trees {
+            let tree_hashes: Vec<String> = scan.trees.iter().map(|(h, _)| h.clone()).collect();
+            let (_, missing_trees) = self.missing_hashes(&[], &tree_hashes).await?;
+            for (hash, bytes) in &scan.trees {
+                if missing_trees.iter().any(|m| m == hash) {
+                    self.put_bytes("trees", hash, bytes.clone()).await?;
+                }
+            }
+            (tree_hashes.len() - missing_trees.len()) as u64
+        } else {
+            for (hash, bytes) in &scan.trees {
+                self.put_bytes("trees", hash, bytes.clone()).await?;
+            }
+            0
+        };
+        let tree_bytes: u64 = scan.trees.iter().map(|(_, b)| b.len() as u64).sum();
+        Ok(IngestReport {
+            snapshot: Snapshot {
+                root: TreeHash(scan.root),
+                identity: Some(TreeHash(scan.identity)),
+            },
+            trees: scan.trees,
+            files: scan.files,
+            tree_bytes,
+            blobs_uploaded,
+            bytes_uploaded,
+            have_hits: blob_hits + tree_hits,
+        })
+    }
+
     /// The whole subtree under `root`, in one call.
     pub async fn flat(&self, root: &TreeHash) -> Result<FlatManifest, StorageError> {
         let resp = self
@@ -430,6 +597,204 @@ fn flush_outcome(status: reqwest::StatusCode, body: &str) -> FlushOutcome {
         FlushOutcome::Fatal(detail)
     } else {
         FlushOutcome::Retry(detail)
+    }
+}
+
+/// One fence — `{run, step, attempt}` — as the Depot's **fence key**: SHA-256
+/// over a length-prefixed encoding, lowercase hex, one safe URL path segment.
+///
+/// The byte layout is a wire contract shared with `scarab-server`'s
+/// `workspaced::fence_key`, which delegates here precisely so the two cannot
+/// drift: the Depot stores each drain record under this key, and the control
+/// plane's [`WorkspaceClient::drain_record`] addresses the record by it.
+/// Length prefixes rather than separators because nothing validates the
+/// charset of an authored step id — an id containing `/`, `\n` or `:` must
+/// neither collide with another fence's key nor escape the path segment.
+pub fn drain_fence_key(run: &str, step: &str, attempt: &str) -> String {
+    scarab_storage::sha256_hex(
+        format!(
+            "{}:{}\n{}:{}\n{}:{}",
+            run.len(),
+            run,
+            step.len(),
+            step,
+            attempt.len(),
+            attempt
+        )
+        .as_bytes(),
+    )
+}
+
+/// One in-Pod drain's outcome, as posted to and read back from the Depot
+/// (stage-1 drain: `POST /v1/drains` / `GET /v1/drains/{fence_key}`).
+///
+/// Field names are the wire contract, shared with `scarab-server`'s
+/// `workspaced.rs` handlers — renaming one here forks the rendezvous.
+///
+/// - `root` is the full ingested snapshot; `pruned_root` is present only when
+///   `outputs:` narrowed the publish. The **effective published root** is
+///   `pruned_root` when present, else `root` — the closure the Depot validated
+///   before accepting this record.
+/// - `identity` is the published root's content identity (ADR-0061 s8), absent
+///   only on an error record that never got that far.
+/// - The tallies are the helper's receipts for ws-timing v2 (`files`,
+///   `tree_bytes`, `blobs_uploaded`, `bytes_uploaded`, `have_hits`,
+///   `ingest_ms`, `prune_ms`); the control plane keeps its own clock for the
+///   exec and the flush.
+/// - `error: None` **is** the success claim. An error record carries the kind
+///   the CP classifies on — `OutputContract` is the only Fatal(Config) one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainRecord {
+    pub root: String,
+    pub pruned_root: Option<String>,
+    pub identity: Option<String>,
+    pub files: u64,
+    pub tree_bytes: u64,
+    pub blobs_uploaded: u64,
+    pub bytes_uploaded: u64,
+    pub have_hits: u64,
+    pub ingest_ms: u64,
+    pub prune_ms: u64,
+    pub error: Option<DrainErrorRecord>,
+}
+
+/// Why a drain did not publish. `detail` is what the operator reads off the
+/// failed Attempt, so it names the first offending path/address, not a class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainErrorRecord {
+    pub kind: DrainErrorKind,
+    pub detail: String,
+}
+
+/// The drain error classes the control plane switches on. Serialised by
+/// variant name — `"OutputContract" | "Ingest" | "RecordPost"` on the wire,
+/// exactly as the contract spells them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DrainErrorKind {
+    /// A declared `outputs:` path the step did not produce (or an unsafe one).
+    /// Permanent: re-running the identical drain cannot make the path appear.
+    OutputContract,
+    /// The ingest leg failed after enough progress that a record was still
+    /// postable. Transient class.
+    Ingest,
+    /// Reserved for the record-POST leg itself failing; a helper that cannot
+    /// POST obviously cannot post this, so it exists for a later writer (the
+    /// CP annotating what it inferred), not for `scarab-wsfetch`.
+    RecordPost,
+}
+
+/// What one `ingest` actually did — the [`Cas::ingest`] result plus the scan's
+/// canonical trees and the transfer tallies. See
+/// [`WorkspaceClient::ingest_report`].
+pub struct IngestReport {
+    pub snapshot: Snapshot,
+    /// `(tree hash, canonical bytes)`, children before parents — every tree in
+    /// the snapshot, exactly as hashed. Feed these to [`MemoCas`] and the
+    /// prune+identity walk never issues an HTTP tree GET.
+    pub trees: Vec<(String, Vec<u8>)>,
+    /// Non-directory entries scanned (files and symlinks).
+    pub files: u64,
+    /// Total canonical tree bytes in the snapshot.
+    pub tree_bytes: u64,
+    /// Blobs actually uploaded (the `/have` misses).
+    pub blobs_uploaded: u64,
+    /// Bytes of those uploads.
+    pub bytes_uploaded: u64,
+    /// Distinct hashes the Depot already had: blobs + trees for
+    /// [`ingest_report`](WorkspaceClient::ingest_report), blobs only for
+    /// [`drain_ingest_report`](WorkspaceClient::drain_ingest_report) (which
+    /// never asks the tree question — see its doc).
+    pub have_hits: u64,
+}
+
+/// A [`Cas`] over a [`WorkspaceClient`] that serves `tree_entries` from an
+/// in-memory canonical-bytes memo, falling through to HTTP only on a miss.
+///
+/// The drain helper's prune+identity walk (`scarab_storage::prune_tree`,
+/// `scarab_storage::content_identity`) reads trees the scan canonicalised
+/// **moments ago in this very process** — paying an HTTP round-trip per
+/// directory to read our own bytes back would re-grow, one grain coarser, the
+/// sequential walk ADR-0061 s2 deleted. So the memo is seeded from
+/// [`IngestReport::trees`], and every tree this wrapper *writes* (the
+/// prune-minted rebuilds) is inserted too, because `content_identity` reads
+/// them right back.
+///
+/// Writes are never elided: `put_tree` always goes through to the client, so
+/// the Depot's warm tier and the fence's write ledger see every pruned tree —
+/// the ledger is what lets the posted `pruned_root` validate, and it also
+/// covers auth for any residual fall-through read.
+pub struct MemoCas<'a> {
+    client: &'a WorkspaceClient,
+    /// tree hash → canonical bytes. `std::sync::Mutex`, never held across an
+    /// `.await` — lock, clone, drop.
+    memo: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl<'a> MemoCas<'a> {
+    /// Wrap `client`, pre-seeding the memo — normally with
+    /// [`IngestReport::trees`].
+    pub fn new(client: &'a WorkspaceClient, trees: Vec<(String, Vec<u8>)>) -> Self {
+        Self {
+            client,
+            memo: std::sync::Mutex::new(trees.into_iter().collect()),
+        }
+    }
+}
+
+#[async_trait]
+impl Cas for MemoCas<'_> {
+    async fn put_blob(&self, data: &[u8]) -> Result<BlobHash, StorageError> {
+        self.client.put_blob(data).await
+    }
+
+    async fn get_blob(&self, hash: &BlobHash) -> Result<Vec<u8>, StorageError> {
+        self.client.get_blob(hash).await
+    }
+
+    async fn put_tree(&self, entries: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {
+        // Canonicalise HERE with the same one definition the client uses, so
+        // the memo's bytes are the bytes the hash addresses — then write
+        // through. The client re-canonicalises to the identical bytes
+        // (`scarab_storage::canonical_tree` both times); one redundant sort is
+        // nothing next to the round-trip it rides on.
+        let (hash, bytes) = canonical_tree(entries.clone())?;
+        self.client.put_tree(entries).await?;
+        self.memo
+            .lock()
+            .expect("memo mutex poisoned")
+            .insert(hash.0.clone(), bytes);
+        Ok(hash)
+    }
+
+    async fn tree_entries(&self, hash: &TreeHash) -> Result<Vec<TreeEntry>, StorageError> {
+        let cached = self
+            .memo
+            .lock()
+            .expect("memo mutex poisoned")
+            .get(&hash.0)
+            .cloned();
+        if let Some(bytes) = cached {
+            return serde_json::from_slice(&bytes)
+                .map_err(|e| StorageError::Backend(format!("memoised tree unparseable: {e}")));
+        }
+        // A residual read (a sub-tree kept whole by an earlier snapshot, say):
+        // fall through to HTTP — the fence's ledger covers the auth — and
+        // memoise so the walk pays for it once.
+        let entries = self.client.tree_entries(hash).await?;
+        let (rehash, bytes) = canonical_tree(entries.clone())?;
+        self.memo
+            .lock()
+            .expect("memo mutex poisoned")
+            .insert(rehash.0, bytes);
+        Ok(entries)
+    }
+
+    async fn materialize(&self, tree: &TreeHash, path: &str) -> Result<(), StorageError> {
+        self.client.materialize(tree, path).await
+    }
+
+    async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
+        self.client.ingest(path).await
     }
 }
 
@@ -601,41 +966,11 @@ impl Cas for WorkspaceClient {
     /// round-trip per file whether or not the content is new, so a fully-deduped
     /// re-ingest measured no faster than a cold one. One batched question
     /// replaces N round-trips.
+    ///
+    /// Delegates to [`ingest_report`](WorkspaceClient::ingest_report) — one
+    /// scan, one upload path; this port method just drops the receipts.
     async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
-        let scan = scan_dir(std::path::Path::new(path))?;
-
-        // One question for every blob, then upload only the misses.
-        let blob_hashes: Vec<String> = scan.blobs.keys().cloned().collect();
-        let (missing_blobs, _) = self.missing_hashes(&blob_hashes, &[]).await?;
-        let uploads: Vec<(String, BlobSource)> = missing_blobs
-            .into_iter()
-            .filter_map(|hash| scan.blobs.get(&hash).cloned().map(|src| (hash, src)))
-            .collect();
-        let results: Vec<Result<(), StorageError>> = futures::stream::iter(uploads)
-            .map(|(hash, source)| async move {
-                let data = read_blob_source(&source).await?;
-                self.put_bytes("blobs", &hash, data).await
-            })
-            .buffer_unordered(CONCURRENCY)
-            .collect()
-            .await;
-        for result in results {
-            result?;
-        }
-
-        // Trees are already canonicalised bottom-up by the scan, so the root
-        // hash is known before a single byte is uploaded.
-        let tree_hashes: Vec<String> = scan.trees.iter().map(|(h, _)| h.clone()).collect();
-        let (_, missing_trees) = self.missing_hashes(&[], &tree_hashes).await?;
-        for (hash, bytes) in &scan.trees {
-            if missing_trees.iter().any(|m| m == hash) {
-                self.put_bytes("trees", hash, bytes.clone()).await?;
-            }
-        }
-        Ok(Snapshot {
-            root: TreeHash(scan.root),
-            identity: Some(TreeHash(scan.identity)),
-        })
+        Ok(self.ingest_report(path).await?.snapshot)
     }
 }
 
@@ -884,6 +1219,9 @@ struct Scan {
     blobs: std::collections::HashMap<String, BlobSource>,
     /// Canonical tree bytes, children before parents.
     trees: Vec<(String, Vec<u8>)>,
+    /// Non-directory entries seen (files and symlinks) — NOT `blobs.len()`,
+    /// which dedups identical content and would under-report.
+    files: u64,
 }
 
 /// Hash a whole directory locally: every blob, every tree, bottom-up.
@@ -900,8 +1238,9 @@ fn scan_dir(dir: &std::path::Path) -> Result<Scan, StorageError> {
         identity: String::new(),
         blobs: std::collections::HashMap::new(),
         trees: Vec::new(),
+        files: 0,
     };
-    let (root, identity) = scan_one(dir, &mut scan.blobs, &mut scan.trees)?;
+    let (root, identity) = scan_one(dir, &mut scan.blobs, &mut scan.trees, &mut scan.files)?;
     scan.root = root;
     scan.identity = identity;
     Ok(scan)
@@ -913,6 +1252,7 @@ fn scan_one(
     dir: &std::path::Path,
     blobs: &mut std::collections::HashMap<String, BlobSource>,
     trees: &mut Vec<(String, Vec<u8>)>,
+    files: &mut u64,
 ) -> Result<(String, String), StorageError> {
     let mut items: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
         .map_err(io_err)?
@@ -939,11 +1279,12 @@ fn scan_one(
             let entry = TreeEntry::symlink(name, BlobHash(hash));
             id_entries.push(entry.clone());
             entries.push(entry);
+            *files += 1;
             continue;
         }
 
         let (target, id_target) = if file_type.is_dir() {
-            let (sub, sub_identity) = scan_one(&item.path(), blobs, trees)?;
+            let (sub, sub_identity) = scan_one(&item.path(), blobs, trees, files)?;
             (
                 TreeTarget::Tree(TreeHash(sub)),
                 TreeTarget::Tree(TreeHash(sub_identity)),
@@ -954,6 +1295,7 @@ fn scan_one(
             blobs
                 .entry(hash.clone())
                 .or_insert(BlobSource::File(item.path()));
+            *files += 1;
             (
                 TreeTarget::Blob(BlobHash(hash.clone())),
                 TreeTarget::Blob(BlobHash(hash)),
@@ -1122,6 +1464,53 @@ mod tests {
             ),
             other => panic!("2xx + unparseable body must NOT be Durable, got {other:?}"),
         }
+    }
+
+    /// The DrainRecord wire shape, field for field, against the stage-1
+    /// contract. The Depot's handlers deserialize these exact names — this
+    /// test kills the mutation where a field here is renamed (or an error
+    /// kind's spelling drifts from `OutputContract|Ingest|RecordPost`) and the
+    /// rendezvous silently forks: the helper would post records the CP-side
+    /// deserializer drops or defaults.
+    #[test]
+    fn a_drain_record_serialises_to_the_contract_field_names_exactly() {
+        let rec = DrainRecord {
+            root: "aa".into(),
+            pruned_root: Some("bb".into()),
+            identity: None,
+            files: 3,
+            tree_bytes: 512,
+            blobs_uploaded: 2,
+            bytes_uploaded: 1024,
+            have_hits: 7,
+            ingest_ms: 41,
+            prune_ms: 5,
+            error: Some(DrainErrorRecord {
+                kind: DrainErrorKind::OutputContract,
+                detail: "declared output path not produced by the step: dist".into(),
+            }),
+        };
+        let v: serde_json::Value = serde_json::to_value(&rec).unwrap();
+        for field in [
+            "root",
+            "pruned_root",
+            "identity",
+            "files",
+            "tree_bytes",
+            "blobs_uploaded",
+            "bytes_uploaded",
+            "have_hits",
+            "ingest_ms",
+            "prune_ms",
+            "error",
+        ] {
+            assert!(v.get(field).is_some(), "missing wire field: {field}");
+        }
+        assert_eq!(v["error"]["kind"], "OutputContract");
+        assert_eq!(v["identity"], serde_json::Value::Null);
+        // And the round trip back — the CP reads what the helper wrote.
+        let back: DrainRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back, rec);
     }
 
     /// A manifest is not a trust boundary: the service could be buggy or hostile

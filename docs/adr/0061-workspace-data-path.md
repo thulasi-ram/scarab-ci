@@ -87,12 +87,15 @@ have here — attach/detach latency at each boundary, stuck volumes when a spot 
 reclaimed, per-node attachment quotas, provisioning delay — comes from binding volumes to
 short-lived pods. Bind them to the long-lived thing instead and all of it goes away.
 
-**One path is a direction-at-a-time claim, and today only one direction has arrived.**
+**One path is a direction-at-a-time claim, and both directions have now arrived.**
 s3-feed converged the **read** path: every Step that inherits a workspace materialises it from
-the service, in every deployment mode, with no second route. The **write** path has not
-converged — the drain still hashes the workspace on the control plane and writes it to the
-object store directly (the service is seeded alongside, as a warm tier, not as the route), and
-it converges on the service only with **s3-drain**, which is not built.
+the service, in every deployment mode, with no second route. **s3-drain converged the write
+path** (2026-08-01): the drain runs *inside the Pod* — the control plane execs `scarab-wsfetch
+drain` in the egress helper, the helper ingests `/workspace` to the Depot warm-first
+(`/have`-dedup), prunes to the authored `outputs:` and folds the content identity in-process,
+and posts a **drain record** to the Depot as the rendezvous. The control plane reads the record
+back, awaits the archival `flush`, and patches root/identity/durability onto the Pod — hashes
+and a record, never bytes.
 
 **2. A Scarab node driver, shipped and installed as standard.**
 It mounts a Workspace Snapshot into a Step Pod as a **read-only lower layer** with a
@@ -120,15 +123,40 @@ Service and driver are **one component in two halves** (server and client), not 
 bytes. Helper containers become Scarab-owned images rather than `busybox` doorstops. The
 `kubectl exec` tar tunnel is deleted.
 
-> **Status of part 3, because it is a slice and not a completed decision.** There are
-> **three** `exec` tar tunnels on a Step boundary, not one, and only the first is gone.
-> **s3-feed has landed:** a Scarab-owned fetcher image pulls the Step's inputs from the
-> workspace service, and the feed-side tunnel and its `busybox` doorstop are deleted. Still
-> live: the **drain** tunnel (`tar -cf` out over `exec`, hashed on the server) and the
-> **artifact-harvest** tunnel (`harvest_artifacts` — a third `exec` tar on every boundary).
-> Both go in **s3-drain**, which is not built. So the control plane has left the data path in
-> one direction. Read every "the tunnel is deleted" in this ADR as scoped to the feed until
-> s3-drain lands.
+> **Status of part 3.** There were **three** `exec` tar tunnels on a Step boundary, not one.
+> **s3-feed** deleted the first: a Scarab-owned fetcher image pulls the Step's inputs from the
+> workspace service, and the feed-side tunnel and its `busybox` doorstop are gone. **s3-drain**
+> (2026-08-01) deleted the second, and reshaped it rather than merely relocating it:
+>
+> - The egress barrier is the **wsfetch image** now — one knob with the fetcher
+>   (`SCARAB_WSFETCH_IMAGE` / chart `workspace.fetcherImage`) — held open by `scarab-wsfetch
+>   hold` and pinned `runAsUser: 0` (root-read is the privilege the drain always had: the
+>   busybox barrier ran as root, and a `0600` file left by a `run_as_root` step must not
+>   silently vanish from the snapshot).
+> - The control plane execs `scarab-wsfetch drain --workspace /workspace --outputs <glob>…` in
+>   that container — argv in, exit code out; the globs are transport, the Pod annotation is the
+>   truth. The helper ingests warm-first with `/have` dedup, prunes and folds the content
+>   identity in-process (no HTTP tree read-backs on the hot path), and POSTs its **DrainRecord**
+>   to the Depot LAST — so a record's existence implies the ingest completed. The Depot
+>   validates the record against the fence's write ledger and the closure's warm presence
+>   before accepting it.
+> - Classification is **record-first**: the record is the truth, the exec's exit code only a
+>   hint when no record exists (a success record publishes; an `OutputContract` record fails
+>   Config with the helper's detail; exit 11 with no record fails Config; 126/127/"executable
+>   file not found" is a named image/control-plane **skew** failure, and so is **exit 0 with no
+>   record** — a stale wsfetch has no subcommands, ignores the `drain` argv, runs fetch and
+>   exits 0 having published nothing, while a current binary always POSTs its record before
+>   exiting 0 — prompt and legible, never a wedge to the step budget; everything else re-drives
+>   under the 5-minute escalation clock).
+> - `ws-timing` moved to **v2**: the control plane keeps `exec_drain_ms` / `cold_flush_ms` /
+>   `total_ms`; `files`, `tree_bytes`, `blobs_uploaded`, `bytes_uploaded`, `have_hits`,
+>   `ingest_ms`, `prune_ms` come off the record, measured where the work now happens.
+>   `tar_bytes` / `tar_unpack_ms` / `walk_ms` died with the tunnel.
+>
+> Still live, on purpose: the **artifact-harvest** tunnel (`harvest_artifacts` — the last
+> `exec` tar, framed and fail-closed). Artifacts ride an independent store with an independent
+> lifecycle; moving them onto the Depot is a filed follow-up ("artifacts ride the Depot"), not
+> part of this slice.
 
 **4. An Attempt is not `Succeeded` until its Workspace Snapshot is durable.** On spot, a node
 can vanish between "the Step exited 0" and "its evidence is safe". Declaring success before
@@ -359,6 +387,16 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   checkout; one machine, loopback object storage, no cross-AZ latency; and the measured binary
   also carried the in-progress s7 metadata-fidelity work, which adds per-file syscalls (not
   round-trips) to both CAS legs. None of that touches the ordering — the gap is 6–20×.
+
+  > **Amended 2026-08-01 (s3-drain).** Every figure in this bullet and s2's — the 4–15% tunnel
+  > share, the 81–88% CAS share — is **pre-0064 and pre-s3-drain**: measured on the shape where
+  > the control plane unpacked the drain tar into a tempdir and ingested it itself, with cold in
+  > the write path. Neither shape exists any more. The drain slice was accordingly **not
+  > motivated by these latencies** but by the architecture (part 3: the control plane leaves the
+  > data path — the prerequisite for 0062's Export) and by **control-plane RAM**: the old drain
+  > buffered the entire workspace tar in one CP `Vec` and unpacked it into a CP tempdir per Step
+  > boundary, a per-drain memory bill proportional to the largest workspace times drain
+  > concurrency. ws-timing v2 keeps the leg observable, but no fresh latency claim is made here.
 - **Concurrency in the CAS legs — s2, the slice s0's numbers created. DONE; it moved the
   bottleneck out of object storage entirely.** s0's own consequence paragraph names this:
   *"concurrency and batching in the CAS legs are worth more today than the tunnel deletion,

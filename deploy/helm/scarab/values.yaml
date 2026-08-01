@@ -243,16 +243,28 @@ workspace:
   # Where the warm tier lives inside the container — the PVC's mount point, and
   # the value of SCARAB_WORKSPACE_DATA_DIR.
   dataDir: /var/lib/scarab/cas
-  # The workspace FETCHER image (ADR-0061 s3-feed): the init container every Step
-  # with `needs:` runs to pull its input snapshots from the service. Digest-pin in
-  # production, exactly as with scarab.cloneImage.
+  # The scarab-wsfetch image, and it is ONE knob for TWO containers in every
+  # workspace Step Pod (ADR-0061):
+  #   - the FETCHER init container (s3-feed): pulls a Step's input snapshots
+  #     from the service when it has `needs:`;
+  #   - the EGRESS helper (s3-drain): `scarab-wsfetch hold` keeps the Pod open
+  #     after the step exits, and the control plane execs `scarab-wsfetch
+  #     drain` in it to publish /workspace to the Depot in-Pod.
+  # Digest-pin in production, exactly as with scarab.cloneImage.
   #
-  # ⚠ This is a temporally-ordered STEPPING STONE, not the design. It is EAGER —
-  # it copies the whole snapshot onto every fresh node — and the CSI/FUSE node
-  # driver replaces it, at which point this value, docker/wsfetch/ and the
-  # executor's WorkspaceFetch all disappear together (git-bug 0628369). While this
-  # is set, `eager_fetch_total` on the server is climbing and the stone is
-  # load-bearing.
+  # ⚠ ROLLOUT ORDER: publish/load this image BEFORE (or with) a control plane
+  # that expects the s3-drain helper. A stale wsfetch has no subcommands — the
+  # `drain` argv is ignored, it runs fetch and exits 0 with NO drain record —
+  # and the control plane fails the Attempt promptly as a Config error naming
+  # the skew (fast and legible, never wedged to the step budget) — but it
+  # fails it. Image first, control plane second.
+  #
+  # The EAGER feed remains a stepping stone: ADR-0062's Workspace Export
+  # replaces how an in-cluster Step gets its inputs, but this image does NOT
+  # die with it (the old node-driver deletion note, git-bug 0628369, is
+  # closed as superseded) — it stays the fetch path for modes without an
+  # Export, and the drain helper regardless. While the eager feed is live,
+  # `eager_fetch_total` on the server is climbing.
   fetcherImage: ghcr.io/thulasi-ram/scarab-wsfetch:edge
   persistence:
     # The warm tier is bounded by SPACE (cold is bounded by time). LRU eviction

@@ -311,21 +311,24 @@ fi
 echo "    a Pod reached the workspace service at http://$ws_host:$ws_port"
 export SCARAB_WORKSPACE_URL="http://$ws_host:$ws_port"
 
-# The fetcher image (ADR-0061 s3-feed). kind cannot pull from the host's docker
-# daemon, so proc mode builds it once and `kind load`s it — the same reason the
-# clone image has to be dealt with explicitly here. Skipped when the image is
-# already in the node, so a re-run of `just up` is cheap.
+# The workspace helper image (ADR-0061): the s3-feed fetcher init container AND
+# the egress hold/drain sidecar. kind cannot pull from the host's docker daemon,
+# so proc mode builds it and `kind load`s it — the same reason the clone image
+# has to be dealt with explicitly here.
 #
-# ⚠ DELETE ME with the node driver (git-bug 0628369), together with
-# docker/wsfetch/ and the executor's WorkspaceFetch.
+# ALWAYS rebuilt (same as `just kube-tests` does for the clone/sidecar images):
+# docker's layer cache makes an unchanged rebuild a few seconds, and the old
+# "skip when the image exists" shortcut served a STALE helper whenever
+# crates/scarab-workspace-client changed — an old binary has no subcommands, so
+# every drain "succeeded" (exit 0) with no record and the Attempt failed as a
+# Config skew error the dev loop itself had manufactured.
+#
+# (The old DELETE-ME note is gone with git-bug 0628369, closed as superseded:
+# ADR-0062 replaces only the eager-fetch role; the egress role survives it.)
 export SCARAB_WSFETCH_IMAGE="${SCARAB_WSFETCH_IMAGE:-scarab-wsfetch:dev}"
 if [ "${SCARAB_WSFETCH_SKIP_BUILD:-0}" != 1 ]; then
   echo "==> building + loading the workspace fetcher image ($SCARAB_WSFETCH_IMAGE)"
-  if ! docker image inspect "$SCARAB_WSFETCH_IMAGE" >/dev/null 2>&1; then
-    docker build -q -t "$SCARAB_WSFETCH_IMAGE" -f "$root/docker/wsfetch/Dockerfile" "$root" >/dev/null
-  else
-    echo "    reusing the local image (docker rmi $SCARAB_WSFETCH_IMAGE to force a rebuild)"
-  fi
+  docker build -q -t "$SCARAB_WSFETCH_IMAGE" -f "$root/docker/wsfetch/Dockerfile" "$root" >/dev/null
   kind load docker-image "$SCARAB_WSFETCH_IMAGE" --name "$cluster" >/dev/null
 fi
 

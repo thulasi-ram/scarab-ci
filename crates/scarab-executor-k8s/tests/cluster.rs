@@ -161,12 +161,13 @@ fn tier_var(name: &str) -> String {
 ///   store, `fall_through_on_warm_error` — what `main.rs` hands to
 ///   `with_workspace_cas`;
 /// - [`depot`](WorkspaceFixture::depot) is the SAME client held concretely —
-///   the drain's warm-first WRITE half plus the awaited `flush`, what
-///   `main.rs` hands to `with_workspace_depot`. **Wiring `cas` without this
-///   re-creates a bug this fixture shipped with**: `drive_workspace` then
-///   takes its "the target IS the durable store, nothing to flush" branch
-///   while the Depot's PUTs are warm-only (ADR-0064), so every live drain
-///   landed in an evictable cache and nothing ever reached cold;
+///   what `main.rs` hands to `with_workspace_depot`. Since ADR-0061 s3-drain
+///   the drain's WRITE half runs in-Pod (`scarab-wsfetch drain` in the egress
+///   helper); this handle is the control plane's side of the rendezvous: the
+///   drain-record GET and the awaited archival `flush`. Dropping it no longer
+///   silently lands drains warm-only (the bug this fixture once shipped
+///   with) — `drive_workspace` now refuses to drain at all without a Depot,
+///   failing the Attempt as Config;
 /// - [`cold`](WorkspaceFixture::cold) is a COLD-ONLY handle on the store the
 ///   Depot archives into — durability assertions read through THIS, because a
 ///   readback through `cas` (or the client) is satisfied by the warm cache and
@@ -202,8 +203,8 @@ struct WorkspaceFixture {
     /// The tiered READ handle (warm = the service, cold = the object store,
     /// fall-through) — `with_workspace_cas`, and the test's ordinary readback.
     cas: std::sync::Arc<dyn scarab_storage::Cas>,
-    /// The Depot client, concrete — `with_workspace_depot`: the drain's
-    /// warm-first ingest and the awaited archival `flush`.
+    /// The Depot client, concrete — `with_workspace_depot`: the drain-record
+    /// GET (the in-Pod helper posts it) and the awaited archival `flush`.
     depot: std::sync::Arc<scarab_workspace_client::WorkspaceClient>,
     /// COLD ONLY — no warm tier, no fall-through. For durability assertions:
     /// what this handle cannot read, no flush made durable.
@@ -747,21 +748,25 @@ async fn workspace_flows_from_a_to_b_through_the_cas() {
 ///
 /// The unit tests pin the *rule* (`settled_state` / `workspace_snapshot_lost`)
 /// against Pod fixtures. This pins the *ordering* against the real thing, which is
-/// what the rule is about: `drive_workspace` ingests warm-first, awaits the
-/// archival `flush` (ADR-0064), patches `scarab.io/workspace-root`, and only then
-/// releases the egress barrier, so the first `Succeeded` a caller can see is
-/// already backed by content COLD holds. A green verdict whose snapshot is not
-/// yet (or never) durable is a claim the durable record cannot back
-/// (CONTEXT.md §2).
+/// what the rule is about — and since ADR-0061 s3-drain the real thing goes
+/// through the HELPER: the control plane execs `scarab-wsfetch drain` in the
+/// egress container, the helper ingests warm-first from inside the Pod and
+/// posts a DrainRecord to the Depot, and `drive_workspace` — record-first —
+/// awaits the archival `flush` (ADR-0064), patches `scarab.io/workspace-root`,
+/// and only then releases the egress barrier. So the first `Succeeded` a
+/// caller can see is already backed by content COLD holds. A green verdict
+/// whose snapshot is not yet (or never) durable is a claim the durable record
+/// cannot back (CONTEXT.md §2).
 ///
 /// Deliberately asserted on the FIRST terminal observation, not after a settle
 /// loop: polling until the root appears would test nothing at all. And
 /// deliberately read back through a **cold-only** handle, not the tiered one:
-/// since ADR-0064 the drain's PUTs land in the Depot's warm cache, so a tiered
-/// (or client) readback is satisfied by warm and proves presence, not
-/// durability. Mutations this kills: reorder the flush after the annotation
-/// patch, or drop the fixture's `with_workspace_depot` wiring — either way the
-/// closure is not in cold at the instant of green and the cold-only walk fails.
+/// the helper's PUTs land in the Depot's warm cache, so a tiered (or client)
+/// readback is satisfied by warm and proves presence, not durability.
+/// Mutations this kills: reorder the flush after the annotation patch, drop
+/// the fixture's `with_workspace_depot` wiring, or release a verdict off the
+/// exec's exit code with no record behind it — either way the closure is not
+/// in cold at the instant of green and the cold-only walk fails.
 #[tokio::test]
 #[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
 async fn a_green_attempt_is_backed_by_a_durable_snapshot_at_the_instant_it_goes_green() {
@@ -1038,10 +1043,14 @@ async fn a_step_with_inputs_is_refused_when_no_workspace_service_is_configured()
     exec.cancel(&h).await.expect("cleanup");
 }
 
-/// LIVE per-path publishing (`outputs:`, ADR-0007): the egress leg prunes the
+/// LIVE per-path publishing (`outputs:`, ADR-0007): the drain prunes the
 /// published snapshot to the declared paths, and a dependent materializes only
-/// those. Kind-tier because the prune runs in `drive_workspace` off the Pod
-/// annotation — `FakeExecutor` has no workspace at all, so this wiring is
+/// those. Since ADR-0061 s3-drain the prune runs IN-POD, inside
+/// `scarab-wsfetch drain`, from argv the control plane sources off the Pod
+/// annotation (argv is transport, the annotation is truth) — so this case now
+/// drives helper exec → DrainRecord → record-first classification end to end,
+/// including the OutputContract leg below arriving via the record.
+/// Kind-tier because `FakeExecutor` has no workspace at all, so this wiring is
 /// k8s-observable-only (the feature-acceptance rule's kind trigger). The prune
 /// *algebra* is proven in-process in `scarab-storage-s3/tests/workspace.rs`.
 #[tokio::test]

@@ -310,6 +310,14 @@ so that failure mode does not exist rather than being defended against. The stat
 as the drain for configurations without an Export (part 5's ladder, and the local executor), where
 it is the correct fallback and not the mechanism.
 
+> **Stage 1 landed 2026-08-01, and its trusted egress helper SHARES the wsfetch image.** 0061's
+> s3-drain put the drain in-Pod ahead of any Export: every workspace Step Pod's egress barrier is
+> now the `scarab-wsfetch` image (`hold` + the exec'd `drain`), one knob with the fetcher — chart
+> `workspace.fetcherImage` / `SCARAB_WSFETCH_IMAGE` — not a second image to version. When stage 2
+> puts the change set on the service side, the helper's `drain` is the thing that stops walking
+> `/workspace` and starts reading the upper; the container, its token, its record rendezvous and
+> its exit-code contract are already in place and do not move.
+
 **4. Zone preference is soft, and a miss is a cost line rather than an outage.**
 A Workspace Export lives on **one** service replica's disk, and the volume must be named in the
 Pod spec before the scheduler places anything. Scarab picks the replica at launch, prepares the
@@ -655,6 +663,21 @@ what the design must do. Each is filed.
    mount was actually NFS. A spike shaped only to produce a number will produce one.
 
 ## Open — deliberately not decided here
+
+### Stage 2 — what still stands between here and an Export-delivered `/workspace`
+
+Stage 1 (the in-Pod drain, 0061 s3-drain) is live. Stage 2 — a Step Pod mounting a Workspace
+Export instead of an eager copy — is **not**, and the remaining work is enumerable rather than
+vague. Each row names what it is blocked on, the gate that proves it, and its size:
+
+| work | blocked on | gate (what proves it) | size |
+|---|---|---|---|
+| **NFS-Ganesha spike** — userspace export of the overlay merged view, the ladder rung that needs no kernel `nfsd` on the Depot | a privileged Linux host with a Rust toolchain (the same tier problem as `0ad393c`) | ops/sec under latency for a `cargo`-shaped write load, with the harness failing LOUDLY on any silent rung fallback | spike, days |
+| **colima NFS client** — the dev substrate cannot mount an Export at all today (red-team #1: no `mount.nfs` in the VM, Pod hangs in `ContainerCreating` forever) | nothing but VM provisioning (`nfs-common` in the colima image / provision script) | a Step Pod on `just up` / `just local-helm` mounts an NFS-backed PVC and reads a file through it | small |
+| **PV/PVC lifecycle** — per-Step PV+PVC create → bind → reap, and Export/Farm reaping behind it (eviction under a live Export is silent corruption, red-team #2) | git-bug `24476bc` (Farm/Export reaping — on the critical path, not beside it) | churn stays cheap at Run scale AND no orphaned PV/PVC/Export survives Run teardown; a reaped Farm under a live Export is refused, not corrupted | medium |
+| **fsGroup over NFS** — kubelet applies no fsGroup to NFS volumes (`Managed: false`, red-team #4), so a non-root Step may be unable to write its own Workspace | a decision: per-Step uid squash on the export vs group-writable modes stamped at Farm build (each changes what s7 fidelity means for modes) | a non-root Step under the ADR-0039 restricted baseline writes an Export-backed `/workspace` | medium, and a potential part-2 blocker |
+| **`0ad393c` — the exact-path overlay test** — `read_change_set` has never run against a kernel-produced upper; every green test covers the copy rung's approximation | a place to run it: privileged Linux runner (dogfood node has no Rust, GHA quota-blocked, darwin cannot mount overlayfs) | whiteouts, opaque dirs, file renames, and absolute+relative `redirect` resolution asserted against a REAL upper layer | the tier, not the code |
+| **eager\|lazy cutover config** — the one `build_pod` line that chooses the workspace volume kind (`emptyDir` today, PVC under an Export) becomes a per-deployment posture | every row above | an explicit config knob, fail-closed (a deployment that asks for lazy without the substrate refuses at launch, never silently feeds eager); `eager_fetch_total` goes to zero and stays there on a lazy deployment | small, once the substrate is proven |
 
 - **The exact path has never executed, and every green test exercises the approximate one.** This is
   the most important caveat on this ADR's status and it is easy to miss, because the code is written,
