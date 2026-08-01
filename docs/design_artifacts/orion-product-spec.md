@@ -817,3 +817,92 @@ package system:
   needs tool `gh`, envelope lacks it → rasterization error at mint.
   Composition narrows or fails; it cannot escalate (ADR-0039's
   grants-are-ceilings applied to documents).
+
+### 17.6 The vault is a vault (owner-decided, 2026-08-01)
+
+A SOP library is **not a Project**. Repo-first is retained precisely because
+the vault *is a repo* — git-versioned, PR-reviewed, read at a pinned SHA via
+a ForgeConnection; it is registered in org settings as a **doc source**,
+nothing more. Project-ness (governance, environments, runs) is an
+independent, optional property: a vault's owners *may* make the same repo a
+Project to get eval-CI on their SOPs — their call, orthogonal, zero new
+concepts on the consumer side.
+
+## 18. AI on the pipeline itself: the cost plane / verdict plane doctrine
+
+The owner's reframe: the AI is also there to *integrate pipelines better,
+take cost-saving calls, do reasoning steps, orchestrate*. The counter the
+owner named: any LLM today can read a pipeline YAML and advise. What the
+external AI structurally cannot do: (1) it sees the **definition**, not the
+**history** — the valuable calls need the evidence corpus (durations, costs,
+flake proofs, failure↔diff correlations across hundreds of runs); (2) it can
+advise but has no safe **hands** — acting needs bounded hooks inside
+admission, not kubectl; (3) when a judged call is wrong there is no
+**attribution or off-switch** without evidence-grained records.
+
+**The doctrine:** *AI may dispose on the cost plane; it may only propose on
+the verdict plane — and anything judged that touches a verdict is
+evidence-marked.* Cost-plane = ordering, prioritisation, cancelling doomed
+work, retry economics: worst case is wasted/saved compute, never a wrong
+green. Verdict-plane = skipping/narrowing what runs: it changes what green
+*means*; a silent judged-green is the one thing this product must never
+emit.
+
+**The pipeline economist:** the flagship form is a **standing SOP whose
+subject is the pipeline's economics**, and whose durable output is **PRs
+against the pipeline YAML** (paths filters, `needs` edges, cache keys,
+`when:` clauses — each PR carrying its evidence: "saves ~$31/run over the
+last 200; here are the 3 runs it would have mis-skipped"). Repo-first for
+optimisations too: reviewed, versioned, revertable — never ambient runtime
+behaviour. Runtime judgment shrinks to the cost-plane residue that cannot be
+a rule.
+
+### 18.1 Whale-scale cost-plane use cases (invisible small, 6–7 figures large)
+
+Common signature: **fleet-level signal + judgment + cost-only blast radius.**
+
+| Family | Judged calls | Hands |
+|---|---|---|
+| **Doomed work** | leg-invariant failure classification → cancel remaining matrix legs; partial cascade pruning (only arm64 descendants doomed); **merge-queue eviction** of semantically-doomed speculative chains | cancel + supersede machinery (exists) |
+| **Retry economics** | **retry-storm suppression / incident mode**: correlate failure fingerprints fleet-wide, hold retries, shed cron load, keep release-blockers, auto-lift, annotate "failed-during-incident" so flake stats stay clean | retry-hold switch (small new hook) |
+| **Speculation** | likely-failers first; speculative start of expensive suites (cancelled if a gate fails); **judged bisect** (probable-culprit-first); Depot/cache pre-warming | admission priority (exists) + Depot API |
+| **Placement & storage** | spot-vs-on-demand per workload (length × eviction risk); right-sizing from cgroup evidence; cache-key surgery; retention tuning from Depot access patterns | PlacementProfiles / RetentionProfiles (exist) |
+| **Attention** | deprioritise drafts/bots/docs-only under queue pressure; expedite release-blockers; **debounce the rapid-fire pusher**; consolidate overlapping nightlies | priority nudge + debounce timer (small new hooks) |
+| **Drift watch** | "this pool got 22% slower since Tuesday"; cross-region egress spikes; cost-per-merged-PR trend — triaged with evidence → tickets/PRs | none (read-only + PR output) |
+
+Boundary case, named: monorepo test *selection* sits exactly on the plane
+line — reordering/parallelising is cost-plane; skipping is verdict-plane and
+drops to propose-only (or evidence-marked opt-in per required check).
+
+## 19. Org applicability: who decides which agents run where
+
+Owner's direction: **the org admin decides which agents apply to all**;
+repos define their own and configure within bounds. Three layers, narrow-
+only all the way down (the §17.5 terms-never-widen rule, applied to config):
+
+```yaml
+# ORG (admin-owned — this is what the Roster becomes)
+roster:
+  - agent: vault//ci-economist
+    applies: all                  # or: by-label, allowlist, opt-in
+    terms: { usd_per_day: 50, model: standard, max_sub_agents: 3 }
+    overridable: [goal, budget↓, max_sub_agents↓, disable]
+    # `disable` itself grantable or not — a compliance agent can be
+    # non-disableable
+
+# REPO (.scarab/agents.yaml — repo-scoped stuff)
+agents:
+  - use: org//ci-economist
+    goal: "mobile matrix first; ignore the docs pipeline"
+    max_sub_agents: 2             # ≤ org's 3
+  - agent: ./sops/release-notes.md   # repo-specific, own SOP
+    terms: { usd: 5 }
+
+# PIPELINE/STEP: as-a-step `with:` params — ADR-0043 machinery unchanged
+```
+
+Applicability is what gives standing SOPs their minting scope
+(`applies: all` + "red main build" = the org-wide triage fleet — the
+Docket's org view is its management surface). **`max_sub_agents`** joins the
+standard terms vocabulary beside budgets: bounds T1/T2 fan-out inside a step
+and the economist's parallel probes — a term, not a hope.
