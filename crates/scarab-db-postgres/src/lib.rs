@@ -95,7 +95,8 @@ impl PostgresDb {
     /// before `a2`. The in-memory `Db` (scarab-testkit) mirrors this exact order.
     pub async fn attempts(&self, run: &RunId, step: &StepId) -> Result<Vec<Attempt>, DbError> {
         let rows = sqlx::query(
-            "SELECT attempt_id, started_at, failure, failure_detail, outcome FROM attempts
+            "SELECT attempt_id, started_at, failure, failure_detail, output_durability, outcome
+             FROM attempts
              WHERE run_id = $1 AND step_id = $2
              ORDER BY started_at, CAST(substring(attempt_id FROM 2) AS INTEGER)",
         )
@@ -126,6 +127,9 @@ impl PostgresDb {
                     started_at: Timestamp(r.get::<i64, _>("started_at")),
                     failure,
                     failure_detail: r.get::<Option<String>, _>("failure_detail"),
+                    // NULL = pre-0064-s2 row / no workspace / stamp-less
+                    // backend — absence of evidence, reported as such.
+                    output_durability: r.get::<Option<String>, _>("output_durability"),
                     outcome,
                 })
             })
@@ -367,12 +371,15 @@ impl Db for PostgresDb {
         attempt: &AttemptId,
         snapshot: &str,
         identity: Option<&str>,
+        durability: Option<&str>,
     ) -> Result<(), DbError> {
         // One transaction (ADR-0056): the attempt's immutable evidence copy
         // and the step's latest-evidence denormalization (+ its provenance
         // stamp) move together or not at all. The identity travels in the same
         // statement as the root it describes — a row with one and not the other
         // would be a snapshot whose content nobody can compare (ADR-0061 s8).
+        // The durability stamp (ADR-0064 s2) rides the ATTEMPT update only:
+        // it is per-attempt historical evidence, never denormalized.
         let mut tx = self.pool().begin().await.map_err(db_err)?;
         sqlx::query(
             "UPDATE step_runs
@@ -391,7 +398,8 @@ impl Db for PostgresDb {
         .await
         .map_err(db_err)?;
         sqlx::query(
-            "UPDATE attempts SET output_snapshot = $4, output_identity = $5
+            "UPDATE attempts
+             SET output_snapshot = $4, output_identity = $5, output_durability = $6
              WHERE run_id = $1 AND step_id = $2 AND attempt_id = $3",
         )
         .bind(&run.0)
@@ -399,6 +407,7 @@ impl Db for PostgresDb {
         .bind(&attempt.0)
         .bind(snapshot)
         .bind(identity)
+        .bind(durability)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -1344,8 +1353,9 @@ impl Db for PostgresDb {
         // `set_attempt_handle`), so keep the existing row untouched.
         sqlx::query(
             "INSERT INTO attempts
-                 (run_id, step_id, attempt_id, started_at, failure, failure_detail, outcome)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 (run_id, step_id, attempt_id, started_at, failure, failure_detail,
+                  output_durability, outcome)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (run_id, step_id, attempt_id) DO NOTHING",
         )
         .bind(&run.0)
@@ -1354,6 +1364,7 @@ impl Db for PostgresDb {
         .bind(attempt.started_at.0)
         .bind(attempt.failure.map(failure_str))
         .bind(attempt.failure_detail.as_deref())
+        .bind(attempt.output_durability.as_deref())
         .bind(attempt.outcome.as_str())
         .execute(self.pool())
         .await

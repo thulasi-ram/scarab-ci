@@ -991,6 +991,20 @@ pub struct AttemptDto {
     /// | `config`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    /// The executor's human-readable cause for a failed attempt (ticket
+    /// 4cf03d7) — e.g. "cold tier refused: connection refused" — alongside the
+    /// machine-consumed `failure` class. Absent = the class is the whole story
+    /// (or a pre-0041 row). Stored since migration 0041; served since ADR-0064
+    /// s2 (same endpoint, same consumer as `output_durability`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_detail: Option<String>,
+    /// Where this attempt's output workspace snapshot was durable when its
+    /// verdict was granted (ADR-0064 s2): `object` | `separate-volume` |
+    /// `warm-only`. Absent = pre-s2 row, no workspace, or a stamp-less
+    /// backend. Per-attempt and historical — it reports what `Succeeded`
+    /// licensed THEN, not the deployment's tier now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_durability: Option<String>,
     /// The attempt's recorded outcome (ADR-0056 amendment): `running` |
     /// `succeeded` | `failed` | `superseded` | `cancelled`. Unlike `failed` this
     /// distinguishes a *superseded* attempt (a rerun/retry replaced its input
@@ -1016,6 +1030,8 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
         started_at: a.started_at.0,
         failed: a.failure.is_some(),
         failure,
+        failure_detail: a.failure_detail.clone(),
+        output_durability: a.output_durability.clone(),
         // The durable read (storage boundary) already resolved back-compat, so
         // `a.outcome` is authoritative here.
         outcome: a.outcome.as_str().to_string(),

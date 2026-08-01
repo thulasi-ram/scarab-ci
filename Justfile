@@ -373,6 +373,31 @@ ui-e2e:
     npx --prefix ui/scarab-web-ui playwright install chromium
     npm --prefix ui/scarab-web-ui run test:e2e
 
+# Contract gate (mirrors the CI `openapi-drift` job, ADR-0054): regenerate the
+# OpenAPI spec and the generated TS client, then fail if either differs from
+# what is committed. Full-route coverage is asserted by the test suite
+# (every_registered_route_is_in_the_openapi_spec) — this gates DRIFT only.
+openapi-drift:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "==> regenerating openapi.json"
+    cargo run -p scarab-server -- --emit-openapi openapi.json
+    git diff --exit-code openapi.json || {
+      echo "error: openapi.json is stale — regenerate and commit it:" >&2
+      echo "  cargo run -p scarab-server -- --emit-openapi openapi.json" >&2
+      exit 1
+    }
+    echo "==> regenerating the UI client"
+    npm --prefix ui/scarab-web-ui ci
+    npm --prefix ui/scarab-web-ui run gen
+    npm --prefix ui/scarab-web-ui run typecheck
+    git diff --exit-code ui/scarab-web-ui/src/api/schema.ts || {
+      echo "error: the generated TS client is stale — regenerate and commit it:" >&2
+      echo "  npm --prefix ui/scarab-web-ui run gen" >&2
+      exit 1
+    }
+    echo "==> no drift: openapi.json and schema.ts match the code"
+
 # Merge gate: are PR <n>'s REQUIRED checks green? Run this before merging.
 # Branch protection and rulesets are both unavailable on this repo (private,
 # free plan → 403), so this is the enforcement, not a convenience: the required

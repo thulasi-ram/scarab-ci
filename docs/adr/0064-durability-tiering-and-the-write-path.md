@@ -73,10 +73,19 @@ The test is `st_dev` of the cold directory against the warm directory, which is 
 | S3 / MinIO | genuine second tier |
 | `LocalDir` on a **separate volume** (a second PVC) | `st_dev` differs → **genuine second tier** |
 | `LocalDir` on the warm volume | `st_dev` matches → **not a tier**; no independent durability |
-| `LocalDir` on the chart's `emptyDir` | same volume, and it dies with the Pod → worse than warm |
+| `LocalDir` on an `emptyDir` of its **own** | `st_dev` **differs** — the probe reads it as a second tier — yet it dies with the Pod *(corrected 2026-08-01, see below)* |
+
+*(Corrected 2026-08-01, while building the probe.)* The original row here claimed the chart's
+`emptyDir` is "same volume" and therefore caught by `st_dev`. That is only true when the cold
+`LocalDir` shares the **warm** volume; a cold `LocalDir` on an `emptyDir` of its own is a
+**different device**, so the probe answers `separate-volume` while the backing dies with the Pod.
+`st_dev` measures *independence*, not *persistence* — persistence of the backing is the **chart's**
+check (refuse or loudly label a cold path that resolves to an `emptyDir`), not a `stat`'s.
+Follow-up: the chart-side check is not yet built.
 
 "Is it object storage?" was the obvious test and it is the wrong one: it would reject a second PVC,
-which is a perfectly good cold tier, and accept nothing else. **The backing is the promise.**
+which is a perfectly good cold tier, and accept nothing else. **The backing is the promise** — and
+`st_dev` is one measurable half of it.
 
 **4. Where there is no independent cold tier, the Depot degrades gracefully rather than refusing.**
 Warm gates `Succeeded`, and the deployment is *loudly* a warm-only-durability deployment: stated at
@@ -91,6 +100,12 @@ have **different guarantees with identical records**. Stamping it means the UI c
 evidence was never archived; this deployment had no independent durable tier"* instead of showing a
 mystery gap. This is [0027](0027-restart-semantics.md)'s rule applied to durability rather than to
 invalidation.
+
+*(Named 2026-08-01, as built.)* The column is **`attempts.output_durability`** and its values are
+the three tier strings the Depot serialises everywhere — `FlushResponse.tier`,
+`SettledExportDto.tier`, `GET /v1/tier`: **`object`**, **`separate-volume`**, **`warm-only`**.
+`NULL` means unknown (an Attempt from before this slice, or a flush answered by an older Depot
+during deploy skew) — recorded as unknown, never defaulted.
 
 ### The amendment to 0061 part 4, stated plainly
 
@@ -193,7 +208,8 @@ accepted; the read leg still refuses it.
 - **A flush that fails fails the Attempt** where a cold tier exists. The Step exited 0 and its
   evidence did not reach the archive, so it is a retryable failure that must name the cause rather
   than surfacing a mystery I/O error.
-- **One new column on `attempts`** for the durability tier that backed the snapshot.
+- **One new column on `attempts`** for the durability tier that backed the snapshot —
+  `attempts.output_durability`, holding `object` / `separate-volume` / `warm-only` (part 5).
 - **A warm-only deployment is a supported configuration** with a stated, weaker guarantee — not a
   misconfiguration to be rejected, and not a silent downgrade either.
 - **The batched flush is a new failure surface**: a partial flush must not report success, and the

@@ -172,6 +172,28 @@ pub struct GcConfig {
 const GC_LEASE: &str = "cas-gc";
 const GC_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
 
+/// How the CAS sweep asks the Depot which durability tier backs it (ADR-0064
+/// s2): the wire strings `object` | `separate-volume` | `warm-only`, from the
+/// Depot's own `GET /v1/tier`. A seam rather than a `WorkspaceClient`
+/// dependency so the sweeper (and its tests) can be driven by anything
+/// real-shaped that answers the question.
+///
+/// The sweep consults it once per pass, for exactly one decision: under a
+/// **warm-only** Depot nothing is ever flushed cold, so the torn-cold residue
+/// diff (`marked − cold listing`) would flag EVERY marked object — a
+/// permanent full-volume false alarm that trains operators to ignore the one
+/// detector that matters everywhere else. Errors do NOT suppress: a torn cold
+/// must not be maskable by breaking `/v1/tier`.
+#[async_trait::async_trait]
+pub trait DepotTierSource: Send + Sync {
+    /// The Depot's current durability tier wire string, or an error when the
+    /// probe fails (unreachable Depot, non-2xx, garbage body).
+    async fn depot_tier(&self) -> Result<String, String>;
+}
+
+/// The tier wire string under which cold is not expected to hold anything.
+const TIER_WARM_ONLY: &str = "warm-only";
+
 /// One reachable object the mark walk could read (through the tiered handle —
 /// which may have been served by the WARM tier) that the cold listing does not
 /// contain: the torn-cold detection of ticket d4d3b95. Every one of these is a
@@ -232,6 +254,9 @@ const RESIDUE_LOG_CAP: usize = 50;
 ///   so the operator is not sent to recover from a tier that has nothing.
 ///   Detection only — the objects stay marked (so the sweep cannot delete
 ///   them) and re-upload-from-warm is a filed follow-up, not this slice.
+/// `depot` is the tier probe (ADR-0064 s2): `None` = no Depot configured (a
+/// drain-less / pre-0061 deployment) — the residue detector stays on, status
+/// quo. See [`DepotTierSource`] for the one decision it drives.
 pub async fn sweep_cas(
     db: &Arc<dyn Db>,
     cas: &Arc<dyn scarab_storage::Cas>,
@@ -239,14 +264,24 @@ pub async fn sweep_cas(
     clock: &Arc<dyn Clock>,
     owner: &str,
     cfg: GcConfig,
+    depot: Option<&dyn DepotTierSource>,
 ) -> Result<CasSweepReport, String> {
     let lease = db
         .lease(GC_LEASE, owner, GC_LEASE_TTL_MS)
         .await
         .map_err(|e| e.to_string())?;
     if lease.owner != owner {
+        // A non-leader asserts nothing: zero the residue gauges so a replica
+        // that LOST the lease stops exporting its last leader-era residue
+        // forever — a phantom tear to whoever scrapes it (ticket 231040a).
+        // This hides nothing: the current leader re-reports on its own next
+        // pass, and an operator aggregates `max` across replicas.
+        crate::metrics::set_cas_gc_cold_residue(0, 0);
+        crate::metrics::set_cas_gc_tier_probe_failed(false);
+        crate::metrics::set_cas_gc_leader(false);
         return Ok(CasSweepReport::default());
     }
+    crate::metrics::set_cas_gc_leader(true);
     let now = clock.now().await;
 
     // --- Mark. ---------------------------------------------------------
@@ -377,6 +412,51 @@ pub async fn sweep_cas(
     }
 
     // --- Torn-cold detection (ticket d4d3b95). --------------------------
+    // First (ADR-0064 s2): is there a cold tier to be torn? Under a warm-only
+    // Depot nothing is ever flushed, the cold listing is meaningless, and the
+    // diff below would flag EVERY marked object on EVERY pass — so the
+    // detector is skipped for this pass and the gauges are zeroed (the leader
+    // gauge stays 1: this pass IS the leader's, its numbers are live — ticket
+    // 231040a's contract is "whose numbers", not "which detector ran").
+    // RULING: only a POSITIVE "warm-only" answer suppresses. On a probe
+    // error the detector stays ON and the failure is logged — a torn cold
+    // must not be maskable by breaking /v1/tier. No Depot configured (`None`)
+    // is the status quo: detector on. The probe-failed gauge (set per leader
+    // pass, like the residue gauges) is what keeps that ruling honest for the
+    // scraper: under a warm-only Depot whose probe is broken, the residue
+    // gauges below flag every marked object — the gauge at 1 says those
+    // alarms may be warm-only false positives, and the probe must be fixed
+    // before trusting (or dismissing) them.
+    crate::metrics::set_cas_gc_tier_probe_failed(false);
+    if let Some(depot) = depot {
+        match depot.depot_tier().await {
+            Ok(tier) if tier == TIER_WARM_ONLY => {
+                tracing::info!(
+                    "cas gc: warm-only deployment — torn-cold detection suppressed; \
+                     no cold listing is meaningful"
+                );
+                crate::metrics::set_cas_gc_cold_residue(0, 0);
+                if swept > 0 {
+                    tracing::info!(swept, marked = marked.len(), "cas gc pass complete");
+                }
+                return Ok(CasSweepReport {
+                    swept,
+                    residue: Vec::new(),
+                    suppressed_residue: Vec::new(),
+                });
+            }
+            Ok(_) => {} // a durable tier: cold is expected to hold the marks
+            Err(e) => {
+                crate::metrics::set_cas_gc_tier_probe_failed(true);
+                tracing::warn!(
+                    error = %e,
+                    "cas gc: depot tier probe failed — torn-cold detection stays ON \
+                     (an unreachable /v1/tier is not evidence there is no cold tier); \
+                     residue alarmed this pass may be a warm-only false positive"
+                );
+            }
+        }
+    }
     // Residue is `marked − cold listing`, and ONLY that direction: cold-extra
     // objects are the ordinary sweep candidates above, never residue. Every
     // entry here read fine through the tiered handle (i.e. warm still holds
@@ -488,6 +568,7 @@ pub fn spawn_sweeper(
     owner: String,
     cfg: RetentionConfig,
     gc: GcConfig,
+    depot: Option<Arc<dyn DepotTierSource>>,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -497,7 +578,9 @@ pub fn spawn_sweeper(
                 Ok(n) => tracing::info!(runs = n, "retention sweep pass complete"),
                 Err(e) => tracing::warn!(error = %e, "retention sweep pass failed"),
             }
-            if let Err(e) = sweep_cas(&db, &cas, &store, &clock, &owner, gc).await {
+            if let Err(e) =
+                sweep_cas(&db, &cas, &store, &clock, &owner, gc, depot.as_deref()).await
+            {
                 tracing::warn!(error = %e, "cas gc pass failed");
             }
             tokio::time::sleep(interval).await;

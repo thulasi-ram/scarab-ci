@@ -209,6 +209,13 @@ pub trait Db: Send + Sync {
     /// the mtime-free merkle fold that restart invalidation compares
     /// (`Executor::output_identity`). `None` for a backend that cannot compute
     /// one; readers then fall back to the root.
+    ///
+    /// `durability` is the third coordinate (ADR-0064 s2): *how durable the
+    /// bytes were when `Succeeded` was granted* — the Depot's self-reported
+    /// tier (`Executor::output_durability`), stamped on the ATTEMPT row only
+    /// (per-attempt evidence, never denormalized: the question it answers is
+    /// historical, "what did this attempt's verdict actually license?").
+    /// `None` = no workspace, a pre-s2 backend, or unknown.
     async fn set_step_output(
         &self,
         run: &RunId,
@@ -216,6 +223,7 @@ pub trait Db: Send + Sync {
         attempt: &AttemptId,
         snapshot: &str,
         identity: Option<&str>,
+        durability: Option<&str>,
     ) -> Result<(), DbError>;
 
     /// The output workspace snapshot a step produced, or `None` if it has not
@@ -855,6 +863,23 @@ pub trait Executor: Send + Sync {
     async fn output_identity(&self, _handle: &ExecHandle) -> Result<Option<String>, ExecError> {
         Ok(None)
     }
+
+    /// Where that same snapshot is **durable** (ADR-0064 s2): the Depot's
+    /// self-reported tier at flush time — the wire strings `"object"` |
+    /// `"separate-volume"` | `"warm-only"` — or `None` when the unit produced
+    /// no workspace or the backend predates the stamp. The orchestrator
+    /// records it per Attempt beside the snapshot root, so "what did this
+    /// attempt's `Succeeded` actually license?" stays answerable per row long
+    /// after the deployment's tier has changed.
+    ///
+    /// Deliberately **required, not defaulted** — unlike its two siblings
+    /// above. A defaulted `Ok(None)` on a decorator silently swallows the
+    /// stamp: the exact forward-or-drop hazard [`artifacts`](Self::artifacts)
+    /// documents (98ea804, and `SecretInjectingExecutor` has dropped evidence
+    /// that way before). The compiler must force every impl — and every
+    /// future wrapper — to decide.
+    async fn output_durability(&self, handle: &ExecHandle)
+        -> Result<Option<String>, ExecError>;
 
     /// The **named results** the (successfully finished) unit emitted via the
     /// results channel (ADR-0008: its `/scarab/results/*.json`), read back

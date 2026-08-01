@@ -1261,6 +1261,14 @@ export interface components {
              *     | `config`.
              */
             failure?: string | null;
+            /**
+             * @description The executor's human-readable cause for a failed attempt (ticket
+             *     4cf03d7) — e.g. "cold tier refused: connection refused" — alongside the
+             *     machine-consumed `failure` class. Absent = the class is the whole story
+             *     (or a pre-0041 row). Stored since migration 0041; served since ADR-0064
+             *     s2 (same endpoint, same consumer as `output_durability`).
+             */
+            failure_detail?: string | null;
             id: string;
             /**
              * @description The attempt's recorded outcome (ADR-0056 amendment): `running` |
@@ -1270,6 +1278,14 @@ export interface components {
              *     success — so the UI never renders an abandoned attempt green.
              */
             outcome: string;
+            /**
+             * @description Where this attempt's output workspace snapshot was durable when its
+             *     verdict was granted (ADR-0064 s2): `object` | `separate-volume` |
+             *     `warm-only`. Absent = pre-s2 row, no workspace, or a stamp-less
+             *     backend. Per-attempt and historical — it reports what `Succeeded`
+             *     licensed THEN, not the deployment's tier now.
+             */
+            output_durability?: string | null;
             /**
              * Format: int64
              * @description When this attempt started (unix-ms).

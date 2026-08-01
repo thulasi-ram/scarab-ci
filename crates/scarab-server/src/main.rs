@@ -36,6 +36,21 @@ use scarab_storage_s3::S3Storage;
 /// the three reasons this is a separate credential).
 const BROWSE_TOKEN_TTL_SECS: i64 = 300;
 
+/// The CAS sweeper's Depot tier probe (ADR-0064 s2), adapting the one
+/// [`scarab_workspace_client::WorkspaceClient`] this process holds to the
+/// sweeper's [`scarab_server::retention::DepotTierSource`] seam (a newtype
+/// because both the trait's home and the client are foreign to this bin).
+/// One `GET /v1/tier` per sweep pass; an error deliberately keeps the
+/// torn-cold detector ON (see the seam's docs).
+struct DepotTierProbe(Arc<scarab_workspace_client::WorkspaceClient>);
+
+#[async_trait::async_trait]
+impl scarab_server::retention::DepotTierSource for DepotTierProbe {
+    async fn depot_tier(&self) -> Result<String, String> {
+        self.0.depot_tier().await.map_err(|e| e.to_string())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Structured logging (ADR-0053): EnvFilter honors RUST_LOG; the JSON
@@ -279,6 +294,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // in-flight ingest whose root is not yet recorded.
                 grace_ms: 24 * 60 * 60 * 1000,
             },
+            // The Depot tier probe (ADR-0064 s2): a warm-only Depot has no
+            // cold tier to be torn, so the sweep suppresses the residue
+            // detector per pass. No Depot configured = detector always on
+            // (this handle also being how the drain-less shape is detected).
+            depot_client
+                .as_ref()
+                .map(|c| {
+                    Arc::new(DepotTierProbe(c.clone()))
+                        as Arc<dyn scarab_server::retention::DepotTierSource>
+                }),
             Duration::from_secs(300),
         );
         tracing::info!(

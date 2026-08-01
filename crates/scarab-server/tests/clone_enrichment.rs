@@ -24,6 +24,7 @@ fn step_run(id: &str) -> StepRun {
             started_at: Timestamp(0),
             failure: None,
             failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],

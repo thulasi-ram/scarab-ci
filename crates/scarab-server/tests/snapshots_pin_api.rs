@@ -366,6 +366,7 @@ async fn a_widened_rerun_plan_names_the_consumer_and_the_producer_over_the_wire(
         &scarab_engine::AttemptId("a1".into()),
         &live,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -374,6 +375,7 @@ async fn a_widened_rerun_plan_names_the_consumer_and_the_producer_over_the_wire(
         &StepId("build".into()),
         &scarab_engine::AttemptId("a1".into()),
         SWEPT,
+        None,
         None,
     )
     .await

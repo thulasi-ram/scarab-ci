@@ -77,6 +77,7 @@ async fn rerun_supersedes_in_flight_descendant_pod() {
             started_at: Timestamp(0),
             failure: None,
             failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -492,6 +493,7 @@ async fn same_tick_supersessions_get_distinct_outbox_keys() {
                 started_at: Timestamp(0),
                 failure: None,
                 failure_detail: None,
+                output_durability: None,
                 outcome: AttemptOutcome::Running,
             },
         )
@@ -575,6 +577,7 @@ async fn superseded_attempt_survives_teardown_induced_lost() {
             started_at: Timestamp(0),
             failure: None,
             failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -602,6 +605,7 @@ async fn superseded_attempt_survives_teardown_induced_lost() {
             started_at: Timestamp(1_000),
             failure: None,
             failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -710,6 +714,7 @@ async fn cancelled_attempt_survives_teardown_induced_lost() {
             started_at: Timestamp(0),
             failure: None,
             failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -828,6 +833,7 @@ async fn attempts_order_by_mint_sequence_on_started_at_tie() {
         started_at: Timestamp(7),
         failure: None,
         failure_detail: None,
+        output_durability: None,
         outcome: AttemptOutcome::Running,
     };
     db.record_attempt(&run, &step, &running("a2"))
@@ -898,6 +904,7 @@ async fn record_attempt_never_downgrades_recorded_evidence() {
             started_at: Timestamp(5),
             failure: None,
             failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -920,6 +927,7 @@ async fn record_attempt_never_downgrades_recorded_evidence() {
             started_at: Timestamp(999),
             failure: None,
             failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -977,6 +985,7 @@ async fn seed_supersede_teardown(db: &InMemoryDb, run_name: &str) -> (RunId, Str
             started_at: Timestamp(0),
             failure: None,
             failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )

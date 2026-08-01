@@ -285,6 +285,12 @@ impl Executor for LocalExecutor {
 
     // `output` uses the port default (`None`): no workspace CAS locally (ADR-0036).
 
+    /// No workspace data plane locally (ADR-0036): nothing is flushed, so there
+    /// is never a durability tier to report (ADR-0064 s2).
+    async fn output_durability(&self, _handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+
     /// Read the step's named results (ADR-0041) from its results dir: every
     /// `<name>.json` file becomes result `<name>` with the file's parsed JSON
     /// value. An absent dir (the step emitted nothing) yields an empty map; a

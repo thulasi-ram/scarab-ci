@@ -165,7 +165,7 @@ async fn seed_workspace(
         ])
         .await
         .unwrap();
-    db.set_step_output(run, step, &AttemptId("a1".into()), &root.0, None)
+    db.set_step_output(run, step, &AttemptId("a1".into()), &root.0, None, None)
         .await
         .unwrap();
     root
@@ -259,7 +259,10 @@ async fn run_detail_exposes_attempt_list_for_reruns() {
             failure: Some(FailureKind::Infra {
                 never_started: false,
             }),
-            failure_detail: None,
+            // The executor's diagnosis (4cf03d7): stored since migration 0041,
+            // SERVED since ADR-0064 s2 — this test is what proves the serve.
+            failure_detail: Some("cold tier refused: connection refused".into()),
+            output_durability: None,
             outcome: AttemptOutcome::Failed,
         },
     )
@@ -273,8 +276,22 @@ async fn run_detail_exposes_attempt_list_for_reruns() {
             started_at: Timestamp(20),
             failure: None,
             failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Succeeded,
         },
+    )
+    .await
+    .unwrap();
+    // The winning attempt's snapshot, stamped with the durability tier the
+    // Depot reported at flush time (ADR-0064 s2) — the write path the
+    // scheduler uses, so the read below covers store → engine → DTO.
+    db.set_step_output(
+        &run,
+        &step,
+        &AttemptId("a2".into()),
+        "root-2",
+        None,
+        Some("object"),
     )
     .await
     .unwrap();
@@ -293,6 +310,26 @@ async fn run_detail_exposes_attempt_list_for_reruns() {
     assert!(
         al[1].get("failure").is_none() || al[1]["failure"].is_null(),
         "no failure on the winning attempt"
+    );
+    // The two per-attempt evidence fields ADR-0064 s2 serves (kills a DTO that
+    // stores them but maps `None`/drops them in `attempt_dto`): the failed
+    // attempt's human-readable cause, the winning attempt's durability tier —
+    // and each absent (skip_serializing_if) where it does not apply.
+    assert_eq!(
+        al[0]["failure_detail"], "cold tier refused: connection refused",
+        "the stored diagnosis is finally served, not write-only"
+    );
+    assert!(
+        al[0]["output_durability"].is_null(),
+        "a failed attempt licensed nothing — no tier to report"
+    );
+    assert!(
+        al[1]["failure_detail"].is_null(),
+        "no diagnosis on the winning attempt"
+    );
+    assert_eq!(
+        al[1]["output_durability"], "object",
+        "the tier stamped at flush time is served per attempt"
     );
 }
 
@@ -314,6 +351,7 @@ async fn step_logs_scope_by_attempt() {
             started_at: Timestamp(10),
             failure: Some(FailureKind::Step),
             failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Failed,
         },
     )
@@ -327,6 +365,7 @@ async fn step_logs_scope_by_attempt() {
             started_at: Timestamp(20),
             failure: None,
             failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Succeeded,
         },
     )

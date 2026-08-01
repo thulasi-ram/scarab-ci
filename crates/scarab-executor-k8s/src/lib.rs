@@ -164,6 +164,34 @@ pub struct K8sExecutor {
     artifact_store: Option<Arc<dyn scarab_storage::ObjectStore>>,
     /// Operator placement config (ADR-0055): baseline + PlacementProfile registry.
     placement: PlacementConfig,
+    /// In-process FALLBACK anchors for the drain escalation clock (ticket
+    /// 66c93be): Pod name — a pure function of the `{run, step, attempt}`
+    /// fence, see [`pod_name`] — → first observed drain-failure epoch ms.
+    /// Consulted ONLY when the durable
+    /// [`ANNOTATION_WS_DRAIN_FIRST_FAILURE`] anchor can neither be read nor
+    /// written (revoked patch RBAC, broken admission webhook): without it the
+    /// annotation write fails on EVERY poll, `drain_failure_verdict` sees no
+    /// anchor, and the verdict stays `Transient` forever — the Depot outage
+    /// presents as a step-budget timeout, the exact disguise 4cf03d7 forbids.
+    ///
+    /// Accepted tradeoff: this map is in-memory, so a control-plane restart
+    /// resets the fallback clock. That can only DELAY escalation, never
+    /// fabricate it — strictly better than never escalating. Entries are
+    /// dropped when a drain succeeds or the Attempt escalates, and
+    /// [`select_drain_anchor`] prunes strays older than 2× the escalation
+    /// window on every invocation, so the map cannot grow unbounded.
+    ///
+    /// The residual hole, stated honestly (ticket 66c93be): a restart
+    /// MID-outage restarts this clock, so escalation via the fallback can
+    /// take up to ~2× the window instead of 1× — a bounded delay. But a
+    /// CRASHLOOPING control plane (each life shorter than the window) with
+    /// permanently broken patch RBAC re-seeds the clock every life and NEVER
+    /// escalates: for that intersection the disguise 4cf03d7 forbids is still
+    /// possible. The fallback narrows the hole to exactly that intersection;
+    /// it does not close it. Closing it needs a durable anchor that survives
+    /// both failures at once, which is what the annotation already is —
+    /// everywhere except under the RBAC outage itself.
+    ws_drain_fallback_anchors: std::sync::Mutex<std::collections::HashMap<String, i64>>,
 }
 
 impl K8sExecutor {
@@ -179,6 +207,7 @@ impl K8sExecutor {
             artifact_store: None,
             clone_image: DEFAULT_CLONE_IMAGE.to_string(),
             placement: PlacementConfig::default(),
+            ws_drain_fallback_anchors: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -194,6 +223,7 @@ impl K8sExecutor {
             artifact_store: None,
             clone_image: DEFAULT_CLONE_IMAGE.to_string(),
             placement: PlacementConfig::default(),
+            ws_drain_fallback_anchors: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -814,15 +844,39 @@ impl K8sExecutor {
                     // ADR-0064): durability is not local, so the batched cold
                     // upload stays ON the critical path — the Depot walks the
                     // PUBLISHED root's closure and uploads what cold is
-                    // missing; only `Durable` may release the verdict. Failures
-                    // are classified by `drain_failure`: `Retry` and transport
-                    // errors re-drive, time-bounded; `Fatal` is EvidenceLost
-                    // now (4cf03d7).
+                    // missing. Two outcomes release the verdict: `Durable`
+                    // (cold holds the closure) and `WarmOnly` (the Depot HAS
+                    // no cold tier — a deployment posture, not a failure; see
+                    // the arm below). Failures are classified by
+                    // `drain_failure`: `Retry` and transport errors re-drive,
+                    // time-bounded; `Fatal` is EvidenceLost now (4cf03d7).
                     let t_flush = std::time::Instant::now();
-                    if let Some(depot) = &self.workspace_depot {
+                    // ADR-0064 s2: what the flush EARNED, for the durability
+                    // stamp below. `Durable` and `WarmOnly` both proceed to
+                    // the annotation patch — a warm-only landing is a Depot
+                    // posture (no cold tier configured), not a failure, and
+                    // withholding the verdict for it would make "no object
+                    // store" mean "no green ever".
+                    let durability: Option<String> = if let Some(depot) = &self.workspace_depot {
                         use scarab_workspace_client::FlushOutcome;
                         match depot.flush(&published).await {
-                            FlushOutcome::Durable => {}
+                            outcome @ FlushOutcome::Durable { .. } => {
+                                durability_stamp(&outcome).map(str::to_string)
+                            }
+                            outcome @ FlushOutcome::WarmOnly => {
+                                // Logged once per Attempt, not once per poll:
+                                // the `already` root-annotation guard at the
+                                // top of this leg makes a successfully
+                                // patched drain once-only.
+                                tracing::info!(
+                                    pod = %name,
+                                    root = %published.0,
+                                    "workspace flush landed warm-only: the Depot has no cold \
+                                     tier behind it, so the verdict is released on the warm \
+                                     copy (ADR-0064 s2)"
+                                );
+                                durability_stamp(&outcome).map(str::to_string)
+                            }
                             FlushOutcome::Retry(cause) => {
                                 return Err(self
                                     .drain_failure(
@@ -846,26 +900,54 @@ impl K8sExecutor {
                                     .await)
                             }
                         }
-                    }
+                    } else {
+                        // No Depot: the drain above wrote the CP store — the
+                        // durable store itself — directly, and the durability
+                        // stamp stays un-patched (NULL). Approved deferral
+                        // (ADR-0064 s2): `output_durability` reports `None`.
+                        None
+                    };
                     let cold_flush_ms = t_flush.elapsed().as_millis();
-                    // Record both on the Pod BEFORE releasing the sidecar:
-                    // output()/output_identity() read them durably across
-                    // control-plane restarts. One patch, so a crash between them
-                    // cannot leave a root whose content nobody can compare.
-                    // Ordering with the flush above is load-bearing: the root
-                    // annotation is the durable claim `output()` reports, so it
-                    // may only exist once the closure is provably cold.
+                    // Record all of these on the Pod BEFORE releasing the
+                    // sidecar: output()/output_identity()/output_durability()
+                    // read them durably across control-plane restarts. One
+                    // patch, so a crash between them cannot leave a root whose
+                    // content nobody can compare — or whose durability tier
+                    // nobody can audit (same crash-atomicity argument,
+                    // ADR-0064 s2). Ordering with the flush above is
+                    // load-bearing: the root annotation is the durable claim
+                    // `output()` reports, so it may only exist once the
+                    // closure's durability has been settled.
+                    let mut annotation_patch = serde_json::Map::new();
+                    annotation_patch.insert(
+                        ANNOTATION_WS_ROOT.to_string(),
+                        serde_json::Value::String(published.0.clone()),
+                    );
+                    annotation_patch.insert(
+                        ANNOTATION_WS_IDENTITY.to_string(),
+                        serde_json::Value::String(
+                            identity.map(|i| i.0).unwrap_or_default(),
+                        ),
+                    );
+                    // `Durable { tier: None }` (old-Depot skew window) and the
+                    // no-Depot branch both stamp NOTHING for this key, so the
+                    // annotation stays absent rather than lying with a guess.
+                    if let Some(tier) = durability {
+                        annotation_patch.insert(
+                            ANNOTATION_WS_DURABILITY.to_string(),
+                            serde_json::Value::String(tier),
+                        );
+                    }
                     let patch = serde_json::json!({
-                        "metadata": { "annotations": {
-                            ANNOTATION_WS_ROOT: published.0,
-                            ANNOTATION_WS_IDENTITY: identity
-                                .map(|i| i.0)
-                                .unwrap_or_default(),
-                        } }
+                        "metadata": { "annotations": annotation_patch }
                     });
                     pods.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
                         .await
                         .map_err(|e| format!("annotate root: {e}"))?;
+                    // The drain made it: whatever transient laps preceded it,
+                    // the escalation clock is over — drop the in-process
+                    // fallback anchor so the map only ever holds live fences.
+                    self.forget_drain_anchor(&name);
                     tracing::info!(
                         pod = %name,
                         leg = "drain",
@@ -933,17 +1015,32 @@ impl K8sExecutor {
                 // Release the sidecar (idempotent): failed steps snapshot
                 // nothing — their workspace is not an output (their artifacts,
                 // harvested above, are).
-                self.exec_with_stdin(
-                    pods,
-                    &name,
-                    WORKSPACE_EGRESS_CONTAINER,
-                    &format!("touch {CTL_MOUNT_PATH}/egress-done"),
-                    Vec::new(),
-                )
-                .await?;
+                self.release_egress_sidecar(pods, &name).await?;
             }
         }
         Ok(())
+    }
+
+    /// Release the workspace egress sidecar: touch the marker its wait-loop —
+    /// which deliberately ignores SIGTERM — is blocked on, so the container
+    /// (and with it the Pod) can terminate. This is the ONE spelling of the
+    /// release (ticket e10cf7e): every path that is done with a workspace Pod
+    /// routes through here — `drive_workspace` after a settle, and `poll`'s
+    /// terminal `OutputContract`/`EvidenceLost` arms, which bail out of
+    /// `drive_workspace` BEFORE its release and used to strand the sidecar in
+    /// its loop forever (Pod phase-Running, holding node resources and its
+    /// emptyDir, matched by no reaper). Idempotent: touching an existing
+    /// marker is a no-op, and a release that never lands leaves the sidecar
+    /// running for the next poll to re-issue.
+    async fn release_egress_sidecar(&self, pods: &Api<Pod>, name: &str) -> Result<(), String> {
+        self.exec_with_stdin(
+            pods,
+            name,
+            WORKSPACE_EGRESS_CONTAINER,
+            &egress_release_cmd(),
+            Vec::new(),
+        )
+        .await
     }
 
     /// Classify a failed Depot drain leg (ingest / prune / flush) and keep the
@@ -961,7 +1058,9 @@ impl K8sExecutor {
     /// On a drain that eventually succeeds, the annotation is simply left
     /// behind: the root annotation gates re-entry to the drain leg, so no
     /// later poll ever consults the anchor again — stale-but-inert, and no
-    /// cleanup patch is owed.
+    /// cleanup patch is owed. (The IN-MEMORY fallback anchor, by contrast, IS
+    /// cleaned up on success — see the end of the drain leg — because nothing
+    /// garbage-collects process memory with the Pod.)
     async fn drain_failure(
         &self,
         pods: &Api<Pod>,
@@ -974,38 +1073,81 @@ impl K8sExecutor {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let first = annotations
+        if fatal {
+            // Escalating now — the Attempt goes terminal, so the fallback
+            // anchor (if any polls seeded one) is dead weight: drop it.
+            self.forget_drain_anchor(name);
+            return DriveErr::EvidenceLost { cause };
+        }
+        // The annotation anchor comes FIRST (durable with the Pod across
+        // control-plane restarts — authoritative whenever it is readable /
+        // writable). Idempotent write, only if absent: a later failed drive
+        // must observe the ORIGINAL clock, never restart it.
+        let annotation_anchor: Result<i64, String> = match annotations
             .get(ANNOTATION_WS_DRAIN_FIRST_FAILURE)
-            .and_then(|v| v.parse::<i64>().ok());
-        match drain_failure_verdict(fatal, first, now_ms) {
-            DrainVerdict::EvidenceLost => DriveErr::EvidenceLost { cause },
-            DrainVerdict::Transient => {
-                // Idempotent anchor: write only if absent — a later failed
-                // drive must observe the ORIGINAL clock, never restart it.
-                if first.is_none() {
-                    let patch = serde_json::json!({
-                        "metadata": { "annotations": {
-                            ANNOTATION_WS_DRAIN_FIRST_FAILURE: now_ms.to_string(),
-                        } }
-                    });
-                    if let Err(e) = pods
-                        .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
-                        .await
-                    {
-                        // Escalation is deferred one blip, not disabled: the
-                        // next failed drive retries this write. Losing the
-                        // anchor to the same API-server weather as the drain
-                        // failure itself must not turn into a panic or a
-                        // premature verdict.
-                        eprintln!(
-                            "scarab-executor: could not record drain first-failure \
-                             on pod {name}: {e}"
-                        );
-                    }
+            .and_then(|v| v.parse::<i64>().ok())
+        {
+            Some(first) => Ok(first),
+            None => {
+                let patch = serde_json::json!({
+                    "metadata": { "annotations": {
+                        ANNOTATION_WS_DRAIN_FIRST_FAILURE: now_ms.to_string(),
+                    } }
+                });
+                match pods
+                    .patch(name, &PatchParams::default(), &Patch::Merge(&patch))
+                    .await
+                {
+                    Ok(_) => Ok(now_ms),
+                    // The anchor could be neither read (absent) nor written.
+                    // One blip here is the same API-server weather as the
+                    // drain failure itself and must not panic or force a
+                    // premature verdict — but if this write fails on EVERY
+                    // poll (revoked patch RBAC, broken admission webhook),
+                    // "retry the write next poll" means the anchor NEVER
+                    // exists and the verdict stays Transient until the
+                    // step-budget timeout — the 4cf03d7 disguise. So the
+                    // clock falls back to the in-process anchor below.
+                    Err(e) => Err(e.to_string()),
                 }
-                DriveErr::Transient(cause)
+            }
+        };
+        let (first, anchor_err) = {
+            let mut anchors = self
+                .ws_drain_fallback_anchors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            select_drain_anchor(annotation_anchor, &mut anchors, name, now_ms)
+        };
+        if let Some(e) = &anchor_err {
+            eprintln!(
+                "scarab-executor: could not record drain first-failure on pod \
+                 {name} (using in-process fallback clock): {e}"
+            );
+        }
+        match drain_failure_verdict(false, Some(first), now_ms) {
+            DrainVerdict::Transient => DriveErr::Transient(cause),
+            DrainVerdict::EvidenceLost => {
+                self.forget_drain_anchor(name);
+                DriveErr::EvidenceLost {
+                    cause: evidence_lost_cause(cause, anchor_err),
+                }
             }
         }
+    }
+
+    /// Drop the in-process fallback anchor for a fence (keyed by its Pod
+    /// name): called when its drain succeeds or its Attempt escalates to
+    /// [`DriveErr::EvidenceLost`] — the two ways a fence's escalation clock
+    /// ends. (An `OutputContract` exit can strand an entry; the 2×-window
+    /// prune in [`select_drain_anchor`] mops those up — it runs on EVERY
+    /// `drain_failure`, the annotation path included, so strays are collected
+    /// even after RBAC heals and fallback inserts stop.)
+    fn forget_drain_anchor(&self, name: &str) {
+        self.ws_drain_fallback_anchors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(name);
     }
 
     /// Tar `/scarab/artifacts` out of the egress container, filter by the
@@ -1427,6 +1569,44 @@ enum DrainVerdict {
     EvidenceLost,
 }
 
+/// The [`ANNOTATION_WS_DURABILITY`] value a flush outcome earns (ADR-0064
+/// s2), pure so the derivation is unit-testable without a Pod:
+///
+/// - `Durable { tier: Some(t) }` → stamp `t` (`"object"` / `"separate-volume"`,
+///   verbatim off the wire — the Depot names the tier, this side records it);
+/// - `WarmOnly` → stamp `"warm-only"` (the verdict was released on the warm
+///   copy; un-stamping this case would make every warm-only deployment
+///   indistinguishable from a pre-s2 one);
+/// - `Durable { tier: None }` → `None`: an old Depot affirmed durability
+///   without naming a tier (rolling-upgrade skew), and an absent stamp beats
+///   a guessed one.
+///
+/// `Retry`/`Fatal` are unreachable from today's one caller: the flush match
+/// in `drive_workspace` returns out through `drain_failure` on both before
+/// any annotation patch, and only the surviving arms call this. Kept as
+/// explicit arms (not a catch-all) so a new `FlushOutcome` variant is a
+/// compile error here, never a silent non-stamp — but they return `None`
+/// (with a debug_assert for the test suite) rather than panic: this runs on
+/// the scheduler's poll path, and if a future caller ever slips a `Retry`/
+/// `Fatal` through, a wrongly-skipped stamp is a recoverable audit gap while
+/// a poll panic takes the whole driver down with it.
+fn durability_stamp(outcome: &scarab_workspace_client::FlushOutcome) -> Option<&str> {
+    use scarab_workspace_client::FlushOutcome;
+    match outcome {
+        FlushOutcome::Durable { tier } => tier.as_deref(),
+        FlushOutcome::WarmOnly => Some("warm-only"),
+        FlushOutcome::Retry(_) | FlushOutcome::Fatal(_) => {
+            debug_assert!(
+                false,
+                "durability_stamp reached with a non-terminal flush outcome — \
+                 drive_workspace must return through drain_failure on Retry/Fatal \
+                 before stamping"
+            );
+            None
+        }
+    }
+}
+
 fn drain_failure_verdict(fatal: bool, first_failure_ms: Option<i64>, now_ms: i64) -> DrainVerdict {
     if fatal {
         return DrainVerdict::EvidenceLost;
@@ -1436,6 +1616,69 @@ fn drain_failure_verdict(fatal: bool, first_failure_ms: Option<i64>, now_ms: i64
             DrainVerdict::EvidenceLost
         }
         _ => DrainVerdict::Transient,
+    }
+}
+
+/// Pick the `first_failure_ms` anchor for [`drain_failure_verdict`] (ticket
+/// 66c93be) — pure over the annotation outcome and the fallback map, so the
+/// anchor SELECTION is testable without a Pod, and the verdict function above
+/// stays byte-identical (the fallback only changes how its input is obtained).
+///
+/// `annotation_anchor` is the durable Pod-annotation path's outcome:
+/// - `Ok(ms)` — the annotation was read, or its if-absent write just landed.
+///   The annotation is authoritative: it is used verbatim, and the fallback
+///   map is neither seeded nor consulted (a stale entry from an earlier RBAC
+///   outage is never promoted over the durable clock — the stray prune below
+///   is the ONLY way this arm touches the map).
+/// - `Err(patch error)` — the annotation could be neither read nor written.
+///   The clock falls back to the in-process map: insert-if-absent with
+///   `now_ms` (a later failed poll must observe the ORIGINAL fallback clock,
+///   never restart it), and the patch error is returned so an escalation via
+///   this path can name BOTH failures in its cause.
+///
+/// Tradeoff, accepted: the map is process memory, so a control-plane restart
+/// resets the fallback clock — which can only DELAY escalation, never
+/// fabricate it. Strictly better than the pre-fix behavior (never escalating
+/// at all when the annotation write fails every poll).
+///
+/// Unbounded-growth cap: on EVERY invocation — annotation path included —
+/// entries OTHER than the current key older than 2× [`WS_DRAIN_ESCALATION_MS`]
+/// are pruned. Live clocks escalate (and are removed) within 1× the window,
+/// so anything past 2× is a stray from a path that never reached success or
+/// escalation. Pruning used to run only on a fallback INSERT, but once RBAC
+/// heals no insert ever happens again, so a stray seeded during the outage
+/// survived for the process lifetime; a cheap map sweep under the same lock
+/// closes that. The current key's own seed is NEVER pruned, however old — its
+/// clock may legally be past the window at the moment it is read.
+fn select_drain_anchor(
+    annotation_anchor: Result<i64, String>,
+    fallback: &mut std::collections::HashMap<String, i64>,
+    key: &str,
+    now_ms: i64,
+) -> (i64, Option<String>) {
+    fallback.retain(|k, t| {
+        k == key || now_ms.saturating_sub(*t) <= 2 * WS_DRAIN_ESCALATION_MS
+    });
+    match annotation_anchor {
+        Ok(first) => (first, None),
+        Err(patch_err) => {
+            let first = *fallback.entry(key.to_string()).or_insert(now_ms);
+            (first, Some(patch_err))
+        }
+    }
+}
+
+/// The cause an escalated [`DriveErr::EvidenceLost`] carries. When the
+/// escalation ran on the in-process fallback clock, the durable anchor was
+/// ALSO failing the whole time — and that second failure is evidence the
+/// operator needs (it points at RBAC / admission, not the Depot alone), so
+/// the cause must name both.
+fn evidence_lost_cause(cause: String, anchor_err: Option<String>) -> String {
+    match anchor_err {
+        Some(e) => format!(
+            "{cause} — and the failure anchor could not be recorded on the Pod: {e}"
+        ),
+        None => cause,
     }
 }
 
@@ -1825,6 +2068,44 @@ impl Executor for K8sExecutor {
                         // operator problem it is not. The Pod is left for its logs.
                         Err(DriveErr::OutputContract(msg)) => {
                             eprintln!("scarab-executor: {msg} (pod {})", handle.0);
+                            // Terminal verdict: nothing more is owed from the
+                            // workspace, so release the egress sidecar before
+                            // reporting it (e10cf7e). This bail happens BEFORE
+                            // drive_workspace's own release, and the sidecar
+                            // ignores SIGTERM by design — without the touch it
+                            // loops forever and the Pod stays phase-Running,
+                            // holding node resources and its emptyDir, matched
+                            // by no reaper. Releasing forfeits nothing: the Pod
+                            // terminates and is kept for its logs exactly like
+                            // the normal failed path — deliberately NOT an
+                            // executor.cancel from the scheduler, which would
+                            // delete the Pod and destroy the logs. Best-effort,
+                            // and best-effort is ALL there is: this return is a
+                            // terminal verdict, the scheduler settles the
+                            // Attempt and marks it dispatched, and NO later
+                            // poll re-enters this arm — so this exec is the one
+                            // and only release attempt. If it fails, the
+                            // SIGTERM-proof sidecar strands the Pod
+                            // phase-Running until an operator acts (the error
+                            // log below names the remedy). The failure must
+                            // never mask or alter the classification. Artifact
+                            // harvest is skipped on this arm because drive
+                            // bailed before it — pre-existing, out of scope
+                            // here.
+                            if let Err(e) = self.release_egress_sidecar(&pods, &handle.0).await {
+                                tracing::error!(
+                                    pod = %handle.0,
+                                    container = WORKSPACE_EGRESS_CONTAINER,
+                                    marker = %egress_done_marker(),
+                                    error = %e,
+                                    "egress release failed on a terminal verdict — this was \
+                                     the ONLY attempt (the verdict settles and no poll \
+                                     re-enters this arm), so the SIGTERM-proof sidecar now \
+                                     strands the Pod phase-Running until an operator acts: \
+                                     `kubectl exec` a `touch` of the marker in the egress \
+                                     container, or delete the Pod (forfeiting its logs)"
+                                );
+                            }
                             return Ok(ExecState::Failed {
                                 exit_code: None,
                                 class: FailureClass::Config,
@@ -1844,6 +2125,32 @@ impl Executor for K8sExecutor {
                                 "scarab-executor: evidence lost for pod {}: {cause}",
                                 handle.0
                             );
+                            // Same terminal-verdict release as the
+                            // OutputContract arm above (e10cf7e): the
+                            // escalation clock has ended, nothing more is owed
+                            // from the workspace, and leaving the SIGTERM-proof
+                            // sidecar waiting strands the Pod phase-Running
+                            // forever. Best-effort, and — as above — this is
+                            // the ONE attempt: the verdict settles, no poll
+                            // re-enters this arm, so a failed exec here leaves
+                            // the Pod stranded until an operator touches the
+                            // marker or deletes it (the error log names the
+                            // remedy). The release never masks or alters the
+                            // classification.
+                            if let Err(e) = self.release_egress_sidecar(&pods, &handle.0).await {
+                                tracing::error!(
+                                    pod = %handle.0,
+                                    container = WORKSPACE_EGRESS_CONTAINER,
+                                    marker = %egress_done_marker(),
+                                    error = %e,
+                                    "egress release failed on a terminal verdict — this was \
+                                     the ONLY attempt (the verdict settles and no poll \
+                                     re-enters this arm), so the SIGTERM-proof sidecar now \
+                                     strands the Pod phase-Running until an operator acts: \
+                                     `kubectl exec` a `touch` of the marker in the egress \
+                                     container, or delete the Pod (forfeiting its logs)"
+                                );
+                            }
                             return Ok(ExecState::Failed {
                                 exit_code: None,
                                 class: FailureClass::Infra {
@@ -1926,6 +2233,31 @@ impl Executor for K8sExecutor {
                 .annotations
                 .as_ref()
                 .and_then(|a| a.get(ANNOTATION_WS_IDENTITY))
+                .filter(|v| !v.is_empty())
+                .cloned()
+        }))
+    }
+
+    /// The durability tier the published snapshot's flush earned (ADR-0064
+    /// s2) — `"object"` | `"separate-volume"` | `"warm-only"` — from the
+    /// sibling Pod annotation the drain leg wrote in the same patch as the
+    /// root. Absent/empty annotation → `Ok(None)`: no Depot wired (approved
+    /// deferral — the drain wrote the durable store directly), a pre-s2 Pod,
+    /// or an old Depot that affirmed durability without naming a tier.
+    async fn output_durability(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        if self.workspace_cas.is_none() {
+            return Ok(None);
+        }
+        let pods = self.pods()?;
+        let pod = pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        Ok(pod.and_then(|p| {
+            p.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(ANNOTATION_WS_DURABILITY))
                 .filter(|v| !v.is_empty())
                 .cloned()
         }))
@@ -2498,6 +2830,18 @@ const WORKSPACE_VOLUME: &str = "scarab-workspace";
 /// Control-plane→Pod handshake dir (markers only; NEVER part of the snapshot).
 const CTL_MOUNT_PATH: &str = "/scarab-ctl";
 const CTL_VOLUME: &str = "scarab-ctl";
+/// The marker the egress sidecar's wait-loop blocks on, and the one command
+/// that sets it. A function (not inlined format strings) so the two spellings
+/// — the sidecar's `until [ -f … ]` and the release's `touch` — provably name
+/// the same file: the exec itself needs a cluster, but the agreement of the
+/// paths is assertable in-process (see the
+/// `egress_release_touches_the_marker_the_sidecar_waits_on` test).
+fn egress_done_marker() -> String {
+    format!("{CTL_MOUNT_PATH}/egress-done")
+}
+fn egress_release_cmd() -> String {
+    format!("touch {}", egress_done_marker())
+}
 /// The helper image for the workspace **egress** container: it only runs
 /// `sh`/`tar`/`sleep`, so a pinned busybox suffices. (`:1.36` and not `:latest`
 /// deliberately — `busybox:latest` defaults to root, which the ADR-0039
@@ -2684,6 +3028,16 @@ const ANNOTATION_WS_ROOT: &str = "scarab.io/workspace-root";
 /// moves with every file's mtime, so a re-run can never reproduce its own root
 /// (git-bug `945b1f4`). Empty when the store computed none.
 const ANNOTATION_WS_IDENTITY: &str = "scarab.io/snapshot-identity";
+/// The Pod annotation recording the durability tier the published snapshot's
+/// flush EARNED (ADR-0064 s2): `"object"` | `"separate-volume"` |
+/// `"warm-only"`, straight off the Depot's flush verdict. Written in the SAME
+/// patch as [`ANNOTATION_WS_ROOT`]/[`ANNOTATION_WS_IDENTITY`] (crash-atomic
+/// with the root claim); `Executor::output_durability` reads it. Deliberately
+/// ABSENT — never a guessed value — when there is nothing truthful to stamp:
+/// no Depot wired (the drain wrote the durable store directly; approved
+/// deferral), or a `Durable`-without-tier reply from an old Depot (skew
+/// window during a rolling upgrade).
+const ANNOTATION_WS_DURABILITY: &str = "scarab.io/workspace-durability";
 /// The Pod annotation carrying the step's authored `outputs:` paths (ADR-0007),
 /// comma-separated. Absent/empty = publish the whole workspace. Read at egress,
 /// so an adopted Pod prunes identically with no in-memory state.
@@ -3120,7 +3474,8 @@ pub fn build_pod(
                 "sh".into(),
                 "-c".into(),
                 format!(
-                    "trap '' TERM; until [ -f {CTL_MOUNT_PATH}/egress-done ]; do sleep 0.2; done"
+                    "trap '' TERM; until [ -f {} ]; do sleep 0.2; done",
+                    egress_done_marker()
                 ),
             ]),
             volume_mounts: Some(match artifacts_mount.clone() {
@@ -4242,6 +4597,7 @@ mod tests {
                 started_at: Timestamp(0),
                 failure: None,
                 failure_detail: None,
+                output_durability: None,
                 outcome: AttemptOutcome::Running,
             }],
             needs: vec![],
@@ -5805,6 +6161,197 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Ticket 66c93be: anchor SELECTION. When the durable annotation anchor
+    // can be neither read nor written on EVERY poll (revoked patch RBAC, a
+    // broken admission webhook), `drain_failure_verdict` must not be starved
+    // of an anchor forever — the in-process fallback map supplies one.
+    // Pure over (annotation_result, map): the outage is constructed, never
+    // scheduled.
+    // ------------------------------------------------------------------
+
+    /// (1) The annotation anchor is usable → it is authoritative: used
+    /// verbatim, never seeded into or promoted from the fallback map — a
+    /// stale in-memory entry must not be trusted over the durable clock, and
+    /// a healthy path must not grow the map. The stray PRUNE still runs on
+    /// this path (it runs on every invocation): a stray seeded during an RBAC
+    /// outage must not survive the process lifetime just because the
+    /// annotation path handles every failure after the heal. Kills the
+    /// mutation that consults the fallback unconditionally (a pre-RBAC-fix
+    /// stale entry would then escalate a healthy drain) and the one that
+    /// prunes only on a fallback insert.
+    #[test]
+    fn a_usable_annotation_anchor_wins_and_is_never_seeded_into_the_fallback_map() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("pod-a".to_string(), 111_i64);
+        let now = 100 * 60 * 1000;
+        // A stray from a healed outage, older than 2x the window.
+        map.insert(
+            "pod-stray-stale".to_string(),
+            now - 2 * WS_DRAIN_ESCALATION_MS - 1,
+        );
+        let (first, anchor_err) =
+            select_drain_anchor(Ok(5_000), &mut map, "pod-a", now);
+        assert_eq!(first, 5_000, "the durable annotation anchor is authoritative");
+        assert_eq!(anchor_err, None, "no anchor failure to report");
+        assert_eq!(
+            map.get("pod-a"),
+            Some(&111),
+            "the current key's entry is neither promoted nor re-seeded"
+        );
+        assert!(
+            !map.contains_key("pod-stray-stale"),
+            "the stray prune runs on the annotation path too — after RBAC heals, \
+             no fallback insert ever happens again to trigger it"
+        );
+    }
+
+    /// (2) Annotation unwritable, map empty → the fallback seeds itself with
+    /// `now` and the verdict is Transient (the outage clock STARTS, it does
+    /// not fire). Kills the mutation that drops the whole fallback (the
+    /// verdict would still be Transient here, but nothing would be seeded —
+    /// which is what leaves case (3) Transient forever).
+    #[test]
+    fn an_unwritable_anchor_seeds_the_fallback_clock_and_stays_transient() {
+        let mut map = std::collections::HashMap::new();
+        let now = 10 * 60 * 1000;
+        let (first, anchor_err) =
+            select_drain_anchor(Err("patch denied".into()), &mut map, "pod-a", now);
+        assert_eq!(first, now, "first fallback observation anchors at now");
+        assert_eq!(anchor_err.as_deref(), Some("patch denied"));
+        assert_eq!(map.get("pod-a"), Some(&now), "the clock is now seeded");
+        assert_eq!(
+            drain_failure_verdict(false, Some(first), now),
+            DrainVerdict::Transient,
+            "the first observed failure never escalates"
+        );
+    }
+
+    /// (3) Annotation unwritable on every poll, fallback entry older than the
+    /// window → EvidenceLost, and the cause names BOTH failures (the drain's
+    /// own AND the anchor write's). Kills two mutations by name:
+    /// - drop the fallback entirely → `first_failure_ms` is None on every
+    ///   poll and this case stays Transient forever (the step-budget-timeout
+    ///   disguise 4cf03d7 forbids);
+    /// - drop insert-if-absent (always overwrite with `now`) → the clock
+    ///   restarts on every poll and never ages past the window, so this case
+    ///   ALSO never escalates.
+    #[test]
+    fn a_fallback_clock_past_the_window_escalates_naming_both_failures() {
+        let mut map = std::collections::HashMap::new();
+        let seeded = 10 * 60 * 1000_i64;
+        map.insert("pod-a".to_string(), seeded);
+        let now = seeded + WS_DRAIN_ESCALATION_MS + 1;
+        let (first, anchor_err) =
+            select_drain_anchor(Err("patch denied".into()), &mut map, "pod-a", now);
+        assert_eq!(
+            first, seeded,
+            "insert-if-absent: the ORIGINAL fallback clock is observed, never restarted"
+        );
+        assert_eq!(
+            drain_failure_verdict(false, Some(first), now),
+            DrainVerdict::EvidenceLost,
+            "past the window the fallback clock escalates"
+        );
+        let cause = evidence_lost_cause("flush: depot unreachable".to_string(), anchor_err);
+        assert!(
+            cause.contains("flush: depot unreachable"),
+            "the drain failure itself is named: {cause}"
+        );
+        assert!(
+            cause.contains("failure anchor could not be recorded on the Pod")
+                && cause.contains("patch denied"),
+            "the anchor-write failure is named too: {cause}"
+        );
+    }
+
+    /// The unbounded-growth cap: a fallback insert prunes OTHER entries older
+    /// than 2× the window (strays from paths that reached neither success nor
+    /// escalation), but never the current key — its clock may legally be old
+    /// at the moment it is being read. Kills the mutation that prunes before
+    /// the insert-if-absent read (the current key's old clock would be
+    /// dropped and re-seeded, restarting it).
+    #[test]
+    fn a_fallback_insert_prunes_stale_strays_but_never_the_current_key() {
+        let mut map = std::collections::HashMap::new();
+        let now = 100 * 60 * 1000_i64;
+        let stale = now - 2 * WS_DRAIN_ESCALATION_MS - 1;
+        let fresh = now - WS_DRAIN_ESCALATION_MS;
+        map.insert("pod-stray-stale".to_string(), stale);
+        map.insert("pod-stray-fresh".to_string(), fresh);
+        map.insert("pod-a".to_string(), stale);
+        let (first, _) =
+            select_drain_anchor(Err("patch denied".into()), &mut map, "pod-a", now);
+        assert_eq!(first, stale, "the current key survives the prune, however old");
+        assert!(
+            !map.contains_key("pod-stray-stale"),
+            "a stray older than 2x the window is pruned"
+        );
+        assert_eq!(
+            map.get("pod-stray-fresh"),
+            Some(&fresh),
+            "a stray still inside 2x the window is kept"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // ADR-0064 s2: the durability stamp. Pure over the flush outcome — the
+    // only annotation-read coverage in this crate is live-tier, so the value
+    // DERIVATION is the unit under test, not the Pod round-trip.
+    // ------------------------------------------------------------------
+
+    /// A named cold tier is stamped verbatim. Kills the mutation that hardcodes
+    /// the stamp (e.g. always `"object"`): a `separate-volume` deployment would
+    /// then audit as object-store-durable — a durability claim about the wrong
+    /// medium.
+    #[test]
+    fn a_durable_flush_stamps_the_tier_the_depot_named() {
+        use scarab_workspace_client::FlushOutcome;
+        assert_eq!(
+            durability_stamp(&FlushOutcome::Durable {
+                tier: Some("object".into())
+            }),
+            Some("object")
+        );
+        assert_eq!(
+            durability_stamp(&FlushOutcome::Durable {
+                tier: Some("separate-volume".into())
+            }),
+            Some("separate-volume")
+        );
+    }
+
+    /// `WarmOnly` stamps `"warm-only"`. Kills the mutation that maps WarmOnly
+    /// to `None`: every warm-only deployment would then silently un-stamp —
+    /// indistinguishable from pre-s2 Pods, and the "this evidence is one disk
+    /// away from gone" audit signal ADR-0064 s2 exists for would never appear.
+    #[test]
+    fn a_warm_only_flush_stamps_warm_only() {
+        use scarab_workspace_client::FlushOutcome;
+        assert_eq!(
+            durability_stamp(&FlushOutcome::WarmOnly),
+            Some("warm-only")
+        );
+    }
+
+    /// `Durable { tier: None }` — an old Depot affirming durability without
+    /// naming a tier (rolling-upgrade skew) — stamps NOTHING. Kills the
+    /// mutation that defaults the missing tier (e.g. to `"object"` or
+    /// `"warm-only"`): an absent stamp is honest, a guessed one is a fabricated
+    /// durability claim.
+    ///
+    /// `Retry`/`Fatal` are deliberately untested here: they are unreachable
+    /// from today's one caller — the flush match returns out through
+    /// `drain_failure` before any patch, and only the surviving arms call
+    /// `durability_stamp`. (If a future caller ever slips one through, the
+    /// production posture is `None` + debug_assert, not a panic — a wrong
+    /// stamp-skip beats taking the poll path down.)
+    #[test]
+    fn a_durable_flush_without_a_tier_stamps_nothing() {
+        use scarab_workspace_client::FlushOutcome;
+        assert_eq!(durability_stamp(&FlushOutcome::Durable { tier: None }), None);
+    }
+
+    // ------------------------------------------------------------------
     // ADR-0061 part 4 (s4): an Attempt is not `Succeeded` until its Workspace
     // Snapshot is durable.
     // ------------------------------------------------------------------
@@ -6166,6 +6713,52 @@ mod tests {
         );
         assert!(pod.metadata.annotations.is_none());
         assert!(pod.spec.as_ref().unwrap().init_containers.is_none());
+    }
+
+    /// e10cf7e: the release command and the sidecar's wait-loop must name the
+    /// SAME marker file. The release is now issued from three places through
+    /// one helper (`release_egress_sidecar`): drive_workspace's settle, and
+    /// poll's terminal OutputContract / EvidenceLost arms — which previously
+    /// bailed without releasing and stranded the SIGTERM-proof sidecar (Pod
+    /// phase-Running forever). The exec itself needs a cluster (the live tier
+    /// exercises it); what IS assertable in-process is the mutation that would
+    /// silently reintroduce the strand: the touch and the `until [ -f … ]`
+    /// drifting onto different paths.
+    #[test]
+    fn egress_release_touches_the_marker_the_sidecar_waits_on() {
+        let cmd = egress_release_cmd();
+        let marker = egress_done_marker();
+        assert_eq!(cmd, format!("touch {marker}"), "release is a bare touch");
+        assert!(
+            marker.starts_with(CTL_MOUNT_PATH),
+            "the marker must live on the control handshake mount the exec \
+             container actually has: {marker}"
+        );
+        // The rendered sidecar waits on that exact path (not merely any
+        // string containing "egress-done").
+        let step = step_with_attempt("run-1", "build", "a1");
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &busybox(),
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            DEFAULT_CLONE_IMAGE,
+            None,
+        );
+        let inits = pod.spec.as_ref().unwrap().init_containers.clone().unwrap();
+        let egress = inits
+            .iter()
+            .find(|c| c.name == WORKSPACE_EGRESS_CONTAINER)
+            .expect("workspace pods carry the egress sidecar");
+        let wait = &egress.command.as_ref().unwrap()[2];
+        assert!(
+            wait.contains(&format!("[ -f {marker} ]")),
+            "sidecar wait-loop must poll the file the release touches; \
+             got: {wait}"
+        );
     }
 
     /// ADR-0061 s3-feed acceptance, at the grain `build_pod` owns: the feed

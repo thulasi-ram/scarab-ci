@@ -142,6 +142,13 @@
 //! make warm load-bearing for durability, which part 4 forbids and ADR-0064 rejects
 //! by name. See [`settle_export`] for the two drains and why the ordering is
 //! sufficient rather than merely intended.
+//!
+//! One deployment shape is exempt **by disclosure, not by accident**: under
+//! [`DurabilityTier::WarmOnly`] (ADR-0064 part 4 — the cold `LocalDir` shares the
+//! warm volume's device, so a "flush" would archive nothing) the flush phases are
+//! skipped and every settle and flush response says `durable: false,
+//! tier: "warm-only"`. The deployment makes a smaller, true promise instead of a
+//! silent false one.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -269,6 +276,13 @@ struct WorkspaceState {
     /// in the Export record — a change to [`crate::export`] and therefore not made
     /// here.
     captures: Arc<Mutex<BTreeMap<ExportHandle, i64>>>,
+    /// What backs the cold tier — probed once at startup by [`run`] (ADR-0064
+    /// parts 3–5) and never re-measured per request: a tier is a property of
+    /// the deployment, and a per-request `stat` that suddenly disagreed with
+    /// the startup disclosure would be a new kind of silent downgrade. Under
+    /// [`DurabilityTier::WarmOnly`] the flush phases are skipped and every
+    /// response discloses `durable: false, tier: "warm-only"`.
+    tier: DurabilityTier,
 }
 
 impl WorkspaceState {
@@ -292,6 +306,75 @@ impl WorkspaceState {
     /// The capture instant for `handle`, or `None` if this process never made it.
     fn capture_of(&self, handle: &ExportHandle) -> Option<i64> {
         self.captures().get(handle).copied()
+    }
+}
+
+/// What actually backs the cold tier — **measured, not assumed** (ADR-0064
+/// parts 3–5, git-bug `981fc6b`).
+///
+/// "Is it object storage?" was the obvious test and the wrong one: it rejects a
+/// second PVC (a perfectly good cold tier) and cannot see a `LocalDir` sitting
+/// on the warm volume. The probe is [`durability_tier`]; the strings are the
+/// wire contract — they appear in `FlushResponse.tier`, `SettledExportDto.tier`,
+/// `GET /v1/tier`, and the control plane stamps them on the Attempt
+/// (`attempts.output_durability`) — so they are defined in exactly one place,
+/// [`DurabilityTier::as_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurabilityTier {
+    /// S3/MinIO: an independent backing by construction.
+    Object,
+    /// A `LocalDir` on a **different device** than the warm volume (a second
+    /// PVC). A genuine second tier.
+    SeparateVolume,
+    /// A `LocalDir` on the **same device** as the warm volume: not a tier.
+    /// Nothing here is archived; `Succeeded` is licensed by the warm volume
+    /// alone, loudly (ADR-0064 part 4).
+    WarmOnly,
+}
+
+impl DurabilityTier {
+    /// The wire form: `"object" | "separate-volume" | "warm-only"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DurabilityTier::Object => "object",
+            DurabilityTier::SeparateVolume => "separate-volume",
+            DurabilityTier::WarmOnly => "warm-only",
+        }
+    }
+}
+
+/// Probe which [`DurabilityTier`] this deployment's cold store amounts to.
+///
+/// Pure decision over one `stat` pair: S3 is `Object` by construction; a
+/// `LocalDir` is compared to the warm directory by `st_dev`
+/// ([`std::os::unix::fs::MetadataExt::dev`]) — same device means writing "cold"
+/// buys nothing warm did not already have. Both directories are created first,
+/// because at first boot neither may exist yet and a probe that errored on
+/// `NotFound` would decide the tier by startup order.
+///
+/// **What `st_dev` cannot see** (recorded in ADR-0064's table, corrected):
+/// a cold `LocalDir` on its *own* `emptyDir` is a different device and probes
+/// `SeparateVolume`, yet dies with the Pod. Persistence of the backing is the
+/// chart's check, not a `stat`'s.
+fn durability_tier(
+    warm_dir: &std::path::Path,
+    store: &StoreConfig,
+) -> std::io::Result<DurabilityTier> {
+    match store {
+        StoreConfig::S3(_) => Ok(DurabilityTier::Object),
+        StoreConfig::LocalDir(dir) => {
+            use std::os::unix::fs::MetadataExt;
+            let cold_dir = std::path::Path::new(dir);
+            std::fs::create_dir_all(warm_dir)?;
+            std::fs::create_dir_all(cold_dir)?;
+            let warm_dev = std::fs::metadata(warm_dir)?.dev();
+            let cold_dev = std::fs::metadata(cold_dir)?.dev();
+            Ok(if warm_dev == cold_dev {
+                DurabilityTier::WarmOnly
+            } else {
+                DurabilityTier::SeparateVolume
+            })
+        }
     }
 }
 
@@ -328,7 +411,54 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .with_concurrency(config.cas_concurrency),
     );
 
-    let app = router(&ws.data_dir, cold_store, ws.token_secret.clone())?;
+    // The durability probe (ADR-0064 parts 3–5) — HERE, because this is the one
+    // place that holds both the raw warm directory and the `StoreConfig`. The
+    // router takes the verdict as a parameter rather than re-probing, so the
+    // acceptance tests can construct each tier's Depot explicitly.
+    let tier = durability_tier(std::path::Path::new(&ws.data_dir), &config.store)?;
+    match (tier, &config.store) {
+        (DurabilityTier::Object, _) => tracing::info!(
+            tier = tier.as_str(),
+            "durability tier: cold is object storage — an independent backing; the archival \
+             flush licenses Succeeded (ADR-0064 part 3)"
+        ),
+        (DurabilityTier::SeparateVolume, StoreConfig::LocalDir(dir)) => {
+            use std::os::unix::fs::MetadataExt;
+            tracing::info!(
+                tier = tier.as_str(),
+                warm_dir = %ws.data_dir,
+                warm_dev = std::fs::metadata(&ws.data_dir)?.dev(),
+                cold_dir = %dir,
+                cold_dev = std::fs::metadata(dir)?.dev(),
+                "durability tier: cold is a LocalDir on a SEPARATE device — a genuine second \
+                 tier; the archival flush licenses Succeeded (ADR-0064 part 3). NOTE st_dev \
+                 cannot vouch for the backing's persistence: a device that dies with the Pod \
+                 (an emptyDir of its own) also probes this way"
+            );
+        }
+        (DurabilityTier::WarmOnly, StoreConfig::LocalDir(dir)) => {
+            use std::os::unix::fs::MetadataExt;
+            let line = format!(
+                "WARM-ONLY DURABILITY: cold LocalDir {dir} shares device {dev} with warm {warm} \
+                 — snapshots will NOT be archived; Succeeded is licensed by the warm volume \
+                 alone (ADR-0064 part 4)",
+                dev = std::fs::metadata(&ws.data_dir)?.dev(),
+                warm = ws.data_dir,
+            );
+            tracing::warn!(tier = tier.as_str(), "{line}");
+            // On stdout beside the listen line below: an operator who started
+            // this by hand must not need a tracing subscriber to learn their
+            // deployment makes the weaker promise.
+            println!("{line}");
+        }
+        // `durability_tier` answers `Object` for every S3 store, so the two
+        // arms above are exhaustive over `LocalDir`.
+        (DurabilityTier::SeparateVolume | DurabilityTier::WarmOnly, StoreConfig::S3(_)) => {
+            unreachable!("durability_tier answers Object for an S3 store")
+        }
+    }
+
+    let app = router(&ws.data_dir, cold_store, ws.token_secret.clone(), tier)?;
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     tracing::info!(
         addr = %config.addr,
@@ -360,13 +490,20 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 /// [`StorageError::Backend`] rather than widening the error type, because a warm
 /// volume that cannot answer either question is the same class of fault
 /// `S3Storage::local` already reports here.
+///
+/// `tier` (ADR-0064 parts 3–5) is a parameter and NOT re-probed here: [`run`] is
+/// the one caller that holds a `StoreConfig` to probe, and the tests construct
+/// each tier's Depot explicitly — a router that probed for itself would make the
+/// warm-only acceptance tests depend on which device the CI runner's tempdirs
+/// land on.
 pub fn router(
     warm_dir: impl AsRef<std::path::Path>,
     cold: Arc<S3Storage>,
     token_secret: Vec<u8>,
+    tier: DurabilityTier,
 ) -> Result<Router, StorageError> {
     let warm_dir = warm_dir.as_ref().to_path_buf();
-    let state = open_state(&warm_dir, cold, token_secret)?;
+    let state = open_state(&warm_dir, cold, token_secret, tier)?;
 
     // The warm-tier size gauge (ADR-0061): LRU eviction is deferred, so this
     // number climbing towards the volume size IS the operator's only warning
@@ -410,6 +547,7 @@ fn open_state(
     warm_dir: &std::path::Path,
     cold: Arc<S3Storage>,
     token_secret: Vec<u8>,
+    tier: DurabilityTier,
 ) -> Result<WorkspaceState, StorageError> {
     // Warm tier: a local-filesystem `Cas` over the persistent volume. NO new
     // adapter is needed for this — `S3Storage::local` is already a local
@@ -428,6 +566,10 @@ fn open_state(
     let exports = open_export_lifecycle(warm_dir, &farm)?;
 
     Ok(WorkspaceState {
+        // The tiered READ handles stay wired under EVERY tier, warm-only
+        // included: a pre-existing same-device cold directory may hold content
+        // warm has lost, and reading it is free — warm-only stops the *writes*
+        // (nothing new is archived), never the fall-through reads.
         cas: Arc::new(TieredCas::new(warm_cas, cold_cas)),
         objects: Arc::new(TieredObjectStore::new(warm_objects, cold_objects)),
         warm: warm_store,
@@ -438,6 +580,7 @@ fn open_state(
         farm,
         exports,
         captures: Arc::new(Mutex::new(BTreeMap::new())),
+        tier,
     })
 }
 
@@ -583,6 +726,9 @@ fn build_router(state: WorkspaceState) -> Router {
     Router::new()
         .merge(cas)
         .merge(exports)
+        // ADR-0064 parts 3–5: which backing licenses `Succeeded` here.
+        // Authenticated (browse scope), unlike the probes below — see `get_tier`.
+        .route("/v1/tier", get(get_tier))
         // Unauthenticated, exactly like the control plane's: a probe that needs
         // a credential cannot report the credential being wrong.
         .route("/healthz", get(healthz))
@@ -1561,6 +1707,13 @@ pub struct FlushRequest {
 #[derive(Debug, Serialize)]
 struct FlushResponse {
     durable: bool,
+    /// The deployment's [`DurabilityTier`], on **every** 200 (ADR-0064 parts
+    /// 3–5): `"object"` or `"separate-volume"` beside `durable: true`,
+    /// `"warm-only"` beside `durable: false`. The client's classifier keys on
+    /// this pair — a `durable: false` *without* `tier: "warm-only"` stays a
+    /// retryable anomaly, so an old proxy's mangled body cannot impersonate
+    /// the warm-only disclosure.
+    tier: &'static str,
     blobs: u64,
     blobs_uploaded: u64,
     trees: u64,
@@ -1593,8 +1746,14 @@ fn flush_refusal(status: StatusCode, retryable: bool, detail: String) -> Respons
 ///
 /// # The status codes are a verdict about RETRYING, not a taxonomy of blame
 ///
-/// - `200` — the whole reachable set is in cold. Idempotent and cheap to repeat:
-///   a re-offer of an archived snapshot is one `head` per address.
+/// - `200`, `durable: true` — the whole reachable set is in cold. Idempotent and
+///   cheap to repeat: a re-offer of an archived snapshot is one `head` per address.
+/// - `200`, `durable: false, tier: "warm-only"` — this deployment HAS no cold
+///   tier (ADR-0064 part 4), so there is nothing to flush to and nothing a
+///   retry would change: deliberately a success status carrying a disclosure,
+///   never a 503. The walk still ran, so a wiped warm tier still answers 503
+///   below — the two conditions must not be conflated, because one is repaired
+///   by the caller's re-driven drain and the other by nothing.
 /// - `422`, `retryable: false` — [`FlushError::Mismatch`]: the two tiers
 ///   disagree on how content is addressed. The **only** fatal class; no retry
 ///   can converge two binaries that canonicalise differently.
@@ -1652,11 +1811,33 @@ async fn flush_cas(
             ))
         }
     };
+    // ADR-0064 part 4: under warm-only durability there is no cold tier to
+    // flush to, and pretending otherwise — a "flush" onto the same device — is
+    // waste plus false comfort. The auth, the hash check and the walk above all
+    // still ran (a wiped warm tier still 503s, exactly as it must: the caller's
+    // re-driven drain repairs THAT), but the answer is a deliberate
+    // `200 durable: false, tier: "warm-only"` and NEVER a 503 — nothing about
+    // being warm-only is repaired by retrying.
+    if matches!(state.tier, DurabilityTier::WarmOnly) {
+        let tally = FlushTally::warm_only(&flush);
+        return Ok((
+            StatusCode::OK,
+            Json(FlushResponse {
+                durable: tally.durable,
+                tier: DurabilityTier::WarmOnly.as_str(),
+                blobs: tally.blobs,
+                blobs_uploaded: tally.blobs_uploaded,
+                trees: tally.trees,
+            }),
+        )
+            .into_response());
+    }
     match flush_to_cold(&reads, &state.cold, &flush, &req.root).await {
         Ok(tally) => Ok((
             StatusCode::OK,
             Json(FlushResponse {
                 durable: tally.durable,
+                tier: state.tier.as_str(),
                 blobs: tally.blobs,
                 blobs_uploaded: tally.blobs_uploaded,
                 trees: tally.trees,
@@ -1929,19 +2110,26 @@ pub struct SettledExportDto {
     pub drain: &'static str,
     /// **`durable` means: the archival flush to the cold tier completed.**
     ///
-    /// Nothing more and nothing less. It is not a claim that this deployment *has* an
-    /// independently-backed cold tier — a `LocalDir` cold store can sit on the warm
-    /// volume, or on the chart's `emptyDir`, and a flush into one of those completes
-    /// perfectly while promising nothing. Disclosing *that* is ADR-0064 parts 3–5 and
-    /// git-bug `981fc6b`, which adds its own field; this one must keep exactly the
-    /// meaning above so that slice does not have to redefine it.
+    /// Nothing more and nothing less — and since this slice (git-bug `981fc6b`,
+    /// ADR-0064 parts 3–5) it can finally be `false`: under
+    /// [`DurabilityTier::WarmOnly`] there is no independent cold tier, the flush
+    /// phase is **skipped** rather than aimed at the warm volume's own device,
+    /// and this field discloses that instead of a `WsError` pretending
+    /// something failed. `tier` below is what tells the reader *why* — a
+    /// `durable: false` here always travels with `tier: "warm-only"`.
     ///
-    /// Still `true` on every response that exists, and now for a reason rather than by
-    /// assertion: ADR-0064 makes the write path warm-first, so the flush is a distinct
-    /// phase that is `await`ed before this DTO is built, and a flush that did not
-    /// complete is a `WsError::Drain` with no DTO to carry a `true` at all. The value is
+    /// Where a flush does exist, the old shape holds unchanged: it is `await`ed
+    /// before this DTO is built, a flush that did not complete is a
+    /// `WsError::Drain` with no DTO to carry a value at all, and the `true` is
     /// read off the flush's own tally rather than written here as a literal.
     pub durable: bool,
+    /// Which backing licenses `Succeeded` in this deployment (ADR-0064 parts
+    /// 3–5): `"object"` or `"separate-volume"` beside `durable: true`, or
+    /// `"warm-only"` beside `durable: false` — the disclosed, weaker promise.
+    /// The control plane stamps this on the Attempt
+    /// (`attempts.output_durability`), because a startup log line cannot
+    /// explain a Run a month later.
+    pub tier: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_set: Option<ChangeSetTallyDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2067,12 +2255,19 @@ async fn settle_export(
                 .map_err(|e| bad(format!("the change-set fold failed: {e}")))?
                 .map_err(|e| bad(e.to_string()))?;
 
-            // And the archival leg, awaited. The fold handed over its inventory —
-            // every blob its rebuilt trees name, every tree it wrote, and every
-            // untouched sub-tree those name — so this costs no second walk of anything.
-            let flushed = flush_to_cold(&drain_cas.reads, &state.cold, &settled.flush, &handle)
-                .await
-                .map_err(|e| bad(e.to_string()))?;
+            // And the archival leg, awaited — where an archive EXISTS. Under
+            // warm-only durability (ADR-0064 part 4) the flush is skipped rather
+            // than pointed at the warm volume's own device, and the DTO's
+            // `durable: false, tier: "warm-only"` is the disclosure. The fold
+            // handed over its inventory either way — every blob its rebuilt
+            // trees name, every tree it wrote, and every untouched sub-tree
+            // those name — so the durable arm costs no second walk of anything.
+            let flushed = match state.tier {
+                DurabilityTier::WarmOnly => FlushTally::warm_only(&settled.flush),
+                _ => flush_to_cold(&drain_cas.reads, &state.cold, &settled.flush, &handle)
+                    .await
+                    .map_err(|e| bad(e.to_string()))?,
+            };
 
             SettledExportDto {
                 handle: handle.to_string(),
@@ -2080,6 +2275,7 @@ async fn settle_export(
                 identity: settled.snapshot.identity.as_ref().map(|id| id.0.clone()),
                 drain: "change-set",
                 durable: flushed.durable,
+                tier: state.tier.as_str(),
                 change_set: Some(ChangeSetTallyDto {
                     blobs_stored: settled.tally.blobs_stored,
                     trees_written: settled.tally.trees_written,
@@ -2133,6 +2329,7 @@ async fn settle_export(
                 manifest,
                 captured_at_ms,
                 handle.clone(),
+                state.tier,
             )
             .await?;
 
@@ -2142,6 +2339,7 @@ async fn settle_export(
                 identity: snapshot.identity.as_ref().map(|id| id.0.clone()),
                 drain: "re-ingest",
                 durable: flushed.durable,
+                tier: state.tier.as_str(),
                 change_set: None,
                 reingest: Some(ReingestTallyDto {
                     hashed: tally.hashed,
@@ -2164,10 +2362,13 @@ async fn settle_export(
         drain = dto.drain,
         root = %dto.root,
         durable = dto.durable,
+        tier = dto.tier,
         total_ms = dto.elapsed_ms,
-        "workspace export settled — the snapshot was written warm and then FLUSHED to the cold \
-         tier, and this response waited for the flush, so the Attempt may be reported Succeeded \
-         (ADR-0064 part 1, keeping ADR-0062 part 3 / ADR-0061 part 4)"
+        "workspace export settled — where an independent cold tier exists this response waited \
+         for the archival flush and the Attempt may be reported Succeeded (ADR-0064 part 1, \
+         keeping ADR-0062 part 3 / ADR-0061 part 4); under warm-only durability there is no \
+         flush to wait for, and `durable: false` + `tier: \"warm-only\"` disclose that the warm \
+         volume alone is the promise (ADR-0064 part 4)"
     );
     Ok(Json(dto))
 }
@@ -2460,6 +2661,7 @@ impl Cas for DrainCas {
 /// has the same internal `buffer_unordered` shape but over **owned** jobs, so its future
 /// is provably `Send` and awaits inline. Which is also the evidence that the fix for the
 /// fold belongs in `settle.rs`: the adapter next door already does it the working way.
+#[allow(clippy::too_many_arguments)]
 async fn reingest_warm_then_flush(
     warm: Arc<S3Storage>,
     cold: Arc<S3Storage>,
@@ -2468,6 +2670,7 @@ async fn reingest_warm_then_flush(
     manifest: FlatManifest,
     captured_at_ms: i64,
     handle: ExportHandle,
+    tier: DurabilityTier,
 ) -> Result<
     (
         Snapshot,
@@ -2498,12 +2701,18 @@ async fn reingest_warm_then_flush(
                 snapshot.root.0
             ),
         })?;
-    let flushed = flush_to_cold(&reads, &cold, &flush, &handle)
-        .await
-        .map_err(|e| WsError::Drain {
-            handle: handle.clone(),
-            detail: e.to_string(),
-        })?;
+    // The walk above runs under EVERY tier — it is also what proves the
+    // published tree is readable — but under warm-only durability there is
+    // nothing to offer it to (ADR-0064 part 4), and the tally says so.
+    let flushed = match tier {
+        DurabilityTier::WarmOnly => FlushTally::warm_only(&flush),
+        _ => flush_to_cold(&reads, &cold, &flush, &handle)
+            .await
+            .map_err(|e| WsError::Drain {
+                handle: handle.clone(),
+                detail: e.to_string(),
+            })?,
+    };
 
     Ok((snapshot, tally, baseline_paths, flushed))
 }
@@ -2530,13 +2739,14 @@ fn flush_concurrency(cold: &S3Storage) -> usize {
 /// [`SettledExportDto::durable`] reports.
 #[derive(Debug, Clone, Copy)]
 struct FlushTally {
-    /// **The flush completed.** Always `true` in a tally that exists, because
-    /// [`flush_to_cold`] has no partial success: ADR-0064 is explicit that a partial
-    /// flush must not report success, so every other outcome is an `Err` and produces
-    /// no tally at all. The field exists so that the DTO's promise is *read off the
-    /// flush* rather than restated as a literal at the call site — and so that a future
-    /// slice which does introduce a second outcome (git-bug `981fc6b`: warm-only
-    /// deployments) cannot add it without every caller seeing the type change.
+    /// **The flush completed.** `true` from [`flush_to_cold`], which has no partial
+    /// success: ADR-0064 is explicit that a partial flush must not report success, so
+    /// every other outcome there is an `Err` and produces no tally at all. The one
+    /// `false` producer is [`FlushTally::warm_only`] — the second outcome this field's
+    /// old doc promised git-bug `981fc6b` would bring: no flush ran because no
+    /// independent cold tier exists to run it against, which is a disclosure and not a
+    /// failure. The field exists so the DTO's promise is *read off the archival phase*
+    /// rather than restated as a literal at the call site.
     durable: bool,
     /// Blobs in the inventory — every address the snapshot reaches, each one either
     /// probed present in cold or read and uploaded. Not "read": the probe pass
@@ -2551,6 +2761,25 @@ struct FlushTally {
     /// Trees offered to cold, across every level.
     trees: u64,
     elapsed_ms: u64,
+}
+
+impl FlushTally {
+    /// The warm-only synthesis (ADR-0064 part 4): **no flush ran**, because this
+    /// deployment has no independent cold tier to run one against, and a "flush"
+    /// onto the warm volume's own device would be waste plus false comfort.
+    ///
+    /// The inventory counts are still real — the walk that produced `flush` ran,
+    /// so a torn warm tier fails *before* this is built — but `blobs_uploaded`
+    /// is `0` by construction: nothing was offered anywhere.
+    fn warm_only(flush: &settle::FlushSet) -> Self {
+        Self {
+            durable: false,
+            blobs: flush.blobs.len() as u64,
+            blobs_uploaded: 0,
+            trees: flush.tree_count() as u64,
+            elapsed_ms: 0,
+        }
+    }
 }
 
 /// Why an archival flush did not complete.
@@ -2932,6 +3161,17 @@ async fn readyz(State(state): State<WorkspaceState>) -> Response {
         )
             .into_response();
     }
+    // Under warm-only durability there is no cold tier to probe (ADR-0064
+    // part 4): the "cold" directory is the warm volume's own device, so its
+    // reachability proves nothing the write probe above did not, and a readiness
+    // that could fail on it would gate the Depot on a tier the deployment has
+    // disclaimed. The payload says so, so an operator curling /readyz learns the
+    // deployment shape rather than reading a bare "ready" as the full promise.
+    if matches!(state.tier, DurabilityTier::WarmOnly) {
+        return "ready (warm-only durability: the cold probe is skipped — cold shares the warm \
+                volume's device, ADR-0064 part 4)"
+            .into_response();
+    }
     // NotFound = reachable; only a backend error means unready. Same convention
     // as the control plane's object-store probe.
     if let Err(StorageError::Backend(e)) = state.cold.get("readyz/probe").await {
@@ -2942,6 +3182,40 @@ async fn readyz(State(state): State<WorkspaceState>) -> Response {
             .into_response();
     }
     "ready".into_response()
+}
+
+/// `GET /v1/tier` — the deployment's [`DurabilityTier`], as one word.
+///
+/// Consulted by the control-plane GC to decide whether torn-cold detection is
+/// meaningful (there is no torn cold where there is no cold); also an operator
+/// probe. Gated exactly like the flush route — `Scope::Browse` — because the
+/// two travel together: the caller that acts on the tier is the caller that
+/// drives flushes, and a fenced Step has no business learning deployment
+/// topology.
+async fn get_tier(
+    State(state): State<WorkspaceState>,
+    headers: HeaderMap,
+) -> Result<Json<TierResponse>, WsError> {
+    let claims = authenticate(&state, &headers)?;
+    if !matches!(claims.scope, Scope::Browse) {
+        tracing::warn!(
+            run = %claims.fence.run,
+            step = %claims.fence.step,
+            attempt = %claims.fence.attempt,
+            "workspace service: 403 — a read-scoped token asked for the durability tier"
+        );
+        return Err(WsError::ScopeForbidden(
+            "the durability tier requires a browse-scoped token",
+        ));
+    }
+    Ok(Json(TierResponse {
+        tier: state.tier.as_str(),
+    }))
+}
+
+#[derive(Serialize)]
+struct TierResponse {
+    tier: &'static str,
 }
 
 /// `GET /metrics` — Prometheus text exposition.
@@ -3185,11 +3459,13 @@ mod tests {
             flushed,
             serde_json::json!({
                 "durable": true,
+                "tier": "separate-volume",
                 "blobs": 1,
                 "blobs_uploaded": 1,
                 "trees": 1
             }),
-            "one new blob probed missing and uploaded, one tree offered"
+            "one new blob probed missing and uploaded, one tree offered — and the tier the \
+             deployment was built with rides on every 200 (ADR-0064 part 5)"
         );
         assert_eq!(
             h.cold
@@ -3310,6 +3586,266 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // ADR-0064 parts 3–5 — the durability tier (git-bug `981fc6b`)
+    // -----------------------------------------------------------------------
+
+    /// The probe's S3 arm: object storage is an independent backing by
+    /// construction, and no filesystem is stat-ed to say so.
+    ///
+    /// Mutation killed: fold the S3 arm into the `LocalDir` comparison (or
+    /// invert it) and an S3 deployment would probe against directories that
+    /// mean nothing, or answer something other than `Object`.
+    #[test]
+    fn an_s3_cold_store_probes_to_the_object_tier() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tier = durability_tier(
+            &tmp.path().join("warm"),
+            &StoreConfig::S3(crate::config::S3Config {
+                bucket: "scarab".into(),
+                endpoint: "http://127.0.0.1:9000".into(),
+                region: "us-east-1".into(),
+                access_key: "k".into(),
+                secret_key: "s".into(),
+            }),
+        )
+        .expect("probe");
+        assert_eq!(tier, DurabilityTier::Object);
+    }
+
+    /// The probe's same-device arm — constructible everywhere, because two
+    /// directories under one tempdir share a device by construction. Neither
+    /// directory exists beforehand: the probe must create both, or a first
+    /// boot's verdict would depend on startup order.
+    ///
+    /// Mutation killed: invert (or drop) the `dev()` comparison and this
+    /// answers `SeparateVolume` — a same-device cold dir would then be flushed
+    /// to and reported durable, the exact false comfort ADR-0064 part 4 exists
+    /// to end.
+    #[test]
+    fn two_directories_on_one_device_probe_to_warm_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        let cold = tmp.path().join("cold");
+        let tier = durability_tier(
+            &warm,
+            &StoreConfig::LocalDir(cold.to_string_lossy().into_owned()),
+        )
+        .expect("probe");
+        assert_eq!(tier, DurabilityTier::WarmOnly);
+        assert!(
+            warm.is_dir() && cold.is_dir(),
+            "the probe must create both directories rather than erroring on a first boot"
+        );
+    }
+
+    /// The cross-device arm, env-gated: `SCARAB_TEST_ALT_DEV` must name a
+    /// directory on a DIFFERENT device than the system tempdir (on darwin e.g.
+    /// a mounted volume; on Linux a tmpfs like /dev/shm when /tmp is not one).
+    ///
+    /// **Opted in, this test is not allowed to pass silently** (the live-tier
+    /// lesson: a fixture that `return`s on a bad precondition goes green while
+    /// executing nothing). A same-device `SCARAB_TEST_ALT_DEV` is therefore a
+    /// loud failure, not a skip — the operator asked for the cross-device arm
+    /// and did not get it.
+    #[test]
+    fn a_cold_dir_on_another_device_probes_to_separate_volume() {
+        let Ok(alt) = std::env::var("SCARAB_TEST_ALT_DEV") else {
+            return; // not opted in — the one legitimate skip
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let warm = tmp.path().join("warm");
+        let cold = std::path::Path::new(&alt).join("scarab-alt-dev-probe");
+        let tier = durability_tier(
+            &warm,
+            &StoreConfig::LocalDir(cold.to_string_lossy().into_owned()),
+        )
+        .expect("probe");
+        let _ = std::fs::remove_dir(&cold);
+        assert_eq!(
+            tier,
+            DurabilityTier::SeparateVolume,
+            "SCARAB_TEST_ALT_DEV={alt} must name a directory on a DIFFERENT device than the \
+             tempdir — if this failed, the opt-in precondition is broken and the cross-device \
+             arm was NOT exercised; fix the env var rather than ignoring this"
+        );
+    }
+
+    /// Under warm-only durability a flush is a **200 disclosure, never a 503**
+    /// — and it writes nothing to cold, because a same-device "archive" is
+    /// waste plus false comfort.
+    ///
+    /// Mutations killed: drop the `WarmOnly` branch in `flush_cas` and the
+    /// response says `durable: true` while cold gains content; turn the
+    /// disclosure into a refusal and the status assertion fails (nothing about
+    /// warm-only is repaired by the retry a 503 commands); drop the
+    /// `flush_set_of` walk from the warm-only path and the absent-root leg
+    /// below answers 200 — a wiped warm tier must still 503, because THAT one
+    /// the caller's re-driven drain does repair.
+    #[tokio::test]
+    async fn under_warm_only_a_flush_is_a_200_disclosure_and_cold_is_not_written() {
+        use scarab_storage::ObjectStore;
+
+        let h = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await;
+
+        let blob = b"warm-only content".to_vec();
+        let blob_hash = hash_hex(&blob);
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "only.txt",
+            TreeTarget::Blob(BlobHash(blob_hash.clone())),
+        )])
+        .expect("canonical tree");
+        let (status, body) = h
+            .put_raw(&format!("/v1/cas/blobs/{blob_hash}"), blob)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = h
+            .put_raw(&format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+
+        let flushed = h
+            .json(
+                "POST",
+                "/v1/cas/flush",
+                Some(serde_json::json!({ "root": tree_hash.0 })),
+            )
+            .await;
+        assert_eq!(
+            flushed,
+            serde_json::json!({
+                "durable": false,
+                "tier": "warm-only",
+                "blobs": 1,
+                "blobs_uploaded": 0,
+                "trees": 1
+            }),
+            "the walk ran (real inventory counts), nothing was uploaded, and the pair \
+             `durable: false` + `tier: \"warm-only\"` is the disclosure the client keys on"
+        );
+        assert!(
+            matches!(
+                h.cold.get(&format!("blobs/{blob_hash}")).await,
+                Err(StorageError::NotFound)
+            ),
+            "cold must NOT be written under warm-only — a same-device archive is false comfort"
+        );
+
+        // The retryable class is untouched: a root warm cannot walk still 503s,
+        // because a wiped warm tier IS repaired by the caller's re-driven drain.
+        let absent = "33".repeat(32);
+        let (status, body) = h
+            .call(
+                "POST",
+                "/v1/cas/flush",
+                Some(serde_json::json!({ "root": absent })),
+            )
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "warm-only must not swallow a wiped warm tier into its 200: {body}"
+        );
+    }
+
+    /// Under warm-only durability a settle publishes to warm, skips the flush
+    /// phase, and answers `durable: false, tier: "warm-only"` — the smaller,
+    /// true promise, on the record.
+    ///
+    /// Mutations killed: hardcode `durable: true` in the DTO (or drop the tier
+    /// match in the re-ingest path) and the `durable`/`tier` assertions fail
+    /// while cold gains the snapshot; skip the warm publish along with the
+    /// flush and the warm materialize below has nothing to read.
+    #[tokio::test]
+    async fn under_warm_only_a_settle_publishes_warm_and_discloses_no_archive() {
+        let h = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await;
+        let (handle, _capability, workspace) = h.prepare().await;
+        std::fs::write(workspace.join("keep.txt"), b"the step rewrote this").expect("rewrite");
+
+        let settled = h
+            .json(
+                "POST",
+                &format!("/v1/exports/{handle}/settle"),
+                Some(serde_json::json!({})),
+            )
+            .await;
+        assert_eq!(settled["durable"], false, "{settled}");
+        assert_eq!(settled["tier"], "warm-only", "{settled}");
+        let root = TreeHash(settled["root"].as_str().expect("root").to_string());
+
+        // Warm alone serves the snapshot — it is the licensed tier here…
+        let out = h.tmp.path().join("from-warm");
+        h.state
+            .warm
+            .materialize(&root, out.to_str().expect("utf-8"))
+            .await
+            .expect("under warm-only the warm tier IS the record's backing");
+        assert_eq!(
+            std::fs::read(out.join("keep.txt")).expect("read"),
+            b"the step rewrote this"
+        );
+        // …and cold was never written.
+        assert!(
+            matches!(
+                h.cold.tree_entries(&root).await,
+                Err(StorageError::NotFound)
+            ),
+            "the settle's flush phase must be SKIPPED under warm-only, not aimed at the same \
+             device and reported as an archive"
+        );
+    }
+
+    /// `GET /v1/tier` answers the state's tier and is gated like the flush.
+    ///
+    /// Mutations killed: hardcode the tier string in `get_tier` and the two
+    /// harnesses below stop disagreeing; drop the `Scope::Browse` check and the
+    /// read-scoped leg answers 200 — the same gate mutation the flush test
+    /// pins, matched here because the route doc claims parity.
+    #[tokio::test]
+    async fn the_tier_route_answers_the_states_tier_and_only_to_browse_scope() {
+        use tower::ServiceExt;
+
+        let h = ExportHarness::start().await;
+        assert_eq!(
+            h.json("GET", "/v1/tier", None).await,
+            serde_json::json!({ "tier": "separate-volume" })
+        );
+        let hw = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await;
+        assert_eq!(
+            hw.json("GET", "/v1/tier", None).await,
+            serde_json::json!({ "tier": "warm-only" })
+        );
+
+        // A fenced Step's read-scoped token is refused, exactly as on the flush.
+        let step_token = workspace_token::mint(
+            b"export-secret",
+            &workspace_token::step_claims(
+                Fence {
+                    run: "r".into(),
+                    step: "s".into(),
+                    attempt: "a".into(),
+                },
+                i64::MAX / 2,
+                vec![h.parent.root.0.clone()],
+            ),
+        );
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/tier")
+            .header(WORKSPACE_TOKEN_HEADER, &step_token)
+            .body(Body::empty())
+            .expect("request");
+        let response = build_router(h.state.clone())
+            .oneshot(request)
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "deployment topology is the control plane's to read, not a fenced Step's"
+        );
+    }
+
     /// The canonicalisation-skew tripwire at its new home, the Depot's tree PUT.
     ///
     /// The body is valid JSON, hashes to the address it is PUT under, and parses
@@ -3409,7 +3945,15 @@ mod tests {
     }
 
     impl ExportHarness {
+        /// The default harness is **separate-volume-shaped**: the tier is passed
+        /// explicitly (the router never probes — see [`router`]), so the two
+        /// tempdirs living on one device is irrelevant, and the flush legs run
+        /// exactly as they would against a second PVC.
         async fn start() -> Self {
+            Self::start_with_tier(DurabilityTier::SeparateVolume).await
+        }
+
+        async fn start_with_tier(tier: DurabilityTier) -> Self {
             let tmp = tempfile::tempdir().expect("tempdir");
             let warm_dir = tmp.path().join("warm");
             let cold_dir = tmp.path().join("cold");
@@ -3435,7 +3979,7 @@ mod tests {
             }
 
             let cold = Arc::new(S3Storage::local(&cold_dir).expect("cold store"));
-            let state = open_state(&warm_dir, cold.clone(), b"export-secret".to_vec())
+            let state = open_state(&warm_dir, cold.clone(), b"export-secret".to_vec(), tier)
                 .expect("open the workspace state");
 
             // A real predecessor Step leaves the parent in warm (its drain) AND in
@@ -3662,6 +4206,10 @@ mod tests {
             .await;
         assert_eq!(settled["drain"], "re-ingest", "the copy rung chose the drain");
         assert_eq!(settled["durable"], true);
+        assert_eq!(
+            settled["tier"], "separate-volume",
+            "a durable settle names the backing that licensed it (ADR-0064 part 5)"
+        );
         let root = TreeHash(settled["root"].as_str().expect("root").to_string());
         assert_ne!(
             root.0, h.parent.root.0,
@@ -4060,7 +4608,13 @@ mod tests {
         std::fs::create_dir_all(&stranger).expect("mkdir stranger");
 
         let cold = Arc::new(S3Storage::local(&cold_dir).expect("cold store"));
-        let _router = router(&warm_dir, cold, b"export-secret".to_vec()).expect("router");
+        let _router = router(
+            &warm_dir,
+            cold,
+            b"export-secret".to_vec(),
+            DurabilityTier::SeparateVolume,
+        )
+        .expect("router");
 
         assert!(
             !residue.exists(),

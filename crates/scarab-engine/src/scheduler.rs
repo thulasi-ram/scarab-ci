@@ -1652,6 +1652,7 @@ impl<'a> Scheduler<'a> {
                         started_at: now,
                         failure: None,
                         failure_detail: None,
+                        output_durability: None,
                         outcome: AttemptOutcome::Running,
                     },
                 )
@@ -2053,6 +2054,7 @@ impl<'a> Scheduler<'a> {
                             started_at: self.clock.now().await,
                             failure: None,
                             failure_detail: None,
+                            output_durability: None,
                             outcome: AttemptOutcome::Running,
                         }],
                         needs: Vec::new(),
@@ -2088,8 +2090,20 @@ impl<'a> Scheduler<'a> {
                     // amendment records why.)
                     if let Some(output) = self.executor.output(&handle).await? {
                         let identity = self.executor.output_identity(&handle).await?;
+                        // The durability stamp (ADR-0064 s2): the tier the
+                        // Depot reported when the flush released this verdict,
+                        // recorded on the attempt row beside the root — the
+                        // per-attempt answer to "what did Succeeded license?".
+                        let durability = self.executor.output_durability(&handle).await?;
                         self.db
-                            .set_step_output(&run, &step, &attempt, &output, identity.as_deref())
+                            .set_step_output(
+                                &run,
+                                &step,
+                                &attempt,
+                                &output,
+                                identity.as_deref(),
+                                durability.as_deref(),
+                            )
                             .await?;
                     }
                     // Capture the step's named results (ADR-0041) under the fence,

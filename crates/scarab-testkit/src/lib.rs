@@ -430,6 +430,7 @@ impl Db for InMemoryDb {
         attempt: &AttemptId,
         snapshot: &str,
         identity: Option<&str>,
+        durability: Option<&str>,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
         let rec = st
@@ -439,6 +440,12 @@ impl Db for InMemoryDb {
         rec.output = Some(snapshot.to_string());
         rec.output_identity = identity.map(str::to_string);
         rec.evidence_attempt = Some(attempt.clone());
+        // The durability stamp (ADR-0064 s2) lands on the ATTEMPT row only —
+        // mirrors the postgres `UPDATE attempts SET … output_durability` in
+        // the same call; a missing attempt row is a silent no-op there too.
+        if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
+            a.output_durability = durability.map(str::to_string);
+        }
         st.attempt_evidence
             .entry((run.clone(), step.clone(), attempt.clone()))
             .or_default()
@@ -1154,6 +1161,7 @@ impl Db for InMemoryDb {
                     started_at: Timestamp(0),
                     failure: None,
                     failure_detail: None,
+                    output_durability: None,
                     outcome: AttemptOutcome::Running,
                 });
             }
@@ -1711,6 +1719,11 @@ struct FakeExecState {
     /// not — the git-bug `945b1f4` shape, see
     /// [`FakeExecutor::set_output_identical_content`].
     churning_roots: std::collections::HashSet<String>,
+    /// The **durability tier** each step's output flush reported (ADR-0064
+    /// s2), keyed by step id — what `Executor::output_durability` returns.
+    /// Absent means "no stamp" (no workspace / a pre-s2 backend), the `None`
+    /// the engine records as NULL.
+    durabilities: HashMap<String, String>,
     /// Named results (ADR-0041) each *step* emits on success, keyed by step id.
     results: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
     /// Artifacts of record (ADR-0052) each *step* published, keyed by step id —
@@ -1813,6 +1826,18 @@ impl FakeExecutor {
             .unwrap()
             .identities
             .insert(step.to_string(), identity.to_string());
+    }
+
+    /// The durability tier `step`'s output flush reports (ADR-0064 s2) — what
+    /// `Executor::output_durability` returns for any of that step's attempts:
+    /// one of the wire strings `object` | `separate-volume` | `warm-only`.
+    /// Unset (the default) models a stamp-less backend, i.e. `None`.
+    pub fn set_output_durability(&self, step: &str, tier: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .durabilities
+            .insert(step.to_string(), tier.to_string());
     }
 
     /// `(step id, attempt id)` out of a `fake://{run}/{step}/{attempt}` handle.
@@ -2008,6 +2033,15 @@ impl Executor for FakeExecutor {
             return Ok(None);
         };
         Ok(self.inner.lock().unwrap().identities.get(&step).cloned())
+    }
+
+    async fn output_durability(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        // Required, not defaulted (ADR-0064 s2): the fake decides explicitly —
+        // the configured tier, or `None` for a step no test stamped.
+        let Some((step, _)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        Ok(self.inner.lock().unwrap().durabilities.get(&step).cloned())
     }
 
     async fn results(

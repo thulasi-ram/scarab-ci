@@ -291,7 +291,7 @@ async fn seed_run_with_workspace(
         .unwrap()
         .root
         .0;
-    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None)
+    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None, None)
         .await
         .unwrap();
     root
@@ -365,6 +365,7 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
             workspace_ttl_ms: 30 * DAY_MS,
             grace_ms: i64::MAX,
         },
+        None,
     )
     .await
     .unwrap();
@@ -378,6 +379,11 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
         report.residue.is_empty() && report.suppressed_residue.is_empty(),
         "nothing is torn: cold-extra objects are sweep candidates, never residue"
     );
+    assert_eq!(
+        scarab_server::metrics::cas_gc_tier_probe_failed(),
+        0,
+        "no probe was made (no Depot configured) — the probe-failed gauge holds 0"
+    );
 
     // Pass 2 — no grace: exactly the old terminal run's UNSHARED objects go.
     let report = sweep_cas(
@@ -390,6 +396,7 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
             workspace_ttl_ms: 30 * DAY_MS,
             grace_ms: 0,
         },
+        None,
     )
     .await
     .unwrap();
@@ -484,6 +491,7 @@ async fn cas_gc_skips_a_dangling_root_instead_of_aborting() {
         &AttemptId("a1".into()),
         &missing,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -508,6 +516,7 @@ async fn cas_gc_skips_a_dangling_root_instead_of_aborting() {
             workspace_ttl_ms: 30 * DAY_MS,
             grace_ms: 0,
         },
+        None,
     )
     .await
     .expect("a dangling root is skipped, not fatal to the pass");
@@ -581,7 +590,7 @@ async fn seed_live_run_with_dir(
     let root = warm.ingest(dir.to_str().unwrap()).await.unwrap().root.0;
     let cold_root = cold.ingest(dir.to_str().unwrap()).await.unwrap().root.0;
     assert_eq!(root, cold_root, "content addressing: same dir, same root");
-    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None)
+    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None, None)
         .await
         .unwrap();
     root
@@ -677,6 +686,7 @@ async fn cas_gc_detects_reachable_objects_missing_from_cold_only() {
             workspace_ttl_ms: 30 * DAY_MS,
             grace_ms: DAY_MS,
         },
+        None,
     )
     .await
     .unwrap();
@@ -801,6 +811,7 @@ async fn residue_under_a_fresh_root_is_suppressed_not_alarmed() {
             workspace_ttl_ms: 30 * DAY_MS,
             grace_ms: DAY_MS,
         },
+        None,
     )
     .await
     .unwrap();
@@ -822,6 +833,98 @@ async fn residue_under_a_fresh_root_is_suppressed_not_alarmed() {
     assert_eq!(report.suppressed_residue[0].root, root);
     assert_eq!(scarab_server::metrics::cas_gc_cold_residue(), 0);
     assert_eq!(scarab_server::metrics::cas_gc_cold_residue_suppressed(), 1);
+
+    tdb.cleanup().await;
+}
+
+/// Ticket 231040a: the residue gauges are leader-reported, so a replica whose
+/// pass does NOT hold the lease must ZERO them — otherwise a replica that
+/// LOST the lease exports its last leader-era residue forever, a phantom tear
+/// to whoever scrapes it. `scarab_cas_gc_leader` (1/0 per pass) tells a scrape
+/// whose numbers are live. Mutations killed: remove the non-leader zeroing →
+/// the stale non-zero residue survives the second sweep; remove either leader
+/// gauge write → the 1-after-leader / 0-after-non-leader assertions fail.
+/// (Relies on nextest process-per-test isolation, like every gauge test here.)
+#[tokio::test]
+async fn residue_gauges_are_zeroed_on_a_non_leader_pass() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let pg = PostgresDb::with_pool(tdb.pool.clone());
+    pg.migrate().await.unwrap();
+
+    let warm_dir = tempfile::tempdir().unwrap();
+    let cold_dir = tempfile::tempdir().unwrap();
+    let warm =
+        Arc::new(scarab_storage_s3::S3Storage::local(warm_dir.path().to_str().unwrap()).unwrap());
+    let cold =
+        Arc::new(scarab_storage_s3::S3Storage::local(cold_dir.path().to_str().unwrap()).unwrap());
+    let tiered: Arc<dyn Cas> =
+        Arc::new(TieredCas::new(warm.clone(), cold.clone()).fall_through_on_warm_error());
+    let cold_store: Arc<dyn ObjectStore> = cold.clone();
+
+    // A real torn state under an aged root, so the LEADER pass reports
+    // genuinely non-zero residue for the non-leader pass to phantom-export.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("t.txt"), "torn-for-gauges").unwrap();
+    let root = seed_live_run_with_dir(&pg, &warm, &cold, "torn-gauge", dir.path()).await;
+    sqlx::query("UPDATE step_runs SET updated_at = 0 WHERE run_id = $1")
+        .bind("torn-gauge")
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    let entries = tiered.tree_entries(&TreeHash(root.clone())).await.unwrap();
+    let torn_blob = entries
+        .iter()
+        .find_map(|e| match &e.target {
+            TreeTarget::Blob(b) => Some(b.0.clone()),
+            _ => None,
+        })
+        .unwrap();
+    cold_store.delete(&format!("blobs/{torn_blob}")).await.unwrap();
+
+    let db: Arc<dyn Db> = Arc::new(pg);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(now_ms));
+    let cfg = GcConfig {
+        workspace_ttl_ms: 30 * DAY_MS,
+        grace_ms: DAY_MS,
+    };
+
+    // Leader pass: real residue, and the leader gauge says these numbers live.
+    let report = sweep_cas(&db, &tiered, &cold_store, &clock, "gc-gauge-leader", cfg, None)
+        .await
+        .unwrap();
+    assert_eq!(report.residue.len(), 1, "the leader pass detects the tear");
+    assert_eq!(scarab_server::metrics::cas_gc_cold_residue(), 1);
+    assert_eq!(scarab_server::metrics::cas_gc_leader(), 1);
+
+    // A second sweeper id while the lease is held (the ADR-0050 trick): its
+    // pass is NOT the leader, asserts nothing, and must zero the gauges.
+    let report = sweep_cas(&db, &tiered, &cold_store, &clock, "gc-gauge-follower", cfg, None)
+        .await
+        .unwrap();
+    assert!(report.residue.is_empty(), "a non-leader reports nothing");
+    assert_eq!(
+        scarab_server::metrics::cas_gc_cold_residue(),
+        0,
+        "a non-leader pass zeroes the alarmed gauge — no phantom tear"
+    );
+    assert_eq!(
+        scarab_server::metrics::cas_gc_cold_residue_suppressed(),
+        0,
+        "…and the suppressed gauge"
+    );
+    assert_eq!(
+        scarab_server::metrics::cas_gc_leader(),
+        0,
+        "the leader gauge says this replica's numbers are not live"
+    );
 
     tdb.cleanup().await;
 }
@@ -940,6 +1043,7 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
             workspace_ttl_ms: 30 * DAY_MS,
             grace_ms: 0,
         },
+        None,
     )
     .await
     .unwrap();
@@ -987,6 +1091,7 @@ async fn a_pinned_run_survives_a_sweep_that_would_otherwise_collect_it() {
             workspace_ttl_ms: 30 * DAY_MS,
             grace_ms: 0,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1035,6 +1140,7 @@ async fn seed_chain(db: &PostgresDb, cas: &Arc<dyn Cas>, run: &RunId) -> Vec<Str
             &AttemptId("a1".into()),
             &snap.root.0,
             snap.identity.as_ref().map(|i| i.0.as_str()),
+            None,
         )
         .await
         .unwrap();
@@ -1117,6 +1223,7 @@ async fn an_expired_input_widens_a_rerun_back_to_clone_instead_of_failing() {
             workspace_ttl_ms: 30 * DAY_MS,
             grace_ms: 0,
         },
+        None,
     )
     .await
     .unwrap();
@@ -1420,6 +1527,242 @@ async fn the_retention_promise_is_keyed_on_updated_at_not_created_at() {
     assert_eq!(wr["pinned_by"], "alice");
     assert_eq!(wr["pinned_at"], SETTLED + DAY_MS);
     assert_eq!(wr["expired"], false);
+
+    tdb.cleanup().await;
+}
+
+// ---------------------------------------------------------------------------
+// Warm-only suppression of the torn-cold detector (ADR-0064 s2).
+// ---------------------------------------------------------------------------
+
+use scarab_server::retention::DepotTierSource;
+
+/// A real-shaped tier probe: answers what a healthy Depot's `GET /v1/tier`
+/// would (one of the wire strings), no CAS involved.
+struct StaticTier(&'static str);
+
+#[async_trait::async_trait]
+impl DepotTierSource for StaticTier {
+    async fn depot_tier(&self) -> Result<String, String> {
+        Ok(self.0.to_string())
+    }
+}
+
+/// The probe when the Depot's /v1/tier is unreachable or broken.
+struct BrokenTier;
+
+#[async_trait::async_trait]
+impl DepotTierSource for BrokenTier {
+    async fn depot_tier(&self) -> Result<String, String> {
+        Err("GET /v1/tier: connection refused".into())
+    }
+}
+
+/// Build the standard torn fixture (one blob of a reachable, aged root deleted
+/// from COLD only) and return everything a sweep needs. Factored so the two
+/// tier-probe tests below drive the IDENTICAL tear and differ only in the
+/// probe's answer.
+async fn torn_fixture(
+    tdb: &common::TestDb,
+    run_id: &str,
+) -> (
+    Arc<dyn Db>,
+    Arc<dyn Cas>,
+    Arc<dyn ObjectStore>,
+    Arc<dyn Clock>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let pg = PostgresDb::with_pool(tdb.pool.clone());
+    pg.migrate().await.unwrap();
+
+    let warm_dir = tempfile::tempdir().unwrap();
+    let cold_dir = tempfile::tempdir().unwrap();
+    let warm =
+        Arc::new(scarab_storage_s3::S3Storage::local(warm_dir.path().to_str().unwrap()).unwrap());
+    let cold =
+        Arc::new(scarab_storage_s3::S3Storage::local(cold_dir.path().to_str().unwrap()).unwrap());
+    let tiered: Arc<dyn Cas> =
+        Arc::new(TieredCas::new(warm.clone(), cold.clone()).fall_through_on_warm_error());
+    let cold_store: Arc<dyn ObjectStore> = cold.clone();
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("t.txt"), "torn-under-a-tier-probe").unwrap();
+    let root = seed_live_run_with_dir(&pg, &warm, &cold, run_id, dir.path()).await;
+    // Aged past the grace window, so nothing suppresses on freshness grounds.
+    sqlx::query("UPDATE step_runs SET updated_at = 0 WHERE run_id = $1")
+        .bind(run_id)
+        .execute(&tdb.pool)
+        .await
+        .unwrap();
+    let entries = tiered.tree_entries(&TreeHash(root.clone())).await.unwrap();
+    let torn_blob = entries
+        .iter()
+        .find_map(|e| match &e.target {
+            TreeTarget::Blob(b) => Some(b.0.clone()),
+            _ => None,
+        })
+        .unwrap();
+    cold_store.delete(&format!("blobs/{torn_blob}")).await.unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 60_000;
+    let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(now_ms));
+    (Arc::new(pg), tiered, cold_store, clock, warm_dir, cold_dir)
+}
+
+/// A Depot answering `warm-only` has NO cold tier to be torn: the residue
+/// detector would otherwise flag every marked object on every pass (nothing
+/// is ever flushed), a permanent false alarm. The pass must skip the detector,
+/// zero the residue gauges — and keep the leader gauge at 1: this IS the
+/// leader's pass, its numbers are live (231040a's contract is about WHOSE
+/// numbers, not which detector ran). Mutations killed: dropping the tier
+/// check → the torn fixture alarms (the leader control-pass proves it would);
+/// zeroing the leader gauge alongside the residue gauges → the 1 assertion
+/// fails; suppressing by shoving the holes into `suppressed_residue` → the
+/// empty-suppressed assertion fails.
+#[tokio::test]
+async fn a_warm_only_tier_answer_suppresses_the_residue_detector() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let (db, tiered, cold_store, clock, _warm, _cold) = torn_fixture(&tdb, "torn-wo").await;
+    let cfg = GcConfig {
+        workspace_ttl_ms: 30 * DAY_MS,
+        grace_ms: DAY_MS,
+    };
+
+    // Control pass, no probe (the no-Depot sweeper shape): the fixture IS
+    // torn and the detector, left on, says so — proving the suppression below
+    // suppresses a real alarm rather than passing on an untorn store.
+    let report = sweep_cas(&db, &tiered, &cold_store, &clock, "gc-wo", cfg, None)
+        .await
+        .unwrap();
+    assert_eq!(report.residue.len(), 1, "the fixture is genuinely torn");
+    assert_eq!(scarab_server::metrics::cas_gc_cold_residue(), 1);
+
+    // The warm-only pass: same tear, detector skipped, gauges zeroed. Seed
+    // the probe-failed gauge to 1 first, so its 0 below proves the pass SET
+    // it per-pass rather than never touching it.
+    scarab_server::metrics::set_cas_gc_tier_probe_failed(true);
+    let probe = StaticTier("warm-only");
+    let report = sweep_cas(
+        &db,
+        &tiered,
+        &cold_store,
+        &clock,
+        "gc-wo",
+        cfg,
+        Some(&probe as &dyn DepotTierSource),
+    )
+    .await
+    .unwrap();
+    assert!(
+        report.residue.is_empty(),
+        "warm-only: no cold listing is meaningful, so nothing is 'missing from cold'"
+    );
+    assert!(
+        report.suppressed_residue.is_empty(),
+        "skipped means SKIPPED — not rerouted into the freshness-suppressed bucket"
+    );
+    assert_eq!(
+        scarab_server::metrics::cas_gc_cold_residue(),
+        0,
+        "the residue gauge is zeroed for the pass, clearing the control pass's 1"
+    );
+    assert_eq!(scarab_server::metrics::cas_gc_cold_residue_suppressed(), 0);
+    assert_eq!(
+        scarab_server::metrics::cas_gc_leader(),
+        1,
+        "this was the LEADER's pass — suppression must not masquerade as lease loss"
+    );
+    assert_eq!(
+        scarab_server::metrics::cas_gc_tier_probe_failed(),
+        0,
+        "the probe SUCCEEDED (it answered warm-only) — a suppressed detector must \
+         not read as a broken probe"
+    );
+
+    // A durable tier answer keeps the detector on (only the literal
+    // `warm-only` suppresses — kills a `!= "object"` style inversion). The
+    // probe SUCCEEDS here — the clean-probe case — so the probe-failed gauge
+    // must land 0 (seeded to 1 to prove it is set, not merely left alone).
+    scarab_server::metrics::set_cas_gc_tier_probe_failed(true);
+    let probe = StaticTier("separate-volume");
+    let report = sweep_cas(
+        &db,
+        &tiered,
+        &cold_store,
+        &clock,
+        "gc-wo",
+        cfg,
+        Some(&probe as &dyn DepotTierSource),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.residue.len(),
+        1,
+        "a separate-volume Depot HAS a cold tier — the tear is real and reported"
+    );
+    assert_eq!(
+        scarab_server::metrics::cas_gc_tier_probe_failed(),
+        0,
+        "a successful probe reads 0 — this residue is trustworthy, not a maybe-warm-only \
+         false positive"
+    );
+
+    tdb.cleanup().await;
+}
+
+/// RULING (implemented exactly): a tier-probe ERROR does not suppress — the
+/// detector stays on and the failure is only logged. Otherwise a torn cold
+/// would be maskable by breaking /v1/tier, and the one detector that matters
+/// would fail exactly when the Depot is failing. Mutation killed: treating
+/// `Err` like `warm-only` (or any suppress-on-error fallback) → the torn
+/// fixture stops alarming here. And the pass must SAY the probe failed:
+/// `scarab_cas_gc_tier_probe_failed` reads 1, so a scrape can tell "probe
+/// down, residue may be warm-only false positives" from real torn cold.
+#[tokio::test]
+async fn a_tier_probe_error_does_not_suppress_the_detector() {
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let (db, tiered, cold_store, clock, _warm, _cold) = torn_fixture(&tdb, "torn-err").await;
+    let cfg = GcConfig {
+        workspace_ttl_ms: 30 * DAY_MS,
+        grace_ms: DAY_MS,
+    };
+
+    let report = sweep_cas(
+        &db,
+        &tiered,
+        &cold_store,
+        &clock,
+        "gc-err",
+        cfg,
+        Some(&BrokenTier as &dyn DepotTierSource),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        report.residue.len(),
+        1,
+        "an unreachable /v1/tier is not evidence there is no cold tier — the tear alarms"
+    );
+    assert_eq!(scarab_server::metrics::cas_gc_cold_residue(), 1);
+    assert_eq!(scarab_server::metrics::cas_gc_leader(), 1);
+    assert_eq!(
+        scarab_server::metrics::cas_gc_tier_probe_failed(),
+        1,
+        "the probe-failed gauge distinguishes 'tier probe failed' from real torn cold: \
+         when 1, the residue above may be a warm-only false positive — fix the probe first"
+    );
 
     tdb.cleanup().await;
 }
