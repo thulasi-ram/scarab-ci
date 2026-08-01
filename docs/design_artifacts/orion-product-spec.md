@@ -514,7 +514,123 @@ One line: **LangGraph decides what to do next; Scarab decides what it is
 allowed to do, pays for it, proves what happened, and survives everything in
 between.**
 
-## 15. Open product questions
+## 15. Why this doesn't already exist — and the surface-area audit
+
+This section exists because the owner asked the falsification question directly:
+*"Isn't this too much surface area for us? What is currently stopping people
+from taking Jenkins/GHA/Temporal and building agent teams? People don't do
+that — why? Or even use n8n as a runner — why?"* The question is the right
+one, and the answers are the positioning.
+
+### 15.1 The falsification test, taken seriously
+
+**GHA/Jenkins.** The premise needs one correction: the biggest player did
+exactly this — GitHub's Copilot coding agent runs on ephemeral Actions
+runners (verified, §12 research). The substrate instinct is *correct*. But
+the agent plane had to be built privately on top, and the governance came out
+holed (firewall covers only the Bash tool; Copilot is a rulesets *bypass
+actor*). The lesson: **an agent plane bolted onto a job runner inherits the
+job runner's assumptions, and they are the wrong ones.** Which assumptions —
+why teams don't do it themselves:
+
+1. *The job model bills you for waiting.* No durable suspend; GHA caps at 6 h
+   and charges while blocked; Jenkins `input` parks an executor. HITL means
+   holding a machine or exiting and losing state. Our gate costs a row.
+2. *Statelessness by design.* No memory between jobs → you hand-build
+   transcript storage, resume, and locking in bash + S3 — i.e. a bad Orion.
+   Everyone gets exactly far enough to discover they are building a durable
+   orchestrator, then stops.
+3. *Secrets are all-or-nothing per job.* An agent with CI secrets has
+   everything — no custody, no egress control, no per-tool grants. This is
+   where security teams veto.
+4. *No cost primitive* beyond machine-minutes; token spend is invisible.
+5. *Logs-as-text observability* — no tool-call grain, no evidence model.
+
+**Temporal.** People **do** build agent orchestration on it (it markets
+durable agents; OpenAI SDK integration). But Temporal is a *library for
+building your own agent platform*: it executes nothing (bring your own
+workers — no isolation, no images, no checkout), governs nothing (no
+approvals/secrets/egress product), and demands determinism discipline in
+workflow code. Adopting it means building identity, sandboxing, budgets,
+audit, the forge loop, and a UI yourself. **That DIY layer is this product's
+hypothesis.** Temporal's existence proves demand for the loop; the layer
+everyone rebuilds on top proves what's missing.
+
+**n8n.** It **is** a huge agent runner — for the Zapier job (business glue),
+where it is winning. Not for repo work, structurally: one shared trust
+domain (pooled credentials, no per-run isolation), no repo semantics
+(checkout/PR/checks), no evidence model, node-graph authoring rather than
+containers. As a coding-agent runner it means handing one process all your
+credentials and getting no audit out.
+
+### 15.2 Synthesis and the threat
+
+Nobody has done it not because the idea is wrong but because it takes four
+things in one system — **execution substrate + durable orchestration +
+forge-native semantics + governance/evidence** — and each incumbent owns one
+or two. GitHub owns substrate+forge but monetises Copilot, not a platform,
+on a legacy job model. Temporal owns the loop. n8n owns orchestration UX for
+a different job. Scarab is odd in owning all four in one codebase already —
+which is the entire reason this is not delusional.
+
+The threat model has one name: **GitHub** owns both sides and Agent HQ shows
+them moving. The counter-position is the shape Cursor-self-hosted and
+Codex's two-phase runtime validate: **self-hosted, framework-neutral, on
+your cluster, with real governance.**
+
+### 15.3 The surface-area audit
+
+The owner's concern is correct: this spec as written is multi-year. It is a
+**map, not a commitment**. Sorted:
+
+- **Rides existing rails (cheap):** agent step kind (one IR field + one
+  persist arm), tools-as-sidecars (ADR-0058), Turn-as-Run (`on: api`),
+  transcript-as-Artifact, CI-as-judge, supersede semantics, Briefing v0 (a
+  JSON assembled from data already stored).
+- **The real bet (genuinely new):** the Orion service (a table + a driver
+  loop + the Docket), the metering-proxy sidecar binary, the budget ledger.
+- **Deferred until a named user pulls:** Toolkit *UI* (gitops files first —
+  the PlacementProfile pattern needs no UI to exist), the Roster (a config
+  list first), fleet policies, standing Mandates, A2A, eBPF, crew-in-a-box
+  scaffolding, the panes-grid.
+- **Dual-use, not booked to this bet:** OTel/metrics (the engine is
+  operationally blind today regardless), `ui/kit`, the sidecar rewrite (an
+  unobservable shell script today).
+
+### 15.4 The kill test
+
+Dogfood on this repo: dep bumps, flaky-test triage, doc-drift PRs, under
+real budgets and real gates. **If we don't leave Mandates running on
+scrarab-ci after a month, the market's answer was in the falsification
+question, and we find out in weeks, not quarters.**
+
+### 15.5 The owner's compass (recorded stances, 2026-07-31 → 2026-08-01)
+
+Positions the owner has taken during this design arc, recorded so future
+work doesn't relitigate them silently:
+
+- **An agent should be nothing more than a container + command + some YAML.**
+  Simplicity is the bar; every layer above that must justify itself. (The
+  spec's answer: the layers are what make it *employable* — §14 — but the
+  authoring surface must stay at container+YAML.)
+- **eBPF: never a DaemonSet; acceptable as a sidecar** under governed grants.
+- **The Superlogical frame is the chosen direction:** the engine stays the
+  public building block; the AI layer (Orion) is the multiplexer equivalent.
+  If the agent foundry isn't a natural fit for a CI runner, *bend the problem
+  until it fits* — the fit found: agents-as-Runs, governance as the value.
+- **Orion may be given away free later.** Every seam must therefore stand on
+  coupling discipline, never on a monetisation boundary.
+- **"Move setup one layer up" is the direction** (the Claude Tag
+  observation): org-curated catalogs — connections, MCPs, credentials,
+  bundles with inheritance — over fresh per-user setup. Toolkits + Roster
+  (§12) are this instinct in house pattern form.
+- **Novelty is required, not optional:** "if a step is just a container
+  running a crew of LangGraph agents, what does Scarab/Orion add" must have
+  a sharp answer at all times (currently §14).
+- **Surface-area skepticism is standing policy:** the falsification question
+  (§15.1) should be re-asked at every scope expansion.
+
+## 16. Open product questions
 
 1. **Docket direction** — A (inbox-first) vs B (panes grid) vs A-with-B-toggle.
 2. **Notifications** — is the Docket enough, or does WAITING·YOU page you in
