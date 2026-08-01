@@ -316,19 +316,51 @@ telling you to co-locate them.
   steps — explicitly unfenced, author's contract. If you reach for it for
   agent chatter, prefer T1/T2.
 
-**What people are looking for in this space** (prior-knowledge assessment,
-verifiable on request): the 2024 peer-to-peer multi-agent hype cooled;
-practice converged on **orchestrator-worker with structured, typed handoffs
-and full-context handovers** — peer chatter fragments context (Cognition's
-"Don't Build Multi-Agents" argument; Anthropic's own multi-agent research
-favoured orchestrator-worker for parallelisable tasks). The asks that
-survived: typed handoffs (= Results), shared context (= Snapshots), parallel
-fan-out with joins (= matrix + join policies), human interrupts (= gates),
-durable resume (= Turns/Mandates), per-agent cost and tracing (= sidecar
-metering + the span projection), cross-vendor interop (**A2A** — relevant
-someday at the *Orion boundary*, a Mandate exposed/consumed as an A2A task,
-never inside the DAG). Scarab's grain matches where practice landed, not
-where the hype was.
+**What people are looking for in this space** (researched & verified
+2026-08-01; sources in the research notes):
+
+- The mid-2025 "don't build multi-agents" stance has a 2026 refinement, and
+  it is stronger for us than the original: Cognition's follow-up
+  (*"Multi-Agents: What's Actually Working"*, Apr 2026) lands on **"reads
+  parallelize, writes stay single-threaded"** — readonly subagents work,
+  parallel writers don't, and their code-review agent works *better without*
+  shared prior context (fresh perspective beats context-sharing for
+  verification). Anthropic's guidance (*"When to use multi-agent systems"*,
+  Jan 2026): start single-agent; multi-agent costs **3–10× the tokens** and
+  wins only for context protection, parallel search, and specialization; the
+  **verification subagent** is the consistently successful pattern.
+- **Scarab enforces read-parallel/write-serial *by construction*:** each
+  Attempt owns its Workspace, parallel steps read shared Snapshots, merges
+  happen only at explicit DAG joins. The discipline the field converged on by
+  painful convention is this architecture's default. And the fresh-context
+  reviewer is literally a DAG peer step that reads outputs but not the
+  transcript — plus CI itself as the blackbox verifier.
+- The asks that survived, mapped: typed handoffs (= Results), shared context
+  (= Snapshots), fan-out/join (= matrix + join policies), human interrupts
+  (= gates), durable resume (= Turns/Mandates), per-agent cost & tracing
+  (= sidecar metering + the span projection). The 3–10× token figure also
+  argues for our default: one strong agent per step, parallelism via the DAG.
+- **A2A** hit v1.0 (Mar 2026, Linux Foundation; 150+ orgs, in Azure Foundry /
+  Copilot Studio / Bedrock AgentCore) — real at the platform layer, still
+  thin on named production users. Relevant someday at the *Orion boundary*
+  (a Mandate exposed/consumed as an A2A task), never inside the DAG. **MCP**'s
+  2026-07-28 spec (stateless core, extensions) is the tool boundary; the
+  official registry is still preview.
+- **Production pain, ranked** (LangChain survey, n=1,340, late 2025):
+  **quality 32% > security ~25% > latency 20%**, with cost *declining* as a
+  blocker as model prices fall — though runaway-cost incidents stay vivid
+  (a documented 11-day loop billing ~$47k; Orion's `max_turns` + cumulative
+  budget kills that class outright). Observability is table stakes (89%
+  adoption) while **evals lag (52% offline / 37% online)** — which validates
+  eval-as-CI as the adjacency and orders the pitch: quality/evidence first,
+  budget enforcement as insurance, latency addressed by topology choice (§9).
+- **The budget gap is verified open:** enforcement today lives only at the
+  LLM-gateway layer (LiteLLM per-session budgets are the closest; Portkey
+  virtual keys; OpenRouter's 2026 guardrails — all keyed on keys/sessions by
+  convention). *A budget enforced by the orchestrator itself against a
+  first-class run identity does not ship anywhere* — that is exactly Orion's
+  metering-proxy + Mandate-ledger design, with identity by construction (the
+  fence), not by key-discipline.
 
 ## 10. Cold starts and the latency budget
 
@@ -365,7 +397,124 @@ neither is disguised as the other. **Warm pod pools are refused for now** —
 they fight namespace-per-run isolation and the trust model; revisit only if
 real Mandates show turn latency as the binding pain.
 
-## 11. Open product questions
+## 11. The Briefing — pipeline meta-context as an agent capability
+
+Agents everywhere else start blind; context engineering is the acknowledged
+hard part (Cognition's principle 1: *share full context*). Scarab holds an
+evidence corpus no agent platform has — so inject it.
+
+**Every agent step receives `/scarab/briefing.json`, read-only:**
+
+| Section | Contents | Why the agent is better for it |
+|---|---|---|
+| identity & cause | Actor, Headline, ref/SHA, PR title, environment | knows *whose* work and *why* |
+| position | DAG placement; what ran before; **prior Attempts with failure diagnoses** | attempt 3 starts knowing what killed attempts 1–2 |
+| terms | budget remaining (tokens/$/time/turns), allowed tools, **downstream gates** ("your changeset will need 2 approvals") | writes its rationale *for the approver it knows is coming* |
+| repo intel | flake verdicts **with content-identity proof**, recent failure clusters, ownership hints | doesn't chase a known flake; routes to the right owner |
+| links | run URL, mandate URL, investigation card if one exists | the explain→act ladder: an altitude-2 investigation is the fixing Mandate's first briefing |
+
+Plus **`scarab-briefing`** — an MCP sidecar in the default toolkit exposing
+read-only, run-scoped queries ("what changed since last green", "history of
+this test", "who owns this path"). Ambient doc for cheap context; MCP for
+drill-down; both governed.
+
+**Budget-aware agents** fall out of the terms row and nobody ships them: the
+runner *discloses* remaining budget so the agent can economize (cheap model
+for lint fixes when $6 remain) — while enforcement stays at the proxy.
+Disclosure and enforcement are different organs; we have both.
+
+## 12. Toolkits and the Roster — setup moved one layer up
+
+The direction requested ("org picks from a catalog, not fresh setup") is the
+**house pattern applied twice more**. PlacementProfile and RetentionProfile
+already established the species: *operator-owned named bundle, referenced by
+name from authored YAML, values never in the repo*. Two new members:
+
+**Toolkit** — the full capability unit, admin-curated, granted by inheritance:
+
+```yaml
+# authored yaml names bundles; admins own contents
+steps:
+  - id: fix
+    agent:
+      image: roster://claude-code-runner        # from the Roster
+      tools: [github-standard, jira-readonly]   # Toolkits, by name
+```
+
+A Toolkit bundles: **MCP server images** (digest-pinned) + **credentials**
+(held by the sidecar; the agent process never sees them) + **egress
+allowlist** (a NetworkPolicy — kernel-enforced, not proxy configuration) +
+**budget defaults** + usage instructions. Granted org → project →
+Environment on the ADR-0037 secret-scope inheritance chain; which Toolkits an
+Environment admits is a protection rule beside the ADR-0039 privilege
+whitelist. Every tool call lands in the per-tool-call audit, tied to Run
+evidence.
+
+**Roster** — the curated agent catalog: digest-pinned approved agent images
+with default terms (budgets, turn timeout) and allowed Toolkits. Creating a
+Mandate = pick from Roster + pick Toolkits + write the goal. Fresh-from-
+scratch setup disappears; so does "which model key do I paste where".
+
+**Market position (researched 2026-08-01):** *no shipped product offers the
+full unit* — tools + credentials + egress + budget defaults as one named
+object, inherited across an org tree, audited. The fragments: **Claude Tag's
+Access bundles** are the closest prior art (named bundles carrying
+credentials + repo grants + domains + plugins + instructions, credentials
+injected at a proxy so the model never holds the key — the same custody
+principle as our tool sidecars) but they are Slack-scoped (workspace/channel,
+not an org tree), have no per-bundle budgets, and govern one surface.
+**Microsoft** went identity-first (Entra Agent ID GA, Agent 365 as registry;
+policy is subtractive allow/block per environment — no nameable bundle).
+**Google** curates at the *agent* grain (Gemini Enterprise Agent Gallery
+with request-and-approve). **OpenAI** has a cross-product Connector Registry
++ Codex `requirements.toml` — registry and policy as separate systems, no
+bundling of credential/egress/budget. Arcade.dev is the closest independent
+(OAuth custody + MCP gateway) with no org-tree inheritance or budget
+primitive. **Toolkits + Roster on a real org tree, with kernel-enforced
+egress and orchestrator-enforced budgets, is unoccupied ground** — and our
+inheritance semantics, custody pattern, and admission machinery all exist.
+
+## 13. Herding — CI scheduling wisdom applied to agent fleets
+
+"Easily herd agents" decomposes into eyes (the Docket, §7) and **hands** —
+and the hands are a transplant of what a CI scheduler already knows:
+
+- **Mandate admission:** concurrency groups for agents ("≤1 active Mandate
+  per repo per goal-class"), priority lanes, fairness across teams — the
+  ADR-0011/0032 machinery at Mandate grain.
+- **Supersede-on-new-commit:** a push to the branch a Turn is fixing
+  supersedes that Turn — ADR-0056's vocabulary applied to agent work; no
+  other platform can even express this.
+- **Hierarchical budget pools:** org → team → Mandate ceilings ("agents org-
+  wide: $500/day"), enforced at admission, visible in the Docket.
+- **Fleet policies:** declarative rules — auto-pause any Mandate touching
+  protected paths; require human confirm past N turns; quiet hours.
+- **Identity-first alignment:** Microsoft's Entra Agent ID validates the
+  instinct — agents need first-class identities. Ours exist by construction:
+  the Mandate's service principal + the per-Run fence, RBAC-scoped, audited.
+
+## 14. If a step is just a container running a LangGraph crew — what do we add?
+
+The one-pager answer. The crew brings the brain; everything that makes it
+*employable rather than merely runnable* is ours, and each row below is a
+verified market gap or an architectural default nobody else has:
+
+| The crew cannot give itself… | Scarab/Orion provides | Status elsewhere |
+|---|---|---|
+| write-serialized parallelism | Attempt-owned Workspaces, merges only at joins | the field's hard-won *convention*; our *construction* |
+| an unbypassable budget | metering proxy + Mandate ledger on the fence identity | **verified open gap** — gateways enforce per-key; no orchestrator enforces per-run |
+| capabilities it didn't configure | Toolkits + Roster, inherited, audited | **verified open gap** — closest (Claude Tag bundles) is Slack-scoped, budget-less |
+| knowledge of where it is | the Briefing (§11) | agents start blind everywhere |
+| a judge it can't sweet-talk | CI as blackbox verifier; done-conditions over external evidence | verification = *the* validated pattern (Cognition/Anthropic '26) |
+| proof of what it did | kernel-attested changesets, per-tool-call audit, evidence-linked transcript | `git diff` inside the sandbox being audited |
+| survival | durable Runs/Turns/Mandates, fork-from-turn | checkpoint-replay requires determinism (Hatchet); we don't |
+| a manager | the Docket + Mandate admission + fleet policies (§13) | dashboards without hands |
+
+One line: **LangGraph decides what to do next; Scarab decides what it is
+allowed to do, pays for it, proves what happened, and survives everything in
+between.**
+
+## 15. Open product questions
 
 1. **Docket direction** — A (inbox-first) vs B (panes grid) vs A-with-B-toggle.
 2. **Notifications** — is the Docket enough, or does WAITING·YOU page you in
@@ -378,3 +527,14 @@ real Mandates show turn latency as the binding pain.
 5. **Naming residue** — the crate/binary: `scarab-orion` (workspace
    convention) vs bare `orion` (product-forward). Cosmetic, decide at scaffold
    time.
+6. **Briefing scope** — does repo intel in the Briefing ever cross repos
+   ("this failure cluster hit 14 repos")? Cross-repo context is valuable and
+   is also an information-disclosure surface; needs an explicit scoping rule
+   (default: same-project only, org-wide behind a grant).
+7. **Toolkit authorship** — operator-config only (gitops, like
+   PlacementProfile) or also an org-settings UI (like ADR-0060 connections)?
+   The Claude Tag comparison argues for the UI; the house pattern argues for
+   gitops. Probably both, UI writing through to the same store.
+8. **Roster curation flow** — who approves an image onto the Roster, and is
+   that approval itself an Environment protection rule or a new org-settings
+   surface?
