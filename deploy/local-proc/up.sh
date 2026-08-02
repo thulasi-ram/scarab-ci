@@ -55,6 +55,13 @@ else
   docker compose -f "$here/compose.yaml" up -d
 fi
 
+# NFS on kind, for whoever wires ADR-0062 stage 2b here (probed 2026-08-02):
+# the default kindest/node image ALREADY ships /sbin/mount.nfs, mount.nfs4 and
+# rpc.statd — no install, no custom node image, no kind.yaml change. The catch is
+# that there is no systemd in a node container to RUN rpc.statd, so a mount that
+# defaults to v3 dies with "rpc.statd is not running" while `-o vers=4` (and an
+# unqualified mount, which negotiates 4.2) both work. Any PV must therefore pin
+# `mountOptions: [nfsvers=4.2]`, or `nolock` if it must stay on v3.
 echo "==> creating kind cluster '$cluster' (kubeconfig: $kubeconfig)"
 if ! kind get clusters 2>/dev/null | grep -qx "$cluster"; then
   kind create cluster --name "$cluster" --config "$here/kind.yaml" --kubeconfig "$kubeconfig"

@@ -271,6 +271,29 @@ workspace:
     # is NOT implemented yet, so until it is, watch the
     # `scarab_workspace_warm_used_bytes` gauge: this number is the whole budget.
     size: 20Gi
+    # ⚠ THIS KEY SILENTLY SELECTS THE SNAPSHOT FARM'S RUNG (ADR-0062). Giving a
+    # Workspace Snapshot tree shape is one local operation per file ON THIS
+    # VOLUME: a copy-on-write clone (`FICLONE`) where the filesystem can do one,
+    # else a full `std::fs::copy` of every byte. The Farm decides that
+    # EMPIRICALLY per target — it clones a probe file, it does NOT switch on the
+    # filesystem's name — and ANY ioctl refusal falls back per file, so a
+    # part-cloned build is a modelled outcome (`FarmRung::Mixed`), not a bug. A
+    # wrong storageClass is therefore never *incorrect*; it is silently SLOW,
+    # and the only place it surfaces is `rung=` on the build's `ws-timing` line.
+    #   ext4        no reflink, ever — the copy rung, always.
+    #   xfs         clones ONLY if the filesystem was made with `reflink=1`.
+    #               Most CSI drivers expose no mkfs options, so you get whatever
+    #               that node image's `mkfs.xfs` defaults to. Verify rather than
+    #               assume: `xfs_info <dataDir> | grep reflink` in the workspace
+    #               pod.
+    #   btrfs/ZFS   clone in principle (ZFS only with OpenZFS block cloning
+    #               enabled — off by default in 2.2 after a corruption bug, on
+    #               from 2.3).
+    # Do NOT point this at network storage. An NFS-backed class is the actively
+    # harmful choice for THIS volume: no reflink, AND overlayfs does not support
+    # an `upperdir` on NFS — while the Export rung probe asks only about
+    # CAP_SYS_ADMIN, so the overlay rung is still chosen and then `mount(2)`
+    # fails outright. The Depot's warm volume wants local disk.
     storageClass: ""       # "" = the cluster default
   resources:
     requests:

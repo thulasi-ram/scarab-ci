@@ -96,6 +96,29 @@ cp deploy/local-helm/.env.example deploy/local-helm/.env
 ```
 Context **must** be `colima` (deploy.sh refuses otherwise — never target EKS).
 
+### NFS in the colima VM — a prerequisite of ADR-0062 stage **2b** only
+
+Nothing in this stack needs an NFS client today. It becomes a prerequisite only for the
+**NFS-delivered Workspace Export** (ADR-0062 stage 2b); the stage-2a `LocalPath` delivery
+hands a co-located Step the Depot's overlay through a `local` PV with no network in it.
+
+Probed 2026-08-02: the colima VM is Ubuntu 24.04.4 / kernel 6.8.0-117 / k3s v1.35.0+k3s1
+and ships **no `mount.nfs`**, though the `nfs`/`nfsv4`/`nfsd` modules are on disk. One
+command fixes it, and an NFS-backed PVC then mounts and round-trips on this cluster in
+about six seconds:
+
+```sh
+colima ssh -- sudo apt-get update
+colima ssh -- sudo apt-get install -y nfs-common   # mount.nfs 2.6.4 from ports.ubuntu.com
+```
+
+It survives `colima stop`/`start` and is **lost on `colima delete`**. There is no colima
+provision hook in this repo, so this is a documented step rather than an automated one —
+and the failure it prevents is silent-ish: kubelet reports *"you might need a
+`/sbin/mount.nfs` helper program"* and the Pod sits in `ContainerCreating` **forever**.
+`csi-driver-nfs` is the alternative for nodes where a package cannot be installed; see
+ADR-0062's amended "no DaemonSet" note, including its `fsGroupPolicy` trap.
+
 ## GitHub App configuration (REQUIRED — both gaps fail *silently*)
 The webhook URL + secret are not enough. Two App settings must be right or the
 loop half-works with **no error anywhere**:

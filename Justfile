@@ -84,6 +84,18 @@ workspace-status port="8081":
 #   just local-helm             # pull + deploy the latest ghcr `edge`
 #   just local-helm sha-abc123  # pull + deploy a specific published SHA
 #   just local-helm local       # build server+clone+sidecar+wsfetch locally, then deploy
+#
+# NFS prerequisite (ADR-0062 stage 2b ONLY — probed 2026-08-02):
+#   Nothing here needs an NFS client today, and nothing in stage 2a will: the
+#   `LocalPath` delivery hands a co-located Step the Depot's overlay through a
+#   `local` PV, no network. Only the NFS-delivered Export (2b) needs a client on
+#   each Step node, and the colima VM ships without one:
+#       colima ssh -- sudo apt-get update && colima ssh -- sudo apt-get install -y nfs-common
+#   Installed once, it survives `colima stop`/`start` and is lost on `colima
+#   delete`. Without it kubelet fails with "you might need a /sbin/mount.nfs
+#   helper program" and the Pod hangs in ContainerCreating FOREVER — no event
+#   worth reading, no timeout. Any PV we create must also pin
+#   `mountOptions: [nfsvers=4.2]` (see the kind note in deploy/local-proc/up.sh).
 
 # Deploy the Helm dogfood stack on colima; pulls ghcr by default, `local` builds.
 local-helm ref="edge":

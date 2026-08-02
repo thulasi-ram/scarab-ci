@@ -25,6 +25,26 @@ something present on every node, outliving every Run, that a platform team must 
 and trust. It is not a blanket prohibition on privilege, and it is not a prohibition on touching
 a node a Step Pod is already running on.
 
+> **Amended 2026-08-02 — the rule is the rationale, and stating it as "no DaemonSet" hid an
+> option.** The sentence above is the constraint; *"Scarab installs and versions"* is what makes
+> it one. A DaemonSet an **operator** chooses, installs and upgrades on its own schedule is
+> outside it for the same reason a lazy snapshotter is (the third row of the table below) — it is
+> someone else's node change. The concrete consequence: **`csi-driver-nfs` is a live alternative
+> to `nfs-utils` as the per-node prerequisite of part 2**, not something this rule excludes. Its
+> node plugin ships its own NFS client and mounts in the host mount namespace, so it makes the
+> delivery path work on nodes whose image has no `mount.nfs` at all (Bottlerocket, hardened AMIs
+> — exactly the population red-team #1 names as the risk). The choice an operator faces is
+> therefore **"a node package Scarab cannot install" vs "an upstream chart Scarab does not
+> version"**, and this ADR deliberately does not make it for them.
+>
+> **The trap, recorded so whoever picks it up does not discover it in a benchmark.**
+> `csi-driver-nfs` declares a real `fsGroupPolicy`, which invites kubelet to **recursively chown
+> the whole mount** on Pod start — walking every inherited path and thereby destroying exactly the
+> laziness the Export exists to buy (and defeating the caching argument below). Using it requires
+> `fsGroupChangePolicy: OnRootMismatch`, or no `fsGroup` at all. This is the same fact as red-team
+> #4 seen from the other side: the in-tree NFS plugin's `Managed: false` is *why* fsGroup does not
+> apply there, and a CSI driver that manages it is not a free upgrade.
+
 0061 did not test part 2 against this, because it asserted the problem away:
 
 > …it is the only mechanism that does — intercepting reads requires a privileged mount, which an
@@ -91,6 +111,20 @@ live mountpoint that fails every operation. This is designed for below, not disc
 | inline `nfs:` volume | allowed | **denied** — restricted volume types |
 | **`persistentVolumeClaim`** | **allowed** | **allowed** |
 | `image:` volume | allowed | allowed |
+| `hostPath` | **denied** | **denied** |
+| inline `csi:` volume | allowed | **allowed** |
+| generic `ephemeral` (inline PVC template) | allowed | **allowed** |
+
+> **Amended 2026-08-02 — three rows the first version of this table did not have, and one of them
+> changes what part 2's delivery may be.** `restricted`'s volume-type allow-list is exactly
+> `configMap, csi, downwardAPI, emptyDir, ephemeral, persistentVolumeClaim, projected, secret`.
+> So **`csi:` and generic `ephemeral` are PSA-legal at `restricted` too** — the table as written
+> implied a PVC was the only legal envelope for an exotic volume, and it is not; it is one of
+> three. That matters because it is what makes `csi-driver-nfs` (amendment above) and an inline
+> per-Step ephemeral volume claim reachable without weakening the posture. And **`hostPath` is
+> denied at `baseline`**, not merely at `restricted` — it is one of `baseline`'s own prohibitions,
+> which is why the `LocalPath` delivery below reaches a production cluster as a `local` PV and
+> only ever as `hostPath` in dev.
 
 Two things follow. `baseline` — not `restricted` — is the level orgs actually set as a cluster
 default, because `restricted` breaks too much; so the population that cannot run a privileged
@@ -194,6 +228,41 @@ there is nothing to copy back. Reads fault over the network only for what the St
 — which is the laziness part 2 of 0061 wanted, obtained from kubelet instead of from a driver.
 Delivery **as a PVC rather than an inline `nfs:` volume is load-bearing**, not stylistic: the table
 above shows inline `nfs:` is denied at `restricted` and the PVC is not.
+
+**The PV must pin `mountOptions: [nfsvers=4.2]`, and that is a correctness requirement rather than
+a tuning choice** (probed 2026-08-02 on this machine). A kind node — `kindest/node`, which
+`just up` runs Steps on — ships `/sbin/mount.nfs`, `mount.nfs4` and `rpc.statd`, but has no
+`systemd` to *run* `rpc.statd`, so a mount that defaults to **v3** fails with *"rpc.statd is not
+running"*. `-o vers=4` and an unqualified mount that negotiates 4.2 both succeed. An unpinned PV
+therefore works or does not depending on what the client's default happens to be on that node —
+the substrate idiosyncrasy the governing principle exists to keep off an author's desk. (`nolock`
+is the alternative for a deployment that must stay on v3; the pin is the default.)
+
+> **Amended 2026-08-02 — delivery is a seam with three arms, and NFS is only one of them.**
+> Part 2 above reads as if "the Export" and "NFS" were the same decision. They are not, and
+> separating them is what makes the *correctness* half testable before the *transport* half
+> exists. Export prepare returns a **`Delivery`**, and the executor's single flagged
+> volume-kind line (`crates/scarab-executor-k8s/src/lib.rs`, the "THE one line that chooses the
+> volume kind" comment) is its one consumer:
+>
+> - **`Eager`** — today's `emptyDir` plus the `scarab-wsfetch` copy. Unchanged, and the fallback
+>   the ladder already names.
+> - **`LocalPath`** — the Depot's overlay `merged/` made visible in the **host** mount namespace
+>   (the Depot's data mount carries `CAP_SYS_ADMIN` and `Bidirectional` propagation) and handed to
+>   a **co-located** Step as a `local` PV — PSA-legal at `restricted`, unlike `hostPath`, which the
+>   amended table above shows is denied at `baseline`. No network, no NFS, no server. The Step is
+>   pinned to the Depot's node by affinity, which is precisely why **this is a dev/single-node
+>   posture and not the production default**: it caps a Run's throughput at one node and it writes
+>   a placement constraint onto every Step, which is the fight with [0055](0055-placement-profiles.md)
+>   part 4 already refuses to pick.
+> - **`Nfs`** — part 2 as written, once there is a server.
+>
+> A deployment that asks for a delivery its topology cannot serve **refuses at launch**, in the
+> same fail-closed shape the cutover knob already required — never a silent fall back to `Eager`.
+>
+> `LocalPath` cannot exist in **proc mode**: the Depot there is a darwin host process and darwin
+> has no `overlayfs`. It is a `just local-helm` capability only, and any recipe or test that
+> claims otherwise is claiming something the substrate cannot do.
 
 **The Export mount carries `redirect_dir=on`, and that is a correctness requirement rather than a
 tuning choice.** Without it, `rename(2)` of a directory that exists only in the lower layer returns
@@ -477,7 +546,9 @@ per Step is the same order of object churn.
 
 - **The service becomes a network filesystem server.** `nfs-ganesha` in userspace is the trodden
   path. It is a real new dependency implementing a protocol with decades of edge cases, and it is
-  the largest single risk in this ADR.
+  the largest single risk in this ADR. **It is also the part 2a does not need** (see the delivery
+  seam), and as of 2026-08-02 it is verifiable on this dev machine rather than on a box we do not
+  have.
 - **A privileged workspace-service Pod is the preferred configuration.** Per the ladder this is
   degradable, so it is not an install prerequisite — which is the material difference from 0061's
   node driver, and the reason this design satisfies the constraint at all.
@@ -563,6 +634,13 @@ per Step is the same order of object churn.
   the link on first write ourselves — and rejected because it means writing the CoW semantics the
   kernel already has, in the write path of every Step, in exchange for a capability an
   operator-installed StatefulSet can reasonably hold.
+
+  > **Amended 2026-08-02 — read the scope of this rejection before citing it against 2b.** What is
+  > rejected here is **implementing copy-on-write in userspace**, which is a property of the
+  > *hardlink-farm-without-`overlayfs`* shape. It says nothing about a userspace NFS server sitting
+  > **above an already-mounted overlay**: there the kernel is still doing the CoW and the server is
+  > a protocol adapter over an ordinary directory. So "we rejected a custom NFS server" is not an
+  > argument against 2b's linked-in-server option, only against making one do the union.
 - **OCI `image` volumes as the transport.** PSA-clean at `restricted` (measured), node-cached,
   parallel and runtime-managed, and it becomes lazy for free the day a platform team adopts a lazy
   snapshotter — a node change Scarab neither installs nor versions, which is the cleanest possible
@@ -605,6 +683,33 @@ what the design must do. Each is filed.
    stated as one — it is present on most distributions and its absence on minimal images
    (Bottlerocket, hardened AMIs) is a real risk. It also means the s9 spike cannot run on `just up`
    or `local-helm` until the colima VM gets `nfs-common`.
+
+   > **Amended 2026-08-02 — the prerequisite is confirmed, but the last sentence was wrong and the
+   > gate it gates is now MET.** "The dev substrate cannot mount an Export, so verification needs a
+   > separate privileged Linux box" was recorded here and in the stage-2 table yesterday, and it
+   > survived one day. Probed on this machine:
+   >
+   > - The colima VM is **Ubuntu 24.04.4, kernel 6.8.0-117-generic, k3s v1.35.0+k3s1**,
+   >   aarch64/`vz`/virtiofs. `mount.nfs` was indeed **absent** — but `nfs`, `nfsv4` and `nfsd` are
+   >   all **on disk** and `modprobe` cleanly, and `apt-get install -y nfs-common` pulls
+   >   `mount.nfs 2.6.4` from `ports.ubuntu.com`. One command, no custom image, no separate host.
+   >   It is installed now; it survives `colima stop`/`start` and is lost on `colima delete`.
+   > - **The delivery path then mounted, on colima k3s.** A PV with an `nfs:` source (server = the
+   >   node's own INTERNAL-IP, `192.168.5.1`) + PVC + consumer Pod went `Running` → `Succeeded` in
+   >   **~6 s**, mounted `vers=3`, and the Pod **read and wrote through it**. kubelet did the mount,
+   >   exactly as part 2 claims.
+   > - **kind needs nothing at all.** The default `kindest/node` (v1.36.1, what
+   >   `deploy/local-proc/kind.yaml` creates) already ships `/sbin/mount.nfs`, `mount.nfs4` and
+   >   `rpc.statd` — no install, no custom node image, no `kind.yaml` change. The one catch is the
+   >   `nfsvers=4.2` pin recorded in part 2: v3 fails there for want of a running `rpc.statd`.
+   >
+   > **So this finding's own gate — "a Step Pod on `just up` / `just local-helm` mounts an
+   > NFS-backed PVC and reads a file through it" — is met for `local-helm` and one cluster-create
+   > away for proc/kind.** What remains true, and is the whole of what this finding should ever
+   > have claimed: an NFS-sourced PV needs an NFS client on every Step node, `nfs-common` is not
+   > in the colima image by default, and **there is no colima provisioning hook in this repo** — so
+   > it must be either a documented prerequisite with a fail-fast check or a recipe that installs
+   > it. (Nothing about the *2a* `LocalPath` delivery needs any of this; see part 2.)
 2. **Evicting a Farm under a live Export is silent corruption — CONFIRMED, and worse than "must not
    happen".** With lower entries deleted while the overlay was mounted, `ls` of the merged directory
    returned **empty** while `cat` of already-cached paths still returned content, and a write into the
@@ -668,16 +773,49 @@ what the design must do. Each is filed.
 
 Stage 1 (the in-Pod drain, 0061 s3-drain) is live. Stage 2 — a Step Pod mounting a Workspace
 Export instead of an eager copy — is **not**, and the remaining work is enumerable rather than
-vague. Each row names what it is blocked on, the gate that proves it, and its size:
+vague. Each row names what it is blocked on, the gate that proves it, and its size.
+
+> **Rewritten 2026-08-02, because the sequencing was wrong.** The first version of this table
+> ordered the work behind an NFS server and then behind a machine to run it on, on the strength of
+> the "cannot be verified here" claim the red-team-#1 amendment above retracts. Both premises are
+> gone, and with them the reason to do the two halves together. **Split stage 2 at the delivery
+> seam**: the *correctness* of the Export — the overlay rung executing, a real kernel-produced
+> upper reaching `read_change_set`, `redirect_dir`/`EXDEV` through a live mount — has nothing to do
+> with NFS, and waiting on a transport to test it is what kept the exact path unexecuted (the most
+> important caveat on this ADR, below). 2a buys that today on `local-helm`. 2b is then a transport
+> change against a path already known to be correct.
+
+**2a — the delivery seam and a co-located, NFS-free path.** No server, no NFS client, no new
+protocol. This is what unblocks the correctness half.
 
 | work | blocked on | gate (what proves it) | size |
 |---|---|---|---|
-| **NFS-Ganesha spike** — userspace export of the overlay merged view, the ladder rung that needs no kernel `nfsd` on the Depot | a privileged Linux host with a Rust toolchain (the same tier problem as `0ad393c`) | ops/sec under latency for a `cargo`-shaped write load, with the harness failing LOUDLY on any silent rung fallback | spike, days |
-| **colima NFS client** — the dev substrate cannot mount an Export at all today (red-team #1: no `mount.nfs` in the VM, Pod hangs in `ContainerCreating` forever) | nothing but VM provisioning (`nfs-common` in the colima image / provision script) | a Step Pod on `just up` / `just local-helm` mounts an NFS-backed PVC and reads a file through it | small |
-| **PV/PVC lifecycle** — per-Step PV+PVC create → bind → reap, and Export/Farm reaping behind it (eviction under a live Export is silent corruption, red-team #2) | git-bug `24476bc` (Farm/Export reaping — on the critical path, not beside it) | churn stays cheap at Run scale AND no orphaned PV/PVC/Export survives Run teardown; a reaped Farm under a live Export is refused, not corrupted | medium |
+| **The `Delivery` seam** — `Delivery::{Eager, LocalPath, Nfs}` returned by Export prepare, with the one flagged volume-kind line in `crates/scarab-executor-k8s/src/lib.rs` as its only consumer | nothing | a deployment asking for a delivery its topology cannot serve **refuses at launch** (proc mode asking for `LocalPath` is the test case), never silently feeding `Eager` | small |
+| **`LocalPath` delivery** — the Depot's overlay `merged/` published into the host mount namespace (`CAP_SYS_ADMIN` + `Bidirectional` on its data mount) and handed to a node-pinned Step as a `local` PV (`hostPath` dev-only — denied at `baseline`, per the amended PSA table) | the seam row | on `just local-helm`: a Step Pod writes `/workspace` through a REAL overlay and the Depot reads the change set out of the upper | medium — **`local-helm` only**, the darwin Depot in proc mode has no `overlayfs` |
+| **`0ad393c` — the exact-path overlay test** — `read_change_set` has never met a kernel-produced upper; every green test covers the copy rung's approximation | the `LocalPath` row, which *is* the place to run it — not a separate privileged host | whiteouts, opaque dirs, file renames, and absolute+relative `redirect` resolution asserted against a REAL upper produced by a REAL Step | the tier, and 2a supplies it |
+| **Export/Farm lifecycle and reaping** — the per-Step volume objects and the Farm underneath them (eviction under a live Export is silent corruption, red-team #2) | git-bug `24476bc` (on the critical path, not beside it) | no orphaned volume object, Export or Farm survives Run teardown; a reaped Farm under a live Export is refused, not corrupted | medium |
+| **eager\|lazy cutover config** — the volume-kind line becomes a per-deployment posture | the rows above | an explicit knob, fail-closed; `eager_fetch_total` goes to zero and stays there on a lazy deployment | small, once the substrate is proven |
+
+**Node pinning is what makes 2a a dev/single-node posture rather than the production default**, and
+it must not be allowed to look like a shipping answer: it caps a Run at one node's throughput and
+writes a placement constraint onto every Step, which fights [0055](0055-placement-profiles.md) in
+precisely the way part 4 refuses to. 2a is a **test and dogfood** delivery that happens to be real.
+
+**2b — the transport.** Everything only a network filesystem can answer, now **locally verifiable**
+(red-team #1 amendment: colima mounts NFS, kind's node image already can).
+
+| work | blocked on | gate (what proves it) | size |
+|---|---|---|---|
+| **A userspace NFSv4 server** — `nfs-ganesha`, or a linked-in server, exporting the overlay merged view; the rung that needs no kernel `nfsd` on the Depot | 2a (export something already known correct) | a Step Pod mounts the export and round-trips a file, with the harness failing LOUDLY on any silent rung fallback | spike, days |
+| **`Delivery::Nfs`** — the PV, its `mountOptions: [nfsvers=4.2]` pin, and per-Step bind/reap churn | the server row | churn stays cheap at Run scale; the mount is asserted to be NFS at the version pinned, not merely "a mount" | medium |
+| **`nfs-common` on Step nodes** — confirmed per-node prerequisite; not in the colima image, and this repo has **no colima provisioning hook** | a choice: document it with a fail-fast preflight, install it from a recipe, or take `csi-driver-nfs` (see the DaemonSet amendment, and its `fsGroupPolicy` trap) | `just local-helm` either mounts an Export or fails naming the missing package — never `ContainerCreating` forever | small |
 | **fsGroup over NFS** — kubelet applies no fsGroup to NFS volumes (`Managed: false`, red-team #4), so a non-root Step may be unable to write its own Workspace | a decision: per-Step uid squash on the export vs group-writable modes stamped at Farm build (each changes what s7 fidelity means for modes) | a non-root Step under the ADR-0039 restricted baseline writes an Export-backed `/workspace` | medium, and a potential part-2 blocker |
-| **`0ad393c` — the exact-path overlay test** — `read_change_set` has never run against a kernel-produced upper; every green test covers the copy rung's approximation | a place to run it: privileged Linux runner (dogfood node has no Rust, GHA quota-blocked, darwin cannot mount overlayfs) | whiteouts, opaque dirs, file renames, and absolute+relative `redirect` resolution asserted against a REAL upper layer | the tier, not the code |
-| **eager\|lazy cutover config** — the one `build_pod` line that chooses the workspace volume kind (`emptyDir` today, PVC under an Export) becomes a per-deployment posture | every row above | an explicit config knob, fail-closed (a deployment that asks for lazy without the substrate refuses at launch, never silently feeds eager); `eager_fetch_total` goes to zero and stays there on a lazy deployment | small, once the substrate is proven |
+| **The fence over AUTH_SYS** — `resvport`, NetworkPolicy, uid squashing (red-team #5: a userspace client needs no kubelet and can assert any uid; first-mount pinning pins the *node*) | the server row | a co-tenant Pod on the same node cannot read another Step's Export, demonstrated rather than argued — or the "capability" claim is honestly downgraded | medium |
+| **Revocation, `ESTALE` and the restart grace window** (red-team #6: 90-second grace, `nfsdcld`) | the server row | revoking under a live client, and restarting the server with live Exports, both produce a **named** Attempt failure rather than a mystery I/O error | medium |
+| **Ops/sec under latency** for a `cargo`-shaped write load against a real in-cluster Export | everything above | the one unpriced number in the design; it decides whether part 5 is an accelerator or a requirement | spike |
+
+None of the 2b rows can be answered by 2a, and that is the reason 2b exists rather than being
+folded away: they are all properties of a network protocol, and `LocalPath` has no network.
 
 - **The exact path has never executed, and every green test exercises the approximate one.** This is
   the most important caveat on this ADR's status and it is easy to miss, because the code is written,
@@ -690,6 +828,15 @@ vague. Each row names what it is blocked on, the gate that proves it, and its si
   every passing test covers. A reader should treat "the change set is exact" as *designed and
   unverified*, not as *working*. Tracked as the tier problem rather than as a bug in any one slice
   (git-bug `0ad393c`), because the missing thing is a place to run it.
+
+  > **Amended 2026-08-02: the status is unchanged, the diagnosis is not.** The exact path still has
+  > never executed. But "nothing in this repo's loop has a privileged Linux host with a Rust
+  > toolchain" is the wrong reason — the Rust toolchain is not needed *on* the host, and
+  > `just local-helm` already runs the Depot as an in-cluster StatefulSet on a Linux node with a
+  > real ext4 disk. 2a's `LocalPath` delivery makes a Step write through that overlay with no NFS
+  > anywhere, which is where `read_change_set` finally meets a kernel-produced upper and where
+  > `redirect_dir`/`EXDEV` runs through a live mount. The blocker was never the tier; it was having
+  > filed this behind a transport. That is what the resequenced stage-2 table above fixes.
 
 - **Operations-per-second under latency, measured, for a `cargo`-shaped write workload against a
   real in-cluster Export.** This is the one unpriced number in the design and it is the number that
