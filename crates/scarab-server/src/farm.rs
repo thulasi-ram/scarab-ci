@@ -1158,69 +1158,29 @@ pub fn supports_reflink(dir: &Path) -> std::io::Result<bool> {
 /// errno. Classifying `EOPNOTSUPP`/`EXDEV`/`EINVAL`/… here would add a way to be
 /// wrong (an unlisted errno turning fatal) and no way to be more right.
 ///
-/// **The syscall is declared inline** because it is not in `std` and this slice may
-/// not add a `libc` dependency to the crate. It lives in the C library `std` is
-/// already linked against, so nothing new is linked.
-#[cfg(target_os = "linux")]
-fn reflink(src: &Path, dst: &Path) -> bool {
-    use std::ffi::{c_int, c_ulong};
-    use std::os::fd::AsRawFd;
-
-    // `FICLONE` == `_IOW(0x94, 9, int)`: dir=1<<30 | size=4<<16 | type=0x94<<8 | nr=9.
-    const FICLONE: c_ulong = 0x4004_9409;
-    unsafe extern "C" {
-        // Declared variadic exactly as the C prototype is: calling a variadic
-        // function through a fixed-arity declaration is not the same ABI
-        // everywhere.
-        fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
-    }
-
-    let Ok(source) = File::open(src) else {
-        return false;
-    };
-    // `create_new`: a clone target must not exist, and a Farm's staging tree is
-    // fresh, so an existing name here would mean something is very wrong.
-    let Ok(target) = File::options().write(true).create_new(true).open(dst) else {
-        return false;
-    };
-    // SAFETY: two open file descriptors we own, and the ioctl `FICLONE` defines for
-    // them. Returns 0 on success and -1 on any refusal.
-    let rc = unsafe { ioctl(target.as_raw_fd(), FICLONE, source.as_raw_fd()) };
-    if rc == 0 {
-        return true;
-    }
-    // Leave no zero-length file for the copy fallback to trip over.
-    drop(target);
-    let _ = std::fs::remove_file(dst);
-    false
-}
-
-/// `clonefile(2)` — APFS. `flags = 0` clones the source's metadata too, which is one
-/// reason `place_file` always sets mode and mtime explicitly afterwards.
+/// The clone itself is [`reflink_copy::reflink`]: `FICLONE` on Linux, `clonefile(2)`
+/// on macOS/APFS, and an `Unsupported` error on every other platform — which this
+/// wrapper flattens to `false`, so the non-cloning platforms need no arm of their
+/// own. The two syscalls used to be declared inline here, because at the time this
+/// crate had no `libc` dependency to reach them through; the crate is a maintained
+/// home for exactly those two declarations and changes nothing about the contract
+/// above.
 ///
-/// Declared inline for the same reason as the Linux arm above.
-#[cfg(target_os = "macos")]
+/// Two properties of that crate this code depends on, both of which the hand-rolled
+/// version also had:
+///
+/// * a failed clone leaves **no** `dst` behind — the Linux arm opens the target
+///   `create_new` and removes it unless the ioctl succeeds, and `clonefile` does not
+///   create one — so the copy fallback never finds a zero-length file in its way;
+/// * a successful clone carries the *source's* mode across (macOS because
+///   `clonefile` copies metadata, Linux because the crate restores it explicitly).
+///   That is one reason `place_file` always sets mode and mtime afterwards
+///   rather than only when it copied. Ownership is the one thing it does *not*
+///   carry — the crate passes `CLONE_NOOWNERCOPY` — which is a distinction
+///   without a difference here: the CAS blob and the Farm entry are both written
+///   by this process on its own warm volume.
 fn reflink(src: &Path, dst: &Path) -> bool {
-    use std::ffi::{c_char, c_int, CString};
-
-    unsafe extern "C" {
-        fn clonefile(src: *const c_char, dst: *const c_char, flags: c_int) -> c_int;
-    }
-
-    let (Ok(from), Ok(to)) = (
-        CString::new(src.as_os_str().as_bytes()),
-        CString::new(dst.as_os_str().as_bytes()),
-    ) else {
-        return false;
-    };
-    // SAFETY: two NUL-terminated paths that outlive the call, and a flags value the
-    // man page defines. Returns 0 on success and -1 on any refusal.
-    unsafe { clonefile(from.as_ptr(), to.as_ptr(), 0) == 0 }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn reflink(_src: &Path, _dst: &Path) -> bool {
-    false
+    reflink_copy::reflink(src, dst).is_ok()
 }
 
 #[cfg(test)]

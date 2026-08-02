@@ -99,6 +99,13 @@ base64 = "0.22"
 jsonwebtoken = "9"
 tar = "0.4"
 tempfile = "3"
+# Reflink/CoW copy for the Snapshot Farm. Replaces hand-declared FICLONE +
+# clonefile FFI; covers Linux, APFS (the dev loop) and Windows ReFS.
+# NOT the `reflink` crate — that one has been abandoned since 2019.
+reflink-copy = "0.1"
+# l*xattr, for reading the overlay's trusted.* markers. Linux-only at the
+# call site; the crate itself is unconditional here.
+xattr = "1"
 rsa = { version = "0.9", features = ["pem"] }
 kube = { version = "4", default-features = false, features = ["client", "ws", "rustls-tls"] }
 k8s-openapi = { version = "0.28", features = ["latest"] }

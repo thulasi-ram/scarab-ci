@@ -1002,11 +1002,19 @@ fn rdev_of(meta: &std::fs::Metadata) -> u64 {
 // ---------------------------------------------------------------------------
 // Linux: the capability check and the xattr reads.
 //
-// `getxattr`/`listxattr` are not in `std`, and this module deliberately does not
-// add a dependency for them: two declarations against libc — which `std` already
-// links — are less surface than a crate, and this workspace argues each infra
-// dependency one by one (see the header of the root Cargo.toml). The `l`-prefixed
-// forms are used throughout, so a symlink is never followed.
+// The capability check below is hand-rolled and stays that way — it reads a
+// field out of `/proc/self/status`, which is a file, not a syscall, and no crate
+// can make that shorter.
+//
+// The two xattr reads go through the `xattr` crate, which is the maintained home
+// for the `listxattr`/`getxattr` declarations this module used to carry inline.
+// Two things this code needs from it, both of which its docs and its source
+// pin: the non-`_deref` entry points are the `l`-prefixed syscalls, so a symlink
+// is never followed; and a name is passed through verbatim rather than scoped to
+// a namespace, which is what makes `trusted.overlay.*` — the whole subject of
+// this module, and the namespace that needs CAP_SYS_ADMIN — readable at all.
+// What the crate does NOT decide is `EOPNOTSUPP`; the two wrappers argue that
+// case themselves, below.
 // ---------------------------------------------------------------------------
 
 /// `CAP_SYS_ADMIN`'s bit position in a capability mask (`linux/capability.h`).
@@ -1082,34 +1090,16 @@ fn read_overlay_xattrs(_path: &Path) -> std::io::Result<Vec<OverlayXattr>> {
     ))
 }
 
+/// `EOPNOTSUPP` — this filesystem has no extended attributes at all.
+///
+/// Spelled as the raw errno rather than matched against
+/// `std::io::ErrorKind::Unsupported`: the errno-to-`ErrorKind` mapping is `std`
+/// implementation detail, not contract, and this is the branch that decides
+/// whether a whiteout can go unseen. The `xattr` crate folds `ENODATA` into
+/// `None` for us but deliberately leaves this one as an error, so it stays
+/// spelled out here.
 #[cfg(target_os = "linux")]
-mod sys {
-    use std::ffi::{c_char, c_void};
-
-    // `unsafe extern`, matching `farm.rs`: the block is what is unsafe to declare
-    // (nothing checks that these signatures match libc's), and saying so is
-    // warning-free on this crate's edition 2021 and required by edition 2024.
-    unsafe extern "C" {
-        pub fn llistxattr(path: *const c_char, list: *mut c_char, size: usize) -> isize;
-        pub fn lgetxattr(
-            path: *const c_char,
-            name: *const c_char,
-            value: *mut c_void,
-            size: usize,
-        ) -> isize;
-    }
-
-    pub const ERANGE: i32 = 34;
-    pub const ENODATA: i32 = 61;
-    pub const EOPNOTSUPP: i32 = 95;
-}
-
-#[cfg(target_os = "linux")]
-fn c_path(path: &Path) -> std::io::Result<std::ffi::CString> {
-    use std::os::unix::ffi::OsStrExt;
-    std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-}
+const EOPNOTSUPP: i32 = 95;
 
 /// Every xattr name on `path`, symlinks not followed.
 ///
@@ -1119,92 +1109,43 @@ fn c_path(path: &Path) -> std::io::Result<std::ffi::CString> {
 /// code has never heard of, instead of never asking about it.
 #[cfg(target_os = "linux")]
 fn list_xattr_names(path: &Path) -> std::io::Result<Vec<String>> {
-    let c = c_path(path)?;
-    loop {
-        let needed = unsafe { sys::llistxattr(c.as_ptr(), std::ptr::null_mut(), 0) };
-        if needed < 0 {
-            let err = std::io::Error::last_os_error();
-            // A filesystem with no xattr support at all can hold no overlay
-            // marker, so there is nothing to miss. (It also cannot *be* an
-            // `overlayfs` upper — the kernel rejects an upper that cannot store
-            // `trusted.*` — so this is not a route to losing a whiteout.)
-            if err.raw_os_error() == Some(sys::EOPNOTSUPP) {
-                return Ok(Vec::new());
-            }
-            return Err(err);
-        }
-        if needed == 0 {
-            return Ok(Vec::new());
-        }
-        let mut buf = vec![0u8; needed as usize];
-        let got = unsafe {
-            sys::llistxattr(
-                c.as_ptr(),
-                buf.as_mut_ptr() as *mut std::ffi::c_char,
-                buf.len(),
-            )
-        };
-        if got < 0 {
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                // The list grew between the sizing call and this one: ask again.
-                Some(sys::ERANGE) => continue,
-                Some(sys::EOPNOTSUPP) => return Ok(Vec::new()),
-                _ => return Err(err),
-            }
-        }
-        buf.truncate(got as usize);
-        return Ok(buf
-            .split(|b| *b == 0)
-            .filter(|n| !n.is_empty())
-            // Overlay marker names are ASCII; a lossy conversion can only mangle
-            // a name from some other namespace, which is ignored anyway.
-            .map(|n| String::from_utf8_lossy(n).into_owned())
-            .collect());
-    }
+    let names = match xattr::list(path) {
+        Ok(names) => names,
+        // A filesystem with no xattr support at all can hold no overlay
+        // marker, so there is nothing to miss. (It also cannot *be* an
+        // `overlayfs` upper — the kernel rejects an upper that cannot store
+        // `trusted.*` — so this is not a route to losing a whiteout.)
+        Err(e) if e.raw_os_error() == Some(EOPNOTSUPP) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(names
+        .filter(|name| !name.is_empty())
+        // Overlay marker names are ASCII; a lossy conversion can only mangle
+        // a name from some other namespace, which is ignored anyway.
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect())
 }
 
 /// The value of one xattr, or `None` if it is not set. Symlinks not followed.
 #[cfg(target_os = "linux")]
 fn get_xattr(path: &Path, name: &str) -> std::io::Result<Option<String>> {
-    let c = c_path(path)?;
-    let c_name = std::ffi::CString::new(name)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    loop {
-        let needed =
-            unsafe { sys::lgetxattr(c.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
-        if needed < 0 {
-            let err = std::io::Error::last_os_error();
-            return match err.raw_os_error() {
-                Some(sys::ENODATA) | Some(sys::EOPNOTSUPP) => Ok(None),
-                _ => Err(err),
-            };
-        }
-        let mut buf = vec![0u8; needed as usize];
-        let got = unsafe {
-            sys::lgetxattr(
-                c.as_ptr(),
-                c_name.as_ptr(),
-                buf.as_mut_ptr() as *mut std::ffi::c_void,
-                buf.len(),
-            )
-        };
-        if got < 0 {
-            let err = std::io::Error::last_os_error();
-            match err.raw_os_error() {
-                Some(sys::ERANGE) => continue,
-                Some(sys::ENODATA) | Some(sys::EOPNOTSUPP) => return Ok(None),
-                _ => return Err(err),
-            }
-        }
-        buf.truncate(got as usize);
+    // `xattr::get` already reports "the attribute is not set" (`ENODATA`) as
+    // `Ok(None)`. `EOPNOTSUPP` means the same thing to this caller — an entry on
+    // a filesystem that cannot hold the attribute does not have it — and is
+    // folded in for the reason `list_xattr_names` sets out.
+    let value = match xattr::get(path, name) {
+        Ok(value) => value,
+        Err(e) if e.raw_os_error() == Some(EOPNOTSUPP) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(value.map(|mut buf| {
         // Overlay values are a one-byte flag or a path; a trailing NUL is part of
         // neither.
         while buf.last() == Some(&0) {
             buf.pop();
         }
-        return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
-    }
+        String::from_utf8_lossy(&buf).into_owned()
+    }))
 }
 
 #[cfg(test)]
