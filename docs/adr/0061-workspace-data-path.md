@@ -223,6 +223,30 @@ Two tiers, two policies, so eviction can never break a promise:
 >   Exports, the log namespace, and Cache — so a tier table row named after one tenant no longer
 >   describes it.
 
+> **Amended 2026-08-03 by [0066](0066-the-depot-is-a-cache.md) — the LRU deferral is superseded, and
+> the warm row's eviction policy changes shape.** This table's *"evict least-recently-used"* was
+> written as an eventual nicety and deferred in implementation (the s5 space bound this ADR's own
+> "GC deletes from cold and leaves warm" bullet calls *"the only thing that will ever reclaim it"*).
+> **It is now the gating gap**, for two reasons this ADR could not see:
+>
+> - **Warm-only makes it load-bearing.** With no cold tier there is no second copy, so what warm
+>   evicts is what a rerun loses — a bounded *recent window* rather than a latency event. An
+>   unbounded, unswept warm tier in that mode is not a cache with a soft edge; it is a volume that
+>   fills and then fails writes.
+> - **Nothing sweeps warm today, at all.** 0066 traced the chain: warm-only skips the cold flush →
+>   cold stays empty → [0050](0050-retention-and-gc.md)'s sweeper only deletes **unmarked cold
+>   objects** → it deletes nothing, ever. The GC reports success and reclaims zero bytes.
+>
+> **And plain LRU is not the mechanism.** 0066 replaces it with a layered policy: evict **unreachable**
+> content first (point the existing mark walk at warm — no new machinery), then, *only where a cold
+> tier exists*, evict reachable-but-cold-backed content by recency; and in warm-only over the mark,
+> **refuse writes loudly** rather than evict. Recency is the part deferred, and deliberately: for
+> immutable content `list_objects` gives least-recently-**written**, which is meaningless, so true LRU
+> needs an access index that is only worth building if reachability-first proves insufficient. The
+> budget stays a **size watermark**, never a TTL — space is the bound an operator controls and the one
+> already instrumented. The warm space budget itself lands as a
+> [0065](0065-retention-cache-and-rederivation.md) `RetentionProfile` knob.
+
 Plus a manual **pin** ("keep this Run's workspaces") for investigations, and **graceful
 degradation**: expired inputs widen a rerun's scope and say so, rather than failing. Rerun
 affordances must state which they are — "Rerun this step" vs "Inputs expired — this re-runs
@@ -260,6 +284,30 @@ from *clone*" — per [0027](0027-restart-semantics.md)'s rule that smart never 
   bounded by space, evicts, and "promises none" — so a design that relied on it to prevent data
   loss would have rebuilt the same bug with a bigger disk. The service's volume is a cache, and
   a cache that survives a Pod roll is a latency win, not a durability one.
+
+  > **Amended 2026-08-03 by [0066](0066-the-depot-is-a-cache.md) — this sentence was right, and it
+  > was violated twice before anyone noticed it was an invariant.** *"The service's volume is a
+  > cache"* is stated here as an observation in a bullet about a different bug. Two later changes
+  > contradicted it: **`e58ce1f`** put **drain records** and **write ledgers** on the Depot — state
+  > that exists on exactly one replica's disk and that a later request needs in order to succeed —
+  > and **warm-only** ([0064](0064-durability-tiering-and-the-write-path.md) part 4) made the warm
+  > tier the only copy of a Workspace Snapshot. Both made the Depot a **system of record** for
+  > something.
+  >
+  > 0066 **promotes the sentence to the governing invariant** — *anything that makes the Depot a
+  > system of record is a defect* — and repairs both violations rather than blessing them. The drain
+  > record stays replica-local but its **absence becomes transient rather than `FatalConfig`**, so a
+  > lost replica costs a re-drive instead of a permanently red build; the re-drive is idempotent by
+  > construction (the drain reads a frozen `/workspace`, re-`PUT`s every tree unconditionally, and
+  > `/have` reports everything missing on a fresh replica). Warm-only is not a violation once it is
+  > read correctly: it does not make the Depot the system of record, it means there **is** no system
+  > of record for workspaces in that deployment — disclosed per Attempt via
+  > `attempts.output_durability`.
+  >
+  > The payoff for holding the invariant is why it is worth the repair: **HA becomes "run more
+  > replicas"** (replicas hold nothing unique), **eviction is safe by construction**, and **spot
+  > preemption costs a cold cache**. The accepted cost, documented rather than apologised for: **HA
+  > requires object storage.**
 - **Cross-AZ traffic is confined to the archive drain**, which can be throttled or scheduled.
   Step Pods talk only to their own zone's service. (In-region object storage is typically
   free per byte; EC2-to-EC2 across AZs is not. The cost was never "object storage" — it was

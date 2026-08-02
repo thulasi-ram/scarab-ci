@@ -4,6 +4,46 @@
 - **Date:** 2026-07-28
 - **Deciders:** thulasi.ram (architect)
 
+> **Amended 2026-08-03 by [0066](0066-the-depot-is-a-cache.md) — the lazy feed is CANCELLED on
+> measurement, and the machinery built for it is being deleted. Read this before reading anything
+> below.** This ADR's entire purpose is to deliver **laziness** — a Step transferring what it reads
+> rather than what it inherits — without a node driver. git-bug `4ce7f2c` measured the leg laziness
+> was buying, on the real `workspaced::router` over the real `WorkspaceClient`, and the premise
+> inverted:
+>
+> | leg | per file | at 50k files |
+> |---|---|---|
+> | feed (`Cas::materialize` — the exact call `scarab-wsfetch` makes) | **0.54 ms** | **~27 s** |
+> | cold drain | **2.68 ms** | **~134 s** |
+>
+> The feed is ~**10× cheaper** than [0061](0061-workspace-data-path.md) s0 measured, and **the drain
+> is now 5× the feed** — so the leg this ADR optimises is the *smaller* one. Worse for the case:
+> of the feed's 1076 ms (2000 files), only **434 ms is blob GETs**; **55% is local filesystem
+> writes**, which a lazy mount pays anyway on first read. Laziness could at best defer a minority
+> share of an already-cheap leg, in exchange for a privileged mount, a per-node prerequisite and an
+> NFS server. **The eager `scarab-wsfetch` init container stays.**
+>
+> **Being deleted** (0066 point 10): `crates/scarab-server/src/export.rs`, `farm.rs`, and the Export
+> half of `settle.rs` — ~10k lines with no control-plane or executor caller. Dormant is not free: the
+> live `/v1/exports*` routes are attack surface (any fence token could `DELETE` another fence's
+> Export until they were Browse-gated), every refactor pays to keep it compiling, and it invites
+> someone to wire it up without reading why it was shelved.
+>
+> **Three carve-outs.** (a) The **fence-residue sweep** is extracted from `sweep_exports_once`
+> **first** — the ledger and drain-record TTLs live inside it and are load-bearing. (b)
+> **`changeset.rs` and its test tier stay**: it is the only code anywhere that reads an `overlayfs`
+> upper layer, it was finally executed 2026-08-02, and it is exactly what a revived laziness effort
+> would want. (c) The **reflink primitive** (`reflink-copy`) stays — a future local cache wants it.
+>
+> **What survives of this ADR: the substrate facts** — the measured kernel/PSA/overlayfs/NFS
+> findings, including `20e8786`'s ganesha semantics — **and the change-set tier.** They are why the
+> revival path is a known quantity rather than a fresh investigation.
+>
+> **The named revival candidate is JuiceFS plus its CSI driver — not a rebuild of the ganesha path.**
+> Triggers, so this is not re-litigated on taste: a read-fraction measurement showing Steps touch a
+> small share of their workspace, or workspaces growing until 27 s matters. It needs the privileged
+> CSI DaemonSet this ADR already priced out, so the cost is known.
+
 ## Context
 
 [0061](0061-workspace-data-path.md) decided a four-part workspace data path. Part 2 was **a

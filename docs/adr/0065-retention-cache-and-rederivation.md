@@ -68,6 +68,34 @@ it as keyed and author-declared.
 machinery. A Step that touches 5% of `node_modules` materialises 5% of it. Cache differs from a
 Workspace Snapshot only in its **retention semantics**, not in its storage or its transport.
 
+> **Amended 2026-08-03 by [0066](0066-the-depot-is-a-cache.md) — the statement STANDS; the rationale
+> and the dependency do not.** A Cache remains a **content-addressed tree**, and that split is the
+> right one for the reason git demonstrates: **git's object model is content-addressed and packfiles
+> are a storage detail.** How bytes are laid out in a bucket says nothing about the logical model, so
+> 0066's packing work (its point 7, deferred to its own ADR) applies **underneath** this decision
+> without touching it.
+>
+> Two things in the paragraph above are now wrong:
+>
+> - **The justification.** *"A Step that touches 5% of `node_modules` materialises 5% of it"* is
+>   **laziness**, which 0066 **cancels** on measurement (git-bug `4ce7f2c`: the feed is 0.54 ms/file
+>   and 55% of it is local filesystem writes a lazy mount pays anyway). **Restate the rationale as
+>   blob-granular dedup** — two Runs with an unchanged lockfile share every blob of the cached tree,
+>   at file grain, with no key negotiation at all. That is a *better* justification than the one it
+>   replaces, and unlike it, it is still true.
+> - **The dependency.** The **Snapshot Farm and Workspace Export machinery** is being **deleted**
+>   (0066 point 10, with three carve-outs). A Cache rides the **CAS and the eager feed**, like
+>   everything else. Point 3's argument against shared mutable cache mounts is unaffected — it turns
+>   on **concurrency**, not on materialisation cost — but its closing sentence, *"laziness gives
+>   mount-like performance with none of the concurrency hazard"*, must be reread as the eager feed's
+>   0.54 ms/file, which is the number that actually answers the "copying a 1 GB tree is brutal"
+>   objection.
+>
+> **And point 8 gains a specific job.** The `RetentionProfile`'s **warm space budget** is exactly the
+> knob 0066 point 4's layered warm eviction needs: a **size watermark**, never a TTL, because space is
+> the bound an operator controls and the one already instrumented. 0066 also records that **nothing
+> sweeps warm today at all**, so that knob has no effect until its arm of the sweeper exists.
+
 **3. A keyed directory cache, not a shared mutable cache mount.** BuildKit-style
 `--mount=type=cache` was considered and rejected on **concurrency**, not cost: a shared mutable
 directory means two concurrent Runs both writing `~/.cargo/registry` or `node_modules`, which is

@@ -40,6 +40,35 @@ depending on an unstated prerequisite.
 The control plane ships chunks to the Depot; the Depot owns them. Object storage stops being a
 prerequisite for logs existing.
 
+> **Amended 2026-08-03 by [0066](0066-the-depot-is-a-cache.md) — the Depot may be where log bytes
+> *pass through*, never where they are *durable*.** This part says the Depot "owns them", and 0066's
+> governing invariant is that **the Depot is definitionally a cache** — anything that makes it a
+> system of record is a defect. Logs on a replica's volume are precisely that.
+>
+> **And the argument is HA, not merely the absence of object storage.** [0066](0066-the-depot-is-a-cache.md)
+> point 3 makes fence affinity a correctness requirement at N > 1: the control plane pins a Run to one
+> Depot replica and reads that choice back off the Pod spec. **That mechanism cannot help logs**, because
+> **log reads outlive the writing replica** — someone opens the Runs UI a week later, long after the Pod
+> that wrote the chunks was rescheduled, and there is no Pod spec left to read a replica choice from.
+> Workspace content is read inside the Run that produced it; logs are read forever. Affinity is the
+> wrong shape for a lifetime that long.
+>
+> **So: logs stream to the Depot's disk as a BUFFER, and land in shared storage.** The object store when
+> one is configured; **compressed blobs in Postgres when not** — see the amendment on
+> [0013](0013-history-and-observability.md), which is where the size cap, the time-partitioned table and
+> the TOAST hazard are recorded. Postgres is chosen because it is **already mandatory**, and because logs
+> are the **only** class with no recompute path while workspaces are reproducible from the forge:
+> **guarantee what cannot be recreated; degrade what can.** Part 8's pin against eviction is what makes
+> the buffer safe — an unshipped chunk is not evictable — and it is now unconditional rather than
+> conditional on a sink existing, because there is always a sink.
+>
+> **Parts 5 and 6 stand, unchanged, and 0066 reuses both verbatim.** Part 5's *absence is authoritative*
+> rule is the mechanism 0066 relies on for every warm miss, and part 6's **volume-identity marker** is
+> named there as the strictly-better future form of the drain record's absence signal (0066 point 2) —
+> deferred, not rejected. Note also git-bug `974440b`: the log write path **swallows errors in every
+> deployment**, not just warm-only, so a chunk that never reaches the buffer is silent today. That is a
+> live defect against part 5's whole premise, and it must be fixed with this move rather than after it.
+
 **2. Not in the CAS.** Logs are keyed `{run, step, attempt}` plus a chunk sequence — a separate
 namespace on the same volume. Content addressing buys nothing for an append-only stream: chunks are
 unique so there is no dedup to win, hashing every chunk costs something for nothing, and an ordered

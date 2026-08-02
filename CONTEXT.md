@@ -123,6 +123,7 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 | **Event log** | Append-only, versioned, immutable record of state transitions. Drives SSE, timeline, audit, time-travel. State tables are the source of truth; the event log is derived-but-durable (via the outbox). |
 | **Admission** | *Scarab's* scheduling decision — which Runs/Steps are allowed to run (concurrency groups, fairness, priority, backpressure). Distinct from k8s **Placement** (node fit). |
 | **Fence** | A monotonic `{run, step, attempt}` token handed to each Attempt and to cooperating external systems (idempotency keys, digest/generation checks) to neutralize the double-effect hazard. |
+| **Provisioning deadline** | The bound on how long an Attempt may spend **getting ready to run** — scheduling, image pull, workspace feed — as opposed to **running** (ADR-0066). A **separate clock** from the Step's authored `timeout:`, which measures execution only, from the moment the step container starts. The principle: **waiting for infrastructure must not bill the Step's execution budget** — before the split, queueing delay ate the author's timeout and a Step that never ran could fail as `Timeout`. Overrunning it is its own **failure class**, never `Timeout`, so the two causes are distinguishable in the record. Distinct again from the **Run budget**, which is a wall-clock spend limit over a whole Run and is not split. |
 
 ### 4.4 Structural / architectural
 
@@ -132,7 +133,8 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 | **Adapter** | A concrete implementation of a Port, in a **separate vendor crate** (`scarab-forge-github`, `scarab-db-postgres`, …), holding all infra deps. |
 | **IR** | The typed, versioned **Pipeline Intermediate Representation** — the *real* DSL. YAML is one frontend; the API schema *is* the IR. |
 | **Forge** | The domain *concept* of a source-of-repos/sink-of-status (GitHub, GitLab, Forgejo). Vendors are **adapters**, never their own domain. |
-| **Data Depot** | The long-lived Scarab-operated service that holds the data plane **near where Steps run**: the warm CAS, **Snapshot Farms**, live **Workspace Exports**, the **Step log** namespace, and **Cache** (ADR-0061, 0062, 0063, 0065). Same binary as the control plane, different role (`--role depot`) and **no durable core** — it never connects to Postgres. Was "the workspace service" until 2026-07-28; renamed because that named it after *one of its tenants* and broke as soon as a second kind of data arrived. `warm store` was rejected for naming it after one of its *properties*, which encodes a tiering decision and dates the same way. **Not** a **Workspace**, a **Workspace Snapshot** or a **Workspace Export** — those are data it holds, and they keep their names. |
+| **Data Depot** | The long-lived Scarab-operated service that holds the data plane **near where Steps run**: the warm CAS, **Snapshot Farms**, live **Workspace Exports**, the **Step log** namespace, and **Cache** (ADR-0061, 0062, 0063, 0065). Same binary as the control plane, different role (`--role depot`) and **no durable core** — it never connects to Postgres. Was "the workspace service" until 2026-07-28; renamed because that named it after *one of its tenants* and broke as soon as a second kind of data arrived. `warm store` was rejected for naming it after one of its *properties*, which encodes a tiering decision and dates the same way. **Not** a **Workspace**, a **Workspace Snapshot** or a **Workspace Export** — those are data it holds, and they keep their names. **Definitionally a cache** (ADR-0066): it holds nothing that cannot be recreated, which is what makes running more replicas a sufficient HA story, eviction safe by construction, and a lost replica a latency event. Anything that makes it a system of record is a defect. |
+| **Warm-only** | The named deployment mode in which **no independent cold tier is configured** (ADR-0064's `st_dev` test) — object storage is a **soft, recommended** requirement, not a hard one (ADR-0066). Supported, with a **smaller, true** guarantee rather than a silent downgrade: the **Data Depot** offers a bounded *recent window*, every Attempt is stamped `warm-only` in `attempts.output_durability`, and warm eviction is genuine loss rather than a latency event. It does **not** mean the Depot becomes the system of record — it means there **is** no system of record for **Workspace Snapshots** in that deployment, which is disclosable because they are reproducible from the forge. **Step logs** are the exception, having no recompute path: they fall back to compressed, size-capped bodies in Postgres (ADR-0013 amendment). Depot **HA requires object storage** — a documented consequence, not a gap. |
 
 ### 4.5 Tenancy & forge binding
 
@@ -266,6 +268,9 @@ scarab-cli         generated-from-OpenAPI CLI
 4. **Pure domain crates import no infra.** If `scarab-engine`'s `Cargo.toml` ever lists
    `sqlx`/`kube`/`reqwest`, that is a bug.
 5. **The UI eats the same API as everyone else.** No private UI backchannel.
+6. **The Data Depot is a cache.** Nothing on its volume may be irreplaceable; anything that
+   makes it a system of record is a defect (ADR-0066). Guarantee what cannot be recreated,
+   degrade what can.
 
 ---
 
