@@ -486,6 +486,74 @@ overlay-tests dir="/var/tmp/scarab-overlay":
     run=(env SCARAB_TEST_OVERLAY=1 SCARAB_TEST_OVERLAY_DIR="$dir" "$bin" --ignored --nocapture --test-threads=1)
     if [ "$(id -u)" = 0 ]; then "${run[@]}"; else sudo "${run[@]}"; fi
 
+# The same tier, ACTUALLY EXECUTED, from a darwin laptop (ADR-0062 s2a-1).
+#
+# `just overlay-tests` refuses on darwin — correctly, and that refusal is exactly
+# why the overlay tier had never run ANYWHERE: the claims in `changeset.rs` about
+# what a kernel puts in an upper directory were only ever checked by unit tests
+# that build the upper themselves. The nearest kernel that can settle them is
+# already on this laptop: the colima VM (Ubuntu 24.04, 6.8.0-117-generic, ext4)
+# that `just adr0062-substrate` pins. This runs the real test binary there.
+#
+# Docker, not kubernetes. The tier needs three things — Linux, CAP_SYS_ADMIN, and
+# an upperdir on a real disk filesystem — and a `--privileged` container on the
+# colima node has all three (verified: mount -t overlay, redirect_dir=on, and
+# `trusted.overlay.*` reads all work). A Pod would add a namespace, a PSA
+# exemption and a cleanup obligation next to the operator's live dogfood stack
+# for no additional proof.
+#
+# Cargo runs INSIDE the VM because this host has no aarch64-linux cross
+# toolchain (no zig, no cross, no musl-cross), and installing one to avoid a
+# container is a bigger, less reproducible dependency than the container.
+# The VM has 2 vCPU, so the FIRST run is a cold ~40min workspace build; the
+# registry and target dir live in named volumes, so a rerun is seconds. The
+# container is memory-capped so a rustc that overreaches is killed instead of
+# the dogfood stack sharing the VM.
+#
+# Reset the caches with:
+#   docker volume rm scarab-overlay-cargo scarab-overlay-target scarab-overlay-scratch
+overlay-tests-colima image="rust:1-bookworm":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # This recipe runs containers on the machine that also hosts the operator's
+    # dogfood stack, and production EKS contexts sit next to the local one. Both
+    # handles must point at colima or we stop — even though only docker is used,
+    # a kube context that is not colima means this shell is aimed somewhere else.
+    dctx=$(docker context show)
+    if [ "$dctx" != "colima" ]; then
+      echo "REFUSING: docker context is '$dctx', not 'colima'." >&2
+      echo "This recipe runs a --privileged container; it will only do that on the local VM." >&2
+      exit 2
+    fi
+    if command -v kubectl >/dev/null 2>&1; then
+      kctx=$(kubectl config current-context 2>/dev/null || echo none)
+      if [ "$kctx" != "colima" ]; then
+        echo "REFUSING: kube context is '$kctx', not 'colima'." >&2
+        exit 2
+      fi
+    fi
+    # Named volumes: /var/lib/docker is ext4 on the VM, so /scratch is a legal
+    # overlayfs upperdir — the container ROOTFS is not (it is overlayfs itself,
+    # and overlay-on-overlay is refused), which is the whole reason for this mount.
+    for v in scarab-overlay-cargo scarab-overlay-target scarab-overlay-scratch; do
+      docker volume create "$v" >/dev/null
+    done
+    echo "==> node: $(colima ssh -- uname -r 2>/dev/null || echo '?'), image {{image}}, repo mounted read-only"
+    docker run --rm --privileged \
+      --memory=2g --memory-swap=2g \
+      -v "$PWD:/repo:ro" \
+      -v scarab-overlay-cargo:/cargo \
+      -v scarab-overlay-target:/target \
+      -v scarab-overlay-scratch:/scratch \
+      -w /repo \
+      -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR=/target \
+      -e CARGO_BUILD_JOBS=2 -e CARGO_INCREMENTAL=0 \
+      -e CARGO_PROFILE_DEV_DEBUG=0 -e CARGO_PROFILE_TEST_DEBUG=0 \
+      -e SCARAB_TEST_OVERLAY=1 -e SCARAB_TEST_OVERLAY_DIR=/scratch/upper \
+      {{image}} \
+      sh -c 'mkdir -p /scratch/upper && cargo test --locked -p scarab-server \
+        --test changeset_overlay -- --ignored --nocapture --test-threads=1'
+
 # Reclaim build-cache disk. Cargo NEVER garbage-collects `target/`: every
 # fingerprint change (branch switch, dep bump, feature flag) writes a new
 # artifact and keeps the old one forever. This checkout reached 100 GB — 610k
