@@ -466,6 +466,50 @@ tier**.
 reason to exist — the artifact `ObjectStore` is control-plane-side with its own credentials, so the
 framing machinery survives *for artifacts only*. Deleting Export does not touch it.
 
+### 11. The address format stays **algorithm-taggable**, and BLAKE3 is the tagged-in candidate.
+
+Cancelling laziness raises a fair question: should we adopt BLAKE3 *now*, so that verified streaming
+(`bao`) is available if laziness ever returns, rather than re-addressing the whole store later? The
+answer is no, but the reasoning matters more than the verdict, because the instinct behind the
+question — do not paint yourself into a corner on an irreversible choice — is right.
+
+**We use SHA-256** (`sha2`, declared in the pure-domain allow-block precisely because hashing is a
+pure function; see [0029](0029-workspace-cas.md) and [0031](0031-crate-boundaries.md)). BLAKE3 appears
+nowhere in the workspace.
+
+Three reasons not to adopt it now:
+
+- **Verified streaming is not what laziness needs.** `bao` verifies a *byte range of one object*
+  without fetching the whole object. Our laziness shape is per-**file**: a lazy read fetches a whole
+  blob, and any hash verifies a whole blob. Range verification earns its keep when you read 4 KB of a
+  2 GB object; CI workspaces are millions of small files. Even under packing (point 7) you fetch a
+  range of a pack, extract the blob, and verify it by its own address — SHA-256 does that.
+- **Adopting it collides with the next quarter of work.** Re-addressing every object breaks a frozen
+  canonical form guarded by a cross-binary skew tripwire (the Depot re-canonicalises every tree `PUT`
+  and `400`s on a byte difference), and the durability gate, the write ledger and the drain record all
+  rest on the current addressing.
+- **Storing both hashes is worse than either.** It doubles hashing cost and gives one object two
+  names — the "one address, two canonicalisations" hazard eliminated on 2026-08-01.
+
+**What we do instead, at zero cost: fix the escape hatch now.** Addresses are bare hex today
+(`blobs/<hash>`). This ADR records that **bare hex means SHA-256, and any future digest gets its own
+tag** (`blake3:<hex>`, or its own prefix namespace). Content-addressed stores routinely carry more
+than one algorithm this way — OCI does, Git's SHA-256 transition does. That makes a later adoption
+**additive**: new objects get tagged addresses, existing objects keep working, and nothing is
+rewritten. An irreversible decision becomes a reversible one for the price of a paragraph.
+
+**Two triggers that would justify tagging BLAKE3 in.** Either alone is sufficient; neither is
+speculative:
+
+1. **Hashing shows up as a measured cost.** This stands on its own merits, independent of laziness —
+   BLAKE3 runs at roughly 5–10 GB/s against SHA-256's 1–2, and `feed_cost.rs` already notes that debug
+   builds inflate the SHA-256 legs. It is not dominant in release for small files. If large artifacts
+   become common, remeasure before assuming.
+2. **Packing adopts partial pack verification.** The one genuine `bao` use case that could arise here
+   is verifying a partial pack read without extracting. That belongs in the packing ADR's own
+   evaluation (`a0c28aa`) — recorded there so whoever writes it *decides* rather than inheriting
+   SHA-256 by default.
+
 ## Alternatives considered
 
 - **Make the Depot a replicated system of record** (Raft over the drain records and write ledgers, or
