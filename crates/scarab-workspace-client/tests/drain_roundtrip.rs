@@ -16,6 +16,8 @@ use scarab_storage::TreeHash;
 use scarab_storage_s3::S3Storage;
 use scarab_workspace_client::{DrainRecord, MemoCas, WorkspaceClient};
 
+mod common;
+
 const SECRET: &[u8] = b"drain-acceptance-secret";
 
 /// The real router on a real port, with a layer that counts **exact tree
@@ -30,10 +32,31 @@ struct Harness {
     warm: tempfile::TempDir,
     #[allow(dead_code)]
     cold: tempfile::TempDir,
+    /// The fence rows' pool — kept so [`Harness::replica`] can start a second
+    /// router over the SAME database (the replicaCount > 1 shape).
+    pool: sqlx::PgPool,
+    /// `None` on a replica: the database belongs to the harness that
+    /// provisioned it, and one `Drop` must not tear it down under the other.
+    #[allow(dead_code)]
+    pg: Option<common::TestPg>,
 }
 
 impl Harness {
-    async fn start() -> Self {
+    async fn start() -> Option<Self> {
+        let pg = common::TestPg::provision().await?;
+        let pool = pg.pool.clone();
+        Some(Self::start_over(pool, Some(pg)).await)
+    }
+
+    /// A SECOND Depot replica: its own warm volume (a fresh tempdir), the same
+    /// database. This is `replicaCount > 1` at this suite's grain — what
+    /// ADR-0067 part 2 exists for: the drain record and the write ledger must
+    /// be readable through EITHER replica, while warm bytes stay per-replica.
+    async fn replica(&self) -> Self {
+        Self::start_over(self.pool.clone(), None).await
+    }
+
+    async fn start_over(pool: sqlx::PgPool, pg: Option<common::TestPg>) -> Self {
         let warm = tempfile::tempdir().expect("warm tempdir");
         let cold = tempfile::tempdir().expect("cold tempdir");
         let cold_store = Arc::new(S3Storage::local(cold.path()).expect("cold store"));
@@ -42,6 +65,7 @@ impl Harness {
             cold_store,
             SECRET.to_vec(),
             scarab_server::workspaced::DurabilityTier::SeparateVolume,
+            pool.clone(),
         )
         .expect("router");
 
@@ -82,6 +106,8 @@ impl Harness {
             tree_puts,
             warm,
             cold,
+            pool,
+            pg,
         }
     }
 
@@ -143,7 +169,7 @@ fn build_workspace(root: &std::path::Path) {
 /// equality is the only place the two constructions meet.
 #[tokio::test]
 async fn the_helper_prune_root_equals_the_control_plane_prune_root() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
     let declared = vec!["src/deep".to_string(), "plain.txt".to_string()];
@@ -195,7 +221,7 @@ async fn the_helper_prune_root_equals_the_control_plane_prune_root() {
 /// 403 against a fence token that has no ledger read grant yet.
 #[tokio::test]
 async fn the_seeded_memo_serves_the_prune_walk_with_zero_http_tree_gets() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
     let declared = vec!["src".to_string()];
@@ -254,7 +280,7 @@ async fn the_seeded_memo_serves_the_prune_walk_with_zero_http_tree_gets() {
 /// works, not against a router that never dedups.
 #[tokio::test]
 async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
     let path = ws.path().to_str().unwrap();
@@ -304,7 +330,7 @@ async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
 /// persisted. The equality at the bottom is byte-for-byte the posted struct.
 #[tokio::test]
 async fn a_drain_record_round_trips_ingest_prune_record_get() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
     let declared = vec!["src".to_string()];
@@ -374,7 +400,7 @@ async fn a_drain_record_round_trips_ingest_prune_record_get() {
 /// never be read" loop-to-dead-letter this addressing exists to prevent.
 #[tokio::test]
 async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
 
@@ -408,4 +434,123 @@ async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
         .expect("get the drain record by fence key")
         .expect("the record must be addressable despite the `/` in the step id");
     assert_eq!(got, rec, "the Depot must hand back exactly what was posted");
+}
+
+/// ADR-0067 part 2 at this suite's grain: `replicaCount > 1`. The fence rows —
+/// the drain record and the write ledger — live in the control plane's
+/// Postgres, so a drain served entirely by replica A must be *visible* through
+/// replica B: the record GET answers through either, and the ledger arm of
+/// tree authorization holds on a replica that never saw the PUT.
+///
+/// Warm bytes stay per-replica on purpose (this slice moves the RECORD halves,
+/// not the bodies), which is what the 404-vs-403 contrast at the bottom pins:
+/// through B the owning fence is *authorized but the bytes are elsewhere*
+/// (404), while a foreign fence is *refused* (403). Before ADR-0067 part 2
+/// both were 403 — B's ledger file was empty — so the contrast is exactly the
+/// row-sharing this slice exists for.
+///
+/// Mutation killed: the ledger or the record quietly moving back onto a
+/// replica-local file (either read path re-rooted under `warm_dir`): the
+/// record GET through B answers `None` and the owning fence's tree GET
+/// through B collapses to 403, both asserted against.
+#[tokio::test]
+async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
+    let Some(a) = Harness::start().await else { return };
+    let b = a.replica().await;
+
+    // The whole drain happens against replica A: tree/blob PUTs (bodies land
+    // in A's warm; ledger rows land in the shared database) and the record
+    // POST (closure validation reads A's warm — the bytes are there).
+    let ws = tempfile::tempdir().unwrap();
+    build_workspace(ws.path());
+    let helper = a.fence_client();
+    let report = helper
+        .drain_ingest_report(ws.path().to_str().unwrap())
+        .await
+        .expect("drain ingest against replica A");
+    let root = report.snapshot.root.0.clone();
+    let rec = DrainRecord {
+        root: root.clone(),
+        pruned_root: None,
+        identity: None,
+        files: report.files,
+        tree_bytes: report.tree_bytes,
+        blobs_uploaded: report.blobs_uploaded,
+        bytes_uploaded: report.bytes_uploaded,
+        have_hits: report.have_hits,
+        ingest_ms: 5,
+        prune_ms: 1,
+        error: None,
+    };
+    helper
+        .post_drain_record(&rec)
+        .await
+        .expect("post the drain record through replica A");
+
+    // The control plane lands on replica B (an arbitrary ClusterIP backend)
+    // and must read the record all the same.
+    let got = b
+        .browse_client()
+        .drain_record("run-1", "build", "a1")
+        .await
+        .expect("get the drain record through replica B")
+        .expect("the record must exist through EITHER replica — it is a row, not a file");
+    assert_eq!(got, rec, "replica B must hand back exactly what A persisted");
+
+    // The write ledger crosses replicas too: on B, the owning fence's
+    // single-tree GET is AUTHORIZED by the shared ledger row — B's tiers just
+    // do not hold the bytes (404) — while a foreign fence stays refused (403).
+    let http = reqwest::Client::new();
+    let owner = http
+        .get(format!("{}/v1/cas/trees/{root}", b.base))
+        .header(
+            "x-scarab-workspace-token",
+            workspace_token::mint(
+                SECRET,
+                &workspace_token::step_claims(
+                    Fence {
+                        run: "run-1".into(),
+                        step: "build".into(),
+                        attempt: "a1".into(),
+                    },
+                    far_future(),
+                    Vec::new(),
+                ),
+            ),
+        )
+        .send()
+        .await
+        .expect("owning-fence tree GET via replica B");
+    assert_eq!(
+        owner.status(),
+        404,
+        "the owning fence must be AUTHORIZED on replica B (the ledger is a shared row); \
+         404 = bytes live on A's warm volume, which this slice deliberately leaves per-replica"
+    );
+    let foreign = http
+        .get(format!("{}/v1/cas/trees/{root}", b.base))
+        .header(
+            "x-scarab-workspace-token",
+            workspace_token::mint(
+                SECRET,
+                &workspace_token::step_claims(
+                    Fence {
+                        run: "run-1".into(),
+                        step: "build".into(),
+                        attempt: "a9".into(),
+                    },
+                    far_future(),
+                    Vec::new(),
+                ),
+            ),
+        )
+        .send()
+        .await
+        .expect("foreign-fence tree GET via replica B");
+    assert_eq!(
+        foreign.status(),
+        403,
+        "a fence that never wrote the tree must stay refused — the shared ledger \
+         must not become a cross-fence read grant"
+    );
 }

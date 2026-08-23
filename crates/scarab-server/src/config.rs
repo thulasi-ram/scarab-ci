@@ -13,7 +13,7 @@
 //! |------|-------|---------|
 //! | `SCARAB_ROLE` | CLI `--role` | which slice(s) this process runs |
 //! | `SCARAB_ADDR` | CLI `--addr` | bind address |
-//! | `SCARAB_DATABASE_URL` | CLI `--database-url` | Postgres URL — **mandatory** for every role that touches the durable core; the ADR-0061 `workspace` data-plane role is the one carve-out |
+//! | `SCARAB_DATABASE_URL` | CLI `--database-url` | Postgres URL — **mandatory for every role**, the `workspace` data plane included (ADR-0067 part 2: it connects for derived rows, never migrates) |
 //! | `SCARAB_OBJECT_DIR` | CLI `--object-dir` | local object-store directory (dev) |
 //! | `SCARAB_NAMESPACE` | CLI `--namespace` | k8s namespace for step Pods |
 //! | `SCARAB_EXECUTOR` | CLI `--executor` | `k8s` (prod) or `local` (dev/CLI) |
@@ -94,18 +94,20 @@ impl Role {
         matches!(self, Role::Converged | Role::Scheduler | Role::Executor)
     }
 
-    /// Roles that touch the durable core.
+    /// Roles that **own** the durable core: the migration path, the secrets
+    /// store, the KEK.
     ///
-    /// The workspace service (ADR-0061) is a **data-plane** component: it holds
-    /// no state Postgres owns, it decrypts nothing, and it must keep serving
-    /// **through** a Postgres outage — a Step reading its inputs does not care
-    /// that the control plane is briefly blind. Requiring a database URL there
-    /// would be a false dependency, and running `migrate()` from N per-failure-
-    /// domain replicas would be actively dangerous.
+    /// The workspace service (ADR-0061) is a **data-plane** component: it
+    /// decrypts nothing, and running `migrate()` from N per-failure-domain
+    /// replicas would be actively dangerous. Since ADR-0067 part 2 it DOES
+    /// connect to the same Postgres — for derived, rebuildable rows only
+    /// (drain records, write ledgers), which is why `SCARAB_DATABASE_URL` is
+    /// now mandatory for **every** role (see [`Config::resolve`]) and this
+    /// predicate no longer gates it. What it still scopes is exactly what the
+    /// workspace role must not have: the KEK, and the migration path.
     ///
     /// This is a **narrow carve-out, not a weakening**: every other role still
-    /// refuses to boot without Postgres and without a KEK. There is still no
-    /// API-only mode.
+    /// refuses to boot without a KEK, and there is still no API-only mode.
     pub fn needs_durable_core(self) -> bool {
         !matches!(self, Role::Workspace)
     }
@@ -359,13 +361,13 @@ struct RawCredential {
 pub struct Config {
     pub role: Role,
     pub addr: String,
-    /// Present for every role that touches the durable core — construction
-    /// fails without it, and there is still no API-only mode. `None` **only**
-    /// for [`Role::Workspace`], the ADR-0061 data-plane role (see
-    /// [`Role::needs_durable_core`]). The type carries that fact so the one
-    /// `expect` can live at the durable-core dispatch site instead of a `""`
-    /// sentinel travelling through the whole composition root.
-    pub database_url: Option<String>,
+    /// Present for **every** role — construction fails without it, and there
+    /// is still no API-only mode. The ADR-0061 workspace carve-out is gone:
+    /// ADR-0067 part 2 has the Depot connect to the same Postgres for derived,
+    /// rebuildable rows (drain records, write ledgers) — connecting yes,
+    /// migrating never. The type carries the guarantee, so no dispatch site
+    /// needs an `expect` or a `""` sentinel.
+    pub database_url: String,
     pub namespace: String,
     pub executor: ExecutorKind,
     pub store: StoreConfig,
@@ -477,9 +479,11 @@ pub struct OAuthConfig {
 pub enum ConfigError {
     #[error(
         "SCARAB_DATABASE_URL is not set. Postgres is mandatory for every serving role \
-         (ADR-0048) — there is no API-only mode. Start a Postgres (dev: `just up`) and \
-         set SCARAB_DATABASE_URL; only `--emit-openapi` works without a database. \
-         SCARAB_DEV_INSECURE does NOT relax this."
+         (ADR-0048) — there is no API-only mode, and the workspace role needs it too \
+         (ADR-0067 part 2: it reads/writes drain records and write ledgers; it never \
+         migrates). Start a Postgres (dev: `just up`) and set SCARAB_DATABASE_URL; \
+         only `--emit-openapi` works without a database. SCARAB_DEV_INSECURE does \
+         NOT relax this."
     )]
     MissingDatabaseUrl,
 
@@ -579,15 +583,15 @@ impl Config {
 
     /// [`resolve`](Self::resolve) with an injectable environment (tests).
     fn resolve_from(cli: &Cli, env: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        // Postgres first: mandatory for every role that touches the durable
-        // core, and deliberately NOT relaxed by the dev escape hatch
-        // (ADR-0048). The ONE carve-out is the ADR-0061 workspace service,
-        // which is a data-plane role — see `Role::needs_durable_core`. The
-        // check is scoped, not weakened: `--role workspace` is the only value
-        // that reaches the `None` branch.
+        // Postgres first: mandatory for EVERY role, and deliberately NOT
+        // relaxed by the dev escape hatch (ADR-0048). The ADR-0061 workspace
+        // carve-out ended with ADR-0067 part 2 — the Depot now connects to the
+        // same database for its derived rows (drain records, write ledgers),
+        // so a workspace replica without a URL is misconfigured, not minimal.
+        // It still never migrates; that half of the boundary lives in
+        // `workspaced::run`, not here.
         let database_url = match cli.database_url.clone().filter(|u| !u.is_empty()) {
-            Some(url) => Some(url),
-            None if !cli.role.needs_durable_core() => None,
+            Some(url) => url,
             None => return Err(ConfigError::MissingDatabaseUrl),
         };
 
@@ -868,9 +872,15 @@ impl Config {
         vec![
             format!("role: {:?}", self.role),
             format!("addr: {}", self.addr),
-            match &self.database_url {
-                Some(url) => format!("database: {} (mandatory, ADR-0048)", redact_url(url)),
-                None => "database: NONE — data-plane role, no durable core (ADR-0061)".to_string(),
+            match self.role {
+                Role::Workspace => format!(
+                    "database: {} (connects, never migrates — ADR-0067 part 2)",
+                    redact_url(&self.database_url)
+                ),
+                _ => format!(
+                    "database: {} (mandatory, ADR-0048)",
+                    redact_url(&self.database_url)
+                ),
             },
             format!("object store: {store}"),
             format!(
@@ -1248,42 +1258,60 @@ mod tests {
         assert_eq!(err, ConfigError::MissingDatabaseUrl);
     }
 
-    /// ADR-0061 D1.1a: the workspace service is a data-plane role, so the
-    /// durable-core gate is SCOPED to the roles that have a durable core. It is
-    /// not weakened — see the two tests below it.
+    /// ADR-0067 part 2: the workspace role now REQUIRES Postgres (it reads and
+    /// writes the drain-record and write-ledger rows), while the KEK carve-out
+    /// survives — the role still decrypts nothing. The env here deliberately
+    /// does NOT set `SCARAB_DEV_INSECURE`, so a missing master key passing is
+    /// the carve-out itself, not the dev escape hatch.
     #[test]
-    fn the_workspace_role_boots_without_postgres_or_a_kek() {
-        let mut cli = cli(None);
+    fn the_workspace_role_requires_postgres_but_not_a_kek() {
+        let mut no_db = cli(None);
+        no_db.role = Role::Workspace;
+        let ws_env = |k: &str| {
+            (k == "SCARAB_WORKSPACE_TOKEN_SECRET").then(|| "ws-secret".to_string())
+        };
+        assert_eq!(
+            Config::resolve_from(&no_db, ws_env).unwrap_err(),
+            ConfigError::MissingDatabaseUrl,
+            "ADR-0067 part 2: a Depot without Postgres is misconfigured"
+        );
+
+        let mut cli = cli(Some("postgres://scarab:pw@db/scarab"));
         cli.role = Role::Workspace;
-        let config = Config::resolve_from(
-            &cli,
-            dev_env(&[("SCARAB_WORKSPACE_TOKEN_SECRET", "ws-secret")]),
-        )
-        .expect("the data-plane role needs neither Postgres nor a KEK");
-        assert!(config.database_url.is_none());
+        let config = Config::resolve_from(&cli, ws_env)
+            .expect("the data-plane role needs Postgres but no KEK");
+        assert_eq!(config.database_url, "postgres://scarab:pw@db/scarab");
         assert!(config.master_key.is_none());
         assert_eq!(
             config.workspace.as_ref().map(|w| w.token_secret.clone()),
             Some(b"ws-secret".to_vec())
         );
-        // And the report says so out loud, rather than printing a blank URL.
+        // And the report states the narrowed boundary out loud.
         assert!(config
             .startup_report()
             .iter()
-            .any(|l| l.contains("database: NONE")));
+            .any(|l| l.contains("never migrates")));
     }
 
-    /// The carve-out must be exactly one role wide. If this ever passes for
-    /// `Api`, the ADR-0048 "no API-only mode" rule has been quietly repealed.
+    /// Every role requires Postgres — the workspace role included since
+    /// ADR-0067 part 2. If `Api` ever passes without one, the ADR-0048
+    /// "no API-only mode" rule has been quietly repealed.
     #[test]
-    fn no_other_role_gets_the_workspace_carve_out() {
-        for role in [Role::Converged, Role::Api, Role::Scheduler, Role::Executor, Role::Webhook] {
+    fn every_role_requires_postgres() {
+        for role in [
+            Role::Converged,
+            Role::Api,
+            Role::Scheduler,
+            Role::Executor,
+            Role::Webhook,
+            Role::Workspace,
+        ] {
             let mut cli = cli(None);
             cli.role = role;
             assert_eq!(
                 Config::resolve_from(&cli, dev_env(&[])).unwrap_err(),
                 ConfigError::MissingDatabaseUrl,
-                "{role:?} must still require Postgres"
+                "{role:?} must require Postgres"
             );
         }
     }
@@ -1292,7 +1320,7 @@ mod tests {
     /// to anyone who can reach the port. That is not a dev convenience.
     #[test]
     fn the_workspace_role_refuses_to_boot_without_a_token_secret() {
-        let mut cli = cli(None);
+        let mut cli = cli(Some("postgres://l/scarab"));
         cli.role = Role::Workspace;
         assert_eq!(
             Config::resolve_from(&cli, dev_env(&[])).unwrap_err(),

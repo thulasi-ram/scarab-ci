@@ -24,13 +24,14 @@
   the same check; the failure is a CrashLoopBackOff on this StatefulSet with that
   message in the container log.
 
-  Note what this Pod does NOT get:
-    * no SCARAB_DATABASE_URL is *used* — the workspace role never connects to
-      Postgres and never runs a migration (ADR-0061; Role::needs_durable_core).
-      The key still arrives via envFrom because the Secret is shared, and the
-      server would refuse to boot without it; the role simply ignores it. In
-      Kubernetes, capability comes from the ServiceAccount and mounted secrets,
-      and this Pod's ServiceAccount has NO RoleBinding at all.
+  Note the boundaries this Pod keeps:
+    * SCARAB_DATABASE_URL arrives via envFrom (the Secret is shared) and since
+      ADR-0067 part 2 the role USES it: the fence rows — drain records and
+      write ledgers — are Postgres rows, so any replica can answer for any
+      fence. It connects lazily and NEVER runs a migration (the control plane
+      owns every table's DDL; deploy it first). In Kubernetes, capability
+      comes from the ServiceAccount and mounted secrets, and this Pod's
+      ServiceAccount has NO RoleBinding at all.
     * no RBAC. The chart's Role is pods/secrets/exec for the executor; a
       workspace replica needs none of it (see serviceaccount-workspace.yaml,
       which is deliberately unbound).

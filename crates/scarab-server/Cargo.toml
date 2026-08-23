@@ -38,6 +38,12 @@ reqwest = { workspace = true }
 base64 = { workspace = true }
 # PKCE S256 code challenges (ADR-0049): SHA-256 of the login verifier.
 sha2 = { workspace = true }
+# ADR-0067 part 2: the workspace role's fence rows (drain records, write
+# ledgers) live in the control plane's Postgres and the Depot reads/writes
+# them directly — connects yes, migrates never. The control-plane roles keep
+# going through `scarab-db-postgres`; this is the data plane's own, deliberately
+# thin, SQL surface (`workspaced.rs` only).
+sqlx = { workspace = true }
 # ADR-0062 Snapshot Farm (`farm.rs`): the `FICLONE` ioctl on Linux and
 # `clonefile(2)` on macOS/APFS, which are the clone rung. Neither is in `std`.
 # `reflink-copy` (cargo-bins, MIT/Apache) covers both plus a plain `Unsupported`
@@ -79,5 +85,4 @@ xattr = { workspace = true }
 [dev-dependencies]
 regex-lite = { workspace = true }
 tower = { workspace = true, features = ["util"] }
-sqlx = { workspace = true }
 tempfile = { workspace = true }

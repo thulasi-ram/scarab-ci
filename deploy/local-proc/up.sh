@@ -237,10 +237,10 @@ if port_listening "127.0.0.1" "$ws_port"; then
 fi
 # `env -u`/explicit overrides rather than editing .env: the workspace role must
 # bind 0.0.0.0 on its own port while the control plane keeps SCARAB_ADDR from the
-# env file. It gets no SCARAB_DATABASE_URL at all — the boot gate's carve-out for
-# this role is scoped, and passing one anyway would hide a regression in it.
+# env file. SCARAB_DATABASE_URL flows through from the same env — since
+# ADR-0067 part 2 the Depot keeps its fence rows (drain records, write
+# ledgers) in the control plane's Postgres: connects yes, migrates never.
 SCARAB_ADDR="0.0.0.0:$ws_port" \
-SCARAB_DATABASE_URL="" \
 nohup "$root/target/debug/scarab-server" --role workspace \
   > "$here/workspace.log" 2>&1 &
 workspace_pid=$!

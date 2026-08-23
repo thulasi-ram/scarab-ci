@@ -115,13 +115,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ADR-0061: the workspace service is a DATA-plane role. It shares this
     // binary — one image, so server↔service version skew is structurally
-    // impossible under one Helm release — but NOT the durable core: it never
-    // connects to Postgres and never runs a migration.
+    // impossible under one Helm release — but NOT the durable core. Since
+    // ADR-0067 part 2 it DOES connect to the same Postgres (for derived,
+    // rebuildable rows: drain records, write ledgers — `workspaced::run`
+    // builds its own pool), but it NEVER migrates: the control plane owns
+    // every table's DDL, so a Depot rolled ahead of the control plane cannot
+    // half-migrate anything. That deployment-ordering property is what the
+    // old "never connects" guard was actually defending, and it survives.
     //
     // The early return is deliberately HERE, before anything below it runs.
     // Everything that follows is the durable core's composition root: it
-    // connects Postgres and migrates, connects and migrates the secrets store,
-    // reads the OIDC PEM, and provisions forge connections — none of which the
+    // migrates Postgres, connects and migrates the secrets store, reads the
+    // OIDC PEM, and provisions forge connections — none of which the
     // workspace service has, needs, or may be allowed to do from N per-failure-
     // domain replicas. Do not move this down, and do not restructure the code
     // below it to make the role a branch: a branch is something a future edit
@@ -130,14 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return scarab_server::workspaced::run(&config).await;
     }
 
-    // From here on the durable core is mandatory, and the config gate already
-    // guaranteed it for every role that reaches this line (see
-    // `Role::needs_durable_core`). One `expect`, at the dispatch site, so the
-    // `Option` carries the fact instead of a `""` sentinel travelling onward.
-    let database_url = config
-        .database_url
-        .clone()
-        .expect("the config gate requires SCARAB_DATABASE_URL for every durable-core role");
+    // The config gate guarantees the URL for every role (ADR-0048/ADR-0067),
+    // so the type is a `String`, not an `Option` with a dispatch-site expect.
+    let database_url = config.database_url.clone();
 
     // This replica's identity for leases + outbox claims (ADR-0051): MUST be
     // unique per process — identical owners would make every replica believe

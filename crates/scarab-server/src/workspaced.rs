@@ -14,19 +14,25 @@
 //!
 //! But this role is **data plane**. It:
 //!
-//! - **never connects to Postgres and never runs a migration** — see
-//!   [`Role::needs_durable_core`](crate::config::Role::needs_durable_core). It
-//!   holds no state Postgres owns, so a database outage must not stop a Step
-//!   from reading its inputs, and `migrate()` from N per-failure-domain replicas
-//!   would be actively dangerous;
+//! - **connects to the control plane's Postgres and never runs a migration**
+//!   (ADR-0067 part 2). The boundary being protected is "not a system of
+//!   record", not "no database": what lives in Postgres from here is derived,
+//!   rebuildable rows only — drain records and write ledgers, so ANY replica
+//!   can answer for a fence — while the control plane owns every table's DDL
+//!   (see [`Role::needs_durable_core`](crate::config::Role::needs_durable_core)),
+//!   so a Depot rolled ahead of it cannot half-migrate anything. The pool is
+//!   built **lazily**: a database outage must not stop a Step from reading its
+//!   inputs — content reads never touch Postgres; the fence-keyed routes fail
+//!   per-request instead;
 //! - **decrypts nothing** — no `SecretProvider`, no KEK;
 //! - **serves its own router**, not the control-plane one. In particular it has
 //!   its own [`readyz`], because readiness here means *warm writable + cold
 //!   reachable*, and the control plane's `/readyz` asks about the database.
 //!
 //! In Kubernetes, capability comes from the ServiceAccount and the mounted
-//! Secrets, not from the image: the chart's workspace StatefulSet gets neither
-//! `SCARAB_DATABASE_URL` nor a RoleBinding.
+//! Secrets, not from the image: the chart's workspace StatefulSet gets no
+//! RoleBinding; `SCARAB_DATABASE_URL` arrives via the shared Secret it always
+//! received (and used to ignore).
 //!
 //! ## Vocabulary
 //!
@@ -219,35 +225,28 @@ const WARM_SIZE_REFRESH_SECS: u64 = 60;
 /// holding a `FarmLease` that keeps a whole Farm un-evictable.
 const EXPORT_SWEEP_SECS: u64 = 120;
 
-/// Where each fence's **write ledger** lives, under the Depot data dir beside
-/// `exports/`: one file per fence, one tree hash per line, appended on every
-/// `PUT /v1/cas/trees/{hash}` a fence-claimed token makes (git-bug `212bb13`).
+/// The stored drain record's format version (the `depot_drain_records.version`
+/// column). Same contract as [`crate::export::RECORD_VERSION`]: a future
+/// reader refuses what it would mis-parse, rather than guessing.
 ///
-/// The ledger is what lets a drain *prove* the root it publishes is content its
-/// own fence wrote, rather than a hash it learned — a content address is not a
-/// secret, so "names the hash" must not be "owns the snapshot". Disk is the
-/// truth and the only copy: a Depot restart must not forget a fence's writes
-/// before the control plane has consumed that fence's drain record.
-const LEDGERS_SUBDIR: &str = "ledgers";
-
-/// Where each fence's **drain record** lives: `drains/{fence-key}/record.json`,
-/// mirroring `exports/{handle}/record.json` — the key is a SHA-256 of the fence
-/// (see [`fence_key`]), so an arbitrary `{run, step, attempt}` can never become
-/// more than one safe path segment.
-const DRAINS_SUBDIR: &str = "drains";
-
-/// The stored drain record's format version. Same contract as
-/// [`crate::export::RECORD_VERSION`]: a future reader refuses what it would
-/// mis-parse, rather than guessing.
+/// The record and each fence's **write ledger** (`depot_fence_writes`) are
+/// Postgres rows, not replica-local files (ADR-0067 part 2): the control plane
+/// GETs a drain record through the ClusterIP — an arbitrary replica — and
+/// closure validation must see the same ledger whichever replica the trees
+/// were PUT through. The rows are derived and rebuildable (losing a ledger row
+/// only re-restricts reads; losing a record row costs one re-drain), which is
+/// what licenses the connection at all: nothing here makes the Depot a system
+/// of record.
 const DRAIN_RECORD_VERSION: u32 = 1;
 
-/// How long fence residue — a write ledger, a drain record — may sit before the
-/// sweep collects it. The bound is the credential's, not a guess: no workspace
-/// token outlives [`workspace_token::WORKSPACE_TOKEN_MAX_TTL_SECS`] plus its
-/// grace, so a ledger this old can never again be extended or read by the fence
-/// that owns it, and a record this old belongs to an Attempt the control plane
-/// long ago classified (its 5-minute drain clock is three orders of magnitude
-/// shorter). Sweeping a ledger only *re-restricts* reads — the safe direction.
+/// How long fence residue — a write-ledger row, a drain-record row — may sit
+/// before the sweep collects it. The bound is the credential's, not a guess: no
+/// workspace token outlives [`workspace_token::WORKSPACE_TOKEN_MAX_TTL_SECS`]
+/// plus its grace, so a ledger row this old can never again be extended or read
+/// by the fence that owns it, and a record this old belongs to an Attempt the
+/// control plane long ago classified (its 5-minute drain clock is three orders
+/// of magnitude shorter). Sweeping a ledger only *re-restricts* reads — the
+/// safe direction.
 const FENCE_RESIDUE_TTL_SECS: i64 =
     workspace_token::WORKSPACE_TOKEN_MAX_TTL_SECS + workspace_token::WORKSPACE_TOKEN_GRACE_SECS;
 
@@ -315,6 +314,12 @@ struct WorkspaceState {
     /// [`DurabilityTier::WarmOnly`] the flush phases are skipped and every
     /// response discloses `durable: false, tier: "warm-only"`.
     tier: DurabilityTier,
+    /// The control plane's Postgres (ADR-0067 part 2) — for the fence rows
+    /// only: `depot_drain_records` and `depot_fence_writes`, both derived and
+    /// rebuildable, both shared across replicas. Connected **lazily**
+    /// ([`run`]) so a database outage degrades exactly the fence-keyed routes
+    /// and never the content path; this role NEVER migrates.
+    db: sqlx::PgPool,
 }
 
 impl WorkspaceState {
@@ -490,12 +495,24 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let app = router(&ws.data_dir, cold_store, ws.token_secret.clone(), tier)?;
+    // The control plane's Postgres, for the fence rows (ADR-0067 part 2).
+    // `connect_lazy` on purpose: this role must keep serving content THROUGH a
+    // database outage (a Step reading its inputs does not care that the fence
+    // rows are briefly unreachable), so boot validates the URL and nothing
+    // else — the fence-keyed routes fail per-request instead. And it NEVER
+    // migrates: the control plane owns every table's DDL, which is the
+    // deployment-ordering property the old "never connects" guard defended.
+    let db = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy(&config.database_url)
+        .map_err(|e| format!("SCARAB_DATABASE_URL does not parse: {e}"))?;
+
+    let app = router(&ws.data_dir, cold_store, ws.token_secret.clone(), tier, db)?;
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     tracing::info!(
         addr = %config.addr,
         warm_dir = %ws.data_dir,
-        "workspace service listening (ADR-0061 data plane; no Postgres, no secrets store)"
+        "workspace service listening (ADR-0061 data plane; connects Postgres for the \
+         fence rows, never migrates — ADR-0067 part 2; no secrets store)"
     );
     println!("workspace service listening on {}", config.addr);
     axum::serve(listener, app)
@@ -528,14 +545,21 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 /// each tier's Depot explicitly — a router that probed for itself would make the
 /// warm-only acceptance tests depend on which device the CI runner's tempdirs
 /// land on.
+///
+/// `db` (ADR-0067 part 2) is the pool holding the fence rows — drain records
+/// and write ledgers. A parameter for the same reason `cold` is: [`run`] builds
+/// it from the validated config (lazily), and the acceptance tests hand in a
+/// pool over a real, migrated throwaway database — two routers over two warm
+/// tempdirs sharing one pool IS the replicaCount > 1 test.
 pub fn router(
     warm_dir: impl AsRef<std::path::Path>,
     cold: Arc<S3Storage>,
     token_secret: Vec<u8>,
     tier: DurabilityTier,
+    db: sqlx::PgPool,
 ) -> Result<Router, StorageError> {
     let warm_dir = warm_dir.as_ref().to_path_buf();
-    let state = open_state(&warm_dir, cold, token_secret, tier)?;
+    let state = open_state(&warm_dir, cold, token_secret, tier, db)?;
 
     // The warm-tier size gauge (ADR-0061): LRU eviction is deferred, so this
     // number climbing towards the volume size IS the operator's only warning
@@ -580,6 +604,7 @@ fn open_state(
     cold: Arc<S3Storage>,
     token_secret: Vec<u8>,
     tier: DurabilityTier,
+    db: sqlx::PgPool,
 ) -> Result<WorkspaceState, StorageError> {
     // Warm tier: a local-filesystem `Cas` over the persistent volume. NO new
     // adapter is needed for this — `S3Storage::local` is already a local
@@ -613,6 +638,7 @@ fn open_state(
         exports,
         captures: Arc::new(Mutex::new(BTreeMap::new())),
         tier,
+        db,
     })
 }
 
@@ -725,64 +751,49 @@ async fn sweep_exports_once(state: &WorkspaceState) {
     state.captures().retain(|handle, _| live.contains(handle));
 
     // Fence residue (git-bug `212bb13`), on the same cadence and the same TTL
-    // discipline as the Export residue above: write ledgers and drain records
-    // older than any token that could still touch them. Failure here leaks a
-    // small file until the next pass, so it is logged and never fatal.
-    let warm_dir = state.warm_dir.clone();
-    match tokio::task::spawn_blocking(move || sweep_fence_residue(&warm_dir, now)).await {
+    // discipline as the Export residue above: write-ledger and drain-record
+    // rows older than any token that could still touch them. Failure here
+    // leaks a few rows until the next pass, so it is logged and never fatal —
+    // and with the rows in Postgres (ADR-0067 part 2), N replicas sweeping is
+    // N races to delete the same expired rows, which DELETE settles for free.
+    match sweep_fence_residue(&state.db, now).await {
         Ok((0, 0)) => {}
         Ok((ledgers, records)) => tracing::info!(
             ledgers,
             records,
-            "swept expired fence residue — write ledgers and drain records no live \
+            "swept expired fence residue — write-ledger and drain-record rows no live \
              token can reach (git-bug 212bb13)"
         ),
         Err(e) => tracing::error!(
             error = %e,
-            "the fence-residue sweep task did not complete; stale ledgers and drain \
-             records will wait for the next pass"
+            "the fence-residue sweep did not complete; stale ledger and drain-record \
+             rows will wait for the next pass"
         ),
     }
 }
 
-/// Collect fence residue older than [`FENCE_RESIDUE_TTL_SECS`]: ledger files
-/// under `ledgers/`, record directories under `drains/`. Answers
-/// `(ledgers_removed, records_removed)`.
+/// Collect fence residue older than [`FENCE_RESIDUE_TTL_SECS`]: write-ledger
+/// rows (`depot_fence_writes`) and drain-record rows (`depot_drain_records`).
+/// Answers `(ledger_rows_removed, records_removed)`.
 ///
-/// Staleness is the entry's own mtime — an append refreshes a ledger's, a record
-/// rewrite refreshes its directory's — so only residue *nothing has touched* for
-/// a whole token lifetime goes. An unreadable mtime is treated as fresh: the
-/// failure mode of keeping is a small leaked file, of deleting a live fence's
-/// ledger it is a 403 on that fence's own read-back.
-fn sweep_fence_residue(warm_dir: &std::path::Path, now: i64) -> (u64, u64) {
+/// Staleness is per row — a ledger row's own `written_at`, a record's
+/// `posted_at` (refreshed when an error record is overwritten) — so only
+/// residue *nothing has touched* for a whole token lifetime goes. Sweeping a
+/// live fence's row is impossible by the TTL bound; sweeping a dead fence's
+/// only re-restricts reads, the safe direction.
+async fn sweep_fence_residue(db: &sqlx::PgPool, now: i64) -> Result<(u64, u64), sqlx::Error> {
     let cutoff = now - FENCE_RESIDUE_TTL_SECS;
-    let stale = |path: &std::path::Path| -> bool {
-        std::fs::metadata(path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| (d.as_secs() as i64) < cutoff)
-            .unwrap_or(false)
-    };
-    let mut ledgers = 0u64;
-    if let Ok(entries) = std::fs::read_dir(warm_dir.join(LEDGERS_SUBDIR)) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if stale(&path) && std::fs::remove_file(&path).is_ok() {
-                ledgers += 1;
-            }
-        }
-    }
-    let mut records = 0u64;
-    if let Ok(entries) = std::fs::read_dir(warm_dir.join(DRAINS_SUBDIR)) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if stale(&path) && std::fs::remove_dir_all(&path).is_ok() {
-                records += 1;
-            }
-        }
-    }
-    (ledgers, records)
+    let ledgers = sqlx::query("DELETE FROM depot_fence_writes WHERE written_at < $1")
+        .bind(cutoff)
+        .execute(db)
+        .await?
+        .rows_affected();
+    let records = sqlx::query("DELETE FROM depot_drain_records WHERE posted_at < $1")
+        .bind(cutoff)
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok((ledgers, records))
 }
 
 fn build_router(state: WorkspaceState) -> Router {
@@ -1143,63 +1154,48 @@ fn fence_key(fence: &Fence) -> String {
     scarab_workspace_client::drain_fence_key(&fence.run, &fence.step, &fence.attempt)
 }
 
-fn ledger_path(state: &WorkspaceState, fence: &Fence) -> std::path::PathBuf {
-    state.warm_dir.join(LEDGERS_SUBDIR).join(fence_key(fence))
-}
-
-fn drain_record_dir(state: &WorkspaceState, fence: &Fence) -> std::path::PathBuf {
-    state.warm_dir.join(DRAINS_SUBDIR).join(fence_key(fence))
-}
-
-/// This fence's write ledger, read **from disk** — the disk is the only copy,
-/// deliberately: a restart must not forget what a fence wrote while the fence's
-/// drain record is still unconsumed. An absent file is an empty ledger; a file
-/// that cannot be read is the warm volume failing, never a miss (same rule as
-/// [`warm_has`]).
+/// This fence's write ledger, read from **Postgres** (`depot_fence_writes`,
+/// ADR-0067 part 2) — shared across replicas, deliberately: closure validation
+/// must see the fence's writes whichever replica the trees were PUT through,
+/// and a Depot restart must not forget them while the fence's drain record is
+/// still unconsumed. No rows is an empty ledger; a query failure is the
+/// database failing, never a miss (same rule as [`warm_has`]). Every address
+/// in a row is normalized bare hex — [`valid_address`] runs at the handler
+/// edge, so tagged spellings never reach here.
 async fn read_ledger(
     state: &WorkspaceState,
     fence: &Fence,
 ) -> Result<HashSet<String>, WsError> {
-    let path = ledger_path(state, fence);
-    match tokio::fs::read_to_string(&path).await {
-        Ok(text) => Ok(text
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashSet::new()),
-        Err(e) => Err(warm_volume_error("read ledger", &path, e)),
-    }
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT tree_address FROM depot_fence_writes WHERE fence_key = $1",
+    )
+    .bind(fence_key(fence))
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| fence_rows_error("read ledger", e))?;
+    Ok(rows.into_iter().collect())
 }
 
-/// Append one tree hash to a fence's write ledger. One line per PUT; duplicates
-/// are harmless (the reader is a set). A failure fails the PUT — the client's
-/// re-PUT is idempotent, and a tree stored without its ledger line would 422
-/// that fence's own drain record later, which is the worse diagnosis.
+/// Append one tree hash to a fence's write ledger. One row per PUT; duplicates
+/// are harmless (`ON CONFLICT DO NOTHING` — the reader is a set). A failure
+/// fails the PUT — the client's re-PUT is idempotent, and a tree stored
+/// without its ledger row would 422 that fence's own drain record later, which
+/// is the worse diagnosis.
 async fn ledger_append(
     state: &WorkspaceState,
     fence: &Fence,
     hash: &str,
 ) -> Result<(), WsError> {
-    use tokio::io::AsyncWriteExt;
-    let dir = state.warm_dir.join(LEDGERS_SUBDIR);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| warm_volume_error("mkdir ledgers", &dir, e))?;
-    let path = ledger_path(state, fence);
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await
-        .map_err(|e| warm_volume_error("open ledger", &path, e))?;
-    file.write_all(format!("{hash}\n").as_bytes())
-        .await
-        .map_err(|e| warm_volume_error("append ledger", &path, e))?;
-    file.flush()
-        .await
-        .map_err(|e| warm_volume_error("flush ledger", &path, e))?;
+    sqlx::query(
+        "INSERT INTO depot_fence_writes (fence_key, tree_address, written_at) \
+         VALUES ($1, $2, $3) ON CONFLICT (fence_key, tree_address) DO NOTHING",
+    )
+    .bind(fence_key(fence))
+    .bind(hash)
+    .bind(now_secs())
+    .execute(&state.db)
+    .await
+    .map_err(|e| fence_rows_error("append ledger", e))?;
     Ok(())
 }
 
@@ -1352,6 +1348,24 @@ async fn warm_has(path: &std::path::Path) -> Result<bool, WsError> {
 /// would make it indistinguishable from an empty one — which is how a torn CAS
 /// goes unnoticed for a week. A `500` is retried; the counter and the log line are
 /// what an operator acts on.
+/// A query against the fence rows (`depot_fence_writes`,
+/// `depot_drain_records`) failed. Always a `500`, retried by the caller —
+/// never a miss: an unreachable database must not read as "empty ledger"
+/// (which would 422 an honest drain) or "no record" (which the control
+/// plane's classifier treats as *no drain happened*). ADR-0067 part 2 accepts
+/// exactly this coupling: the content path never touches Postgres, the
+/// fence-keyed routes degrade with it.
+fn fence_rows_error(op: &str, e: sqlx::Error) -> WsError {
+    tracing::warn!(
+        op,
+        error = %e,
+        "workspace service: a fence-rows query FAILED — the control plane's Postgres is \
+         unreachable or the schema is behind this binary (the Depot never migrates; \
+         deploy the control plane first — ADR-0067 part 2)"
+    );
+    WsError::Backend(format!("fence rows ({op}): {e}"))
+}
+
 fn warm_volume_error(op: &str, path: &std::path::Path, e: std::io::Error) -> WsError {
     WARM_READ_FAILED.fetch_add(1, Ordering::Relaxed);
     tracing::warn!(
@@ -2189,10 +2203,11 @@ pub struct DrainRecord {
     pub error: Option<DrainErrorDto>,
 }
 
-/// The on-disk envelope around a [`DrainRecord`]: versioned like
-/// [`crate::export::RECORD_VERSION`] so a future reader refuses rather than
-/// mis-parses, and carrying the fence in clear because the directory name is a
-/// hash of it — a record an operator finds on disk must say whose it is.
+/// The stored envelope around a [`DrainRecord`] — one `depot_drain_records`
+/// row (ADR-0067 part 2): versioned like [`crate::export::RECORD_VERSION`] so
+/// a future reader refuses rather than mis-parses, and carrying the fence in
+/// clear because the row's key is a hash of it — a record an operator finds in
+/// the table must say whose it is.
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredDrainRecord {
     version: u32,
@@ -2203,7 +2218,7 @@ struct StoredDrainRecord {
     record: DrainRecord,
 }
 
-/// Read the stored drain record for `fence`, or `None`. A file that exists and
+/// Read the stored drain record for `fence`, or `None`. A row that exists and
 /// does not parse is an error, never silently "absent" — absence licenses a
 /// fresh POST, and a corrupt record must not be overwritable by accident.
 async fn read_drain_record(
@@ -2219,31 +2234,41 @@ async fn read_drain_record_by_key(
     state: &WorkspaceState,
     key: &str,
 ) -> Result<Option<StoredDrainRecord>, WsError> {
-    let path = state
-        .warm_dir
-        .join(DRAINS_SUBDIR)
-        .join(key)
-        .join(crate::export::RECORD_FILE);
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(warm_volume_error("read drain record", &path, e)),
+    let row: Option<(i32, String, String, String, i64, serde_json::Value)> = sqlx::query_as(
+        "SELECT version, run, step, attempt, posted_at, record \
+         FROM depot_drain_records WHERE fence_key = $1",
+    )
+    .bind(key)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| fence_rows_error("read drain record", e))?;
+    let Some((version, run, step, attempt, posted_at, record)) = row else {
+        return Ok(None);
     };
-    let stored: StoredDrainRecord = serde_json::from_slice(&bytes).map_err(|e| {
+    let version = u32::try_from(version).map_err(|_| {
         WsError::Backend(format!(
-            "the drain record at {} is not one: {e}",
-            path.display()
+            "the drain record for fence key {key} has a negative version ({version})"
         ))
     })?;
-    if stored.version > DRAIN_RECORD_VERSION {
+    if version > DRAIN_RECORD_VERSION {
         return Err(WsError::Backend(format!(
-            "the drain record at {} is version {} and this reader speaks {}",
-            path.display(),
-            stored.version,
-            DRAIN_RECORD_VERSION
+            "the drain record for fence key {key} is version {version} and this \
+             reader speaks {DRAIN_RECORD_VERSION}"
         )));
     }
-    Ok(Some(stored))
+    let record: DrainRecord = serde_json::from_value(record).map_err(|e| {
+        WsError::Backend(format!(
+            "the drain record for fence key {key} is not one: {e}"
+        ))
+    })?;
+    Ok(Some(StoredDrainRecord {
+        version,
+        run,
+        step,
+        attempt,
+        posted_at,
+        record,
+    }))
 }
 
 /// The verdict of a drain record's server-side validation: complete, or the
@@ -2394,12 +2419,11 @@ async fn post_drain(
         }
     }
 
-    // Persist, then 200. Written to a temp name and renamed so a crash mid-write
-    // leaves either the old record or the new one, never a torn parse.
-    let dir = drain_record_dir(&state, &fence);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| warm_volume_error("mkdir drain record", &dir, e))?;
+    // Persist, then 200. One row upsert (ADR-0067 part 2), so a crash
+    // mid-request leaves either the old record or the new one, never a torn
+    // parse — and any replica serves the GET. The upsert arm is the error-
+    // record overwrite: the write-once check above already 409'd a second
+    // success POST.
     let stored = StoredDrainRecord {
         version: DRAIN_RECORD_VERSION,
         run: fence.run.clone(),
@@ -2408,16 +2432,27 @@ async fn post_drain(
         posted_at: now_secs(),
         record,
     };
-    let bytes = serde_json::to_vec(&stored)
+    let record_json = serde_json::to_value(&stored.record)
         .map_err(|e| WsError::Backend(format!("serialising a drain record: {e}")))?;
-    let tmp = dir.join(".tmp-record.json");
-    let path = dir.join(crate::export::RECORD_FILE);
-    tokio::fs::write(&tmp, &bytes)
-        .await
-        .map_err(|e| warm_volume_error("write drain record", &tmp, e))?;
-    tokio::fs::rename(&tmp, &path)
-        .await
-        .map_err(|e| warm_volume_error("rename drain record", &path, e))?;
+    sqlx::query(
+        "INSERT INTO depot_drain_records \
+             (fence_key, run, step, attempt, version, posted_at, record) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (fence_key) DO UPDATE SET \
+             run = EXCLUDED.run, step = EXCLUDED.step, attempt = EXCLUDED.attempt, \
+             version = EXCLUDED.version, posted_at = EXCLUDED.posted_at, \
+             record = EXCLUDED.record",
+    )
+    .bind(fence_key(&fence))
+    .bind(&stored.run)
+    .bind(&stored.step)
+    .bind(&stored.attempt)
+    .bind(i32::try_from(stored.version).expect("DRAIN_RECORD_VERSION fits i32"))
+    .bind(stored.posted_at)
+    .bind(&record_json)
+    .execute(&state.db)
+    .await
+    .map_err(|e| fence_rows_error("persist drain record", e))?;
 
     tracing::info!(
         run = %fence.run,
@@ -3944,6 +3979,109 @@ fn dir_size(dir: &std::path::Path) -> u64 {
 mod tests {
     use super::*;
 
+    /// An isolated, migrated throwaway database for one harness — the fence
+    /// rows (ADR-0067 part 2) are Postgres rows now, so the Depot's own
+    /// acceptance grain includes a real database. Same skip-without-env
+    /// pattern as `crates/scarab-db-postgres/tests/common/mod.rs`: absent
+    /// `SCARAB_TEST_DATABASE_URL` skips (loudly), and CI sets
+    /// `SCARAB_TEST_REQUIRE_PG=1` so the suite can never silently lose these.
+    /// Migrated through `PostgresDb::migrate` — the control plane's own path;
+    /// the test IS the control plane here, the Depot code under test never
+    /// migrates.
+    struct TestPg {
+        pool: sqlx::PgPool,
+        admin_url: String,
+        dbname: String,
+    }
+
+    impl TestPg {
+        async fn provision() -> Option<Self> {
+            use std::sync::atomic::AtomicU32;
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+            let Ok(admin_url) = std::env::var("SCARAB_TEST_DATABASE_URL") else {
+                if std::env::var("SCARAB_TEST_REQUIRE_PG").is_ok_and(|v| v == "1") {
+                    panic!("PG-backed test skipped but SCARAB_TEST_REQUIRE_PG=1");
+                }
+                eprintln!(
+                    "SKIPPED (PG-backed test): set SCARAB_TEST_DATABASE_URL to run — \
+                     `just test` wires it up"
+                );
+                return None;
+            };
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let dbname = format!("scarab_ws_test_{}_{}", std::process::id(), n);
+
+            let admin = sqlx::PgPool::connect(&admin_url).await.expect("connect admin db");
+            sqlx::query(&format!("DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"))
+                .execute(&admin)
+                .await
+                .expect("drop stale test db");
+            sqlx::query(&format!("CREATE DATABASE {dbname}"))
+                .execute(&admin)
+                .await
+                .expect("create test db");
+            admin.close().await;
+
+            let url = swap_db(&admin_url, &dbname);
+            let pool = sqlx::PgPool::connect(&url).await.expect("connect test db");
+            scarab_db_postgres::PostgresDb::with_pool(pool.clone())
+                .migrate()
+                .await
+                .expect("migrate test db");
+            Some(Self {
+                pool,
+                admin_url,
+                dbname,
+            })
+        }
+    }
+
+    /// Best-effort teardown without an explicit `cleanup().await` at ~30 call
+    /// sites: a plain thread with its own tiny runtime, joined, so a passing
+    /// run leaves no `scarab_ws_test_*` databases behind. `WITH (FORCE)`
+    /// terminates the harness's own live connections.
+    impl Drop for TestPg {
+        fn drop(&mut self) {
+            let admin_url = self.admin_url.clone();
+            let dbname = self.dbname.clone();
+            let _ = std::thread::spawn(move || {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(async {
+                    if let Ok(admin) = sqlx::PgPool::connect(&admin_url).await {
+                        let _ = sqlx::query(&format!(
+                            "DROP DATABASE IF EXISTS {dbname} WITH (FORCE)"
+                        ))
+                        .execute(&admin)
+                        .await;
+                        admin.close().await;
+                    }
+                });
+            })
+            .join();
+        }
+    }
+
+    /// Replace the database path in a connection URL, preserving query params.
+    fn swap_db(url: &str, dbname: &str) -> String {
+        let (base, query) = match url.split_once('?') {
+            Some((b, q)) => (b, Some(q)),
+            None => (url, None),
+        };
+        let slash = base.rfind('/').expect("url has a path");
+        let mut out = format!("{}/{}", &base[..slash], dbname);
+        if let Some(q) = query {
+            out.push('?');
+            out.push_str(q);
+        }
+        out
+    }
+
     #[test]
     fn only_a_64_char_lowercase_hex_hash_is_accepted() {
         let good = "a".repeat(64);
@@ -4056,7 +4194,7 @@ mod tests {
     async fn a_put_writes_warm_only_and_the_flush_rpc_is_what_archives_it() {
         use scarab_storage::ObjectStore;
 
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
 
         // A NEW blob and a NEW tree naming it, canonicalised exactly as the
         // client's linked `scarab_storage` would.
@@ -4153,7 +4291,7 @@ mod tests {
     async fn a_read_scoped_token_cannot_trigger_the_archival_flush() {
         use tower::ServiceExt;
 
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let step_token = workspace_token::mint(
             b"export-secret",
             &workspace_token::step_claims(
@@ -4199,7 +4337,7 @@ mod tests {
     async fn the_flush_route_tells_fatal_from_retryable() {
         use scarab_storage::ObjectStore;
 
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
 
         // A root neither tier holds: the walk fails, and that is RETRYABLE — the
         // caller's re-driven drain re-uploads via `/have` + PUTs before retrying.
@@ -4349,7 +4487,7 @@ mod tests {
     async fn under_warm_only_a_flush_is_a_200_disclosure_and_cold_is_not_written() {
         use scarab_storage::ObjectStore;
 
-        let h = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await;
+        let Some(h) = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await else { return };
 
         let blob = b"warm-only content".to_vec();
         let blob_hash = hash_hex(&blob);
@@ -4421,7 +4559,7 @@ mod tests {
     /// flush and the warm materialize below has nothing to read.
     #[tokio::test]
     async fn under_warm_only_a_settle_publishes_warm_and_discloses_no_archive() {
-        let h = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await;
+        let Some(h) = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await else { return };
         let (handle, _capability, workspace) = h.prepare().await;
         std::fs::write(workspace.join("keep.txt"), b"the step rewrote this").expect("rewrite");
 
@@ -4468,12 +4606,12 @@ mod tests {
     async fn the_tier_route_answers_the_states_tier_and_only_to_browse_scope() {
         use tower::ServiceExt;
 
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         assert_eq!(
             h.json("GET", "/v1/tier", None).await,
             serde_json::json!({ "tier": "separate-volume" })
         );
-        let hw = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await;
+        let Some(hw) = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await else { return };
         assert_eq!(
             hw.json("GET", "/v1/tier", None).await,
             serde_json::json!({ "tier": "warm-only" })
@@ -4522,7 +4660,7 @@ mod tests {
     /// `put_tree` leg would later re-file under a different address.
     #[tokio::test]
     async fn a_tree_put_that_is_not_in_canonical_form_is_refused_as_skew() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let entries = vec![TreeEntry::new(
             "a.txt",
             TreeTarget::Blob(BlobHash("aa".repeat(32))),
@@ -4606,7 +4744,7 @@ mod tests {
     /// the token's own fence and the OTHER fence's 403 assertion fails.
     #[tokio::test]
     async fn a_fenced_tree_put_is_ledgered_and_authorizes_that_fences_own_read_back() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let token = h.step_token("r1", "build", "a1");
 
         let blob = b"the drain wrote this".to_vec();
@@ -4658,7 +4796,7 @@ mod tests {
     /// 200 over content this fence never wrote.
     #[tokio::test]
     async fn a_ledgered_parent_naming_a_foreign_tree_gets_single_reads_but_never_flat() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
 
         // A foreign fence's content: a blob and the tree naming it.
         let foreign = h.step_token("r0", "seed", "a1");
@@ -4770,7 +4908,7 @@ mod tests {
     /// Mutation killed: a future append-on-have in the `/have` handler.
     #[tokio::test]
     async fn a_have_probe_never_appends_the_ledger() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
 
         // Foreign content, present in warm.
         let foreign = h.step_token("r0", "seed", "a1");
@@ -4832,7 +4970,7 @@ mod tests {
     /// and this cross-fence hash-naming answers 200.
     #[tokio::test]
     async fn a_drain_record_naming_an_unledgered_root_is_refused_naming_it() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let token = h.step_token("r1", "build", "a1");
         let (status, body) = h
             .call_as(
@@ -4857,7 +4995,7 @@ mod tests {
     /// Depot cannot serve.
     #[tokio::test]
     async fn a_drain_record_with_an_incomplete_blob_closure_is_refused() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let token = h.step_token("r1", "build", "a1");
 
         let missing_blob = hash_hex(b"never uploaded");
@@ -4915,7 +5053,7 @@ mod tests {
     /// stranding the retried drain that finally worked.
     #[tokio::test]
     async fn a_success_record_is_write_once_and_an_error_record_is_overwritable() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
 
         // Fence 1: success, then a stale retry.
         let f1 = h.step_token("r1", "build", "a1");
@@ -4974,7 +5112,7 @@ mod tests {
     async fn a_drain_record_is_browse_read_only_and_survives_a_restart() {
         use tower::ServiceExt;
 
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let f1 = h.step_token("r1", "build", "a1");
         let root = seed_fenced_snapshot(&h, &f1).await;
         let (status, body) = h
@@ -5000,6 +5138,10 @@ mod tests {
             h.cold.clone(),
             b"export-secret".to_vec(),
             DurabilityTier::SeparateVolume,
+            // The SAME database, deliberately: a restarted replica — or a
+            // DIFFERENT one behind the ClusterIP — shares the control plane's
+            // Postgres, which is the whole point of ADR-0067 part 2.
+            h.state.db.clone(),
         )
         .expect("reopen the workspace state over the same volume");
         let request = axum::http::Request::builder()
@@ -5033,7 +5175,7 @@ mod tests {
     /// on a Step's say-so).
     #[tokio::test]
     async fn every_export_route_refuses_a_fenced_token() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         // The token's own fence matches the body, so the SCOPE gate — not the
         // mismatch check — is what must refuse prepare.
         let token = h.step_token("run-1", "build", "a1");
@@ -5077,7 +5219,7 @@ mod tests {
     /// assertion fails.
     #[tokio::test]
     async fn a_prepare_naming_another_fence_is_refused_as_a_mismatch() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let token = h.step_token("run-1", "build", "a1");
         let mut body = h.prepare_body();
         body["attempt"] = serde_json::json!("someone-elses-attempt");
@@ -5128,6 +5270,10 @@ mod tests {
         cold: Arc<S3Storage>,
         parent: Snapshot,
         token: String,
+        /// Keeps the throwaway database alive for the harness's lifetime; its
+        /// `Drop` tears the database down.
+        #[allow(dead_code)]
+        pg: TestPg,
     }
 
     impl ExportHarness {
@@ -5135,11 +5281,16 @@ mod tests {
         /// explicitly (the router never probes — see [`router`]), so the two
         /// tempdirs living on one device is irrelevant, and the flush legs run
         /// exactly as they would against a second PVC.
-        async fn start() -> Self {
+        ///
+        /// `None` = no `SCARAB_TEST_DATABASE_URL` (see [`TestPg::provision`]):
+        /// the fence rows live in Postgres now (ADR-0067 part 2), so the
+        /// Depot's acceptance grain needs one.
+        async fn start() -> Option<Self> {
             Self::start_with_tier(DurabilityTier::SeparateVolume).await
         }
 
-        async fn start_with_tier(tier: DurabilityTier) -> Self {
+        async fn start_with_tier(tier: DurabilityTier) -> Option<Self> {
+            let pg = TestPg::provision().await?;
             let tmp = tempfile::tempdir().expect("tempdir");
             let warm_dir = tmp.path().join("warm");
             let cold_dir = tmp.path().join("cold");
@@ -5165,8 +5316,14 @@ mod tests {
             }
 
             let cold = Arc::new(S3Storage::local(&cold_dir).expect("cold store"));
-            let state = open_state(&warm_dir, cold.clone(), b"export-secret".to_vec(), tier)
-                .expect("open the workspace state");
+            let state = open_state(
+                &warm_dir,
+                cold.clone(),
+                b"export-secret".to_vec(),
+                tier,
+                pg.pool.clone(),
+            )
+            .expect("open the workspace state");
 
             // A real predecessor Step leaves the parent in warm (its drain) AND in
             // cold (its flush). `TieredCas::ingest` is a deliberate refusal since
@@ -5195,13 +5352,14 @@ mod tests {
                 b"export-secret",
                 &workspace_token::browse_claims(i64::MAX / 2),
             );
-            Self {
+            Some(Self {
                 tmp,
                 state,
                 cold,
                 parent,
                 token,
-            }
+                pg,
+            })
         }
 
         /// The drain's read handle, composed out of the state's own `TieredCas` exactly
@@ -5409,7 +5567,7 @@ mod tests {
     ///   the response, which ADR-0064 rejects by name — there is nothing there to read.
     #[tokio::test]
     async fn a_step_publishes_exactly_what_it_left_including_a_deletion_and_cold_can_serve_it() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let (handle, _capability, workspace) = h.prepare().await;
 
         // Exactly what a Step does: edit, add, delete.
@@ -5481,7 +5639,7 @@ mod tests {
     /// is the same property at the fold's grain and carries the reasoning.
     #[tokio::test]
     async fn the_reingest_drain_reuses_the_files_the_step_never_touched() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let (handle, _capability, workspace) = h.prepare().await;
         std::fs::write(workspace.join("keep.txt"), b"touched").expect("rewrite");
         // The blob of a file the Step will NOT touch, deleted from cold before the
@@ -5554,7 +5712,7 @@ mod tests {
     /// the same state the fold is in, made exact.
     #[tokio::test]
     async fn a_reap_is_refused_while_a_drain_is_reading_the_evidence() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let (handle, _capability, _workspace) = h.prepare().await;
 
         let inputs = h
@@ -5602,7 +5760,7 @@ mod tests {
     /// that makes the careless handler safe too.
     #[tokio::test]
     async fn a_settle_that_fails_does_not_reap_the_export() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let (handle, _capability, workspace) = h.prepare().await;
         std::fs::remove_dir_all(&workspace).expect("remove the writable tree");
         std::fs::write(&workspace, b"not a directory").expect("put a file in its place");
@@ -5702,7 +5860,7 @@ mod tests {
     /// silently drops a rung reports a number the real deployment never produces.
     #[tokio::test]
     async fn a_prepare_builds_the_farm_it_leases_and_reports_the_rungs() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let farm_path = h
             .state
             .farm
@@ -5751,7 +5909,7 @@ mod tests {
     /// wire admitting the Export exists.
     #[tokio::test]
     async fn a_capability_claims_once_per_client_and_a_second_client_is_refused_blindly() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let (handle, capability, workspace) = h.prepare().await;
 
         let claim = |client: &str| {
@@ -5829,11 +5987,19 @@ mod tests {
         std::fs::create_dir_all(&stranger).expect("mkdir stranger");
 
         let cold = Arc::new(S3Storage::local(&cold_dir).expect("cold store"));
+        // A lazy pool nothing ever connects: this test's claim is the farm
+        // residue sweep, which never touches the fence rows. The background
+        // fence-residue sweep the router spawns fails per-pass against it,
+        // which is exactly the non-fatal degradation `run` documents.
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused-in-this-test/none")
+            .expect("lazy pool");
         let _router = router(
             &warm_dir,
             cold,
             b"export-secret".to_vec(),
             DurabilityTier::SeparateVolume,
+            db,
         )
         .expect("router");
 
@@ -5883,7 +6049,7 @@ mod tests {
     /// own plumbing rather than by hand — see the note there.
     #[tokio::test]
     async fn the_change_set_fold_writes_warm_and_the_flush_is_what_reaches_cold() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let settled = fold_one_edit(&h).await;
 
         assert_eq!(
@@ -6058,7 +6224,7 @@ mod tests {
     /// field would leak onto a failure response.
     #[tokio::test]
     async fn a_settle_whose_cold_flush_fails_does_not_report_durable() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let (handle, _capability, workspace) = h.prepare().await;
         std::fs::write(workspace.join("keep.txt"), b"the step rewrote this").expect("rewrite");
         break_cold(&h, "blobs");
@@ -6126,7 +6292,7 @@ mod tests {
     /// below is what still catches a phase swap.
     #[tokio::test]
     async fn a_flush_that_fails_leaves_no_cold_tree_naming_an_absent_child() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let settled = fold_one_edit(&h).await;
         break_cold(&h, "blobs");
 
@@ -6165,7 +6331,7 @@ mod tests {
     /// indistinguishable.
     #[tokio::test]
     async fn a_second_flush_of_the_same_snapshot_writes_nothing() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let settled = fold_one_edit(&h).await;
         let handle = ExportHandle::parse(&"ab".repeat(32)).expect("a handle");
 
@@ -6241,7 +6407,7 @@ mod tests {
     /// (the tally assertion says the probe answered for the whole inventory).
     #[tokio::test]
     async fn a_flush_whose_inventory_cold_already_holds_reads_no_blob_out_of_warm() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let settled = fold_one_edit(&h).await;
         let handle = ExportHandle::parse(&"3c".repeat(32)).expect("a handle");
 
@@ -6303,7 +6469,7 @@ mod tests {
     /// exercises.
     #[tokio::test]
     async fn a_cold_tier_that_cannot_answer_the_existence_probe_fails_the_flush() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let settled = fold_one_edit(&h).await;
         break_cold(&h, "blobs");
 
@@ -6344,7 +6510,7 @@ mod tests {
     /// to cover it.
     #[tokio::test]
     async fn a_blob_the_drain_reused_is_still_offered_to_the_cold_flush() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let settled = fold_one_edit(&h).await;
 
         let inherited = BlobHash(hash_hex(b"keep.txt"));
@@ -6391,7 +6557,7 @@ mod tests {
     /// three layers later.
     #[tokio::test]
     async fn an_inherited_sub_tree_is_in_the_flush_inventory_below_the_tree_that_names_it() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         let settled = fold_one_edit(&h).await;
 
         let inherited = h
@@ -6458,7 +6624,7 @@ mod tests {
     /// tier holding a root over absent children after a *failed* flush.
     #[tokio::test]
     async fn the_walked_flush_inventory_is_deepest_level_first() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
 
         // Three levels, so the ordering is a claim about more than "reversed or not": a
         // two-level fixture passes for a `swap` as well as for a sort.
@@ -6536,7 +6702,7 @@ mod tests {
     /// settle would report `durable: true` for a root cold cannot resolve.
     #[tokio::test]
     async fn a_cold_tier_that_files_content_under_another_address_fails_the_flush() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
 
         // The parent's real tree object, re-filed in warm under an address that is
         // well-formed and certainly not its own.
@@ -6590,7 +6756,7 @@ mod tests {
     /// loop would be testing `tokio::time`.
     #[tokio::test]
     async fn the_reaper_collects_an_expired_export_and_forgets_its_capture() {
-        let h = ExportHarness::start().await;
+        let Some(h) = ExportHarness::start().await else { return };
         // An Export whose capability has already expired. `exp` is an absolute unix
         // second the caller computes, so expiry is expressed by choosing one in the
         // past — no clock to move, which is why this role needs no `Clock`.

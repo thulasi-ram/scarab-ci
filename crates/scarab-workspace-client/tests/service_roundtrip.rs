@@ -29,9 +29,12 @@ use scarab_storage::{Cas, MODE_SYMLINK};
 use scarab_storage_s3::S3Storage;
 use scarab_workspace_client::WorkspaceClient;
 
+mod common;
+
 const SECRET: &[u8] = b"acceptance-workspace-secret";
 
-/// A running service plus the tempdirs behind it. Dropping it drops the dirs.
+/// A running service plus the tempdirs behind it. Dropping it drops the dirs
+/// (and the throwaway database — see `common::TestPg`).
 struct Harness {
     base: String,
     warm: tempfile::TempDir,
@@ -40,17 +43,24 @@ struct Harness {
     #[allow(dead_code)]
     cold: tempfile::TempDir,
     cold_store: Arc<S3Storage>,
+    /// The fence rows' database (ADR-0067 part 2). Held for its `Drop`.
+    #[allow(dead_code)]
+    pg: common::TestPg,
 }
 
 impl Harness {
     /// The default harness is separate-volume-shaped: the tier is a router
     /// parameter (only `workspaced::run` probes), so the tempdirs sharing a
     /// device does not demote it.
-    async fn start() -> Self {
+    ///
+    /// `None` = no `SCARAB_TEST_DATABASE_URL` configured (the caller skips):
+    /// the write ledger and the drain records are Postgres rows now.
+    async fn start() -> Option<Self> {
         Self::start_with_tier(scarab_server::workspaced::DurabilityTier::SeparateVolume).await
     }
 
-    async fn start_with_tier(tier: scarab_server::workspaced::DurabilityTier) -> Self {
+    async fn start_with_tier(tier: scarab_server::workspaced::DurabilityTier) -> Option<Self> {
+        let pg = common::TestPg::provision().await?;
         let warm = tempfile::tempdir().expect("warm tempdir");
         let cold = tempfile::tempdir().expect("cold tempdir");
         let cold_store = Arc::new(S3Storage::local(cold.path()).expect("cold store"));
@@ -59,6 +69,7 @@ impl Harness {
             cold_store.clone(),
             SECRET.to_vec(),
             tier,
+            pg.pool.clone(),
         )
         .expect("router");
 
@@ -70,12 +81,13 @@ impl Harness {
             let _ = axum::serve(listener, app).await;
         });
 
-        Self {
+        Some(Self {
             base: format!("http://{addr}"),
             warm,
             cold,
             cold_store,
-        }
+            pg,
+        })
     }
 
     /// A client holding a `read`-scope token fenced to one run/step/attempt and
@@ -176,7 +188,7 @@ fn mode_of(path: &std::path::Path) -> u32 {
 /// restore path — and it needs its own test, which is this one.
 #[tokio::test]
 async fn a_snapshot_round_trips_through_the_service_with_metadata_intact() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());
 
@@ -255,7 +267,7 @@ async fn a_snapshot_round_trips_through_the_service_with_metadata_intact() {
 /// forked and a snapshot written one way is invisible the other way.
 #[tokio::test]
 async fn a_snapshot_written_through_the_service_has_the_same_root_as_one_written_direct() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());
 
@@ -300,7 +312,7 @@ async fn a_snapshot_written_through_the_service_has_the_same_root_as_one_written
 /// `have` reports MISSING, and it reports it correctly in both directions.
 #[tokio::test]
 async fn have_reports_exactly_what_is_missing() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let client = h.browse_client();
 
     let stored = client.put_blob(b"i am stored").await.unwrap();
@@ -334,7 +346,7 @@ async fn have_reports_exactly_what_is_missing() {
 /// round trip per directory.
 #[tokio::test]
 async fn flat_returns_the_whole_subtree_in_one_call() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());
     let snapshot = h
@@ -392,7 +404,7 @@ async fn flat_returns_the_whole_subtree_in_one_call() {
 /// halves — the read succeeds, and afterwards warm can answer on its own.
 #[tokio::test]
 async fn a_cold_only_snapshot_is_served_and_backfills_the_warm_tier() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());
 
@@ -445,7 +457,7 @@ async fn a_cold_only_snapshot_is_served_and_backfills_the_warm_tier() {
 /// path rather than in the response.
 #[tokio::test]
 async fn a_body_that_does_not_hash_to_its_address_is_rejected() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let wrong = "a".repeat(64);
     let resp = h
         .raw()
@@ -461,7 +473,7 @@ async fn a_body_that_does_not_hash_to_its_address_is_rejected() {
 /// PUT is idempotent: 201 the first time, 200 when the service already had it.
 #[tokio::test]
 async fn put_is_idempotent_and_says_which_happened() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let body = b"idempotent".to_vec();
     let hash = {
         use sha2::Digest;
@@ -494,7 +506,7 @@ async fn put_is_idempotent_and_says_which_happened() {
 /// identity; the alternative is one object forked under two warm keys.
 #[tokio::test]
 async fn a_tagged_address_names_the_same_object_as_its_bare_form() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let body = b"tagged and bare are one object".to_vec();
     let hash = {
         use sha2::Digest;
@@ -583,7 +595,7 @@ async fn a_tagged_address_names_the_same_object_as_its_bare_form() {
 /// part 12 — `blake3:` is the intended follow-up, not an accepted input).
 #[tokio::test]
 async fn an_unknown_algorithm_tag_is_a_400() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let addr = format!("blake3:{}", "a".repeat(64));
     for url in [
         format!("{}/v1/cas/blobs/{addr}", h.base),
@@ -613,7 +625,7 @@ async fn an_unknown_algorithm_tag_is_a_400() {
 /// that does not name the root is 403, which is a different fact.
 #[tokio::test]
 async fn the_token_is_actually_enforced() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());
     let snapshot = h
@@ -682,7 +694,7 @@ async fn the_token_is_actually_enforced() {
 /// address they were fetched by.
 #[tokio::test]
 async fn tree_bytes_come_back_verbatim() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let client = h.browse_client();
     let blob = client.put_blob(b"x").await.unwrap();
     let root = client
@@ -734,7 +746,7 @@ async fn tree_bytes_come_back_verbatim() {
 /// a range read must transfer the range, and a size must not transfer content.
 #[tokio::test]
 async fn ranged_reads_and_sizes_work_without_transferring_the_whole_blob() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let client = h.browse_client();
     let body: Vec<u8> = (0u8..=255).cycle().take(100_000).collect();
     let hash = client.put_blob(&body).await.unwrap();
@@ -761,7 +773,7 @@ async fn ranged_reads_and_sizes_work_without_transferring_the_whole_blob() {
 /// tier is empty" and silently falling through.
 #[tokio::test]
 async fn absent_is_not_found_and_unreachable_is_not_absent() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let client = h.browse_client();
     assert!(matches!(
         client
@@ -782,7 +794,7 @@ async fn absent_is_not_found_and_unreachable_is_not_absent() {
 /// plane's DB check — this role has no database at all.
 #[tokio::test]
 async fn healthz_and_readyz_answer_without_a_database() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let raw = h.raw();
     assert_eq!(
         raw.get(format!("{}/healthz", h.base))
@@ -818,7 +830,7 @@ async fn healthz_and_readyz_answer_without_a_database() {
 /// service's filesystem.
 #[tokio::test]
 async fn a_malformed_hash_is_rejected_before_anything_touches_the_filesystem() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     for bad in ["short", &"A".repeat(64), &"g".repeat(64)] {
         let resp = h
             .raw()
@@ -834,7 +846,7 @@ async fn a_malformed_hash_is_rejected_before_anything_touches_the_filesystem() {
 /// The cap exists so one request cannot ask about an unbounded set.
 #[tokio::test]
 async fn an_oversized_have_batch_is_refused() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let blobs: Vec<String> = (0..10_001).map(|i| format!("{i:064x}")).collect();
     let resp = h
         .raw()
@@ -854,7 +866,7 @@ async fn an_oversized_have_batch_is_refused() {
 async fn a_later_snapshot_can_overlay_a_read_only_file_and_a_symlink() {
     use std::os::unix::fs::PermissionsExt;
 
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let client = h.browse_client();
 
     let first_src = tempfile::tempdir().unwrap();
@@ -945,7 +957,7 @@ async fn a_directory_with_no_recorded_mode_is_restored_not_left_widened() {
     use scarab_storage::{TreeEntry, TreeTarget};
     use std::os::unix::fs::PermissionsExt;
 
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let writer = h.browse_client();
 
     // A synthetic tree, built through `put_tree`/`put_blob` rather than `ingest`:
@@ -993,7 +1005,7 @@ async fn a_directory_with_no_recorded_mode_is_restored_not_left_widened() {
 /// leg's 403 would come back as a garbled `Ok`.
 #[tokio::test]
 async fn depot_tier_is_answered_over_real_http_and_wants_browse_scope() {
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     assert_eq!(
         h.browse_client().depot_tier().await.expect("depot_tier"),
         "separate-volume"
@@ -1018,7 +1030,7 @@ async fn depot_tier_is_answered_over_real_http_and_wants_browse_scope() {
 async fn a_warm_only_depot_flush_classifies_as_warm_only() {
     use scarab_workspace_client::FlushOutcome;
 
-    let h = Harness::start_with_tier(scarab_server::workspaced::DurabilityTier::WarmOnly).await;
+    let Some(h) = Harness::start_with_tier(scarab_server::workspaced::DurabilityTier::WarmOnly).await else { return };
     let client = h.browse_client();
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());
@@ -1047,7 +1059,7 @@ async fn a_warm_only_depot_flush_classifies_as_warm_only() {
 async fn a_separate_volume_depot_flush_is_durable_and_names_its_tier() {
     use scarab_workspace_client::FlushOutcome;
 
-    let h = Harness::start().await;
+    let Some(h) = Harness::start().await else { return };
     let client = h.browse_client();
     let source = tempfile::tempdir().unwrap();
     build_fixture(source.path());

@@ -47,6 +47,12 @@ path = "src/bin/scarab-wsfetch.rs"
 # Not in `[workspace.dependencies]` — scarab-server is the composition root and
 # nothing depends on it in production. A dev-dep path is deliberate.
 scarab-server = { path = "../scarab-server" }
+# The fence rows (drain records, write ledgers) are Postgres rows since
+# ADR-0067 part 2, so the acceptance harness provisions a real, migrated
+# throwaway database per test (tests/common/mod.rs) — migrated through the
+# control plane's own path, because the Depot under test never migrates.
+scarab-db-postgres = { workspace = true }
+sqlx = { workspace = true }
 scarab-storage-s3 = { workspace = true }
 scarab-executor-k8s = { workspace = true }
 axum = { workspace = true }

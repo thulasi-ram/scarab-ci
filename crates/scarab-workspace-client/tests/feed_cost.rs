@@ -36,6 +36,8 @@ use scarab_workspace_client::WorkspaceClient;
 
 const SECRET: &[u8] = b"measurement-workspace-secret";
 
+mod common;
+
 /// The s0 constant: 8.19 MB of workspace, held fixed across file counts so
 /// per-file cost separates from per-byte cost.
 const TOTAL_BYTES: usize = 8_190_000;
@@ -44,10 +46,16 @@ struct Harness {
     base: String,
     _warm: tempfile::TempDir,
     _cold: tempfile::TempDir,
+    _pg: common::TestPg,
 }
 
 impl Harness {
     async fn start() -> Self {
+        // A benchmark run explicitly (`--ignored`) fails loudly rather than
+        // skipping: a silently-skipped measurement is a wrong number.
+        let pg = common::TestPg::provision()
+            .await
+            .expect("this benchmark needs SCARAB_TEST_DATABASE_URL (the fence rows are Postgres rows — ADR-0067 part 2)");
         let warm = tempfile::tempdir().expect("warm tempdir");
         let cold = tempfile::tempdir().expect("cold tempdir");
         let cold_store = Arc::new(S3Storage::local(cold.path()).expect("cold store"));
@@ -56,6 +64,7 @@ impl Harness {
             cold_store,
             SECRET.to_vec(),
             scarab_server::workspaced::DurabilityTier::SeparateVolume,
+            pg.pool.clone(),
         )
         .expect("router");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -69,6 +78,7 @@ impl Harness {
             base: format!("http://{addr}"),
             _warm: warm,
             _cold: cold,
+            _pg: pg,
         }
     }
 
