@@ -177,8 +177,10 @@ use scarab_storage::content::{FlatDir, FlatEntry, FlatManifest};
 use scarab_storage::statcache::StatCache;
 use scarab_storage::tiered::{TieredCas, TieredObjectStore};
 use scarab_storage::{
-    BlobHash, Cas, ObjectStore, Snapshot, StorageError, TreeEntry, TreeHash, TreeTarget,
+    tagged_address, BlobHash, Cas, HashAlgo, ObjectStore, Snapshot, StorageError, TreeEntry,
+    TreeHash, TreeTarget,
 };
+use scarab_storage_s3::pack::{FinishedPack, PackMember, PackMemberKind, PackWriter};
 use scarab_storage_s3::S3Storage;
 
 use crate::changeset;
@@ -250,6 +252,23 @@ const DRAIN_RECORD_VERSION: u32 = 1;
 const FENCE_RESIDUE_TTL_SECS: i64 =
     workspace_token::WORKSPACE_TOKEN_MAX_TTL_SECS + workspace_token::WORKSPACE_TOKEN_GRACE_SECS;
 
+/// The request header labelling a CAS PUT's durability (ADR-0067 part 6):
+/// `durable` (streamed into the fence's pack) or `cache-only` (warm only,
+/// unpromised and evictable). **Absent = durable** — an old `scarab-wsfetch`
+/// image sends no label, and defaulting the other way would silently demote
+/// its whole drain to a promise nothing keeps; until images roll, its scratch
+/// rides the packs too, which is waste and never loss.
+const DURABILITY_HEADER: &str = "x-scarab-durability";
+
+/// Where one body pack rolls over to the next (ADR-0067 part 7: size-capped,
+/// always closed at the drain boundary). 64 MiB: large enough that a typical
+/// drain is one or two packs (one PUT-equivalent each), small enough that
+/// reading three files out of a pack is never a multi-gigabyte range's
+/// neighbourhood. A member LARGER than the cap gets its own single-member
+/// pack — there is deliberately no loose-durable side channel, so pack
+/// footers alone describe everything durable the bucket holds.
+const PACK_SIZE_CAP_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Everything the service handlers need. Cheap to clone (all `Arc`, plus a
 /// [`SnapshotFarm`] which is two paths and a flag).
 #[derive(Clone)]
@@ -315,11 +334,21 @@ struct WorkspaceState {
     /// response discloses `durable: false, tier: "warm-only"`.
     tier: DurabilityTier,
     /// The control plane's Postgres (ADR-0067 part 2) — for the fence rows
-    /// only: `depot_drain_records` and `depot_fence_writes`, both derived and
-    /// rebuildable, both shared across replicas. Connected **lazily**
-    /// ([`run`]) so a database outage degrades exactly the fence-keyed routes
-    /// and never the content path; this role NEVER migrates.
+    /// (`depot_drain_records`, `depot_fence_writes`) and the pack index
+    /// (`depot_packs`, `depot_pack_members`), all derived and rebuildable,
+    /// all shared across replicas. Connected **lazily** ([`run`]) so a
+    /// database outage degrades exactly the fence-keyed routes — and turns
+    /// durable-only reads into retryable 500s, never 404s — while the
+    /// warm-served content path keeps answering; this role NEVER migrates.
     db: sqlx::PgPool,
+    /// `fence_key → the fence's open pack session` (ADR-0067 parts 4–8): the
+    /// per-drain state between "durable bytes started arriving" and "the
+    /// drain record sealed them". In memory like [`Self::captures`], and for
+    /// the same reason it is safe there: a restart forgets the session, the
+    /// abandoned multipart uploads publish nothing, and the re-driven drain
+    /// re-uploads. The outer lock is sync and never held across an `await`;
+    /// each session's own lock is async because appending IS I/O.
+    packs: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<PackSession>>>>>,
 }
 
 impl WorkspaceState {
@@ -639,6 +668,7 @@ fn open_state(
         captures: Arc::new(Mutex::new(BTreeMap::new())),
         tier,
         db,
+        packs: Arc::new(Mutex::new(BTreeMap::new())),
     })
 }
 
@@ -1459,8 +1489,9 @@ async fn get_blob(
         Err(e) => return Err(warm_volume_error("get_blob open", &path, e)),
     }
 
-    // Warm miss: pull through cold (and backfill warm on the way).
-    let data = state.cas.get_blob(&BlobHash(hash)).await?;
+    // Warm miss: the pack index first (ranged read, backfills warm), then the
+    // loose cold object (dual-read migration, ADR-0067).
+    let data = blob_via_pack_then_loose(&state, &hash).await?;
     let mut resp = data.into_response();
     resp.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
@@ -1520,11 +1551,13 @@ async fn ranged_blob(
                 .map_err(|e| WsError::Backend(e.to_string()))?;
             (buf, total)
         }
-        // Warm miss: pull the whole blob through cold (which backfills warm) and
-        // slice. There is no range read on the cold port — that asymmetry is the
-        // reason `ContentSource` exists.
+        // Warm miss: whole member via the pack index (which backfills warm), or
+        // the whole loose blob through cold (ditto) — then slice. The pack read
+        // fetches the member entire rather than ranging at `offset + first`,
+        // because a partial read cannot be verified against its address; the
+        // backfill makes the next range a warm seek anyway.
         None => {
-            let whole = state.cas.get_blob(&BlobHash(hash.to_string())).await?;
+            let whole = blob_via_pack_then_loose(state, hash).await?;
             let total = whole.len() as u64;
             if first >= total {
                 let mut resp = Response::new(Body::empty());
@@ -1586,11 +1619,11 @@ async fn head_blob(
     let path = warm_blob_path(&state, &hash);
     let len = match tokio::fs::metadata(&path).await {
         Ok(meta) => meta.len(),
-        // Cold-only: there is no size-without-read on the cold port, so this is
-        // a full read. Slow, never wrong — and it backfills warm, so the second
-        // HEAD is cheap.
+        // Not warm: the pack index answers the size with NO read at all
+        // (ADR-0067 part 9); only a loose-only legacy blob still pays the
+        // full cold read (which backfills warm, so the second HEAD is cheap).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            state.cas.get_blob(&BlobHash(hash)).await?.len() as u64
+            blob_size_via_pack_then_loose(&state, &hash).await?
         }
         // A broken volume must not answer as a miss: `blob_size` is what a lazy
         // mount's `getattr` calls, and a wrong size there is a wrong file.
@@ -1620,8 +1653,9 @@ async fn put_blob(
     Path(hash): Path<String>,
     body: axum::body::Bytes,
 ) -> Result<Response, WsError> {
-    authenticate(&state, &headers)?;
+    let claims = authenticate(&state, &headers)?;
     let hash = valid_address(&hash)?;
+    let durability = durability_of(&headers)?;
 
     let actual = hash_hex(&body);
     if actual != hash {
@@ -1652,11 +1686,28 @@ async fn put_blob(
     // writing cold here again would put the per-object round trip ADR-0061
     // measured at 81–88% of a Step boundary straight back on the hot path, and
     // it would do so silently, because nothing would fail.
+    //
+    // ADR-0067 amends exactly one case: a FENCED durable PUT additionally
+    // streams into its fence's pack below — one multipart upload per drain,
+    // not a cold round trip per object, so the cost this paragraph defends
+    // against does not return with the durability.
     let already = warm_has(&warm_blob_path(&state, &hash)).await?;
     state
         .warm
         .put(&format!("blobs/{hash}"), body.to_vec())
         .await?;
+
+    // ADR-0067 parts 4–6: a fence's DURABLE bytes stream into its pack as
+    // they arrive — durable-at-the-drain, no second pass. Cache-only stays
+    // the warm seed above, unpromised. A durable PUT with no fence (the
+    // control plane's own ingest) has no drain to close a pack, so it keeps
+    // the ADR-0064 shape this slice inherits: warm now, the flush archives.
+    if durability == Durability::Durable {
+        if let Some(fence) = fence_claim(&claims) {
+            pack_append(&state, fence, PackMemberKind::Blob, &hash, &body).await?;
+        }
+    }
+
     Ok(if already {
         StatusCode::OK.into_response()
     } else {
@@ -1681,7 +1732,12 @@ async fn get_tree(
     // hold bare hex, so a tagged spelling must be stripped for them to match.
     let hash = valid_address(&hash)?;
     authorize_tree(&state, &headers, &hash, TreeRead::Single).await?;
-    let bytes = state.objects.get(&format!("trees/{hash}")).await?;
+    let bytes = match state.warm.get(&format!("trees/{hash}")).await {
+        Ok(bytes) => bytes,
+        // Warm miss: pack index first, loose cold second (dual-read).
+        Err(StorageError::NotFound) => tree_bytes_via_pack_then_loose(&state, &hash).await?,
+        Err(e) => return Err(e.into()),
+    };
     let mut resp = bytes.into_response();
     resp.headers_mut().insert(
         axum::http::header::CONTENT_TYPE,
@@ -1707,6 +1763,7 @@ async fn put_tree(
 ) -> Result<Response, WsError> {
     let claims = authenticate(&state, &headers)?;
     let hash = valid_address(&hash)?;
+    let durability = durability_of(&headers)?;
 
     let actual = hash_hex(&body);
     if actual != hash {
@@ -1786,6 +1843,13 @@ async fn put_tree(
     // drain record later with a worse diagnosis.
     if let Some(fence) = fence_claim(&claims) {
         ledger_append(&state, fence, &hash).await?;
+        // The ledger records ALL fence tree PUTs (cache-only included — losing
+        // a cache-only row only re-restricts reads); the PACK records only the
+        // durable subset (ADR-0067 part 8: the footers are the rebuildable
+        // authority for what is durable, nothing else).
+        if durability == Durability::Durable {
+            pack_append(&state, fence, PackMemberKind::Tree, &hash, &body).await?;
+        }
     }
 
     Ok(if already {
@@ -1831,7 +1895,7 @@ async fn flatten(state: &WorkspaceState, root: &TreeHash) -> Result<FlatManifest
     queue.push_back((root.clone(), String::new()));
 
     while let Some((tree, prefix)) = queue.pop_front() {
-        let mut children = state.cas.tree_entries(&tree).await?;
+        let mut children = tree_entries_anywhere(state, &tree).await?;
         // Canonical order, so two calls for the same root produce the same
         // manifest byte-for-byte.
         children.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1881,7 +1945,7 @@ async fn blob_size(state: &WorkspaceState, blob: &BlobHash) -> Result<u64, WsErr
     match tokio::fs::metadata(&path).await {
         Ok(meta) => Ok(meta.len()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(state.cas.get_blob(blob).await?.len() as u64)
+            blob_size_via_pack_then_loose(state, &blob.0).await
         }
         Err(e) => Err(warm_volume_error("flat blob_size", &path, e)),
     }
@@ -1983,6 +2047,474 @@ async fn have(
         missing_blobs,
         missing_trees,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// The pack: the one-pass durable write (ADR-0067 parts 4–10)
+// ---------------------------------------------------------------------------
+
+/// A PUT's declared durability (ADR-0067 part 6), off [`DURABILITY_HEADER`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Durability {
+    /// Streamed into the posting fence's pack as it arrives — durable at the
+    /// drain, no second pass.
+    Durable,
+    /// Warm only: the build-scratch remainder, unpromised and evictable, kept
+    /// for the post-hoc "what did this build actually produce" view.
+    CacheOnly,
+}
+
+/// Parse the durability label. Absent = durable (see [`DURABILITY_HEADER`]);
+/// an unknown value is a 400, fail-closed — a typo'd label must not silently
+/// pick either promise.
+fn durability_of(headers: &HeaderMap) -> Result<Durability, WsError> {
+    match headers.get(DURABILITY_HEADER) {
+        None => Ok(Durability::Durable),
+        Some(v) => match v.to_str() {
+            Ok("durable") => Ok(Durability::Durable),
+            Ok("cache-only") => Ok(Durability::CacheOnly),
+            _ => Err(WsError::BadRequest(format!(
+                "unknown {DURABILITY_HEADER} value — expected `durable` or `cache-only`"
+            ))),
+        },
+    }
+}
+
+/// One fence's drain-in-progress: its open pack, the packs already sealed,
+/// and the addresses packed so far (a client retry re-PUTs idempotently and
+/// must not file the same bytes twice).
+///
+/// Lives from the fence's first durable PUT until its drain record commits
+/// (`post_drain` removes the session only after the index transaction). A
+/// 422'd or error-record drain leaves the session in place on purpose: the
+/// retried drain appends what is still missing and seals then.
+struct PackSession {
+    fence_key: String,
+    next_seq: u32,
+    open: Option<PackWriter>,
+    sealed: Vec<FinishedPack>,
+    packed: HashSet<String>,
+}
+
+impl PackSession {
+    fn new(fence_key: String) -> Self {
+        Self {
+            fence_key,
+            next_seq: 1,
+            open: None,
+            sealed: Vec::new(),
+            packed: HashSet::new(),
+        }
+    }
+
+    /// `packs/<fence_key>/<seq>.pack` — drain-aligned keys (ADR-0067 part 7):
+    /// a pack never shares a fence, so retention that expires the fence
+    /// expires whole packs.
+    fn next_key(&mut self) -> String {
+        let key = format!("packs/{}/{:06}.pack", self.fence_key, self.next_seq);
+        self.next_seq += 1;
+        key
+    }
+
+    /// Append one verified member, rolling at [`PACK_SIZE_CAP_BYTES`]. An
+    /// oversized member gets its own single-member pack, sealed immediately —
+    /// no loose-durable side channel, so the footers stay the whole story.
+    ///
+    /// On any storage failure the open writer is discarded whole and its
+    /// members are forgotten from `packed`, so the client's retried PUTs
+    /// re-append them into a fresh pack rather than being deduped into loss.
+    async fn append(
+        &mut self,
+        cold: &S3Storage,
+        kind: PackMemberKind,
+        tagged: String,
+        data: &[u8],
+    ) -> Result<(), StorageError> {
+        if self.packed.contains(&tagged) {
+            return Ok(());
+        }
+        let len = data.len() as u64;
+        let oversized = len > PACK_SIZE_CAP_BYTES;
+        if oversized
+            || self
+                .open
+                .as_ref()
+                .is_some_and(|w| w.body_bytes() + len > PACK_SIZE_CAP_BYTES)
+        {
+            self.seal_open().await?;
+        }
+        if self.open.is_none() {
+            let key = self.next_key();
+            self.open = Some(cold.open_pack(&key).await?);
+        }
+        let writer = self.open.as_mut().expect("opened above");
+        if let Err(e) = writer.append(kind, tagged.clone(), data).await {
+            self.discard_open();
+            return Err(e);
+        }
+        self.packed.insert(tagged);
+        if oversized {
+            self.seal_open().await?;
+        }
+        Ok(())
+    }
+
+    /// Complete the open pack's multipart upload — the atomic publish. On
+    /// failure the writer's members leave `packed` (see [`Self::append`]).
+    async fn seal_open(&mut self) -> Result<(), StorageError> {
+        let Some(writer) = self.open.take() else {
+            return Ok(());
+        };
+        let addresses: Vec<String> =
+            writer.members().iter().map(|m| m.address.clone()).collect();
+        match writer.finish().await {
+            Ok(finished) => {
+                self.sealed.push(finished);
+                Ok(())
+            }
+            Err(e) => {
+                for address in addresses {
+                    self.packed.remove(&address);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Drop the open writer and forget its members, so retried PUTs re-pack
+    /// them. The abandoned multipart upload publishes nothing.
+    fn discard_open(&mut self) {
+        if let Some(writer) = self.open.take() {
+            for member in writer.members() {
+                self.packed.remove(&member.address);
+            }
+            // Dropped, not awaited: abort is best-effort reclamation and this
+            // is an error path already holding the session lock.
+            drop(writer);
+        }
+    }
+}
+
+/// This fence's pack session, created on first use. The map guard is sync and
+/// dropped before anything awaits.
+fn pack_session(state: &WorkspaceState, fence_key: &str) -> Arc<tokio::sync::Mutex<PackSession>> {
+    let mut map = state.packs.lock().unwrap_or_else(PoisonError::into_inner);
+    map.entry(fence_key.to_string())
+        .or_insert_with(|| {
+            Arc::new(tokio::sync::Mutex::new(PackSession::new(
+                fence_key.to_string(),
+            )))
+        })
+        .clone()
+}
+
+/// Stream one verified durable member into the posting fence's pack (ADR-0067
+/// part 5: the Depot streams; the pod never holds a storage credential). A
+/// failure fails the PUT — the client's re-PUT is idempotent, and a durable
+/// PUT the pack silently missed would be a `/have`-shaped lie later.
+async fn pack_append(
+    state: &WorkspaceState,
+    fence: &Fence,
+    kind: PackMemberKind,
+    hex: &str,
+    data: &[u8],
+) -> Result<(), WsError> {
+    let key = fence_key(fence);
+    let session = pack_session(state, &key);
+    let mut session = session.lock().await;
+    session
+        .append(&state.cold, kind, tagged_address(HashAlgo::Sha256, hex), data)
+        .await
+        .map_err(|e| {
+            WsError::Backend(format!(
+                "streaming {kind} {hex} into pack for fence {key} failed: {e}",
+                kind = kind.as_str()
+            ))
+        })
+}
+
+/// The commit pack's body (ADR-0067 part 8): the fence, the published root,
+/// the sibling list, and every sibling's index — written LAST, as one atomic
+/// PUT at `packs/<fence_key>/commit.pack`. It is both the receipt ("did this
+/// drain finish" = does this object exist) and the ledger's durable half
+/// ("what did this fence write durable" = the indexes in here) — properties
+/// of the object store, answerable by any replica, rebuildable by nothing
+/// but a GET.
+#[derive(Serialize)]
+struct CommitPackDoc<'a> {
+    version: u32,
+    run: &'a str,
+    step: &'a str,
+    attempt: &'a str,
+    fence_key: &'a str,
+    /// Tagged (ADR-0067 part 12), like every address in a footer or index row.
+    root: String,
+    /// The effective published root: `pruned_root` when the drain pruned.
+    published_root: String,
+    packs: Vec<CommitPackEntry<'a>>,
+}
+
+#[derive(Serialize)]
+struct CommitPackEntry<'a> {
+    key: &'a str,
+    bytes: u64,
+    members: &'a [PackMember],
+}
+
+/// Seal this fence's packs and write its commit pack, in the only safe order:
+/// body packs complete (atomic, each), then the commit pack (one PUT, atomic,
+/// LAST — reachability begins here, ADR-0067 parts 4 and 8). Returns the
+/// sealed body packs and the commit pack's `(key, bytes)` for the index
+/// transaction that follows; `(empty, None)` when the fence streamed nothing
+/// durable (a cache-only-everything drain, or a client that never labelled).
+///
+/// On failure the session survives with what it managed to seal, minus the
+/// members of any pack that failed mid-flight (see [`PackSession::seal_open`])
+/// — the re-driven drain re-PUTs those and this seals again, idempotently.
+async fn seal_fence_packs(
+    state: &WorkspaceState,
+    fence: &Fence,
+    record: &DrainRecord,
+) -> Result<(Vec<FinishedPack>, Option<(String, u64)>), WsError> {
+    let key = fence_key(fence);
+    let session = {
+        let map = state.packs.lock().unwrap_or_else(PoisonError::into_inner);
+        map.get(&key).cloned()
+    };
+    let Some(session) = session else {
+        return Ok((Vec::new(), None));
+    };
+    let sealed = {
+        let mut session = session.lock().await;
+        session.seal_open().await.map_err(|e| {
+            WsError::Backend(format!("sealing the open pack for fence {key} failed: {e}"))
+        })?;
+        session.sealed.clone()
+    };
+    if sealed.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+
+    let effective = record.pruned_root.as_deref().unwrap_or(&record.root);
+    let doc = CommitPackDoc {
+        version: PACK_RECORD_VERSION,
+        run: &fence.run,
+        step: &fence.step,
+        attempt: &fence.attempt,
+        fence_key: &key,
+        root: tagged_address(HashAlgo::Sha256, &record.root),
+        published_root: tagged_address(HashAlgo::Sha256, effective),
+        packs: sealed
+            .iter()
+            .map(|p| CommitPackEntry {
+                key: &p.key,
+                bytes: p.bytes,
+                members: &p.members,
+            })
+            .collect(),
+    };
+    let bytes = serde_json::to_vec(&doc)
+        .map_err(|e| WsError::Backend(format!("serialising the commit pack: {e}")))?;
+    let commit_key = format!("packs/{key}/commit.pack");
+    let commit_bytes = bytes.len() as u64;
+    state.cold.put(&commit_key, bytes).await.map_err(|e| {
+        WsError::Backend(format!("writing the commit pack {commit_key} failed: {e}"))
+    })?;
+    Ok((sealed, Some((commit_key, commit_bytes))))
+}
+
+/// The commit pack's format version. Distinct constant from
+/// [`DRAIN_RECORD_VERSION`] because the two documents evolve independently.
+const PACK_RECORD_VERSION: u32 = 1;
+
+/// A query against the pack index (`depot_packs`, `depot_pack_members`)
+/// failed. A 500 the caller retries — never a miss: a durable-only object
+/// must not read as absent because the database blinked (the absent verdict
+/// is what tells a client to skip an upload, the one unrecoverable direction).
+fn pack_rows_error(op: &str, e: sqlx::Error) -> WsError {
+    tracing::warn!(
+        op,
+        error = %e,
+        "workspace service: a pack-index query FAILED — the control plane's Postgres is \
+         unreachable or the schema is behind this binary (the Depot never migrates; \
+         deploy the control plane first — ADR-0067 parts 2 and 11)"
+    );
+    WsError::Backend(format!("pack index ({op}): {e}"))
+}
+
+/// The pack index row for one address, if any: `(pack_key, offset, len)`.
+/// One address may sit in several packs (two drains publishing a shared
+/// blob); any row serves.
+async fn pack_member_of(
+    state: &WorkspaceState,
+    kind: PackMemberKind,
+    hex: &str,
+) -> Result<Option<(String, i64, i64)>, WsError> {
+    sqlx::query_as(
+        "SELECT pack_key, byte_offset, byte_len FROM depot_pack_members \
+         WHERE address = $1 AND kind = $2 LIMIT 1",
+    )
+    .bind(tagged_address(HashAlgo::Sha256, hex))
+    .bind(kind.as_str())
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|e| pack_rows_error("member lookup", e))
+}
+
+/// Read one member out of its pack by ranged read, verify it against its
+/// address, and backfill warm so the next read is local. `Ok(None)` = the
+/// index has no row **or** the bucket no longer has the pack — the bucket
+/// wins over the index (ADR-0067 part 11), so a stale row falls through to
+/// the loose object rather than manufacturing a 404.
+async fn read_packed(
+    state: &WorkspaceState,
+    kind: PackMemberKind,
+    hex: &str,
+) -> Result<Option<Vec<u8>>, WsError> {
+    let Some((pack_key, offset, len)) = pack_member_of(state, kind, hex).await? else {
+        return Ok(None);
+    };
+    let (offset, len) = (
+        u64::try_from(offset).map_err(|_| {
+            WsError::Backend(format!("pack row for {hex} has a negative offset ({offset})"))
+        })?,
+        u64::try_from(len).map_err(|_| {
+            WsError::Backend(format!("pack row for {hex} has a negative length ({len})"))
+        })?,
+    );
+    let bytes = match state.cold.get_range(&pack_key, offset, len).await {
+        Ok(bytes) => bytes,
+        Err(StorageError::NotFound) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if hash_hex(&bytes) != hex {
+        return Err(WsError::Backend(format!(
+            "pack member at {pack_key}[{offset}..+{len}] does not hash to {hex} — the index \
+             and the pack disagree; refusing to serve corruption"
+        )));
+    }
+    let prefix = match kind {
+        PackMemberKind::Blob => "blobs",
+        PackMemberKind::Tree => "trees",
+    };
+    if let Err(e) = state.warm.put(&format!("{prefix}/{hex}"), bytes.clone()).await {
+        // Backfill is an optimisation; a full or briefly-broken warm volume
+        // must not fail a read the pack just answered correctly.
+        tracing::warn!(hex, error = %e, "warm backfill from a pack failed (read still served)");
+    }
+    Ok(Some(bytes))
+}
+
+/// A blob on warm miss: the pack index first, the loose object second — the
+/// dual-read migration (ADR-0067 consequences). A pack-index outage must not
+/// convert a durable blob into a 404: the loose read is still tried, and only
+/// a loose miss surfaces the index error (500, retryable).
+async fn blob_via_pack_then_loose(state: &WorkspaceState, hex: &str) -> Result<Vec<u8>, WsError> {
+    match read_packed(state, PackMemberKind::Blob, hex).await {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Ok(state.cas.get_blob(&BlobHash(hex.to_string())).await?),
+        Err(index_err) => match state.cas.get_blob(&BlobHash(hex.to_string())).await {
+            Ok(bytes) => Ok(bytes),
+            Err(StorageError::NotFound) => Err(index_err),
+            Err(e) => Err(e.into()),
+        },
+    }
+}
+
+/// [`blob_via_pack_then_loose`] for a tree's verbatim bytes. The loose leg is
+/// the tiered raw read (`trees/<hex>`), which backfills warm on the way past.
+async fn tree_bytes_via_pack_then_loose(
+    state: &WorkspaceState,
+    hex: &str,
+) -> Result<Vec<u8>, WsError> {
+    match read_packed(state, PackMemberKind::Tree, hex).await {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Ok(state.objects.get(&format!("trees/{hex}")).await?),
+        Err(index_err) => match state.objects.get(&format!("trees/{hex}")).await {
+            Ok(bytes) => Ok(bytes),
+            Err(StorageError::NotFound) => Err(index_err),
+            Err(e) => Err(e.into()),
+        },
+    }
+}
+
+/// A blob's size on warm miss, cheapest answer first: the pack index's
+/// `byte_len` costs no read at all (ADR-0067 part 9 — the index triples as
+/// the size index; the loose cold arm has always been a full download), then
+/// the loose read. Index outage handled as everywhere else: loose still
+/// tried, only a loose miss surfaces the index error.
+async fn blob_size_via_pack_then_loose(
+    state: &WorkspaceState,
+    hex: &str,
+) -> Result<u64, WsError> {
+    match pack_member_of(state, PackMemberKind::Blob, hex).await {
+        Ok(Some((_, _, len))) => u64::try_from(len).map_err(|_| {
+            WsError::Backend(format!("pack row for {hex} has a negative length ({len})"))
+        }),
+        Ok(None) => Ok(state.cas.get_blob(&BlobHash(hex.to_string())).await?.len() as u64),
+        Err(index_err) => match state.cas.get_blob(&BlobHash(hex.to_string())).await {
+            Ok(bytes) => Ok(bytes.len() as u64),
+            Err(StorageError::NotFound) => Err(index_err),
+            Err(e) => Err(e.into()),
+        },
+    }
+}
+
+/// One tree's parsed entries, whichever tier or pack holds it — the `/flat`
+/// walk's read, so a snapshot that is durable-only (fresh replica, empty
+/// warm) still flattens.
+async fn tree_entries_anywhere(
+    state: &WorkspaceState,
+    tree: &TreeHash,
+) -> Result<Vec<TreeEntry>, WsError> {
+    let bytes = match state.warm.get(&format!("trees/{}", tree.0)).await {
+        Ok(bytes) => bytes,
+        Err(StorageError::NotFound) => tree_bytes_via_pack_then_loose(state, &tree.0).await?,
+        Err(e) => return Err(e.into()),
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|e| WsError::Backend(format!("tree {} does not parse: {e}", tree.0)))
+}
+
+/// Which of `blobs` the pack index already holds durable. Used by the flush
+/// to stop re-uploading loose copies of packed content. A query failure
+/// answers the empty set with a warning — the flush then re-uploads loose,
+/// which is waste in the safe direction, never a skipped upload.
+async fn packed_blobs_of(
+    db: &sqlx::PgPool,
+    blobs: &HashSet<BlobHash>,
+) -> HashSet<BlobHash> {
+    if blobs.is_empty() {
+        return HashSet::new();
+    }
+    let tagged: Vec<String> = blobs
+        .iter()
+        .map(|b| tagged_address(HashAlgo::Sha256, &b.0))
+        .collect();
+    let rows: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT DISTINCT address FROM depot_pack_members WHERE kind = 'blob' AND address = ANY($1)",
+    )
+    .bind(&tagged)
+    .fetch_all(db)
+    .await;
+    match rows {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|t| {
+                scarab_storage::parse_address(&t)
+                    .ok()
+                    .map(|(_, hex)| BlobHash(hex.to_string()))
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "pack-index probe for the flush failed — treating nothing as packed, so the \
+                 flush re-uploads loose copies (waste, never loss)"
+            );
+            HashSet::new()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2125,13 +2657,25 @@ async fn flush_cas(
         )
             .into_response());
     }
+    // ADR-0067 slice 3 (dual-write era): blobs the drain already streamed
+    // into a pack ARE durable — probing their loose keys would find nothing
+    // and re-upload every packed blob beside its pack. Subtract them from the
+    // inventory; the tally still reports the full count, with the packed
+    // portion counted as present rather than offered. Trees are left alone
+    // (small, `put_if_absent` re-offer, and it keeps the Mismatch tripwire).
+    let packed = packed_blobs_of(&state.db, &flush.blobs).await;
+    let flush = {
+        let mut flush = flush;
+        flush.blobs.retain(|b| !packed.contains(b));
+        flush
+    };
     match flush_to_cold(&reads, &state.cold, &flush, &req.root).await {
         Ok(tally) => Ok((
             StatusCode::OK,
             Json(FlushResponse {
                 durable: tally.durable,
                 tier: state.tier.as_str(),
-                blobs: tally.blobs,
+                blobs: tally.blobs + packed.len() as u64,
                 blobs_uploaded: tally.blobs_uploaded,
                 trees: tally.trees,
             }),
@@ -2419,11 +2963,20 @@ async fn post_drain(
         }
     }
 
-    // Persist, then 200. One row upsert (ADR-0067 part 2), so a crash
-    // mid-request leaves either the old record or the new one, never a torn
-    // parse — and any replica serves the GET. The upsert arm is the error-
-    // record overwrite: the write-once check above already 409'd a second
-    // success POST.
+    // ADR-0067 parts 4, 8, 10 — the commit point, in the only safe order:
+    // 1. body packs complete + commit pack lands (bytes — atomic, in the
+    //    bucket, reachable by nothing yet);
+    // 2. ONE transaction: pack rows, member rows, drain-record row (pointers).
+    // A crash between 1 and 2 leaves unreachable pack bytes, which is safe
+    // and reclaimable; a row naming an incomplete pack is the state this
+    // ordering exists to make impossible. Error records seal nothing — the
+    // session stays open for the retried drain.
+    let (sealed, commit) = if record.error.is_none() {
+        seal_fence_packs(&state, &fence, &record).await?
+    } else {
+        (Vec::new(), None)
+    };
+
     let stored = StoredDrainRecord {
         version: DRAIN_RECORD_VERSION,
         run: fence.run.clone(),
@@ -2434,6 +2987,63 @@ async fn post_drain(
     };
     let record_json = serde_json::to_value(&stored.record)
         .map_err(|e| WsError::Backend(format!("serialising a drain record: {e}")))?;
+    let key = fence_key(&fence);
+    let now = now_secs();
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|e| fence_rows_error("begin drain transaction", e))?;
+    for pack in &sealed {
+        sqlx::query(
+            "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes) \
+             VALUES ($1, $2, 'body', $3, $4) ON CONFLICT (pack_key) DO NOTHING",
+        )
+        .bind(&pack.key)
+        .bind(&key)
+        .bind(now)
+        .bind(i64::try_from(pack.bytes).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| pack_rows_error("insert pack row", e))?;
+        let mut addresses = Vec::with_capacity(pack.members.len());
+        let mut kinds = Vec::with_capacity(pack.members.len());
+        let mut offsets = Vec::with_capacity(pack.members.len());
+        let mut lens = Vec::with_capacity(pack.members.len());
+        for m in &pack.members {
+            addresses.push(m.address.clone());
+            kinds.push(m.kind.as_str().to_string());
+            offsets.push(i64::try_from(m.offset).unwrap_or(i64::MAX));
+            lens.push(i64::try_from(m.len).unwrap_or(i64::MAX));
+        }
+        sqlx::query(
+            "INSERT INTO depot_pack_members (address, kind, pack_key, byte_offset, byte_len) \
+             SELECT a, k, $1, o, l FROM UNNEST($2::text[], $3::text[], $4::bigint[], $5::bigint[]) \
+             AS t(a, k, o, l) ON CONFLICT (address, pack_key) DO NOTHING",
+        )
+        .bind(&pack.key)
+        .bind(&addresses)
+        .bind(&kinds)
+        .bind(&offsets)
+        .bind(&lens)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| pack_rows_error("insert member rows", e))?;
+    }
+    if let Some((commit_key, commit_bytes)) = &commit {
+        sqlx::query(
+            "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes) \
+             VALUES ($1, $2, 'commit', $3, $4) ON CONFLICT (pack_key) DO NOTHING",
+        )
+        .bind(commit_key)
+        .bind(&key)
+        .bind(now)
+        .bind(i64::try_from(*commit_bytes).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| pack_rows_error("insert commit pack row", e))?;
+    }
     sqlx::query(
         "INSERT INTO depot_drain_records \
              (fence_key, run, step, attempt, version, posted_at, record) \
@@ -2443,16 +3053,30 @@ async fn post_drain(
              version = EXCLUDED.version, posted_at = EXCLUDED.posted_at, \
              record = EXCLUDED.record",
     )
-    .bind(fence_key(&fence))
+    .bind(&key)
     .bind(&stored.run)
     .bind(&stored.step)
     .bind(&stored.attempt)
     .bind(i32::try_from(stored.version).expect("DRAIN_RECORD_VERSION fits i32"))
     .bind(stored.posted_at)
     .bind(&record_json)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| fence_rows_error("persist drain record", e))?;
+    tx.commit()
+        .await
+        .map_err(|e| fence_rows_error("commit drain transaction", e))?;
+
+    // The session's job is done only now that the rows exist. Dropped on
+    // success alone: a failed transaction keeps the session (and its sealed
+    // packs) for the retried POST to commit.
+    if stored.record.error.is_none() {
+        state
+            .packs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+    }
 
     tracing::info!(
         run = %fence.run,
