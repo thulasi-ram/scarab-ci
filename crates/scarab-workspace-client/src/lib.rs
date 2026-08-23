@@ -174,6 +174,21 @@ struct HaveResponse {
     missing_blobs: Vec<String>,
     #[serde(default)]
     missing_trees: Vec<String>,
+    /// Additive (ADR-0067 part 4, OQ4): what the WARM tier lacks.
+    /// `None` = a pre-slice-4 Depot, whose `missing_blobs`/`missing_trees`
+    /// WERE the warm answer — the fallback below restores exactly that.
+    #[serde(default)]
+    missing_warm: Option<Vec<String>>,
+}
+
+/// What one batched `/have` sweep learned (ADR-0067 part 4):
+/// `durable_blobs`/`durable_trees` are the DURABLE-set misses (the pack
+/// index does not hold them — a durable upload must happen whatever warm
+/// holds), `warm` is the warm-tier misses (what cache-only dedup keys on).
+struct MissingReport {
+    durable_blobs: Vec<String>,
+    durable_trees: Vec<String>,
+    warm: std::collections::HashSet<String>,
 }
 
 impl WorkspaceClient {
@@ -250,15 +265,24 @@ impl WorkspaceClient {
         StorageError::Backend(format!("workspace service {status}: {body}"))
     }
 
-    /// Which of these the service does not have. Chunked; the service caps a
-    /// batch and a client that ignored that would just get a 400.
+    /// Which of these the service does not have — durable-set answers plus
+    /// the warm-tier answer (see [`MissingReport`]). Chunked; the service
+    /// caps a batch and a client that ignored that would just get a 400.
+    ///
+    /// Against a Depot that predates `missing_warm` (rolling-skew window)
+    /// the warm set falls back to that Depot's `missing_blobs`/`missing_trees`
+    /// — which under the old contract WERE the warm answer, so both dedup
+    /// keys degrade to exactly the pre-slice-4 behaviour.
     async fn missing_hashes(
         &self,
         blobs: &[String],
         trees: &[String],
-    ) -> Result<(Vec<String>, Vec<String>), StorageError> {
-        let mut missing_blobs = Vec::new();
-        let mut missing_trees = Vec::new();
+    ) -> Result<MissingReport, StorageError> {
+        let mut report = MissingReport {
+            durable_blobs: Vec::new(),
+            durable_trees: Vec::new(),
+            warm: std::collections::HashSet::new(),
+        };
         for blob_chunk in blobs.chunks(HAVE_CHUNK.max(1)) {
             let resp = self
                 .request(reqwest::Method::POST, "/v1/cas/have")
@@ -273,7 +297,11 @@ impl WorkspaceClient {
                 return Err(Self::status_error(resp).await);
             }
             let body: HaveResponse = resp.json().await.map_err(Self::transport)?;
-            missing_blobs.extend(body.missing_blobs);
+            match body.missing_warm {
+                Some(warm) => report.warm.extend(warm),
+                None => report.warm.extend(body.missing_blobs.iter().cloned()),
+            }
+            report.durable_blobs.extend(body.missing_blobs);
         }
         for tree_chunk in trees.chunks(HAVE_CHUNK.max(1)) {
             let resp = self
@@ -289,9 +317,13 @@ impl WorkspaceClient {
                 return Err(Self::status_error(resp).await);
             }
             let body: HaveResponse = resp.json().await.map_err(Self::transport)?;
-            missing_trees.extend(body.missing_trees);
+            match body.missing_warm {
+                Some(warm) => report.warm.extend(warm),
+                None => report.warm.extend(body.missing_trees.iter().cloned()),
+            }
+            report.durable_trees.extend(body.missing_trees);
         }
-        Ok((missing_blobs, missing_trees))
+        Ok(report)
     }
 
     /// `PUT` raw bytes under a hash the caller already computed, optionally
@@ -516,14 +548,30 @@ impl WorkspaceClient {
             Some(outputs) => durable_label_plan(&scan, outputs).await?,
         };
 
-        // One question for every blob, then upload only the misses.
+        // One question for every blob, then upload only the misses — keyed on
+        // the answer that matches each blob's PROMISE (ADR-0067 part 4):
+        // durable-labelled (and unlabelled, the durable default) blobs dedup
+        // against the durable pack index — a blob warm holds but no pack does
+        // is NOT durable, and skipping its upload would post a record nothing
+        // backs; cache-only scratch dedups against warm, the only tier it
+        // ever lives in.
         let blob_hashes: Vec<String> = scan.blobs.keys().cloned().collect();
-        let (missing_blobs, _) = self.missing_hashes(&blob_hashes, &[]).await?;
-        let blob_hits = (blob_hashes.len() - missing_blobs.len()) as u64;
-        let uploads: Vec<(String, BlobSource)> = missing_blobs
-            .into_iter()
-            .filter_map(|hash| scan.blobs.get(&hash).cloned().map(|src| (hash, src)))
+        let missing = self.missing_hashes(&blob_hashes, &[]).await?;
+        let durable_missing: std::collections::HashSet<&str> =
+            missing.durable_blobs.iter().map(String::as_str).collect();
+        let must_upload = |hash: &String| match plan.label_of(hash) {
+            // `None` is the FEED-path ingest: a warm-seeding operation whose
+            // PUTs open no pack (nothing durable can come of re-uploading),
+            // so it deduplicates against warm — the tier it actually serves.
+            Some(Label::CacheOnly) | None => missing.warm.contains(hash),
+            Some(Label::Durable) => durable_missing.contains(hash.as_str()),
+        };
+        let uploads: Vec<(String, BlobSource)> = blob_hashes
+            .iter()
+            .filter(|hash| must_upload(hash))
+            .filter_map(|hash| scan.blobs.get(hash).cloned().map(|src| (hash.clone(), src)))
             .collect();
+        let blob_hits = (blob_hashes.len() - uploads.len()) as u64;
         let blobs_uploaded = uploads.len() as u64;
         let plan = &plan;
         let results: Vec<Result<u64, StorageError>> = futures::stream::iter(uploads)
@@ -549,7 +597,14 @@ impl WorkspaceClient {
         // record's closure validation reads that ledger.
         let tree_hits = if dedup_trees {
             let tree_hashes: Vec<String> = scan.trees.iter().map(|(h, _)| h.clone()).collect();
-            let (_, missing_trees) = self.missing_hashes(&[], &tree_hashes).await?;
+            // The feed-path ingest is warm seeding (see `must_upload` above),
+            // so its tree dedup keys on the warm answer.
+            let report = self.missing_hashes(&[], &tree_hashes).await?;
+            let missing_trees: Vec<String> = tree_hashes
+                .iter()
+                .filter(|h| report.warm.contains(*h))
+                .cloned()
+                .collect();
             for (hash, bytes) in &scan.trees {
                 if missing_trees.iter().any(|m| m == hash) {
                     self.put_bytes("trees", hash, bytes.clone(), plan.label_of(hash))
@@ -1075,10 +1130,13 @@ impl ContentSource for WorkspaceClient {
     ) -> Result<(Vec<BlobHash>, Vec<TreeHash>), StorageError> {
         let blob_ids: Vec<String> = blobs.iter().map(|b| b.0.clone()).collect();
         let tree_ids: Vec<String> = trees.iter().map(|t| t.0.clone()).collect();
-        let (mb, mt) = self.missing_hashes(&blob_ids, &tree_ids).await?;
+        // The DURABLE-set answer (ADR-0067 part 4): "missing" is what a caller
+        // acts on by uploading or fetching, and the durable index is the set
+        // whose misses are the unrecoverable direction to get wrong.
+        let report = self.missing_hashes(&blob_ids, &tree_ids).await?;
         Ok((
-            mb.into_iter().map(BlobHash).collect(),
-            mt.into_iter().map(TreeHash).collect(),
+            report.durable_blobs.into_iter().map(BlobHash).collect(),
+            report.durable_trees.into_iter().map(TreeHash).collect(),
         ))
     }
 

@@ -1969,48 +1969,37 @@ pub struct HaveRequest {
 pub struct HaveResponse {
     pub missing_blobs: Vec<String>,
     pub missing_trees: Vec<String>,
+    /// Additive (ADR-0067 part 4, OQ4): what the **warm tier** lacks, blobs
+    /// and trees alike — the answer `missing_blobs`/`missing_trees` used to
+    /// give before they became durable-set answers. Cache-only dedup keys on
+    /// this; a pre-slice-4 client simply never reads it.
+    pub missing_warm: Vec<String>,
 }
 
-/// `POST /v1/cas/have` — which of these the service does **not** have.
+/// `POST /v1/cas/have` — which of these are not yet **durable**, and which
+/// the warm tier lacks.
 ///
 /// Returns **missing**, not present, on purpose: missing is what the client acts
-/// on, and in the high-hit-rate case a warm tier exists to produce, the response
-/// is nearly empty.
+/// on, and in the high-hit-rate case the response is nearly empty.
 ///
-/// **"Have" means "the warm tier has it", and that is a deliberate, documented
-/// narrowing.** The `ObjectStore` port has no existence primitive — only `get`
-/// (which downloads) and `list_objects` (whose prefixes are segment-wise in
-/// `object_store`, so a full-key prefix does not match the key itself). So the
-/// only cheap answer available is the warm one.
+/// **`missing_blobs` / `missing_trees` answer the DURABLE index**
+/// (`depot_pack_members`, ADR-0067 parts 4 and 9) — not the warm tier, and
+/// deliberately not the loose legacy objects either: a durable miss means
+/// "upload it", which is the safe direction, and legacy loose content
+/// re-uploads exactly once and lands packed. This is what retired the second
+/// pass: a drain's durable dedup must key on what the packs hold, because a
+/// blob the warm tier has but no pack holds is NOT durable — under the old
+/// warm answer the client would skip the upload, nothing would pack it, and
+/// the drain record would promise a durability nothing backs.
 ///
-/// The consequence is bounded and never wrong **in the direction that matters**:
-/// a blob that lives only in cold is reported missing, the client re-uploads it,
-/// and the write is an idempotent overwrite in cold plus a warm fill — which is
-/// what we wanted anyway.
+/// **`missing_warm` answers the warm tier** — the old semantics, additive
+/// (OQ4). Cache-only content (build scratch) keys on it: scratch is an
+/// evictable warm convenience, so warm presence is the whole question.
 ///
-/// This docstring used to justify the narrowing with *"because every write through
-/// this service goes cold-first, warm ⊇ everything this service ever stored"*.
-/// **That is false in both directions**, and it was load-bearing for a shortcut in
-/// `put_blob` / `put_tree` that skipped the cold write. Four independent reasons,
-/// and ADR-0064 added the fourth:
-///
-/// - `TieredObjectStore::put` deliberately **succeeds when the warm leg fails**
-///   (correctly — for the raw-bytes routes cold is still the load-bearing tier),
-///   so content written through this service can be cold-only *by design*;
-/// - ADR-0050's GC deletes from cold without touching warm, so it can be
-///   warm-only too;
-/// - the warm tier has no eviction, so it only grows;
-/// - and the **drain now writes warm first** (ADR-0064 part 1), so between the
-///   drain and its archival flush — and permanently, if that flush failed and the
-///   Attempt was retried elsewhere — warm holds content cold does not.
-///
-/// The honest statement is the narrow one: **this endpoint answers about the warm
-/// tier and nothing else**, and every caller must treat a "missing" as "upload it"
-/// rather than as "cold does not have it".
-///
-/// Adding `exists` to the `ObjectStore` port — which would let this answer about
-/// the durable set, and would let a `PUT` skip a redundant cold upload — is a
-/// filed follow-up.
+/// A pack-index query failure is a **500, never a verdict**: answering
+/// "missing" off a blinked database would re-upload a workspace (waste, and
+/// the drain's own index transaction would fail anyway), and answering
+/// "present" would skip an upload — the one unrecoverable direction.
 async fn have(
     State(state): State<WorkspaceState>,
     headers: HeaderMap,
@@ -2024,31 +2013,94 @@ async fn have(
         )));
     }
 
+    // The response echoes each missing address AS THE CLIENT SPELLED IT —
+    // tagged or bare — because the client correlates the answer against its
+    // own request set (ADR-0067 part 12). Only the probes are normalized.
+    let blobs: Vec<(String, String)> = req
+        .blobs
+        .iter()
+        .map(|h| valid_address(h).map(|bare| (h.clone(), bare)))
+        .collect::<Result<_, _>>()?;
+    let trees: Vec<(String, String)> = req
+        .trees
+        .iter()
+        .map(|h| valid_address(h).map(|bare| (h.clone(), bare)))
+        .collect::<Result<_, _>>()?;
+
+    let durable_blobs = durable_present_of(
+        &state.db,
+        PackMemberKind::Blob,
+        blobs.iter().map(|(_, bare)| bare.as_str()),
+    )
+    .await?;
+    let durable_trees = durable_present_of(
+        &state.db,
+        PackMemberKind::Tree,
+        trees.iter().map(|(_, bare)| bare.as_str()),
+    )
+    .await?;
+
     // `warm_has`, not `metadata(..).is_err()`: a broken volume must not report
     // every object as missing. That direction is not merely wasteful — the client
     // would re-upload the entire workspace over a volume that cannot store it,
     // and each PUT would then fail anyway, one round trip at a time.
-    // The response echoes each missing address AS THE CLIENT SPELLED IT —
-    // tagged or bare — because the client correlates the answer against its
-    // own request set (ADR-0067 part 12). Only the warm probe is normalized.
     let mut missing_blobs = Vec::new();
-    for hash in &req.blobs {
-        let bare = valid_address(hash)?;
-        if !warm_has(&warm_blob_path(&state, &bare)).await? {
-            missing_blobs.push(hash.clone());
+    let mut missing_warm = Vec::new();
+    for (spelled, bare) in &blobs {
+        if !durable_blobs.contains(bare) {
+            missing_blobs.push(spelled.clone());
+        }
+        if !warm_has(&warm_blob_path(&state, bare)).await? {
+            missing_warm.push(spelled.clone());
         }
     }
     let mut missing_trees = Vec::new();
-    for hash in &req.trees {
-        let bare = valid_address(hash)?;
-        if !warm_has(&warm_tree_path(&state, &bare)).await? {
-            missing_trees.push(hash.clone());
+    for (spelled, bare) in &trees {
+        if !durable_trees.contains(bare) {
+            missing_trees.push(spelled.clone());
+        }
+        if !warm_has(&warm_tree_path(&state, bare)).await? {
+            missing_warm.push(spelled.clone());
         }
     }
     Ok(Json(HaveResponse {
         missing_blobs,
         missing_trees,
+        missing_warm,
     }))
+}
+
+/// Which of these bare-hex addresses the durable pack index already holds —
+/// one `ANY($1)` query per kind, tagged on the way in, bare on the way out.
+/// A query failure is the caller's 500 ([`pack_rows_error`]): presence here
+/// licenses SKIPPING an upload, so it must never be guessed.
+async fn durable_present_of<'a>(
+    db: &sqlx::PgPool,
+    kind: PackMemberKind,
+    bares: impl Iterator<Item = &'a str>,
+) -> Result<HashSet<String>, WsError> {
+    let tagged: Vec<String> = bares
+        .map(|h| tagged_address(HashAlgo::Sha256, h))
+        .collect();
+    if tagged.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT address FROM depot_pack_members WHERE kind = $2 AND address = ANY($1)",
+    )
+    .bind(&tagged)
+    .bind(kind.as_str())
+    .fetch_all(db)
+    .await
+    .map_err(|e| pack_rows_error("durable presence", e))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|t| {
+            scarab_storage::parse_address(&t)
+                .ok()
+                .map(|(_, hex)| hex.to_string())
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -2826,10 +2878,14 @@ enum ClosureVerdict {
 }
 
 /// Validate a success record's closure against **warm and the fence's ledger**
-/// — warm-only reads on purpose: the drain *just wrote* warm (warm-only PUTs),
-/// so a cold-only tree here is not a slow path, it is a tree this fence never
-/// wrote, i.e. a ledger miss wearing a different hat. Bounded like
-/// [`flush_set_of`]: BFS with a visited set, hashes only in memory.
+/// — the TREE walk is warm-only on purpose: the drain PUTs every closure tree
+/// unconditionally (only a PUT reaches the ledger), so a cold-only tree here
+/// is not a slow path, it is a tree this fence never wrote, i.e. a ledger miss
+/// wearing a different hat. Blobs check warm OR the durable pack index — the
+/// drain's blob dedup keys on the index (ADR-0067 part 4), so an
+/// already-durable blob is legitimately never re-uploaded to this replica's
+/// warm. Bounded like [`flush_set_of`]: BFS with a visited set, hashes only
+/// in memory.
 async fn validate_drain_closure(
     state: &WorkspaceState,
     ledger: &HashSet<String>,
@@ -2868,10 +2924,29 @@ async fn validate_drain_closure(
             }
         }
     }
+    // Blobs: warm first, then the durable pack index. The fallback exists
+    // because the drain's durable dedup keys on the index (ADR-0067 part 4):
+    // a blob some earlier fence already packed is skipped by the client and
+    // may legitimately be absent from THIS replica's warm — refusing it would
+    // 422 every retried drain forever, since the retry re-asks `/have` and
+    // re-skips the same upload. Durable presence is the stronger fact anyway;
+    // reads range into the pack and backfill warm.
+    let mut warm_missing: Vec<String> = Vec::new();
     for blob in blobs {
         if !warm_has(&warm_blob_path(state, &blob)).await? {
+            warm_missing.push(blob);
+        }
+    }
+    if !warm_missing.is_empty() {
+        let durable = durable_present_of(
+            &state.db,
+            PackMemberKind::Blob,
+            warm_missing.iter().map(String::as_str),
+        )
+        .await?;
+        if let Some(blob) = warm_missing.iter().find(|b| !durable.contains(*b)) {
             return Ok(ClosureVerdict::Missing(format!(
-                "blob {blob} is not in the warm tier"
+                "blob {blob} is neither in the warm tier nor durable in the pack index"
             )));
         }
     }

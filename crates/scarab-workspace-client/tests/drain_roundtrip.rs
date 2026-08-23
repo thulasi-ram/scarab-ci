@@ -328,9 +328,43 @@ async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
         report.snapshot.root, seeded.snapshot.root,
         "same workspace, same root — the unconditional PUTs must not change addressing"
     );
-    // Blob dedup is KEPT exactly as is: nothing re-uploads, the /have hits show.
-    assert_eq!(report.blobs_uploaded, 0, "unchanged blobs must still dedup");
-    assert!(report.have_hits > 0, "the blob /have hits must be counted");
+    // Blob dedup keys on the DURABLE index (ADR-0067 part 4): the seeder's
+    // warm blobs are in no pack, so the drain re-uploads them all — warm
+    // presence must NOT be allowed to skip a durable upload (the slice-3 gap
+    // this slice closes).
+    assert_eq!(
+        report.blobs_uploaded, report.files,
+        "warm-seeded blobs are durable-missing and must all upload"
+    );
+
+    // Seal the fence's packs by posting the record — the index rows are what
+    // the next fence's `/have` answers from.
+    h.fence_client()
+        .post_drain_record(&DrainRecord {
+            root: report.snapshot.root.0.clone(),
+            pruned_root: None,
+            identity: report.snapshot.identity.as_ref().map(|t| t.0.clone()),
+            files: report.files,
+            tree_bytes: report.tree_bytes,
+            blobs_uploaded: report.blobs_uploaded,
+            bytes_uploaded: report.bytes_uploaded,
+            have_hits: report.have_hits,
+            ingest_ms: 1,
+            prune_ms: 0,
+            error: None,
+        })
+        .await
+        .expect("post drain record");
+
+    // A SECOND fence draining identical content dedups everything: the blobs
+    // are durable now, so `/have`'s durable answer skips every upload.
+    let report2 = h
+        .fence_client_for("run-1", "build", "a2")
+        .drain_ingest_report(path, &[])
+        .await
+        .expect("second drain ingest");
+    assert_eq!(report2.blobs_uploaded, 0, "durable blobs must dedup");
+    assert!(report2.have_hits > 0, "the blob /have hits must be counted");
 }
 
 /// Drain-mode round trip over the real router: ingest → prune → POST the
@@ -737,6 +771,93 @@ async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_addres
         "the flush must not re-upload loose copies of packed blobs: {flushed}"
     );
     assert_eq!(flushed["durable"], serde_json::json!(true), "{flushed}");
+}
+
+/// `/have` answers the DURABLE index, identically through every replica
+/// (ADR-0067 part 4, OQ4): blobs a drain packed via router A are not missing
+/// via router B (whose warm never held a byte), while the cache-only scratch
+/// is durable-missing everywhere — and the warm axis rides the additive
+/// `missing_warm` field, per replica.
+///
+/// Mutations killed: answering `missing_blobs` from warm (B would report the
+/// packed blob missing — and A would report the SCRATCH present, the exact
+/// slice-3 gap: warm presence skipping a durable upload); folding the warm
+/// answer into the durable field (A's scratch would vanish from
+/// `missing_blobs` and never pack).
+#[tokio::test]
+async fn have_answers_the_durable_index_identically_across_replicas() {
+    let Some(a) = Harness::start().await else { return };
+    let ws = tempfile::tempdir().unwrap();
+    build_workspace(ws.path());
+    let declared = vec!["src".to_string(), "plain.txt".to_string()];
+
+    let helper = a.fence_client();
+    let report = helper
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
+        .await
+        .expect("drain ingest with labels");
+    let memo = MemoCas::new(&helper, report.trees);
+    let pruned = scarab_storage::prune_tree(&memo, &report.snapshot.root, &declared)
+        .await
+        .expect("prune");
+    helper
+        .post_drain_record(&DrainRecord {
+            root: report.snapshot.root.0.clone(),
+            pruned_root: Some(pruned.0.clone()),
+            identity: None,
+            files: report.files,
+            tree_bytes: report.tree_bytes,
+            blobs_uploaded: report.blobs_uploaded,
+            bytes_uploaded: report.bytes_uploaded,
+            have_hits: report.have_hits,
+            ingest_ms: 1,
+            prune_ms: 0,
+            error: None,
+        })
+        .await
+        .expect("post drain record");
+
+    let kept_blob = scarab_storage::sha256_hex(b"fn main() {}");
+    let junk_blob = scarab_storage::sha256_hex(&vec![7u8; 4096]);
+    let browse = workspace_token::mint(SECRET, &workspace_token::browse_claims(far_future()));
+    let ask = |base: String, token: String| {
+        let kept = kept_blob.clone();
+        let junk = junk_blob.clone();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{base}/v1/cas/have"))
+                .header("x-scarab-workspace-token", token)
+                .json(&serde_json::json!({ "blobs": [kept, junk] }))
+                .send()
+                .await
+                .expect("have request")
+                .json::<serde_json::Value>()
+                .await
+                .expect("have body")
+        }
+    };
+
+    // Router A: its warm holds both, so `missing_warm` is empty — but the
+    // scratch blob is still durable-missing. Warm presence must not be able
+    // to impersonate durability.
+    let on_a = ask(a.base.clone(), browse.clone()).await;
+    assert_eq!(on_a["missing_blobs"], serde_json::json!([junk_blob.clone()]));
+    assert_eq!(on_a["missing_warm"], serde_json::json!([]));
+
+    // Router B: empty warm, same database. The durable answer is identical;
+    // the warm answer is B's own.
+    let b = a.replica().await;
+    let on_b = ask(b.base.clone(), browse).await;
+    assert_eq!(
+        on_b["missing_blobs"],
+        serde_json::json!([junk_blob.clone()]),
+        "the durable answer must not depend on which replica is asked"
+    );
+    assert_eq!(
+        on_b["missing_warm"],
+        serde_json::json!([kept_blob, junk_blob]),
+        "the warm answer is per-replica: B's warm has neither"
+    );
 }
 
 /// The top risk of the whole plan, pinned: **bytes before pointers** (ADR-0067

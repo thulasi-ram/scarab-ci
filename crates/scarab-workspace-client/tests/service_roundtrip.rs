@@ -315,17 +315,48 @@ async fn have_reports_exactly_what_is_missing() {
     let Some(h) = Harness::start().await else { return };
     let client = h.browse_client();
 
+    // A browse PUT is unfenced: it seeds warm and joins no pack, so it is
+    // warm-present and durable-missing — the two axes `/have` now separates
+    // (ADR-0067 part 4 / OQ4).
     let stored = client.put_blob(b"i am stored").await.unwrap();
     let absent = scarab_storage::BlobHash("b".repeat(64));
 
+    let body: serde_json::Value = h
+        .raw()
+        .post(format!("{}/v1/cas/have", h.base))
+        .header("x-scarab-workspace-token", h.browse_token())
+        .json(&serde_json::json!({ "blobs": [stored.0.clone(), absent.0.clone()] }))
+        .send()
+        .await
+        .expect("have request")
+        .json()
+        .await
+        .expect("have body");
+    assert_eq!(
+        body["missing_blobs"],
+        serde_json::json!([stored.0.clone(), absent.0.clone()]),
+        "missing_blobs answers the DURABLE index: an unpacked warm blob is durable-missing"
+    );
+    assert_eq!(
+        body["missing_warm"],
+        serde_json::json!([absent.0.clone()]),
+        "missing_warm answers the warm tier: only the truly absent one"
+    );
+    assert_eq!(body["missing_trees"], serde_json::json!([]));
+
+    // The `ContentSource::missing` port maps onto the durable answer.
     let (missing_blobs, missing_trees) = client
         .missing(&[stored.clone(), absent.clone()], &[])
         .await
         .expect("have");
-    assert_eq!(missing_blobs, vec![absent], "only the absent one is missing");
+    assert_eq!(
+        missing_blobs,
+        vec![stored.clone(), absent],
+        "the port's missing set is the durable-miss set"
+    );
     assert!(missing_trees.is_empty());
 
-    // And for trees.
+    // And for trees: same two axes.
     let root = client
         .put_tree(vec![scarab_storage::TreeEntry::new(
             "a",
@@ -334,11 +365,23 @@ async fn have_reports_exactly_what_is_missing() {
         .await
         .unwrap();
     let absent_tree = scarab_storage::TreeHash("c".repeat(64));
-    let (_, missing_trees) = client
-        .missing(&[], &[root, absent_tree.clone()])
+    let body: serde_json::Value = h
+        .raw()
+        .post(format!("{}/v1/cas/have", h.base))
+        .header("x-scarab-workspace-token", h.browse_token())
+        .json(&serde_json::json!({ "trees": [root.0.clone(), absent_tree.0.clone()] }))
+        .send()
         .await
-        .unwrap();
-    assert_eq!(missing_trees, vec![absent_tree]);
+        .expect("have request")
+        .json()
+        .await
+        .expect("have body");
+    assert_eq!(
+        body["missing_trees"],
+        serde_json::json!([root.0.clone(), absent_tree.0.clone()]),
+        "an unpacked warm tree is durable-missing too"
+    );
+    assert_eq!(body["missing_warm"], serde_json::json!([absent_tree.0.clone()]));
 }
 
 /// `/flat` returns the WHOLE subtree in one call — the endpoint the entire
