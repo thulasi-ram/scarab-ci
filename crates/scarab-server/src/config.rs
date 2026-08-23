@@ -705,8 +705,12 @@ impl Config {
 
         // Auth default-deny (ADR-0048): a boot that can authenticate no one
         // must not pretend to be up — OAuth login (ADR-0049) or the loud
-        // dev escape hatch.
-        if oauth.is_none() && !dev_insecure {
+        // dev escape hatch. Scoped to the roles that serve the human-facing
+        // surface: the workspace role's authenticator is the fence-scoped
+        // workspace token (SCARAB_WORKSPACE_TOKEN_SECRET — its own refusal
+        // below, so this is not "authenticates no one"), it mounts no OAuth
+        // login route, and an OAuth config there would configure nothing.
+        if oauth.is_none() && !dev_insecure && !matches!(cli.role, Role::Workspace) {
             return Err(ConfigError::NoAuthenticator);
         }
 
