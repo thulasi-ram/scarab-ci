@@ -8,6 +8,12 @@
   copies), [0050](0050-retention-and-gc.md), [0061](0061-workspace-data-path.md),
   [0027](0027-restart-semantics.md)
 
+> **Amended 2026-08-24 by [0067](0067-the-pack-is-the-record.md) — the retention grain becomes the
+> pack, not the object.** Retention now operates over the bucket plus a derived Postgres index (on
+> any disagreement the bucket wins), and drain-aligned pack boundaries mean most of a pack dies
+> with its Run. Deletes are pointers-before-bytes behind a grace window longer than any in-flight
+> read — no WAL. The classes, the `RetentionProfile` knobs, and the Cache itself are untouched.
+
 ## Context
 
 [0007](0007-data-passing-model.md) makes the Workspace **implicit-by-default**: a Step inherits the

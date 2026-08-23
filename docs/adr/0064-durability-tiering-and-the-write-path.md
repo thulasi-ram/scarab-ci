@@ -8,6 +8,14 @@
   [0063](0063-step-logs-on-the-data-depot.md) (the Data Depot),
   [0027](0027-restart-semantics.md), [0029](0029-workspace-cas.md)
 
+> **Amended 2026-08-24 by [0067](0067-the-pack-is-the-record.md) — parts 1–2 retire: no warm-first
+> write, no flush RPC.** The durable write happens in **one pass** at drain time, as an atomic pack
+> written straight to the object store, so warm stops being a durability tier at all. The pinned
+> ordering invariant is made vacuous, not weakened. Part 4's warm-only deployment mode and part 5's
+> stamp (`attempts.output_durability`, the boot banner, the `st_dev` probe, the GC suppression) are
+> deleted; warm-only survives only as a runtime degradation in which a drain **fails** rather than
+> succeeding with a smaller promise. Part 3's "backing is measured, not assumed" test stands.
+
 ## Context
 
 [0061](0061-workspace-data-path.md) part 4 states the rule:

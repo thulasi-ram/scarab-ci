@@ -13,6 +13,13 @@
 > node driver becomes an install prerequisite" consequence, and the "cross-AZ traffic is confined
 > to the archive drain" consequence.
 
+> **Amended 2026-08-24 by [0067](0067-the-pack-is-the-record.md) — part 4's tiering is amended
+> again: the durable write happens in one pass at the drain.** A drain now succeeds only when its
+> content has landed in the object store as an atomic pack — no warm-first write, no deferred
+> flush. The drain-record file and the per-fence write ledger leave the Depot's local disk: the
+> commit pack in the bucket is both the receipt and the ledger (0067 part 8), with Postgres holding
+> only a derived, rebuildable index. Parts 1 and 3 — the service, the feed, the aggregation — stand.
+
 ## Context
 
 [0004](0004-execution-topology.md) chose **pod-per-step** with the workspace passed as

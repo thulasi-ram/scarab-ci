@@ -7,6 +7,13 @@
   [0061](0061-workspace-data-path.md) (the warm/cold tiers and the service being renamed),
   [0027](0027-restart-semantics.md) ("smart never means mysterious")
 
+> **Amended 2026-08-24 by [0067](0067-the-pack-is-the-record.md) — the Depot's copy of anything,
+> logs included, is never authoritative; the object store is.** 0067 part 1 makes the object store
+> a hard requirement, so the 2026-08-03 amendment's **compressed-bodies-in-Postgres fallback is
+> deleted** — it existed only for warm-only, which is retired. The rest of that amendment stands:
+> the Depot's disk is a buffer for the live tail, Postgres holds byte offsets and never bodies,
+> and parts 5 and 6 are untouched.
+
 ## Context
 
 [0013](0013-history-and-observability.md) sends a Step's stdout/stderr to **chunked, gzipped blobs in the

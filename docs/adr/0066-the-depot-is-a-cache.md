@@ -13,6 +13,14 @@
   is new here), [0013](0013-history-and-observability.md) (**amends "bodies never"**),
   [0047](0047-retry-classification-and-attempt-model.md) (the failure classes the clocks split into)
 
+> **Amended 2026-08-24 by [0067](0067-the-pack-is-the-record.md) — the "soft, recommended" stance
+> is reversed: Postgres *and* object storage are hard requirements (owner decision, 2026-08-23).**
+> 0067 is the packing ADR point 7 called for, and it implements point 1's cache invariant by
+> **removing** the replica-local state rather than routing back to it — so points 2 and 3 are
+> overtaken: fence affinity and cordon stop being correctness requirements (they remain
+> freely-abandonable warmth optimisations), and point 4's eviction problem dissolves rather than
+> being solved. Point 10's carve-outs and point 11's algorithm-taggable addresses stand.
+
 ## Context
 
 Four things arrived between [0064](0064-durability-tiering-and-the-write-path.md) and this ADR, and
