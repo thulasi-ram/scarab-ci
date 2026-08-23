@@ -111,7 +111,6 @@ fn running_step() -> StepRun {
             started_at: Timestamp(0),
             failure: None,
             failure_detail: None,
-            output_durability: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -154,9 +153,6 @@ impl Executor for GatedExec {
     }
     // ADR-0064 s2: required (never defaulted) so the compiler makes every impl —
     // wrappers included — decide; this stub snapshots nothing, so no stamp.
-    async fn output_durability(&self, _h: &ExecHandle) -> Result<Option<String>, ExecError> {
-        Ok(None)
-    }
     async fn log_stream(&self, _step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         // Count the open *before* parking, so the fence is provably held while a
         // concurrent `ensure` runs.

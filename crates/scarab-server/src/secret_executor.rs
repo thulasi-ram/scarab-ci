@@ -201,12 +201,6 @@ impl Executor for SecretInjectingExecutor {
         self.inner.output_identity(handle).await
     }
 
-    async fn output_durability(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
-        // Forward the durability stamp (ADR-0064 s2). The method is REQUIRED
-        // on the trait precisely so this wrapper cannot silently swallow it
-        // the way the defaulted `output_identity` above once was.
-        self.inner.output_durability(handle).await
-    }
 
     async fn results(
         &self,

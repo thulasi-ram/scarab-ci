@@ -1,0 +1,13 @@
+-- ADR-0067 part 4 (slice 4): every successful drain is durable by
+-- construction — the Depot seals the drain's packs and commits their index
+-- rows strictly before it stores the drain record, and the settle path packs
+-- before it answers — so the per-attempt durability stamp (ADR-0064 s2,
+-- migration 0042) became a constant. The ADR's ruling: delete the column
+-- rather than keeping it as ceremony.
+--
+-- Pre-0067 rows lose their historical tier string. That is deliberate and
+-- was weighed: the stamp existed to distinguish `warm-only` verdicts from
+-- archived ones, and warm-only is retired as a deployment mode (ADR-0067
+-- part 1) — an operator auditing an old warm-only Run has the deployment's
+-- own history for it.
+ALTER TABLE attempts DROP COLUMN IF EXISTS output_durability;

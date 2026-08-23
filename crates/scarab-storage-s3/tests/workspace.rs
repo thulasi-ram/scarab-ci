@@ -53,7 +53,7 @@ async fn output_workspace_flows_to_dependent_input() {
         .ingest(a_work.to_str().unwrap())
         .await
         .expect("ingest A");
-    db.set_step_output(&run, &a, &AttemptId("a1".into()), &snapshot.root.0, None, None)
+    db.set_step_output(&run, &a, &AttemptId("a1".into()), &snapshot.root.0, None)
         .await
         .unwrap();
 

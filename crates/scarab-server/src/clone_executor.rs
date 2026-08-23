@@ -201,11 +201,6 @@ impl Executor for CloneEnrichingExecutor {
         self.inner.output_identity(handle).await
     }
 
-    async fn output_durability(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
-        // Forward the durability stamp (ADR-0064 s2) — required on the trait
-        // so a decorator cannot silently swallow it.
-        self.inner.output_durability(handle).await
-    }
 
     async fn results(
         &self,

@@ -176,9 +176,6 @@ impl Executor for RecordingExec {
     }
     // ADR-0064 s2: required (never defaulted) so the compiler makes every impl —
     // wrappers included — decide; this stub snapshots nothing, so no stamp.
-    async fn output_durability(&self, _h: &ExecHandle) -> Result<Option<String>, ExecError> {
-        Ok(None)
-    }
 }
 
 #[tokio::test]

@@ -233,7 +233,6 @@ async fn diamond_workspace_flows_to_d_which_sees_both() {
             &AttemptId("a1".into()),
             &snap.root.0,
             snap.identity.as_ref().map(|i| i.0.as_str()),
-            None,
         )
         .await
         .unwrap();

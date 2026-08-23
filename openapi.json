@@ -2367,7 +2367,7 @@
               "string",
               "null"
             ],
-            "description": "The executor's human-readable cause for a failed attempt (ticket\n4cf03d7) — e.g. \"cold tier refused: connection refused\" — alongside the\nmachine-consumed `failure` class. Absent = the class is the whole story\n(or a pre-0041 row). Stored since migration 0041; served since ADR-0064\ns2 (same endpoint, same consumer as `output_durability`)."
+            "description": "The executor's human-readable cause for a failed attempt (ticket\n4cf03d7) — e.g. \"cold tier refused: connection refused\" — alongside the\nmachine-consumed `failure` class. Absent = the class is the whole story\n(or a pre-0041 row). Stored since migration 0041."
           },
           "id": {
             "type": "string"
@@ -2375,13 +2375,6 @@
           "outcome": {
             "type": "string",
             "description": "The attempt's recorded outcome (ADR-0056 amendment): `running` |\n`succeeded` | `failed` | `superseded` | `cancelled`. Unlike `failed` this\ndistinguishes a *superseded* attempt (a rerun/retry replaced its input\nwhile it was still running and its Pod was torn down) from a genuine\nsuccess — so the UI never renders an abandoned attempt green."
-          },
-          "output_durability": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Where this attempt's output workspace snapshot was durable when its\nverdict was granted (ADR-0064 s2): `object` | `separate-volume` |\n`warm-only`. Absent = pre-s2 row, no workspace, or a stamp-less\nbackend. Per-attempt and historical — it reports what `Succeeded`\nlicensed THEN, not the deployment's tier now."
           },
           "started_at": {
             "type": "integer",

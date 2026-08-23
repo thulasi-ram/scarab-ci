@@ -2322,30 +2322,6 @@ impl Executor for K8sExecutor {
         }))
     }
 
-    /// The durability tier the published snapshot's flush earned (ADR-0064
-    /// s2) — `"object"` | `"separate-volume"` | `"warm-only"` — from the
-    /// sibling Pod annotation the drain leg wrote in the same patch as the
-    /// root. Absent/empty annotation → `Ok(None)`: no Depot wired (approved
-    /// deferral — the drain wrote the durable store directly), a pre-s2 Pod,
-    /// or an old Depot that affirmed durability without naming a tier.
-    async fn output_durability(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
-        if self.workspace_cas.is_none() {
-            return Ok(None);
-        }
-        let pods = self.pods()?;
-        let pod = pods
-            .get_opt(&handle.0)
-            .await
-            .map_err(|e| ExecError::Other(e.to_string()))?;
-        Ok(pod.and_then(|p| {
-            p.metadata
-                .annotations
-                .as_ref()
-                .and_then(|a| a.get(ANNOTATION_WS_DURABILITY))
-                .filter(|v| !v.is_empty())
-                .cloned()
-        }))
-    }
 
     /// The artifacts the step published (ADR-0052), from the Pod annotation
     /// the harvest recorded (durable with the Pod across restarts).
@@ -3121,16 +3097,6 @@ const ANNOTATION_WS_ROOT: &str = "scarab.io/workspace-root";
 /// moves with every file's mtime, so a re-run can never reproduce its own root
 /// (git-bug `945b1f4`). Empty when the store computed none.
 const ANNOTATION_WS_IDENTITY: &str = "scarab.io/snapshot-identity";
-/// The Pod annotation recording the durability tier the published snapshot's
-/// flush EARNED (ADR-0064 s2): `"object"` | `"separate-volume"` |
-/// `"warm-only"`, straight off the Depot's flush verdict. Written in the SAME
-/// patch as [`ANNOTATION_WS_ROOT`]/[`ANNOTATION_WS_IDENTITY`] (crash-atomic
-/// with the root claim); `Executor::output_durability` reads it. Deliberately
-/// ABSENT — never a guessed value — when there is nothing truthful to stamp:
-/// no Depot wired (the drain wrote the durable store directly; approved
-/// deferral), or a `Durable`-without-tier reply from an old Depot (skew
-/// window during a rolling upgrade).
-const ANNOTATION_WS_DURABILITY: &str = "scarab.io/workspace-durability";
 /// The Pod annotation carrying the step's authored `outputs:` paths (ADR-0007),
 /// comma-separated. Absent/empty = publish the whole workspace. Read at egress,
 /// so an adopted Pod prunes identically with no in-memory state.
@@ -4734,7 +4700,6 @@ mod tests {
                 started_at: Timestamp(0),
                 failure: None,
                 failure_detail: None,
-                output_durability: None,
                 outcome: AttemptOutcome::Running,
             }],
             needs: vec![],

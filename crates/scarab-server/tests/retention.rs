@@ -291,7 +291,7 @@ async fn seed_run_with_workspace(
         .unwrap()
         .root
         .0;
-    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None, None)
+    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None)
         .await
         .unwrap();
     root
@@ -491,7 +491,6 @@ async fn cas_gc_skips_a_dangling_root_instead_of_aborting() {
         &AttemptId("a1".into()),
         &missing,
         None,
-        None,
     )
     .await
     .unwrap();
@@ -590,7 +589,7 @@ async fn seed_live_run_with_dir(
     let root = warm.ingest(dir.to_str().unwrap()).await.unwrap().root.0;
     let cold_root = cold.ingest(dir.to_str().unwrap()).await.unwrap().root.0;
     assert_eq!(root, cold_root, "content addressing: same dir, same root");
-    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None, None)
+    db.set_step_output(&run, &StepId("s1".into()), &AttemptId("a1".into()), &root, None)
         .await
         .unwrap();
     root
@@ -1140,7 +1139,6 @@ async fn seed_chain(db: &PostgresDb, cas: &Arc<dyn Cas>, run: &RunId) -> Vec<Str
             &AttemptId("a1".into()),
             &snap.root.0,
             snap.identity.as_ref().map(|i| i.0.as_str()),
-            None,
         )
         .await
         .unwrap();

@@ -5,9 +5,9 @@
 //! (fixed in 82f5840). The Slice-4 tests missed this by wrapping a bare
 //! `FakeExecutor` and never exercising the decorator.
 //!
-//! Same hazard, evidence flavour (ADR-0061 s8 / ADR-0064 s2): the decorators
-//! must forward `output_identity` and `output_durability`, or every real
-//! (secrets-wired) deployment silently records NULL evidence. "The
+//! Same hazard, evidence flavour (ADR-0061 s8): the decorators must forward
+//! `output_identity`, or every real (secrets-wired) deployment silently
+//! records NULL evidence. "The
 //! decorators" is PLURAL and this file honours that: production nests
 //! `clone(secret(k8s))` (main.rs), so `CloneEnrichingExecutor` — the
 //! OUTERMOST layer, with its own forwards in clone_executor.rs — is driven
@@ -51,17 +51,17 @@ async fn secret_injecting_executor_forwards_launch_service_to_inner() {
     );
 }
 
-/// The decorator must FORWARD `output_identity` and `output_durability` to the
-/// executor it wraps. `output_identity` really was swallowed until ADR-0064 s2:
-/// the defaulted trait method shadowed the inner impl, so a secrets-wired
-/// deployment recorded no identity, restart compared roots, and
-/// skip-if-unchanged could never fire (the 945b1f4 failure shape, reintroduced
-/// by the wrapper). `output_durability` is REQUIRED on the trait for exactly
-/// this reason — but required only forces *an* impl, not a forwarding one.
-/// Mutations killed: reverting either forward to an `Ok(None)` body — the
+/// The decorator must FORWARD `output_identity` to the executor it wraps. It
+/// really was swallowed once: the defaulted trait method shadowed the inner
+/// impl, so a secrets-wired deployment recorded no identity, restart compared
+/// roots, and skip-if-unchanged could never fire (the 945b1f4 failure shape,
+/// reintroduced by the wrapper). (`output_durability` was the trio's third
+/// member until ADR-0067 part 4 made durability a property of the drain
+/// itself and retired the stamp.)
+/// Mutation killed: reverting the forward to an `Ok(None)` body — the
 /// wrapper then answers `None` while the inner demonstrably answers `Some`.
 #[tokio::test]
-async fn secret_injecting_executor_forwards_output_identity_and_durability() {
+async fn secret_injecting_executor_forwards_output_identity() {
     let inner = Arc::new(FakeExecutor::new());
     let db = Arc::new(InMemoryDb::new());
     let secrets = Arc::new(FakeSecrets::new());
@@ -70,7 +70,6 @@ async fn secret_injecting_executor_forwards_output_identity_and_durability() {
 
     inner.set_output("s1", "root-hash");
     inner.set_output_identity("s1", "identity-hash");
-    inner.set_output_durability("s1", "object");
     let decorator = SecretInjectingExecutor::new(inner.clone(), db, secrets, logs);
 
     // The FakeExecutor's fence-derived handle shape: fake://{run}/{step}/{attempt}.
@@ -80,16 +79,7 @@ async fn secret_injecting_executor_forwards_output_identity_and_durability() {
         Some("identity-hash"),
         "the content identity (ADR-0061 s8) must pass through the decorator"
     );
-    assert_eq!(
-        decorator
-            .output_durability(&handle)
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("object"),
-        "the durability stamp (ADR-0064 s2) must pass through the decorator"
-    );
-    // And the address itself, completing the evidence trio.
+    // And the address itself, completing the evidence pair.
     assert_eq!(
         decorator.output(&handle).await.unwrap().as_deref(),
         Some("root-hash")
@@ -98,15 +88,15 @@ async fn secret_injecting_executor_forwards_output_identity_and_durability() {
 
 /// The FULL production nesting (main.rs:535/550 — `clone(secret(k8s))`):
 /// `CloneEnrichingExecutor` is the OUTERMOST decorator, with its own
-/// `output_identity` / `output_durability` overrides (clone_executor.rs) that
-/// the defaulted trait method would silently shadow if either were deleted.
-/// The secret-layer test above proves nothing about the layer production
-/// calls FIRST, so this drives the evidence trio through both layers.
-/// Mutations killed: delete either override in clone_executor.rs (it falls to
+/// `output_identity` override (clone_executor.rs) that the defaulted trait
+/// method would silently shadow if it were deleted. The secret-layer test
+/// above proves nothing about the layer production calls FIRST, so this
+/// drives the evidence through both layers.
+/// Mutations killed: delete the override in clone_executor.rs (it falls to
 /// the defaulted method) or hardcode it to `Ok(None)` — the stack then
 /// answers `None` while the inner stub demonstrably answers `Some`.
 #[tokio::test]
-async fn the_production_decorator_stack_forwards_identity_and_durability() {
+async fn the_production_decorator_stack_forwards_identity() {
     let inner = Arc::new(FakeExecutor::new());
     let db = Arc::new(InMemoryDb::new());
     let secrets = Arc::new(FakeSecrets::new());
@@ -115,7 +105,6 @@ async fn the_production_decorator_stack_forwards_identity_and_durability() {
 
     inner.set_output("s1", "root-hash");
     inner.set_output_identity("s1", "identity-hash");
-    inner.set_output_durability("s1", "object");
 
     let secret_layer: Arc<dyn Executor> = Arc::new(SecretInjectingExecutor::new(
         inner.clone(),
@@ -135,16 +124,7 @@ async fn the_production_decorator_stack_forwards_identity_and_durability() {
         Some("identity-hash"),
         "the content identity (ADR-0061 s8) must survive BOTH decorator layers"
     );
-    assert_eq!(
-        stack
-            .output_durability(&handle)
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("object"),
-        "the durability stamp (ADR-0064 s2) must survive BOTH decorator layers"
-    );
-    // And the address itself, completing the evidence trio through the stack.
+    // And the address itself, completing the evidence pair through the stack.
     assert_eq!(
         stack.output(&handle).await.unwrap().as_deref(),
         Some("root-hash")

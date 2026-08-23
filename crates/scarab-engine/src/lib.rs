@@ -258,15 +258,6 @@ pub struct Attempt {
     /// decodable; `None` means the class alone is the whole story.
     #[serde(default)]
     pub failure_detail: Option<String>,
-    /// Where this attempt's output workspace snapshot was **durable** when its
-    /// verdict was granted (ADR-0064 s2): the Depot's self-reported tier wire
-    /// string — `object` | `separate-volume` | `warm-only` — stamped by
-    /// `set_step_output` beside the snapshot root. Per-attempt evidence, never
-    /// recomputed: it answers "what did THIS `Succeeded` license?" after the
-    /// deployment's tier has changed. `#[serde(default)]` keeps pre-s2
-    /// rows/blobs decodable; `None` = no workspace, pre-s2 row, or unknown.
-    #[serde(default)]
-    pub output_durability: Option<String>,
     /// The recorded terminal (or in-flight) outcome of this attempt (ADR-0056
     /// amendment). `Running` until an outcome is written; `Superseded` and
     /// `Cancelled` are the non-failure terminations that must never render as a
@@ -1161,7 +1152,6 @@ impl StepRun {
             started_at: at,
             failure: None,
             failure_detail: None,
-            output_durability: None,
             outcome: AttemptOutcome::Running,
         });
         Ok(vec![
