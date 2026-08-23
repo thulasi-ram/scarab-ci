@@ -5186,7 +5186,8 @@ mod tests {
 
     /// **The acceptance test for this slice.** A Step gets an Export, writes into it,
     /// **deletes an inherited file**, and settles — and the published snapshot is
-    /// exactly the tree it left, readable from the **cold** tier alone.
+    /// exactly the tree it left, readable through a **fresh-warm replica** off the
+    /// pack index alone.
     ///
     /// Both halves are the ADR:
     ///
@@ -5194,11 +5195,11 @@ mod tests {
     ///   silently returns, and the whole `SettleDrain`-per-rung type exists because
     ///   reading a copy-rung tree as an overlay upper does exactly that. Deleting
     ///   `run.sh` is how this notices.
-    /// - *"a change set is folded into the CAS locally and then uploaded to cold before
-    ///   the Attempt may reach `Succeeded`"* is asserted by materialising the settled
-    ///   root through a store that can see **only** the cold directory. Warm cannot
-    ///   help it; if the archival flush had not run — or had been allowed to run after
-    ///   the response, which ADR-0064 rejects by name — there is nothing there to read.
+    /// - *"a change set is folded into the CAS locally and made durable before the
+    ///   Attempt may reach `Succeeded`"* (ADR-0062 part 3, as ADR-0067 part 4 keeps
+    ///   it) is asserted by flattening the settled root through a replica whose warm
+    ///   never held a byte. If the pack leg had not run — or had been allowed to run
+    ///   after the response — there is nothing there to read.
     #[tokio::test]
     async fn a_step_publishes_exactly_what_it_left_including_a_deletion_and_cold_can_serve_it() {
         let Some(h) = ExportHarness::start().await else { return };
@@ -5218,10 +5219,9 @@ mod tests {
             )
             .await;
         assert_eq!(settled["drain"], "re-ingest", "the copy rung chose the drain");
-        assert_eq!(settled["durable"], true);
-        assert_eq!(
-            settled["tier"], "separate-volume",
-            "a durable settle names the backing that licensed it (ADR-0064 part 5)"
+        assert!(
+            settled.get("durable").is_none() && settled.get("tier").is_none(),
+            "a 200 IS the durability claim (ADR-0067 part 4) — no hedge field rides it: {settled}"
         );
         let root = TreeHash(settled["root"].as_str().expect("root").to_string());
         assert_ne!(
@@ -5230,26 +5230,39 @@ mod tests {
              fixture would pass for a settle that published its input"
         );
 
-        // THE DURABILITY ASSERTION. `h.cold` is `S3Storage::local(<cold dir>)` — the
-        // cold directory and nothing else: no warm tier to fall back to, no tiering, no
-        // cache. If the cold leg had not run there is nothing here to read.
-        let out = h.tmp.path().join("from-cold");
-        h.cold
-            .materialize(&root, out.to_str().expect("utf-8"))
+        // THE DURABILITY ASSERTION. A fresh replica — empty warm, the same
+        // bucket and database — must produce the whole snapshot off the pack
+        // index and ranged reads (plus the parent's legacy loose objects):
+        // nothing of the settle survives anywhere else. If the pack leg had
+        // not run before the 200 there is nothing here to read.
+        let replica = replica_state(&h);
+        let manifest = flatten(&replica, &root)
             .await
             .expect(
-                "the settled snapshot must be readable from COLD ALONE — ADR-0062 part 3: a green \
-                 Attempt always has its snapshot in the tier that makes a promise",
+                "the settled snapshot must be readable through a FRESH-WARM replica — ADR-0062 \
+                 part 3: a green Attempt always has its snapshot in the tier that makes a promise",
             );
-
+        let mut published: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for entry in &manifest.entries {
+            let bytes = blob_via_pack_then_loose(&replica, &entry.blob.0)
+                .await
+                .unwrap_or_else(|e| panic!("blob {} must be servable: {e:?}", entry.path));
+            published.insert(entry.path.clone(), bytes);
+        }
+        // `tree_contents` lists directories too; the manifest's entries are
+        // files and symlinks, so the comparison covers exactly those.
+        let left: BTreeMap<String, Vec<u8>> = left_behind
+            .iter()
+            .filter(|(path, _)| !workspace.join(path).is_dir())
+            .map(|(path, (bytes, _mode))| (path.clone(), bytes.clone()))
+            .collect();
         assert_eq!(
-            tree_contents(&out),
-            left_behind,
+            published, left,
             "the published snapshot must BE the tree the Step left: the rewrite, the addition, \
              the untouched files, the symlink — and NOT `run.sh`, which it deleted"
         );
         assert!(
-            !tree_contents(&out).contains_key("run.sh"),
+            !published.contains_key("run.sh"),
             "the deleted file came back. That is the silent failure ADR-0062 makes the rung choose \
              the drain to prevent, and it is the one this assertion exists for"
         );
@@ -5263,22 +5276,23 @@ mod tests {
     /// therefore has to own. Forget it and every file is re-read: never wrong, and
     /// `reused == 0` is the only thing that would say so.
     ///
-    /// **Two of this test's premises moved with ADR-0064 part 1 and the numbers did
-    /// not.** The tally now comes from the **warm** walk, because there is only one walk
-    /// — the cold walk that used to report these counters is gone, along with the
-    /// tripwire for the case where the two disagreed on the root. And a `Reuse` no
-    /// longer means "cold was never offered this blob": the archival flush covers every
-    /// blob the resulting snapshot names, reused ones included, which the last assertion
-    /// below is what pins. `a_blob_the_drain_reused_is_still_offered_to_the_cold_flush`
-    /// is the same property at the fold's grain and carries the reasoning.
+    /// **Two of this test's premises moved and the numbers did not.** The tally
+    /// comes from the **warm** walk, because there is only one walk — the cold walk
+    /// that used to report these counters is gone, along with the tripwire for the
+    /// case where the two disagreed on the root. And a `Reuse` no longer means "the
+    /// durable tier was never offered this blob": the settle's pack leg covers every
+    /// blob the resulting snapshot names, reused ones included, which the last
+    /// assertion below is what pins.
+    /// `a_blob_the_fold_reused_is_still_made_durable_by_the_pack_leg` is the same
+    /// property at the fold's grain and carries the reasoning.
     #[tokio::test]
     async fn the_reingest_drain_reuses_the_files_the_step_never_touched() {
         let Some(h) = ExportHarness::start().await else { return };
         let (handle, _capability, workspace) = h.prepare().await;
         std::fs::write(workspace.join("keep.txt"), b"touched").expect("rewrite");
-        // The blob of a file the Step will NOT touch, deleted from cold before the
-        // settle. The drain will reuse it out of the baseline and read nothing, so the
-        // only thing that can put it back in cold is the flush.
+        // The blob of a file the Step will NOT touch, deleted from cold loose before
+        // the settle. The drain will reuse it out of the baseline and read nothing, so
+        // the only thing that can make it durable again is the settle's pack leg.
         let reused_key = format!("blobs/{}", hash_hex(b"inner"));
         h.cold
             .delete(&reused_key)
@@ -5322,17 +5336,22 @@ mod tests {
              compare (and its target was read by the walk either way)"
         );
 
-        // …and the blob nothing read is in cold anyway, because the flush offers every
-        // blob the snapshot names. Before ADR-0064 the cold leg skipped exactly these,
-        // on the argument that "the parent was durable once" — which stops being true
-        // the moment the parent ages out of cold while warm, which never evicts, keeps
-        // serving it.
+        // …and the blob nothing read is durable anyway, because the pack leg covers
+        // every blob the snapshot names. The old cold leg skipped exactly these, on
+        // the argument that "the parent was durable once" — which stops being true
+        // the moment the parent ages out of the durable set while warm, which never
+        // evicts, keeps serving it.
+        assert!(
+            member_rows(&h.state.db, &hash_hex(b"inner")).await > 0,
+            "a blob the drain REUSED must still be made durable by the pack leg: warm \
+             outlives the durable set, so skipping it publishes a durable tree naming a \
+             child nothing durable holds and calls that success"
+        );
+        let replica = replica_state(&h);
         assert_eq!(
-            h.cold.get(&reused_key).await.expect(
-                "a blob the drain REUSED must still be offered to cold: warm outlives cold, so \
-                 skipping it publishes a cold tree naming a child cold does not hold and calls \
-                 that success"
-            ),
+            blob_via_pack_then_loose(&replica, &hash_hex(b"inner"))
+                .await
+                .expect("the reused blob must be servable off the pack"),
             b"inner".to_vec()
         );
     }
