@@ -75,7 +75,6 @@ impl Harness {
             warm.path(),
             cold_store.clone(),
             SECRET.to_vec(),
-            scarab_server::workspaced::DurabilityTier::SeparateVolume,
             pool.clone(),
         )
         .expect("router");
@@ -631,14 +630,14 @@ async fn member_rows_for(pool: &sqlx::PgPool, hex: &str) -> i64 {
 /// its pruned closure into packs; the drain record commits the index; and a
 /// SECOND replica whose warm has never held a byte serves every published
 /// address by ranged reads into the shared bucket — while the build scratch
-/// never enters the durable index at all, and the pre-existing flush finds
-/// zero blobs left to upload.
+/// never enters the durable index at all, and `/have` confirms nothing is
+/// left for any second pass.
 ///
 /// Mutations killed: dropping the pod's labels (junk lands in the index — the
 /// junk assertion fires); packing without the index transaction (replica B
 /// 404s); labelling by upload order instead of the pruned closure (either
-/// assertion); the flush ignoring the pack index (blobs_uploaded != 0 — the
-/// second pass re-uploading what part 4 already made durable).
+/// assertion); `/have` answering warm instead of the durable index (the
+/// closing assertions fire).
 #[tokio::test]
 async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_address() {
     use scarab_storage::content::ContentSource;
@@ -750,27 +749,28 @@ async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_addres
         assert_eq!(bytes.len() as u64, entry.size, "size index vs bytes: {}", entry.path);
     }
 
-    // The (still-existing) second pass has nothing left to carry: every blob
-    // of the published closure is already durable in a pack.
-    let flushed: serde_json::Value = reqwest::Client::new()
-        .post(format!("{}/v1/cas/flush", a.base))
+    // There is no second pass left to carry anything (ADR-0067 part 4): the
+    // durable index already answers for the whole published closure, so a
+    // re-drain of the same content would upload zero.
+    let have: serde_json::Value = reqwest::Client::new()
+        .post(format!("{}/v1/cas/have", a.base))
         .header(
             "x-scarab-workspace-token",
             workspace_token::mint(SECRET, &workspace_token::browse_claims(far_future())),
         )
-        .json(&serde_json::json!({ "root": pruned.0 }))
+        .json(&serde_json::json!({ "blobs": [kept_blob], "trees": [pruned.0.clone()] }))
         .send()
         .await
-        .expect("flush request")
+        .expect("have request")
         .json()
         .await
-        .expect("flush tally");
+        .expect("have body");
     assert_eq!(
-        flushed["blobs_uploaded"],
-        serde_json::json!(0),
-        "the flush must not re-upload loose copies of packed blobs: {flushed}"
+        have["missing_blobs"],
+        serde_json::json!([]),
+        "a packed blob is durable — nothing left for any second pass: {have}"
     );
-    assert_eq!(flushed["durable"], serde_json::json!(true), "{flushed}");
+    assert_eq!(have["missing_trees"], serde_json::json!([]), "{have}");
 }
 
 /// `/have` answers the DURABLE index, identically through every replica

@@ -60,14 +60,14 @@ static CAS_GC_COLD_RESIDUE_SUPPRESSED: AtomicU64 = AtomicU64::new(0);
 /// are live: the residue gauges are leader-reported; non-leaders hold 0.
 static CAS_GC_LEADER: AtomicU64 = AtomicU64::new(0);
 
-/// Whether the last leader pass's Depot tier probe (`GET /v1/tier`, ADR-0064
-/// s2) FAILED (1) or succeeded / was not needed (0). A probe error does not
-/// suppress the torn-cold detector — but under a warm-only Depot whose probe
-/// is broken, the detector then flags every marked object, so this gauge is
-/// what lets a scrape tell "real torn cold" from "the probe is down and the
-/// residue may be a warm-only false positive". Leader-reported like the
-/// residue gauges; non-leaders hold 0 (ticket 231040a).
-static CAS_GC_TIER_PROBE_FAILED: AtomicU64 = AtomicU64::new(0);
+/// Whether the last leader pass's Depot durable-index probe (the `/have`
+/// durable answer, ADR-0067) FAILED (1) or succeeded / was not needed (0). A
+/// probe error does not suppress the torn-durability detector — but with the
+/// probe down the detector cannot subtract pack-durable content, so this
+/// gauge is what lets a scrape tell "real torn cold" from "the probe is down
+/// and the residue may be pack-durable false positives". Leader-reported like
+/// the residue gauges; non-leaders hold 0 (ticket 231040a).
+static CAS_GC_DEPOT_PROBE_FAILED: AtomicU64 = AtomicU64::new(0);
 
 /// Record one CAS GC pass's torn-cold residue (alarmed, suppressed).
 /// Leader-reported; non-leaders hold 0 (ticket 231040a).
@@ -81,11 +81,11 @@ pub fn set_cas_gc_leader(leader: bool) {
     CAS_GC_LEADER.store(leader as u64, Ordering::Relaxed);
 }
 
-/// Record whether the last CAS GC pass's Depot tier probe failed. Stored per
-/// pass like the residue gauges: 1 on a probe error, 0 on success or when no
-/// probe was made (no Depot configured / non-leader).
-pub fn set_cas_gc_tier_probe_failed(failed: bool) {
-    CAS_GC_TIER_PROBE_FAILED.store(failed as u64, Ordering::Relaxed);
+/// Record whether the last CAS GC pass's Depot durable-index probe failed.
+/// Stored per pass like the residue gauges: 1 on a probe error, 0 on success
+/// or when no probe was made (no Depot configured / non-leader).
+pub fn set_cas_gc_depot_probe_failed(failed: bool) {
+    CAS_GC_DEPOT_PROBE_FAILED.store(failed as u64, Ordering::Relaxed);
 }
 
 /// Torn-cold residue the last CAS GC pass alarmed on.
@@ -103,9 +103,9 @@ pub fn cas_gc_leader() -> u64 {
     CAS_GC_LEADER.load(Ordering::Relaxed)
 }
 
-/// 1 if the last CAS GC pass's Depot tier probe failed, else 0.
-pub fn cas_gc_tier_probe_failed() -> u64 {
-    CAS_GC_TIER_PROBE_FAILED.load(Ordering::Relaxed)
+/// 1 if the last CAS GC pass's Depot durable-index probe failed, else 0.
+pub fn cas_gc_depot_probe_failed() -> u64 {
+    CAS_GC_DEPOT_PROBE_FAILED.load(Ordering::Relaxed)
 }
 
 /// Append the counters to a Prometheus text exposition body.
@@ -131,14 +131,14 @@ scarab_cas_gc_cold_residue_suppressed {}
 # HELP scarab_cas_gc_leader Whether this replica's last CAS GC pass held the sweep lease (1 = leader; the residue gauges above are live here, non-leaders hold 0).
 # TYPE scarab_cas_gc_leader gauge
 scarab_cas_gc_leader {}
-# HELP scarab_cas_gc_tier_probe_failed Whether the last CAS GC pass's Depot tier probe failed (when 1, residue alarms may be warm-only false positives — fix the probe first).
-# TYPE scarab_cas_gc_tier_probe_failed gauge
-scarab_cas_gc_tier_probe_failed {}
+# HELP scarab_cas_gc_depot_probe_failed Whether the last CAS GC pass's Depot durable-index probe failed (when 1, residue alarms may be pack-durable false positives — fix the probe first).
+# TYPE scarab_cas_gc_depot_probe_failed gauge
+scarab_cas_gc_depot_probe_failed {}
 ",
         cas_gc_cold_residue(),
         cas_gc_cold_residue_suppressed(),
         cas_gc_leader(),
-        cas_gc_tier_probe_failed()
+        cas_gc_depot_probe_failed()
     ));
     // The control plane's own view of the ADR-0061 tiering. The workspace
     // *service* exports the same counters from its own `/metrics`, and both are

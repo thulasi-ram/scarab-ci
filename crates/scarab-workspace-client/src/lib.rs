@@ -350,75 +350,6 @@ impl WorkspaceClient {
         Ok(())
     }
 
-    /// Ask the Depot to archive everything reachable from `root` to cold —
-    /// `POST /v1/cas/flush` (ADR-0064).
-    ///
-    /// This is the durability leg of the control plane's write path: `ingest`
-    /// above seeds the Depot's **warm** tier (the PUT handlers are warm-only),
-    /// and nothing is durable until this flush answers `Durable`. The caller
-    /// that needs `Succeeded` awaits this, exactly as the Depot's own settle
-    /// path awaits its internal flush phase — which is where ADR-0061 part 4's
-    /// "cold gates `Succeeded`" now lives.
-    ///
-    /// Not `Result`, deliberately: the caller's next move is the whole payload,
-    /// and a `Result` would invite `?`-ing a [`FlushOutcome::Retry`] into a
-    /// permanent failure. `Retry` covers transport errors and every 5xx — the
-    /// Depot's own refusal body says `retryable: true` for those, including a
-    /// wiped warm tier, because re-driving the drain re-uploads what is missing.
-    /// `Fatal` is the Depot's `422` alone: an addressing disagreement no retry
-    /// converges. [`WarmOnly`](FlushOutcome::WarmOnly) is the Depot's disclosure
-    /// that no cold tier exists (ADR-0064 part 4) — not retried, because nothing
-    /// about being warm-only is repaired by retrying.
-    pub async fn flush(&self, root: &TreeHash) -> FlushOutcome {
-        #[derive(Serialize)]
-        struct FlushRequest<'a> {
-            root: &'a str,
-        }
-        let resp = self
-            .request(reqwest::Method::POST, "/v1/cas/flush")
-            .json(&FlushRequest { root: &root.0 })
-            .send()
-            .await;
-        match resp {
-            Err(e) => FlushOutcome::Retry(format!("workspace service unreachable: {e}")),
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                flush_outcome(status, &body)
-            }
-        }
-    }
-
-    /// Which durability tier backs this Depot — `GET /v1/tier` (ADR-0064
-    /// parts 3–5): `"object" | "separate-volume" | "warm-only"`.
-    ///
-    /// Consulted by the control-plane GC to decide whether torn-cold detection
-    /// is meaningful (no cold, no torn cold); also an operator probe.
-    /// Authenticated like every other call here; the route wants the control
-    /// plane's own scope (`Browse`), same as [`flush`](Self::flush). A
-    /// transport failure, a non-2xx, or a body without the field is an `Err` —
-    /// an old Depot without the route answers 404, and the caller must treat
-    /// "cannot ask" as unknown rather than defaulting a tier.
-    pub async fn depot_tier(&self) -> Result<String, StorageError> {
-        let resp = self
-            .request(reqwest::Method::GET, "/v1/tier")
-            .send()
-            .await
-            .map_err(Self::transport)?;
-        if !resp.status().is_success() {
-            return Err(Self::status_error(resp).await);
-        }
-        let body: serde_json::Value = resp.json().await.map_err(Self::transport)?;
-        body.get("tier")
-            .and_then(|t| t.as_str())
-            .map(String::from)
-            .ok_or_else(|| {
-                StorageError::Backend(
-                    "workspace service answered /v1/tier without a `tier` field".into(),
-                )
-            })
-    }
-
     /// Publish the in-Pod drain's outcome — `POST /v1/drains` (stage-1 drain).
     ///
     /// The Depot is the rendezvous: the helper posts this record LAST, after
@@ -653,96 +584,6 @@ impl WorkspaceClient {
     }
 }
 
-/// What one archival flush request came back as — the caller's next move, as a
-/// type (ADR-0064).
-///
-/// Four outcomes, because the Depot's answers split on two axes: whether the
-/// snapshot is archived, and — when it is not — whether re-driving can help:
-///
-/// - [`Durable`](FlushOutcome::Durable) — a 2xx whose body affirms
-///   `durable: true`: everything reachable from the root is in cold; the
-///   Attempt may be reported `Succeeded`. Carries the Depot's `tier` string
-///   (`"object"` / `"separate-volume"`, ADR-0064 part 5) for the caller to
-///   stamp on the Attempt — `None` only against an older Depot that predates
-///   the field (the deploy-skew window), which the caller records as unknown
-///   rather than inventing a value;
-/// - [`WarmOnly`](FlushOutcome::WarmOnly) — a 2xx that says `durable: false`
-///   **and names `tier: "warm-only"`**: the deployment has no independent cold
-///   tier (ADR-0064 part 4), nothing was archived, nothing about that is
-///   repaired by retrying, and the caller records the disclosed weaker
-///   guarantee instead of re-driving forever;
-/// - [`Retry`](FlushOutcome::Retry) — transport failures, 5xx, anything
-///   unrecognised — **including a 2xx whose body says `durable: false` without
-///   the warm-only tier, or does not parse**, because durability is read off
-///   the response, never assumed from the status line. The Depot answers
-///   `503 retryable: true` even for a warm miss, because the caller's re-driven
-///   drain re-uploads what warm lost before it retries the flush;
-/// - [`Fatal`](FlushOutcome::Fatal) — the Depot's `422`: the tiers disagree on
-///   how content is addressed, and no retry converges that. Fail the Attempt
-///   promptly, with this detail as the cause.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FlushOutcome {
-    Durable { tier: Option<String> },
-    WarmOnly,
-    Retry(String),
-    Fatal(String),
-}
-
-/// Classify one flush response. Pure, so the mapping — the entire contract of
-/// [`WorkspaceClient::flush`] beyond transport — is testable without a server.
-fn flush_outcome(status: reqwest::StatusCode, body: &str) -> FlushOutcome {
-    if status.is_success() {
-        // A 2xx alone is NOT the durability claim — the body's `durable` field
-        // is. This outcome licenses `Succeeded`, so it must be read off the
-        // response and not assumed from the status line. Since git-bug 981fc6b
-        // there IS a Depot that answers `durable: false` on purpose: a
-        // warm-only deployment (ADR-0064 part 4), which says so with
-        // `tier: "warm-only"` — an affirmative disclosure, classified
-        // `WarmOnly`, never retried. That tier pairing is load-bearing: a
-        // `durable: false` WITHOUT it, and a 2xx whose body does not parse (a
-        // proxy's masked 200), still come back `Retry` — the masked-proxy /
-        // partial-flush protection this classifier has always carried. A
-        // mangled body must not be able to impersonate the one legitimate
-        // "not durable and that is fine" answer.
-        let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
-        let durable = parsed
-            .as_ref()
-            .and_then(|v| v.get("durable").and_then(|d| d.as_bool()));
-        let tier = parsed
-            .as_ref()
-            .and_then(|v| v.get("tier").and_then(|t| t.as_str()).map(String::from));
-        return match durable {
-            // `tier` is `None` only against a Depot from before the field
-            // existed (deploy skew); the caller records "unknown", it does not
-            // guess.
-            Some(true) => FlushOutcome::Durable { tier },
-            Some(false) if tier.as_deref() == Some("warm-only") => FlushOutcome::WarmOnly,
-            Some(false) => FlushOutcome::Retry(
-                "workspace service answered success with `durable: false` and no \
-                 `tier: \"warm-only\"` disclosure — the flush did not archive the closure \
-                 to cold and did not say why"
-                    .into(),
-            ),
-            None => FlushOutcome::Retry(format!(
-                "workspace service answered {status} without a parseable `durable` \
-                 field — refusing to treat the status line alone as durability: {body}"
-            )),
-        };
-    }
-    // The refusal body is `{"retryable": …, "detail": …}`; the detail is what an
-    // operator reads off the failed Attempt. Anything else (a proxy's error
-    // page, an empty body) falls back to the status line plus whatever came.
-    let detail = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("detail").and_then(|d| d.as_str()).map(String::from))
-        .unwrap_or_else(|| format!("workspace service {status}: {body}"));
-    if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-        FlushOutcome::Fatal(detail)
-    } else {
-        FlushOutcome::Retry(detail)
-    }
-}
-
 /// One fence — `{run, step, attempt}` — as the Depot's **fence key**: SHA-256
 /// over a length-prefixed encoding, lowercase hex, one safe URL path segment.
 ///
@@ -783,7 +624,7 @@ pub fn drain_fence_key(run: &str, step: &str, attempt: &str) -> String {
 /// - The tallies are the helper's receipts for ws-timing v2 (`files`,
 ///   `tree_bytes`, `blobs_uploaded`, `bytes_uploaded`, `have_hits`,
 ///   `ingest_ms`, `prune_ms`); the control plane keeps its own clock for the
-///   exec and the flush.
+///   exec.
 /// - `error: None` **is** the success claim. An error record carries the kind
 ///   the CP classifies on — `OutputContract` is the only Fatal(Config) one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1622,107 +1463,6 @@ mod tests {
             hash_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-    }
-
-    /// The flush contract's client half: 2xx + `durable: true` → `Durable`
-    /// (carrying the Depot's tier), 2xx + `durable: false` + `tier: "warm-only"`
-    /// → `WarmOnly`, `422` alone → `Fatal`, everything else → `Retry`
-    /// (ADR-0064 parts 1 and 4).
-    ///
-    /// Mutations killed: swap the 422/503 arms — a canonicalisation fork would be
-    /// re-driven forever, or a Depot blip (or wiped warm tier, which the re-driven
-    /// drain heals) would permanently fail an Attempt; drop the `detail`
-    /// extraction — the failed Attempt's cause degrades to a bare status line;
-    /// drop the success-body `durable` check (any 2xx → `Durable`) — the
-    /// 2xx+`durable: false` and 2xx+garbage-body cases below would license
-    /// `Succeeded` on a flush that archived nothing; drop the `tier` extraction
-    /// on the Durable arm — the Attempt's `output_durability` stamp silently
-    /// becomes always-unknown.
-    #[test]
-    fn a_flush_response_is_classified_by_whether_retrying_can_help() {
-        assert_eq!(
-            flush_outcome(
-                reqwest::StatusCode::OK,
-                r#"{"durable":true,"tier":"separate-volume","blobs":3,"blobs_uploaded":1,"trees":2}"#
-            ),
-            FlushOutcome::Durable {
-                tier: Some("separate-volume".into())
-            },
-            "a durable answer carries the backing the caller stamps on the Attempt"
-        );
-        // An OLD Depot (pre-tier field, deploy skew): still durable — that
-        // field's absence must not fail a flush that archived everything — but
-        // the tier is honestly unknown, never guessed.
-        assert_eq!(
-            flush_outcome(
-                reqwest::StatusCode::OK,
-                r#"{"durable":true,"blobs":3,"blobs_uploaded":1,"trees":2}"#
-            ),
-            FlushOutcome::Durable { tier: None },
-            "skew window: durable without a tier is Durable{{None}}, not Retry and not a guess"
-        );
-        assert_eq!(
-            flush_outcome(
-                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-                r#"{"retryable":false,"detail":"the two tiers do not agree on how content is addressed"}"#
-            ),
-            FlushOutcome::Fatal("the two tiers do not agree on how content is addressed".into()),
-            "422 is the ONLY fatal class, and the Depot's detail is the Attempt's cause"
-        );
-        assert_eq!(
-            flush_outcome(
-                reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                r#"{"retryable":true,"detail":"cold tier unreachable"}"#
-            ),
-            FlushOutcome::Retry("cold tier unreachable".into())
-        );
-        // A body that is not the refusal shape (a proxy's 502 page, an empty
-        // 500) must still classify — as Retry, with the status line kept.
-        match flush_outcome(reqwest::StatusCode::BAD_GATEWAY, "<html>bad gateway</html>") {
-            FlushOutcome::Retry(detail) => assert!(
-                detail.contains("502"),
-                "the fallback detail must carry the status: {detail}"
-            ),
-            other => panic!("an unrecognised failure must be retried, got {other:?}"),
-        }
-        // The one legitimate "not durable and that is fine": the Depot's
-        // warm-only disclosure (ADR-0064 part 4). Named by its tier, so it is
-        // affirmative — classified once, never re-driven.
-        assert_eq!(
-            flush_outcome(
-                reqwest::StatusCode::OK,
-                r#"{"durable":false,"tier":"warm-only","blobs":3,"blobs_uploaded":0,"trees":2}"#,
-            ),
-            FlushOutcome::WarmOnly,
-            "durable:false + tier:\"warm-only\" is a disclosure, not a failure — retrying it \
-             forever is the mutation this kills"
-        );
-        // A 2xx is not itself durability: a `durable: false` WITHOUT the
-        // warm-only tier must not license `Succeeded` and must not read as the
-        // disclosure either — it is an anomaly (a partial-flush bug, a proxy
-        // rewriting bodies), and the caller re-drives instead of recording a
-        // green Attempt cold cannot back.
-        match flush_outcome(
-            reqwest::StatusCode::OK,
-            r#"{"durable":false,"blobs":3,"blobs_uploaded":0,"trees":2}"#,
-        ) {
-            FlushOutcome::Retry(detail) => assert!(
-                detail.contains("durable"),
-                "the detail must name the condition: {detail}"
-            ),
-            other => panic!(
-                "2xx + durable:false without the warm-only tier must be Retry, got {other:?}"
-            ),
-        }
-        // Same for a 2xx whose body is not the tally shape at all (a proxy's
-        // masked 200): durability is read off the body, never off the status.
-        match flush_outcome(reqwest::StatusCode::OK, "<html>ok</html>") {
-            FlushOutcome::Retry(detail) => assert!(
-                detail.contains("durable") && detail.contains("200"),
-                "the detail must name the missing field and the status: {detail}"
-            ),
-            other => panic!("2xx + unparseable body must NOT be Durable, got {other:?}"),
-        }
     }
 
     /// The DrainRecord wire shape, field for field, against the stage-1

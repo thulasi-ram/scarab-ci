@@ -63,7 +63,6 @@ impl Harness {
             warm.path(),
             cold_store,
             SECRET.to_vec(),
-            scarab_server::workspaced::DurabilityTier::SeparateVolume,
             pg.pool.clone(),
         )
         .expect("router");

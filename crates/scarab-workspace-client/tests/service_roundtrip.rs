@@ -49,17 +49,10 @@ struct Harness {
 }
 
 impl Harness {
-    /// The default harness is separate-volume-shaped: the tier is a router
-    /// parameter (only `workspaced::run` probes), so the tempdirs sharing a
-    /// device does not demote it.
-    ///
     /// `None` = no `SCARAB_TEST_DATABASE_URL` configured (the caller skips):
-    /// the write ledger and the drain records are Postgres rows now.
+    /// the write ledger, the drain records and the pack index are Postgres
+    /// rows now.
     async fn start() -> Option<Self> {
-        Self::start_with_tier(scarab_server::workspaced::DurabilityTier::SeparateVolume).await
-    }
-
-    async fn start_with_tier(tier: scarab_server::workspaced::DurabilityTier) -> Option<Self> {
         let pg = common::TestPg::provision().await?;
         let warm = tempfile::tempdir().expect("warm tempdir");
         let cold = tempfile::tempdir().expect("cold tempdir");
@@ -68,7 +61,6 @@ impl Harness {
             warm.path(),
             cold_store.clone(),
             SECRET.to_vec(),
-            tier,
             pg.pool.clone(),
         )
         .expect("router");
@@ -1037,86 +1029,4 @@ async fn a_directory_with_no_recorded_mode_is_restored_not_left_widened() {
     );
 
     let _ = std::fs::set_permissions(out.path().join("d"), std::fs::Permissions::from_mode(0o755));
-}
-
-/// `depot_tier` reads the deployment's durability tier over real HTTP, and the
-/// route wants the control plane's own scope (ADR-0064 parts 3–5).
-///
-/// Mutations killed: mangle the client's URL or the `tier` field extraction and
-/// the browse leg fails against the REAL route — the pure classifier tests
-/// cannot see a path typo; drop the client's non-2xx check and the read-scoped
-/// leg's 403 would come back as a garbled `Ok`.
-#[tokio::test]
-async fn depot_tier_is_answered_over_real_http_and_wants_browse_scope() {
-    let Some(h) = Harness::start().await else { return };
-    assert_eq!(
-        h.browse_client().depot_tier().await.expect("depot_tier"),
-        "separate-volume"
-    );
-    // A fenced Step's read-scoped token is refused — deployment topology is the
-    // control plane's to read.
-    let reader = h.client_for(&["a".repeat(64).as_str()]);
-    assert!(
-        reader.depot_tier().await.is_err(),
-        "a read-scoped token must not learn the tier"
-    );
-}
-
-/// The end-to-end warm-only contract, wire strings included: a Depot built
-/// warm-only (ADR-0064 part 4) answers the flush with the disclosure, and the
-/// client classifies it `WarmOnly` — not `Durable`, not an endless `Retry`.
-///
-/// This is the skew tripwire between the Depot's serialised tier strings and
-/// the client's classifier: the pure tests on each side pin their own half,
-/// and only a real round trip proves the two halves name the same string.
-#[tokio::test]
-async fn a_warm_only_depot_flush_classifies_as_warm_only() {
-    use scarab_workspace_client::FlushOutcome;
-
-    let Some(h) = Harness::start_with_tier(scarab_server::workspaced::DurabilityTier::WarmOnly).await else { return };
-    let client = h.browse_client();
-    let source = tempfile::tempdir().unwrap();
-    build_fixture(source.path());
-    let snapshot = client
-        .ingest(source.path().to_str().unwrap())
-        .await
-        .expect("ingest seeds warm exactly as under any tier");
-
-    match client.flush(&snapshot.root).await {
-        FlushOutcome::WarmOnly => {}
-        other => panic!(
-            "a warm-only Depot's flush must classify WarmOnly — Durable would record an \
-             archive that does not exist, Retry would re-drive forever: got {other:?}"
-        ),
-    }
-    assert_eq!(
-        client.depot_tier().await.expect("depot_tier"),
-        "warm-only",
-        "and /v1/tier names the same tier the flush disclosed"
-    );
-}
-
-/// The durable leg of the same wire contract: a Depot with a real second tier
-/// answers `Durable` carrying the tier string the caller stamps on the Attempt.
-#[tokio::test]
-async fn a_separate_volume_depot_flush_is_durable_and_names_its_tier() {
-    use scarab_workspace_client::FlushOutcome;
-
-    let Some(h) = Harness::start().await else { return };
-    let client = h.browse_client();
-    let source = tempfile::tempdir().unwrap();
-    build_fixture(source.path());
-    let snapshot = client
-        .ingest(source.path().to_str().unwrap())
-        .await
-        .expect("ingest");
-
-    match client.flush(&snapshot.root).await {
-        FlushOutcome::Durable { tier } => assert_eq!(
-            tier.as_deref(),
-            Some("separate-volume"),
-            "the tier must come off the Depot's response, not be defaulted client-side"
-        ),
-        other => panic!("a real second tier must flush Durable, got {other:?}"),
-    }
 }

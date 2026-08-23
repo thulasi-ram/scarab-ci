@@ -172,27 +172,36 @@ pub struct GcConfig {
 const GC_LEASE: &str = "cas-gc";
 const GC_LEASE_TTL_MS: i64 = 5 * 60 * 1000;
 
-/// How the CAS sweep asks the Depot which durability tier backs it (ADR-0064
-/// s2): the wire strings `object` | `separate-volume` | `warm-only`, from the
-/// Depot's own `GET /v1/tier`. A seam rather than a `WorkspaceClient`
-/// dependency so the sweeper (and its tests) can be driven by anything
-/// real-shaped that answers the question.
+/// How the CAS sweep asks the Depot which marked addresses are already
+/// **durable in the pack index** (ADR-0067 parts 4 and 9) — the `/have`
+/// durable answer, over whatever client the composition root holds. A seam
+/// rather than a `WorkspaceClient` dependency so the sweeper (and its tests)
+/// can be driven by anything real-shaped that answers the question.
 ///
-/// The sweep consults it once per pass, for exactly one decision: under a
-/// **warm-only** Depot nothing is ever flushed cold, so the torn-cold residue
-/// diff (`marked − cold listing`) would flag EVERY marked object — a
-/// permanent full-volume false alarm that trains operators to ignore the one
-/// detector that matters everywhere else. Errors do NOT suppress: a torn cold
-/// must not be maskable by breaking `/v1/tier`.
+/// The sweep consults it once per pass, for exactly one decision: a durable
+/// drain writes PACKS, not loose `blobs/`/`trees/` objects, so the loose cold
+/// listing alone would flag every packed object as torn-cold residue — a
+/// permanent, growing false alarm that trains operators to ignore the one
+/// detector that matters. Errors do NOT excuse anything: on a probe failure
+/// the detector stays on (a torn cold must not be maskable by breaking the
+/// Depot) and the probe-failed gauge says the alarms may be pack-durable
+/// false positives.
 #[async_trait::async_trait]
-pub trait DepotTierSource: Send + Sync {
-    /// The Depot's current durability tier wire string, or an error when the
-    /// probe fails (unreachable Depot, non-2xx, garbage body).
-    async fn depot_tier(&self) -> Result<String, String>;
+pub trait DepotDurableIndex: Send + Sync {
+    /// Which of these bare-hex addresses are NOT durable in the pack index —
+    /// blobs and trees, answered separately (the two CAS namespaces).
+    async fn durable_missing(
+        &self,
+        blobs: Vec<String>,
+        trees: Vec<String>,
+    ) -> Result<
+        (
+            std::collections::HashSet<String>,
+            std::collections::HashSet<String>,
+        ),
+        String,
+    >;
 }
-
-/// The tier wire string under which cold is not expected to hold anything.
-const TIER_WARM_ONLY: &str = "warm-only";
 
 /// One reachable object the mark walk could read (through the tiered handle —
 /// which may have been served by the WARM tier) that the cold listing does not
@@ -254,9 +263,10 @@ const RESIDUE_LOG_CAP: usize = 50;
 ///   so the operator is not sent to recover from a tier that has nothing.
 ///   Detection only — the objects stay marked (so the sweep cannot delete
 ///   them) and re-upload-from-warm is a filed follow-up, not this slice.
-/// `depot` is the tier probe (ADR-0064 s2): `None` = no Depot configured (a
-/// drain-less / pre-0061 deployment) — the residue detector stays on, status
-/// quo. See [`DepotTierSource`] for the one decision it drives.
+/// `depot` is the durable-index probe (ADR-0067): `None` = no Depot
+/// configured (a drain-less / pre-0061 deployment, where nothing packs) —
+/// the residue detector runs on the loose listing alone, status quo. See
+/// [`DepotDurableIndex`] for the one decision it drives.
 pub async fn sweep_cas(
     db: &Arc<dyn Db>,
     cas: &Arc<dyn scarab_storage::Cas>,
@@ -264,7 +274,7 @@ pub async fn sweep_cas(
     clock: &Arc<dyn Clock>,
     owner: &str,
     cfg: GcConfig,
-    depot: Option<&dyn DepotTierSource>,
+    depot: Option<&dyn DepotDurableIndex>,
 ) -> Result<CasSweepReport, String> {
     let lease = db
         .lease(GC_LEASE, owner, GC_LEASE_TTL_MS)
@@ -277,7 +287,7 @@ pub async fn sweep_cas(
         // This hides nothing: the current leader re-reports on its own next
         // pass, and an operator aggregates `max` across replicas.
         crate::metrics::set_cas_gc_cold_residue(0, 0);
-        crate::metrics::set_cas_gc_tier_probe_failed(false);
+        crate::metrics::set_cas_gc_depot_probe_failed(false);
         crate::metrics::set_cas_gc_leader(false);
         return Ok(CasSweepReport::default());
     }
@@ -411,49 +421,59 @@ pub async fn sweep_cas(
         }
     }
 
-    // --- Torn-cold detection (ticket d4d3b95). --------------------------
-    // First (ADR-0064 s2): is there a cold tier to be torn? Under a warm-only
-    // Depot nothing is ever flushed, the cold listing is meaningless, and the
-    // diff below would flag EVERY marked object on EVERY pass — so the
-    // detector is skipped for this pass and the gauges are zeroed (the leader
-    // gauge stays 1: this pass IS the leader's, its numbers are live — ticket
-    // 231040a's contract is "whose numbers", not "which detector ran").
-    // RULING: only a POSITIVE "warm-only" answer suppresses. On a probe
-    // error the detector stays ON and the failure is logged — a torn cold
-    // must not be maskable by breaking /v1/tier. No Depot configured (`None`)
-    // is the status quo: detector on. The probe-failed gauge (set per leader
-    // pass, like the residue gauges) is what keeps that ruling honest for the
-    // scraper: under a warm-only Depot whose probe is broken, the residue
-    // gauges below flag every marked object — the gauge at 1 says those
-    // alarms may be warm-only false positives, and the probe must be fixed
-    // before trusting (or dismissing) them.
-    crate::metrics::set_cas_gc_tier_probe_failed(false);
+    // --- Torn-durability detection (ticket d4d3b95, amended by ADR-0067). --
+    // A durable drain writes PACKS, not loose objects, so absence from the
+    // loose cold listing no longer means "not durable": the pack index is
+    // consulted for exactly the keys the loose listing could not vouch for,
+    // and a pack-durable key is no residue. RULING preserved from the
+    // tier-probe era: a probe ERROR does not suppress — the detector stays
+    // on, the failure is logged, and the probe-failed gauge (set per leader
+    // pass, like the residue gauges) tells the scraper these alarms may be
+    // pack-durable false positives rather than real torn cold.
+    crate::metrics::set_cas_gc_depot_probe_failed(false);
+    let mut durable_in_packs: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(depot) = depot {
-        match depot.depot_tier().await {
-            Ok(tier) if tier == TIER_WARM_ONLY => {
-                tracing::info!(
-                    "cas gc: warm-only deployment — torn-cold detection suppressed; \
-                     no cold listing is meaningful"
-                );
-                crate::metrics::set_cas_gc_cold_residue(0, 0);
-                if swept > 0 {
-                    tracing::info!(swept, marked = marked.len(), "cas gc pass complete");
-                }
-                return Ok(CasSweepReport {
-                    swept,
-                    residue: Vec::new(),
-                    suppressed_residue: Vec::new(),
-                });
+        let mut blob_hexes = Vec::new();
+        let mut tree_hexes = Vec::new();
+        for key in marked.keys() {
+            if in_cold.contains(key) || walk_missing.contains(key) {
+                continue;
             }
-            Ok(_) => {} // a durable tier: cold is expected to hold the marks
-            Err(e) => {
-                crate::metrics::set_cas_gc_tier_probe_failed(true);
-                tracing::warn!(
-                    error = %e,
-                    "cas gc: depot tier probe failed — torn-cold detection stays ON \
-                     (an unreachable /v1/tier is not evidence there is no cold tier); \
-                     residue alarmed this pass may be a warm-only false positive"
-                );
+            if let Some(hex) = key.strip_prefix("blobs/") {
+                blob_hexes.push(hex.to_string());
+            } else if let Some(hex) = key.strip_prefix("trees/") {
+                tree_hexes.push(hex.to_string());
+            }
+        }
+        if !blob_hexes.is_empty() || !tree_hexes.is_empty() {
+            match depot
+                .durable_missing(blob_hexes.clone(), tree_hexes.clone())
+                .await
+            {
+                Ok((missing_blobs, missing_trees)) => {
+                    durable_in_packs.extend(
+                        blob_hexes
+                            .iter()
+                            .filter(|h| !missing_blobs.contains(*h))
+                            .map(|h| format!("blobs/{h}")),
+                    );
+                    durable_in_packs.extend(
+                        tree_hexes
+                            .iter()
+                            .filter(|h| !missing_trees.contains(*h))
+                            .map(|h| format!("trees/{h}")),
+                    );
+                }
+                Err(e) => {
+                    crate::metrics::set_cas_gc_depot_probe_failed(true);
+                    tracing::warn!(
+                        error = %e,
+                        "cas gc: depot durable-index probe failed — torn-durability detection \
+                         stays ON (an unreachable Depot is not evidence the content is durable); \
+                         residue alarmed this pass may be durable in packs (false positives) — \
+                         fix the probe before trusting or dismissing the alarms"
+                    );
+                }
             }
         }
     }
@@ -467,7 +487,7 @@ pub async fn sweep_cas(
     let mut residue: Vec<ColdResidue> = Vec::new();
     let mut suppressed_residue: Vec<ColdResidue> = Vec::new();
     for (key, root_idx) in &marked {
-        if in_cold.contains(key) || walk_missing.contains(key) {
+        if in_cold.contains(key) || walk_missing.contains(key) || durable_in_packs.contains(key) {
             continue;
         }
         let (root, recorded_at) = &roots[*root_idx];
@@ -568,7 +588,7 @@ pub fn spawn_sweeper(
     owner: String,
     cfg: RetentionConfig,
     gc: GcConfig,
-    depot: Option<Arc<dyn DepotTierSource>>,
+    depot: Option<Arc<dyn DepotDurableIndex>>,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

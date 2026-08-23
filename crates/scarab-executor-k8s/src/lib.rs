@@ -148,14 +148,15 @@ pub struct K8sExecutor {
     /// s3-feed). Required for any Step with `needs:` once the workspace flow is
     /// on — there is no control-plane feed path any more.
     workspace_fetch: Option<WorkspaceFetch>,
-    /// The Depot drain handle (ADR-0064 control-plane half): the same workspace
-    /// service `workspace_cas` uses as its warm tier, held concretely because
-    /// the drain needs `flush` — a client capability, not a `Cas` port method.
-    /// When wired, `drive_workspace` ingests WARM-first through this client and
-    /// awaits `flush(published_root)` before annotating the Pod and releasing
+    /// The Depot drain handle: the same workspace service `workspace_cas`
+    /// uses as its warm tier, held concretely because the drain-record read
+    /// (`drain_record`) is a client capability, not a `Cas` port method.
+    /// When wired, `drive_workspace` reads the in-Pod drain's record through
+    /// this client — a success record already means the drain's packs are
+    /// durable (ADR-0067 part 4) — before annotating the Pod and releasing
     /// the sidecar. `None` = no Depot (object-store-only dev): the drain
     /// ingests straight into `workspace_cas`, which IS the cold store then —
-    /// durability is direct and there is nothing to flush.
+    /// durability is direct.
     workspace_depot: Option<Arc<scarab_workspace_client::WorkspaceClient>>,
     /// The artifact blob store (ADR-0052). When wired (and the workspace
     /// flow is on), every step Pod gets a `/scarab/artifacts` emptyDir that
@@ -268,13 +269,13 @@ impl K8sExecutor {
         self
     }
 
-    /// Wire the Depot drain handle (ADR-0064 control-plane half): the drain
-    /// then ingests WARM-first through `depot` (one walk, `/have`-dedup),
-    /// prunes against warm-write/tiered-read, and awaits
-    /// `depot.flush(published_root)` — the durability gate — before annotating
-    /// the Pod and releasing the sidecar. Without this the drain writes
-    /// `workspace_cas` directly, which is only correct when that handle IS the
-    /// durable store (no workspace service configured).
+    /// Wire the Depot drain handle: the in-Pod drain then ingests WARM-first
+    /// against `depot`'s service (one walk, `/have` durable-dedup, packs at
+    /// the drain — ADR-0067 part 4) and this side reads the drain record back
+    /// through it before annotating the Pod and releasing the sidecar.
+    /// Without this the drain writes `workspace_cas` directly, which is only
+    /// correct when that handle IS the durable store (no workspace service
+    /// configured).
     pub fn with_workspace_depot(
         mut self,
         depot: Arc<scarab_workspace_client::WorkspaceClient>,
@@ -652,13 +653,13 @@ impl K8sExecutor {
     /// `outputs:`, computes the content identity, and POSTs a **drain record**
     /// to the Depot — the rendezvous this side then reads. Classification is
     /// RECORD-FIRST: the record on the Depot is the truth, the exec's exit
-    /// code only a hint for when there is no record. On a success record:
-    /// await `flush(published_root)` — the ADR-0064 durability gate: the Depot
-    /// uploads the closure to cold and only `Durable`/`WarmOnly` lets this leg
-    /// proceed — THEN patch the root onto the Pod as an annotation, harvest
-    /// the artifacts of record (EVERY terminated step, whatever its exit code
-    /// — a28a173), and release the sidecar. No workspace byte crosses the
-    /// control plane any more: it exchanges root hashes and a record.
+    /// code only a hint for when there is no record. A success record already
+    /// MEANS durable (ADR-0067 part 4: the Depot commits the drain's packs
+    /// and their index rows strictly before storing it), so on one this leg
+    /// patches the root onto the Pod as an annotation, harvests the artifacts
+    /// of record (EVERY terminated step, whatever its exit code — a28a173),
+    /// and releases the sidecar. No workspace byte crosses the control plane
+    /// any more: it exchanges root hashes and a record.
     ///
     /// # The feed leg used to be here, and is gone (ADR-0061 s3-feed)
     ///
@@ -780,7 +781,6 @@ impl K8sExecutor {
                                     pods,
                                     &name,
                                     &annotations,
-                                    false,
                                     format!("drain record fetch: {e}"),
                                 )
                                 .await)
@@ -804,7 +804,7 @@ impl K8sExecutor {
                         }
                         DrainDecision::Transient(cause) => {
                             return Err(self
-                                .drain_failure(pods, &name, &annotations, false, cause)
+                                .drain_failure(pods, &name, &annotations, cause)
                                 .await)
                         }
                     };
@@ -814,86 +814,27 @@ impl K8sExecutor {
                     // root is `pruned_root` else `root`, the same rule the
                     // Depot validated the record's closure against), and its
                     // content IDENTITY. When a prune happened, the UNPRUNED
-                    // full snapshot is deliberately never flushed: it lands
-                    // warm-only, an evictable cache, NOT durable evidence
-                    // (ADR-0064; only the published root's closure is
-                    // guaranteed).
+                    // remainder is deliberately cache-only: warm, evictable,
+                    // NOT durable evidence (ADR-0067 part 6; only the
+                    // published root's closure is packed and guaranteed).
                     let published = scarab_storage::TreeHash(
                         rec.pruned_root.clone().unwrap_or_else(|| rec.root.clone()),
                     );
                     let identity: Option<String> = rec.identity.clone();
-                    // The durability gate (ADR-0061 part 4 as amended by
-                    // ADR-0064): durability is not local, so the batched cold
-                    // upload stays ON the critical path — the Depot walks the
-                    // PUBLISHED root's closure and uploads what cold is
-                    // missing. Two outcomes release the verdict: `Durable`
-                    // (cold holds the closure) and `WarmOnly` (the Depot HAS
-                    // no cold tier — a deployment posture, not a failure; see
-                    // the arm below). Failures are classified by
-                    // `drain_failure`: `Retry` and transport errors re-drive,
-                    // time-bounded; `Fatal` is EvidenceLost now (4cf03d7).
-                    let t_flush = std::time::Instant::now();
-                    // ADR-0064 s2: what the flush EARNED, for the durability
-                    // stamp below. `Durable` and `WarmOnly` both proceed to
-                    // the annotation patch — a warm-only landing is a Depot
-                    // posture (no cold tier configured), not a failure, and
-                    // withholding the verdict for it would make "no object
-                    // store" mean "no green ever".
-                    let durability: Option<String> = {
-                        use scarab_workspace_client::FlushOutcome;
-                        match depot.flush(&published).await {
-                            outcome @ FlushOutcome::Durable { .. } => {
-                                durability_stamp(&outcome).map(str::to_string)
-                            }
-                            outcome @ FlushOutcome::WarmOnly => {
-                                // Logged once per Attempt, not once per poll:
-                                // the `already` root-annotation guard at the
-                                // top of this leg makes a successfully
-                                // patched drain once-only.
-                                tracing::info!(
-                                    pod = %name,
-                                    root = %published.0,
-                                    "workspace flush landed warm-only: the Depot has no cold \
-                                     tier behind it, so the verdict is released on the warm \
-                                     copy (ADR-0064 s2)"
-                                );
-                                durability_stamp(&outcome).map(str::to_string)
-                            }
-                            FlushOutcome::Retry(cause) => {
-                                return Err(self
-                                    .drain_failure(
-                                        pods,
-                                        &name,
-                                        &annotations,
-                                        false,
-                                        format!("flush: {cause}"),
-                                    )
-                                    .await)
-                            }
-                            FlushOutcome::Fatal(cause) => {
-                                return Err(self
-                                    .drain_failure(
-                                        pods,
-                                        &name,
-                                        &annotations,
-                                        true,
-                                        format!("flush: {cause}"),
-                                    )
-                                    .await)
-                            }
-                        }
-                    };
-                    let cold_flush_ms = t_flush.elapsed().as_millis();
-                    // Record all of these on the Pod BEFORE releasing the
-                    // sidecar: output()/output_identity()/output_durability()
-                    // read them durably across control-plane restarts. One
-                    // patch, so a crash between them cannot leave a root whose
-                    // content nobody can compare — or whose durability tier
-                    // nobody can audit (same crash-atomicity argument,
-                    // ADR-0064 s2). Ordering with the flush above is
-                    // load-bearing: the root annotation is the durable claim
-                    // `output()` reports, so it may only exist once the
-                    // closure's durability has been settled.
+                    // There is NO flush leg any more (ADR-0067 part 4): the
+                    // drain record's 200 already meant the published closure
+                    // was packed durable and its index transaction committed
+                    // — the Depot refuses the record otherwise — so the
+                    // record read above IS the durability gate, and the
+                    // annotation patch below may run immediately.
+                    //
+                    // Record these on the Pod BEFORE releasing the sidecar:
+                    // output()/output_identity() read them durably across
+                    // control-plane restarts. One patch, so a crash between
+                    // them cannot leave a root whose content nobody can
+                    // compare. The root annotation is the durable claim
+                    // `output()` reports, and the drain record it came from
+                    // was only stored after the packs landed.
                     let mut annotation_patch = serde_json::Map::new();
                     annotation_patch.insert(
                         ANNOTATION_WS_ROOT.to_string(),
@@ -903,15 +844,6 @@ impl K8sExecutor {
                         ANNOTATION_WS_IDENTITY.to_string(),
                         serde_json::Value::String(identity.unwrap_or_default()),
                     );
-                    // `Durable { tier: None }` (old-Depot skew window) and the
-                    // no-Depot branch both stamp NOTHING for this key, so the
-                    // annotation stays absent rather than lying with a guess.
-                    if let Some(tier) = durability {
-                        annotation_patch.insert(
-                            ANNOTATION_WS_DURABILITY.to_string(),
-                            serde_json::Value::String(tier),
-                        );
-                    }
                     let patch = serde_json::json!({
                         "metadata": { "annotations": annotation_patch }
                     });
@@ -924,7 +856,7 @@ impl K8sExecutor {
                     self.forget_drain_anchor(&name);
                     // ws-timing v2 (ADR-0061 s3-drain). CP-side clocks:
                     // `exec_drain_ms` (the whole in-Pod helper run, wall
-                    // clock), `cold_flush_ms`, `total_ms`. Everything else —
+                    // clock) and `total_ms`. Everything else —
                     // files, tree_bytes, blobs_uploaded, bytes_uploaded,
                     // have_hits, ingest_ms, prune_ms — comes off the helper's
                     // DrainRecord, measured where the work now happens.
@@ -945,7 +877,6 @@ impl K8sExecutor {
                         ingest_ms = rec.ingest_ms,
                         prune_ms = rec.prune_ms,
                         exec_drain_ms,
-                        cold_flush_ms,
                         outputs = declared.len(),
                         total_ms = t_leg.elapsed().as_millis(),
                         "ws-timing"
@@ -1029,7 +960,7 @@ impl K8sExecutor {
         .await
     }
 
-    /// Classify a failed Depot drain leg (ingest / prune / flush) and keep the
+    /// Classify a failed Depot drain leg (ingest / prune / record) and keep the
     /// escalation clock (ADR-0064 / ticket 4cf03d7). The decision itself is
     /// the pure [`drain_failure_verdict`]; this wrapper supplies its inputs —
     /// reading, and on the FIRST failure recording, the
@@ -1052,19 +983,12 @@ impl K8sExecutor {
         pods: &Api<Pod>,
         name: &str,
         annotations: &std::collections::BTreeMap<String, String>,
-        fatal: bool,
         cause: String,
     ) -> DriveErr {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        if fatal {
-            // Escalating now — the Attempt goes terminal, so the fallback
-            // anchor (if any polls seeded one) is dead weight: drop it.
-            self.forget_drain_anchor(name);
-            return DriveErr::EvidenceLost { cause };
-        }
         // The annotation anchor comes FIRST (durable with the Pod across
         // control-plane restarts — authoritative whenever it is readable /
         // writable). Idempotent write, only if absent: a later failed drive
@@ -1111,7 +1035,7 @@ impl K8sExecutor {
                  {name} (using in-process fallback clock): {e}"
             );
         }
-        match drain_failure_verdict(false, Some(first), now_ms) {
+        match drain_failure_verdict(Some(first), now_ms) {
             DrainVerdict::Transient => DriveErr::Transient(cause),
             DrainVerdict::EvidenceLost => {
                 self.forget_drain_anchor(name);
@@ -1637,8 +1561,8 @@ enum DriveErr {
     /// step with a developer verdict instead of retrying (ADR-0007 fail-closed).
     OutputContract(String),
     /// The step ran (and exited 0), but its evidence could not be made durable
-    /// (ADR-0064 / ticket 4cf03d7): the Depot's `flush` said `Fatal`, or the
-    /// drain kept failing past [`WS_DRAIN_ESCALATION_MS`]. The workspace lives
+    /// (ticket 4cf03d7): the drain kept failing past
+    /// [`WS_DRAIN_ESCALATION_MS`]. The workspace lives
     /// on the Pod's emptyDir and the Depot cannot take it, so there is nothing
     /// left to wait for — `poll` fails the Attempt as
     /// `Infra { never_started: false }` WITH this cause, through the normal
@@ -1657,19 +1581,19 @@ impl std::fmt::Display for DriveErr {
     }
 }
 
-/// What a failed drain leg (ingest / prune / flush against the Depot) means
-/// for the Attempt right now — pure over `(fatal, first_failure_ms, now_ms)`,
-/// so tests construct the interleaving instead of scheduling it.
+/// What a failed drain leg (ingest / prune / record against the Depot) means
+/// for the Attempt right now — pure over `(first_failure_ms, now_ms)`, so
+/// tests construct the interleaving instead of scheduling it.
 ///
-/// - A `FlushOutcome::Fatal` escalates immediately: the Depot has said the
-///   snapshot can never become durable as-is, so more polling is a lie.
-/// - Anything transient (`FlushOutcome::Retry`, ingest/transport errors) is
-///   re-driven next poll — but bounded by TIME, not by count, anchored on the
-///   [`ANNOTATION_WS_DRAIN_FIRST_FAILURE`] the caller records at the first
-///   failure: past [`WS_DRAIN_ESCALATION_MS`] the verdict is `EvidenceLost`
-///   carrying the LAST cause. Time, not count, because poll cadence is an
-///   operator tunable — a count would make the escalation window drift with
-///   config, and the 4cf03d7 ruling is about wall-clock promptness.
+/// Every drain-leg failure is transient (ingest/transport errors, error
+/// records) and re-driven next poll — but bounded by TIME, not by count,
+/// anchored on the [`ANNOTATION_WS_DRAIN_FIRST_FAILURE`] the caller records
+/// at the first failure: past [`WS_DRAIN_ESCALATION_MS`] the verdict is
+/// `EvidenceLost` carrying the LAST cause. Time, not count, because poll
+/// cadence is an operator tunable — a count would make the escalation window
+/// drift with config, and the 4cf03d7 ruling is about wall-clock promptness.
+/// (The immediate-escalation arm died with the flush RPC: ADR-0067 part 4
+/// left no Depot answer that means "this can never become durable as-is".)
 #[derive(Debug, PartialEq, Eq)]
 enum DrainVerdict {
     /// Re-drive next poll (and record the first-failure annotation if absent).
@@ -1678,48 +1602,8 @@ enum DrainVerdict {
     EvidenceLost,
 }
 
-/// The [`ANNOTATION_WS_DURABILITY`] value a flush outcome earns (ADR-0064
-/// s2), pure so the derivation is unit-testable without a Pod:
-///
-/// - `Durable { tier: Some(t) }` → stamp `t` (`"object"` / `"separate-volume"`,
-///   verbatim off the wire — the Depot names the tier, this side records it);
-/// - `WarmOnly` → stamp `"warm-only"` (the verdict was released on the warm
-///   copy; un-stamping this case would make every warm-only deployment
-///   indistinguishable from a pre-s2 one);
-/// - `Durable { tier: None }` → `None`: an old Depot affirmed durability
-///   without naming a tier (rolling-upgrade skew), and an absent stamp beats
-///   a guessed one.
-///
-/// `Retry`/`Fatal` are unreachable from today's one caller: the flush match
-/// in `drive_workspace` returns out through `drain_failure` on both before
-/// any annotation patch, and only the surviving arms call this. Kept as
-/// explicit arms (not a catch-all) so a new `FlushOutcome` variant is a
-/// compile error here, never a silent non-stamp — but they return `None`
-/// (with a debug_assert for the test suite) rather than panic: this runs on
-/// the scheduler's poll path, and if a future caller ever slips a `Retry`/
-/// `Fatal` through, a wrongly-skipped stamp is a recoverable audit gap while
-/// a poll panic takes the whole driver down with it.
-fn durability_stamp(outcome: &scarab_workspace_client::FlushOutcome) -> Option<&str> {
-    use scarab_workspace_client::FlushOutcome;
-    match outcome {
-        FlushOutcome::Durable { tier } => tier.as_deref(),
-        FlushOutcome::WarmOnly => Some("warm-only"),
-        FlushOutcome::Retry(_) | FlushOutcome::Fatal(_) => {
-            debug_assert!(
-                false,
-                "durability_stamp reached with a non-terminal flush outcome — \
-                 drive_workspace must return through drain_failure on Retry/Fatal \
-                 before stamping"
-            );
-            None
-        }
-    }
-}
 
-fn drain_failure_verdict(fatal: bool, first_failure_ms: Option<i64>, now_ms: i64) -> DrainVerdict {
-    if fatal {
-        return DrainVerdict::EvidenceLost;
-    }
+fn drain_failure_verdict(first_failure_ms: Option<i64>, now_ms: i64) -> DrainVerdict {
     match first_failure_ms {
         Some(first) if now_ms.saturating_sub(first) > WS_DRAIN_ESCALATION_MS => {
             DrainVerdict::EvidenceLost
@@ -1828,7 +1712,7 @@ const WSFETCH_EXIT_OUTPUT_CONTRACT: i32 = 11;
 /// exit code only as a hint when no record exists.
 #[derive(Debug, PartialEq, Eq)]
 enum DrainDecision {
-    /// A success record exists: flush, patch, release.
+    /// A success record exists (its packs are already durable): patch, release.
     Publish,
     /// Permanent, author-fixable (ADR-0007): a declared `outputs:` path was
     /// not produced. Fails the step as `Config` via the existing
@@ -1912,9 +1796,10 @@ fn classify_drain(
         // same binary forever.
         DrainExecOutcome::Exit(0) => DrainDecision::FatalConfig(
             "the drain exec reported success but the Depot holds no drain \
-             record — either a stale helper image lacking the drain subcommand \
-             (publish the wsfetch image before the control plane), or the \
-             Depot lost its drain records volume."
+             record — the stale-binary signature: a helper image lacking the \
+             drain subcommand (publish the wsfetch image before the control \
+             plane). Record absence is Postgres-backed and replica-independent, \
+             so a lost volume cannot explain it."
                 .to_string(),
         ),
         DrainExecOutcome::Exit(code) => DrainDecision::Transient(format!(
@@ -3257,7 +3142,7 @@ const ANNOTATION_WS_OUTPUTS: &str = "scarab.io/workspace-outputs";
 /// [`DriveErr::EvidenceLost`] after [`WS_DRAIN_ESCALATION_MS`] instead of
 /// grinding until the step-budget timeout. Durable with the Pod, so a
 /// control-plane restart mid-outage neither resets nor loses the clock. Only
-/// drain-leg failures (ingest / prune / flush against the Depot) touch it;
+/// drain-leg failures (ingest / prune / record against the Depot) touch it;
 /// artifact-harvest failures keep their own transient loop.
 const ANNOTATION_WS_DRAIN_FIRST_FAILURE: &str = "scarab.dev/ws-drain-first-failure-ms";
 /// How long the drain may keep failing transiently before the Attempt is
@@ -6354,28 +6239,9 @@ mod tests {
     // ------------------------------------------------------------------
     // ADR-0064 control-plane half (ticket 4cf03d7): a failed Depot drain is
     // Transient — bounded by TIME — and then EvidenceLost. Pure over
-    // (fatal, first_failure_ms, now_ms): the interleavings are constructed,
+    // (first_failure_ms, now_ms): the interleavings are constructed,
     // never scheduled (this repo's concurrency-test lesson).
     // ------------------------------------------------------------------
-
-    /// A `FlushOutcome::Fatal` escalates IMMEDIATELY, first failure or not:
-    /// the Depot has said this snapshot can never become durable, so one more
-    /// transient lap would only push the truth toward the step-budget timeout.
-    /// Kills the mutation that drops the `if fatal` short-circuit (Fatal would
-    /// then present as a retriable blip until the 5-minute clock ran out).
-    #[test]
-    fn a_fatal_flush_is_evidence_lost_immediately() {
-        // No prior failure recorded — the very first observation.
-        assert_eq!(
-            drain_failure_verdict(true, None, 1_000),
-            DrainVerdict::EvidenceLost
-        );
-        // And equally with a fresh clock already running.
-        assert_eq!(
-            drain_failure_verdict(true, Some(999), 1_000),
-            DrainVerdict::EvidenceLost
-        );
-    }
 
     /// A transient failure inside the 5-minute window keeps re-driving — both
     /// on the FIRST failure (no anchor yet: the caller records it) and while
@@ -6385,14 +6251,14 @@ mod tests {
     #[test]
     fn a_transient_drain_failure_within_the_window_re_drives() {
         let now = 10 * 60 * 1000;
-        assert_eq!(drain_failure_verdict(false, None, now), DrainVerdict::Transient);
+        assert_eq!(drain_failure_verdict(None, now), DrainVerdict::Transient);
         // Exactly at the bound is still transient ("past 5 minutes", not "at").
         assert_eq!(
-            drain_failure_verdict(false, Some(now - WS_DRAIN_ESCALATION_MS), now),
+            drain_failure_verdict(Some(now - WS_DRAIN_ESCALATION_MS), now),
             DrainVerdict::Transient
         );
         assert_eq!(
-            drain_failure_verdict(false, Some(now - WS_DRAIN_ESCALATION_MS + 1), now),
+            drain_failure_verdict(Some(now - WS_DRAIN_ESCALATION_MS + 1), now),
             DrainVerdict::Transient
         );
     }
@@ -6405,12 +6271,12 @@ mod tests {
     fn a_transient_drain_failure_past_the_window_is_evidence_lost() {
         let now = 60 * 60 * 1000;
         assert_eq!(
-            drain_failure_verdict(false, Some(now - WS_DRAIN_ESCALATION_MS - 1), now),
+            drain_failure_verdict(Some(now - WS_DRAIN_ESCALATION_MS - 1), now),
             DrainVerdict::EvidenceLost
         );
         // A clock skewed into the future must not underflow into escalation.
         assert_eq!(
-            drain_failure_verdict(false, Some(now + 1_000), now),
+            drain_failure_verdict(Some(now + 1_000), now),
             DrainVerdict::Transient
         );
     }
@@ -6475,7 +6341,7 @@ mod tests {
         assert_eq!(anchor_err.as_deref(), Some("patch denied"));
         assert_eq!(map.get("pod-a"), Some(&now), "the clock is now seeded");
         assert_eq!(
-            drain_failure_verdict(false, Some(first), now),
+            drain_failure_verdict(Some(first), now),
             DrainVerdict::Transient,
             "the first observed failure never escalates"
         );
@@ -6503,7 +6369,7 @@ mod tests {
             "insert-if-absent: the ORIGINAL fallback clock is observed, never restarted"
         );
         assert_eq!(
-            drain_failure_verdict(false, Some(first), now),
+            drain_failure_verdict(Some(first), now),
             DrainVerdict::EvidenceLost,
             "past the window the fallback clock escalates"
         );
@@ -6546,64 +6412,6 @@ mod tests {
             Some(&fresh),
             "a stray still inside 2x the window is kept"
         );
-    }
-
-    // ------------------------------------------------------------------
-    // ADR-0064 s2: the durability stamp. Pure over the flush outcome — the
-    // only annotation-read coverage in this crate is live-tier, so the value
-    // DERIVATION is the unit under test, not the Pod round-trip.
-    // ------------------------------------------------------------------
-
-    /// A named cold tier is stamped verbatim. Kills the mutation that hardcodes
-    /// the stamp (e.g. always `"object"`): a `separate-volume` deployment would
-    /// then audit as object-store-durable — a durability claim about the wrong
-    /// medium.
-    #[test]
-    fn a_durable_flush_stamps_the_tier_the_depot_named() {
-        use scarab_workspace_client::FlushOutcome;
-        assert_eq!(
-            durability_stamp(&FlushOutcome::Durable {
-                tier: Some("object".into())
-            }),
-            Some("object")
-        );
-        assert_eq!(
-            durability_stamp(&FlushOutcome::Durable {
-                tier: Some("separate-volume".into())
-            }),
-            Some("separate-volume")
-        );
-    }
-
-    /// `WarmOnly` stamps `"warm-only"`. Kills the mutation that maps WarmOnly
-    /// to `None`: every warm-only deployment would then silently un-stamp —
-    /// indistinguishable from pre-s2 Pods, and the "this evidence is one disk
-    /// away from gone" audit signal ADR-0064 s2 exists for would never appear.
-    #[test]
-    fn a_warm_only_flush_stamps_warm_only() {
-        use scarab_workspace_client::FlushOutcome;
-        assert_eq!(
-            durability_stamp(&FlushOutcome::WarmOnly),
-            Some("warm-only")
-        );
-    }
-
-    /// `Durable { tier: None }` — an old Depot affirming durability without
-    /// naming a tier (rolling-upgrade skew) — stamps NOTHING. Kills the
-    /// mutation that defaults the missing tier (e.g. to `"object"` or
-    /// `"warm-only"`): an absent stamp is honest, a guessed one is a fabricated
-    /// durability claim.
-    ///
-    /// `Retry`/`Fatal` are deliberately untested here: they are unreachable
-    /// from today's one caller — the flush match returns out through
-    /// `drain_failure` before any patch, and only the surviving arms call
-    /// `durability_stamp`. (If a future caller ever slips one through, the
-    /// production posture is `None` + debug_assert, not a panic — a wrong
-    /// stamp-skip beats taking the poll path down.)
-    #[test]
-    fn a_durable_flush_without_a_tier_stamps_nothing() {
-        use scarab_workspace_client::FlushOutcome;
-        assert_eq!(durability_stamp(&FlushOutcome::Durable { tier: None }), None);
     }
 
     // ------------------------------------------------------------------

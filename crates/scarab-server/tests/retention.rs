@@ -380,7 +380,7 @@ async fn cas_gc_sweeps_only_unreachable_aged_objects() {
         "nothing is torn: cold-extra objects are sweep candidates, never residue"
     );
     assert_eq!(
-        scarab_server::metrics::cas_gc_tier_probe_failed(),
+        scarab_server::metrics::cas_gc_depot_probe_failed(),
         0,
         "no probe was made (no Depot configured) — the probe-failed gauge holds 0"
     );
@@ -1532,36 +1532,59 @@ async fn the_retention_promise_is_keyed_on_updated_at_not_created_at() {
 }
 
 // ---------------------------------------------------------------------------
-// Warm-only suppression of the torn-cold detector (ADR-0064 s2).
+// Pack-durable subtraction in the torn-cold detector (ADR-0067).
 // ---------------------------------------------------------------------------
 
-use scarab_server::retention::DepotTierSource;
+use scarab_server::retention::DepotDurableIndex;
+use std::collections::HashSet;
 
-/// A real-shaped tier probe: answers what a healthy Depot's `GET /v1/tier`
-/// would (one of the wire strings), no CAS involved.
-struct StaticTier(&'static str);
+/// A real-shaped durable-index probe: answers that EVERYTHING asked about is
+/// durable in packs (nothing missing) — the post-ADR-0067 steady state, where
+/// durable drains write packs and the loose listing vouches for nothing.
+struct AllDurable;
 
 #[async_trait::async_trait]
-impl DepotTierSource for StaticTier {
-    async fn depot_tier(&self) -> Result<String, String> {
-        Ok(self.0.to_string())
+impl DepotDurableIndex for AllDurable {
+    async fn durable_missing(
+        &self,
+        _blobs: Vec<String>,
+        _trees: Vec<String>,
+    ) -> Result<(HashSet<String>, HashSet<String>), String> {
+        Ok((HashSet::new(), HashSet::new()))
     }
 }
 
-/// The probe when the Depot's /v1/tier is unreachable or broken.
-struct BrokenTier;
+/// A probe that says NOTHING is durable in packs — legacy loose-only content.
+struct NoneDurable;
 
 #[async_trait::async_trait]
-impl DepotTierSource for BrokenTier {
-    async fn depot_tier(&self) -> Result<String, String> {
-        Err("GET /v1/tier: connection refused".into())
+impl DepotDurableIndex for NoneDurable {
+    async fn durable_missing(
+        &self,
+        blobs: Vec<String>,
+        trees: Vec<String>,
+    ) -> Result<(HashSet<String>, HashSet<String>), String> {
+        Ok((blobs.into_iter().collect(), trees.into_iter().collect()))
+    }
+}
+
+/// The probe when the Depot is unreachable or broken.
+struct BrokenIndex;
+
+#[async_trait::async_trait]
+impl DepotDurableIndex for BrokenIndex {
+    async fn durable_missing(
+        &self,
+        _blobs: Vec<String>,
+        _trees: Vec<String>,
+    ) -> Result<(HashSet<String>, HashSet<String>), String> {
+        Err("POST /v1/cas/have: connection refused".into())
     }
 }
 
 /// Build the standard torn fixture (one blob of a reachable, aged root deleted
-/// from COLD only) and return everything a sweep needs. Factored so the two
-/// tier-probe tests below drive the IDENTICAL tear and differ only in the
-/// probe's answer.
+/// from COLD only) and return everything a sweep needs. Factored so the probe
+/// tests below drive the IDENTICAL tear and differ only in the probe's answer.
 async fn torn_fixture(
     tdb: &common::TestDb,
     run_id: &str,
@@ -1614,60 +1637,59 @@ async fn torn_fixture(
     (Arc::new(pg), tiered, cold_store, clock, warm_dir, cold_dir)
 }
 
-/// A Depot answering `warm-only` has NO cold tier to be torn: the residue
-/// detector would otherwise flag every marked object on every pass (nothing
-/// is ever flushed), a permanent false alarm. The pass must skip the detector,
-/// zero the residue gauges — and keep the leader gauge at 1: this IS the
-/// leader's pass, its numbers are live (231040a's contract is about WHOSE
-/// numbers, not which detector ran). Mutations killed: dropping the tier
-/// check → the torn fixture alarms (the leader control-pass proves it would);
-/// zeroing the leader gauge alongside the residue gauges → the 1 assertion
-/// fails; suppressing by shoving the holes into `suppressed_residue` → the
-/// empty-suppressed assertion fails.
+/// A marked object the pack index holds durable is NOT torn-cold residue:
+/// durable drains write packs, not loose objects, so the loose cold listing
+/// alone would flag every packed object on every pass — a permanent false
+/// alarm. And the subtraction is the INDEX's answer, not a blanket suppression:
+/// the same tear under a nothing-is-packed answer still alarms.
+///
+/// Mutations killed: dropping the durable-index subtraction (the AllDurable
+/// pass alarms — the control pass proves the fixture is genuinely torn);
+/// inverting the missing-set test (the NoneDurable pass goes quiet);
+/// suppressing wholesale on a configured probe (the NoneDurable pass again).
 #[tokio::test]
-async fn a_warm_only_tier_answer_suppresses_the_residue_detector() {
+async fn a_pack_durable_object_is_not_torn_cold_residue() {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
     };
-    let (db, tiered, cold_store, clock, _warm, _cold) = torn_fixture(&tdb, "torn-wo").await;
+    let (db, tiered, cold_store, clock, _warm, _cold) = torn_fixture(&tdb, "torn-pack").await;
     let cfg = GcConfig {
         workspace_ttl_ms: 30 * DAY_MS,
         grace_ms: DAY_MS,
     };
 
     // Control pass, no probe (the no-Depot sweeper shape): the fixture IS
-    // torn and the detector, left on, says so — proving the suppression below
-    // suppresses a real alarm rather than passing on an untorn store.
-    let report = sweep_cas(&db, &tiered, &cold_store, &clock, "gc-wo", cfg, None)
+    // torn and the detector, on the loose listing alone, says so.
+    let report = sweep_cas(&db, &tiered, &cold_store, &clock, "gc-pack", cfg, None)
         .await
         .unwrap();
     assert_eq!(report.residue.len(), 1, "the fixture is genuinely torn");
     assert_eq!(scarab_server::metrics::cas_gc_cold_residue(), 1);
 
-    // The warm-only pass: same tear, detector skipped, gauges zeroed. Seed
-    // the probe-failed gauge to 1 first, so its 0 below proves the pass SET
-    // it per-pass rather than never touching it.
-    scarab_server::metrics::set_cas_gc_tier_probe_failed(true);
-    let probe = StaticTier("warm-only");
+    // The pack-durable pass: same tear, but the index vouches for the hole.
+    // Seed the probe-failed gauge to 1 first, so its 0 below proves the pass
+    // SET it per-pass rather than never touching it.
+    scarab_server::metrics::set_cas_gc_depot_probe_failed(true);
+    let probe = AllDurable;
     let report = sweep_cas(
         &db,
         &tiered,
         &cold_store,
         &clock,
-        "gc-wo",
+        "gc-pack",
         cfg,
-        Some(&probe as &dyn DepotTierSource),
+        Some(&probe as &dyn DepotDurableIndex),
     )
     .await
     .unwrap();
     assert!(
         report.residue.is_empty(),
-        "warm-only: no cold listing is meaningful, so nothing is 'missing from cold'"
+        "a pack-durable object is durable — absence from the LOOSE listing proves nothing"
     );
     assert!(
         report.suppressed_residue.is_empty(),
-        "skipped means SKIPPED — not rerouted into the freshness-suppressed bucket"
+        "subtracted means SUBTRACTED — not rerouted into the freshness-suppressed bucket"
     );
     assert_eq!(
         scarab_server::metrics::cas_gc_cold_residue(),
@@ -1678,57 +1700,53 @@ async fn a_warm_only_tier_answer_suppresses_the_residue_detector() {
     assert_eq!(
         scarab_server::metrics::cas_gc_leader(),
         1,
-        "this was the LEADER's pass — suppression must not masquerade as lease loss"
+        "this was the LEADER's pass — subtraction must not masquerade as lease loss"
     );
     assert_eq!(
-        scarab_server::metrics::cas_gc_tier_probe_failed(),
+        scarab_server::metrics::cas_gc_depot_probe_failed(),
         0,
-        "the probe SUCCEEDED (it answered warm-only) — a suppressed detector must \
-         not read as a broken probe"
+        "the probe SUCCEEDED — a subtracted alarm must not read as a broken probe"
     );
 
-    // A durable tier answer keeps the detector on (only the literal
-    // `warm-only` suppresses — kills a `!= "object"` style inversion). The
-    // probe SUCCEEDS here — the clean-probe case — so the probe-failed gauge
-    // must land 0 (seeded to 1 to prove it is set, not merely left alone).
-    scarab_server::metrics::set_cas_gc_tier_probe_failed(true);
-    let probe = StaticTier("separate-volume");
+    // A nothing-is-packed answer keeps the alarm: the subtraction is per
+    // address, never a blanket suppression for having a Depot at all.
+    scarab_server::metrics::set_cas_gc_depot_probe_failed(true);
+    let probe = NoneDurable;
     let report = sweep_cas(
         &db,
         &tiered,
         &cold_store,
         &clock,
-        "gc-wo",
+        "gc-pack",
         cfg,
-        Some(&probe as &dyn DepotTierSource),
+        Some(&probe as &dyn DepotDurableIndex),
     )
     .await
     .unwrap();
     assert_eq!(
         report.residue.len(),
         1,
-        "a separate-volume Depot HAS a cold tier — the tear is real and reported"
+        "content in no pack and no loose object is REALLY missing — the tear is reported"
     );
     assert_eq!(
-        scarab_server::metrics::cas_gc_tier_probe_failed(),
+        scarab_server::metrics::cas_gc_depot_probe_failed(),
         0,
-        "a successful probe reads 0 — this residue is trustworthy, not a maybe-warm-only \
-         false positive"
+        "a successful probe reads 0 — this residue is trustworthy"
     );
 
     tdb.cleanup().await;
 }
 
-/// RULING (implemented exactly): a tier-probe ERROR does not suppress — the
-/// detector stays on and the failure is only logged. Otherwise a torn cold
-/// would be maskable by breaking /v1/tier, and the one detector that matters
-/// would fail exactly when the Depot is failing. Mutation killed: treating
-/// `Err` like `warm-only` (or any suppress-on-error fallback) → the torn
+/// RULING (preserved from the tier-probe era): a durable-index probe ERROR
+/// does not suppress — the detector stays on and the failure is only logged.
+/// Otherwise a torn cold would be maskable by breaking the Depot, and the one
+/// detector that matters would fail exactly when the Depot is failing.
+/// Mutation killed: treating `Err` like "everything is packed" → the torn
 /// fixture stops alarming here. And the pass must SAY the probe failed:
-/// `scarab_cas_gc_tier_probe_failed` reads 1, so a scrape can tell "probe
-/// down, residue may be warm-only false positives" from real torn cold.
+/// `scarab_cas_gc_depot_probe_failed` reads 1, so a scrape can tell "probe
+/// down, residue may be pack-durable false positives" from real torn cold.
 #[tokio::test]
-async fn a_tier_probe_error_does_not_suppress_the_detector() {
+async fn a_durable_index_probe_error_does_not_suppress_the_detector() {
     let Some(tdb) = fresh_db().await else {
         eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
         return;
@@ -1746,22 +1764,22 @@ async fn a_tier_probe_error_does_not_suppress_the_detector() {
         &clock,
         "gc-err",
         cfg,
-        Some(&BrokenTier as &dyn DepotTierSource),
+        Some(&BrokenIndex as &dyn DepotDurableIndex),
     )
     .await
     .unwrap();
     assert_eq!(
         report.residue.len(),
         1,
-        "an unreachable /v1/tier is not evidence there is no cold tier — the tear alarms"
+        "an unreachable Depot is not evidence the content is durable — the tear alarms"
     );
     assert_eq!(scarab_server::metrics::cas_gc_cold_residue(), 1);
     assert_eq!(scarab_server::metrics::cas_gc_leader(), 1);
     assert_eq!(
-        scarab_server::metrics::cas_gc_tier_probe_failed(),
+        scarab_server::metrics::cas_gc_depot_probe_failed(),
         1,
-        "the probe-failed gauge distinguishes 'tier probe failed' from real torn cold: \
-         when 1, the residue above may be a warm-only false positive — fix the probe first"
+        "the probe-failed gauge distinguishes 'index probe failed' from real torn cold: \
+         when 1, the residue above may be pack-durable false positives — fix the probe first"
     );
 
     tdb.cleanup().await;

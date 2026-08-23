@@ -36,18 +36,41 @@ use scarab_storage_s3::S3Storage;
 /// the three reasons this is a separate credential).
 const BROWSE_TOKEN_TTL_SECS: i64 = 300;
 
-/// The CAS sweeper's Depot tier probe (ADR-0064 s2), adapting the one
+/// The CAS sweeper's Depot durable-index probe (ADR-0067), adapting the one
 /// [`scarab_workspace_client::WorkspaceClient`] this process holds to the
-/// sweeper's [`scarab_server::retention::DepotTierSource`] seam (a newtype
+/// sweeper's [`scarab_server::retention::DepotDurableIndex`] seam (a newtype
 /// because both the trait's home and the client are foreign to this bin).
-/// One `GET /v1/tier` per sweep pass; an error deliberately keeps the
-/// torn-cold detector ON (see the seam's docs).
-struct DepotTierProbe(Arc<scarab_workspace_client::WorkspaceClient>);
+/// Chunked `/have` durable answers per sweep pass; an error deliberately
+/// keeps the torn-durability detector ON (see the seam's docs).
+struct DepotDurableProbe(Arc<scarab_workspace_client::WorkspaceClient>);
 
 #[async_trait::async_trait]
-impl scarab_server::retention::DepotTierSource for DepotTierProbe {
-    async fn depot_tier(&self) -> Result<String, String> {
-        self.0.depot_tier().await.map_err(|e| e.to_string())
+impl scarab_server::retention::DepotDurableIndex for DepotDurableProbe {
+    async fn durable_missing(
+        &self,
+        blobs: Vec<String>,
+        trees: Vec<String>,
+    ) -> Result<
+        (
+            std::collections::HashSet<String>,
+            std::collections::HashSet<String>,
+        ),
+        String,
+    > {
+        use scarab_storage::content::ContentSource;
+        let blob_ids: Vec<scarab_storage::BlobHash> =
+            blobs.into_iter().map(scarab_storage::BlobHash).collect();
+        let tree_ids: Vec<scarab_storage::TreeHash> =
+            trees.into_iter().map(scarab_storage::TreeHash).collect();
+        let (mb, mt) = self
+            .0
+            .missing(&blob_ids, &tree_ids)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((
+            mb.into_iter().map(|b| b.0).collect(),
+            mt.into_iter().map(|t| t.0).collect(),
+        ))
     }
 }
 
@@ -294,15 +317,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // in-flight ingest whose root is not yet recorded.
                 grace_ms: 24 * 60 * 60 * 1000,
             },
-            // The Depot tier probe (ADR-0064 s2): a warm-only Depot has no
-            // cold tier to be torn, so the sweep suppresses the residue
-            // detector per pass. No Depot configured = detector always on
-            // (this handle also being how the drain-less shape is detected).
+            // The Depot durable-index probe (ADR-0067): durable drains write
+            // packs, not loose objects, so the sweep must ask the pack index
+            // before alarming a marked object as torn-cold residue. No Depot
+            // configured = loose listing alone, status quo (this handle also
+            // being how the drain-less shape is detected).
             depot_client
                 .as_ref()
                 .map(|c| {
-                    Arc::new(DepotTierProbe(c.clone()))
-                        as Arc<dyn scarab_server::retention::DepotTierSource>
+                    Arc::new(DepotDurableProbe(c.clone()))
+                        as Arc<dyn scarab_server::retention::DepotDurableIndex>
                 }),
             Duration::from_secs(300),
         );

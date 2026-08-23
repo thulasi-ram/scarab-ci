@@ -79,11 +79,9 @@
 //!   content-addressed write whose hash this service verified cannot overwrite
 //!   or corrupt anything. The worst case is disk consumption, which is the warm
 //!   tier's bounded resource;
-//! - **the archival flush** (`POST /v1/cas/flush`) requires
-//!   [`Scope::Browse`] — the control plane's own scope. Unlike a write it is not
-//!   harmless under any valid token: it commands cold round trips for an
-//!   arbitrary root, which a fenced Step's `Read` token must not be able to do
-//!   at will (cost amplification, not data exposure).
+//!   (There used to be a fourth bullet here: the archival flush RPC, gated to
+//!   [`Scope::Browse`]. ADR-0067 part 4 retired the flush — the drain's packs
+//!   are the durable write, so there is no second pass left to gate.)
 //!
 //! Every 401 emits a `tracing::warn!` naming the run and step. The results
 //! endpoint (ADR-0042) emits nothing on failure; that is a gap, not a pattern.
@@ -133,28 +131,22 @@
 //! forbids. That borrow is the point: the returned value is an RAII guard, and while
 //! it lives no reap can delete the upper layer the fold is reading.
 //!
-//! ### Durability is not local (ADR-0062 part 3, ADR-0061 part 4, ADR-0064 part 1)
+//! ### Durability is not local (ADR-0062 part 3, ADR-0061 part 4, ADR-0067 part 4)
 //!
-//! **A settle does not report success until the new snapshot is in cold.** The fold
+//! **A settle does not report success until the new snapshot is durable.** The fold
 //! itself is local — that is part 3's whole argument — but the service's own disk
 //! *is* the warm tier, and ADR-0061's retention table says warm promises nothing. So
 //! a green Attempt whose evidence sits only in warm is a durable record making a
 //! claim it cannot back.
 //!
-//! ADR-0064 part 1 changes *how* the bytes reach cold and nothing about what must be
-//! true first: a drain writes **warm in one local walk**, and then one **batched
-//! archival flush** ([`flush_to_cold`]) puts the whole of it in cold, and the settle
-//! response waits for that flush. Nothing here archives asynchronously — that would
-//! make warm load-bearing for durability, which part 4 forbids and ADR-0064 rejects
-//! by name. See [`settle_export`] for the two drains and why the ordering is
-//! sufficient rather than merely intended.
-//!
-//! One deployment shape is exempt **by disclosure, not by accident**: under
-//! [`DurabilityTier::WarmOnly`] (ADR-0064 part 4 — the cold `LocalDir` shares the
-//! warm volume's device, so a "flush" would archive nothing) the flush phases are
-//! skipped and every settle and flush response says `durable: false,
-//! tier: "warm-only"`. The deployment makes a smaller, true promise instead of a
-//! silent false one.
+//! ADR-0067 part 4 makes the durable write **one pass, no second one**: a drain's
+//! durable bytes stream into packs as they arrive; a settle packs its snapshot's
+//! not-yet-durable remainder ([`pack_inventory_under_fence`]) and answers only once
+//! the commit pack and the index transaction have landed. Nothing here archives
+//! asynchronously — that would make warm load-bearing for durability — and there is
+//! no deferred flush and no warm-only deployment mode any more: a Depot whose object
+//! store cannot take the bytes fails the drain rather than succeeding with a smaller
+//! promise (ADR-0067 part 1).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -277,14 +269,14 @@ struct WorkspaceState {
     /// two tiers as one thing**, which is why a drain composes its own handle out of
     /// this one ([`DrainCas::over`]) rather than being handed two legs separately: one
     /// composition, so the two roles cannot disagree about which disk is which.
-    /// The drain no longer *writes* through the tiering itself (ADR-0064 part 1
-    /// makes it warm-only writes plus a batched flush) but it still **reads** through
-    /// it; see [`DrainCas`] and [`settle_export`].
+    /// The drain no longer *writes* through the tiering itself (warm writes plus
+    /// the fence's pack, ADR-0067 part 4) but it still **reads** through it; see
+    /// [`DrainCas`] and [`settle_export`].
     cas: Arc<TieredCas>,
     /// Warm-then-cold **raw keyed bytes** — the verbatim path, for **reads**:
-    /// a warm miss falls through to cold and backfills. The PUT verbs stopped
-    /// writing through it (ADR-0064: warm-only; the archival flush is the cold
-    /// writer). See the module docs on why this is not `Cas`.
+    /// a warm miss falls through to cold and backfills. The PUT verbs do not
+    /// write through it (warm plus the fence's pack, ADR-0067 part 4). See the
+    /// module docs on why this is not `Cas`.
     objects: Arc<TieredObjectStore>,
     /// The warm tier alone: the readiness write probe, and **the tier the re-ingest
     /// drain walks into** (ADR-0064 part 1 — one walk, local, and its error is the
@@ -292,8 +284,8 @@ struct WorkspaceState {
     /// `S3Storage::ingest_with_baseline` — ADR-0062's no-Export drain — is not on
     /// either port and cannot be: a `StatCache` is a drain's input, not a store's.
     warm: Arc<S3Storage>,
-    /// The cold tier alone: the readiness reachability probe, and **the target of the
-    /// archival flush** that gates a settle. Same reason it is concrete.
+    /// The cold tier alone: the readiness reachability probe, and **where the
+    /// packs land** ([`S3Storage::open_pack`]). Same reason it is concrete.
     cold: Arc<S3Storage>,
     /// The warm volume's root on disk. The service reaches it directly to
     /// stream blob bodies and to `stat` sizes — neither of which [`Cas`] can
@@ -326,13 +318,6 @@ struct WorkspaceState {
     /// in the Export record — a change to [`crate::export`] and therefore not made
     /// here.
     captures: Arc<Mutex<BTreeMap<ExportHandle, i64>>>,
-    /// What backs the cold tier — probed once at startup by [`run`] (ADR-0064
-    /// parts 3–5) and never re-measured per request: a tier is a property of
-    /// the deployment, and a per-request `stat` that suddenly disagreed with
-    /// the startup disclosure would be a new kind of silent downgrade. Under
-    /// [`DurabilityTier::WarmOnly`] the flush phases are skipped and every
-    /// response discloses `durable: false, tier: "warm-only"`.
-    tier: DurabilityTier,
     /// The control plane's Postgres (ADR-0067 part 2) — for the fence rows
     /// (`depot_drain_records`, `depot_fence_writes`) and the pack index
     /// (`depot_packs`, `depot_pack_members`), all derived and rebuildable,
@@ -375,75 +360,6 @@ impl WorkspaceState {
     }
 }
 
-/// What actually backs the cold tier — **measured, not assumed** (ADR-0064
-/// parts 3–5, git-bug `981fc6b`).
-///
-/// "Is it object storage?" was the obvious test and the wrong one: it rejects a
-/// second PVC (a perfectly good cold tier) and cannot see a `LocalDir` sitting
-/// on the warm volume. The probe is [`durability_tier`]; the strings are the
-/// wire contract — they appear in `FlushResponse.tier`, `SettledExportDto.tier`,
-/// `GET /v1/tier`, and the control plane stamps them on the Attempt
-/// (`attempts.output_durability`) — so they are defined in exactly one place,
-/// [`DurabilityTier::as_str`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DurabilityTier {
-    /// S3/MinIO: an independent backing by construction.
-    Object,
-    /// A `LocalDir` on a **different device** than the warm volume (a second
-    /// PVC). A genuine second tier.
-    SeparateVolume,
-    /// A `LocalDir` on the **same device** as the warm volume: not a tier.
-    /// Nothing here is archived; `Succeeded` is licensed by the warm volume
-    /// alone, loudly (ADR-0064 part 4).
-    WarmOnly,
-}
-
-impl DurabilityTier {
-    /// The wire form: `"object" | "separate-volume" | "warm-only"`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DurabilityTier::Object => "object",
-            DurabilityTier::SeparateVolume => "separate-volume",
-            DurabilityTier::WarmOnly => "warm-only",
-        }
-    }
-}
-
-/// Probe which [`DurabilityTier`] this deployment's cold store amounts to.
-///
-/// Pure decision over one `stat` pair: S3 is `Object` by construction; a
-/// `LocalDir` is compared to the warm directory by `st_dev`
-/// ([`std::os::unix::fs::MetadataExt::dev`]) — same device means writing "cold"
-/// buys nothing warm did not already have. Both directories are created first,
-/// because at first boot neither may exist yet and a probe that errored on
-/// `NotFound` would decide the tier by startup order.
-///
-/// **What `st_dev` cannot see** (recorded in ADR-0064's table, corrected):
-/// a cold `LocalDir` on its *own* `emptyDir` is a different device and probes
-/// `SeparateVolume`, yet dies with the Pod. Persistence of the backing is the
-/// chart's check, not a `stat`'s.
-fn durability_tier(
-    warm_dir: &std::path::Path,
-    store: &StoreConfig,
-) -> std::io::Result<DurabilityTier> {
-    match store {
-        StoreConfig::S3(_) => Ok(DurabilityTier::Object),
-        StoreConfig::LocalDir(dir) => {
-            use std::os::unix::fs::MetadataExt;
-            let cold_dir = std::path::Path::new(dir);
-            std::fs::create_dir_all(warm_dir)?;
-            std::fs::create_dir_all(cold_dir)?;
-            let warm_dev = std::fs::metadata(warm_dir)?.dev();
-            let cold_dev = std::fs::metadata(cold_dir)?.dev();
-            Ok(if warm_dev == cold_dev {
-                DurabilityTier::WarmOnly
-            } else {
-                DurabilityTier::SeparateVolume
-            })
-        }
-    }
-}
-
 /// Serve the workspace service. Called from the composition root **before** it
 /// touches Postgres, and it never returns to it.
 pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -458,11 +374,9 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     // Cold tier: exactly as the composition root builds it, so the two roles
     // cannot disagree about where the archive is — **including the in-flight limit.**
     // `with_concurrency` is not decoration here: it is how `SCARAB_CAS_CONCURRENCY`
-    // reaches this role at all, and [`flush_concurrency`] reads the archival flush's
-    // batch width straight off this handle rather than keeping a second copy of the
-    // number. Without the call the knob would be honoured in the control plane
-    // (`main.rs`) and silently ignored in the Depot, which is exactly the drift
-    // ADR-0048's "one documented place" rule exists to prevent.
+    // reaches this role at all. Without the call the knob would be honoured in the
+    // control plane (`main.rs`) and silently ignored in the Depot, which is exactly
+    // the drift ADR-0048's "one documented place" rule exists to prevent.
     let cold_store = Arc::new(
         match &config.store {
             StoreConfig::S3(s3) => S3Storage::s3(
@@ -477,53 +391,6 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .with_concurrency(config.cas_concurrency),
     );
 
-    // The durability probe (ADR-0064 parts 3–5) — HERE, because this is the one
-    // place that holds both the raw warm directory and the `StoreConfig`. The
-    // router takes the verdict as a parameter rather than re-probing, so the
-    // acceptance tests can construct each tier's Depot explicitly.
-    let tier = durability_tier(std::path::Path::new(&ws.data_dir), &config.store)?;
-    match (tier, &config.store) {
-        (DurabilityTier::Object, _) => tracing::info!(
-            tier = tier.as_str(),
-            "durability tier: cold is object storage — an independent backing; the archival \
-             flush licenses Succeeded (ADR-0064 part 3)"
-        ),
-        (DurabilityTier::SeparateVolume, StoreConfig::LocalDir(dir)) => {
-            use std::os::unix::fs::MetadataExt;
-            tracing::info!(
-                tier = tier.as_str(),
-                warm_dir = %ws.data_dir,
-                warm_dev = std::fs::metadata(&ws.data_dir)?.dev(),
-                cold_dir = %dir,
-                cold_dev = std::fs::metadata(dir)?.dev(),
-                "durability tier: cold is a LocalDir on a SEPARATE device — a genuine second \
-                 tier; the archival flush licenses Succeeded (ADR-0064 part 3). NOTE st_dev \
-                 cannot vouch for the backing's persistence: a device that dies with the Pod \
-                 (an emptyDir of its own) also probes this way"
-            );
-        }
-        (DurabilityTier::WarmOnly, StoreConfig::LocalDir(dir)) => {
-            use std::os::unix::fs::MetadataExt;
-            let line = format!(
-                "WARM-ONLY DURABILITY: cold LocalDir {dir} shares device {dev} with warm {warm} \
-                 — snapshots will NOT be archived; Succeeded is licensed by the warm volume \
-                 alone (ADR-0064 part 4)",
-                dev = std::fs::metadata(&ws.data_dir)?.dev(),
-                warm = ws.data_dir,
-            );
-            tracing::warn!(tier = tier.as_str(), "{line}");
-            // On stdout beside the listen line below: an operator who started
-            // this by hand must not need a tracing subscriber to learn their
-            // deployment makes the weaker promise.
-            println!("{line}");
-        }
-        // `durability_tier` answers `Object` for every S3 store, so the two
-        // arms above are exhaustive over `LocalDir`.
-        (DurabilityTier::SeparateVolume | DurabilityTier::WarmOnly, StoreConfig::S3(_)) => {
-            unreachable!("durability_tier answers Object for an S3 store")
-        }
-    }
-
     // The control plane's Postgres, for the fence rows (ADR-0067 part 2).
     // `connect_lazy` on purpose: this role must keep serving content THROUGH a
     // database outage (a Step reading its inputs does not care that the fence
@@ -535,7 +402,7 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .connect_lazy(&config.database_url)
         .map_err(|e| format!("SCARAB_DATABASE_URL does not parse: {e}"))?;
 
-    let app = router(&ws.data_dir, cold_store, ws.token_secret.clone(), tier, db)?;
+    let app = router(&ws.data_dir, cold_store, ws.token_secret.clone(), db)?;
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     tracing::info!(
         addr = %config.addr,
@@ -569,12 +436,6 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 /// volume that cannot answer either question is the same class of fault
 /// `S3Storage::local` already reports here.
 ///
-/// `tier` (ADR-0064 parts 3–5) is a parameter and NOT re-probed here: [`run`] is
-/// the one caller that holds a `StoreConfig` to probe, and the tests construct
-/// each tier's Depot explicitly — a router that probed for itself would make the
-/// warm-only acceptance tests depend on which device the CI runner's tempdirs
-/// land on.
-///
 /// `db` (ADR-0067 part 2) is the pool holding the fence rows — drain records
 /// and write ledgers. A parameter for the same reason `cold` is: [`run`] builds
 /// it from the validated config (lazily), and the acceptance tests hand in a
@@ -584,11 +445,10 @@ pub fn router(
     warm_dir: impl AsRef<std::path::Path>,
     cold: Arc<S3Storage>,
     token_secret: Vec<u8>,
-    tier: DurabilityTier,
     db: sqlx::PgPool,
 ) -> Result<Router, StorageError> {
     let warm_dir = warm_dir.as_ref().to_path_buf();
-    let state = open_state(&warm_dir, cold, token_secret, tier, db)?;
+    let state = open_state(&warm_dir, cold, token_secret, db)?;
 
     // The warm-tier size gauge (ADR-0061): LRU eviction is deferred, so this
     // number climbing towards the volume size IS the operator's only warning
@@ -632,7 +492,6 @@ fn open_state(
     warm_dir: &std::path::Path,
     cold: Arc<S3Storage>,
     token_secret: Vec<u8>,
-    tier: DurabilityTier,
     db: sqlx::PgPool,
 ) -> Result<WorkspaceState, StorageError> {
     // Warm tier: a local-filesystem `Cas` over the persistent volume. NO new
@@ -652,10 +511,8 @@ fn open_state(
     let exports = open_export_lifecycle(warm_dir, &farm)?;
 
     Ok(WorkspaceState {
-        // The tiered READ handles stay wired under EVERY tier, warm-only
-        // included: a pre-existing same-device cold directory may hold content
-        // warm has lost, and reading it is free — warm-only stops the *writes*
-        // (nothing new is archived), never the fall-through reads.
+        // The tiered READ handles: a warm miss falls through to cold —
+        // loose legacy objects and pack ranges alike — and backfills.
         cas: Arc::new(TieredCas::new(warm_cas, cold_cas)),
         objects: Arc::new(TieredObjectStore::new(warm_objects, cold_objects)),
         warm: warm_store,
@@ -666,7 +523,6 @@ fn open_state(
         farm,
         exports,
         captures: Arc::new(Mutex::new(BTreeMap::new())),
-        tier,
         db,
         packs: Arc::new(Mutex::new(BTreeMap::new())),
     })
@@ -800,6 +656,42 @@ async fn sweep_exports_once(state: &WorkspaceState) {
              rows will wait for the next pass"
         ),
     }
+
+    // Abandoned pack sessions (ADR-0067 parts 4–8), on the same TTL
+    // discipline: a session untouched for a whole token lifetime belongs to a
+    // drain that never came back — its fence can neither append nor seal any
+    // more, so the open multipart upload is aborted (best-effort reclamation
+    // of staged parts; an incomplete upload publishes nothing either way) and
+    // the session forgotten. Sealed-but-uncommitted body packs stay behind as
+    // unreachable bytes for the grace-window reclaim job (a later slice).
+    // `try_lock` skips any session a request is actively using.
+    let stale: Vec<(String, Arc<tokio::sync::Mutex<PackSession>>)> = {
+        let map = state.packs.lock().unwrap_or_else(PoisonError::into_inner);
+        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let cutoff = now - FENCE_RESIDUE_TTL_SECS;
+    for (key, session) in stale {
+        let Ok(mut guard) = session.try_lock() else { continue };
+        if guard.last_touched >= cutoff {
+            continue;
+        }
+        state
+            .packs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+        let sealed = guard.sealed.len();
+        if let Some(writer) = guard.open.take() {
+            writer.abort().await;
+        }
+        tracing::warn!(
+            fence_key = %key,
+            sealed_packs = sealed,
+            "aborted an abandoned pack session — its fence outlived every token that \
+             could seal it (drain never came back); sealed-but-uncommitted packs remain \
+             as unreachable bytes"
+        );
+    }
 }
 
 /// Collect fence residue older than [`FENCE_RESIDUE_TTL_SECS`]: write-ledger
@@ -835,10 +727,6 @@ fn build_router(state: WorkspaceState) -> Router {
         .route("/v1/cas/trees/{hash}", get(get_tree).put(put_tree))
         .route("/v1/cas/trees/{hash}/flat", get(get_flat))
         .route("/v1/cas/have", post(have))
-        // ADR-0064: the archival flush as an RPC, for the drain that is not this
-        // service's own settle path — the control plane's per-Step write leg
-        // seeds warm through the PUTs above and THIS is what makes it durable.
-        .route("/v1/cas/flush", post(flush_cas))
         // A blob body is a whole file (ADR-0029), so the default 2 MB limit is
         // far too small; the warm volume is the real bound.
         .layer(DefaultBodyLimit::max(MAX_BLOB_BYTES));
@@ -871,9 +759,6 @@ fn build_router(state: WorkspaceState) -> Router {
         .merge(cas)
         .merge(exports)
         .merge(drains)
-        // ADR-0064 parts 3–5: which backing licenses `Succeeded` here.
-        // Authenticated (browse scope), unlike the probes below — see `get_tier`.
-        .route("/v1/tier", get(get_tier))
         // Unauthenticated, exactly like the control plane's: a probe that needs
         // a credential cannot report the credential being wrong.
         .route("/healthz", get(healthz))
@@ -1154,8 +1039,8 @@ fn fence_claim(claims: &WorkspaceClaims) -> Option<&Fence> {
 }
 
 /// Refuse everything that is a **control-plane** operation to any token that is
-/// not the control plane's own scope. Same gate `flush_cas` and `get_tier`
-/// state inline; the Export lifecycle and the drain-record read joined it
+/// not the control plane's own scope. The Export lifecycle and the
+/// drain-record read joined it
 /// (git-bug `212bb13` — before this, *any* valid Step token could prepare,
 /// claim, settle or revoke another fence's Export, a cross-fence DoS).
 fn require_browse(claims: &WorkspaceClaims, refusal: &'static str) -> Result<(), WsError> {
@@ -1674,23 +1559,15 @@ async fn put_blob(
     // write happens either way: an idempotent overwrite of identical bytes is
     // cheaper than a shortcut whose premise can go stale.
     //
-    // **WARM ONLY.** This handler used to write through `TieredObjectStore::put`
-    // — cold first, "always write cold, whatever warm holds" — because the PUT
-    // was the durability leg: ADR-0061 part 4's "an Attempt is not `Succeeded`
-    // until its Workspace Snapshot is durable" was enforced by every upload
-    // paying a cold round trip inline. That invariant has not weakened, it has
-    // MIGRATED (ADR-0064): the **archival flush is the only cold writer** —
-    // `POST /v1/cas/flush` for the control plane's drain, and the settle path's
-    // own [`flush_to_cold`] phase for Exports — and whoever needs `Succeeded`
-    // awaits that flush. A PUT is now a warm seed the flush later archives;
-    // writing cold here again would put the per-object round trip ADR-0061
-    // measured at 81–88% of a Step boundary straight back on the hot path, and
-    // it would do so silently, because nothing would fail.
-    //
-    // ADR-0067 amends exactly one case: a FENCED durable PUT additionally
-    // streams into its fence's pack below — one multipart upload per drain,
-    // not a cold round trip per object, so the cost this paragraph defends
-    // against does not return with the durability.
+    // **Warm, plus the fence's pack.** This handler used to write through
+    // `TieredObjectStore::put` — cold first, a round trip per object, the cost
+    // ADR-0061 measured at 81–88% of a Step boundary. ADR-0064 moved durability
+    // to a deferred flush; ADR-0067 part 4 retired the second pass entirely:
+    // a FENCED durable PUT streams into its fence's pack below — one multipart
+    // upload per drain, not a cold round trip per object — and the drain
+    // record's transaction is what publishes it. Re-adding a per-PUT cold
+    // write here would restore the old cost silently, because nothing would
+    // fail.
     let already = warm_has(&warm_blob_path(&state, &hash)).await?;
     state
         .warm
@@ -1795,7 +1672,7 @@ async fn put_tree(
     // docs). A mismatch here means the two binaries disagree on canonical form:
     // storing the body verbatim would file, under one address, bytes this Depot
     // can never reproduce from their parse — `/flat` would still walk it, but a
-    // re-serialising reader (the flush's `put_tree` leg, a backfill) would mint a
+    // re-serialising reader (an index rebuild, a backfill) would mint a
     // second address for the same tree and every lookup would half-work. Refused
     // at the door, fail-closed: the evolution rule on `canonical_tree_bytes`
     // (additive `Option` fields only) is what keeps this 400 unreachable across a
@@ -1821,15 +1698,13 @@ async fn put_tree(
         )));
     }
 
-    // **WARM ONLY** — the cold write moved to the archival flush; see `put_blob`
-    // for the whole migration story (ADR-0064), and for ADR-0067's amendment:
-    // a FENCED durable PUT also streams into its fence's pack below.
-    // It matters MORE for a tree than
-    // for a blob, because a tree is the address an Attempt records as its
-    // evidence — which is exactly why the flush, not the PUT, is what a caller
-    // awaits before reporting `Succeeded`: a root that exists only in warm is a
-    // snapshot the durable record points at and cannot produce, and the flush
-    // completing is the one statement that this is no longer so.
+    // **Warm, plus the fence's pack** — see `put_blob` for the migration story
+    // (ADR-0064's deferred flush, retired by ADR-0067 part 4). It matters MORE
+    // for a tree than for a blob, because a tree is the address an Attempt
+    // records as its evidence: a root that exists only in warm is a snapshot
+    // the durable record points at and cannot produce, and the drain record's
+    // commit — packs sealed, index rows landed — is the one statement that
+    // this is no longer so.
     let already = warm_has(&warm_tree_path(&state, &hash)).await?;
     state
         .warm
@@ -2148,6 +2023,11 @@ struct PackSession {
     open: Option<PackWriter>,
     sealed: Vec<FinishedPack>,
     packed: HashSet<String>,
+    /// Unix seconds of the last append — what the abandoned-session sweep
+    /// compares against [`FENCE_RESIDUE_TTL_SECS`]: a session this old belongs
+    /// to a fence no live token can extend, so nothing can legally append to
+    /// or seal it again.
+    last_touched: i64,
 }
 
 impl PackSession {
@@ -2158,6 +2038,7 @@ impl PackSession {
             open: None,
             sealed: Vec::new(),
             packed: HashSet::new(),
+            last_touched: now_secs(),
         }
     }
 
@@ -2184,6 +2065,7 @@ impl PackSession {
         tagged: String,
         data: &[u8],
     ) -> Result<(), StorageError> {
+        self.last_touched = now_secs();
         if self.packed.contains(&tagged) {
             return Ok(());
         }
@@ -2322,13 +2204,18 @@ struct CommitPackEntry<'a> {
 /// transaction that follows; `(empty, None)` when the fence streamed nothing
 /// durable (a cache-only-everything drain, or a client that never labelled).
 ///
+/// `root`/`published_root` are the receipt's coordinates: the drain's record
+/// roots on the drain path, the settled snapshot's root (both) on the Export
+/// settle path.
+///
 /// On failure the session survives with what it managed to seal, minus the
 /// members of any pack that failed mid-flight (see [`PackSession::seal_open`])
 /// — the re-driven drain re-PUTs those and this seals again, idempotently.
 async fn seal_fence_packs(
     state: &WorkspaceState,
     fence: &Fence,
-    record: &DrainRecord,
+    root: &str,
+    published_root: &str,
 ) -> Result<(Vec<FinishedPack>, Option<(String, u64)>), WsError> {
     let key = fence_key(fence);
     let session = {
@@ -2349,15 +2236,14 @@ async fn seal_fence_packs(
         return Ok((Vec::new(), None));
     }
 
-    let effective = record.pruned_root.as_deref().unwrap_or(&record.root);
     let doc = CommitPackDoc {
         version: PACK_RECORD_VERSION,
         run: &fence.run,
         step: &fence.step,
         attempt: &fence.attempt,
         fence_key: &key,
-        root: tagged_address(HashAlgo::Sha256, &record.root),
-        published_root: tagged_address(HashAlgo::Sha256, effective),
+        root: tagged_address(HashAlgo::Sha256, root),
+        published_root: tagged_address(HashAlgo::Sha256, published_root),
         packs: sealed
             .iter()
             .map(|p| CommitPackEntry {
@@ -2380,6 +2266,163 @@ async fn seal_fence_packs(
 /// The commit pack's format version. Distinct constant from
 /// [`DRAIN_RECORD_VERSION`] because the two documents evolve independently.
 const PACK_RECORD_VERSION: u32 = 1;
+
+/// Insert one sealed drain's pack rows + member rows into an open index
+/// transaction — the POINTERS half of ADR-0067 part 10, shared by the drain
+/// path (whose transaction also carries the drain record) and the Export
+/// settle path (whose transaction carries only these).
+async fn insert_pack_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    fence_key: &str,
+    sealed: &[FinishedPack],
+    commit: &Option<(String, u64)>,
+    now: i64,
+) -> Result<(), WsError> {
+    for pack in sealed {
+        sqlx::query(
+            "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes) \
+             VALUES ($1, $2, 'body', $3, $4) ON CONFLICT (pack_key) DO NOTHING",
+        )
+        .bind(&pack.key)
+        .bind(fence_key)
+        .bind(now)
+        .bind(i64::try_from(pack.bytes).unwrap_or(i64::MAX))
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| pack_rows_error("insert pack row", e))?;
+        let mut addresses = Vec::with_capacity(pack.members.len());
+        let mut kinds = Vec::with_capacity(pack.members.len());
+        let mut offsets = Vec::with_capacity(pack.members.len());
+        let mut lens = Vec::with_capacity(pack.members.len());
+        for m in &pack.members {
+            addresses.push(m.address.clone());
+            kinds.push(m.kind.as_str().to_string());
+            offsets.push(i64::try_from(m.offset).unwrap_or(i64::MAX));
+            lens.push(i64::try_from(m.len).unwrap_or(i64::MAX));
+        }
+        sqlx::query(
+            "INSERT INTO depot_pack_members (address, kind, pack_key, byte_offset, byte_len) \
+             SELECT a, k, $1, o, l FROM UNNEST($2::text[], $3::text[], $4::bigint[], $5::bigint[]) \
+             AS t(a, k, o, l) ON CONFLICT (address, pack_key) DO NOTHING",
+        )
+        .bind(&pack.key)
+        .bind(&addresses)
+        .bind(&kinds)
+        .bind(&offsets)
+        .bind(&lens)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| pack_rows_error("insert member rows", e))?;
+    }
+    if let Some((commit_key, commit_bytes)) = commit {
+        sqlx::query(
+            "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes) \
+             VALUES ($1, $2, 'commit', $3, $4) ON CONFLICT (pack_key) DO NOTHING",
+        )
+        .bind(commit_key)
+        .bind(fence_key)
+        .bind(now)
+        .bind(i64::try_from(*commit_bytes).unwrap_or(i64::MAX))
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| pack_rows_error("insert commit pack row", e))?;
+    }
+    Ok(())
+}
+
+/// ADR-0067 part 4 on the **Export settle path**: stream everything reachable
+/// from the settled snapshot that the durable index does not already hold
+/// into packs under the Export's fence, commit-pack last, then one index
+/// transaction — the settle-path twin of the drain's seal-and-commit, and
+/// what retired its `flush_to_cold` leg.
+///
+/// The inventory is the fold's own receipt (`settle::FlushSet`) — every blob
+/// the rebuilt trees name, every tree written or inherited — so an untouched
+/// sub-tree inherited from an already-durable parent is FILTERED here by the
+/// index rather than re-uploaded: most of a typical settle packs nothing but
+/// its delta, and a wholly untouched Step packs nothing at all (its parent's
+/// commit pack is the record).
+///
+/// Bytes come off [`ReadThrough`] (warm, falling through to cold) and are
+/// re-verified against their address before packing — the pack must never
+/// launder a corrupt warm object into the durable tier.
+async fn pack_inventory_under_fence(
+    state: &WorkspaceState,
+    fence: &Fence,
+    inventory: &settle::FlushSet,
+    reads: &ReadThrough,
+    root: &TreeHash,
+) -> Result<(), WsError> {
+    let blob_bares: Vec<String> = inventory.blobs.iter().map(|b| b.0.clone()).collect();
+    let durable_blobs = durable_present_of(
+        &state.db,
+        PackMemberKind::Blob,
+        blob_bares.iter().map(String::as_str),
+    )
+    .await?;
+    let tree_bares: Vec<String> = {
+        let mut seen = HashSet::new();
+        inventory
+            .tree_levels
+            .iter()
+            .flatten()
+            .filter(|t| seen.insert(t.0.clone()))
+            .map(|t| t.0.clone())
+            .collect()
+    };
+    let durable_trees = durable_present_of(
+        &state.db,
+        PackMemberKind::Tree,
+        tree_bares.iter().map(String::as_str),
+    )
+    .await?;
+
+    for hex in blob_bares.iter().filter(|h| !durable_blobs.contains(*h)) {
+        // `get_blob` verifies the bytes hash to the address on the way out.
+        let bytes = reads.get_blob(&BlobHash(hex.clone())).await.map_err(|e| {
+            WsError::Backend(format!("reading blob {hex} for the settle pack: {e}"))
+        })?;
+        pack_append(state, fence, PackMemberKind::Blob, hex, &bytes).await?;
+    }
+    for hex in tree_bares.iter().filter(|h| !durable_trees.contains(*h)) {
+        let bytes = state
+            .objects
+            .get(&format!("trees/{hex}"))
+            .await
+            .map_err(|e| {
+                WsError::Backend(format!("reading tree {hex} for the settle pack: {e}"))
+            })?;
+        if hash_hex(&bytes) != *hex {
+            return Err(WsError::Backend(format!(
+                "tree {hex} read back with a different hash — refusing to pack corruption"
+            )));
+        }
+        pack_append(state, fence, PackMemberKind::Tree, hex, &bytes).await?;
+    }
+
+    // Bytes before pointers (part 10): packs complete + commit pack lands,
+    // THEN the index rows, then the session is forgotten. Nothing new durable
+    // (`(empty, None)`) means nothing to commit — the untouched-Step case.
+    let (sealed, commit) = seal_fence_packs(state, fence, &root.0, &root.0).await?;
+    if !sealed.is_empty() {
+        let key = fence_key(fence);
+        let mut tx = state
+            .db
+            .begin()
+            .await
+            .map_err(|e| pack_rows_error("begin settle pack transaction", e))?;
+        insert_pack_rows(&mut tx, &key, &sealed, &commit, now_secs()).await?;
+        tx.commit()
+            .await
+            .map_err(|e| pack_rows_error("commit settle pack transaction", e))?;
+    }
+    state
+        .packs
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&fence_key(fence));
+    Ok(())
+}
 
 /// A query against the pack index (`depot_packs`, `depot_pack_members`)
 /// failed. A 500 the caller retries — never a miss: a durable-only object
@@ -2530,227 +2573,6 @@ async fn tree_entries_anywhere(
         .map_err(|e| WsError::Backend(format!("tree {} does not parse: {e}", tree.0)))
 }
 
-/// Which of `blobs` the pack index already holds durable. Used by the flush
-/// to stop re-uploading loose copies of packed content. A query failure
-/// answers the empty set with a warning — the flush then re-uploads loose,
-/// which is waste in the safe direction, never a skipped upload.
-async fn packed_blobs_of(
-    db: &sqlx::PgPool,
-    blobs: &HashSet<BlobHash>,
-) -> HashSet<BlobHash> {
-    if blobs.is_empty() {
-        return HashSet::new();
-    }
-    let tagged: Vec<String> = blobs
-        .iter()
-        .map(|b| tagged_address(HashAlgo::Sha256, &b.0))
-        .collect();
-    let rows: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT DISTINCT address FROM depot_pack_members WHERE kind = 'blob' AND address = ANY($1)",
-    )
-    .bind(&tagged)
-    .fetch_all(db)
-    .await;
-    match rows {
-        Ok(rows) => rows
-            .into_iter()
-            .filter_map(|t| {
-                scarab_storage::parse_address(&t)
-                    .ok()
-                    .map(|(_, hex)| BlobHash(hex.to_string()))
-            })
-            .collect(),
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "pack-index probe for the flush failed — treating nothing as packed, so the \
-                 flush re-uploads loose copies (waste, never loss)"
-            );
-            HashSet::new()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The archival flush as an RPC (ADR-0064)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-pub struct FlushRequest {
-    /// The snapshot root whose whole reachable set must be in cold before this
-    /// route answers success.
-    pub root: String,
-}
-
-/// What one completed flush cost — [`FlushTally`], on the wire.
-#[derive(Debug, Serialize)]
-struct FlushResponse {
-    durable: bool,
-    /// The deployment's [`DurabilityTier`], on **every** 200 (ADR-0064 parts
-    /// 3–5): `"object"` or `"separate-volume"` beside `durable: true`,
-    /// `"warm-only"` beside `durable: false`. The client's classifier keys on
-    /// this pair — a `durable: false` *without* `tier: "warm-only"` stays a
-    /// retryable anomaly, so an old proxy's mangled body cannot impersonate
-    /// the warm-only disclosure.
-    tier: &'static str,
-    blobs: u64,
-    blobs_uploaded: u64,
-    trees: u64,
-}
-
-/// Why a flush did not complete, and — the field the caller acts on — whether
-/// re-driving it can ever help.
-#[derive(Debug, Serialize)]
-struct FlushRefusal {
-    retryable: bool,
-    detail: String,
-}
-
-fn flush_refusal(status: StatusCode, retryable: bool, detail: String) -> Response {
-    (status, Json(FlushRefusal { retryable, detail })).into_response()
-}
-
-/// `POST /v1/cas/flush` — archive everything reachable from `root` to cold, and
-/// answer only when all of it is there.
-///
-/// This is [`flush_to_cold`] with an HTTP surface: the same walk
-/// ([`flush_set_of`]), the same ordered phases, the same no-partial-success
-/// contract. It exists for the drain that is **not** this service's own settle
-/// path — the control plane's per-Step write leg, which under ADR-0064 seeds
-/// warm through the PUTs above (now warm-only) and calls this once per drained
-/// snapshot. The part-4 invariant those PUT handlers used to carry — "the cold
-/// write gates `Succeeded`" — lives HERE now: the caller awaits this route
-/// before reporting an Attempt `Succeeded`, exactly as [`settle_export`] awaits
-/// its own flush phase.
-///
-/// # The status codes are a verdict about RETRYING, not a taxonomy of blame
-///
-/// - `200`, `durable: true` — the whole reachable set is in cold. Idempotent and
-///   cheap to repeat: a re-offer of an archived snapshot is one `head` per address.
-/// - `200`, `durable: false, tier: "warm-only"` — this deployment HAS no cold
-///   tier (ADR-0064 part 4), so there is nothing to flush to and nothing a
-///   retry would change: deliberately a success status carrying a disclosure,
-///   never a 503. The walk still ran, so a wiped warm tier still answers 503
-///   below — the two conditions must not be conflated, because one is repaired
-///   by the caller's re-driven drain and the other by nothing.
-/// - `422`, `retryable: false` — [`FlushError::Mismatch`]: the two tiers
-///   disagree on how content is addressed. The **only** fatal class; no retry
-///   can converge two binaries that canonicalise differently.
-/// - `503`, `retryable: true` — everything else, **including a warm miss**. A
-///   wiped or evicted warm tier is not fatal here even though this flush cannot
-///   proceed without the bytes: the control plane's drain loop re-drives the
-///   whole leg, and its re-upload (`/have`, then PUTs of what is missing)
-///   re-seeds warm before the retried flush runs — the state is provably
-///   recoverable, and a fatal answer would strand it. Cold IO, warm IO and an
-///   unanswerable existence probe are the same verdict for the same reason.
-///
-/// # `Scope::Browse` only
-///
-/// The PUTs accept any valid token because a content-addressed write with a
-/// verified hash can corrupt nothing. A flush is different in kind: it commands
-/// cold round trips for an arbitrary root, so a fenced Step's `Read` token
-/// driving it at will is a cost amplification. Only the control plane's own
-/// scope may trigger one.
-async fn flush_cas(
-    State(state): State<WorkspaceState>,
-    headers: HeaderMap,
-    Json(req): Json<FlushRequest>,
-) -> Result<Response, WsError> {
-    let claims = authenticate(&state, &headers)?;
-    if !matches!(claims.scope, Scope::Browse) {
-        tracing::warn!(
-            run = %claims.fence.run,
-            step = %claims.fence.step,
-            attempt = %claims.fence.attempt,
-            root = %req.root,
-            "workspace service: 403 — a read-scoped token asked for an archival flush"
-        );
-        return Err(WsError::ScopeForbidden(
-            "the archival flush requires a browse-scoped token",
-        ));
-    }
-    valid_hash(&req.root)?;
-
-    let reads = ReadThrough(state.cas.clone());
-    let root = TreeHash(req.root.clone());
-    // A walk failure — including a root neither tier holds — is retryable: the
-    // caller's re-driven drain re-uploads what warm is missing before it retries
-    // the flush, so "not here yet / not here any more" is a state the retry loop
-    // itself repairs.
-    let flush = match flush_set_of(&reads, &root).await {
-        Ok(flush) => flush,
-        Err(e) => {
-            return Ok(flush_refusal(
-                StatusCode::SERVICE_UNAVAILABLE,
-                true,
-                format!(
-                    "walking {} for its flush inventory failed — nothing was offered to cold: {e}",
-                    req.root
-                ),
-            ))
-        }
-    };
-    // ADR-0064 part 4: under warm-only durability there is no cold tier to
-    // flush to, and pretending otherwise — a "flush" onto the same device — is
-    // waste plus false comfort. The auth, the hash check and the walk above all
-    // still ran (a wiped warm tier still 503s, exactly as it must: the caller's
-    // re-driven drain repairs THAT), but the answer is a deliberate
-    // `200 durable: false, tier: "warm-only"` and NEVER a 503 — nothing about
-    // being warm-only is repaired by retrying.
-    if matches!(state.tier, DurabilityTier::WarmOnly) {
-        let tally = FlushTally::warm_only(&flush);
-        return Ok((
-            StatusCode::OK,
-            Json(FlushResponse {
-                durable: tally.durable,
-                tier: DurabilityTier::WarmOnly.as_str(),
-                blobs: tally.blobs,
-                blobs_uploaded: tally.blobs_uploaded,
-                trees: tally.trees,
-            }),
-        )
-            .into_response());
-    }
-    // ADR-0067 slice 3 (dual-write era): blobs the drain already streamed
-    // into a pack ARE durable — probing their loose keys would find nothing
-    // and re-upload every packed blob beside its pack. Subtract them from the
-    // inventory; the tally still reports the full count, with the packed
-    // portion counted as present rather than offered. Trees are left alone
-    // (small, `put_if_absent` re-offer, and it keeps the Mismatch tripwire).
-    let packed = packed_blobs_of(&state.db, &flush.blobs).await;
-    let flush = {
-        let mut flush = flush;
-        flush.blobs.retain(|b| !packed.contains(b));
-        flush
-    };
-    match flush_to_cold(&reads, &state.cold, &flush, &req.root).await {
-        Ok(tally) => Ok((
-            StatusCode::OK,
-            Json(FlushResponse {
-                durable: tally.durable,
-                tier: state.tier.as_str(),
-                blobs: tally.blobs + packed.len() as u64,
-                blobs_uploaded: tally.blobs_uploaded,
-                trees: tally.trees,
-            }),
-        )
-            .into_response()),
-        // The one fatal class: the tiers disagree about addressing, and no
-        // re-drive converges that. Everything else is the retryable verdict —
-        // see the handler docs for why a warm miss is deliberately among them.
-        Err(e @ FlushError::Mismatch { .. }) => Ok(flush_refusal(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            false,
-            e.to_string(),
-        )),
-        Err(e) => Ok(flush_refusal(
-            StatusCode::SERVICE_UNAVAILABLE,
-            true,
-            e.to_string(),
-        )),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The drain rendezvous (git-bug 212bb13)
 // ---------------------------------------------------------------------------
@@ -2884,7 +2706,7 @@ enum ClosureVerdict {
 /// wearing a different hat. Blobs check warm OR the durable pack index — the
 /// drain's blob dedup keys on the index (ADR-0067 part 4), so an
 /// already-durable blob is legitimately never re-uploaded to this replica's
-/// warm. Bounded like [`flush_set_of`]: BFS with a visited set, hashes only
+/// warm. Bounded like [`reachable_set_of`]: BFS with a visited set, hashes only
 /// in memory.
 async fn validate_drain_closure(
     state: &WorkspaceState,
@@ -3049,7 +2871,8 @@ async fn post_drain(
     // ordering exists to make impossible. Error records seal nothing — the
     // session stays open for the retried drain.
     let (sealed, commit) = if record.error.is_none() {
-        seal_fence_packs(&state, &fence, &record).await?
+        let effective = record.pruned_root.clone().unwrap_or_else(|| record.root.clone());
+        seal_fence_packs(&state, &fence, &record.root, &effective).await?
     } else {
         (Vec::new(), None)
     };
@@ -3072,55 +2895,7 @@ async fn post_drain(
         .begin()
         .await
         .map_err(|e| fence_rows_error("begin drain transaction", e))?;
-    for pack in &sealed {
-        sqlx::query(
-            "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes) \
-             VALUES ($1, $2, 'body', $3, $4) ON CONFLICT (pack_key) DO NOTHING",
-        )
-        .bind(&pack.key)
-        .bind(&key)
-        .bind(now)
-        .bind(i64::try_from(pack.bytes).unwrap_or(i64::MAX))
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| pack_rows_error("insert pack row", e))?;
-        let mut addresses = Vec::with_capacity(pack.members.len());
-        let mut kinds = Vec::with_capacity(pack.members.len());
-        let mut offsets = Vec::with_capacity(pack.members.len());
-        let mut lens = Vec::with_capacity(pack.members.len());
-        for m in &pack.members {
-            addresses.push(m.address.clone());
-            kinds.push(m.kind.as_str().to_string());
-            offsets.push(i64::try_from(m.offset).unwrap_or(i64::MAX));
-            lens.push(i64::try_from(m.len).unwrap_or(i64::MAX));
-        }
-        sqlx::query(
-            "INSERT INTO depot_pack_members (address, kind, pack_key, byte_offset, byte_len) \
-             SELECT a, k, $1, o, l FROM UNNEST($2::text[], $3::text[], $4::bigint[], $5::bigint[]) \
-             AS t(a, k, o, l) ON CONFLICT (address, pack_key) DO NOTHING",
-        )
-        .bind(&pack.key)
-        .bind(&addresses)
-        .bind(&kinds)
-        .bind(&offsets)
-        .bind(&lens)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| pack_rows_error("insert member rows", e))?;
-    }
-    if let Some((commit_key, commit_bytes)) = &commit {
-        sqlx::query(
-            "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes) \
-             VALUES ($1, $2, 'commit', $3, $4) ON CONFLICT (pack_key) DO NOTHING",
-        )
-        .bind(commit_key)
-        .bind(&key)
-        .bind(now)
-        .bind(i64::try_from(*commit_bytes).unwrap_or(i64::MAX))
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| pack_rows_error("insert commit pack row", e))?;
-    }
+    insert_pack_rows(&mut tx, &key, &sealed, &commit, now).await?;
     sqlx::query(
         "INSERT INTO depot_drain_records \
              (fence_key, run, step, attempt, version, posted_at, record) \
@@ -3476,29 +3251,13 @@ pub struct SettledExportDto {
     /// Which drain read the Export back: `change-set` (the overlay rung's exact upper
     /// layer) or `re-ingest` (the copy rung's `(size, mtime, ctime)` approximation).
     /// The rung chose it, not the caller.
+    ///
+    /// There is deliberately no `durable` field any more (ADR-0067 part 4):
+    /// a 200 from a settle **is** the durability claim — the snapshot's
+    /// not-yet-durable members were packed, the commit pack landed, and the
+    /// index transaction committed strictly before this DTO existed. A settle
+    /// that could not do that is a `WsError`, never a hedged success.
     pub drain: &'static str,
-    /// **`durable` means: the archival flush to the cold tier completed.**
-    ///
-    /// Nothing more and nothing less — and since this slice (git-bug `981fc6b`,
-    /// ADR-0064 parts 3–5) it can finally be `false`: under
-    /// [`DurabilityTier::WarmOnly`] there is no independent cold tier, the flush
-    /// phase is **skipped** rather than aimed at the warm volume's own device,
-    /// and this field discloses that instead of a `WsError` pretending
-    /// something failed. `tier` below is what tells the reader *why* — a
-    /// `durable: false` here always travels with `tier: "warm-only"`.
-    ///
-    /// Where a flush does exist, the old shape holds unchanged: it is `await`ed
-    /// before this DTO is built, a flush that did not complete is a
-    /// `WsError::Drain` with no DTO to carry a value at all, and the `true` is
-    /// read off the flush's own tally rather than written here as a literal.
-    pub durable: bool,
-    /// Which backing licenses `Succeeded` in this deployment (ADR-0064 parts
-    /// 3–5): `"object"` or `"separate-volume"` beside `durable: true`, or
-    /// `"warm-only"` beside `durable: false` — the disclosed, weaker promise.
-    /// The control plane stamps this on the Attempt
-    /// (`attempts.output_durability`), because a startup log line cannot
-    /// explain a Run a month later.
-    pub tier: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_set: Option<ChangeSetTallyDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3507,52 +3266,34 @@ pub struct SettledExportDto {
 }
 
 /// `POST /v1/exports/{handle}/settle` — fold what the Step wrote back into the CAS,
-/// **and get it into cold before answering.**
+/// **and pack it durable before answering.**
 ///
-/// # How the durability decision is enforced (ADR-0064 part 1: warm-first, then flush)
+/// # How the durability decision is enforced (ADR-0067 part 4: one pass, the pack)
 ///
-/// ADR-0062 part 3 settles *what* must be true: *"a change set is folded into the CAS
-/// locally and then uploaded to cold before the Attempt may reach `Succeeded`"*.
-/// ADR-0064 part 1 settles *how the bytes get there*, and it is the same for both
-/// drains, which is the point of it:
+/// ADR-0062 part 3 settles *what* must be true: the folded snapshot is durable before
+/// the Attempt may reach `Succeeded`. ADR-0067 settles *how*:
 ///
-/// 1. **write warm, in one walk.** The Depot's warm tier is a directory on this
-///    service's own volume, so this leg is local syscalls and no network. Warm's error
-///    is the caller's error — if the snapshot does not exist, there is nothing to
-///    archive and nothing to report. *Reads* on this leg still fall through to cold and
-///    backfill warm; only the writes are warm-only. [`DrainCas`] holds that distinction
-///    and says why it is not symmetry.
-/// 2. **then one batched archival flush to cold**, [`flush_to_cold`], which this route
-///    `await`s before answering. Blobs first, then trees deepest-first, so cold never
-///    holds a reachable tree whose children are absent. A flush that does not complete
-///    is a `500` naming the cold flush, never a `200` with a hedge.
+/// 1. **the fold writes warm, in one walk.** The Depot's warm tier is a directory on
+///    this service's own volume, so this leg is local syscalls and no network. Warm's
+///    error is the caller's error. *Reads* on this leg still fall through to cold and
+///    backfill warm; only the writes are warm-only. [`DrainCas`] holds that
+///    distinction and says why it is not symmetry.
+/// 2. **then the not-yet-durable remainder streams into packs under the Export's
+///    fence** ([`pack_inventory_under_fence`]): body packs, commit pack LAST, one
+///    index transaction — the same seal-and-commit the drain path runs, `await`ed
+///    before this route answers. A settle that cannot pack is a `500` naming the
+///    leg, never a `200` with a hedge.
 ///
-/// What that replaces is a cold round-trip *per blob*, interleaved into the fold, plus
-/// (on the re-ingest drain) a second independent walk of the whole tree — the 4–6 ms
-/// per file ADR-0061's s0 measured as 81–88% of a Step boundary. What it preserves is
-/// ADR-0061 part 4 exactly: **the Attempt is not settled until the flush completes.**
-/// Warm is the write *path*; cold is still the promise. Nothing is archived
-/// asynchronously and nothing is archived after the response — ADR-0064 rejects that
-/// explicitly, because it would make the warm tier load-bearing for durability.
+/// What the pack leg covers is easy to get wrong in one direction only — omission —
+/// so the inventory includes the blobs the fold **reused** and the sub-trees it took
+/// across **by hash**, not only what it wrote; the durable index then filters what is
+/// already packed, so in the common case only the Step's delta uploads.
 ///
-/// What the flush covers is easy to get wrong in one direction only — omission — and
-/// every omission has the same failure mode: cold ends up holding a reachable tree whose
-/// child is absent, and the settle reports `durable: true`. So the inventory includes the
-/// blobs the fold **reused** and the sub-trees it took across **by hash**, not only what
-/// it wrote, because warm outlives cold (the GC deletes from cold only; warm has no
-/// eviction) and "the parent was durable once" is not "cold holds it now".
-///
-/// The one thing that legitimately flushes nothing is **an untouched Step**: it writes
-/// nothing and returns its input snapshot verbatim, which was archived before the Attempt
-/// that produced it was allowed to succeed. `settle::FlushSet` states the boundary, and
+/// The one thing that legitimately packs nothing is **an untouched Step**: it writes
+/// nothing and returns its input snapshot verbatim, whose own drain packed it before
+/// its Attempt was allowed to succeed. `settle::FlushSet` states the boundary, and
 /// the one hole still open inside it (blobs reachable only through an inherited
 /// sub-tree).
-///
-/// Note the asymmetry that remains, so nobody reads it as an oversight: the *control
-/// plane's* `TieredCas` — where warm is this service over HTTP — is still cold-first
-/// per write. Making warm authoritative there would let a Depot outage fail every
-/// Step, which is a different decision with a different risk; it is git-bug `212bb13`,
-/// not this route's.
 ///
 /// # Settle strictly before revoke, and never a reap on failure
 ///
@@ -3594,6 +3335,9 @@ async fn settle_export(
     let inputs = state.exports.settle_inputs(&handle)?;
     let parent = inputs.parent.clone();
     let drain = inputs.drain.clone();
+    // The Export's fence: whose packs the settled snapshot's durable bytes
+    // land in (ADR-0067 parts 4 and 8 on the settle path).
+    let fence = inputs.fence.clone();
 
     let dto = match drain {
         SettleDrain::ChangeSet { upper, markers } => {
@@ -3628,27 +3372,25 @@ async fn settle_export(
                 .map_err(|e| bad(format!("the change-set fold failed: {e}")))?
                 .map_err(|e| bad(e.to_string()))?;
 
-            // And the archival leg, awaited — where an archive EXISTS. Under
-            // warm-only durability (ADR-0064 part 4) the flush is skipped rather
-            // than pointed at the warm volume's own device, and the DTO's
-            // `durable: false, tier: "warm-only"` is the disclosure. The fold
-            // handed over its inventory either way — every blob its rebuilt
-            // trees name, every tree it wrote, and every untouched sub-tree
-            // those name — so the durable arm costs no second walk of anything.
-            let flushed = match state.tier {
-                DurabilityTier::WarmOnly => FlushTally::warm_only(&settled.flush),
-                _ => flush_to_cold(&drain_cas.reads, &state.cold, &settled.flush, &handle)
-                    .await
-                    .map_err(|e| bad(e.to_string()))?,
-            };
+            // And the durable leg, awaited (ADR-0067 part 4): the fold handed
+            // over its inventory — every blob its rebuilt trees name, every
+            // tree it wrote, and every untouched sub-tree those name — and
+            // the not-yet-durable remainder packs under the Export's fence
+            // before this route answers.
+            pack_inventory_under_fence(
+                &state,
+                &fence,
+                &settled.flush,
+                &drain_cas.reads,
+                &settled.snapshot.root,
+            )
+            .await?;
 
             SettledExportDto {
                 handle: handle.to_string(),
                 root: settled.snapshot.root.0.clone(),
                 identity: settled.snapshot.identity.as_ref().map(|id| id.0.clone()),
                 drain: "change-set",
-                durable: flushed.durable,
-                tier: state.tier.as_str(),
                 change_set: Some(ChangeSetTallyDto {
                     blobs_stored: settled.tally.blobs_stored,
                     trees_written: settled.tally.trees_written,
@@ -3694,25 +3436,25 @@ async fn settle_export(
                 0
             });
 
-            let (snapshot, tally, baseline_paths, flushed) = reingest_warm_then_flush(
+            let reads = ReadThrough(state.cas.clone());
+            let (snapshot, tally, baseline_paths, inventory) = reingest_warm(
                 state.warm.clone(),
-                state.cold.clone(),
-                ReadThrough(state.cas.clone()),
+                reads.clone(),
                 path,
                 manifest,
                 captured_at_ms,
                 handle.clone(),
-                state.tier,
             )
             .await?;
+            // The durable leg (ADR-0067 part 4), same as the change-set arm.
+            pack_inventory_under_fence(&state, &fence, &inventory, &reads, &snapshot.root)
+                .await?;
 
             SettledExportDto {
                 handle: handle.to_string(),
                 root: snapshot.root.0.clone(),
                 identity: snapshot.identity.as_ref().map(|id| id.0.clone()),
                 drain: "re-ingest",
-                durable: flushed.durable,
-                tier: state.tier.as_str(),
                 change_set: None,
                 reingest: Some(ReingestTallyDto {
                     hashed: tally.hashed,
@@ -3734,14 +3476,11 @@ async fn settle_export(
         handle = %dto.handle,
         drain = dto.drain,
         root = %dto.root,
-        durable = dto.durable,
-        tier = dto.tier,
         total_ms = dto.elapsed_ms,
-        "workspace export settled — where an independent cold tier exists this response waited \
-         for the archival flush and the Attempt may be reported Succeeded (ADR-0064 part 1, \
-         keeping ADR-0062 part 3 / ADR-0061 part 4); under warm-only durability there is no \
-         flush to wait for, and `durable: false` + `tier: \"warm-only\"` disclose that the warm \
-         volume alone is the promise (ADR-0064 part 4)"
+        "workspace export settled — the snapshot's not-yet-durable members were packed \
+         under the Export's fence and the index committed before this response (ADR-0067 \
+         part 4, keeping ADR-0062 part 3 / ADR-0061 part 4), so the Attempt may be \
+         reported Succeeded"
     );
     Ok(Json(dto))
 }
@@ -3821,11 +3560,11 @@ async fn list_exports(
 ///
 /// The store is a [`DrainCas`]: warm-only writes, tiered reads. Durability did not move
 /// to warm with the writes — the fold reports its inventory in
-/// [`settle::Settled::flush`] and [`settle_export`] `await`s [`flush_to_cold`] over that
-/// inventory before it answers, so the settle still does not report success until the
-/// snapshot is archived. What changed is that the archival leg is now a phase the handler
-/// can see, one batch wide, instead of a cold `PUT` interleaved into every `put_blob`
-/// inside the fold.
+/// [`settle::Settled::flush`] and [`settle_export`] `await`s
+/// [`pack_inventory_under_fence`] over it before answering (ADR-0067 part 4), so the
+/// settle still does not report success until the snapshot is durable. The durable leg
+/// is a phase the handler can see, instead of a cold `PUT` interleaved into every
+/// `put_blob` inside the fold.
 ///
 /// # Why it runs on a blocking thread, which is NOT a design choice
 ///
@@ -3922,9 +3661,9 @@ impl ReadThrough {
 ///
 /// - **Writes are warm-only**, which is the slice. One local walk, no cold round trip
 ///   per blob; the durability decision moves out of the store and into
-///   [`flush_to_cold`], a phase [`settle_export`] awaits and an operator can see.
-///   Writing through [`TieredCas`] instead would put cold back on the per-blob path,
-///   which is the cost ADR-0061 measured.
+///   [`pack_inventory_under_fence`], a phase [`settle_export`] awaits and an operator
+///   can see. Writing through [`TieredCas`] instead would put cold back on the
+///   per-blob path, which is the cost ADR-0061 measured.
 /// - **Reads are tiered**, and that is a correctness requirement, not symmetry.
 ///   `TieredCas` falls back to cold on a warm `NotFound` and backfills warm with what
 ///   it found, and **warm-lacks-while-cold-has is a state this system produces on
@@ -3991,7 +3730,8 @@ impl Cas for DrainCas {
     }
 }
 
-/// The re-ingest drain, ADR-0064 part 1: **one warm walk, then the archival flush.**
+/// The re-ingest drain: **one warm walk, then the reachability inventory** the
+/// caller's pack leg consumes (ADR-0067 part 4).
 ///
 /// `ingest_with_baseline` has no tiered twin and should not have one — a [`StatCache`]
 /// is a *drain's* input, not a store's — so the tiering for this drain is written out
@@ -4002,36 +3742,33 @@ impl Cas for DrainCas {
 /// file.
 ///
 /// - **Warm decides whether there is a snapshot at all.** Its error is the caller's:
-///   nothing was published, so there is nothing to archive and nothing to report.
-/// - **The flush decides whether the snapshot is archived**, and this function does not
-///   return until it has. A flush failure is the caller's error too, and it names the
-///   cold flush — the Step exited 0 and its evidence did not reach the archive, which
-///   is a retryable failure and must not read as a mystery I/O error.
+///   nothing was published, so there is nothing to make durable and nothing to report.
+/// - **The caller's pack leg** ([`pack_inventory_under_fence`]) decides whether the
+///   snapshot is durable, over the inventory this returns.
 ///
-/// # Why the flush set is a walk here and an inventory there
+/// # Why the inventory is a walk here and free there
 ///
-/// [`fold_change_set`] gets its flush set for free: the fold knows every address it
+/// [`fold_change_set`] gets its inventory for free: the fold knows every address it
 /// touched. This drain does not fold — `ingest_with_baseline` answers with a root and a
-/// tally — so the addresses have to be recovered, and [`flush_set_of`] recovers them by
-/// walking the resulting tree, which is one tree object per directory and no file content
-/// at all. Normally every read of that walk is local, since the ingest above just wrote
-/// the tree to warm; it still goes through [`ReadThrough`] rather than the warm leg,
-/// because a warm tier that lost something cold has must not fail a settle (see
-/// [`DrainCas`]).
+/// tally — so the addresses have to be recovered, and [`reachable_set_of`] recovers them
+/// by walking the resulting tree, which is one tree object per directory and no file
+/// content at all. Normally every read of that walk is local, since the ingest above
+/// just wrote the tree to warm; it still goes through [`ReadThrough`] rather than the
+/// warm leg, because a warm tier that lost something cold has must not fail a settle
+/// (see [`DrainCas`]).
 ///
 /// The `FlatManifest` this function already receives is *not* that vehicle, and it is
 /// worth saying why rather than leaving it looking like an oversight: a manifest carries
 /// every blob (`FlatEntry::blob`) but its directories are `FlatDir` **paths**, not tree
-/// hashes, so it structurally cannot supply the flush's tree list. Using it for the
+/// hashes, so it structurally cannot supply the inventory's tree list. Using it for the
 /// blobs and walking for the trees would be two traversals of one tree to answer one
 /// question.
 ///
 /// One consequence of the walk, stated because it is a real change: the *reused* blobs
-/// — the ones the baseline vouched for and neither tier wrote — are now offered to cold
-/// as well, where the old cold leg skipped them. That is deliberate and it is the
-/// finding this ordering exists for (see `settle::FlushSet`): warm outlives cold, so
-/// "the parent was durable once" is not "cold holds it now", and the cost of being sure
-/// is one `head` per reused blob.
+/// — the ones the baseline vouched for and neither tier wrote — are in the inventory
+/// too. That is deliberate (see `settle::FlushSet`): warm outlives cold, so "the parent
+/// was durable once" is not "the durable index holds it now", and the cost of being
+/// sure is one index row lookup per reused blob.
 ///
 /// The [`StatCache`] is *built here* from the manifest rather than passed in, so the one
 /// genuinely large value on this path (a `BTreeMap` entry per file in the parent
@@ -4042,22 +3779,19 @@ impl Cas for DrainCas {
 /// has the same internal `buffer_unordered` shape but over **owned** jobs, so its future
 /// is provably `Send` and awaits inline. Which is also the evidence that the fix for the
 /// fold belongs in `settle.rs`: the adapter next door already does it the working way.
-#[allow(clippy::too_many_arguments)]
-async fn reingest_warm_then_flush(
+async fn reingest_warm(
     warm: Arc<S3Storage>,
-    cold: Arc<S3Storage>,
     reads: ReadThrough,
     path: String,
     manifest: FlatManifest,
     captured_at_ms: i64,
     handle: ExportHandle,
-    tier: DurabilityTier,
 ) -> Result<
     (
         Snapshot,
         scarab_storage::statcache::DrainTally,
         usize,
-        FlushTally,
+        settle::FlushSet,
     ),
     WsError,
 > {
@@ -4072,170 +3806,26 @@ async fn reingest_warm_then_flush(
             detail: format!("the warm re-ingest of the export failed: {e}"),
         })?;
 
-    let flush = flush_set_of(&reads, &snapshot.root)
+    // The reachability walk doubles as proof the published tree is readable;
+    // its inventory is what the caller's pack leg owes the durable tier
+    // (ADR-0067 part 4).
+    let inventory = reachable_set_of(&reads, &snapshot.root)
         .await
         .map_err(|e| WsError::Drain {
             handle: handle.clone(),
             detail: format!(
                 "the re-ingest published {} to the warm tier but its tree could not be walked to \
-                 work out what the cold flush owes: {e}",
+                 work out what the pack leg owes: {e}",
                 snapshot.root.0
             ),
         })?;
-    // The walk above runs under EVERY tier — it is also what proves the
-    // published tree is readable — but under warm-only durability there is
-    // nothing to offer it to (ADR-0064 part 4), and the tally says so.
-    let flushed = match tier {
-        DurabilityTier::WarmOnly => FlushTally::warm_only(&flush),
-        _ => flush_to_cold(&reads, &cold, &flush, &handle)
-            .await
-            .map_err(|e| WsError::Drain {
-                handle: handle.clone(),
-                detail: e.to_string(),
-            })?,
-    };
 
-    Ok((snapshot, tally, baseline_paths, flushed))
+    Ok((snapshot, tally, baseline_paths, inventory))
 }
 
-/// How many archival offers the flush keeps in flight — **read off the cold handle it
-/// is about to use.**
-///
-/// A cold leg is round-trip-bound, so what matters is having enough requests outstanding
-/// to hide the latency (ADR-0061 s2). The number is not re-picked here for a third time:
-/// it is `S3Storage`'s own in-flight limit for this very store, which means the operator
-/// knob that sets it (`SCARAB_CAS_CONCURRENCY` → `Config::cas_concurrency` →
-/// `S3Storage::with_concurrency`, ADR-0048) reaches the flush without a second piece of
-/// plumbing to forget. A store built without the knob reports
-/// [`scarab_storage_s3::DEFAULT_CAS_CONCURRENCY`], so the fallback is the same default a
-/// constant would have named.
-///
-/// A function rather than a `const` for exactly that reason: a `const` cannot be
-/// configured, and the previous one silently ignored the knob.
-fn flush_concurrency(cold: &S3Storage) -> usize {
-    cold.concurrency()
-}
-
-/// What one completed archival flush cost — and the fact
-/// [`SettledExportDto::durable`] reports.
-#[derive(Debug, Clone, Copy)]
-struct FlushTally {
-    /// **The flush completed.** `true` from [`flush_to_cold`], which has no partial
-    /// success: ADR-0064 is explicit that a partial flush must not report success, so
-    /// every other outcome there is an `Err` and produces no tally at all. The one
-    /// `false` producer is [`FlushTally::warm_only`] — the second outcome this field's
-    /// old doc promised git-bug `981fc6b` would bring: no flush ran because no
-    /// independent cold tier exists to run it against, which is a disclosure and not a
-    /// failure. The field exists so the DTO's promise is *read off the archival phase*
-    /// rather than restated as a literal at the call site.
-    durable: bool,
-    /// Blobs in the inventory — every address the snapshot reaches, each one either
-    /// probed present in cold or read and uploaded. Not "read": the probe pass
-    /// answers for most of them with one `head` and no warm read at all (git-bug
-    /// `38b945e`).
-    blobs: u64,
-    /// Of those, the blobs the probe found cold MISSING — the only ones the flush
-    /// read out of warm and offered with bytes. `blobs - blobs_uploaded` cost one
-    /// `head` each and nothing more, which is what makes a retried flush cheap and
-    /// idempotent: re-offering an already-archived snapshot uploads zero.
-    blobs_uploaded: u64,
-    /// Trees offered to cold, across every level.
-    trees: u64,
-    elapsed_ms: u64,
-}
-
-impl FlushTally {
-    /// The warm-only synthesis (ADR-0064 part 4): **no flush ran**, because this
-    /// deployment has no independent cold tier to run one against, and a "flush"
-    /// onto the warm volume's own device would be waste plus false comfort.
-    ///
-    /// The inventory counts are still real — the walk that produced `flush` ran,
-    /// so a torn warm tier fails *before* this is built — but `blobs_uploaded`
-    /// is `0` by construction: nothing was offered anywhere.
-    fn warm_only(flush: &settle::FlushSet) -> Self {
-        Self {
-            durable: false,
-            blobs: flush.blobs.len() as u64,
-            blobs_uploaded: 0,
-            trees: flush.tree_count() as u64,
-            elapsed_ms: 0,
-        }
-    }
-}
-
-/// Why an archival flush did not complete.
-///
-/// Every variant names the tier, the operation and the address, because this is the
-/// error an operator meets when a Step exited 0 and its Attempt failed anyway. ADR-0064:
-/// *"a flush that fails fails the Attempt … so it is a retryable failure that must name
-/// the cause rather than surfacing a mystery I/O error."* A bare
-/// [`StorageError`] would satisfy neither half — it says `NotFound` without saying
-/// *which tier* was asked or *what for*.
-#[derive(Debug, thiserror::Error)]
-enum FlushError {
-    #[error(
-        "the archival flush could not ask the COLD tier whether it already holds blob {hash}, so \
-         nothing was read out of warm and the snapshot is not archived. A probe that cannot be \
-         answered must fail the flush: read as \"present\" it would silently skip an upload and \
-         report a durability cold cannot back, read as \"missing\" it would bury a broken cold \
-         tier under a misleading read-and-upload failure: {source}"
-    )]
-    ColdBlobProbe {
-        hash: String,
-        #[source]
-        source: StorageError,
-    },
-    #[error(
-        "the archival flush could not read blob {hash} back off the WARM tier to send it to cold, \
-         so the snapshot is not archived: {source}"
-    )]
-    WarmBlob {
-        hash: String,
-        #[source]
-        source: StorageError,
-    },
-    #[error(
-        "the archival flush could not write blob {hash} to the COLD tier, so the snapshot is not \
-         archived and this Attempt must not be reported Succeeded: {source}"
-    )]
-    ColdBlob {
-        hash: String,
-        #[source]
-        source: StorageError,
-    },
-    #[error(
-        "the archival flush could not read tree {hash} back off the WARM tier to send it to cold, \
-         so the snapshot is not archived: {source}"
-    )]
-    WarmTree {
-        hash: String,
-        #[source]
-        source: StorageError,
-    },
-    #[error(
-        "the archival flush could not write tree {hash} to the COLD tier, so the snapshot is not \
-         archived and this Attempt must not be reported Succeeded: {source}"
-    )]
-    ColdTree {
-        hash: String,
-        #[source]
-        source: StorageError,
-    },
-    #[error(
-        "the archival flush offered {kind} {offered} to the cold tier and cold filed it under \
-         {stored} instead. The two tiers do not agree on how content is addressed, so archiving \
-         this snapshot would file it at an address nothing will look it up by — refusing rather \
-         than reporting a durability that is not reachable"
-    )]
-    Mismatch {
-        kind: &'static str,
-        offered: String,
-        stored: String,
-    },
-}
-
-/// Everything reachable from `root`, as a flush inventory — for the drain that does not
-/// fold and therefore has no incremental answer.
+/// Everything reachable from `root`, as a pack-leg inventory
+/// ([`settle::FlushSet`]) — for the drain that does not fold and therefore
+/// has no incremental answer.
 ///
 /// Breadth-first by level so the levels can simply be reversed into
 /// [`settle::FlushSet`]'s deepest-first order; one `tree_entries` per directory and no
@@ -4261,7 +3851,7 @@ enum FlushError {
 /// deepest-first walk offers `T` before `C` — a cold tree naming an absent child, which
 /// is the one thing this ordering exists to prevent. So the same address may be offered
 /// at several levels, and the cost of that is a `head`.
-async fn flush_set_of(
+async fn reachable_set_of(
     reads: &ReadThrough,
     root: &TreeHash,
 ) -> Result<settle::FlushSet, StorageError> {
@@ -4289,216 +3879,6 @@ async fn flush_set_of(
         blobs,
         tree_levels: levels.into_iter().rev().collect(),
     })
-}
-
-/// **The archival flush** (ADR-0064 part 1): offer one drain's whole output to the cold
-/// tier, in one batched phase, and answer only when all of it is there.
-///
-/// This is the leg that licenses `Succeeded`. It replaced a cold round trip interleaved
-/// into every `put_blob` of the drain — that ordering got the invariant for free and
-/// paid ADR-0061's measured 4–6 ms per file for it; this gets the same invariant by
-/// being `await`ed before the settle answers.
-///
-/// # Blobs, then trees deepest-first
-///
-/// A tree names its children's hashes. So cold must never hold a **reachable tree whose
-/// children are absent** — a later reader cannot tell that state from corruption, and
-/// the CAS GC's mark walk would follow it. Hence two ordered phases, and within the
-/// tree phase one level at a time: the trees inside one level name none of each other,
-/// so they go up together, while a level only starts once the level below it is
-/// archived. It is exactly the grouping `S3Storage::ingest`'s phase 3 makes, for exactly
-/// the same reason.
-///
-/// The ordering is what makes a *failed* flush safe as well as a successful one. Cold
-/// after a failure holds some prefix of the blobs and no tree that names a missing one,
-/// which is a consistent (if incomplete) store rather than a corrupt one.
-///
-/// # There is no partial success, and no cursor
-///
-/// Total success or `Err` — ADR-0064: *"a partial flush must not report success"*.
-/// Nothing records how far a flush got, deliberately: a retry re-offers the whole batch,
-/// and because the CAS is content-addressed and cold's `put_if_absent` turns a re-offer
-/// into a `head`, re-offering is nearly free and always correct. A persisted cursor
-/// would be a second source of truth about durability that could be wrong, in exchange
-/// for saving `head`s.
-///
-/// # It reads rather than being handed bytes — and it reads through the tiering
-///
-/// Warm is local, and warm is where the content *is*: the drain either just wrote a blob
-/// there or reused one that was already there. Threading bytes through from the drain
-/// instead would mean holding a whole change set's content in memory across the fold —
-/// and it could not cover the reused blobs at all, since nothing read them.
-///
-/// The reads go through [`ReadThrough`] rather than the warm leg for the same reason the
-/// fold's do ([`DrainCas`]): a reused blob that warm never received — `TieredCas`
-/// swallows a warm write failure by design — or a recreated warm PVC would otherwise
-/// fail the flush on content cold already holds, or holds and could re-seed warm with.
-/// Cold is the concrete handle, because the tuning knob and the existence probe live on
-/// the type and not on the port.
-///
-/// # Cold is asked first, and only the misses are read (git-bug `38b945e`)
-///
-/// The blob inventory is probed against cold — [`S3Storage::has_blob`], one `head` per
-/// address, at the same bounded concurrency as everything else — **before anything is
-/// read out of warm**, and only the misses are then read and offered with bytes. The
-/// shape this replaced read every blob out of warm and hashed it twice (once for
-/// `Cas::get_blob`'s integrity check, once in cold's `store_addressed`) just to have
-/// cold's `put_if_absent` answer "already have it": on a 50k-file workspace that is 50k
-/// full reads and 50k SHA-256s per Step boundary — the per-file cost ADR-0061 measured
-/// at 81–88% of a drain leg, reintroduced on the archival leg.
-///
-/// A probe **failure fails the flush**, never a verdict. Read as "present" it would
-/// silently skip an upload and report a durability cold cannot back — the silent-skip
-/// shape this repo has been bitten by, and the reason the probe is a concrete method on
-/// `S3Storage` rather than a defaulted [`Cas`] trait method. Read as "missing" it would
-/// fall back to the read-and-offer path and bury a broken cold tier under a misleading
-/// warm-read or cold-write error.
-///
-/// **Trees are deliberately not probed.** A tree object is one small JSON document per
-/// directory whose warm read is local and cheap, and skipping the re-offer of a present
-/// tree would lose the [`FlushError::Mismatch`] tripwire, which only fires when the
-/// tree is re-canonicalised on its way into cold; `put_if_absent` already turns the
-/// re-offer into the same single `head` a probe would cost.
-async fn flush_to_cold(
-    reads: &ReadThrough,
-    cold: &S3Storage,
-    flush: &settle::FlushSet,
-    // What this flush is *for*, for the completion log line: an [`ExportHandle`]
-    // on the settle path, a snapshot root on the `POST /v1/cas/flush` RPC.
-    // `impl Display` rather than the handle type because the RPC has no Export.
-    subject: &(impl std::fmt::Display + Sync),
-) -> Result<FlushTally, FlushError> {
-    use futures::StreamExt;
-
-    let started = Instant::now();
-    let concurrency = flush_concurrency(cold);
-
-    // --- Phase 0: probe cold for the blobs it is missing. ---------------------
-    // Nothing is read out of warm until this pass has answered for the whole
-    // inventory, and a probe that errors fails the flush here — see the doc
-    // above for why neither "present" nor "missing" may stand in for an answer.
-    let missing: Vec<BlobHash> = {
-        // OWNED hashes for the same `buffer_unordered` lifetime reason as the
-        // phases below; unlike them the async block returns its hash, so
-        // ownership simply moves through.
-        let mut stream = futures::stream::iter(flush.blobs.iter().cloned())
-            .map(|hash| async move {
-                let present = cold.has_blob(&hash).await.map_err(|source| {
-                    FlushError::ColdBlobProbe {
-                        hash: hash.0.clone(),
-                        source,
-                    }
-                })?;
-                Ok::<_, FlushError>((hash, present))
-            })
-            .buffer_unordered(concurrency);
-        let mut misses = Vec::new();
-        while let Some(result) = stream.next().await {
-            let (hash, present) = result?;
-            if !present {
-                misses.push(hash);
-            }
-        }
-        misses
-    };
-    let blobs_uploaded = missing.len() as u64;
-
-    // --- Phase 1: the missing blobs, read out of warm and offered with bytes. -
-    {
-        // The stream yields OWNED hashes, not references. A closure returning an
-        // `async move` block that borrows its argument is not general enough over
-        // lifetimes for `buffer_unordered`, and the resulting error surfaces at the
-        // `route(..)` call site rather than here — so keep the ownership.
-        let mut stream = futures::stream::iter(missing.into_iter())
-            .map(|hash| async move {
-                let hash = &hash;
-                let bytes = reads.get_blob(hash).await.map_err(|source| {
-                    FlushError::WarmBlob {
-                        hash: hash.0.clone(),
-                        source,
-                    }
-                })?;
-                let stored = cold.put_blob(&bytes).await.map_err(|source| {
-                    FlushError::ColdBlob {
-                        hash: hash.0.clone(),
-                        source,
-                    }
-                })?;
-                if &stored != hash {
-                    return Err(FlushError::Mismatch {
-                        kind: "blob",
-                        offered: hash.0.clone(),
-                        stored: stored.0,
-                    });
-                }
-                Ok::<_, FlushError>(())
-            })
-            .buffer_unordered(concurrency);
-        while let Some(result) = stream.next().await {
-            result?;
-        }
-    }
-
-    // --- Phase 2: trees, deepest level first. --------------------------------
-    for level in &flush.tree_levels {
-        // Owned hashes, for the same lifetime reason as phase 1.
-        let mut stream = futures::stream::iter(level.iter().cloned())
-            .map(|hash| async move {
-                let hash = &hash;
-                // `tree_entries` + `put_tree` rather than the raw bytes, because a
-                // `Cas` is the port both tiers share here. The canonical form lives in
-                // `scarab-storage` and both tiers are this one binary, so the
-                // round-trip cannot change the address — and the check below is what
-                // says so rather than assumes it.
-                let entries = reads.tree_entries(hash).await.map_err(|source| {
-                    FlushError::WarmTree {
-                        hash: hash.0.clone(),
-                        source,
-                    }
-                })?;
-                let stored = cold.put_tree(entries).await.map_err(|source| {
-                    FlushError::ColdTree {
-                        hash: hash.0.clone(),
-                        source,
-                    }
-                })?;
-                if &stored != hash {
-                    return Err(FlushError::Mismatch {
-                        kind: "tree",
-                        offered: hash.0.clone(),
-                        stored: stored.0,
-                    });
-                }
-                Ok::<_, FlushError>(())
-            })
-            .buffer_unordered(concurrency);
-        while let Some(result) = stream.next().await {
-            result?;
-        }
-    }
-
-    let tally = FlushTally {
-        // Reached only when every offer above succeeded, which is the whole of what
-        // this flag means.
-        durable: true,
-        blobs: flush.blobs.len() as u64,
-        blobs_uploaded,
-        trees: flush.tree_count() as u64,
-        elapsed_ms: started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-    };
-    tracing::info!(
-        flush = "archival",
-        subject = %subject,
-        flush_blobs = tally.blobs,
-        flush_blobs_uploaded = tally.blobs_uploaded,
-        flush_trees = tally.trees,
-        levels = flush.tree_levels.len(),
-        concurrency,
-        total_ms = tally.elapsed_ms,
-        "archival flush complete — every blob and every tree this drain published is in the cold \
-         tier, so the Attempt may be reported Succeeded (ADR-0064 part 1)"
-    );
-    Ok(tally)
 }
 
 /// An Export handle as it may appear in a URL: exactly 64 lowercase hex chars.
@@ -4542,17 +3922,6 @@ async fn readyz(State(state): State<WorkspaceState>) -> Response {
         )
             .into_response();
     }
-    // Under warm-only durability there is no cold tier to probe (ADR-0064
-    // part 4): the "cold" directory is the warm volume's own device, so its
-    // reachability proves nothing the write probe above did not, and a readiness
-    // that could fail on it would gate the Depot on a tier the deployment has
-    // disclaimed. The payload says so, so an operator curling /readyz learns the
-    // deployment shape rather than reading a bare "ready" as the full promise.
-    if matches!(state.tier, DurabilityTier::WarmOnly) {
-        return "ready (warm-only durability: the cold probe is skipped — cold shares the warm \
-                volume's device, ADR-0064 part 4)"
-            .into_response();
-    }
     // NotFound = reachable; only a backend error means unready. Same convention
     // as the control plane's object-store probe.
     if let Err(StorageError::Backend(e)) = state.cold.get("readyz/probe").await {
@@ -4563,40 +3932,6 @@ async fn readyz(State(state): State<WorkspaceState>) -> Response {
             .into_response();
     }
     "ready".into_response()
-}
-
-/// `GET /v1/tier` — the deployment's [`DurabilityTier`], as one word.
-///
-/// Consulted by the control-plane GC to decide whether torn-cold detection is
-/// meaningful (there is no torn cold where there is no cold); also an operator
-/// probe. Gated exactly like the flush route — `Scope::Browse` — because the
-/// two travel together: the caller that acts on the tier is the caller that
-/// drives flushes, and a fenced Step has no business learning deployment
-/// topology.
-async fn get_tier(
-    State(state): State<WorkspaceState>,
-    headers: HeaderMap,
-) -> Result<Json<TierResponse>, WsError> {
-    let claims = authenticate(&state, &headers)?;
-    if !matches!(claims.scope, Scope::Browse) {
-        tracing::warn!(
-            run = %claims.fence.run,
-            step = %claims.fence.step,
-            attempt = %claims.fence.attempt,
-            "workspace service: 403 — a read-scoped token asked for the durability tier"
-        );
-        return Err(WsError::ScopeForbidden(
-            "the durability tier requires a browse-scoped token",
-        ));
-    }
-    Ok(Json(TierResponse {
-        tier: state.tier.as_str(),
-    }))
-}
-
-#[derive(Serialize)]
-struct TierResponse {
-    tier: &'static str,
 }
 
 /// `GET /metrics` — Prometheus text exposition.
@@ -4878,27 +4213,24 @@ mod tests {
         );
     }
 
-    /// ADR-0064 on the *upload* path: a PUT writes **warm only**, and the flush
-    /// RPC is what archives it.
-    ///
-    /// This test replaces `a_put_of_content_warm_already_holds_still_writes_cold`,
-    /// whose premise inverted: the PUT used to be the durability leg
-    /// (cold-first through `TieredObjectStore::put`), so warm-has + cold-lacks had
-    /// to be repaired inline. The cold write now belongs to exactly one place —
-    /// the archival flush — and a PUT that still wrote cold would silently put
-    /// the per-object round trip ADR-0061 measured right back on the hot path.
+    /// The *upload* path: a PUT writes **warm only** — no loose cold object,
+    /// ever. Durable bytes reach the bucket as the fence's PACKS (ADR-0067
+    /// part 4), whose completion and index transaction belong to the drain
+    /// record; a PUT that wrote a loose cold object would silently put the
+    /// per-object round trip ADR-0061 measured (81–88% of a Step boundary)
+    /// right back on the hot path.
     ///
     /// Mutation killed: revert either PUT handler to the tiered (cold-first)
-    /// store and the "NOTHING in cold after the PUTs" assertions fail; delete the
-    /// flush leg and the "cold holds both after the flush" assertions fail.
+    /// store and the "NOTHING loose in cold after the PUTs" assertions fail.
     #[tokio::test]
-    async fn a_put_writes_warm_only_and_the_flush_rpc_is_what_archives_it() {
+    async fn a_put_writes_warm_only_and_never_a_loose_cold_object() {
         use scarab_storage::ObjectStore;
 
         let Some(h) = ExportHarness::start().await else { return };
 
         // A NEW blob and a NEW tree naming it, canonicalised exactly as the
-        // client's linked `scarab_storage` would.
+        // client's linked `scarab_storage` would — PUT under a FENCED token,
+        // durable by default, so the pack leg runs too.
         let blob = b"fresh content the depot has never seen".to_vec();
         let blob_hash = hash_hex(&blob);
         let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
@@ -4907,29 +4239,36 @@ mod tests {
         )])
         .expect("canonical tree");
 
+        let step = h.step_token("run-p", "put", "a1");
         let (status, body) = h
-            .put_raw(&format!("/v1/cas/blobs/{blob_hash}"), blob.clone())
+            .put_raw_as(&step, &format!("/v1/cas/blobs/{blob_hash}"), blob.clone())
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let (status, body) = h
-            .put_raw(&format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes.clone())
+            .put_raw_as(
+                &step,
+                &format!("/v1/cas/trees/{}", tree_hash.0),
+                tree_bytes.clone(),
+            )
             .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
 
-        // NOTHING reached cold: the PUT is a warm seed, not the durability leg.
+        // NOTHING landed loose in cold: the PUT is a warm seed plus a pack
+        // append, and an unfinished pack is invisible until the drain record
+        // seals and commits it.
         assert!(
             matches!(
                 h.cold.get(&format!("blobs/{blob_hash}")).await,
                 Err(StorageError::NotFound)
             ),
-            "a PUT blob must not write cold — the flush is the only cold writer (ADR-0064)"
+            "a PUT blob must not write a loose cold object (ADR-0067 part 4)"
         );
         assert!(
             matches!(
                 h.cold.get(&format!("trees/{}", tree_hash.0)).await,
                 Err(StorageError::NotFound)
             ),
-            "a PUT tree must not write cold either"
+            "a PUT tree must not write a loose cold object either"
         );
         // …and both are readable from warm, verbatim.
         assert_eq!(
@@ -4948,405 +4287,8 @@ mod tests {
                 .expect("the tree is in warm"),
             tree_bytes
         );
-
-        // The flush RPC is the cold writer, and its tally is the wire's.
-        let flushed = h
-            .json(
-                "POST",
-                "/v1/cas/flush",
-                Some(serde_json::json!({ "root": tree_hash.0 })),
-            )
-            .await;
-        assert_eq!(
-            flushed,
-            serde_json::json!({
-                "durable": true,
-                "tier": "separate-volume",
-                "blobs": 1,
-                "blobs_uploaded": 1,
-                "trees": 1
-            }),
-            "one new blob probed missing and uploaded, one tree offered — and the tier the \
-             deployment was built with rides on every 200 (ADR-0064 part 5)"
-        );
-        assert_eq!(
-            h.cold
-                .get(&format!("blobs/{blob_hash}"))
-                .await
-                .expect("the flush archived the blob"),
-            blob
-        );
-        assert!(
-            h.cold.tree_entries(&tree_hash).await.is_ok(),
-            "and the tree — this pair of assertions is what the caller's `Succeeded` now rests on"
-        );
     }
 
-    /// The flush route's scope gate: a fenced Step's `Read` token must not be
-    /// able to command cold round trips for arbitrary roots.
-    ///
-    /// Mutation killed: drop the `Scope::Browse` check in `flush_cas` and this
-    /// request — a *valid* token over a *real* root — answers `200` instead of
-    /// `403`, because everything past the gate would succeed.
-    #[tokio::test]
-    async fn a_read_scoped_token_cannot_trigger_the_archival_flush() {
-        use tower::ServiceExt;
-
-        let Some(h) = ExportHarness::start().await else { return };
-        let step_token = workspace_token::mint(
-            b"export-secret",
-            &workspace_token::step_claims(
-                Fence {
-                    run: "r".into(),
-                    step: "s".into(),
-                    attempt: "a".into(),
-                },
-                i64::MAX / 2,
-                vec![h.parent.root.0.clone()],
-            ),
-        );
-        let request = axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/cas/flush")
-            .header(WORKSPACE_TOKEN_HEADER, &step_token)
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({ "root": h.parent.root.0 }))
-                    .expect("serialize"),
-            ))
-            .expect("request");
-        let response = build_router(h.state.clone())
-            .oneshot(request)
-            .await
-            .expect("response");
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "a read-scoped token asking for a flush is a 403 — even for a root it may read"
-        );
-    }
-
-    /// The flush route's two refusal classes, told apart by the one field a
-    /// caller acts on.
-    ///
-    /// Mutations killed: map `Mismatch` retryable (the control plane would
-    /// re-drive a canonicalisation fork forever) — the `422`/`retryable: false`
-    /// pair fails; map a walk miss fatal (a wiped warm tier would permanently
-    /// fail an Attempt whose re-driven drain would have healed it) — the
-    /// `503`/`retryable: true` pair fails.
-    #[tokio::test]
-    async fn the_flush_route_tells_fatal_from_retryable() {
-        use scarab_storage::ObjectStore;
-
-        let Some(h) = ExportHarness::start().await else { return };
-
-        // A root neither tier holds: the walk fails, and that is RETRYABLE — the
-        // caller's re-driven drain re-uploads via `/have` + PUTs before retrying.
-        let absent = "22".repeat(32);
-        let (status, body) = h
-            .call(
-                "POST",
-                "/v1/cas/flush",
-                Some(serde_json::json!({ "root": absent })),
-            )
-            .await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        let refusal: serde_json::Value = serde_json::from_str(&body).expect("a JSON refusal");
-        assert_eq!(
-            refusal["retryable"],
-            serde_json::json!(true),
-            "an unwalkable root is a state the retry loop itself repairs: {body}"
-        );
-
-        // A tree mis-filed in warm under an address it does not hash to: cold
-        // re-files it under the real address, `Mismatch` — the ONLY fatal class.
-        let bytes = h
-            .state
-            .warm
-            .get(&format!("trees/{}", h.parent.root.0))
-            .await
-            .expect("the parent's tree object is in warm");
-        let wrong = "11".repeat(32);
-        h.state
-            .warm
-            .put(&format!("trees/{wrong}"), bytes)
-            .await
-            .expect("mis-file a tree, as the old backfill tripwire feared");
-        let (status, body) = h
-            .call(
-                "POST",
-                "/v1/cas/flush",
-                Some(serde_json::json!({ "root": wrong })),
-            )
-            .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-        let refusal: serde_json::Value = serde_json::from_str(&body).expect("a JSON refusal");
-        assert_eq!(
-            refusal["retryable"],
-            serde_json::json!(false),
-            "an addressing disagreement cannot be retried into agreement: {body}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // ADR-0064 parts 3–5 — the durability tier (git-bug `981fc6b`)
-    // -----------------------------------------------------------------------
-
-    /// The probe's S3 arm: object storage is an independent backing by
-    /// construction, and no filesystem is stat-ed to say so.
-    ///
-    /// Mutation killed: fold the S3 arm into the `LocalDir` comparison (or
-    /// invert it) and an S3 deployment would probe against directories that
-    /// mean nothing, or answer something other than `Object`.
-    #[test]
-    fn an_s3_cold_store_probes_to_the_object_tier() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let tier = durability_tier(
-            &tmp.path().join("warm"),
-            &StoreConfig::S3(crate::config::S3Config {
-                bucket: "scarab".into(),
-                endpoint: "http://127.0.0.1:9000".into(),
-                region: "us-east-1".into(),
-                access_key: "k".into(),
-                secret_key: "s".into(),
-            }),
-        )
-        .expect("probe");
-        assert_eq!(tier, DurabilityTier::Object);
-    }
-
-    /// The probe's same-device arm — constructible everywhere, because two
-    /// directories under one tempdir share a device by construction. Neither
-    /// directory exists beforehand: the probe must create both, or a first
-    /// boot's verdict would depend on startup order.
-    ///
-    /// Mutation killed: invert (or drop) the `dev()` comparison and this
-    /// answers `SeparateVolume` — a same-device cold dir would then be flushed
-    /// to and reported durable, the exact false comfort ADR-0064 part 4 exists
-    /// to end.
-    #[test]
-    fn two_directories_on_one_device_probe_to_warm_only() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let warm = tmp.path().join("warm");
-        let cold = tmp.path().join("cold");
-        let tier = durability_tier(
-            &warm,
-            &StoreConfig::LocalDir(cold.to_string_lossy().into_owned()),
-        )
-        .expect("probe");
-        assert_eq!(tier, DurabilityTier::WarmOnly);
-        assert!(
-            warm.is_dir() && cold.is_dir(),
-            "the probe must create both directories rather than erroring on a first boot"
-        );
-    }
-
-    /// The cross-device arm, env-gated: `SCARAB_TEST_ALT_DEV` must name a
-    /// directory on a DIFFERENT device than the system tempdir (on darwin e.g.
-    /// a mounted volume; on Linux a tmpfs like /dev/shm when /tmp is not one).
-    ///
-    /// **Opted in, this test is not allowed to pass silently** (the live-tier
-    /// lesson: a fixture that `return`s on a bad precondition goes green while
-    /// executing nothing). A same-device `SCARAB_TEST_ALT_DEV` is therefore a
-    /// loud failure, not a skip — the operator asked for the cross-device arm
-    /// and did not get it.
-    #[test]
-    fn a_cold_dir_on_another_device_probes_to_separate_volume() {
-        let Ok(alt) = std::env::var("SCARAB_TEST_ALT_DEV") else {
-            return; // not opted in — the one legitimate skip
-        };
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let warm = tmp.path().join("warm");
-        let cold = std::path::Path::new(&alt).join("scarab-alt-dev-probe");
-        let tier = durability_tier(
-            &warm,
-            &StoreConfig::LocalDir(cold.to_string_lossy().into_owned()),
-        )
-        .expect("probe");
-        let _ = std::fs::remove_dir(&cold);
-        assert_eq!(
-            tier,
-            DurabilityTier::SeparateVolume,
-            "SCARAB_TEST_ALT_DEV={alt} must name a directory on a DIFFERENT device than the \
-             tempdir — if this failed, the opt-in precondition is broken and the cross-device \
-             arm was NOT exercised; fix the env var rather than ignoring this"
-        );
-    }
-
-    /// Under warm-only durability a flush is a **200 disclosure, never a 503**
-    /// — and it writes nothing to cold, because a same-device "archive" is
-    /// waste plus false comfort.
-    ///
-    /// Mutations killed: drop the `WarmOnly` branch in `flush_cas` and the
-    /// response says `durable: true` while cold gains content; turn the
-    /// disclosure into a refusal and the status assertion fails (nothing about
-    /// warm-only is repaired by the retry a 503 commands); drop the
-    /// `flush_set_of` walk from the warm-only path and the absent-root leg
-    /// below answers 200 — a wiped warm tier must still 503, because THAT one
-    /// the caller's re-driven drain does repair.
-    #[tokio::test]
-    async fn under_warm_only_a_flush_is_a_200_disclosure_and_cold_is_not_written() {
-        use scarab_storage::ObjectStore;
-
-        let Some(h) = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await else { return };
-
-        let blob = b"warm-only content".to_vec();
-        let blob_hash = hash_hex(&blob);
-        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
-            "only.txt",
-            TreeTarget::Blob(BlobHash(blob_hash.clone())),
-        )])
-        .expect("canonical tree");
-        let (status, body) = h
-            .put_raw(&format!("/v1/cas/blobs/{blob_hash}"), blob)
-            .await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-        let (status, body) = h
-            .put_raw(&format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
-            .await;
-        assert_eq!(status, StatusCode::CREATED, "{body}");
-
-        let flushed = h
-            .json(
-                "POST",
-                "/v1/cas/flush",
-                Some(serde_json::json!({ "root": tree_hash.0 })),
-            )
-            .await;
-        assert_eq!(
-            flushed,
-            serde_json::json!({
-                "durable": false,
-                "tier": "warm-only",
-                "blobs": 1,
-                "blobs_uploaded": 0,
-                "trees": 1
-            }),
-            "the walk ran (real inventory counts), nothing was uploaded, and the pair \
-             `durable: false` + `tier: \"warm-only\"` is the disclosure the client keys on"
-        );
-        assert!(
-            matches!(
-                h.cold.get(&format!("blobs/{blob_hash}")).await,
-                Err(StorageError::NotFound)
-            ),
-            "cold must NOT be written under warm-only — a same-device archive is false comfort"
-        );
-
-        // The retryable class is untouched: a root warm cannot walk still 503s,
-        // because a wiped warm tier IS repaired by the caller's re-driven drain.
-        let absent = "33".repeat(32);
-        let (status, body) = h
-            .call(
-                "POST",
-                "/v1/cas/flush",
-                Some(serde_json::json!({ "root": absent })),
-            )
-            .await;
-        assert_eq!(
-            status,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "warm-only must not swallow a wiped warm tier into its 200: {body}"
-        );
-    }
-
-    /// Under warm-only durability a settle publishes to warm, skips the flush
-    /// phase, and answers `durable: false, tier: "warm-only"` — the smaller,
-    /// true promise, on the record.
-    ///
-    /// Mutations killed: hardcode `durable: true` in the DTO (or drop the tier
-    /// match in the re-ingest path) and the `durable`/`tier` assertions fail
-    /// while cold gains the snapshot; skip the warm publish along with the
-    /// flush and the warm materialize below has nothing to read.
-    #[tokio::test]
-    async fn under_warm_only_a_settle_publishes_warm_and_discloses_no_archive() {
-        let Some(h) = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await else { return };
-        let (handle, _capability, workspace) = h.prepare().await;
-        std::fs::write(workspace.join("keep.txt"), b"the step rewrote this").expect("rewrite");
-
-        let settled = h
-            .json(
-                "POST",
-                &format!("/v1/exports/{handle}/settle"),
-                Some(serde_json::json!({})),
-            )
-            .await;
-        assert_eq!(settled["durable"], false, "{settled}");
-        assert_eq!(settled["tier"], "warm-only", "{settled}");
-        let root = TreeHash(settled["root"].as_str().expect("root").to_string());
-
-        // Warm alone serves the snapshot — it is the licensed tier here…
-        let out = h.tmp.path().join("from-warm");
-        h.state
-            .warm
-            .materialize(&root, out.to_str().expect("utf-8"))
-            .await
-            .expect("under warm-only the warm tier IS the record's backing");
-        assert_eq!(
-            std::fs::read(out.join("keep.txt")).expect("read"),
-            b"the step rewrote this"
-        );
-        // …and cold was never written.
-        assert!(
-            matches!(
-                h.cold.tree_entries(&root).await,
-                Err(StorageError::NotFound)
-            ),
-            "the settle's flush phase must be SKIPPED under warm-only, not aimed at the same \
-             device and reported as an archive"
-        );
-    }
-
-    /// `GET /v1/tier` answers the state's tier and is gated like the flush.
-    ///
-    /// Mutations killed: hardcode the tier string in `get_tier` and the two
-    /// harnesses below stop disagreeing; drop the `Scope::Browse` check and the
-    /// read-scoped leg answers 200 — the same gate mutation the flush test
-    /// pins, matched here because the route doc claims parity.
-    #[tokio::test]
-    async fn the_tier_route_answers_the_states_tier_and_only_to_browse_scope() {
-        use tower::ServiceExt;
-
-        let Some(h) = ExportHarness::start().await else { return };
-        assert_eq!(
-            h.json("GET", "/v1/tier", None).await,
-            serde_json::json!({ "tier": "separate-volume" })
-        );
-        let Some(hw) = ExportHarness::start_with_tier(DurabilityTier::WarmOnly).await else { return };
-        assert_eq!(
-            hw.json("GET", "/v1/tier", None).await,
-            serde_json::json!({ "tier": "warm-only" })
-        );
-
-        // A fenced Step's read-scoped token is refused, exactly as on the flush.
-        let step_token = workspace_token::mint(
-            b"export-secret",
-            &workspace_token::step_claims(
-                Fence {
-                    run: "r".into(),
-                    step: "s".into(),
-                    attempt: "a".into(),
-                },
-                i64::MAX / 2,
-                vec![h.parent.root.0.clone()],
-            ),
-        );
-        let request = axum::http::Request::builder()
-            .method("GET")
-            .uri("/v1/tier")
-            .header(WORKSPACE_TOKEN_HEADER, &step_token)
-            .body(Body::empty())
-            .expect("request");
-        let response = build_router(h.state.clone())
-            .oneshot(request)
-            .await
-            .expect("response");
-        assert_eq!(
-            response.status(),
-            StatusCode::FORBIDDEN,
-            "deployment topology is the control plane's to read, not a fenced Step's"
-        );
-    }
 
     /// The canonicalisation-skew tripwire at its new home, the Depot's tree PUT.
     ///
@@ -5838,7 +4780,6 @@ mod tests {
             &h.tmp.path().join("warm"),
             h.cold.clone(),
             b"export-secret".to_vec(),
-            DurabilityTier::SeparateVolume,
             // The SAME database, deliberately: a restarted replica — or a
             // DIFFERENT one behind the ClusterIP — shares the control plane's
             // Postgres, which is the whole point of ADR-0067 part 2.
@@ -5978,19 +4919,10 @@ mod tests {
     }
 
     impl ExportHarness {
-        /// The default harness is **separate-volume-shaped**: the tier is passed
-        /// explicitly (the router never probes — see [`router`]), so the two
-        /// tempdirs living on one device is irrelevant, and the flush legs run
-        /// exactly as they would against a second PVC.
-        ///
         /// `None` = no `SCARAB_TEST_DATABASE_URL` (see [`TestPg::provision`]):
-        /// the fence rows live in Postgres now (ADR-0067 part 2), so the
-        /// Depot's acceptance grain needs one.
+        /// the fence rows and the pack index live in Postgres (ADR-0067
+        /// part 2), so the Depot's acceptance grain needs one.
         async fn start() -> Option<Self> {
-            Self::start_with_tier(DurabilityTier::SeparateVolume).await
-        }
-
-        async fn start_with_tier(tier: DurabilityTier) -> Option<Self> {
             let pg = TestPg::provision().await?;
             let tmp = tempfile::tempdir().expect("tempdir");
             let warm_dir = tmp.path().join("warm");
@@ -6021,15 +4953,16 @@ mod tests {
                 &warm_dir,
                 cold.clone(),
                 b"export-secret".to_vec(),
-                tier,
                 pg.pool.clone(),
             )
             .expect("open the workspace state");
 
-            // A real predecessor Step leaves the parent in warm (its drain) AND in
-            // cold (its flush). `TieredCas::ingest` is a deliberate refusal since
-            // ADR-0064, so build that end state the content-addressed way: one
-            // ingest per tier of the same source yields byte-identical objects.
+            // A real predecessor Step leaves the parent in warm; the LOOSE cold
+            // copy stands in for pre-pack legacy content (the dual-read
+            // migration's second leg). `TieredCas::ingest` is a deliberate
+            // refusal since ADR-0064, so build that end state the
+            // content-addressed way: one ingest per tier of the same source
+            // yields byte-identical objects.
             let warm_seed = S3Storage::local(&warm_dir).expect("warm seed handle");
             let parent = warm_seed
                 .ingest(src.to_str().expect("utf-8"))
@@ -6064,7 +4997,7 @@ mod tests {
         }
 
         /// The drain's read handle, composed out of the state's own `TieredCas` exactly
-        /// as [`settle_export`] composes it — so a test driving [`flush_to_cold`]
+        /// as [`settle_export`] composes it — so a test driving the pack leg
         /// directly reads through the same tiering the route does, and cannot
         /// accidentally prove something about the warm leg alone.
         fn reads(&self) -> ReadThrough {
@@ -6695,14 +5628,8 @@ mod tests {
         let db = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused-in-this-test/none")
             .expect("lazy pool");
-        let _router = router(
-            &warm_dir,
-            cold,
-            b"export-secret".to_vec(),
-            DurabilityTier::SeparateVolume,
-            db,
-        )
-        .expect("router");
+        let _router = router(&warm_dir, cold, b"export-secret".to_vec(), db)
+            .expect("router");
 
         assert!(
             !residue.exists(),
@@ -6720,16 +5647,16 @@ mod tests {
         );
     }
 
-    /// The **change-set** drain, ADR-0064 part 1: the fold writes **warm**, the
-    /// **archival flush** is what reaches cold — and it survives being driven on a
-    /// blocking thread.
+    /// The **change-set** drain: the fold writes **warm**, the **pack leg**
+    /// is what makes it durable (ADR-0067 part 4) — and it survives being
+    /// driven on a blocking thread.
     ///
-    /// This test used to assert that the fold itself reached cold, because the fold was
-    /// handed a `TieredCas` whose every put was cold-first. That mechanism is gone, so
-    /// the assertion is not weakened but *split in two*, which is strictly stronger: the
-    /// folded snapshot must be readable from **warm alone and NOT from cold** before the
-    /// flush, and from **cold alone** after it. Either half alone would pass against a
-    /// mechanism that wrote both tiers everywhere; together they say which leg did what.
+    /// The assertion is split in two, which is strictly stronger than either
+    /// half: the folded snapshot must be readable from **warm alone and NOT
+    /// from cold** before the pack leg, and from a **fresh-warm replica**
+    /// (pack index + ranged reads) after it. Either half alone would pass
+    /// against a mechanism that wrote both tiers everywhere; together they
+    /// say which leg did what.
     ///
     /// Two more things, and the second is why this test exists at its own grain rather
     /// than riding on the acceptance test above.
@@ -6749,7 +5676,7 @@ mod tests {
     /// The change set comes from [`fold_one_edit`], which builds it through `changeset`'s
     /// own plumbing rather than by hand — see the note there.
     #[tokio::test]
-    async fn the_change_set_fold_writes_warm_and_the_flush_is_what_reaches_cold() {
+    async fn the_change_set_fold_writes_warm_and_the_pack_leg_makes_it_durable() {
         let Some(h) = ExportHarness::start().await else { return };
         let settled = fold_one_edit(&h).await;
 
@@ -6778,20 +5705,20 @@ mod tests {
                 Err(StorageError::NotFound)
             ),
             "and it must NOT be in cold yet. The fold does not archive — if this passes because \
-             the fold wrote both tiers, the flush below is dead code and nothing in this service \
-             would notice"
+             the fold wrote both tiers, the pack leg below is dead code and nothing in this \
+             service would notice"
         );
 
-        // And the GC's damage, applied before the flush so the flush is the only thing
-        // that can undo it: `dir/` is an UNTOUCHED sub-tree this fold took across by
+        // And the GC's damage, applied before the pack leg so the pack leg is the only
+        // thing that can undo it: `dir/` is an UNTOUCHED sub-tree this fold took across by
         // hash, and its **tree object** is deleted from cold while warm keeps it. That is
         // exactly the reachable state — the CAS GC sweeps cold only (`retention.rs`) and
         // the warm tier has no eviction at all, so a parent that aged past
         // `retention_workspace_days` leaves cold without a sub-tree warm still serves.
         //
         // Without this the `dir/inner.txt` assertion at the bottom passed for the wrong
-        // reason: the harness ingests the parent through the tiered store, so cold
-        // already held `dir/` and the flush could have omitted it entirely.
+        // reason: the harness seeds the parent into cold loose, so the dual-read could
+        // have served `dir/` even if the pack leg had omitted it entirely.
         let inherited_subtree = h
             .state
             .warm
@@ -6810,40 +5737,74 @@ mod tests {
             .await
             .expect("evict the inherited sub-tree from cold, as ADR-0050's GC would");
 
-        // Half two: the flush is what archives it, and then cold alone produces the
-        // whole snapshot — which is what licenses `Succeeded` (ADR-0061 part 4).
-        let handle = ExportHandle::parse(&"cd".repeat(32)).expect("a handle for the log line");
-        let flushed = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
-            .await
-            .expect("the archival flush must complete");
-        assert!(flushed.durable, "a completed flush is what `durable` reports");
+        // Half two: the PACK LEG is what makes it durable (ADR-0067 part 4),
+        // and then a replica whose warm never held a byte produces the whole
+        // snapshot off the pack index — which is what licenses `Succeeded`
+        // (ADR-0061 part 4).
+        pack_inventory_under_fence(
+            &h.state,
+            &pack_fence(),
+            &settled.flush,
+            &h.reads(),
+            &settled.snapshot.root,
+        )
+        .await
+        .expect("the settle pack leg must complete");
 
-        let out = h.tmp.path().join("fold-from-cold");
-        h.cold
-            .materialize(&settled.snapshot.root, out.to_str().expect("utf-8"))
+        let replica = replica_state(&h);
+        let manifest = flatten(&replica, &settled.snapshot.root)
             .await
-            .expect(
-                "after the flush the folded snapshot must be readable from COLD ALONE — this is \
-                 the whole of how ADR-0062 part 3's durability decision is enforced on this path",
-            );
-        let published = tree_contents(&out);
-        assert_eq!(
-            published.get("keep.txt").map(|(bytes, _)| bytes.as_slice()),
-            Some(b"the step rewrote this".as_slice()),
-            "the edit is published"
+            .expect("the replica must flatten the folded snapshot off the pack index");
+        let paths: Vec<&str> = manifest.entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(
+            paths.contains(&"keep.txt") && !paths.contains(&"run.sh"),
+            "the edit is published and the whiteout dropped the inherited file: {paths:?}"
         );
         assert!(
-            !published.contains_key("run.sh"),
-            "and the whiteout dropped the inherited file rather than republishing it: {:?}",
-            published.keys().collect::<Vec<_>>()
+            paths.contains(&"dir/inner.txt"),
+            "the untouched subtree is carried across by hash — and the pack leg had to make \
+             its TREE OBJECT durable, because the loose cold copy was deleted above: {paths:?}"
         );
-        assert!(
-            published.contains_key("dir/inner.txt"),
-            "while the untouched subtree is carried across by hash — and the flush had to put its \
-             TREE OBJECT back in cold, which was deleted above. An inventory that lists only the \
-             trees the fold rebuilt archives a root naming an absent `dir/` and reports \
-             `durable: true`"
-        );
+        let rewritten = blob_via_pack_then_loose(&replica, &hash_hex(b"the step rewrote this"))
+            .await
+            .expect("the fold's new blob must be servable through the replica");
+        assert_eq!(rewritten, b"the step rewrote this".to_vec());
+    }
+
+    /// The pack-index rows for one bare-hex address, counted — the durable
+    /// index's answer, as the tests observe it.
+    async fn member_rows(db: &sqlx::PgPool, hex: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM depot_pack_members WHERE address = $1",
+        )
+        .bind(tagged_address(HashAlgo::Sha256, hex))
+        .fetch_one(db)
+        .await
+        .expect("count member rows")
+    }
+
+    /// A SECOND replica's view: a fresh state over an EMPTY warm directory,
+    /// the same cold store and the same database — what the pack index plus
+    /// ranged reads must be able to serve alone (ADR-0067 part 4).
+    fn replica_state(h: &ExportHarness) -> WorkspaceState {
+        let warm2 = h.tmp.path().join("warm-replica");
+        std::fs::create_dir_all(&warm2).expect("mkdir replica warm");
+        open_state(
+            &warm2,
+            h.cold.clone(),
+            b"export-secret".to_vec(),
+            h.state.db.clone(),
+        )
+        .expect("open the replica state")
+    }
+
+    /// The Export-settle fence the pack-leg tests stream under.
+    fn pack_fence() -> Fence {
+        Fence {
+            run: "run-fold".into(),
+            step: "fold".into(),
+            attempt: "a1".into(),
+        }
     }
 
     /// One edit plus one whiteout, folded into the **warm** tier alone: the change-set
@@ -6901,34 +5862,24 @@ mod tests {
         std::fs::write(&at, b"not a directory").expect("put a file where the prefix must be");
     }
 
-    /// **The ticket's requirement, on the RE-INGEST drain only.** Cold is dead, so the
-    /// settle answers `500` and no `durable` reaches the wire.
+    /// A settle whose PACK LEG fails is an error, never a settle. The Step
+    /// exited 0 and the fold succeeded — the snapshot really is in warm — and
+    /// that is exactly the state in which answering 200 would put a claim in
+    /// the durable record that the record cannot back (ADR-0067 part 4).
     ///
-    /// ADR-0064: *"a flush that fails fails the Attempt"*. The Step exited 0 and the drain
-    /// succeeded — the snapshot really is in warm — and that is exactly the state in
-    /// which reporting success would put a claim in the durable record that the record
-    /// cannot back.
-    ///
-    /// **What this test does NOT cover, said plainly rather than implied away.** It goes
-    /// through `h.prepare()`, which is the **copy** rung, so the drain is
-    /// `SettleDrain::Reingest` and the code exercised is
-    /// [`reingest_warm_then_flush`]'s error mapping. The change-set drain's identical
-    /// mapping in [`settle_export`] is *not* reached from here and cannot be on this host
-    /// — `ExportRung::Overlay` needs `CAP_SYS_ADMIN` on a Linux kernel (git-bug
-    /// `0ad393c`). `a_flush_that_fails_leaves_no_cold_tree_naming_an_absent_child` covers
-    /// that drain's flush failure at the function grain instead.
-    ///
-    /// The `durable` half is also weaker than it looks and is kept for the day that
-    /// changes: a `WsError::Drain` renders a fixed string with no JSON body at all, so
-    /// today the substring simply cannot appear. It becomes a real assertion the moment
-    /// anyone gives the error a structured body, which is the plausible way a `durable`
-    /// field would leak onto a failure response.
+    /// **What this test does NOT cover, said plainly rather than implied
+    /// away.** It goes through `h.prepare()`, which is the **copy** rung, so
+    /// the drain is `SettleDrain::Reingest`. The change-set drain's identical
+    /// pack leg is not reached from here and cannot be on this host —
+    /// `ExportRung::Overlay` needs `CAP_SYS_ADMIN` on a Linux kernel (git-bug
+    /// `0ad393c`). `a_pack_leg_that_fails_leaves_no_index_rows` covers that
+    /// drain's pack failure at the function grain instead.
     #[tokio::test]
-    async fn a_settle_whose_cold_flush_fails_does_not_report_durable() {
+    async fn a_settle_whose_pack_leg_fails_is_an_error_not_a_settle() {
         let Some(h) = ExportHarness::start().await else { return };
         let (handle, _capability, workspace) = h.prepare().await;
         std::fs::write(workspace.join("keep.txt"), b"the step rewrote this").expect("rewrite");
-        break_cold(&h, "blobs");
+        break_cold(&h, "packs");
 
         let (status, body) = h
             .call(
@@ -6940,31 +5891,17 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::INTERNAL_SERVER_ERROR,
-            "an unarchivable snapshot is a retryable failure, not a settle: {body}"
+            "a snapshot that cannot be packed durable is a retryable failure, not a settle: {body}"
         );
         assert!(
-            !body.contains("\"durable\":true") && !body.contains("\"durable\": true"),
-            "and nothing on the wire may say the snapshot is durable — a caller that reads this \
-             field is deciding whether an Attempt may be Succeeded. NOTE this half is trivially \
-             true while `WsError::Drain` renders a plain string; it is a tripwire for a \
-             structured error body, not evidence about today: {body}"
-        );
-        // And the reason the assertion above is weak, pinned rather than described: the
-        // whole body is one fixed sentence, so there is no field on the wire to be wrong.
-        // When someone gives `WsError::Drain` a structured body this fires, and whoever
-        // is holding it then has to look at the `durable` assertion above and make it
-        // mean something. The *cause* is not on the wire at all by design — it is on the
-        // `tracing::error!` line in `WsError`'s `IntoResponse`, because a drain failure
-        // names an internal path.
-        assert_eq!(
-            body, "the workspace export could not be settled",
-            "a drain failure is a fixed string today; changing that is the moment the \
-             `durable` check above stops being trivially true"
+            !body.contains(&format!("\"root\"")),
+            "no root may reach the wire on a failed settle — a caller that reads one is \
+             deciding whether an Attempt may be Succeeded: {body}"
         );
 
         // The other half of the same invariant: warm DID get the snapshot, so this is
-        // genuinely the "the fold worked and the archive did not" case and not a fold
-        // that failed for its own reasons.
+        // genuinely the "the fold worked and the durable leg did not" case and not a
+        // fold that failed for its own reasons.
         assert!(
             h.state
                 .warm
@@ -6975,146 +5912,79 @@ mod tests {
         );
     }
 
-    /// A flush that fails partway leaves cold **self-consistent**: no cold tree naming a
-    /// child cold does not hold.
-    ///
-    /// This is what blobs-before-trees buys, and a test that only checked for an `Err`
-    /// would not cover it — the failing and the succeeding flush return the same `Err`
-    /// whichever order the two phases run in. So the blob leg is killed and the **tree**
-    /// leg left working: with the phases in the right order nothing reaches cold at all;
-    /// with them swapped, cold ends up holding the settled root — a reachable tree whose
-    /// blobs are absent, which no later reader can tell from corruption and which the GC's
-    /// mark walk would follow.
-    ///
-    /// Since git-bug `38b945e` the blob leg fronted by a probe fails at the **probe** —
-    /// a `head` under a `blobs` that is a file is an error, not a `NotFound` — so the
-    /// variant this matches moved from `ColdBlob` to `ColdBlobProbe`. The invariant is
-    /// unchanged: the flush fails before anything reaches cold, and the tree assertion
-    /// below is what still catches a phase swap.
+    /// A pack leg that fails leaves **no index rows and no commit pack** —
+    /// bytes before pointers (ADR-0067 part 10) on the settle path. An
+    /// unfinished multipart upload publishes nothing, so the only observable
+    /// damage is unreachable staged parts; a row naming an incomplete pack is
+    /// the state this ordering exists to make impossible.
     #[tokio::test]
-    async fn a_flush_that_fails_leaves_no_cold_tree_naming_an_absent_child() {
+    async fn a_pack_leg_that_fails_leaves_no_index_rows() {
+        use scarab_storage::ObjectStore;
+
         let Some(h) = ExportHarness::start().await else { return };
         let settled = fold_one_edit(&h).await;
-        break_cold(&h, "blobs");
+        break_cold(&h, "packs");
 
-        let handle = ExportHandle::parse(&"ef".repeat(32)).expect("a handle");
-        let err = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
+        pack_inventory_under_fence(
+            &h.state,
+            &pack_fence(),
+            &settled.flush,
+            &h.reads(),
+            &settled.snapshot.root,
+        )
         .await
-        .expect_err("a cold tier that cannot take a blob must fail the flush");
-        assert!(
-            matches!(err, FlushError::ColdBlobProbe { .. }),
-            "and it must name the cold-tier probe as the cause rather than surfacing a bare I/O \
-             error: {err}"
-        );
+        .expect_err("a cold store that cannot take a pack must fail the leg");
 
+        assert_eq!(
+            member_rows(&h.state.db, &hash_hex(b"the step rewrote this")).await,
+            0,
+            "no member row may name bytes that never landed — `/have` would tell the next \
+             drain to skip the upload, the one unrecoverable direction"
+        );
+        let key = fence_key(&pack_fence());
+        let packs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM depot_packs WHERE fence_key = $1")
+            .bind(&key)
+            .fetch_one(&h.state.db)
+            .await
+            .expect("count pack rows");
+        assert_eq!(packs, 0, "no pack row either");
         assert!(
             matches!(
-                h.cold.tree_entries(&settled.snapshot.root).await,
-                Err(StorageError::NotFound)
+                h.cold.get(&format!("packs/{key}/commit.pack")).await,
+                Err(StorageError::NotFound) | Err(StorageError::Backend(_))
             ),
-            "the failed flush must not have left the settled ROOT in cold: it names blobs cold \
-             does not hold, and a reader cannot tell that from corruption"
+            "and no commit pack: reachability begins there, so it must not exist"
         );
     }
 
-    /// A flush is **idempotent**: running it twice succeeds twice and the second run
-    /// writes nothing.
+    /// The pack leg is **idempotent through the index**: a second settle of
+    /// the same snapshot — another fence, same content — packs NOTHING and
+    /// reads NOTHING, because the durable index already answers for every
+    /// member. That is what retired the flush's per-blob `head` probe.
     ///
-    /// ADR-0064 makes this load-bearing rather than incidental — *"the batch must be
-    /// idempotent, because the CAS is content-addressed and a retried flush will
-    /// re-offer the same keys"* — and it is why no partial-flush cursor is persisted: a
-    /// retry re-offers everything and that is cheap.
-    ///
-    /// "Wrote nothing" is *measured* rather than assumed, by corrupting one archived
-    /// blob between the two runs: a flush that re-uploaded would repair it, a flush that
-    /// heads-and-skips leaves the corruption in place. Timestamps would have been the
-    /// obvious probe and are useless here — two runs in one millisecond are
-    /// indistinguishable.
+    /// "Reads nothing" is *constructed*, not inferred from a counter: between
+    /// the two runs every inventory blob body in BOTH tiers is overwritten
+    /// with bytes that do not hash to their address — still present, no
+    /// longer readable (`get_blob` verifies on the way out) — so any read at
+    /// all would fail the second run.
     #[tokio::test]
-    async fn a_second_flush_of_the_same_snapshot_writes_nothing() {
+    async fn a_second_pack_of_the_same_snapshot_packs_nothing_and_reads_nothing() {
         let Some(h) = ExportHarness::start().await else { return };
         let settled = fold_one_edit(&h).await;
-        let handle = ExportHandle::parse(&"ab".repeat(32)).expect("a handle");
 
-        let first = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
-            .await
-            .expect("the first flush");
-
-        // The expectation is a LITERAL, spelled out from the fixture, and not a second
-        // reading of the same `FlushSet` — comparing `second` against `first` cannot fail,
-        // because both tallies are counted off the one inventory both runs were handed.
-        //
-        // `fold_one_edit` rewrites `keep.txt` and whiteouts `run.sh` over the parent in
-        // `parent_files()` plus its `link.txt` symlink. So the rebuilt ROOT is the only
-        // tree this fold wrote, and it names exactly two blobs — the new `keep.txt` and
-        // the inherited `link.txt` symlink target — while `run.sh`'s blob is gone with the
-        // whiteout and `dir/`'s two blobs are named by `dir/` rather than by the root. The
-        // trees are the rebuilt root and the inherited `dir/`.
-        let (want_blobs, want_trees) = (2u64, 2u64);
-        assert_eq!(
-            (first.blobs, first.blobs_uploaded, first.trees, first.durable),
-            (want_blobs, 1, want_trees, true),
-            "the inventory this fixture produces: {} blob addresses and {} trees — and exactly \
-             ONE blob uploaded, because the parent was ingested through the tiered store so cold \
-             already held `keep.txt`'s reused blob, while the fold's rewritten content is new",
-            settled.flush.blobs.len(),
-            settled.flush.tree_count()
+        pack_inventory_under_fence(
+            &h.state,
+            &pack_fence(),
+            &settled.flush,
+            &h.reads(),
+            &settled.snapshot.root,
+        )
+        .await
+        .expect("the first pack leg");
+        assert!(
+            member_rows(&h.state.db, &settled.snapshot.root.0).await > 0,
+            "the settled root must be a durable pack member after the first leg"
         );
-
-        let key = format!("blobs/{}", hash_hex(b"the step rewrote this"));
-        h.cold
-            .put(&key, b"a byte-for-byte re-upload would repair this".to_vec())
-            .await
-            .expect("corrupt one archived blob");
-
-        let second = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
-            .await
-            .expect("a re-offered flush must succeed, or a retried settle could never go green");
-        assert_eq!(
-            (second.blobs, second.blobs_uploaded, second.trees, second.durable),
-            (want_blobs, 0, want_trees, true),
-            "the whole inventory is re-offered — nothing records how far the first one got, so a \
-             retry re-offers everything and reports the same durability — and the probe answers \
-             for ALL of it, so the second flush uploads zero"
-        );
-        assert_eq!(
-            h.cold.get(&key).await.expect("still there"),
-            b"a byte-for-byte re-upload would repair this".to_vec(),
-            "the second flush must not have re-uploaded: a re-offer of a content-addressed key is \
-             a `head` and nothing more, which is what makes retrying the whole batch cheap"
-        );
-    }
-
-    /// **Git-bug `38b945e`'s acceptance test**: a flush whose whole inventory cold
-    /// already holds performs ZERO warm blob reads.
-    ///
-    /// "Zero reads" is *constructed*, not inferred from a counter: after a first flush
-    /// archives everything, every blob body in BOTH tiers is overwritten with bytes
-    /// that do not hash to their address — still **present**, no longer **readable**.
-    /// `get_blob` verifies content against the address on every read (and this
-    /// service's tiering does not serve around a warm error that is not `NotFound`),
-    /// so any blob read through any leg now fails — the sanity assertion in the middle
-    /// pins that — while cold's `head`, the only thing the probe is allowed to cost,
-    /// still answers "present". A second flush that passes is therefore proof that no
-    /// blob was read.
-    ///
-    /// Corrupting rather than deleting is load-bearing: [`ReadThrough`] falls through
-    /// a warm `NotFound` to cold and would quietly serve exactly the read this test
-    /// exists to rule out.
-    ///
-    /// Mutations this kills: delete the probe pass and read-and-offer everything (the
-    /// old shape — every read fails, the flush errors); invert or hardcode the probe's
-    /// verdict so "present" is read anyway (same failure); miscount `blobs_uploaded`
-    /// (the tally assertion says the probe answered for the whole inventory).
-    #[tokio::test]
-    async fn a_flush_whose_inventory_cold_already_holds_reads_no_blob_out_of_warm() {
-        let Some(h) = ExportHarness::start().await else { return };
-        let settled = fold_one_edit(&h).await;
-        let handle = ExportHandle::parse(&"3c".repeat(32)).expect("a handle");
-
-        flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
-            .await
-            .expect("the first flush archives the whole inventory");
 
         for blob in &settled.flush.blobs {
             let key = format!("blobs/{}", blob.0);
@@ -7125,8 +5995,6 @@ mod tests {
                     .expect("corrupt the blob body in place");
             }
         }
-        // Sanity for the observable itself: a blob read through the drain's own read
-        // handle must now fail, or a passing flush below proves nothing.
         let sentinel = settled
             .flush
             .blobs
@@ -7135,69 +6003,51 @@ mod tests {
             .expect("the fixture's inventory has blobs");
         assert!(
             h.reads().get_blob(sentinel).await.is_err(),
-            "corrupting both tiers must make every blob read fail — `get_blob` hashes what it \
-             serves — otherwise this test cannot distinguish a probe from a read"
+            "corrupting both tiers must make every blob read fail, or this test cannot \
+             distinguish an index answer from a read"
         );
 
-        let second = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
+        let second_fence = Fence {
+            run: "run-fold".into(),
+            step: "fold".into(),
+            attempt: "a2".into(),
+        };
+        pack_inventory_under_fence(
+            &h.state,
+            &second_fence,
+            &settled.flush,
+            &h.reads(),
+            &settled.snapshot.root,
+        )
+        .await
+        .expect(
+            "a second pack of an already-durable snapshot must read zero blobs: every body \
+             in both tiers is unreadable, so any read at all would have failed this leg",
+        );
+        let packs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM depot_packs WHERE fence_key = $1")
+            .bind(fence_key(&second_fence))
+            .fetch_one(&h.state.db)
             .await
-            .expect(
-                "a flush whose whole inventory cold already holds must read ZERO blobs out of \
-                 warm: every body in both tiers is unreadable, so any read at all would have \
-                 failed this flush (git-bug 38b945e)",
-            );
+            .expect("count pack rows");
         assert_eq!(
-            (second.blobs, second.blobs_uploaded, second.durable),
-            (2, 0, true),
-            "and the tally says so: the whole inventory was satisfied by the probe alone"
+            packs, 0,
+            "and it packs nothing: the durable index answered for the whole inventory"
         );
     }
 
-    /// A probe the cold tier cannot answer **fails the flush** — it is never read as a
-    /// verdict.
-    ///
-    /// The mutation that matters is probe-error-as-"present": the flush would skip
-    /// every upload, archive the trees over blobs cold does not hold and report
-    /// `durable: true` — the silent-skip shape this repo has been bitten by, and under
-    /// it this `expect_err` panics on an `Ok`. The lesser mutation,
-    /// probe-error-as-"missing", falls back to read-and-offer and dies at the upload
-    /// with `ColdBlob` — a real failure wearing the wrong cause — which is why the
-    /// *variant* is matched and not just the `Err`.
-    ///
-    /// `break_cold` puts a file where the `blobs/` prefix must be, so the probe's
-    /// `head` is an `ENOTDIR`-shaped error and NOT a `NotFound`: exactly the "cannot
-    /// answer" case, distinct from the "answered: missing" case every other test here
-    /// exercises.
-    #[tokio::test]
-    async fn a_cold_tier_that_cannot_answer_the_existence_probe_fails_the_flush() {
-        let Some(h) = ExportHarness::start().await else { return };
-        let settled = fold_one_edit(&h).await;
-        break_cold(&h, "blobs");
-
-        let handle = ExportHandle::parse(&"4d".repeat(32)).expect("a handle");
-        let err = flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
-            .await
-            .expect_err("a cold tier that cannot say what it holds must fail the flush");
-        assert!(
-            matches!(err, FlushError::ColdBlobProbe { .. }),
-            "and the error must name the probe: \"present\" would be the silent skip, \
-             \"missing\" a fall-back read that fails later blaming the wrong operation: {err}"
-        );
-    }
-
-    /// A blob the fold **reused** from the parent snapshot is still offered to cold.
+    /// A blob the fold **reused** from the parent snapshot is still made durable.
     ///
     /// The regression guard for the finding that shaped `settle::FlushSet`. The tempting
-    /// optimisation is to flush only what the fold *wrote*, and it is wrong, because
-    /// warm routinely outlives cold: the CAS GC deletes from cold only, and the warm tier
-    /// has no eviction implemented at all. So a reused blob can be absent from cold, and
-    /// a flush that skipped it would publish a cold tree naming a child cold does not
-    /// hold **and report success** — silently, and only for snapshots whose parent has
-    /// aged past `retention_workspace_days`.
+    /// optimisation is to pack only what the fold *wrote*, and it is wrong, because
+    /// warm routinely outlives the durable tier: the CAS GC deletes loose cold objects,
+    /// and the warm tier has no eviction implemented at all. So a reused blob can be
+    /// absent from the durable set, and a pack leg that skipped it would publish a
+    /// durable root naming a child nothing durable holds — silently, and only for
+    /// snapshots whose parent has aged past `retention_workspace_days`.
     ///
-    /// Set up as the GC would leave it: the blob is evicted from cold *before* the flush,
-    /// and the fold never touches that file, so the flush is the only thing that can put
-    /// it back.
+    /// Set up as the GC would leave it: the blob is evicted from cold loose *before*
+    /// the pack leg, and the fold never touches that file, so the pack leg is the only
+    /// thing that can make it durable again.
     ///
     /// The subject is `link.txt`, the parent's symlink at the **root** — inherited, not
     /// named by the change set, and named directly by the one tree this fold rebuilt. A
@@ -7210,48 +6060,59 @@ mod tests {
     /// together with what closing it would cost; this test deliberately does not pretend
     /// to cover it.
     #[tokio::test]
-    async fn a_blob_the_drain_reused_is_still_offered_to_the_cold_flush() {
+    async fn a_blob_the_fold_reused_is_still_made_durable_by_the_pack_leg() {
         let Some(h) = ExportHarness::start().await else { return };
         let settled = fold_one_edit(&h).await;
 
         let inherited = BlobHash(hash_hex(b"keep.txt"));
         assert!(
             settled.flush.blobs.contains(&inherited),
-            "the flush inventory must include the blobs the fold REUSED, not only the one it \
+            "the pack inventory must include the blobs the fold REUSED, not only the one it \
              stored. `blobs_stored` is {} and the inventory holds {} addresses",
             settled.tally.blobs_stored,
             settled.flush.blobs.len()
         );
 
+        // Evict the loose cold copy first, so the pack leg cannot pass by
+        // accident of the harness's legacy seeding.
         let key = format!("blobs/{}", inherited.0);
         h.cold
             .delete(&key)
             .await
             .expect("evict an inherited blob from cold, as ADR-0050's GC would");
 
-        let handle = ExportHandle::parse(&"ba".repeat(32)).expect("a handle");
-        flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
-            .await
-            .expect("the flush");
+        pack_inventory_under_fence(
+            &h.state,
+            &pack_fence(),
+            &settled.flush,
+            &h.reads(),
+            &settled.snapshot.root,
+        )
+        .await
+        .expect("the pack leg");
 
+        assert!(
+            member_rows(&h.state.db, &inherited.0).await > 0,
+            "the reused blob must be a durable pack member: it is named by a tree this leg \
+             just made durable"
+        );
+        let replica = replica_state(&h);
         assert_eq!(
-            h.cold.get(&key).await.expect(
-                "the reused blob must be back in cold: it is named by a tree this flush just \
-                 archived, and cold's own heads-then-puts is the only self-heal it has"
-            ),
+            blob_via_pack_then_loose(&replica, &inherited.0)
+                .await
+                .expect("the reused blob must be servable off the pack alone"),
             b"keep.txt".to_vec()
         );
     }
 
-    /// A sub-tree the fold **inherited** is offered to cold too, and the flush is what
-    /// puts its tree object back.
+    /// A sub-tree the fold **inherited** is in the inventory too, and the pack leg is
+    /// what makes its tree object durable.
     ///
     /// The same finding as the reused blob, one level up, and the one the tree inventory
     /// used to miss entirely. `dir/` is untouched, so the fold takes it across by hash and
-    /// writes nothing for it — but the rebuilt root NAMES it, and cold can have swept it
-    /// while warm still serves it (the GC deletes from cold only; warm has no eviction).
-    /// A flush that listed only the trees the fold *wrote* would archive a root pointing
-    /// at an absent `dir/` and report `durable: true`.
+    /// writes nothing for it — but the rebuilt root NAMES it, and the durable set can
+    /// have lost it while warm still serves it. A pack leg that listed only the trees
+    /// the fold *wrote* would publish a durable root pointing at an absent `dir/`.
     ///
     /// Distinct from the acceptance-shaped test above: this one asserts the **inventory**
     /// names it and at what depth, so it fails at the fold rather than at a `materialize`
@@ -7298,23 +6159,29 @@ mod tests {
             "and the rebuilt root LAST"
         );
 
-        // And end to end: the GC's damage, then the flush, then cold alone can read it.
+        // And end to end: the GC's damage, then the pack leg, then the durable
+        // index alone can name it.
         h.cold
             .delete(&format!("trees/{}", inherited.0))
             .await
             .expect("evict the inherited sub-tree from cold, as ADR-0050's GC would");
-        let handle = ExportHandle::parse(&"1a".repeat(32)).expect("a handle");
-        flush_to_cold(&h.reads(), &h.cold, &settled.flush, &handle)
-            .await
-            .expect("the flush");
+        pack_inventory_under_fence(
+            &h.state,
+            &pack_fence(),
+            &settled.flush,
+            &h.reads(),
+            &settled.snapshot.root,
+        )
+        .await
+        .expect("the pack leg");
         assert!(
-            h.cold.tree_entries(&inherited).await.is_ok(),
-            "the flush had to put the inherited sub-tree's tree object back in cold — it is the \
-             only thing on this path that can"
+            member_rows(&h.state.db, &inherited.0).await > 0,
+            "the pack leg had to make the inherited sub-tree's tree object durable — it is \
+             the only thing on this path that can"
         );
     }
 
-    /// [`flush_set_of`]'s own ordering: **deepest level first**, for the drain that has to
+    /// [`reachable_set_of`]'s own ordering: **deepest level first**, for the drain that has to
     /// rediscover its inventory by walking.
     ///
     /// The change-set drain gets its levels from the fold and has its own test; this one is
@@ -7324,7 +6191,7 @@ mod tests {
     /// `put_tree` does not check that a child is present — and would only show up as a cold
     /// tier holding a root over absent children after a *failed* flush.
     #[tokio::test]
-    async fn the_walked_flush_inventory_is_deepest_level_first() {
+    async fn the_walked_inventory_is_deepest_level_first() {
         let Some(h) = ExportHarness::start().await else { return };
 
         // Three levels, so the ordering is a claim about more than "reversed or not": a
@@ -7364,7 +6231,7 @@ mod tests {
             "b",
         );
 
-        let flush = flush_set_of(&h.reads(), &snapshot.root)
+        let flush = reachable_set_of(&h.reads(), &snapshot.root)
             .await
             .expect("walk the snapshot for its flush inventory");
 
@@ -7385,67 +6252,6 @@ mod tests {
                  addresses",
                 flush.blobs.len()
             );
-        }
-    }
-
-    /// [`FlushError::Mismatch`]: cold filed the content under an address the flush did not
-    /// offer, so the flush refuses rather than reporting a durability nothing will find.
-    ///
-    /// Reachable without a test double, because `Cas::tree_entries` on `S3Storage` reads a
-    /// tree object by key and does **not** verify that it canonicalises back to that key
-    /// (unlike `get_blob`, which does). So a tree object filed in warm under an address it
-    /// does not hash to — which is exactly what
-    /// `scarab_storage::tiered`'s backfill tripwire exists to notice — reaches cold, is
-    /// re-canonicalised on the way in, and comes back with a different hash.
-    ///
-    /// The refusal matters because the alternative is silent: `put_tree` would have
-    /// succeeded, cold would hold the content at an address no snapshot names, and the
-    /// settle would report `durable: true` for a root cold cannot resolve.
-    #[tokio::test]
-    async fn a_cold_tier_that_files_content_under_another_address_fails_the_flush() {
-        let Some(h) = ExportHarness::start().await else { return };
-
-        // The parent's real tree object, re-filed in warm under an address that is
-        // well-formed and certainly not its own.
-        let bytes = h
-            .state
-            .warm
-            .get(&format!("trees/{}", h.parent.root.0))
-            .await
-            .expect("the parent's tree object is in warm");
-        let wrong = TreeHash("11".repeat(32));
-        h.state
-            .warm
-            .put(&format!("trees/{}", wrong.0), bytes)
-            .await
-            .expect("file a tree under an address it does not hash to");
-
-        let flush = settle::FlushSet {
-            blobs: HashSet::new(),
-            tree_levels: vec![vec![wrong.clone()]],
-        };
-        let handle = ExportHandle::parse(&"2b".repeat(32)).expect("a handle");
-        let err = flush_to_cold(&h.reads(), &h.cold, &flush, &handle)
-            .await
-            .expect_err("a tier disagreement about addressing must fail the flush");
-
-        match err {
-            FlushError::Mismatch {
-                kind,
-                ref offered,
-                ref stored,
-            } => {
-                assert_eq!(kind, "tree");
-                assert_eq!(offered, &wrong.0, "the address the flush offered");
-                assert_eq!(
-                    stored, &h.parent.root.0,
-                    "and the one cold actually filed it under — both in the message, because an \
-                     operator cannot act on `hash mismatch` alone"
-                );
-            }
-            other => panic!(
-                "the flush must refuse with `Mismatch` and not with a bare write error: {other}"
-            ),
         }
     }
 
