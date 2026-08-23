@@ -19,7 +19,8 @@
 > **removing** the replica-local state rather than routing back to it — so points 2 and 3 are
 > overtaken: fence affinity and cordon stop being correctness requirements (they remain
 > freely-abandonable warmth optimisations), and point 4's eviction problem dissolves rather than
-> being solved. Point 10's carve-outs and point 11's algorithm-taggable addresses stand.
+> being solved. Point 10's carve-outs stand; point 11's layer 1 — algorithm-tagged addresses — is
+> **adopted** by 0067 part 12 (tags ship now, BLAKE3 stays the tagged-in follow-up).
 
 ## Context
 
