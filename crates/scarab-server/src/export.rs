@@ -37,16 +37,18 @@
 //! side-channel to get wrong; the only operation is "hash it and look the handle
 //! up".
 //!
-//! # The record is on disk because this role has no database
+//! # The record is on disk because an Export is replica-local
 //!
-//! `Role::needs_durable_core` is false for `--role workspace`
-//! ([`crate::workspaced`]): no Postgres, no migration, no `Clock`. An Export
-//! record therefore **cannot** live in a table, and there is no migration in this
-//! slice. It is one JSON file per Export at `<handle>/`[`RECORD_FILE`], with an
-//! in-memory index rebuilt from those files at startup
-//! ([`ExportRegistry::open`]). That is not a workaround — it is what makes the
-//! ticket's *"reaped on service restart (orphan sweep)"* possible at all: the disk
-//! is the only thing that survives a `SIGKILL`, so the disk has to be the record.
+//! The workspace role does connect to Postgres since ADR-0067 part 2 — but only
+//! for rows any replica may answer for (drain records, write ledgers). An
+//! Export is the opposite kind of thing: an overlay **mounted on one replica's
+//! own warm volume**, so its record in a shared table would let another replica
+//! "know about" a mount it cannot serve, revoke or reap. It is one JSON file
+//! per Export at `<handle>/`[`RECORD_FILE`], with an in-memory index rebuilt
+//! from those files at startup ([`ExportRegistry::open`]). That is not a
+//! workaround — it is what makes the ticket's *"reaped on service restart
+//! (orphan sweep)"* possible at all: the disk is the only thing that survives a
+//! `SIGKILL` beside the mounts themselves, so the disk has to be the record.
 //!
 //! Same reason the **Step deadline is passed in**: the service cannot look one up.
 //! `exp` is an absolute unix second computed by the control plane from the Step's
