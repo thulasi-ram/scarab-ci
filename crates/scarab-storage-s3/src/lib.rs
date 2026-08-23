@@ -60,6 +60,8 @@
 //!   so peak footprint is roughly `concurrency × largest blob`. That is the reason
 //!   the limit is an operator knob rather than a constant.
 
+pub mod pack;
+
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -441,6 +443,28 @@ impl S3Storage {
     /// two prefixes this store files content-addressed objects under.
     pub async fn has_tree(&self, hash: &TreeHash) -> Result<bool, StorageError> {
         self.has(&format!("trees/{}", hash.0)).await
+    }
+
+    /// Read `len` bytes of the object at `key` starting at `offset` — the
+    /// ranged read a pack member lookup resolves into (ADR-0067 part 9:
+    /// `depot_pack_members` carries `(pack_key, byte_offset, byte_len)`, and
+    /// this is the request those three make). `object_store` supports the
+    /// range natively on every backend, so nothing here downloads-and-slices.
+    pub async fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, StorageError> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = self
+            .backend()?
+            .get_range(&ObjPath::from(key), offset..offset + len)
+            .await
+            .map_err(map_err)?;
+        Ok(bytes.to_vec())
     }
 
     /// The one `head`-shaped primitive the typed probes and
