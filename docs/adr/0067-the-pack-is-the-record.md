@@ -232,6 +232,22 @@ index. Postgres is a fast query surface, not a second source of truth: on any di
 bucket wins, and losing the index is a rebuild job rather than data loss. This is what licenses
 part 2 — the Depot reads a database, and nothing there is a record of anything.
 
+### 12. Addresses grow an algorithm tag; the hash stays SHA-256 for now
+
+*(Added 2026-08-24, owner decision.)* This ADR ships layer 1 of
+[0066](0066-the-depot-is-a-cache.md) point 11: every address the system writes from now on is
+**algorithm-tagged** (`sha256:<hex>`), and every reader accepts both tagged and legacy bare
+addresses. Nothing is rewritten; no historical root changes meaning. The tag is what makes the
+digest choice reversible — a later `blake3:` address coexists with every `sha256:` one, and mixed
+trees stay unambiguous.
+
+BLAKE3 itself is the intended follow-up, **not** part of this ADR. Two facts sized that call
+(verified 2026-08-24): it is a registered REAPI digest function, so the swap stays inside the
+standard's vocabulary; and its verified-streaming story — ranged reads a client can verify without
+the whole blob — is real but not free, since mainline `bao` is beta cryptography with a ~6.25%
+outboard overhead at 1 KiB chunks (the chunk-group variants that cut this to ~0.1% live in forks,
+`abao` / n0's `bao-tree`). Adopt the tag now, decide the hash when that story is load-bearing.
+
 ## Consequences
 
 **What this deletes.**
@@ -286,11 +302,17 @@ MinIO and `kind.yml` runs the live tier on a local directory. Note also that **n
 - **Adopt the Bazel remote-execution CAS protocol.** Its shape is an eerily exact match —
   `FindMissingBlobs` is `/have`, `GetTree` is `/flat`, batch read/write is the wire work the
   transfer handoff was going to invent, and its digest carries a size, which is part 9's problem
-  solved at the format level. Rejected for two concrete reasons: its `FileNode` carries an
-  executable bit where a `TreeEntry` carries **full mode and mtime**, and mtimes are load-bearing
-  because build tools use them to decide what to rebuild; and the tree hash **is** the recorded
-  snapshot identity, so changing the tree format changes every historical Run's root. **The design
-  lessons are adopted (batch shape, size available without a read); the protocol is not.**
+  solved at the format level. One rejection ground originally claimed here was **wrong** and is
+  corrected (2026-08-24, verified against the proto): REAPI is *not* limited to an executable
+  bit — since v2.2, typed `NodeProperties` carry `mtime` and `unix_mode` on `FileNode`,
+  `SymlinkNode` and `Directory`. The caveats are real but smaller: property support is
+  server-dependent (a server may `INVALID_ARGUMENT` names it does not accept), and populated
+  properties enter the `Directory` digest — the same coupling our `TreeEntry` already has. What
+  actually rejects the protocol: the tree hash **is** the recorded snapshot identity, so changing
+  the tree format changes every historical Run's root; and REAPI has no equivalent of the fence
+  ledger, the `durable`/`cache-only` label, or the commit-pack atomic boundary — the parts of this
+  ADR that carry its guarantees. **The design lessons are adopted (batch shape, size available
+  without a read); the protocol is not.**
 - **Encrypt content so authorisation leaves the data path.** Explored and rejected: with a
   content-derived key, rotation changes every address; with a per-file key table, the address is
   stable but rotation, erasure and the fork-PR case each need their own answer; and either way the
