@@ -1822,7 +1822,9 @@ async fn put_tree(
     }
 
     // **WARM ONLY** — the cold write moved to the archival flush; see `put_blob`
-    // for the whole migration story (ADR-0064). It matters MORE for a tree than
+    // for the whole migration story (ADR-0064), and for ADR-0067's amendment:
+    // a FENCED durable PUT also streams into its fence's pack below.
+    // It matters MORE for a tree than
     // for a blob, because a tree is the address an Attempt records as its
     // evidence — which is exactly why the flush, not the PUT, is what a caller
     // awaits before reporting `Succeeded`: a root that exists only in warm is a
