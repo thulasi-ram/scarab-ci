@@ -67,6 +67,59 @@ const CONCURRENCY: usize = 16;
 /// to stay under it.
 const HAVE_CHUNK: usize = 5_000;
 
+/// The durability-label header on CAS PUTs (ADR-0067 part 6). Duplicated from
+/// `scarab_server::workspaced` as a literal for the same reason as the token
+/// header below: this crate speaks HTTP to the Depot without linking the
+/// server, and the acceptance tests drive both ends of the wire.
+const DURABILITY_HEADER: &str = "x-scarab-durability";
+
+/// One PUT's durability label (ADR-0067 part 6): what of a drain the Depot
+/// streams into the fence's pack (`Durable`) versus keeps warm-only,
+/// unpromised and evictable (`CacheOnly`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Label {
+    Durable,
+    CacheOnly,
+}
+
+impl Label {
+    fn as_str(self) -> &'static str {
+        match self {
+            Label::Durable => "durable",
+            Label::CacheOnly => "cache-only",
+        }
+    }
+}
+
+/// How a scan's uploads are labelled — decided BEFORE anything is uploaded,
+/// because the Depot cannot infer the trim from arriving trees (children
+/// first, root last — ADR-0067 part 6) while the pod has the whole tree in
+/// hand from the scan.
+enum LabelPlan {
+    /// The feed-path ingest: no labels at all (the header's absent-is-durable
+    /// default carries it, and there is no drain here to pack anything).
+    Unlabelled,
+    /// A drain with no `outputs:`: the whole closure is the publish.
+    AllDurable,
+    /// A drain trimmed by `outputs:`: the pruned closure's addresses (bare
+    /// hex, trees and blobs alike) are durable, everything else is scratch.
+    Pruned(std::collections::HashSet<String>),
+}
+
+impl LabelPlan {
+    fn label_of(&self, hash: &str) -> Option<Label> {
+        match self {
+            LabelPlan::Unlabelled => None,
+            LabelPlan::AllDurable => Some(Label::Durable),
+            LabelPlan::Pruned(durable) => Some(if durable.contains(hash) {
+                Label::Durable
+            } else {
+                Label::CacheOnly
+            }),
+        }
+    }
+}
+
 /// Where a request's workspace token comes from.
 ///
 /// Two shapes because there are two kinds of client and they have opposite
@@ -241,14 +294,24 @@ impl WorkspaceClient {
         Ok((missing_blobs, missing_trees))
     }
 
-    /// `PUT` raw bytes under a hash the caller already computed.
-    async fn put_bytes(&self, kind: &str, hash: &str, data: Vec<u8>) -> Result<(), StorageError> {
-        let resp = self
+    /// `PUT` raw bytes under a hash the caller already computed, optionally
+    /// labelled for durability (ADR-0067 part 6). `None` sends no header —
+    /// which the Depot reads as `durable`, the compatibility default that
+    /// keeps an unlabelled writer on today's promise.
+    async fn put_bytes(
+        &self,
+        kind: &str,
+        hash: &str,
+        data: Vec<u8>,
+        label: Option<Label>,
+    ) -> Result<(), StorageError> {
+        let mut req = self
             .request(reqwest::Method::PUT, &format!("/v1/cas/{kind}/{hash}"))
-            .body(data)
-            .send()
-            .await
-            .map_err(Self::transport)?;
+            .body(data);
+        if let Some(label) = label {
+            req = req.header(DURABILITY_HEADER, label.as_str());
+        }
+        let resp = req.send().await.map_err(Self::transport)?;
         if !resp.status().is_success() {
             return Err(Self::status_error(resp).await);
         }
@@ -405,7 +468,7 @@ impl WorkspaceClient {
     /// the walk is a hard error from `scan_dir`, never a silent skip — the
     /// scan's `read_dir`/`read`/`metadata` failures all propagate.
     pub async fn ingest_report(&self, path: &str) -> Result<IngestReport, StorageError> {
-        self.ingest_report_inner(path, true).await
+        self.ingest_report_inner(path, None).await
     }
 
     /// [`ingest_report`](Self::ingest_report) for the **drain**: every scan
@@ -421,16 +484,37 @@ impl WorkspaceClient {
     /// workspace. Trees are small and a PUT requires the bytes, which is what
     /// preserves the security argument. `have_hits` consequently counts
     /// **blobs only** here — the tree question is never asked.
-    pub async fn drain_ingest_report(&self, path: &str) -> Result<IngestReport, StorageError> {
-        self.ingest_report_inner(path, false).await
+    ///
+    /// `outputs` is the Step's declared trim (ADR-0067 part 6): the pod
+    /// computes the pruned closure **locally, before uploading a byte** — the
+    /// scan already produced every tree, so the prune costs zero HTTP — and
+    /// labels the closure's blobs and trees `durable`, the scratch remainder
+    /// `cache-only`. Empty = the whole closure publishes, all durable. The
+    /// prune-minted parent trees themselves are PUT later by the caller's
+    /// real prune walk (over [`MemoCas`]) and ride the durable default.
+    pub async fn drain_ingest_report(
+        &self,
+        path: &str,
+        outputs: &[String],
+    ) -> Result<IngestReport, StorageError> {
+        self.ingest_report_inner(path, Some(outputs)).await
     }
 
+    /// `drain`: `None` = the feed-path ingest (tree `/have` dedup, no labels);
+    /// `Some(outputs)` = the drain (unconditional tree PUTs, durability labels
+    /// from the local prune of `outputs`).
     async fn ingest_report_inner(
         &self,
         path: &str,
-        dedup_trees: bool,
+        drain: Option<&[String]>,
     ) -> Result<IngestReport, StorageError> {
         let scan = scan_dir(std::path::Path::new(path))?;
+        let dedup_trees = drain.is_none();
+        let plan = match drain {
+            None => LabelPlan::Unlabelled,
+            Some(outputs) if outputs.is_empty() => LabelPlan::AllDurable,
+            Some(outputs) => durable_label_plan(&scan, outputs).await?,
+        };
 
         // One question for every blob, then upload only the misses.
         let blob_hashes: Vec<String> = scan.blobs.keys().cloned().collect();
@@ -441,11 +525,13 @@ impl WorkspaceClient {
             .filter_map(|hash| scan.blobs.get(&hash).cloned().map(|src| (hash, src)))
             .collect();
         let blobs_uploaded = uploads.len() as u64;
+        let plan = &plan;
         let results: Vec<Result<u64, StorageError>> = futures::stream::iter(uploads)
             .map(|(hash, source)| async move {
                 let data = read_blob_source(&source).await?;
                 let len = data.len() as u64;
-                self.put_bytes("blobs", &hash, data).await?;
+                self.put_bytes("blobs", &hash, data, plan.label_of(&hash))
+                    .await?;
                 Ok(len)
             })
             .buffer_unordered(CONCURRENCY)
@@ -466,13 +552,15 @@ impl WorkspaceClient {
             let (_, missing_trees) = self.missing_hashes(&[], &tree_hashes).await?;
             for (hash, bytes) in &scan.trees {
                 if missing_trees.iter().any(|m| m == hash) {
-                    self.put_bytes("trees", hash, bytes.clone()).await?;
+                    self.put_bytes("trees", hash, bytes.clone(), plan.label_of(hash))
+                        .await?;
                 }
             }
             (tree_hashes.len() - missing_trees.len()) as u64
         } else {
             for (hash, bytes) in &scan.trees {
-                self.put_bytes("trees", hash, bytes.clone()).await?;
+                self.put_bytes("trees", hash, bytes.clone(), plan.label_of(hash))
+                    .await?;
             }
             0
         };
@@ -832,7 +920,7 @@ fn canonical_tree(entries: Vec<TreeEntry>) -> Result<(TreeHash, Vec<u8>), Storag
 impl Cas for WorkspaceClient {
     async fn put_blob(&self, data: &[u8]) -> Result<BlobHash, StorageError> {
         let hash = hash_hex(data);
-        self.put_bytes("blobs", &hash, data.to_vec()).await?;
+        self.put_bytes("blobs", &hash, data.to_vec(), None).await?;
         Ok(BlobHash(hash))
     }
 
@@ -857,7 +945,11 @@ impl Cas for WorkspaceClient {
 
     async fn put_tree(&self, entries: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {
         let (hash, bytes) = canonical_tree(entries)?;
-        self.put_bytes("trees", &hash.0, bytes).await?;
+        // Unlabelled = the Depot's durable default (ADR-0067 part 6): the one
+        // fenced writer that comes through here is the drain's prune minting
+        // its narrower parents via [`MemoCas`], and those ARE the published
+        // closure — durable is the correct label, not an accident.
+        self.put_bytes("trees", &hash.0, bytes, None).await?;
         Ok(hash)
     }
 
@@ -1222,6 +1314,115 @@ struct Scan {
     /// Non-directory entries seen (files and symlinks) — NOT `blobs.len()`,
     /// which dedups identical content and would under-report.
     files: u64,
+}
+
+/// Decide a trimmed drain's durable set (ADR-0067 part 6): prune the scan's
+/// root to `outputs` **locally** — the scan holds every canonical tree, so
+/// the walk costs zero HTTP — then collect the pruned closure's tree and blob
+/// hashes. Deterministic over the same trees as the caller's later real prune
+/// (one `prune_tree`, one input), so the labels and the published closure
+/// cannot disagree.
+///
+/// A prune that finds the declaration unsatisfiable (`MissingPath` /
+/// `UnsafePath`) labels **everything cache-only**: nothing will publish — the
+/// caller's own prune fails identically and posts the `OutputContract` error
+/// record — and packing scratch for a drain that publishes nothing is pure
+/// waste. The workspace still reaches warm, preserving the post-hoc view.
+async fn durable_label_plan(scan: &Scan, outputs: &[String]) -> Result<LabelPlan, StorageError> {
+    let memo = ScanTreeCas::new(scan);
+    let root = TreeHash(scan.root.clone());
+    let pruned = match scarab_storage::prune_tree(&memo, &root, outputs).await {
+        Ok(pruned) => pruned,
+        Err(scarab_storage::PruneError::Storage(e)) => return Err(e),
+        Err(_) => return Ok(LabelPlan::Pruned(std::collections::HashSet::new())),
+    };
+    // The pruned closure, over the memo — which now also holds the
+    // prune-minted parents its `put_tree` recorded.
+    let mut durable = std::collections::HashSet::new();
+    let mut queue = vec![pruned.0];
+    while let Some(tree) = queue.pop() {
+        if !durable.insert(tree.clone()) {
+            continue;
+        }
+        for entry in memo.entries_of(&tree)? {
+            match entry.target {
+                TreeTarget::Blob(blob) => {
+                    durable.insert(blob.0);
+                }
+                TreeTarget::Tree(sub) => queue.push(sub.0),
+            }
+        }
+    }
+    Ok(LabelPlan::Pruned(durable))
+}
+
+/// A [`Cas`] over the scan's own canonical tree bytes, entirely in memory —
+/// what [`durable_label_plan`]'s prune walks instead of HTTP. Reads serve the
+/// scan; `put_tree` (the prune minting a narrower parent) canonicalises and
+/// remembers, exactly like [`MemoCas`] minus the wire. Content operations are
+/// deliberately unreachable: the label prune reads trees and writes trees,
+/// nothing else, and a path that asked for bytes here would be a bug worth a
+/// loud error rather than a silent download.
+struct ScanTreeCas {
+    trees: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
+}
+
+impl ScanTreeCas {
+    fn new(scan: &Scan) -> Self {
+        Self {
+            trees: std::sync::Mutex::new(scan.trees.iter().cloned().collect()),
+        }
+    }
+
+    fn entries_of(&self, hash: &str) -> Result<Vec<TreeEntry>, StorageError> {
+        let bytes = self
+            .trees
+            .lock()
+            .expect("scan-tree memo mutex poisoned")
+            .get(hash)
+            .cloned()
+            .ok_or(StorageError::NotFound)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| StorageError::Backend(format!("scanned tree {hash} unparseable: {e}")))
+    }
+
+    fn unreachable(op: &str) -> StorageError {
+        StorageError::Backend(format!(
+            "the label prune only reads and mints trees; {op} must never be asked of it"
+        ))
+    }
+}
+
+#[async_trait]
+impl Cas for ScanTreeCas {
+    async fn put_blob(&self, _data: &[u8]) -> Result<BlobHash, StorageError> {
+        Err(Self::unreachable("put_blob"))
+    }
+
+    async fn get_blob(&self, _hash: &BlobHash) -> Result<Vec<u8>, StorageError> {
+        Err(Self::unreachable("get_blob"))
+    }
+
+    async fn put_tree(&self, entries: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {
+        let (hash, bytes) = canonical_tree(entries)?;
+        self.trees
+            .lock()
+            .expect("scan-tree memo mutex poisoned")
+            .insert(hash.0.clone(), bytes);
+        Ok(hash)
+    }
+
+    async fn tree_entries(&self, hash: &TreeHash) -> Result<Vec<TreeEntry>, StorageError> {
+        self.entries_of(&hash.0)
+    }
+
+    async fn materialize(&self, _tree: &TreeHash, _path: &str) -> Result<(), StorageError> {
+        Err(Self::unreachable("materialize"))
+    }
+
+    async fn ingest(&self, _path: &str) -> Result<Snapshot, StorageError> {
+        Err(Self::unreachable("ingest"))
+    }
 }
 
 /// Hash a whole directory locally: every blob, every tree, bottom-up.

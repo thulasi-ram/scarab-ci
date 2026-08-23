@@ -463,7 +463,7 @@ async fn run_drain(client: &WorkspaceClient, workspace: &str, outputs: &[String]
     // The DRAIN variant: trees are PUT unconditionally so every tree of the
     // closure enters this fence's write ledger (only a PUT appends it), or
     // the record POST below would 422 on any incremental workspace.
-    let report = match client.drain_ingest_report(workspace).await {
+    let report = match client.drain_ingest_report(workspace, outputs).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("scarab-wsfetch: drain: ingest {workspace}: {e}");
