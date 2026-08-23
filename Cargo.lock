@@ -2884,6 +2884,7 @@ dependencies = [
  "scarab-engine",
  "scarab-storage",
  "scarab-testkit",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

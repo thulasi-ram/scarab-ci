@@ -30,8 +30,14 @@ struct Harness {
     tree_puts: Arc<AtomicUsize>,
     #[allow(dead_code)]
     warm: tempfile::TempDir,
+    /// SHARED across replicas, like the production bucket: `Arc`, so
+    /// [`Harness::replica`] serves the same cold store rather than a private
+    /// one — packs written through replica A must range-read through B.
     #[allow(dead_code)]
-    cold: tempfile::TempDir,
+    cold: Arc<tempfile::TempDir>,
+    /// A second handle over the same cold directory, for the assertions that
+    /// look straight into the bucket (commit packs, pack objects).
+    cold_store: Arc<S3Storage>,
     /// The fence rows' pool — kept so [`Harness::replica`] can start a second
     /// router over the SAME database (the replicaCount > 1 shape).
     pool: sqlx::PgPool,
@@ -45,24 +51,29 @@ impl Harness {
     async fn start() -> Option<Self> {
         let pg = common::TestPg::provision().await?;
         let pool = pg.pool.clone();
-        Some(Self::start_over(pool, Some(pg)).await)
+        let cold = Arc::new(tempfile::tempdir().expect("cold tempdir"));
+        Some(Self::start_over(pool, Some(pg), cold).await)
     }
 
     /// A SECOND Depot replica: its own warm volume (a fresh tempdir), the same
-    /// database. This is `replicaCount > 1` at this suite's grain — what
-    /// ADR-0067 part 2 exists for: the drain record and the write ledger must
-    /// be readable through EITHER replica, while warm bytes stay per-replica.
+    /// database, the SAME cold store. This is `replicaCount > 1` at this
+    /// suite's grain — what ADR-0067 exists for: the fence rows and the pack
+    /// index are shared rows, the bucket is one bucket, and only warm bytes
+    /// stay per-replica.
     async fn replica(&self) -> Self {
-        Self::start_over(self.pool.clone(), None).await
+        Self::start_over(self.pool.clone(), None, self.cold.clone()).await
     }
 
-    async fn start_over(pool: sqlx::PgPool, pg: Option<common::TestPg>) -> Self {
+    async fn start_over(
+        pool: sqlx::PgPool,
+        pg: Option<common::TestPg>,
+        cold: Arc<tempfile::TempDir>,
+    ) -> Self {
         let warm = tempfile::tempdir().expect("warm tempdir");
-        let cold = tempfile::tempdir().expect("cold tempdir");
         let cold_store = Arc::new(S3Storage::local(cold.path()).expect("cold store"));
         let app = scarab_server::workspaced::router(
             warm.path(),
-            cold_store,
+            cold_store.clone(),
             SECRET.to_vec(),
             scarab_server::workspaced::DurabilityTier::SeparateVolume,
             pool.clone(),
@@ -106,6 +117,7 @@ impl Harness {
             tree_puts,
             warm,
             cold,
+            cold_store,
             pool,
             pg,
         }
@@ -304,7 +316,7 @@ async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
     let before = h.tree_puts.load(Ordering::SeqCst);
     let report = h
         .fence_client()
-        .drain_ingest_report(path)
+        .drain_ingest_report(path, &[])
         .await
         .expect("drain ingest");
     assert_eq!(
@@ -340,7 +352,7 @@ async fn a_drain_record_round_trips_ingest_prune_record_get() {
     // appended only on PUT), memo-fed prune+identity, record LAST.
     let helper = h.fence_client();
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap())
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
         .await
         .expect("ingest with the fence token");
     let root: TreeHash = report.snapshot.root.clone();
@@ -406,7 +418,7 @@ async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
 
     let helper = h.fence_client_for("run-1", "fmt/check", "a1");
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap())
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
         .await
         .expect("ingest with the slash-stepped fence token");
     let rec = DrainRecord {
@@ -436,23 +448,24 @@ async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
     assert_eq!(got, rec, "the Depot must hand back exactly what was posted");
 }
 
-/// ADR-0067 part 2 at this suite's grain: `replicaCount > 1`. The fence rows —
-/// the drain record and the write ledger — live in the control plane's
-/// Postgres, so a drain served entirely by replica A must be *visible* through
-/// replica B: the record GET answers through either, and the ledger arm of
-/// tree authorization holds on a replica that never saw the PUT.
+/// ADR-0067 at this suite's grain: `replicaCount > 1`. The fence rows — the
+/// drain record and the write ledger — live in the control plane's Postgres,
+/// so a drain served entirely by replica A must be *visible* through replica
+/// B: the record GET answers through either, and the ledger arm of tree
+/// authorization holds on a replica that never saw the PUT.
 ///
-/// Warm bytes stay per-replica on purpose (this slice moves the RECORD halves,
-/// not the bodies), which is what the 404-vs-403 contrast at the bottom pins:
-/// through B the owning fence is *authorized but the bytes are elsewhere*
-/// (404), while a foreign fence is *refused* (403). Before ADR-0067 part 2
-/// both were 403 — B's ledger file was empty — so the contrast is exactly the
-/// row-sharing this slice exists for.
+/// Since slice 3 the durable BYTES cross replicas too: the drain streamed
+/// them into packs in the shared bucket and the record POST committed the
+/// index rows, so the owning fence's tree GET through B — whose warm has
+/// never held a byte — answers **200 with the verbatim tree** via a ranged
+/// read into the pack. (Under slice 2 this was a 404: authorized, bytes
+/// elsewhere.) A foreign fence stays 403: authorization is decided before
+/// content, and the shared index must not become a cross-fence read grant.
 ///
 /// Mutation killed: the ledger or the record quietly moving back onto a
-/// replica-local file (either read path re-rooted under `warm_dir`): the
-/// record GET through B answers `None` and the owning fence's tree GET
-/// through B collapses to 403, both asserted against.
+/// replica-local file (record GET through B answers `None`; owner GET
+/// collapses to 403), or the dual-read losing its pack arm (owner GET through
+/// B regresses to 404 — the replica-independence part 4 paid for).
 #[tokio::test]
 async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
     let Some(a) = Harness::start().await else { return };
@@ -465,7 +478,7 @@ async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
     build_workspace(ws.path());
     let helper = a.fence_client();
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap())
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
         .await
         .expect("drain ingest against replica A");
     let root = report.snapshot.root.0.clone();
@@ -498,8 +511,9 @@ async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
     assert_eq!(got, rec, "replica B must hand back exactly what A persisted");
 
     // The write ledger crosses replicas too: on B, the owning fence's
-    // single-tree GET is AUTHORIZED by the shared ledger row — B's tiers just
-    // do not hold the bytes (404) — while a foreign fence stays refused (403).
+    // single-tree GET is AUTHORIZED by the shared ledger row, and since
+    // slice 3 the BYTES answer as well — B range-reads them out of the pack
+    // the drain wrote to the shared bucket. A foreign fence stays refused.
     let http = reqwest::Client::new();
     let owner = http
         .get(format!("{}/v1/cas/trees/{root}", b.base))
@@ -523,9 +537,16 @@ async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
         .expect("owning-fence tree GET via replica B");
     assert_eq!(
         owner.status(),
-        404,
-        "the owning fence must be AUTHORIZED on replica B (the ledger is a shared row); \
-         404 = bytes live on A's warm volume, which this slice deliberately leaves per-replica"
+        200,
+        "the owning fence must be AUTHORIZED on replica B (the ledger is a shared row) AND \
+         served: the drain packed the tree durably, so B range-reads it from the shared \
+         bucket via the pack index (ADR-0067 slice 3)"
+    );
+    let owner_bytes = owner.bytes().await.expect("owner tree body").to_vec();
+    assert_eq!(
+        scarab_storage::sha256_hex(&owner_bytes),
+        root,
+        "the tree served out of a pack must still be the verbatim canonical bytes"
     );
     let foreign = http
         .get(format!("{}/v1/cas/trees/{root}", b.base))
@@ -553,4 +574,309 @@ async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
         "a fence that never wrote the tree must stay refused — the shared ledger \
          must not become a cross-fence read grant"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-0067 slice 3 — the pack is the record
+// ---------------------------------------------------------------------------
+
+/// The tagged spelling index rows and footers use (ADR-0067 part 12).
+fn tagged(hex: &str) -> String {
+    format!("sha256:{hex}")
+}
+
+async fn member_rows_for(pool: &sqlx::PgPool, hex: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM depot_pack_members WHERE address = $1")
+        .bind(tagged(hex))
+        .fetch_one(pool)
+        .await
+        .expect("count member rows")
+}
+
+/// The whole slice in one arc: a drain trimmed by `outputs:` streams exactly
+/// its pruned closure into packs; the drain record commits the index; and a
+/// SECOND replica whose warm has never held a byte serves every published
+/// address by ranged reads into the shared bucket — while the build scratch
+/// never enters the durable index at all, and the pre-existing flush finds
+/// zero blobs left to upload.
+///
+/// Mutations killed: dropping the pod's labels (junk lands in the index — the
+/// junk assertion fires); packing without the index transaction (replica B
+/// 404s); labelling by upload order instead of the pruned closure (either
+/// assertion); the flush ignoring the pack index (blobs_uploaded != 0 — the
+/// second pass re-uploading what part 4 already made durable).
+#[tokio::test]
+async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_address() {
+    use scarab_storage::content::ContentSource;
+    use scarab_storage::{BlobHash, Cas};
+
+    let Some(a) = Harness::start().await else { return };
+    let ws = tempfile::tempdir().unwrap();
+    build_workspace(ws.path());
+    let declared = vec!["src".to_string(), "plain.txt".to_string()];
+
+    // The drain exactly as `scarab-wsfetch drain` composes it.
+    let helper = a.fence_client();
+    let report = helper
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
+        .await
+        .expect("drain ingest with labels");
+    let memo = MemoCas::new(&helper, report.trees);
+    let pruned = scarab_storage::prune_tree(&memo, &report.snapshot.root, &declared)
+        .await
+        .expect("prune");
+    let identity = scarab_storage::content_identity(&memo, &pruned)
+        .await
+        .expect("identity");
+    helper
+        .post_drain_record(&DrainRecord {
+            root: report.snapshot.root.0.clone(),
+            pruned_root: Some(pruned.0.clone()),
+            identity: Some(identity.0),
+            files: report.files,
+            tree_bytes: report.tree_bytes,
+            blobs_uploaded: report.blobs_uploaded,
+            bytes_uploaded: report.bytes_uploaded,
+            have_hits: report.have_hits,
+            ingest_ms: 7,
+            prune_ms: 2,
+            error: None,
+        })
+        .await
+        .expect("post drain record");
+
+    // The index rows exist — body pack(s) plus the commit pack, this fence's.
+    let fence_key = scarab_workspace_client::drain_fence_key("run-1", "build", "a1");
+    let packs: Vec<(String, String)> =
+        sqlx::query_as("SELECT pack_key, kind FROM depot_packs WHERE fence_key = $1")
+            .bind(&fence_key)
+            .fetch_all(&a.pool)
+            .await
+            .expect("pack rows");
+    assert!(
+        packs.iter().any(|(_, kind)| kind == "body"),
+        "at least one body pack row: {packs:?}"
+    );
+    assert!(
+        packs
+            .iter()
+            .any(|(key, kind)| kind == "commit" && key.ends_with("/commit.pack")),
+        "the commit pack row: {packs:?}"
+    );
+    // …and the commit pack is a real object in the bucket, written before the
+    // rows that name it.
+    use scarab_storage::ObjectStore as _;
+    a.cold_store
+        .get(&format!("packs/{fence_key}/commit.pack"))
+        .await
+        .expect("the commit pack object exists in the bucket");
+
+    // The published closure is in the index; the scratch is not. The labels
+    // were computed from the pruned closure, not from upload order.
+    let kept_blob = scarab_storage::sha256_hex(b"fn main() {}");
+    let junk_blob = scarab_storage::sha256_hex(&vec![7u8; 4096]);
+    assert!(
+        member_rows_for(&a.pool, &pruned.0).await > 0,
+        "the pruned root tree must be a durable pack member"
+    );
+    assert!(
+        member_rows_for(&a.pool, &kept_blob).await > 0,
+        "a blob under a declared output must be a durable pack member"
+    );
+    assert_eq!(
+        member_rows_for(&a.pool, &junk_blob).await,
+        0,
+        "build scratch (target/junk.bin) must NOT enter the durable index — it was \
+         labelled cache-only and stays a warm-only convenience"
+    );
+    assert_eq!(
+        member_rows_for(&a.pool, &report.snapshot.root.0).await,
+        0,
+        "the UNPRUNED root names the scratch and is not published — cache-only, not packed"
+    );
+
+    // A second replica: empty warm, shared database, shared bucket. Every
+    // published address must answer through it — ranged reads into the packs.
+    let b = a.replica().await;
+    let reader = b.browse_client();
+    let entries = reader.tree_entries(&pruned).await.expect(
+        "the pruned root must be readable through a replica that never held it warm",
+    );
+    assert!(!entries.is_empty());
+    let range = reader
+        .read_range(&BlobHash(kept_blob.clone()), 0, 4)
+        .await
+        .expect("ranged read of a packed blob through replica B");
+    assert_eq!(range, b"fn m", "the range must come off the packed bytes");
+    // And the whole feed surface: /flat sizes off the index (no read), blobs
+    // off the packs.
+    let manifest = reader.flat(&pruned).await.expect("/flat through replica B");
+    for entry in &manifest.entries {
+        let bytes = reader.get_blob(&entry.blob).await.expect("blob via B");
+        assert_eq!(bytes.len() as u64, entry.size, "size index vs bytes: {}", entry.path);
+    }
+
+    // The (still-existing) second pass has nothing left to carry: every blob
+    // of the published closure is already durable in a pack.
+    let flushed: serde_json::Value = reqwest::Client::new()
+        .post(format!("{}/v1/cas/flush", a.base))
+        .header(
+            "x-scarab-workspace-token",
+            workspace_token::mint(SECRET, &workspace_token::browse_claims(far_future())),
+        )
+        .json(&serde_json::json!({ "root": pruned.0 }))
+        .send()
+        .await
+        .expect("flush request")
+        .json()
+        .await
+        .expect("flush tally");
+    assert_eq!(
+        flushed["blobs_uploaded"],
+        serde_json::json!(0),
+        "the flush must not re-upload loose copies of packed blobs: {flushed}"
+    );
+    assert_eq!(flushed["durable"], serde_json::json!(true), "{flushed}");
+}
+
+/// The top risk of the whole plan, pinned: **bytes before pointers** (ADR-0067
+/// part 10). A drain that uploaded its whole workspace with durable labels but
+/// whose record POST never happened — the crash window — must leave ZERO index
+/// rows and ZERO visible pack objects: the open multipart upload is invisible
+/// until completed, and completion + commit pack happen inside the record POST
+/// strictly before the transaction that writes rows. Then the record POST runs
+/// and both sides appear together.
+///
+/// Mutation killed: inserting pack/member rows at PUT time (rows exist before
+/// the POST — `/have`-shaped readers would skip uploads for bytes that are not
+/// yet durable, the one unrecoverable direction), or completing packs lazily
+/// after the transaction (the object-existence asserts after the POST fail).
+#[tokio::test]
+async fn pack_bytes_land_strictly_before_any_index_row() {
+    use scarab_storage::{ObjectStore as _, StorageError};
+
+    let Some(h) = Harness::start().await else { return };
+    let ws = tempfile::tempdir().unwrap();
+    build_workspace(ws.path());
+
+    let helper = h.fence_client_for("run-9", "pack-order", "a1");
+    let report = helper
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
+        .await
+        .expect("drain ingest, everything durable");
+
+    // The crash window: uploads done, record never posted.
+    let fence_key = scarab_workspace_client::drain_fence_key("run-9", "pack-order", "a1");
+    let rows = |table: &'static str, pool: sqlx::PgPool| async move {
+        sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .expect(table)
+    };
+    assert_eq!(
+        rows("depot_packs", h.pool.clone()).await,
+        0,
+        "no pack row may exist before the drain record commits"
+    );
+    assert_eq!(
+        rows("depot_pack_members", h.pool.clone()).await,
+        0,
+        "no member row may exist before the drain record commits"
+    );
+    assert!(
+        matches!(
+            h.cold_store
+                .get(&format!("packs/{fence_key}/000001.pack"))
+                .await,
+            Err(StorageError::NotFound)
+        ),
+        "the open pack is a multipart upload — invisible until the drain seals it"
+    );
+    assert!(
+        matches!(
+            h.cold_store
+                .get(&format!("packs/{fence_key}/commit.pack"))
+                .await,
+            Err(StorageError::NotFound)
+        ),
+        "no commit pack before the record POST — reachability begins at the commit pack"
+    );
+
+    // The record POST is the commit point: packs complete, commit pack lands,
+    // one transaction writes rows. Both sides appear together.
+    helper
+        .post_drain_record(&DrainRecord {
+            root: report.snapshot.root.0.clone(),
+            pruned_root: None,
+            identity: report.snapshot.identity.as_ref().map(|t| t.0.clone()),
+            files: report.files,
+            tree_bytes: report.tree_bytes,
+            blobs_uploaded: report.blobs_uploaded,
+            bytes_uploaded: report.bytes_uploaded,
+            have_hits: report.have_hits,
+            ingest_ms: 3,
+            prune_ms: 0,
+            error: None,
+        })
+        .await
+        .expect("post drain record");
+
+    assert!(rows("depot_packs", h.pool.clone()).await >= 2, "body + commit rows");
+    assert!(rows("depot_pack_members", h.pool.clone()).await > 0);
+    // The bucket self-describes (part 11): the sealed pack's own footer parses
+    // back, off the bucket alone, and agrees with the index rows.
+    let index = h
+        .cold_store
+        .pack_index(&format!("packs/{fence_key}/000001.pack"))
+        .await
+        .expect("the sealed pack's footer index reads back off the bucket alone");
+    assert!(!index.is_empty());
+    let in_rows = member_rows_for(&h.pool, index[0].address.trim_start_matches("sha256:")).await;
+    assert!(in_rows > 0, "footer and index rows must agree on membership");
+    h.cold_store
+        .get(&format!("packs/{fence_key}/commit.pack"))
+        .await
+        .expect("the commit pack exists once the drain is recorded");
+}
+
+/// The durability label is validated at the door: a value that is neither
+/// `durable` nor `cache-only` is a 400 — never silently rounded to either
+/// promise — and both real values are accepted.
+#[tokio::test]
+async fn an_unknown_durability_label_is_refused_at_the_door() {
+    let Some(h) = Harness::start().await else { return };
+    let data = b"labelled bytes".to_vec();
+    let hash = scarab_storage::sha256_hex(&data);
+    let token = workspace_token::mint(
+        SECRET,
+        &workspace_token::step_claims(
+            Fence {
+                run: "run-1".into(),
+                step: "label".into(),
+                attempt: "a1".into(),
+            },
+            far_future(),
+            Vec::new(),
+        ),
+    );
+    let http = reqwest::Client::new();
+    let put = |label: &'static str| {
+        let http = http.clone();
+        let url = format!("{}/v1/cas/blobs/{hash}", h.base);
+        let token = token.clone();
+        let data = data.clone();
+        async move {
+            http.put(url)
+                .header("x-scarab-workspace-token", token)
+                .header("x-scarab-durability", label)
+                .body(data)
+                .send()
+                .await
+                .expect("PUT")
+                .status()
+        }
+    };
+    assert_eq!(put("bogus").await, 400, "an unknown label must fail closed");
+    assert_eq!(put("cache-only").await, 201);
+    assert_eq!(put("durable").await, 200, "idempotent re-PUT, now packed");
 }
