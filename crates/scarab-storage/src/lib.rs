@@ -223,6 +223,54 @@ pub fn sha256_hex(data: &[u8]) -> String {
     hex
 }
 
+/// The hash algorithm an address's tag names (ADR-0067 part 12).
+///
+/// One variant on purpose. The tag is what keeps the digest choice reversible
+/// (ADR-0066 point 11, layer 1): a later `blake3:` address can coexist with
+/// every `sha256:` one without a rewrite, but nothing commits to a second
+/// algorithm before its verified-streaming story is load-bearing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashAlgo {
+    Sha256,
+}
+
+impl HashAlgo {
+    /// The tag as it appears on the wire, without the `:`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HashAlgo::Sha256 => "sha256",
+        }
+    }
+}
+
+/// Split an address into its algorithm and its bare hex (ADR-0067 part 12).
+///
+/// Accepts both forms every reader must: tagged (`sha256:<hex>`) and legacy
+/// bare hex, which is implicitly SHA-256 — the only algorithm any address ever
+/// written so far was computed with. An unknown tag is refused, fail-closed: a
+/// `blake3:` address must error, never be silently filed under a SHA-256 key
+/// its bytes do not hash to.
+///
+/// This does **not** validate the hex itself — length and charset stay with
+/// the caller, which already had that job for bare addresses.
+pub fn parse_address(address: &str) -> Result<(HashAlgo, &str), StorageError> {
+    match address.split_once(':') {
+        None => Ok((HashAlgo::Sha256, address)),
+        Some(("sha256", hex)) => Ok((HashAlgo::Sha256, hex)),
+        Some((algo, _)) => Err(StorageError::UnknownAlgorithm(algo.to_string())),
+    }
+}
+
+/// The tagged form of an address: `sha256:<hex>`.
+///
+/// Everything written from now on — index rows, pack footers, `/have` bodies —
+/// is born tagged (ADR-0067 part 12). The tag lives only at those boundaries:
+/// storage keys (`blobs/<hex>`, `trees/<hex>`) and tree-internal targets stay
+/// bare, because canonical tree bytes are a frozen hash preimage.
+pub fn tagged_address(algo: HashAlgo, hex: &str) -> String {
+    format!("{}:{hex}", algo.as_str())
+}
+
 /// The canonical byte form of a tree — **the hash preimage**: entries sorted by
 /// name, then compact `serde_json`. Structurally identical trees therefore share
 /// a hash (and thus dedup) regardless of insertion order.
@@ -342,6 +390,8 @@ pub enum StorageError {
     NotFound,
     #[error("hash mismatch (corruption)")]
     HashMismatch,
+    #[error("unknown hash algorithm: {0}")]
+    UnknownAlgorithm(String),
     #[error("storage backend error: {0}")]
     Backend(String),
 }
@@ -501,4 +551,42 @@ pub async fn prune_tree(
     // Deterministic order — the tree hash must not depend on authoring order.
     kept.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(cas.put_tree(kept).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-0067 part 12: both spellings parse to the same (algorithm, hex) —
+    /// the tag changes nothing about what the address names.
+    #[test]
+    fn parse_address_accepts_tagged_and_bare_as_one_identity() {
+        let hex = "a".repeat(64);
+        let tagged = tagged_address(HashAlgo::Sha256, &hex);
+        assert_eq!(tagged, format!("sha256:{hex}"));
+        assert_eq!(parse_address(&hex).unwrap(), (HashAlgo::Sha256, hex.as_str()));
+        assert_eq!(parse_address(&tagged).unwrap(), (HashAlgo::Sha256, hex.as_str()));
+    }
+
+    /// An unknown tag errors rather than falling through as SHA-256 — filing
+    /// a `blake3:` address under a SHA-256 key would be silent corruption.
+    #[test]
+    fn parse_address_refuses_an_unknown_algorithm() {
+        for bad in ["blake3:aaaa", "sha512:bbbb", ":cccc", "SHA256:dddd"] {
+            assert!(
+                matches!(parse_address(bad), Err(StorageError::UnknownAlgorithm(_))),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// Hex validity is deliberately NOT this function's job — the caller keeps
+    /// it, exactly as it already had it for bare addresses.
+    #[test]
+    fn parse_address_leaves_hex_validation_to_the_caller() {
+        assert_eq!(
+            parse_address("sha256:not-hex").unwrap(),
+            (HashAlgo::Sha256, "not-hex")
+        );
+    }
 }

@@ -1276,6 +1276,22 @@ fn valid_hash(hash: &str) -> Result<(), WsError> {
     }
 }
 
+/// A content address as it may arrive on the wire: [`valid_hash`] hex,
+/// optionally algorithm-tagged (`sha256:<hex>`, ADR-0067 part 12).
+///
+/// Returns the normalized **bare** hex, and that normalization happens once,
+/// here, at the handler edge: storage keys (`blobs/<hex>`, `trees/<hex>`),
+/// ledger entries and every `PathBuf` below this line stay bare, so a tagged
+/// and a bare spelling of one object can never fork into two identities. An
+/// unknown tag (`blake3:`) is a 400, fail-closed — never filed under a
+/// SHA-256 key its bytes do not hash to.
+fn valid_address(address: &str) -> Result<String, WsError> {
+    let (_algo, hex) = scarab_storage::parse_address(address)
+        .map_err(|e| WsError::BadRequest(e.to_string()))?;
+    valid_hash(hex)?;
+    Ok(hex.to_string())
+}
+
 /// The content address of `data`: its SHA-256, lowercase hex.
 ///
 /// Duplicated from the `scarab-storage-s3` adapter's private helper on purpose —
@@ -1395,7 +1411,7 @@ async fn get_blob(
     Path(hash): Path<String>,
 ) -> Result<Response, WsError> {
     authenticate(&state, &headers)?;
-    valid_hash(&hash)?;
+    let hash = valid_address(&hash)?;
 
     if let Some((first, last)) = parse_range(&headers) {
         return ranged_blob(&state, &hash, first, last).await;
@@ -1551,7 +1567,7 @@ async fn head_blob(
     Path(hash): Path<String>,
 ) -> Result<Response, WsError> {
     authenticate(&state, &headers)?;
-    valid_hash(&hash)?;
+    let hash = valid_address(&hash)?;
 
     let path = warm_blob_path(&state, &hash);
     let len = match tokio::fs::metadata(&path).await {
@@ -1591,7 +1607,7 @@ async fn put_blob(
     body: axum::body::Bytes,
 ) -> Result<Response, WsError> {
     authenticate(&state, &headers)?;
-    valid_hash(&hash)?;
+    let hash = valid_address(&hash)?;
 
     let actual = hash_hex(&body);
     if actual != hash {
@@ -1647,8 +1663,10 @@ async fn get_tree(
     headers: HeaderMap,
     Path(hash): Path<String>,
 ) -> Result<Response, WsError> {
+    // Normalized BEFORE authorization: the roots claim and the write ledger
+    // hold bare hex, so a tagged spelling must be stripped for them to match.
+    let hash = valid_address(&hash)?;
     authorize_tree(&state, &headers, &hash, TreeRead::Single).await?;
-    valid_hash(&hash)?;
     let bytes = state.objects.get(&format!("trees/{hash}")).await?;
     let mut resp = bytes.into_response();
     resp.headers_mut().insert(
@@ -1674,7 +1692,7 @@ async fn put_tree(
     body: axum::body::Bytes,
 ) -> Result<Response, WsError> {
     let claims = authenticate(&state, &headers)?;
-    valid_hash(&hash)?;
+    let hash = valid_address(&hash)?;
 
     let actual = hash_hex(&body);
     if actual != hash {
@@ -1781,8 +1799,9 @@ async fn get_flat(
     headers: HeaderMap,
     Path(hash): Path<String>,
 ) -> Result<Json<FlatManifest>, WsError> {
+    // Normalized before authorization, as in `get_tree`.
+    let hash = valid_address(&hash)?;
     authorize_tree(&state, &headers, &hash, TreeRead::Flat).await?;
-    valid_hash(&hash)?;
     Ok(Json(flatten(&state, &TreeHash(hash)).await?))
 }
 
@@ -1929,17 +1948,20 @@ async fn have(
     // every object as missing. That direction is not merely wasteful — the client
     // would re-upload the entire workspace over a volume that cannot store it,
     // and each PUT would then fail anyway, one round trip at a time.
+    // The response echoes each missing address AS THE CLIENT SPELLED IT —
+    // tagged or bare — because the client correlates the answer against its
+    // own request set (ADR-0067 part 12). Only the warm probe is normalized.
     let mut missing_blobs = Vec::new();
     for hash in &req.blobs {
-        valid_hash(hash)?;
-        if !warm_has(&warm_blob_path(&state, hash)).await? {
+        let bare = valid_address(hash)?;
+        if !warm_has(&warm_blob_path(&state, &bare)).await? {
             missing_blobs.push(hash.clone());
         }
     }
     let mut missing_trees = Vec::new();
     for hash in &req.trees {
-        valid_hash(hash)?;
-        if !warm_has(&warm_tree_path(&state, hash)).await? {
+        let bare = valid_address(hash)?;
+        if !warm_has(&warm_tree_path(&state, &bare)).await? {
             missing_trees.push(hash.clone());
         }
     }
@@ -2299,7 +2321,7 @@ async fn validate_drain_closure(
 async fn post_drain(
     State(state): State<WorkspaceState>,
     headers: HeaderMap,
-    Json(record): Json<DrainRecord>,
+    Json(mut record): Json<DrainRecord>,
 ) -> Result<Response, WsError> {
     let claims = authenticate(&state, &headers)?;
     // Step-id charset is unvalidated (workspace_token.rs:473 pins that `/`, `|` etc.
@@ -2331,12 +2353,14 @@ async fn post_drain(
     }
 
     if record.error.is_none() {
-        valid_hash(&record.root)?;
-        if let Some(pruned) = &record.pruned_root {
-            valid_hash(pruned)?;
+        // Normalized INTO the record: the ledger checks below and the persisted
+        // record itself must see bare hex, whichever spelling arrived.
+        record.root = valid_address(&record.root)?;
+        if let Some(pruned) = record.pruned_root.take() {
+            record.pruned_root = Some(valid_address(&pruned)?);
         }
-        if let Some(identity) = &record.identity {
-            valid_hash(identity)?;
+        if let Some(identity) = record.identity.take() {
+            record.identity = Some(valid_address(&identity)?);
         }
 
         let ledger = read_ledger(&state, &fence).await?;
@@ -3934,6 +3958,24 @@ mod tests {
             &"a".repeat(65),
         ] {
             assert!(valid_hash(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    /// ADR-0067 part 12: a tagged address normalizes to the same bare hex a
+    /// legacy address is, an unknown algorithm is refused, and the hex rules
+    /// still apply behind the tag — a tag is not a way around the path guard.
+    #[test]
+    fn a_tagged_address_normalizes_and_an_unknown_algorithm_is_refused() {
+        let hex = "a".repeat(64);
+        assert_eq!(valid_address(&hex).unwrap(), hex);
+        assert_eq!(valid_address(&format!("sha256:{hex}")).unwrap(), hex);
+        for bad in [
+            format!("blake3:{hex}"),
+            format!("sha256:{}", "A".repeat(64)),
+            "sha256:../../etc/passwd".to_string(),
+            format!("sha256:sha256:{hex}"),
+        ] {
+            assert!(valid_address(&bad).is_err(), "{bad:?} must be rejected");
         }
     }
 

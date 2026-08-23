@@ -489,6 +489,126 @@ async fn put_is_idempotent_and_says_which_happened() {
     assert_eq!(second.status(), 200, "already had it");
 }
 
+/// ADR-0067 part 12: a tagged address (`sha256:<hex>`) names the SAME object a
+/// bare address stored — on PUT, GET, tree GET and `/have`. Two spellings, one
+/// identity; the alternative is one object forked under two warm keys.
+#[tokio::test]
+async fn a_tagged_address_names_the_same_object_as_its_bare_form() {
+    let h = Harness::start().await;
+    let body = b"tagged and bare are one object".to_vec();
+    let hash = {
+        use sha2::Digest;
+        let d = sha2::Sha256::digest(&body);
+        d.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+
+    // Stored under the BARE spelling...
+    let put = h
+        .raw()
+        .put(format!("{}/v1/cas/blobs/{hash}", h.base))
+        .header("x-scarab-workspace-token", h.browse_token())
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 201, "stored bare");
+
+    // ...readable under the TAGGED one.
+    let got = h
+        .raw()
+        .get(format!("{}/v1/cas/blobs/sha256:{hash}", h.base))
+        .header("x-scarab-workspace-token", h.browse_token())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(got.status(), 200, "tagged GET finds the bare-stored blob");
+    assert_eq!(got.bytes().await.unwrap().as_ref(), &body[..]);
+
+    // A tagged re-PUT is the idempotent 200 — the SAME warm key, not a second
+    // object under a `sha256:...` filename.
+    let again = h
+        .raw()
+        .put(format!("{}/v1/cas/blobs/sha256:{hash}", h.base))
+        .header("x-scarab-workspace-token", h.browse_token())
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200, "tagged PUT hits the bare-stored object");
+
+    // `/have` under the tagged spelling agrees the object is present, and a
+    // missing address comes back AS THE CLIENT SPELLED IT, so the caller can
+    // correlate the answer against its own request set.
+    let absent = format!("sha256:{}", "b".repeat(64));
+    let have = h
+        .raw()
+        .post(format!("{}/v1/cas/have", h.base))
+        .header("x-scarab-workspace-token", h.browse_token())
+        .json(&serde_json::json!({
+            "blobs": [format!("sha256:{hash}"), absent.clone()],
+            "trees": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(have.status(), 200);
+    let have: serde_json::Value = have.json().await.unwrap();
+    assert_eq!(
+        have["missing_blobs"],
+        serde_json::json!([absent]),
+        "present-under-bare is not missing under tagged; absent echoes as sent"
+    );
+
+    // And a tree stored bare (through the client) is readable tagged.
+    let client = h.browse_client();
+    let root = client
+        .put_tree(vec![scarab_storage::TreeEntry::new(
+            "a",
+            scarab_storage::TreeTarget::Blob(scarab_storage::BlobHash(hash.clone())),
+        )])
+        .await
+        .unwrap();
+    let tree = h
+        .raw()
+        .get(format!("{}/v1/cas/trees/sha256:{}", h.base, root.0))
+        .header("x-scarab-workspace-token", h.browse_token())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tree.status(), 200, "tagged tree GET finds the bare-stored tree");
+}
+
+/// An unknown algorithm tag is a 400 at the door, never a miss and never a
+/// silent filing under a SHA-256 key its bytes do not hash to (ADR-0067
+/// part 12 — `blake3:` is the intended follow-up, not an accepted input).
+#[tokio::test]
+async fn an_unknown_algorithm_tag_is_a_400() {
+    let h = Harness::start().await;
+    let addr = format!("blake3:{}", "a".repeat(64));
+    for url in [
+        format!("{}/v1/cas/blobs/{addr}", h.base),
+        format!("{}/v1/cas/trees/{addr}", h.base),
+    ] {
+        let resp = h
+            .raw()
+            .get(url)
+            .header("x-scarab-workspace-token", h.browse_token())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "GET {addr} must be refused");
+    }
+    let put = h
+        .raw()
+        .put(format!("{}/v1/cas/blobs/{addr}", h.base))
+        .header("x-scarab-workspace-token", h.browse_token())
+        .body(b"whatever".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 400, "PUT {addr} must be refused");
+}
+
 /// No token, a forged token and an expired token are all 401 — and a valid token
 /// that does not name the root is 403, which is a different fact.
 #[tokio::test]
