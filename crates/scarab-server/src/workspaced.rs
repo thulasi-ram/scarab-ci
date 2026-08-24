@@ -2120,6 +2120,11 @@ fn durability_of(headers: &HeaderMap, fence: Option<&Fence>) -> Result<Durabilit
 /// retried drain appends what is still missing and seals then.
 struct PackSession {
     fence_key: String,
+    /// The control plane's Postgres — where a sealed pack's rows are staged
+    /// the moment its multipart upload completes (git-bug afb13c2): rows with
+    /// `committed = FALSE`, per-pack bytes-before-pointers, so another
+    /// replica's drain POST can see this replica's sealed bytes mid-drain.
+    db: sqlx::PgPool,
     /// Unique per in-memory session (R2). The sequence alone restarts at 1
     /// with every session, so two sessions for one fence — concurrent
     /// duplicate POSTs on two replicas, or a restart-recreated session — would
@@ -2141,9 +2146,10 @@ struct PackSession {
 }
 
 impl PackSession {
-    fn new(fence_key: String) -> Self {
+    fn new(fence_key: String, db: sqlx::PgPool) -> Self {
         Self {
             fence_key,
+            db,
             session: uuid::Uuid::new_v4().simple().to_string(),
             next_seq: 1,
             open: None,
@@ -2213,6 +2219,16 @@ impl PackSession {
 
     /// Complete the open pack's multipart upload — the atomic publish. On
     /// failure the writer's members leave `packed` (see [`Self::append`]).
+    ///
+    /// A sealed pack's index rows are STAGED right here (git-bug afb13c2):
+    /// one small transaction, `committed = FALSE`, strictly after the
+    /// multipart completes — per-pack bytes-before-pointers. Staged rows are
+    /// what lets a drain whose PUTs scattered across replicas find every
+    /// sealed byte at POST time; the record transaction flips them committed.
+    /// A staging failure does NOT fail the seal: the pack stays in `sealed`
+    /// (the fence's own POST re-inserts it, `ON CONFLICT DO NOTHING`), and
+    /// its members leave `packed` so a retried PUT re-packs them — the path
+    /// a cross-replica POST needs when this replica's rows never landed.
     async fn seal_open(&mut self) -> Result<(), StorageError> {
         let Some(writer) = self.open.take() else {
             return Ok(());
@@ -2221,6 +2237,19 @@ impl PackSession {
             writer.members().iter().map(|m| m.address.clone()).collect();
         match writer.finish().await {
             Ok(finished) => {
+                if let Err(e) = stage_pack_rows(&self.db, &self.fence_key, &finished).await {
+                    tracing::warn!(
+                        fence_key = %self.fence_key,
+                        pack_key = %finished.key,
+                        error = %e,
+                        "staging a sealed pack's index rows failed — the pack is durable \
+                         in the bucket and stays in this session (its own POST will \
+                         re-insert the rows); its members will re-pack if re-PUT"
+                    );
+                    for address in &addresses {
+                        self.packed.remove(address);
+                    }
+                }
                 self.sealed.push(finished);
                 Ok(())
             }
@@ -2255,6 +2284,7 @@ fn pack_session(state: &WorkspaceState, fence_key: &str) -> Arc<tokio::sync::Mut
         .or_insert_with(|| {
             Arc::new(tokio::sync::Mutex::new(PackSession::new(
                 fence_key.to_string(),
+                state.db.clone(),
             )))
         })
         .clone()
@@ -2303,22 +2333,32 @@ struct CommitPackDoc<'a> {
     root: String,
     /// The effective published root: `pruned_root` when the drain pruned.
     published_root: String,
-    packs: Vec<CommitPackEntry<'a>>,
+    packs: Vec<CommitPackEntry>,
 }
 
 #[derive(Serialize)]
-struct CommitPackEntry<'a> {
-    key: &'a str,
+struct CommitPackEntry {
+    key: String,
     bytes: u64,
-    members: &'a [PackMember],
+    members: Vec<PackMember>,
 }
 
 /// Seal this fence's packs and write its commit pack, in the only safe order:
 /// body packs complete (atomic, each), then the commit pack (one PUT, atomic,
-/// LAST — reachability begins here, ADR-0067 parts 4 and 8). Returns the
-/// sealed body packs and the commit pack's `(key, bytes)` for the index
-/// transaction that follows; `(empty, None)` when the fence streamed nothing
-/// durable (a cache-only-everything drain, or a client that never labelled).
+/// LAST — reachability begins here, ADR-0067 parts 4 and 8). Returns this
+/// session's sealed body packs and the commit pack's `(key, bytes)` for the
+/// index transaction that follows; `(empty, None)` when NOTHING durable exists
+/// for the fence anywhere (a cache-only-everything drain, or a client that
+/// never labelled).
+///
+/// The commit pack's sibling list is built from **the fence's staged index
+/// rows ∪ this session's seals** (git-bug afb13c2) — the union across
+/// replicas: a scattered drain seals packs on several replicas, each staging
+/// its rows at seal time, and the one replica that receives the POST must
+/// write a receipt naming all of them. Rows, deliberately NOT a bucket
+/// prefix list: the prefix also holds sealed-but-abandoned orphans whose
+/// members were re-PUT into later packs, and the receipt must not claim
+/// those (bucket listing stays additive part-11 rebuild material only).
 ///
 /// `root`/`published_root` are the receipt's coordinates: the drain's record
 /// roots on the drain path, the settled snapshot's root (both) on the Export
@@ -2338,18 +2378,31 @@ async fn seal_fence_packs(
         let map = state.packs.lock().unwrap_or_else(PoisonError::into_inner);
         map.get(&key).cloned()
     };
-    let Some(session) = session else {
-        return Ok((Vec::new(), None));
+    let sealed = match session {
+        Some(session) => {
+            let mut session = session.lock().await;
+            session.seal_open().await.map_err(|e| {
+                WsError::Backend(format!("sealing the open pack for fence {key} failed: {e}"))
+            })?;
+            session.sealed.clone()
+        }
+        // No session here does not mean nothing durable: another replica (or
+        // this one before a restart) may have staged rows already.
+        None => Vec::new(),
     };
-    let sealed = {
-        let mut session = session.lock().await;
-        session.seal_open().await.map_err(|e| {
-            WsError::Backend(format!("sealing the open pack for fence {key} failed: {e}"))
-        })?;
-        session.sealed.clone()
-    };
-    if sealed.is_empty() {
-        return Ok((Vec::new(), None));
+
+    // The union, keyed by pack key: staged rows first, then this session's
+    // seals — the backstop for a seal whose row staging failed.
+    let mut packs: BTreeMap<String, CommitPackEntry> = staged_body_packs(&state.db, &key).await?;
+    for p in &sealed {
+        packs.entry(p.key.clone()).or_insert_with(|| CommitPackEntry {
+            key: p.key.clone(),
+            bytes: p.bytes,
+            members: p.members.clone(),
+        });
+    }
+    if packs.is_empty() {
+        return Ok((sealed, None));
     }
 
     let doc = CommitPackDoc {
@@ -2360,14 +2413,7 @@ async fn seal_fence_packs(
         fence_key: &key,
         root: tagged_address(HashAlgo::Sha256, root),
         published_root: tagged_address(HashAlgo::Sha256, published_root),
-        packs: sealed
-            .iter()
-            .map(|p| CommitPackEntry {
-                key: &p.key,
-                bytes: p.bytes,
-                members: &p.members,
-            })
-            .collect(),
+        packs: packs.into_values().collect(),
     };
     let bytes = serde_json::to_vec(&doc)
         .map_err(|e| WsError::Backend(format!("serialising the commit pack: {e}")))?;
@@ -2382,6 +2428,114 @@ async fn seal_fence_packs(
 /// The commit pack's format version. Distinct constant from
 /// [`DRAIN_RECORD_VERSION`] because the two documents evolve independently.
 const PACK_RECORD_VERSION: u32 = 1;
+
+/// Every body pack the index holds for one fence — staged or committed, any
+/// replica — grouped back into commit-pack entries. The read behind
+/// [`seal_fence_packs`]'s union; a query failure is the usual retryable 500
+/// ([`pack_rows_error`]), never an empty answer (an empty answer would write
+/// a receipt that disowns sealed bytes).
+async fn staged_body_packs(
+    db: &sqlx::PgPool,
+    fence_key: &str,
+) -> Result<BTreeMap<String, CommitPackEntry>, WsError> {
+    let rows: Vec<(String, i64, String, String, i64, i64)> = sqlx::query_as(
+        "SELECT p.pack_key, p.bytes, m.address, m.kind, m.byte_offset, m.byte_len \
+         FROM depot_packs p JOIN depot_pack_members m ON m.pack_key = p.pack_key \
+         WHERE p.fence_key = $1 AND p.kind = 'body' \
+         ORDER BY p.pack_key, m.byte_offset",
+    )
+    .bind(fence_key)
+    .fetch_all(db)
+    .await
+    .map_err(|e| pack_rows_error("read the fence's staged packs", e))?;
+    let mut packs: BTreeMap<String, CommitPackEntry> = BTreeMap::new();
+    for (pack_key, bytes, address, kind, offset, len) in rows {
+        let kind = match kind.as_str() {
+            "blob" => PackMemberKind::Blob,
+            "tree" => PackMemberKind::Tree,
+            other => {
+                return Err(WsError::Backend(format!(
+                    "pack member row {address} in {pack_key} has an unknown kind {other:?}"
+                )))
+            }
+        };
+        packs
+            .entry(pack_key.clone())
+            .or_insert_with(|| CommitPackEntry {
+                key: pack_key,
+                bytes: u64::try_from(bytes).unwrap_or(0),
+                members: Vec::new(),
+            })
+            .members
+            .push(PackMember {
+                address,
+                kind,
+                offset: u64::try_from(offset).unwrap_or(0),
+                len: u64::try_from(len).unwrap_or(0),
+            });
+    }
+    Ok(packs)
+}
+
+/// Stage ONE sealed pack's index rows — `committed = FALSE` — in a small
+/// transaction of its own, right after the pack's multipart upload completed
+/// (git-bug afb13c2): per-pack bytes-before-pointers. Visible only to the
+/// staging fence until its record/settle transaction flips the rows (see
+/// [`durable_present_of`]); `ON CONFLICT DO NOTHING` keeps the POST-time
+/// re-insert of the same pack idempotent.
+async fn stage_pack_rows(
+    db: &sqlx::PgPool,
+    fence_key: &str,
+    pack: &FinishedPack,
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+    insert_one_body_pack(&mut tx, fence_key, pack, now_secs()).await?;
+    tx.commit().await
+}
+
+/// One body pack's `depot_packs` + `depot_pack_members` rows, into an open
+/// transaction — shared by seal-time staging ([`stage_pack_rows`]) and the
+/// record/settle transaction's backstop re-insert ([`insert_pack_rows`]).
+async fn insert_one_body_pack(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    fence_key: &str,
+    pack: &FinishedPack,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes) \
+         VALUES ($1, $2, 'body', $3, $4) ON CONFLICT (pack_key) DO NOTHING",
+    )
+    .bind(&pack.key)
+    .bind(fence_key)
+    .bind(now)
+    .bind(i64::try_from(pack.bytes).unwrap_or(i64::MAX))
+    .execute(&mut **tx)
+    .await?;
+    let mut addresses = Vec::with_capacity(pack.members.len());
+    let mut kinds = Vec::with_capacity(pack.members.len());
+    let mut offsets = Vec::with_capacity(pack.members.len());
+    let mut lens = Vec::with_capacity(pack.members.len());
+    for m in &pack.members {
+        addresses.push(m.address.clone());
+        kinds.push(m.kind.as_str().to_string());
+        offsets.push(i64::try_from(m.offset).unwrap_or(i64::MAX));
+        lens.push(i64::try_from(m.len).unwrap_or(i64::MAX));
+    }
+    sqlx::query(
+        "INSERT INTO depot_pack_members (address, kind, pack_key, byte_offset, byte_len) \
+         SELECT a, k, $1, o, l FROM UNNEST($2::text[], $3::text[], $4::bigint[], $5::bigint[]) \
+         AS t(a, k, o, l) ON CONFLICT (address, pack_key) DO NOTHING",
+    )
+    .bind(&pack.key)
+    .bind(&addresses)
+    .bind(&kinds)
+    .bind(&offsets)
+    .bind(&lens)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
 
 /// Insert one sealed drain's pack rows + member rows into an open index
 /// transaction — the POINTERS half of ADR-0067 part 10, shared by the drain
@@ -2401,40 +2555,9 @@ async fn insert_pack_rows(
     now: i64,
 ) -> Result<(), WsError> {
     for pack in sealed {
-        sqlx::query(
-            "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes) \
-             VALUES ($1, $2, 'body', $3, $4) ON CONFLICT (pack_key) DO NOTHING",
-        )
-        .bind(&pack.key)
-        .bind(fence_key)
-        .bind(now)
-        .bind(i64::try_from(pack.bytes).unwrap_or(i64::MAX))
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| pack_rows_error("insert pack row", e))?;
-        let mut addresses = Vec::with_capacity(pack.members.len());
-        let mut kinds = Vec::with_capacity(pack.members.len());
-        let mut offsets = Vec::with_capacity(pack.members.len());
-        let mut lens = Vec::with_capacity(pack.members.len());
-        for m in &pack.members {
-            addresses.push(m.address.clone());
-            kinds.push(m.kind.as_str().to_string());
-            offsets.push(i64::try_from(m.offset).unwrap_or(i64::MAX));
-            lens.push(i64::try_from(m.len).unwrap_or(i64::MAX));
-        }
-        sqlx::query(
-            "INSERT INTO depot_pack_members (address, kind, pack_key, byte_offset, byte_len) \
-             SELECT a, k, $1, o, l FROM UNNEST($2::text[], $3::text[], $4::bigint[], $5::bigint[]) \
-             AS t(a, k, o, l) ON CONFLICT (address, pack_key) DO NOTHING",
-        )
-        .bind(&pack.key)
-        .bind(&addresses)
-        .bind(&kinds)
-        .bind(&offsets)
-        .bind(&lens)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| pack_rows_error("insert member rows", e))?;
+        insert_one_body_pack(tx, fence_key, pack, now)
+            .await
+            .map_err(|e| pack_rows_error("insert pack rows", e))?;
     }
     if let Some((commit_key, commit_bytes)) = commit {
         sqlx::query(
@@ -2531,10 +2654,12 @@ async fn pack_inventory_under_fence(
     }
 
     // Bytes before pointers (part 10): packs complete + commit pack lands,
-    // THEN the index rows, then the session is forgotten. Nothing new durable
-    // (`(empty, None)`) means nothing to commit — the untouched-Step case.
+    // THEN the index rows, then the session is forgotten. Nothing durable
+    // anywhere (`(empty, None)`) means nothing to commit — the untouched-Step
+    // case. `commit` alone can be `Some` with zero fresh seals: a prior
+    // attempt's staged rows still need their commit row and the flip.
     let (sealed, commit) = seal_fence_packs(state, fence, &root.0, &root.0).await?;
-    if !sealed.is_empty() {
+    if !sealed.is_empty() || commit.is_some() {
         let key = fence_key(fence);
         let mut tx = state
             .db
@@ -3101,7 +3226,13 @@ async fn post_drain(
         .begin()
         .await
         .map_err(|e| fence_rows_error("begin drain transaction", e))?;
-    insert_pack_rows(&mut tx, &key, &sealed, &commit, now).await?;
+    // Success records only: an ERROR record must neither index packs nor flip
+    // the fence's staged rows committed — that staging belongs to a drain
+    // that has not finished (git-bug afb13c2), and committing it would make
+    // an aborted drain's bytes durable evidence.
+    if stored.record.error.is_none() {
+        insert_pack_rows(&mut tx, &key, &sealed, &commit, now).await?;
+    }
     sqlx::query(
         "INSERT INTO depot_drain_records \
              (fence_key, run, step, attempt, version, posted_at, record) \
