@@ -4270,6 +4270,21 @@ async fn persist_run_from_ir(
         let interp_ctx = serde_json::json!({ "inputs": inputs, "event": event.context() });
         let group = scarab_pipeline::cel::interpolate(&c.group, &interp_ctx)
             .map_err(|e| TriggerError::Pipeline(format!("concurrency group `{}`: {e}", c.group)))?;
+        // Tenancy scope (QA finding; git-bug 5120335): the author's group name is
+        // an arbitrary string, so it is scoped to the owning repo here — at
+        // construction, exactly like `supersede_key` above — as
+        // `{owner}/{name}:{group}`. Without the prefix, two unrelated tenants
+        // both naming their group `deploy` would share one global slot
+        // (`concurrency_slots.group_key` is a global PRIMARY KEY), serializing
+        // across the tenant boundary — and under `cancel-in-progress` one
+        // tenant's run would cancel the other's. Untenanted runs (no repo —
+        // inline dev submissions) take an `inline:` namespace instead; it can
+        // never collide with a repo-scoped key because a repo prefix always
+        // carries a `/` before its first `:`.
+        let group = match event.repo() {
+            Some(repo) => format!("{}/{}:{group}", repo.owner, repo.name),
+            None => format!("inline:{group}"),
+        };
         // ADR-0032: a governed (environment-targeting) deploy still SERIALIZES
         // against its group, but must never silently cancel the current slot
         // holder — an in-flight production deploy is not disposable. So a governed
