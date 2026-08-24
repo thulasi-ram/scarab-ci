@@ -2203,9 +2203,19 @@ export interface components {
          *     step's output snapshot (ADR-0029).
          */
         WorkspaceEntryDto: {
-            /** @description `"dir"` (a sub-tree) or `"file"` (a blob). */
+            /**
+             * @description `"dir"` (a sub-tree), `"file"` (a blob), or `"symlink"` (a blob whose
+             *     content is the link target path, marked by the symlink file-type bits in
+             *     the entry mode — ADR-0061 s7 keeps git's representation in the CAS).
+             */
             kind: string;
             name: string;
+            /**
+             * @description The link target path — present only when `kind` is `"symlink"`. The
+             *     target is reported verbatim from the snapshot; it may point outside the
+             *     snapshot or at nothing (a dangling link).
+             */
+            target?: string | null;
         };
         /** @description A directory listing within a step's output workspace snapshot. */
         WorkspaceListing: {
@@ -4055,7 +4065,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description the file bytes */
+            /** @description the file bytes. For a symlink the body is the link TARGET PATH (that is all the snapshot stores for it), flagged by the `X-Scarab-Symlink: 1` response header — it is never the target's content */
             200: {
                 headers: {
                     [name: string]: unknown;

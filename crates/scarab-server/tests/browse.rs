@@ -224,6 +224,81 @@ async fn workspace_lists_directories_first_and_streams_a_file() {
 }
 
 #[tokio::test]
+async fn workspace_names_a_symlink_and_flags_its_target_stream() {
+    // git-bug 1344d1d: a symlink is a blob-holding-the-target-path marked by
+    // the mode file-type bits (ADR-0061 s7). The listing must say "symlink"
+    // (with the target), never "file" — and the file endpoint, whose body for
+    // a symlink IS the target path, must flag that so no client presents a
+    // path as file contents.
+    let db = Arc::new(InMemoryDb::new());
+    let cas = MemCas::default();
+    let run = RunId("r1".into());
+    let step = StepId("build".into());
+    seed_run_step(&db, &run, &step).await;
+
+    let readme = cas.put_blob(b"# real file\n").await.unwrap();
+    let link_target = cas.put_blob(b"docs/README.md").await.unwrap();
+    let root = cas
+        .put_tree(vec![
+            TreeEntry::new("README.md", TreeTarget::Blob(readme)),
+            TreeEntry::symlink("README.link", link_target),
+        ])
+        .await
+        .unwrap();
+    db.set_step_output(&run, &step, &AttemptId("a1".into()), &root.0, None)
+        .await
+        .unwrap();
+
+    let app = router(state(db, Some(Arc::new(cas))));
+
+    // Listing: the symlink is named for what the filesystem held, target inline.
+    let resp = app
+        .clone()
+        .oneshot(get("/v1/runs/r1/steps/build/workspace"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let entries = v["entries"].as_array().unwrap();
+    assert_eq!(entries[0]["name"], "README.link");
+    assert_eq!(entries[0]["kind"], "symlink");
+    assert_eq!(entries[0]["target"], "docs/README.md");
+    assert_eq!(entries[1]["name"], "README.md");
+    assert_eq!(entries[1]["kind"], "file");
+    assert!(
+        entries[1].get("target").is_none(),
+        "a plain file carries no target"
+    );
+
+    // File endpoint on the symlink: body is the target path, flagged as such.
+    let resp = app
+        .clone()
+        .oneshot(get(
+            "/v1/runs/r1/steps/build/workspace/file?path=README.link",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-scarab-symlink")
+            .map(|h| h.to_str().unwrap()),
+        Some("1"),
+        "a symlink stream must be flagged"
+    );
+    assert_eq!(body_bytes(resp).await, b"docs/README.md");
+
+    // …and a regular file is NOT flagged.
+    let resp = app
+        .oneshot(get("/v1/runs/r1/steps/build/workspace/file?path=README.md"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-scarab-symlink").is_none());
+    assert_eq!(body_bytes(resp).await, b"# real file\n");
+}
+
+#[tokio::test]
 async fn workspace_without_snapshot_is_available_false() {
     let db = Arc::new(InMemoryDb::new());
     let run = RunId("r1".into());

@@ -2127,7 +2127,7 @@
         ],
         "responses": {
           "200": {
-            "description": "the file bytes"
+            "description": "the file bytes. For a symlink the body is the link TARGET PATH (that is all the snapshot stores for it), flagged by the `X-Scarab-Symlink: 1` response header — it is never the target's content"
           },
           "404": {
             "description": "no such file or browse disabled"
@@ -3780,10 +3780,17 @@
         "properties": {
           "kind": {
             "type": "string",
-            "description": "`\"dir\"` (a sub-tree) or `\"file\"` (a blob)."
+            "description": "`\"dir\"` (a sub-tree), `\"file\"` (a blob), or `\"symlink\"` (a blob whose\ncontent is the link target path, marked by the symlink file-type bits in\nthe entry mode — ADR-0061 s7 keeps git's representation in the CAS)."
           },
           "name": {
             "type": "string"
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The link target path — present only when `kind` is `\"symlink\"`. The\ntarget is reported verbatim from the snapshot; it may point outside the\nsnapshot or at nothing (a dangling link)."
           }
         }
       },

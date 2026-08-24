@@ -696,7 +696,13 @@ export default function StepPane(props: {
                               </button>
                             </Show>
                             <span class="fsize mono">{e.kind}</span>
-                            <span class="fmeta" />
+                            {/* A symlink's honest identity (git-bug 1344d1d):
+                                the snapshot stores only the target PATH, so
+                                show it — opening the entry streams that path,
+                                not the target's content. */}
+                            <span class="fmeta">
+                              {e.kind === "symlink" && e.target ? `→ ${e.target}` : ""}
+                            </span>
                           </li>
                         )}
                       </For>

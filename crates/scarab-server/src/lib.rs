@@ -2966,8 +2966,15 @@ async fn get_attempt_consumed(
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WorkspaceEntryDto {
     pub name: String,
-    /// `"dir"` (a sub-tree) or `"file"` (a blob).
+    /// `"dir"` (a sub-tree), `"file"` (a blob), or `"symlink"` (a blob whose
+    /// content is the link target path, marked by the symlink file-type bits in
+    /// the entry mode — ADR-0061 s7 keeps git's representation in the CAS).
     pub kind: String,
+    /// The link target path — present only when `kind` is `"symlink"`. The
+    /// target is reported verbatim from the snapshot; it may point outside the
+    /// snapshot or at nothing (a dangling link).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// A directory listing within a step's output workspace snapshot.
@@ -3008,31 +3015,37 @@ fn workspace_segments(path: &str) -> Result<Vec<String>, ApiError> {
 }
 
 /// Walk `segments` down from `root`, returning the [`scarab_storage::TreeTarget`]
-/// they name (a sub-tree or a blob), or `NotFound` if any segment is missing.
+/// they name (a sub-tree or a blob) plus whether the final entry is a symlink
+/// (a blob whose content is the link target path, ADR-0061 s7 — `false` for the
+/// root itself), or `NotFound` if any segment is missing.
 async fn workspace_walk(
     cas: &Arc<dyn scarab_storage::Cas>,
     root: scarab_storage::TreeHash,
     segments: &[String],
-) -> Result<scarab_storage::TreeTarget, ApiError> {
+) -> Result<(scarab_storage::TreeTarget, bool), ApiError> {
     use scarab_storage::TreeTarget;
     let mut cursor = TreeTarget::Tree(root);
+    let mut symlink = false;
     for seg in segments {
         let tree = match cursor {
             TreeTarget::Tree(h) => h,
-            // A path component descends into a file — no such directory.
+            // A path component descends into a file — no such directory. A
+            // symlink is a blob too, so a path THROUGH one is refused rather
+            // than resolved (the snapshot walk never follows links).
             TreeTarget::Blob(_) => return Err(ApiError::NotFound),
         };
         let entries = cas
             .tree_entries(&tree)
             .await
             .map_err(|_| ApiError::NotFound)?;
-        cursor = entries
+        let entry = entries
             .into_iter()
             .find(|e| &e.name == seg)
-            .ok_or(ApiError::NotFound)?
-            .target;
+            .ok_or(ApiError::NotFound)?;
+        symlink = entry.is_symlink();
+        cursor = entry.target;
     }
-    Ok(cursor)
+    Ok((cursor, symlink))
 }
 
 /// Read a step's output snapshot root hash, or `None` if it produced none.
@@ -3098,26 +3111,41 @@ async fn list_workspace(
             }))
         }
     };
-    let tree = match workspace_walk(cas, root, &segments).await? {
+    let tree = match workspace_walk(cas, root, &segments).await?.0 {
         TreeTarget::Tree(h) => h,
         // The path names a file, not a directory.
         TreeTarget::Blob(_) => return Err(ApiError::NotFound),
     };
-    let mut entries: Vec<WorkspaceEntryDto> = cas
+    let mut entries: Vec<WorkspaceEntryDto> = Vec::new();
+    for e in cas
         .tree_entries(&tree)
         .await
         .map_err(|_| ApiError::NotFound)?
-        .into_iter()
-        .map(|e| WorkspaceEntryDto {
-            name: e.name,
-            kind: match e.target {
-                TreeTarget::Tree(_) => "dir",
-                TreeTarget::Blob(_) => "file",
+    {
+        // A symlink is a blob whose CONTENT is the link target path, marked by
+        // the mode file-type bits (ADR-0061 s7, git-bug 1344d1d) — name it for
+        // what the filesystem it represents held, never as a plain file. The
+        // target blob is a path (tiny), so resolve it inline for the listing.
+        let (kind, target) = match (&e.target, e.is_symlink()) {
+            (TreeTarget::Tree(_), _) => ("dir", None),
+            (TreeTarget::Blob(h), true) => {
+                let target = cas
+                    .get_blob(h)
+                    .await
+                    .ok()
+                    .map(|b| String::from_utf8_lossy(&b).into_owned());
+                ("symlink", target)
             }
-            .to_string(),
-        })
-        .collect();
-    // Directories first, then lexicographic — a conventional file listing.
+            (TreeTarget::Blob(_), false) => ("file", None),
+        };
+        entries.push(WorkspaceEntryDto {
+            name: e.name,
+            kind: kind.to_string(),
+            target,
+        });
+    }
+    // Directories first, then lexicographic — a conventional file listing
+    // (symlinks group with files).
     entries.sort_by(|a, b| (a.kind != "dir", &a.name).cmp(&(b.kind != "dir", &b.name)));
     Ok(Json(WorkspaceListing {
         path,
@@ -3137,7 +3165,12 @@ async fn list_workspace(
         ("path" = String, Query, description = "file path within the snapshot"),
         ("attempt" = Option<String>, Query, description = "attempt id — that attempt's immutable snapshot instead of the latest (ADR-0056)")
     ),
-    responses((status = 200, description = "the file bytes"), (status = 404, description = "no such file or browse disabled"))
+    responses(
+        (status = 200, description = "the file bytes. For a symlink the body is the link \
+            TARGET PATH (that is all the snapshot stores for it), flagged by the \
+            `X-Scarab-Symlink: 1` response header — it is never the target's content"),
+        (status = 404, description = "no such file or browse disabled")
+    )
 )]
 async fn get_workspace_file(
     State(st): State<AppState>,
@@ -3158,9 +3191,9 @@ async fn get_workspace_file(
     let root = step_snapshot_root(&st, &run, &StepId(step), q.attempt.as_deref())
         .await?
         .ok_or(ApiError::NotFound)?;
-    let blob = match workspace_walk(cas, root, &segments).await? {
-        TreeTarget::Blob(h) => h,
-        TreeTarget::Tree(_) => return Err(ApiError::NotFound),
+    let (blob, symlink) = match workspace_walk(cas, root, &segments).await? {
+        (TreeTarget::Blob(h), symlink) => (h, symlink),
+        (TreeTarget::Tree(_), _) => return Err(ApiError::NotFound),
     };
     let bytes = cas.get_blob(&blob).await.map_err(|_| ApiError::NotFound)?;
     // Serve text inline where it looks like UTF-8 (logs, source, configs); fall
@@ -3175,6 +3208,16 @@ async fn get_workspace_file(
         axum::http::header::CONTENT_TYPE,
         axum::http::HeaderValue::from_static(content_type),
     );
+    // A symlink's blob is the link TARGET PATH, not the target's content
+    // (ADR-0061 s7). Streaming it is honest — that IS everything the snapshot
+    // stores for the entry — but only with the flag that says so, so a client
+    // never presents a path as if it were file contents (git-bug 1344d1d).
+    if symlink {
+        resp.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-scarab-symlink"),
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
     Ok(resp)
 }
 
