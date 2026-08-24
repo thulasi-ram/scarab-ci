@@ -27,11 +27,11 @@ futures = { workspace = true }
 # Structured logging (ADR-0053): the `ws-timing` phase breakdown of a Step
 # boundary that ADR-0061 s0 measures. The server installs the subscriber.
 tracing = { workspace = true }
-# The Depot handle for the drain (ADR-0064 control-plane half): warm-first
-# ingest + the awaited `flush` that gates Succeeded. A REAL dependency now, not
-# only the dev one it used to be — `drive_workspace` calls `flush`, which is a
-# concrete client capability, not a `Cas` port method. No cycle: the reverse
-# edge (workspace-client → scarab-server → this crate) is dev-only.
+# The Depot handle for the drain rendezvous (git-bug 212bb13 / ADR-0067): the
+# drain runs in-Pod, and `drive_workspace` reads each fence's drain record
+# back (`drain_record`) — a concrete client capability, not a `Cas` port
+# method. A REAL dependency, not only the dev one it used to be. No cycle: the
+# reverse edge (workspace-client → scarab-server → this crate) is dev-only.
 scarab-workspace-client = { workspace = true }
 
 [dev-dependencies]

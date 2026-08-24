@@ -251,7 +251,7 @@ pub struct FlushSet {
     /// A level is a distance from the root, so one address may appear at several
     /// levels when two names of different lengths reach it. That costs a `head`;
     /// deduplicating across levels could invert a parent and its own child (the
-    /// note on `crate::workspaced::flush_set_of` works the case through).
+    /// note on `crate::workspaced::reachable_set_of` works the case through).
     pub tree_levels: Vec<Vec<TreeHash>>,
 }
 
@@ -440,7 +440,7 @@ pub async fn settle_change_set(
     // offering it once per name buys a `head` per name and nothing else. Across levels
     // is unsafe, and non-obviously so — keeping one occurrence per address globally can
     // leave a tree in a shallower level than its own child, which the deepest-first
-    // flush would then offer parent-first. `crate::workspaced::flush_set_of` works the
+    // flush would then offer parent-first. `crate::workspaced::reachable_set_of` works the
     // same case through for the drain that has to rediscover its inventory.
     let flush = FlushSet {
         blobs: fold.blobs,

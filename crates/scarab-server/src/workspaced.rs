@@ -859,10 +859,11 @@ enum WsError {
     Forbidden,
     /// A valid token whose **scope** may not drive this operation. Distinct from
     /// [`Forbidden`](WsError::Forbidden) because the refusal is about what kind of
-    /// caller this is, not which snapshot it asked for: the one user today is the
-    /// flush route, which a fenced Step's `Read` token must not be able to drive —
-    /// an arbitrary-root flush is a cost amplification (cold round trips on demand),
-    /// even though a content-addressed write can corrupt nothing.
+    /// caller this is, not which snapshot it asked for. Its users today: every
+    /// `/v1/exports*` route and the drain-record GET (`require_browse` — control-
+    /// plane operations a fenced Step token must not drive), and the drain-record
+    /// POST's inverse gate (posted only under a fence-claimed token — a Browse
+    /// token reads records, it does not write them).
     ScopeForbidden(&'static str),
     NotFound,
     /// The client sent a hash that does not match the bytes, an unparseable

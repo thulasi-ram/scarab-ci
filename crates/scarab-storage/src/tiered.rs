@@ -8,60 +8,40 @@
 //! [`prune_tree`](crate::prune_tree), which already lives here as a free
 //! function over `&dyn Cas`.
 //!
-//! # As of ADR-0064, cold-first-per-blob is one of TWO write mechanisms — this is one of them
+//! # Two live topologies — never say "the TieredCas"
 //!
-//! [ADR-0064](../../../docs/adr/0064-durability-tiering-and-the-write-path.md)
-//! replaces cold-first-per-blob with warm-first-plus-one-batched-flush, but only
-//! for the Data Depot's own drain (`scarab-server`'s settle path): that drain no
-//! longer tiers through this type **at all**. It writes warm directly, on its
-//! own disk, and performs one batched archival flush to cold afterward — one
-//! walk, no network round-trip per object. `TieredCas` itself keeps the
-//! cold-first ordering documented below, unchanged, because its two live
-//! instances do not share the Depot drain's topology:
+//! (History, one line: ADR-0064 built a deferred-flush write path around this
+//! type; ADR-0067 part 4 deleted that flush machinery outright. Durable bytes
+//! now stream into per-fence PACKS on the Depot at drain time — nothing
+//! flushes warm to cold any more, and no `WarmOnly` state exists. What
+//! remains here is the plain two-tier combinator.) Its two live instances do
+//! NOT share a topology:
 //!
-//! - the control plane's instance
-//!   (`crates/scarab-server/src/main.rs:216`) has **warm = `WorkspaceClient`
-//!   over HTTP to the Depot**;
-//! - the Depot's own instance
-//!   (`crates/scarab-server/src/workspaced.rs:401`) has **warm =
-//!   `S3Storage::local(dir)`**, a local directory.
+//! - the **control plane's** instance (`crates/scarab-server/src/main.rs`):
+//!   warm = `WorkspaceClient` over HTTP to the Depot, with `Cas` PUTs
+//!   labelled **cache-only** — a fenceless PUT opens no pack and can never be
+//!   durable there; cold = **direct loose object-store writes**, which is the
+//!   durable copy for whatever stray writes still come through. In practice
+//!   it is a read-and-repair handle: Browse, the GC mark walk and the
+//!   rerun-widening oracle read through it, falling through to cold and
+//!   backfilling warm.
+//! - the **Depot's own** instance (`crates/scarab-server/src/workspaced.rs`):
+//!   warm = `S3Storage::local(dir)`, its own volume; cold = the bucket. The
+//!   Depot's DURABLE writes are packs (`workspaced`'s `PackSession`), a
+//!   separate mechanism that never routes through this type.
 //!
-//! ADR-0064's "one walk, no network" is therefore only true of the Depot's own
-//! instance's *drain*, and even there only because that code path stopped
-//! calling into this module — the instance still exists, still cold-first, for
-//! whatever else still uses it (reads, GC, tests).
-//!
-//! **The control plane's instance is a different story, and it is worth being
-//! precise about rather than lumping it in with "whatever else still uses
-//! it": since ADR-0064's control-plane half (2026-08-01) it is a READ-side
-//! pairing, not a write path.** The drain no longer routes any write through
-//! it. `drive_workspace` ingests WARM-first through the Depot client
-//! (`scarab-workspace-client` — one walk, `/have`-dedup, PUTs land warm-only)
-//! and then awaits ONE `flush(published_root)` RPC, which is what archives the
-//! published closure to cold and licenses `Succeeded`. What this instance
-//! still does is fall-through-and-backfill READS: Browse, the GC mark walk,
-//! the rerun-widening oracle and the drain's own read half all come through
-//! here — plus the refusal at the bottom of this file, where [`Cas::ingest`]
-//! on a `TieredCas` returns an error so nothing can silently route a drain
-//! through it again. (Whether the control plane should keep a per-Step write
-//! leg of its own was git-bug `212bb13`'s open question; the ADR-0064
-//! rewiring answered it — the write leg is the Depot client, and the second
-//! walk this paragraph used to price is no longer paid.)
-//!
-//! A caution for anyone re-verifying that claim: the old wiring was
-//! trait-object dispatch — `drive_workspace(cas: &dyn Cas)` calling
-//! `cas.ingest(...)` — so a textual grep for `TieredCas::ingest` has never
-//! proven anything about callers, in either direction. Today's call graph is
-//! `drive_workspace` → the Depot client's `ingest` (through the warm/read
-//! `DrainCas` split in `crates/scarab-executor-k8s/src/lib.rs`) → one awaited
-//! `WorkspaceClient::flush`; the READS still arrive here as `dyn Cas`. Follow
-//! the `Arc<dyn Cas>` handles from the composition root
-//! (`crates/scarab-server/src/main.rs`), never a grep.
+//! The drain writes through NEITHER: it runs in-Pod (`scarab-wsfetch`), PUTs
+//! straight to the Depot under a fenced token, and its durability gate is the
+//! drain record's pack transaction (ADR-0067), not a tiered write. The
+//! refusal at the bottom of this file — [`Cas::ingest`] on a `TieredCas` is
+//! an error — is what keeps anything from silently routing a drain back
+//! through here via `dyn Cas` dispatch (which a grep cannot see; follow the
+//! `Arc<dyn Cas>` handles from the composition root, never a grep).
 //!
 //! What follows describes the ordering this type still uses, for both of its
-//! remaining instances — reached today by **stray writes** only
-//! (`put_blob`/`put_tree` from anything that is not a drain; the read path's
-//! best-effort backfill writes to warm directly), never by the drains.
+//! instances — reached today by **stray writes** only (`put_blob`/`put_tree`
+//! from anything that is not a drain; the read path's best-effort backfill
+//! writes to warm directly), never by the drains.
 //!
 //! # The write order is COLD FIRST, and that is not an accident
 //!
@@ -429,21 +409,19 @@ impl Cas for TieredCas {
 
     /// `Cas::ingest` is **not tiered** — refused loudly, never half-honored.
     ///
-    /// Both drain paths now write WARM directly and make durability a separate,
-    /// awaited step (ADR-0064): the Depot's own drain writes its local disk and
-    /// batch-flushes cold; the control plane's `drive_workspace` ingests to the
-    /// Depot via `scarab-workspace-client` and awaits `flush` before releasing
-    /// the sidecar. The old override here (cold-first double walk, with a
-    /// root-disagreement tripwire between the two walks) had exactly one
-    /// production caller — `drive_workspace`, via `dyn Cas` — and that caller
-    /// is rewired. Because trait-object dispatch is invisible to grep, a caller
-    /// this crate cannot see could still reach the trait method: returning an
-    /// error makes such a miss fail its Step loudly instead of silently paying
-    /// two walks — or worse, quietly writing a snapshot whose durability nobody
-    /// then flushes.
+    /// Drains do not route through this type at all any more: the drain runs
+    /// in-Pod (`scarab-wsfetch`), PUTs to the Depot under its fenced token,
+    /// and durability is the drain record's pack transaction (ADR-0067). The
+    /// old override here (cold-first double walk, with a root-disagreement
+    /// tripwire between the two walks) had exactly one production caller —
+    /// `drive_workspace`, via `dyn Cas` — and that caller is rewired. Because
+    /// trait-object dispatch is invisible to grep, a caller this crate cannot
+    /// see could still reach the trait method: returning an error makes such
+    /// a miss fail its Step loudly instead of silently paying two walks — or
+    /// worse, quietly writing a snapshot whose durability nothing then backs.
     async fn ingest(&self, _path: &str) -> Result<Snapshot, StorageError> {
         Err(StorageError::Backend(
-            "ingest is not tiered — drains write warm then flush (ADR-0064)".into(),
+            "ingest is not tiered — drains go in-Pod to the Depot's packs (ADR-0067)".into(),
         ))
     }
 }

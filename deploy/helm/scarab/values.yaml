@@ -247,6 +247,8 @@ workspace:
   # One per failure domain. Per-AZ topology is a later slice; NOTHING in this
   # design has been exercised with more than one instance, so treat >1 as
   # unproven rather than supported.
+  # WARNING: >1 is UNSAFE for drains today — pack sessions and drain-closure
+  # validation are replica-local (see templates/service-workspace.yaml); keep at 1.
   replicaCount: 1
   # Where the warm tier lives inside the container — the PVC's mount point, and
   # the value of SCARAB_WORKSPACE_DATA_DIR.
