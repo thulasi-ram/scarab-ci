@@ -3068,11 +3068,15 @@ enum ClosureVerdict {
     Missing(String),
 }
 
-/// Validate a success record's closure against **warm and the fence's ledger**
-/// — the TREE walk is warm-only on purpose: the drain PUTs every closure tree
-/// unconditionally (only a PUT reaches the ledger), so a cold-only tree here
-/// is not a slow path, it is a tree this fence never wrote, i.e. a ledger miss
-/// wearing a different hat. Blobs check warm OR the durable pack index — the
+/// Validate a success record's closure against **the fence's ledger, warm OR
+/// the pack index**. The tree walk used to be warm-only, on a rationale the
+/// PG-backed ledger voided (a cold-only tree read as "a tree this fence
+/// never wrote" — but the ledger check right above is the ledger check, on
+/// shared rows, whichever replica the PUT landed on): since git-bug afb13c2
+/// a scattered drain's trees legitimately sit in ANOTHER replica's warm and
+/// in the shared index via its staged packs, so a warm miss here falls
+/// through to [`tree_bytes_via_pack_then_loose`] — a ranged read any replica
+/// can serve. Blobs check warm OR the durable pack index as before — the
 /// drain's blob dedup keys on the index (ADR-0067 part 4), so an
 /// already-durable blob is legitimately never re-uploaded to this replica's
 /// warm. Bounded like [`reachable_set_of`]: BFS with a visited set, hashes only
@@ -3098,14 +3102,21 @@ async fn validate_drain_closure(
         let bytes = match state.warm.get(&format!("trees/{tree}")).await {
             Ok(bytes) => bytes,
             Err(StorageError::NotFound) => {
-                return Ok(ClosureVerdict::Missing(format!(
-                    "tree {tree} is not in the warm tier"
-                )))
+                match tree_bytes_via_pack_then_loose(state, &tree).await {
+                    Ok(bytes) => bytes,
+                    Err(WsError::NotFound) => {
+                        return Ok(ClosureVerdict::Missing(format!(
+                            "tree {tree} is neither in the warm tier nor readable \
+                             from the pack index"
+                        )))
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             Err(e) => return Err(WsError::Backend(e.to_string())),
         };
         let entries: Vec<TreeEntry> = serde_json::from_slice(&bytes).map_err(|e| {
-            WsError::Backend(format!("tree {tree} in warm does not parse: {e}"))
+            WsError::Backend(format!("tree {tree} does not parse: {e}"))
         })?;
         for entry in entries {
             match entry.target {
