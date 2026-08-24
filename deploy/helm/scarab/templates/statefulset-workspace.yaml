@@ -125,8 +125,11 @@ spec:
             # is a volume, and volumes stay writable.
             - name: cas
               mountPath: {{ .Values.workspace.dataDir | quote }}
-            # The cold-tier local-dir fallback and any temp file. Unused when
-            # scarab.s3.bucket is set, which it must be in any real install.
+            # Temp space under the writable home. Since ADR-0067 part 1 there
+            # is NO cold-tier local-dir fallback to land here: an empty
+            # scarab.s3.bucket fails the boot (and the boot write-probe
+            # refuses an unreachable one) instead of silently archiving into
+            # this emptyDir, whose contents die with the Pod.
             - name: scratch
               mountPath: /home/scarab/.scarab
             - name: tmp

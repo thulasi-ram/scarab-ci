@@ -5,10 +5,14 @@
   `http://<fullname>-workspace.<ns>.svc` with no port.
 
   Deliberately NOT headless: a headless Service exists to give each replica its
-  own DNS name, and nothing addresses an individual workspace replica. When
-  per-failure-domain placement lands (a later slice), the routing question is
-  "which zone's service", which is a second Service or a topology-aware hint —
-  not per-Pod DNS.
+  own DNS name, and nothing addresses an individual workspace replica. Since
+  ADR-0067 that is a correctness statement, not just taste — the fence rows and
+  the pack index live in Postgres and the durable bytes in the bucket, so ANY
+  replica can answer for ANY fence, and pinning a fence to a replica (the old
+  0066 affinity/cordon idea) would only ever be a cache-warmth optimisation,
+  freely abandonable. When per-failure-domain placement lands (a later slice),
+  the routing question is "which zone's service", which is a second Service or
+  a topology-aware hint — not per-Pod DNS.
 
   `publishNotReadyAddresses` is left at its default (false) on purpose: a replica
   whose warm volume is not writable must leave rotation, which is the entire
