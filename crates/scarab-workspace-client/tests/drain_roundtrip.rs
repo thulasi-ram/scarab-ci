@@ -883,10 +883,17 @@ async fn have_answers_the_durable_index_identically_across_replicas() {
 /// pack's multipart upload completed, and never `committed` before the
 /// record transaction. An oversized member forces one mid-drain seal: its
 /// rows are staged (`committed = FALSE`, visible ONLY to the owning fence),
-/// its pack object is already complete in the bucket, while the small
-/// files' OPEN tail pack has neither rows nor a visible object and no
-/// commit pack exists. The record POST then commits everything together.
-/// The linger is disabled so nothing seals the tail behind the test's back.
+/// its pack object is already complete in the bucket, while the OPEN tail
+/// pack has neither rows nor a visible object and no commit pack exists.
+/// The record POST then commits everything together. The linger is disabled
+/// so nothing seals the tail behind the test's back.
+///
+/// The open-tail probe is the ROOT TREE, deliberately: the client PUTs
+/// blobs first (16-wide) and every tree serially after, so the trees always
+/// land in the final, still-open pack — whereas a small BLOB is the wrong
+/// probe, because the oversized member's arrival ROLLS the open pack,
+/// sealing-and-staging whatever small blobs landed before it (correctly:
+/// that rolled pack's multipart completed too).
 ///
 /// Mutations killed: staging rows before `finish()` completes (the staged
 /// pack's footer read off the bucket fails); staging the open tail's
@@ -945,11 +952,12 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
         member_rows_for(&h.pool, &big_hash).await > 0,
         "the sealed oversized member must be staged"
     );
-    let kept_blob = scarab_storage::sha256_hex(b"fn main() {}");
+    let root_tree = report.snapshot.root.0.clone();
     assert_eq!(
-        member_rows_for(&h.pool, &kept_blob).await,
+        member_rows_for(&h.pool, &root_tree).await,
         0,
-        "an OPEN pack's members must have no rows — its multipart upload has not completed"
+        "an OPEN pack's members must have no rows — its multipart upload has not completed \
+         (trees are PUT last, so the root tree is always in the open tail)"
     );
     assert!(
         matches!(
@@ -1034,8 +1042,13 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
         "the record transaction must flip the WHOLE fence committed"
     );
     assert!(
-        member_rows_for(&h.pool, &kept_blob).await > 0,
+        member_rows_for(&h.pool, &root_tree).await > 0,
         "the tail pack's members are indexed with the record"
+    );
+    let kept_blob = scarab_storage::sha256_hex(b"fn main() {}");
+    assert!(
+        member_rows_for(&h.pool, &kept_blob).await > 0,
+        "a small blob is indexed too — whether it sealed in the rolled pack or the tail"
     );
     // The bucket self-describes (part 11): a sealed pack's own footer parses
     // back off the bucket alone and agrees with the index rows.
