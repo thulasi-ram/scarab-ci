@@ -1941,7 +1941,10 @@ async fn have(
     headers: HeaderMap,
     Json(req): Json<HaveRequest>,
 ) -> Result<Json<HaveResponse>, WsError> {
-    authenticate(&state, &headers)?;
+    let claims = authenticate(&state, &headers)?;
+    // A fenced caller (the drain helper) may count its own staged packs as
+    // durable; everyone else sees committed rows only (git-bug afb13c2).
+    let caller_fence = fence_claim(&claims).map(fence_key);
     let total = req.blobs.len() + req.trees.len();
     if total > HAVE_MAX_HASHES {
         return Err(WsError::BadRequest(format!(
@@ -1967,12 +1970,14 @@ async fn have(
         &state.db,
         PackMemberKind::Blob,
         blobs.iter().map(|(_, bare)| bare.as_str()),
+        caller_fence.as_deref(),
     )
     .await?;
     let durable_trees = durable_present_of(
         &state.db,
         PackMemberKind::Tree,
         trees.iter().map(|(_, bare)| bare.as_str()),
+        caller_fence.as_deref(),
     )
     .await?;
 
@@ -2010,10 +2015,21 @@ async fn have(
 /// one `ANY($1)` query per kind, tagged on the way in, bare on the way out.
 /// A query failure is the caller's 500 ([`pack_rows_error`]): presence here
 /// licenses SKIPPING an upload, so it must never be guessed.
+///
+/// **The committed predicate** (git-bug afb13c2): a row counts only when its
+/// pack is `committed` — sealed AND owned by a drain/settle transaction that
+/// finished — or when it belongs to `caller_fence`'s own staging. Body packs
+/// are indexed at seal time now, before any commit pack exists, so an
+/// unfiltered read would let another fence dedup against never-committed
+/// staging the future reclaimer deletes (the ec294b7 class widened). The one
+/// caller allowed to trust staged rows is the fence that staged them: its
+/// retried drain must not re-upload what it already sealed, and its own
+/// record transaction is the only thing that can commit those rows.
 async fn durable_present_of<'a>(
     db: &sqlx::PgPool,
     kind: PackMemberKind,
     bares: impl Iterator<Item = &'a str>,
+    caller_fence: Option<&str>,
 ) -> Result<HashSet<String>, WsError> {
     let tagged: Vec<String> = bares
         .map(|h| tagged_address(HashAlgo::Sha256, h))
@@ -2022,10 +2038,14 @@ async fn durable_present_of<'a>(
         return Ok(HashSet::new());
     }
     let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT address FROM depot_pack_members WHERE kind = $2 AND address = ANY($1)",
+        "SELECT DISTINCT m.address FROM depot_pack_members m \
+         JOIN depot_packs p ON p.pack_key = m.pack_key \
+         WHERE m.kind = $2 AND m.address = ANY($1) \
+           AND (p.committed OR p.fence_key = $3)",
     )
     .bind(&tagged)
     .bind(kind.as_str())
+    .bind(caller_fence)
     .fetch_all(db)
     .await
     .map_err(|e| pack_rows_error("durable presence", e))?;
@@ -2367,6 +2387,12 @@ const PACK_RECORD_VERSION: u32 = 1;
 /// transaction — the POINTERS half of ADR-0067 part 10, shared by the drain
 /// path (whose transaction also carries the drain record) and the Export
 /// settle path (whose transaction carries only these).
+///
+/// Also the **commit flip** (git-bug afb13c2): every `depot_packs` row of this
+/// fence — inserted here, or staged earlier at seal time, on this replica or
+/// another — turns `committed = TRUE` inside the same transaction, atomically
+/// with the record that makes the drain real. Until this runs, staged rows
+/// are visible only to their own fence (see [`durable_present_of`]).
 async fn insert_pack_rows(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     fence_key: &str,
@@ -2423,6 +2449,11 @@ async fn insert_pack_rows(
         .await
         .map_err(|e| pack_rows_error("insert commit pack row", e))?;
     }
+    sqlx::query("UPDATE depot_packs SET committed = TRUE WHERE fence_key = $1 AND NOT committed")
+        .bind(fence_key)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| pack_rows_error("commit the fence's pack rows", e))?;
     Ok(())
 }
 
@@ -2449,11 +2480,13 @@ async fn pack_inventory_under_fence(
     reads: &ReadThrough,
     root: &TreeHash,
 ) -> Result<(), WsError> {
+    let caller = fence_key(fence);
     let blob_bares: Vec<String> = inventory.blobs.iter().map(|b| b.0.clone()).collect();
     let durable_blobs = durable_present_of(
         &state.db,
         PackMemberKind::Blob,
         blob_bares.iter().map(String::as_str),
+        Some(&caller),
     )
     .await?;
     let tree_bares: Vec<String> = {
@@ -2470,6 +2503,7 @@ async fn pack_inventory_under_fence(
         &state.db,
         PackMemberKind::Tree,
         tree_bares.iter().map(String::as_str),
+        Some(&caller),
     )
     .await?;
 
@@ -2818,6 +2852,7 @@ async fn validate_drain_closure(
     state: &WorkspaceState,
     ledger: &HashSet<String>,
     effective_root: &str,
+    caller_fence_key: &str,
 ) -> Result<ClosureVerdict, WsError> {
     let mut visited: HashSet<String> = HashSet::new();
     let mut queue: Vec<String> = vec![effective_root.to_string()];
@@ -2870,6 +2905,7 @@ async fn validate_drain_closure(
             &state.db,
             PackMemberKind::Blob,
             warm_missing.iter().map(String::as_str),
+            Some(caller_fence_key),
         )
         .await?;
         if let Some(blob) = warm_missing.iter().find(|b| !durable.contains(*b)) {
@@ -2974,7 +3010,7 @@ async fn post_drain(
             }
         }
         let effective = record.pruned_root.as_deref().unwrap_or(&record.root);
-        match validate_drain_closure(&state, &ledger, effective).await? {
+        match validate_drain_closure(&state, &ledger, effective, &fence_key(&fence)).await? {
             ClosureVerdict::Complete { trees, blobs } => closure = Some((trees, blobs)),
             ClosureVerdict::Missing(detail) => return Ok(refusal(detail)),
         }
@@ -2998,8 +3034,9 @@ async fn post_drain(
     // The durable-presence gate: a SUCCESS record commits only if the
     // published closure is durable — every member either sealed into the
     // packs THIS transaction is about to index, or already in
-    // `depot_pack_members` (durable_present_of is fence-blind, which is
-    // right: an earlier fence's pack is durable whoever asks). Without it, a
+    // `depot_pack_members` under the committed predicate (another fence's
+    // COMMITTED pack is durable whoever asks; this fence's own staged rows
+    // count too, because this very transaction commits them). Without it, a
     // Depot restart between the drain's PUTs and its record POST destroys
     // the in-memory pack session, `seal_fence_packs` answers `(empty, None)`,
     // the warm/ledger validation above still passes (both survive on the PVC
@@ -3007,6 +3044,7 @@ async fn post_drain(
     // by zero pack rows. Error records skip this on purpose: they exist
     // precisely because the ingest may not have happened.
     if record.error.is_none() {
+        let caller = fence_key(&fence);
         let (trees, blobs) = closure.as_ref().expect("success records were validated above");
         let sealed_addresses: HashSet<&str> = sealed
             .iter()
@@ -3024,7 +3062,9 @@ async fn post_drain(
             if unsealed.is_empty() {
                 continue;
             }
-            let durable = durable_present_of(&state.db, kind, unsealed.iter().copied()).await?;
+            let durable =
+                durable_present_of(&state.db, kind, unsealed.iter().copied(), Some(&caller))
+                    .await?;
             lost.extend(
                 unsealed
                     .into_iter()

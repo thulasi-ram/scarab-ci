@@ -10,7 +10,6 @@ async-trait = { workspace = true }
 sqlx = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

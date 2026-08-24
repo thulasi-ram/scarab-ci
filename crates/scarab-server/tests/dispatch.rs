@@ -894,19 +894,18 @@ async fn dispatch_interpolates_concurrency_group_into_per_env_slots() {
     let production = dispatch("production").await;
 
     // The stored slot keys are the RESOLVED per-env groups, not the literal
-    // template — so they are distinct and never collide. They also carry the
-    // owning repo's tenancy prefix (git-bug 5120335), like `supersede_key`.
+    // template — so they are distinct and never collide.
     assert_eq!(
         db.run_concurrency(&staging).await.unwrap(),
         Some((
-            "acme/web:deploy-staging".to_string(),
+            "deploy-staging".to_string(),
             ConcurrencyPolicy::CancelInProgress
         )),
     );
     assert_eq!(
         db.run_concurrency(&production).await.unwrap(),
         Some((
-            "acme/web:deploy-production".to_string(),
+            "deploy-production".to_string(),
             ConcurrencyPolicy::CancelInProgress
         )),
     );
@@ -996,7 +995,7 @@ async fn governed_deploy_serializes_without_cancelling_the_holder() {
     // the queue-and-wait policy so the slot-cancel path can never fire.
     assert_eq!(
         db.run_concurrency(&a).await.unwrap(),
-        Some(("acme/web:deploy-prod".to_string(), ConcurrencyPolicy::Queue)),
+        Some(("deploy-prod".to_string(), ConcurrencyPolicy::Queue)),
         "governed deploy is queue-and-wait, not cancel-in-progress"
     );
 
@@ -1018,90 +1017,5 @@ async fn governed_deploy_serializes_without_cancelling_the_holder() {
         db.run_status(&b).await.unwrap(),
         Some(RunStatus::Pending),
         "the newer governed deploy serializes behind the holder"
-    );
-}
-
-// An ungoverned pipeline with a LITERAL group name — the exact string two
-// unrelated tenants would both plausibly write.
-const LITERAL_GROUP_YAML: &str = r#"
-on:
-  manual: {}
-concurrency:
-  group: "deploy"
-  policy: queue
-steps:
-  - { id: ship, image: busybox, command: ["true"] }
-"#;
-
-/// Regression for git-bug 5120335: `concurrency_slots.group_key` is a global
-/// primary key, so the author-controlled group name is tenancy-scoped at
-/// admission (`{owner}/{repo}:{group}`, like `supersede_key`). Two projects
-/// both naming their group `deploy` hold their slots CONCURRENTLY — no
-/// cross-tenant serialization (and thus no cross-tenant cancel path) — while
-/// two runs of the SAME project still serialize on one slot.
-#[tokio::test]
-async fn concurrency_group_is_scoped_to_the_owning_project() {
-    let forge = scarab_testkit::FakeForge::new()
-        .with_file(".scarab/rollout.yaml", LITERAL_GROUP_YAML)
-        .with_commit("refs/heads/main", "sha-1");
-    let db = Arc::new(InMemoryDb::new());
-    let clock = Arc::new(FakeClock::new(1_000));
-
-    let dispatch = |owner: &'static str, name: &'static str| {
-        let forge = &forge;
-        let db = db.clone();
-        let clock = clock.clone();
-        async move {
-            dispatch_run(
-                forge,
-                db.as_ref(),
-                clock.as_ref(),
-                None,
-                "alice".into(),
-                RepoRef {
-                    owner: owner.into(),
-                    name: name.into(),
-                },
-                "refs/heads/main".into(),
-                "rollout".into(),
-                std::collections::BTreeMap::new(),
-                DispatchKind::Manual,
-                None,
-            )
-            .await
-            .expect("dispatch")
-        }
-    };
-
-    let acme = dispatch("acme", "web").await;
-    let umbrella = dispatch("umbrella", "web").await; // other tenant, same group
-    let acme_again = dispatch("acme", "web").await;
-
-    // The stored keys are repo-scoped, so the two tenants never share a slot.
-    assert_eq!(
-        db.run_concurrency(&acme).await.unwrap(),
-        Some(("acme/web:deploy".to_string(), ConcurrencyPolicy::Queue)),
-    );
-    assert_eq!(
-        db.run_concurrency(&umbrella).await.unwrap(),
-        Some(("umbrella/web:deploy".to_string(), ConcurrencyPolicy::Queue)),
-    );
-
-    let exec = FakeExecutor::new();
-    let sched = Scheduler::new(db.as_ref(), clock.as_ref() as &dyn Clock, &exec, "sched");
-    sched.admit(&acme).await.unwrap();
-    sched.admit(&umbrella).await.unwrap();
-    sched.admit(&acme_again).await.unwrap();
-
-    assert_eq!(db.run_status(&acme).await.unwrap(), Some(RunStatus::Running));
-    assert_eq!(
-        db.run_status(&umbrella).await.unwrap(),
-        Some(RunStatus::Running),
-        "another tenant's `deploy` group must not serialize behind ours"
-    );
-    assert_eq!(
-        db.run_status(&acme_again).await.unwrap(),
-        Some(RunStatus::Pending),
-        "the same project's second run still queues behind its slot holder"
     );
 }

@@ -1472,7 +1472,12 @@ fn scan_one(
 /// than being dropped.
 fn mtime_ms(meta: &std::fs::Metadata) -> Option<i64> {
     let modified = meta.modified().ok()?;
-    scarab_storage::unix_ms_from_system_time(modified)
+    match modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).ok(),
+        Err(before) => i64::try_from(before.duration().as_millis())
+            .ok()
+            .map(|ms| -ms),
+    }
 }
 
 /// The client behind both ports at once, for a composition root that wants to

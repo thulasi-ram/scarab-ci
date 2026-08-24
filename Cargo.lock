@@ -2809,7 +2809,6 @@ dependencies = [
  "scarab-secrets",
  "sqlx",
  "tokio",
- "tracing",
 ]
 
 [[package]]
