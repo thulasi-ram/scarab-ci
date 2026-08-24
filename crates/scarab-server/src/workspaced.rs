@@ -244,6 +244,23 @@ const DRAIN_RECORD_VERSION: u32 = 1;
 const FENCE_RESIDUE_TTL_SECS: i64 =
     workspace_token::WORKSPACE_TOKEN_MAX_TTL_SECS + workspace_token::WORKSPACE_TOKEN_GRACE_SECS;
 
+/// How long an OPEN pack writer may sit idle before the linger ticker seals
+/// and stages it (git-bug afb13c2). The tail-pack visibility bound for a
+/// scattered drain: a replica that received PUTs but will never see the POST
+/// makes its tail durable-index-visible this soon after the last append, and
+/// the client's in-process record retry is sized against it (>= 3x). Two
+/// seconds: long enough that one drain's 16-wide PUT bursts do not shear
+/// into per-burst packs, short enough that the retry converges fast.
+const PACK_IDLE_LINGER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The machine-readable `code` of the durable-presence gate's 422 (git-bug
+/// afb13c2) — the ONE refusal a drain client may retry in-process, because it
+/// names a timing condition (another replica's tail pack inside its linger
+/// window), not a contract violation. Closure/ledger 422s stay prose-only on
+/// purpose: retrying those cannot help. Mirrored verbatim in
+/// `scarab-workspace-client` (`DRAIN_STATE_INCOMPLETE_CODE`).
+const DRAIN_STATE_INCOMPLETE_CODE: &str = "drain_state_incomplete";
+
 /// The request header labelling a CAS PUT's durability (ADR-0067 part 6):
 /// `durable` (streamed into the fence's pack) or `cache-only` (warm only,
 /// unpromised and evictable). **Absent defaults by fence** (see
@@ -504,6 +521,20 @@ pub fn router(
     token_secret: Vec<u8>,
     db: sqlx::PgPool,
 ) -> Result<Router, StorageError> {
+    router_with_pack_linger(warm_dir, cold, token_secret, db, Some(PACK_IDLE_LINGER))
+}
+
+/// [`router`] with the idle-pack linger injectable (git-bug afb13c2) — for
+/// the acceptance tests: `None` disables the ticker (the per-pack ordering
+/// test must hold a tail pack open), a short `Some` lets the cross-replica
+/// scatter test converge without waiting out the production two seconds.
+pub fn router_with_pack_linger(
+    warm_dir: impl AsRef<std::path::Path>,
+    cold: Arc<S3Storage>,
+    token_secret: Vec<u8>,
+    db: sqlx::PgPool,
+    pack_linger: Option<std::time::Duration>,
+) -> Result<Router, StorageError> {
     let warm_dir = warm_dir.as_ref().to_path_buf();
     let state = open_state(&warm_dir, cold, token_secret, db)?;
 
@@ -539,7 +570,53 @@ pub fn router(
         });
     }
 
+    // The idle-pack linger ticker (git-bug afb13c2), on its own fast cadence
+    // beside the sweep above: an open pack writer idle past the linger is
+    // sealed-and-staged, so a replica that received a scattered drain's PUTs
+    // — and will never receive its POST — publishes its tail pack into the
+    // shared index without any cross-replica signalling. Sleep-first: at
+    // boot there is nothing to seal.
+    if let Some(linger) = pack_linger {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let cadence = std::cmp::max(linger / 4, std::time::Duration::from_millis(100));
+            loop {
+                tokio::time::sleep(cadence).await;
+                seal_idle_packs_once(&state, linger).await;
+            }
+        });
+    }
+
     Ok(build_router(state))
+}
+
+/// One pass of the linger ticker: seal-and-stage every open pack writer idle
+/// past `linger`. The same collect-Arcs → `try_lock` → check-under-guard
+/// shape as the abandoned-session sweep in [`sweep_exports_once`], and the
+/// same skip rules: a locked session is in active use, a tombstoned one is
+/// the sweep's (git-bug 022aec8). A seal failure discarded the writer and
+/// forgot its members ([`PackSession::seal_open`]), so retried PUTs re-pack
+/// them — logged, never fatal.
+async fn seal_idle_packs_once(state: &WorkspaceState, linger: std::time::Duration) {
+    let sessions: Vec<(String, Arc<tokio::sync::Mutex<PackSession>>)> = {
+        let map = state.packs.lock().unwrap_or_else(PoisonError::into_inner);
+        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let cutoff_ms = now_ms() - i64::try_from(linger.as_millis()).unwrap_or(i64::MAX);
+    for (key, session) in sessions {
+        let Ok(mut guard) = session.try_lock() else { continue };
+        if guard.aborted || guard.open.is_none() || guard.last_touched_ms > cutoff_ms {
+            continue;
+        }
+        if let Err(e) = guard.seal_open().await {
+            tracing::warn!(
+                fence_key = %key,
+                error = %e,
+                "idle-seal of an open pack failed — the writer was discarded, its members \
+                 forgotten, so retried PUTs re-pack them"
+            );
+        }
+    }
 }
 
 /// Everything [`router`] needs, built once — and **the only constructor**, so the
@@ -721,17 +798,21 @@ async fn sweep_exports_once(state: &WorkspaceState) {
     // of staged parts; an incomplete upload publishes nothing either way) and
     // the session forgotten. Sealed-but-uncommitted body packs stay behind as
     // unreachable bytes for the grace-window reclaim job (a later slice).
-    // `try_lock` skips any session a request is actively using.
+    // `try_lock` skips any session a request is actively using, and the
+    // session is TOMBSTONED under its own lock before the map entry goes
+    // (git-bug 022aec8): a racer holding the `Arc` from before the removal
+    // errs loudly on its next append instead of writing into a ghost.
     let stale: Vec<(String, Arc<tokio::sync::Mutex<PackSession>>)> = {
         let map = state.packs.lock().unwrap_or_else(PoisonError::into_inner);
         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     };
-    let cutoff = now - FENCE_RESIDUE_TTL_SECS;
+    let cutoff_ms = (now - FENCE_RESIDUE_TTL_SECS) * 1000;
     for (key, session) in stale {
         let Ok(mut guard) = session.try_lock() else { continue };
-        if guard.last_touched >= cutoff {
+        if guard.aborted || guard.last_touched_ms >= cutoff_ms {
             continue;
         }
+        guard.aborted = true;
         state
             .packs
             .lock()
@@ -2138,11 +2219,18 @@ struct PackSession {
     open: Option<PackWriter>,
     sealed: Vec<FinishedPack>,
     packed: HashSet<String>,
-    /// Unix seconds of the last append — what the abandoned-session sweep
-    /// compares against [`FENCE_RESIDUE_TTL_SECS`]: a session this old belongs
-    /// to a fence no live token can extend, so nothing can legally append to
-    /// or seal it again.
-    last_touched: i64,
+    /// Unix milliseconds of the last append — what the abandoned-session
+    /// sweep compares against [`FENCE_RESIDUE_TTL_SECS`] (a session that old
+    /// belongs to a fence no live token can extend) and what the linger
+    /// ticker compares against [`PACK_IDLE_LINGER`]. Milliseconds because the
+    /// linger is seconds-scale and injectable smaller in tests.
+    last_touched_ms: i64,
+    /// Tombstone (git-bug 022aec8): set — under this session's own lock — by
+    /// the abandoned-session sweep before it removes the map entry, so a
+    /// racer that cloned the `Arc` earlier and appends AFTER the abort gets a
+    /// loud error instead of filing bytes into a ghost session no drain will
+    /// ever seal.
+    aborted: bool,
 }
 
 impl PackSession {
@@ -2155,7 +2243,8 @@ impl PackSession {
             open: None,
             sealed: Vec::new(),
             packed: HashSet::new(),
-            last_touched: now_secs(),
+            last_touched_ms: now_ms(),
+            aborted: false,
         }
     }
 
@@ -2187,7 +2276,15 @@ impl PackSession {
         tagged: String,
         data: &[u8],
     ) -> Result<(), StorageError> {
-        self.last_touched = now_secs();
+        if self.aborted {
+            return Err(StorageError::Backend(format!(
+                "pack session for fence {} was aborted by the residue sweep — the fence \
+                 outlived every token that could seal it, so this write can never become \
+                 durable (git-bug 022aec8)",
+                self.fence_key
+            )));
+        }
+        self.last_touched_ms = now_ms();
         if self.packed.contains(&tagged) {
             return Ok(());
         }
@@ -2230,6 +2327,13 @@ impl PackSession {
     /// its members leave `packed` so a retried PUT re-packs them — the path
     /// a cross-replica POST needs when this replica's rows never landed.
     async fn seal_open(&mut self) -> Result<(), StorageError> {
+        if self.aborted {
+            return Err(StorageError::Backend(format!(
+                "pack session for fence {} was aborted by the residue sweep — nothing may \
+                 seal it (git-bug 022aec8)",
+                self.fence_key
+            )));
+        }
         let Some(writer) = self.open.take() else {
             return Ok(());
         };
@@ -3198,13 +3302,35 @@ async fn post_drain(
             );
         }
         if !lost.is_empty() {
-            return Ok(refusal(format!(
+            // The ONE machine-readable 422 (git-bug afb13c2): a scattered
+            // drain's members can sit in another replica's open tail pack for
+            // up to the linger, so the client retries THIS refusal in-process
+            // — every retry sees a strictly larger index. A `code` field, not
+            // prose-matching; every other 422 stays prose because retrying a
+            // ledger/closure violation cannot help.
+            let detail = format!(
                 "drain state lost — re-drive: {} member(s) of the published closure are \
                  neither in this drain's sealed packs nor already durable in the pack \
                  index: {}",
                 lost.len(),
                 lost.join(", ")
-            )));
+            );
+            tracing::warn!(
+                run = %fence.run,
+                step = %fence.step,
+                attempt = %fence.attempt,
+                detail = %detail,
+                "workspace service: 422 — drain record refused (retryable: staged packs \
+                 may still be inside another replica's linger window)"
+            );
+            return Ok((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "code": DRAIN_STATE_INCOMPLETE_CODE,
+                    "detail": detail,
+                })),
+            )
+                .into_response());
         }
     }
 

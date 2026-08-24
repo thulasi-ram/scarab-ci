@@ -405,16 +405,54 @@ impl WorkspaceClient {
     /// failure is exit 12; classification is record-first on the control
     /// plane, so the exit code is only a hint.
     pub async fn post_drain_record(&self, rec: &DrainRecord) -> Result<(), StorageError> {
+        match self.post_drain_record_classified(rec).await? {
+            DrainPostOutcome::Posted => Ok(()),
+            DrainPostOutcome::StateIncomplete(detail) => Err(StorageError::Backend(format!(
+                "workspace service 422 ({DRAIN_STATE_INCOMPLETE_CODE}): {detail}"
+            ))),
+        }
+    }
+
+    /// [`post_drain_record`](Self::post_drain_record), distinguishing the ONE
+    /// refusal a drain may retry in-process (git-bug afb13c2): the Depot's
+    /// durable-presence gate answers 422 with a machine-readable
+    /// `{"code": "drain_state_incomplete", ...}` body when members of the
+    /// published closure are not yet in the shared pack index — on a
+    /// scattered drain they can sit in another replica's open tail pack for
+    /// up to that replica's idle linger. Keyed on the `code` field only,
+    /// NEVER on prose: every other 422 (ledger, closure) names a contract
+    /// violation retrying cannot fix, and stays an error here.
+    pub async fn post_drain_record_classified(
+        &self,
+        rec: &DrainRecord,
+    ) -> Result<DrainPostOutcome, StorageError> {
         let resp = self
             .request(reqwest::Method::POST, "/v1/drains")
             .json(rec)
             .send()
             .await
             .map_err(Self::transport)?;
-        if !resp.status().is_success() {
-            return Err(Self::status_error(resp).await);
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(DrainPostOutcome::Posted);
         }
-        Ok(())
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let body = resp.text().await.unwrap_or_default();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if v.get("code").and_then(|c| c.as_str()) == Some(DRAIN_STATE_INCOMPLETE_CODE) {
+                    let detail = v
+                        .get("detail")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("(no detail)")
+                        .to_string();
+                    return Ok(DrainPostOutcome::StateIncomplete(detail));
+                }
+            }
+            return Err(StorageError::Backend(format!(
+                "workspace service {status}: {body}"
+            )));
+        }
+        Err(Self::status_error(resp).await)
     }
 
     /// Read one fence's drain record — `GET /v1/drains/{fence_key}`, where the
@@ -680,6 +718,25 @@ pub struct DrainRecord {
     pub ingest_ms: u64,
     pub prune_ms: u64,
     pub error: Option<DrainErrorRecord>,
+}
+
+/// The `code` field of the Depot's retryable drain-record 422 (git-bug
+/// afb13c2). Mirrors `workspaced`'s constant verbatim — the wire contract is
+/// this string, and matching anything else (status alone, prose) is exactly
+/// what [`WorkspaceClient::post_drain_record_classified`] must not do.
+pub const DRAIN_STATE_INCOMPLETE_CODE: &str = "drain_state_incomplete";
+
+/// How one drain-record POST ended, for the in-process retry decision (see
+/// [`WorkspaceClient::post_drain_record_classified`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainPostOutcome {
+    /// 2xx — the record is deposited; the drain is done.
+    Posted,
+    /// The durable-presence gate's machine-readable 422: not everything the
+    /// record publishes is in the shared pack index YET. Retryable in-process
+    /// — every retry sees a strictly larger index — and bounded by the
+    /// caller; the exit-12 outer re-drive stays the correctness path.
+    StateIncomplete(String),
 }
 
 /// Why a drain did not publish. `detail` is what the operator reads off the

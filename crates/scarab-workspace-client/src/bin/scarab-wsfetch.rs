@@ -96,7 +96,8 @@ use std::os::unix::fs::PermissionsExt;
 
 use scarab_storage::{PruneError, StorageError, TreeHash};
 use scarab_workspace_client::{
-    DrainErrorKind, DrainErrorRecord, DrainRecord, IngestReport, MemoCas, WorkspaceClient,
+    DrainErrorKind, DrainErrorRecord, DrainPostOutcome, DrainRecord, IngestReport, MemoCas,
+    WorkspaceClient,
 };
 
 /// The env var naming the tmpfs file holding the workspace token. Must agree
@@ -126,6 +127,13 @@ const DEFAULT_EGRESS_DONE_MARKER: &str = "/scarab-ctl/egress-done";
 const EXIT_DRAIN_TRANSIENT: i32 = 10;
 const EXIT_DRAIN_OUTPUT_CONTRACT: i32 = 11;
 const EXIT_DRAIN_RECORD_POST: i32 = 12;
+
+/// Cap on the in-process record-POST retry (git-bug afb13c2): comfortably
+/// over 3x the Depot's 2 s idle-pack linger — the window a scattered drain's
+/// tail packs need to become index-visible — and small next to the control
+/// plane's 5-minute drain clock. On exhaustion the exit-12 outer re-drive is
+/// the correctness path; this loop only buys back its latency.
+const DRAIN_INCOMPLETE_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -565,21 +573,49 @@ async fn run_drain(client: &WorkspaceClient, workspace: &str, outputs: &[String]
         prune_ms,
         error: None,
     };
-    match client.post_drain_record(&rec).await {
-        Ok(()) => {
-            println!(
-                "scarab-wsfetch: drain — record posted: root={} pruned_root={} prune_ms={prune_ms}",
-                rec.root,
-                pruned_root.as_deref().unwrap_or("-"),
-            );
-            0
-        }
-        Err(e) => {
-            eprintln!(
-                "scarab-wsfetch: drain: record POST failed after successful ingest \
-                 (the snapshot is in warm; only the rendezvous is missing): {e}"
-            );
-            EXIT_DRAIN_RECORD_POST
+    // Retried in-process ONLY on the Depot's machine-readable
+    // `drain_state_incomplete` 422 (git-bug afb13c2): a scattered drain's
+    // members can sit in another replica's open tail pack until that
+    // replica's idle linger seals it into the shared index, and every retry
+    // sees a strictly larger index. Any other failure exits 12 immediately —
+    // the outer re-drive is the correctness path either way.
+    let mut waited = std::time::Duration::ZERO;
+    let mut pause = std::time::Duration::from_millis(500);
+    loop {
+        match client.post_drain_record_classified(&rec).await {
+            Ok(DrainPostOutcome::Posted) => {
+                println!(
+                    "scarab-wsfetch: drain — record posted: root={} pruned_root={} prune_ms={prune_ms}",
+                    rec.root,
+                    pruned_root.as_deref().unwrap_or("-"),
+                );
+                return 0;
+            }
+            Ok(DrainPostOutcome::StateIncomplete(detail)) => {
+                if waited >= DRAIN_INCOMPLETE_RETRY_CAP {
+                    eprintln!(
+                        "scarab-wsfetch: drain: record POST still incomplete after {}ms — \
+                         handing over to the outer re-drive: {detail}",
+                        waited.as_millis()
+                    );
+                    return EXIT_DRAIN_RECORD_POST;
+                }
+                eprintln!(
+                    "scarab-wsfetch: drain: drain state incomplete (a tail pack may still \
+                     be inside another replica's linger window) — retrying in {}ms: {detail}",
+                    pause.as_millis()
+                );
+                tokio::time::sleep(pause).await;
+                waited += pause;
+                pause = std::cmp::min(pause * 2, std::time::Duration::from_millis(2_500));
+            }
+            Err(e) => {
+                eprintln!(
+                    "scarab-wsfetch: drain: record POST failed after successful ingest \
+                     (the snapshot is in warm; only the rendezvous is missing): {e}"
+                );
+                return EXIT_DRAIN_RECORD_POST;
+            }
         }
     }
 }
