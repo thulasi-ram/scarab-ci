@@ -96,8 +96,9 @@ impl Label {
 /// first, root last — ADR-0067 part 6) while the pod has the whole tree in
 /// hand from the scan.
 enum LabelPlan {
-    /// The feed-path ingest: no labels at all (the header's absent-is-durable
-    /// default carries it, and there is no drain here to pack anything).
+    /// The feed-path ingest: no labels at all — the Depot's fence-dependent
+    /// absent-header default carries it (fenced = durable, fenceless =
+    /// cache-only), and there is no drain here to pack anything.
     Unlabelled,
     /// A drain with no `outputs:`: the whole closure is the publish.
     AllDurable,
@@ -135,6 +136,7 @@ impl LabelPlan {
 ///   the exact wart ADR-0061 refused to inherit from the results token. So it
 ///   supplies a [`Minted`](TokenSource::Minted) closure instead and gets a
 ///   short-lived token per request.
+#[derive(Clone)]
 enum TokenSource {
     Fixed(String),
     /// Called once per request. Minting is an HMAC over ~40 bytes, i.e. free
@@ -160,6 +162,12 @@ pub struct WorkspaceClient {
     /// from the tmpfs file the executor mounts, never from an env var value; in
     /// the control plane it is minted per request (see [`TokenSource`]).
     token: TokenSource,
+    /// Label every [`Cas`] PUT (`put_blob`/`put_tree`) `cache-only` explicitly
+    /// (see [`Self::cache_only_cas`]). Off by default: the fenced in-Pod
+    /// writers that come through the `Cas` impl (the drain's prune-minted
+    /// parents via [`MemoCas`]) ride the Depot's fenced absent-header default,
+    /// which is `durable` — the correct promise for them.
+    cas_cache_only: bool,
 }
 
 #[derive(Serialize)]
@@ -219,6 +227,25 @@ impl WorkspaceClient {
             http: reqwest::Client::new(),
             base: base.into().trim_end_matches('/').to_string(),
             token,
+            cas_cache_only: false,
+        }
+    }
+
+    /// A twin of this client whose [`Cas`] PUTs (`put_blob`/`put_tree`) carry
+    /// an explicit `cache-only` durability label (ADR-0067 part 6).
+    ///
+    /// This is the control plane's warm leg: its `TieredCas` warm writes and
+    /// read backfills treat the Depot as a CACHE — the durable copy is the
+    /// cold leg's own direct object-store write — and these PUTs are
+    /// fenceless (Browse token), so no pack could ever make them durable on
+    /// the Depot anyway. Labelling them explicitly states that intent on the
+    /// wire instead of leaning on the Depot's fenceless absent-header default.
+    pub fn cache_only_cas(&self) -> Self {
+        Self {
+            http: self.http.clone(),
+            base: self.base.clone(),
+            token: self.token.clone(),
+            cas_cache_only: true,
         }
     }
 
@@ -326,10 +353,23 @@ impl WorkspaceClient {
         Ok(report)
     }
 
+    /// The label this client's [`Cas`] PUTs carry: `Some(CacheOnly)` for a
+    /// [`cache_only_cas`](Self::cache_only_cas) twin, otherwise `None` (no
+    /// header — the Depot defaults a fenced PUT to `durable` and a fenceless
+    /// one to `cache-only`).
+    fn cas_put_label(&self) -> Option<Label> {
+        if self.cas_cache_only {
+            Some(Label::CacheOnly)
+        } else {
+            None
+        }
+    }
+
     /// `PUT` raw bytes under a hash the caller already computed, optionally
     /// labelled for durability (ADR-0067 part 6). `None` sends no header —
-    /// which the Depot reads as `durable`, the compatibility default that
-    /// keeps an unlabelled writer on today's promise.
+    /// the Depot's default is then fence-dependent: `durable` for a fenced
+    /// PUT (old `scarab-wsfetch` compat), `cache-only` for a fenceless one
+    /// (old control-plane compat).
     async fn put_bytes(
         &self,
         kind: &str,
@@ -818,7 +858,8 @@ fn canonical_tree(entries: Vec<TreeEntry>) -> Result<(TreeHash, Vec<u8>), Storag
 impl Cas for WorkspaceClient {
     async fn put_blob(&self, data: &[u8]) -> Result<BlobHash, StorageError> {
         let hash = hash_hex(data);
-        self.put_bytes("blobs", &hash, data.to_vec(), None).await?;
+        self.put_bytes("blobs", &hash, data.to_vec(), self.cas_put_label())
+            .await?;
         Ok(BlobHash(hash))
     }
 
@@ -843,11 +884,14 @@ impl Cas for WorkspaceClient {
 
     async fn put_tree(&self, entries: Vec<TreeEntry>) -> Result<TreeHash, StorageError> {
         let (hash, bytes) = canonical_tree(entries)?;
-        // Unlabelled = the Depot's durable default (ADR-0067 part 6): the one
-        // fenced writer that comes through here is the drain's prune minting
-        // its narrower parents via [`MemoCas`], and those ARE the published
-        // closure — durable is the correct label, not an accident.
-        self.put_bytes("trees", &hash.0, bytes, None).await?;
+        // Default (unlabelled): the one FENCED writer that comes through here
+        // is the drain's prune minting its narrower parents via [`MemoCas`],
+        // and those ARE the published closure — the Depot's fenced
+        // absent-header default (`durable`) is the correct label, not an
+        // accident. A `cache_only_cas` twin (the control plane's fenceless
+        // warm leg) labels explicitly instead.
+        self.put_bytes("trees", &hash.0, bytes, self.cas_put_label())
+            .await?;
         Ok(hash)
     }
 

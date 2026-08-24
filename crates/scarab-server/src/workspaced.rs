@@ -246,10 +246,14 @@ const FENCE_RESIDUE_TTL_SECS: i64 =
 
 /// The request header labelling a CAS PUT's durability (ADR-0067 part 6):
 /// `durable` (streamed into the fence's pack) or `cache-only` (warm only,
-/// unpromised and evictable). **Absent = durable** — an old `scarab-wsfetch`
-/// image sends no label, and defaulting the other way would silently demote
-/// its whole drain to a promise nothing keeps; until images roll, its scratch
-/// rides the packs too, which is waste and never loss.
+/// unpromised and evictable). **Absent defaults by fence** (see
+/// [`durability_of`]): a FENCED absent-header PUT is durable — an old
+/// `scarab-wsfetch` image sends no label, and defaulting the other way would
+/// silently demote its whole drain to a promise nothing keeps — while a
+/// FENCELESS absent-header PUT is cache-only, because without a fence there
+/// is no pack and nothing here could ever keep a durable promise (an old
+/// control-plane binary's warm-cache leg keeps working, on the promise it
+/// always actually had).
 const DURABILITY_HEADER: &str = "x-scarab-durability";
 
 /// Where one body pack rolls over to the next (ADR-0067 part 7: size-capped,
@@ -1593,7 +1597,7 @@ async fn put_blob(
 ) -> Result<Response, WsError> {
     let claims = authenticate(&state, &headers)?;
     let hash = valid_address(&hash)?;
-    let durability = durability_of(&headers)?;
+    let durability = durability_of(&headers, fence_claim(&claims))?;
 
     let actual = hash_hex(&body);
     if actual != hash {
@@ -1629,9 +1633,11 @@ async fn put_blob(
 
     // ADR-0067 parts 4–6: a fence's DURABLE bytes stream into its pack as
     // they arrive — durable-at-the-drain, no second pass. Cache-only stays
-    // the warm seed above, unpromised. A durable PUT with no fence (the
-    // control plane's own ingest) has no drain to close a pack, so it keeps
-    // the ADR-0064 shape this slice inherits: warm now, the flush archives.
+    // the warm seed above, unpromised. `durability_of` already guarantees
+    // Durable implies a fence (a fenceless durable label is a 400 at the
+    // door): there is no fenceless durable arm here, because without a pack
+    // nothing could keep the promise — the fenceless warm seed above is a
+    // cache entry, full stop.
     if durability == Durability::Durable {
         if let Some(fence) = fence_claim(&claims) {
             pack_append(&state, fence, PackMemberKind::Blob, &hash, &body).await?;
@@ -1693,7 +1699,7 @@ async fn put_tree(
 ) -> Result<Response, WsError> {
     let claims = authenticate(&state, &headers)?;
     let hash = valid_address(&hash)?;
-    let durability = durability_of(&headers)?;
+    let durability = durability_of(&headers, fence_claim(&claims))?;
 
     let actual = hash_hex(&body);
     if actual != hash {
@@ -1751,8 +1757,9 @@ async fn put_tree(
         )));
     }
 
-    // **Warm, plus the fence's pack** — see `put_blob` for the migration story
-    // (ADR-0064's deferred flush, retired by ADR-0067 part 4). It matters MORE
+    // **Warm, plus the fence's pack** — same shape as `put_blob`: durable
+    // implies a fence (`durability_of` refuses the fenceless durable label at
+    // the door), and a fenceless PUT is a cache entry only. It matters MORE
     // for a tree than for a blob, because a tree is the address an Attempt
     // records as its evidence: a root that exists only in warm is a snapshot
     // the durable record points at and cannot produce, and the drain record's
@@ -2046,13 +2053,33 @@ enum Durability {
     CacheOnly,
 }
 
-/// Parse the durability label. Absent = durable (see [`DURABILITY_HEADER`]);
-/// an unknown value is a 400, fail-closed — a typo'd label must not silently
-/// pick either promise.
-fn durability_of(headers: &HeaderMap) -> Result<Durability, WsError> {
+/// Resolve a PUT's effective durability from its label and its token's fence.
+///
+/// The matrix (ADR-0067 part 6 + OQ1 compat):
+/// - fenced, absent → **durable** (an old `scarab-wsfetch` sends no label;
+///   demoting it would silently unback its whole drain);
+/// - fenced, labelled → as labelled;
+/// - fenceless, absent → **cache-only** (an old control-plane binary's warm
+///   leg; nothing fenceless can ever become durable here — there is no pack);
+/// - fenceless, `durable` → **400**: refused at the door rather than accepted
+///   warm-only under a promise nothing keeps — a durable PUT is kept by the
+///   posting fence's pack, and a fenceless PUT has none;
+/// - unknown value → 400, fail-closed — a typo'd label must not silently pick
+///   either promise.
+fn durability_of(headers: &HeaderMap, fence: Option<&Fence>) -> Result<Durability, WsError> {
     match headers.get(DURABILITY_HEADER) {
-        None => Ok(Durability::Durable),
+        None => Ok(if fence.is_some() {
+            Durability::Durable
+        } else {
+            Durability::CacheOnly
+        }),
         Some(v) => match v.to_str() {
+            Ok("durable") if fence.is_none() => Err(WsError::BadRequest(
+                "a durable-labelled PUT requires a fence claim: durability is kept by the \
+                 posting fence's pack (ADR-0067 part 4) and a fenceless PUT has no pack — \
+                 label it cache-only, or send it under a fenced token"
+                    .to_string(),
+            )),
             Ok("durable") => Ok(Durability::Durable),
             Ok("cache-only") => Ok(Durability::CacheOnly),
             _ => Err(WsError::BadRequest(format!(
@@ -4519,6 +4546,162 @@ mod tests {
             "prune_ms": 1,
             "error": null
         })
+    }
+
+    /// One labelled PUT against the harness's router — the durability-matrix
+    /// arms (`put_raw_as` cannot carry the header).
+    async fn put_labelled(
+        h: &ExportHarness,
+        token: &str,
+        uri: &str,
+        body: Vec<u8>,
+        label: Option<&str>,
+    ) -> (StatusCode, String) {
+        use tower::ServiceExt;
+        let mut builder = axum::http::Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header(WORKSPACE_TOKEN_HEADER, token);
+        if let Some(label) = label {
+            builder = builder.header(DURABILITY_HEADER, label);
+        }
+        let response = build_router(h.state.clone())
+            .oneshot(builder.body(Body::from(body)).expect("request"))
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// The durability matrix at the door (A3): a durable label without a
+    /// fence is a 400 — durability is kept by the posting fence's pack and a
+    /// fenceless PUT has none — while absent-header PUTs keep both old
+    /// clients working: fenceless absent = cache-only (an old control-plane
+    /// binary's warm-cache leg), fenced absent = durable (old
+    /// `scarab-wsfetch`, OQ1).
+    ///
+    /// Mutations killed: accept the fenceless durable label (the 400 arms
+    /// answer 2xx over a promise nothing keeps); default fenceless-absent to
+    /// durable again (the no-session assertion fails); default fenced-absent
+    /// to cache-only (the packed-member assertion fails — and every legacy
+    /// drain would silently publish nothing durable).
+    #[tokio::test]
+    async fn the_durability_matrix_splits_by_fence_and_refuses_fenceless_durable() {
+        let Some(h) = ExportHarness::start().await else { return };
+        let browse = h.token.clone();
+
+        let blob = b"labelled at the door".to_vec();
+        let hash = hash_hex(&blob);
+
+        // Fenceless + absent: accepted — a cache write, no pack session.
+        let (status, body) = put_labelled(
+            &h,
+            &browse,
+            &format!("/v1/cas/blobs/{hash}"),
+            blob.clone(),
+            None,
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+        assert!(
+            h.state
+                .packs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "a fenceless PUT must open no pack session"
+        );
+
+        // Fenceless + explicit durable: refused, blob and tree alike.
+        let (status, body) = put_labelled(
+            &h,
+            &browse,
+            &format!("/v1/cas/blobs/{hash}"),
+            blob.clone(),
+            Some("durable"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("fence"),
+            "the refusal must name the missing fence claim: {body}"
+        );
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "f.txt",
+            TreeTarget::Blob(BlobHash(hash.clone())),
+        )])
+        .expect("canonical tree");
+        let (status, body) = put_labelled(
+            &h,
+            &browse,
+            &format!("/v1/cas/trees/{}", tree_hash.0),
+            tree_bytes.clone(),
+            Some("durable"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            h.state
+                .packs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "refused PUTs must leave no session behind"
+        );
+
+        // Fenced + absent: durable, unchanged — the bytes stream into the
+        // fence's pack session.
+        let fenced = h.step_token("r7", "matrix", "a1");
+        let fence = Fence {
+            run: "r7".into(),
+            step: "matrix".into(),
+            attempt: "a1".into(),
+        };
+        let (status, body) = put_labelled(
+            &h,
+            &fenced,
+            &format!("/v1/cas/blobs/{hash}"),
+            blob.clone(),
+            None,
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+
+        // Fenced + explicit cache-only: accepted, and NOT packed.
+        let scratch = b"fenced scratch".to_vec();
+        let scratch_hash = hash_hex(&scratch);
+        let (status, body) = put_labelled(
+            &h,
+            &fenced,
+            &format!("/v1/cas/blobs/{scratch_hash}"),
+            scratch,
+            Some("cache-only"),
+        )
+        .await;
+        assert!(status.is_success(), "{body}");
+
+        let session = {
+            let map = h.state.packs.lock().unwrap_or_else(PoisonError::into_inner);
+            map.get(&fence_key(&fence))
+                .cloned()
+                .expect("a fenced absent-header PUT must open the fence's pack session")
+        };
+        let session = session.lock().await;
+        assert!(
+            session
+                .packed
+                .contains(&tagged_address(HashAlgo::Sha256, &hash)),
+            "the fenced absent-header blob must be in the fence's pack"
+        );
+        assert!(
+            !session
+                .packed
+                .contains(&tagged_address(HashAlgo::Sha256, &scratch_hash)),
+            "the fenced cache-only blob must NOT be in the fence's pack"
+        );
     }
 
     /// A fenced PUT lands in that fence's write ledger, and the ledger is a

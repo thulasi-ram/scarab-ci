@@ -202,10 +202,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // retention table gives it a TTL and calls it "the guarantee users are given".
     let cold_cas: Arc<dyn scarab_storage::Cas> = storage;
 
-    // The Depot client (ADR-0061/0064): ONE client, two jobs. As `Arc<dyn Cas>`
-    // it is the warm tier of the tiered READ handle below; held concretely it
-    // is also the executor's DRAIN handle, because the drain needs `flush` —
-    // a client capability, not a `Cas` port method.
+    // The Depot client (ADR-0061/0067): ONE client, two jobs. Its
+    // `cache_only_cas` twin is the warm tier of the tiered READ handle below;
+    // held concretely it is also the executor's drain-rendezvous handle,
+    // because reading a fence's drain record back (`drain_record`) is a
+    // client capability, not a `Cas` port method.
     //
     // The token is minted **per request**, in `browse` scope, for this process's
     // own use (`workspace_token::browse_claims`). Per-request rather than once at
@@ -246,38 +247,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    literal reading of "a warm miss is slower, never wrong". Note this is
     //    the OPPOSITE of a Step Pod, which must fail closed: a Pod has no
     //    credentials, by design (ADR-0042).
-    //  * **the drain does NOT write through it.** The old shape ingested every
-    //    Step's snapshot cold-first through this handle and re-walked the
-    //    directory for warm (`TieredCas::ingest`, now deleted — it refuses
-    //    loudly if anything still reaches it through `dyn Cas`). The drain is
-    //    warm-first via `depot_client` above — one walk, `/have`-dedup, and
-    //    prune-minted trees land warm only — followed by ONE awaited
-    //    `flush(published_root)`: the Depot uploads the closure to cold and
-    //    only `Durable` releases the verdict. ADR-0061 part 4's guarantee is
-    //    kept by awaiting the flush, not by ordering each blob; a Depot outage
-    //    fails Attempts promptly and legibly (`Infra` + cause, time-bounded —
-    //    ticket 4cf03d7), never as a step-budget timeout.
+    //  * **the drain does NOT write through it.** The drain is in-Pod since
+    //    git-bug 212bb13: `scarab-wsfetch` ingests /workspace straight to the
+    //    Depot under its fenced token, durable bytes stream into the fence's
+    //    PACKS as they arrive, and the drain record's index transaction is
+    //    the durability gate (ADR-0067 part 4 — the flush RPC and the second
+    //    pass it implied are deleted). This process only reads the record
+    //    back (`drain_record`) and classifies.
     //  * **stray writes** (`put_blob`/`put_tree` from anything that is not the
     //    drain) keep the old cold-first rule: cold decides success, a warm
-    //    failure is a warning plus a counter.
+    //    failure is a warning plus a counter. The warm leg is the
+    //    `cache_only_cas` twin: a fenceless PUT opens no pack and can never
+    //    be durable on the Depot, so the cache-only label states on the wire
+    //    what was always true — the durable copy is the direct cold write.
     let workspace_cas: Arc<dyn scarab_storage::Cas> = match &depot_client {
         Some(client) => {
             tracing::info!(
                 url = %config.workspace.as_ref().map(|ws| ws.url.as_str()).unwrap_or_default(),
-                "workspace snapshots: warm = the workspace service, cold = the object store \
-                 (ADR-0061 D1.6 reads fall through to cold; the drain is warm-first + one \
-                 awaited cold flush on the Depot, ADR-0064)"
+                "workspace snapshots: warm = the workspace service (cache-only leg), cold = \
+                 the object store, direct (ADR-0061 D1.6 reads fall through to cold; drains \
+                 are in-Pod into the Depot's packs — ADR-0067, no flush pass)"
             );
             Arc::new(
-                scarab_storage::tiered::TieredCas::new(client.clone(), cold_cas)
-                    .fall_through_on_warm_error(),
+                scarab_storage::tiered::TieredCas::new(
+                    Arc::new(client.cache_only_cas()),
+                    cold_cas,
+                )
+                .fall_through_on_warm_error(),
             )
         }
         // No service configured: the object store IS the whole store. The
         // executor already refuses to launch a step that inherits a workspace in
         // this state (fail-closed) and its drain writes this handle directly
-        // (durable by construction, nothing to flush), so this path serves
-        // Browse and GC over pre-ADR-0061 snapshots and drain-less dev.
+        // (durable by construction), so this path serves Browse and GC over
+        // pre-ADR-0061 snapshots and drain-less dev.
         None => cold_cas,
     };
     let logs = Arc::new(LogService::new(store.clone(), db.clone()));
