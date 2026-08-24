@@ -9,7 +9,7 @@
 //! `SCARAB_MASTER_KEY` and gates boot on it, ADR-0048); the provider is
 //! pluggable (a KMS-backed master key later). This adapter never reads env.
 
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -81,20 +81,37 @@ impl SecretProvider for PostgresSecrets {
         .map_err(|e| SecretError::Backend(e.to_string()))?
         .ok_or(SecretError::NotFound)?;
 
-        // Unwrap the data key with the master key, then open the value.
-        let data_key = decrypt(
-            &self.master,
-            &row.get::<Vec<u8>, _>("key_nonce"),
-            &row.get::<Vec<u8>, _>("wrapped_key"),
-        )?;
+        let key_nonce = row.get::<Vec<u8>, _>("key_nonce");
+        let wrapped_key = row.get::<Vec<u8>, _>("wrapped_key");
+        let value_nonce = row.get::<Vec<u8>, _>("value_nonce");
+        let ciphertext = row.get::<Vec<u8>, _>("ciphertext");
+
+        // Unwrap the data key with the master key, then open the value. Both
+        // seals are bound to this row's (scope, key) via AAD; rows written
+        // before AAD binding carry none (AES-GCM: absent AAD == empty AAD),
+        // so a failed AAD-bound unwrap falls back to the legacy empty-AAD
+        // format for the whole row. New writes always bind.
+        let aad = row_aad(&scope_key(scope), key);
+        let (data_key, legacy) = match decrypt(&self.master, &key_nonce, &wrapped_key, &aad) {
+            Ok(dk) => (dk, false),
+            Err(_) => (decrypt(&self.master, &key_nonce, &wrapped_key, b"")?, true),
+        };
+        if legacy {
+            tracing::debug!(
+                scope = %scope_key(scope),
+                key,
+                "secret row predates AAD binding; decrypted via legacy no-AAD path \
+                 (rewrite the secret to bind it to its row)"
+            );
+        }
         let data_key: [u8; 32] = data_key
             .try_into()
             .map_err(|_| SecretError::Backend("corrupt data key".into()))?;
-        let value = decrypt(
-            &data_key,
-            &row.get::<Vec<u8>, _>("value_nonce"),
-            &row.get::<Vec<u8>, _>("ciphertext"),
-        )?;
+        let value = if legacy {
+            decrypt(&data_key, &value_nonce, &ciphertext, b"")?
+        } else {
+            decrypt(&data_key, &value_nonce, &ciphertext, &aad)?
+        };
         Ok(Secret {
             key: key.to_string(),
             value,
@@ -103,9 +120,12 @@ impl SecretProvider for PostgresSecrets {
 
     async fn put(&self, scope: &SecretScope, secret: Secret) -> Result<(), SecretError> {
         // Fresh per-secret data key; seal the value under it, then wrap it.
+        // Both seals bind the row identity (scope, key) as AAD so the sealed
+        // bytes cannot be replayed onto a different row (git-bug 4e1e40d).
+        let aad = row_aad(&scope_key(scope), &secret.key);
         let data_key: [u8; 32] = random_bytes();
-        let (ciphertext, value_nonce) = encrypt(&data_key, &secret.value)?;
-        let (wrapped_key, key_nonce) = encrypt(&self.master, &data_key)?;
+        let (ciphertext, value_nonce) = encrypt(&data_key, &secret.value, &aad)?;
+        let (wrapped_key, key_nonce) = encrypt(&self.master, &data_key, &aad)?;
 
         sqlx::query(
             "INSERT INTO secrets (scope, key, ciphertext, value_nonce, wrapped_key, key_nonce)
@@ -165,24 +185,45 @@ fn scope_key(scope: &SecretScope) -> String {
     }
 }
 
-/// AES-256-GCM seal → (ciphertext, 96-bit nonce).
-fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), SecretError> {
+/// The associated data binding a seal to its row: `scope_text || 0x00 || key`.
+/// `scope_key` never contains NUL, so the encoding is unambiguous.
+fn row_aad(scope_text: &str, key: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(scope_text.len() + 1 + key.len());
+    aad.extend_from_slice(scope_text.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(key.as_bytes());
+    aad
+}
+
+/// AES-256-GCM seal with associated data → (ciphertext, 96-bit nonce).
+fn encrypt(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), SecretError> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| SecretError::Backend(format!("cipher init: {e}")))?;
     let nonce_bytes: [u8; 12] = random_bytes();
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(nonce, Payload { msg: plaintext, aad })
         .map_err(|_| SecretError::Backend("encryption failed".into()))?;
     Ok((ciphertext, nonce_bytes.to_vec()))
 }
 
-/// AES-256-GCM open. A wrong key / tampered ciphertext fails the auth tag.
-fn decrypt(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, SecretError> {
+/// AES-256-GCM open. A wrong key, tampered ciphertext, or mismatched
+/// associated data fails the auth tag. An empty `aad` opens the legacy
+/// pre-AAD format (absent AAD is the same thing to AES-GCM).
+fn decrypt(
+    key: &[u8; 32],
+    nonce: &[u8],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, SecretError> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| SecretError::Backend(format!("cipher init: {e}")))?;
     cipher
-        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
         .map_err(|_| SecretError::Backend("decryption failed".into()))
 }
 
@@ -190,4 +231,35 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
     OsRng.fill_bytes(&mut buf);
     buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AAD binds the seal: the same bytes open only under the AAD they were
+    /// sealed with, and an empty AAD opens legacy (pre-AAD) ciphertext.
+    #[test]
+    fn aad_binds_and_empty_aad_is_legacy() {
+        let key = [9u8; 32];
+        let aad = row_aad("repo:acme/app", "TOKEN");
+
+        let (ct, nonce) = encrypt(&key, b"v", &aad).unwrap();
+        assert_eq!(decrypt(&key, &nonce, &ct, &aad).unwrap(), b"v");
+        // A different row identity fails the tag.
+        let other = row_aad("env:acme/app/production", "TOKEN");
+        assert!(decrypt(&key, &nonce, &ct, &other).is_err());
+        assert!(decrypt(&key, &nonce, &ct, b"").is_err());
+
+        // Legacy rows were sealed with no AAD — the empty-AAD open is that path.
+        let (legacy_ct, legacy_nonce) = encrypt(&key, b"old", b"").unwrap();
+        assert_eq!(decrypt(&key, &legacy_nonce, &legacy_ct, b"").unwrap(), b"old");
+        assert!(decrypt(&key, &legacy_nonce, &legacy_ct, &aad).is_err());
+    }
+
+    /// The NUL separator keeps (scope, key) pairs from colliding.
+    #[test]
+    fn row_aad_is_unambiguous() {
+        assert_ne!(row_aad("repo:a", "bK"), row_aad("repo:ab", "K"));
+    }
 }
