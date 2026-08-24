@@ -391,6 +391,22 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .with_concurrency(config.cas_concurrency),
     );
 
+    // Fail-closed boot (ADR-0067 part 1): the object store is a HARD
+    // requirement, so prove it reachable AND writable before serving a single
+    // request. This replaces the old unprobed assumption (any configured
+    // bucket, existent or not, used to be taken on faith): a write, a ranged
+    // read back, and a delete — the three verbs the pack path lives on. A
+    // Depot that cannot do these would accept drains it can never make
+    // durable, which is exactly the smaller-promise failure part 1 retires.
+    boot_probe_cold(&cold_store).await.map_err(|e| {
+        format!(
+            "refusing to serve: the cold object store failed its boot \
+             write-probe (ADR-0067 part 1 — object storage is mandatory, \
+             warm-only is not a deployment mode). Fix the bucket/credentials/\
+             endpoint (SCARAB_S3_*) or the local object dir and restart: {e}"
+        )
+    })?;
+
     // The control plane's Postgres, for the fence rows (ADR-0067 part 2).
     // `connect_lazy` on purpose: this role must keep serving content THROUGH a
     // database outage (a Step reading its inputs does not care that the fence
@@ -415,6 +431,43 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     tracing::info!("workspace service shutdown complete");
+    Ok(())
+}
+
+/// The boot write-probe of the cold store (ADR-0067 part 1): `put`, `get_range`
+/// back, `delete` — refuse to serve when any of the three fails.
+///
+/// A probe key per boot (never a fixed name): two replicas booting into the
+/// same bucket must not race each other's probe — one's `delete` landing
+/// between the other's `put` and `get_range` would refuse a perfectly healthy
+/// boot. The key lives under its own `probe/` prefix so a crash between `put`
+/// and `delete` leaves one orphan byte-string no content path can ever collide
+/// with, not a fake object under `blobs/` or `packs/`.
+///
+/// Deliberately `get_range`, not plain `get`: ranged reads are the verb the
+/// pack index resolves every durable miss through, and S3-compatible stores
+/// exist that answer `GET` but not `Range` — a boot that only proved `get`
+/// would come up green and then 500 the first warm-missed read.
+async fn boot_probe_cold(cold: &S3Storage) -> Result<(), String> {
+    let key = format!("probe/boot-{}", uuid::Uuid::new_v4());
+    let body = b"scarab depot boot probe".to_vec();
+    cold.put(&key, body.clone())
+        .await
+        .map_err(|e| format!("write probe (put {key}): {e}"))?;
+    let read = cold
+        .get_range(&key, 0, body.len() as u64)
+        .await
+        .map_err(|e| format!("ranged read-back (get_range {key}): {e}"))?;
+    if read != body {
+        return Err(format!(
+            "ranged read-back (get_range {key}) returned {} bytes that do not \
+             match what was written — the store is reachable but not trustworthy",
+            read.len()
+        ));
+    }
+    cold.delete(&key)
+        .await
+        .map_err(|e| format!("probe cleanup (delete {key}): {e}"))?;
     Ok(())
 }
 
@@ -3904,12 +3957,18 @@ async fn healthz() -> &'static str {
 /// `GET /readyz` — **warm writable + cold reachable**. Deliberately NOT the
 /// control plane's readiness.
 ///
-/// The control plane's `/readyz` asks the database a question, and this role has
-/// no database (ADR-0061 data plane). Reusing it would either hard-wire a false
-/// dependency or, worse, report ready while the volume was read-only.
+/// The control plane's `/readyz` asks the database a question. This role does
+/// connect to Postgres now (ADR-0067 part 2, lazily) but deliberately keeps it
+/// OUT of readiness: the content path must keep serving through a database
+/// outage, so a DB check here would pull healthy replicas out of rotation for
+/// exactly the routes that still work. Reusing the control plane's probe would
+/// also, worse, report ready while the warm volume was read-only.
 ///
 /// Warm is probed by **writing**, not reading: a full or read-only volume is the
-/// failure this service actually has, and a read probe cannot see either.
+/// failure this service actually has, and a read probe cannot see either. Cold
+/// is probed for **reachability** only — the expensive write-probe ran once, at
+/// boot (`boot_probe_cold`, ADR-0067 part 1), and a per-scrape write against a
+/// real bucket would be cost without signal.
 async fn readyz(State(state): State<WorkspaceState>) -> Response {
     if let Err(e) = state
         .warm
@@ -6325,6 +6384,108 @@ mod tests {
         assert!(
             h.state.farm.holders(&h.parent.root).expect("holders").is_empty(),
             "the Farm lease is released, so the warm tier can reclaim the Farm"
+        );
+    }
+
+    // --- fail-closed boot (ADR-0067 part 1) ---------------------------------
+
+    /// The happy path of the boot probe: put + ranged read-back + delete, and
+    /// nothing left behind — a probe that leaked its key on every boot would
+    /// slowly fill the bucket's `probe/` prefix with orphans.
+    #[tokio::test]
+    async fn boot_probe_passes_on_a_writable_store_and_leaves_no_residue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cold = S3Storage::local(dir.path()).expect("local cold store");
+        boot_probe_cold(&cold)
+            .await
+            .expect("a writable store probes clean");
+        let leftovers = std::fs::read_dir(dir.path().join("probe"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0, "the probe deletes its own key");
+    }
+
+    /// A store with no live backend — the deterministic, instant stand-in for
+    /// "configured but unreachable" — refuses the probe, and the refusal names
+    /// the verb that failed (an operator staring at a boot log needs to know
+    /// whether it was the write or the read-back).
+    #[tokio::test]
+    async fn boot_probe_refuses_an_unreachable_store() {
+        let cold = S3Storage::new("ghost-bucket");
+        let err = boot_probe_cold(&cold)
+            .await
+            .expect_err("no backend must never probe clean");
+        assert!(
+            err.contains("write probe"),
+            "the refusal names the failing verb: {err}"
+        );
+    }
+
+    /// [`run`] itself fails closed: a cold store that cannot take a write never
+    /// serves (ADR-0067 part 1 — replacing the old behaviour where any
+    /// configured store, writable or not, was taken on faith and the first
+    /// drain discovered the truth).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_refuses_to_serve_when_the_cold_store_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let warm = tempfile::tempdir().expect("warm dir");
+        let cold = tempfile::tempdir().expect("cold dir");
+        std::fs::set_permissions(cold.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("make cold dir read-only");
+        // Running as root ignores the mode bits and the probe would pass — and
+        // run() would then bind and serve forever. Detect and skip instead.
+        if std::fs::write(cold.path().join("writable-check"), b"x").is_ok() {
+            eprintln!("SKIPPED: read-only dir is still writable here (running as root?)");
+            return;
+        }
+
+        let config = Config {
+            role: Role::Workspace,
+            addr: "127.0.0.1:0".into(),
+            // Parseable, never dialed: the probe refuses before the lazy pool
+            // would ever connect.
+            database_url: "postgres://scarab:scarab@127.0.0.1:1/never_dialed".into(),
+            namespace: "scarab".into(),
+            executor: crate::config::ExecutorKind::K8s,
+            store: StoreConfig::LocalDir(cold.path().to_string_lossy().into_owned()),
+            results_egress: None,
+            workspace: Some(crate::config::WorkspaceServiceConfig {
+                token_secret: b"test-secret".to_vec(),
+                url: "http://127.0.0.1:0".into(),
+                data_dir: warm.path().to_string_lossy().into_owned(),
+                fetcher_image: "ghcr.io/example/wsfetch:test".into(),
+            }),
+            github_webhook_secret: None,
+            forgejo_webhook_secret: None,
+            gate_token_secret: None,
+            oidc: None,
+            master_key: None,
+            dev_insecure: false,
+            step_timeout_secs: 3600,
+            public_url: "http://localhost:8080".into(),
+            github_app_id: None,
+            github_app_pem: None,
+            github_app_pem_file: None,
+            clone_image: "ghcr.io/example/clone:test".into(),
+            placement_config_file: None,
+            oauth: None,
+            retention_log_days: 30,
+            retention_artifact_days: 90,
+            retention_workspace_days: 14,
+            cas_concurrency: 4,
+            connections: vec![],
+        };
+
+        let err = run(&config)
+            .await
+            .expect_err("a cold store that cannot take a write must refuse boot");
+        // Restore the mode so the TempDir can clean itself up.
+        let _ = std::fs::set_permissions(cold.path(), std::fs::Permissions::from_mode(0o700));
+        assert!(
+            err.to_string().contains("ADR-0067"),
+            "the refusal cites the decision that makes the store mandatory: {err}"
         );
     }
 }
