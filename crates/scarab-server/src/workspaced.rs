@@ -6421,6 +6421,37 @@ mod tests {
         );
     }
 
+    /// `/readyz` is the boot probe's runtime counterpart: cold going
+    /// unreachable AFTER a clean boot must pull the replica out of rotation
+    /// (503), not keep it advertised while every durable read 500s. The warm
+    /// half's write-probe already has acceptance coverage
+    /// (`service_roundtrip.rs`); this pins the cold arm, which no test held.
+    #[tokio::test]
+    async fn readyz_reports_unready_when_the_cold_tier_is_unreachable() {
+        let warm = tempfile::tempdir().expect("warm dir");
+        // Never dialed: readyz deliberately asks the database nothing.
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://u:p@127.0.0.1:1/never_dialed")
+            .expect("lazy pool");
+        let state = open_state(
+            warm.path(),
+            Arc::new(S3Storage::new("ghost-bucket")),
+            b"test-secret".to_vec(),
+            db,
+        )
+        .expect("open state");
+        let resp = readyz(State(state)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("cold tier unreachable"),
+            "the 503 names which tier failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
     /// [`run`] itself fails closed: a cold store that cannot take a write never
     /// serves (ADR-0067 part 1 — replacing the old behaviour where any
     /// configured store, writable or not, was taken on faith and the first
