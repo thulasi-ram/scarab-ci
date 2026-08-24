@@ -6,18 +6,17 @@
 
   Deliberately NOT headless: a headless Service exists to give each replica its
   own DNS name, and nothing addresses an individual workspace replica by name.
-  Since ADR-0067 the READ side (and the drain-record read) really is
+  Since ADR-0067 the READ side (and the drain-record read) is
   replica-independent — the fence rows, the drain records and the pack index
   live in Postgres and the durable bytes in the bucket, so any replica can
-  ANSWER for any fence. The drain WRITE path is NOT: pack sessions are
-  in-memory on whichever replica received the PUTs, and the drain record's
-  closure validation reads that replica's own warm volume, so a drain whose
-  PUTs and record POST land on different replicas is refused (422 — "drain
-  state lost"). replicaCount > 1 therefore remains UNSAFE for drains until the
-  write path is made replica-independent (follow-up ticket); the ClusterIP
-  shape is still right for the read side, and per-failure-domain placement (a
-  later slice) is "which zone's service" — a second Service or a
-  topology-aware hint, not per-Pod DNS.
+  ANSWER for any fence. Since git-bug afb13c2 the drain WRITE path is
+  replica-safe too: a sealed body pack's index rows are staged the moment its
+  multipart upload completes, an idle tail pack is sealed by a 2 s linger,
+  and whichever replica receives POST /v1/drains commits the union of the
+  fence's packs — wherever the 16-wide PUTs scattered. No replica affinity is
+  needed for correctness (it remains only a possible warmth optimisation);
+  per-failure-domain placement (a later slice) is "which zone's service" — a
+  second Service or a topology-aware hint, not per-Pod DNS.
 
   `publishNotReadyAddresses` is left at its default (false) on purpose: a replica
   whose warm volume is not writable must leave rotation, which is the entire

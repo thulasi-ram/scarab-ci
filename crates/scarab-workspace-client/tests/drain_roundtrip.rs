@@ -49,10 +49,20 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Option<Self> {
+        Self::start_with_linger(None).await
+    }
+
+    /// [`Self::start`] with the idle-pack linger dialled in (git-bug
+    /// afb13c2). `None` — the default above — keeps every test deterministic
+    /// (nothing seals but the drain itself); the cross-replica scatter test
+    /// passes a short `Some` because a replica's tail pack becoming
+    /// index-visible WITHOUT that replica ever seeing the POST is the very
+    /// thing under test.
+    async fn start_with_linger(linger: Option<std::time::Duration>) -> Option<Self> {
         let pg = common::TestPg::provision().await?;
         let pool = pg.pool.clone();
         let cold = Arc::new(tempfile::tempdir().expect("cold tempdir"));
-        Some(Self::start_over(pool, Some(pg), cold).await)
+        Some(Self::start_over(pool, Some(pg), cold, linger).await)
     }
 
     /// A SECOND Depot replica: its own warm volume (a fresh tempdir), the same
@@ -61,21 +71,28 @@ impl Harness {
     /// index are shared rows, the bucket is one bucket, and only warm bytes
     /// stay per-replica.
     async fn replica(&self) -> Self {
-        Self::start_over(self.pool.clone(), None, self.cold.clone()).await
+        self.replica_with_linger(None).await
+    }
+
+    /// [`Self::replica`] with its own linger — see [`Self::start_with_linger`].
+    async fn replica_with_linger(&self, linger: Option<std::time::Duration>) -> Self {
+        Self::start_over(self.pool.clone(), None, self.cold.clone(), linger).await
     }
 
     async fn start_over(
         pool: sqlx::PgPool,
         pg: Option<common::TestPg>,
         cold: Arc<tempfile::TempDir>,
+        linger: Option<std::time::Duration>,
     ) -> Self {
         let warm = tempfile::tempdir().expect("warm tempdir");
         let cold_store = Arc::new(S3Storage::local(cold.path()).expect("cold store"));
-        let app = scarab_server::workspaced::router(
+        let app = scarab_server::workspaced::router_with_pack_linger(
             warm.path(),
             cold_store.clone(),
             SECRET.to_vec(),
             pool.clone(),
+            linger,
         )
         .expect("router");
 
@@ -860,25 +877,36 @@ async fn have_answers_the_durable_index_identically_across_replicas() {
     );
 }
 
-/// The top risk of the whole plan, pinned: **bytes before pointers** (ADR-0067
-/// part 10). A drain that uploaded its whole workspace with durable labels but
-/// whose record POST never happened — the crash window — must leave ZERO index
-/// rows and ZERO visible pack objects: the open multipart upload is invisible
-/// until completed, and completion + commit pack happen inside the record POST
-/// strictly before the transaction that writes rows. Then the record POST runs
-/// and both sides appear together.
+/// The top risk of the whole plan, re-pinned PER-PACK for the seal-time
+/// staging protocol (git-bug afb13c2): a pack's index rows may now exist
+/// BEFORE the drain record — that is the feature — but never before THAT
+/// pack's multipart upload completed, and never `committed` before the
+/// record transaction. An oversized member forces one mid-drain seal: its
+/// rows are staged (`committed = FALSE`, visible ONLY to the owning fence),
+/// its pack object is already complete in the bucket, while the small
+/// files' OPEN tail pack has neither rows nor a visible object and no
+/// commit pack exists. The record POST then commits everything together.
+/// The linger is disabled so nothing seals the tail behind the test's back.
 ///
-/// Mutation killed: inserting pack/member rows at PUT time (rows exist before
-/// the POST — `/have`-shaped readers would skip uploads for bytes that are not
-/// yet durable, the one unrecoverable direction), or completing packs lazily
-/// after the transaction (the object-existence asserts after the POST fail).
+/// Mutations killed: staging rows before `finish()` completes (the staged
+/// pack's footer read off the bucket fails); staging the open tail's
+/// members (tail rows exist pre-POST); dropping the committed predicate
+/// (the fenceless `/have` counts staging as durable — dedup against a drain
+/// that may never finish, the one unrecoverable direction); flipping
+/// `committed` anywhere but the record transaction.
 #[tokio::test]
 async fn pack_bytes_land_strictly_before_any_index_row() {
     use scarab_storage::{ObjectStore as _, StorageError};
 
-    let Some(h) = Harness::start().await else { return };
+    let Some(h) = Harness::start_with_linger(None).await else { return };
     let ws = tempfile::tempdir().unwrap();
     build_workspace(ws.path());
+    // One member over the 64 MiB pack cap: appended mid-drain, it seals (and
+    // stages) its own single-member pack while everything else stays open.
+    let big = vec![9u8; 65 * 1024 * 1024];
+    std::fs::write(ws.path().join("big.bin"), &big).unwrap();
+    let big_hash = scarab_storage::sha256_hex(&big);
+    drop(big);
 
     let helper = h.fence_client_for("run-9", "pack-order", "a1");
     let report = helper
@@ -888,37 +916,40 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
 
     // The crash window: uploads done, record never posted.
     let fence_key = scarab_workspace_client::drain_fence_key("run-9", "pack-order", "a1");
-    let rows = |table: &'static str, pool: sqlx::PgPool| async move {
-        sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(&pool)
+
+    // PER-PACK bytes-before-pointers: every staged row names a COMPLETE pack
+    // object (its footer reads back off the bucket alone), and nothing is
+    // committed yet.
+    let staged: Vec<(String, bool)> =
+        sqlx::query_as("SELECT pack_key, committed FROM depot_packs WHERE fence_key = $1")
+            .bind(&fence_key)
+            .fetch_all(&h.pool)
             .await
-            .expect(table)
-    };
-    assert_eq!(
-        rows("depot_packs", h.pool.clone()).await,
-        0,
-        "no pack row may exist before the drain record commits"
-    );
-    assert_eq!(
-        rows("depot_pack_members", h.pool.clone()).await,
-        0,
-        "no member row may exist before the drain record commits"
-    );
-    // Pack keys carry a per-session component (`<session>-<seq:06>.pack`), so
-    // the exact key cannot be guessed from outside — list the fence's whole
-    // prefix instead: no completed pack object may be visible yet.
-    let visible: Vec<String> = h
-        .cold_store
-        .list_objects(&format!("packs/{fence_key}/"))
-        .await
-        .expect("list the fence's pack prefix")
-        .into_iter()
-        .map(|o| o.key)
-        .filter(|k| k.ends_with(".pack"))
-        .collect();
+            .expect("staged pack rows");
     assert!(
-        visible.is_empty(),
-        "the open pack is a multipart upload — invisible until the drain seals it: {visible:?}"
+        !staged.is_empty(),
+        "the oversized member must have sealed-and-staged mid-drain"
+    );
+    for (pack_key, committed) in &staged {
+        assert!(
+            !committed,
+            "no pack may be committed before the record POST: {pack_key}"
+        );
+        let index = h.cold_store.pack_index(pack_key).await.expect(
+            "a staged row must name a COMPLETE pack object — bytes strictly before \
+             pointers, per pack",
+        );
+        assert!(!index.is_empty(), "{pack_key}: an empty footer");
+    }
+    assert!(
+        member_rows_for(&h.pool, &big_hash).await > 0,
+        "the sealed oversized member must be staged"
+    );
+    let kept_blob = scarab_storage::sha256_hex(b"fn main() {}");
+    assert_eq!(
+        member_rows_for(&h.pool, &kept_blob).await,
+        0,
+        "an OPEN pack's members must have no rows — its multipart upload has not completed"
     );
     assert!(
         matches!(
@@ -930,8 +961,50 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
         "no commit pack before the record POST — reachability begins at the commit pack"
     );
 
-    // The record POST is the commit point: packs complete, commit pack lands,
-    // one transaction writes rows. Both sides appear together.
+    // The committed predicate (migration 0046): staged rows answer /have for
+    // the OWNING fence alone. A fenceless caller must not be able to dedup
+    // against a drain that may never finish.
+    let ask_have = |token: String, base: String, blob: String| async move {
+        reqwest::Client::new()
+            .post(format!("{base}/v1/cas/have"))
+            .header("x-scarab-workspace-token", token)
+            .json(&serde_json::json!({ "blobs": [blob] }))
+            .send()
+            .await
+            .expect("have request")
+            .json::<serde_json::Value>()
+            .await
+            .expect("have body")
+    };
+    let browse = workspace_token::mint(SECRET, &workspace_token::browse_claims(far_future()));
+    let on_browse = ask_have(browse.clone(), h.base.clone(), big_hash.clone()).await;
+    assert_eq!(
+        on_browse["missing_blobs"],
+        serde_json::json!([big_hash.clone()]),
+        "a staged (uncommitted) pack must be INVISIBLE to a fenceless caller: {on_browse}"
+    );
+    let own = workspace_token::mint(
+        SECRET,
+        &workspace_token::step_claims(
+            Fence {
+                run: "run-9".into(),
+                step: "pack-order".into(),
+                attempt: "a1".into(),
+            },
+            far_future(),
+            Vec::new(),
+        ),
+    );
+    let on_owner = ask_have(own, h.base.clone(), big_hash.clone()).await;
+    assert_eq!(
+        on_owner["missing_blobs"],
+        serde_json::json!([]),
+        "the owning fence must see its own staging — its retried drain must not \
+         re-upload what it already sealed: {on_owner}"
+    );
+
+    // The record POST is the commit point: the tail seals, the commit pack
+    // lands, one transaction writes the remaining rows and flips the fence.
     helper
         .post_drain_record(&DrainRecord {
             root: report.snapshot.root.0.clone(),
@@ -949,10 +1022,23 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
         .await
         .expect("post drain record");
 
-    assert!(rows("depot_packs", h.pool.clone()).await >= 2, "body + commit rows");
-    assert!(rows("depot_pack_members", h.pool.clone()).await > 0);
-    // The bucket self-describes (part 11): the sealed pack's own footer parses
-    // back, off the bucket alone, and agrees with the index rows.
+    let uncommitted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM depot_packs WHERE fence_key = $1 AND NOT committed",
+    )
+    .bind(&fence_key)
+    .fetch_one(&h.pool)
+    .await
+    .expect("count uncommitted");
+    assert_eq!(
+        uncommitted, 0,
+        "the record transaction must flip the WHOLE fence committed"
+    );
+    assert!(
+        member_rows_for(&h.pool, &kept_blob).await > 0,
+        "the tail pack's members are indexed with the record"
+    );
+    // The bucket self-describes (part 11): a sealed pack's own footer parses
+    // back off the bucket alone and agrees with the index rows.
     let body_pack_key: String = sqlx::query_scalar(
         "SELECT pack_key FROM depot_packs WHERE fence_key = $1 AND kind = 'body' LIMIT 1",
     )
@@ -972,6 +1058,9 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
         .get(&format!("packs/{fence_key}/commit.pack"))
         .await
         .expect("the commit pack exists once the drain is recorded");
+    // And now — only now — the staged blob is durable to everyone.
+    let on_browse = ask_have(browse, h.base.clone(), big_hash.clone()).await;
+    assert_eq!(on_browse["missing_blobs"], serde_json::json!([]), "{on_browse}");
 }
 
 /// The durability label is validated at the door: a value that is neither
@@ -1014,4 +1103,179 @@ async fn an_unknown_durability_label_is_refused_at_the_door() {
     assert_eq!(put("bogus").await, 400, "an unknown label must fail closed");
     assert_eq!(put("cache-only").await, 201);
     assert_eq!(put("durable").await, 200, "idempotent re-PUT, now packed");
+}
+
+/// git-bug afb13c2's whole point, at this suite's grain: a drain whose PUTs
+/// scattered across TWO replicas commits through ONE POST. One blob of the
+/// workspace is PUT durably through replica B under the drain's own fence;
+/// B's linger ticker seals-and-stages it into the shared index (`committed =
+/// FALSE` — visible to this fence, invisible to everyone else); the rest of
+/// the drain runs entirely through replica A, whose fenced `/have` dedups
+/// against the fence's OWN staging and never re-uploads the blob; the record
+/// POST through A validates the closure warm-or-index, writes ONE commit
+/// pack naming BOTH replicas' packs (from rows, not a bucket listing), and
+/// flips the whole fence committed. A third, cold-warm replica then serves
+/// every published byte.
+///
+/// Mutations killed: `/have` or the durable gate ignoring fence-owned
+/// staging (the POST 422s forever — the exact multi-replica hang this ticket
+/// closes); the commit doc built from this session's seals alone (replica
+/// B's pack missing from the receipt); the flip leaking outside the record
+/// transaction (rows stay staged after the POST); the ticker never staging
+/// an idle tail (the bounded poll below times out).
+#[tokio::test]
+async fn a_scattered_drain_commits_through_one_replica() {
+    use scarab_storage::{BlobHash, Cas as _};
+
+    let linger = Some(std::time::Duration::from_millis(250));
+    let Some(a) = Harness::start_with_linger(linger).await else { return };
+    let b = a.replica_with_linger(linger).await;
+
+    let ws = tempfile::tempdir().unwrap();
+    build_workspace(ws.path());
+    let declared = vec!["src".to_string(), "plain.txt".to_string()];
+    // plain.txt's blob is the scattered half: it reaches replica B only.
+    let scattered = scarab_storage::sha256_hex(b"hello world");
+
+    let fence_token = workspace_token::mint(
+        SECRET,
+        &workspace_token::step_claims(
+            Fence {
+                run: "run-sc".into(),
+                step: "build".into(),
+                attempt: "a1".into(),
+            },
+            far_future(),
+            Vec::new(),
+        ),
+    );
+    let put = reqwest::Client::new()
+        .put(format!("{}/v1/cas/blobs/{scattered}", b.base))
+        .header("x-scarab-workspace-token", &fence_token)
+        .body(b"hello world".to_vec())
+        .send()
+        .await
+        .expect("durable PUT via replica B");
+    assert!(put.status().is_success(), "PUT via B: {}", put.status());
+
+    // Replica B's linger ticker must seal-and-stage its idle tail pack —
+    // convergence, so a bounded poll, not a raced window.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while member_rows_for(&a.pool, &scattered).await == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica B's linger ticker never staged its idle tail pack"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let (staged_pack, committed): (String, bool) = sqlx::query_as(
+        "SELECT p.pack_key, p.committed FROM depot_packs p \
+         JOIN depot_pack_members m ON m.pack_key = p.pack_key WHERE m.address = $1",
+    )
+    .bind(tagged(&scattered))
+    .fetch_one(&a.pool)
+    .await
+    .expect("the staged pack row");
+    assert!(!committed, "staged, not committed — no record POST has happened");
+
+    // The committed predicate, cross-caller: a fenceless /have must not see it.
+    let browse = workspace_token::mint(SECRET, &workspace_token::browse_claims(far_future()));
+    let have: serde_json::Value = reqwest::Client::new()
+        .post(format!("{}/v1/cas/have", a.base))
+        .header("x-scarab-workspace-token", &browse)
+        .json(&serde_json::json!({ "blobs": [scattered.clone()] }))
+        .send()
+        .await
+        .expect("have request")
+        .json()
+        .await
+        .expect("have body");
+    assert_eq!(
+        have["missing_blobs"],
+        serde_json::json!([scattered.clone()]),
+        "another caller must NOT count staged (uncommitted) rows as durable: {have}"
+    );
+
+    // The rest of the drain, entirely through replica A — exactly as
+    // `scarab-wsfetch drain` composes it.
+    let helper = a.fence_client_for("run-sc", "build", "a1");
+    let report = helper
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
+        .await
+        .expect("drain ingest through replica A");
+    assert!(
+        report.have_hits >= 1,
+        "the fence's own staging must dedup the scattered blob (have_hits = {})",
+        report.have_hits
+    );
+    let memo = MemoCas::new(&helper, report.trees);
+    let pruned = scarab_storage::prune_tree(&memo, &report.snapshot.root, &declared)
+        .await
+        .expect("prune");
+    helper
+        .post_drain_record(&DrainRecord {
+            root: report.snapshot.root.0.clone(),
+            pruned_root: Some(pruned.0.clone()),
+            identity: None,
+            files: report.files,
+            tree_bytes: report.tree_bytes,
+            blobs_uploaded: report.blobs_uploaded,
+            bytes_uploaded: report.bytes_uploaded,
+            have_hits: report.have_hits,
+            ingest_ms: 4,
+            prune_ms: 1,
+            error: None,
+        })
+        .await
+        .expect("the scattered drain's record POST must succeed through replica A");
+
+    // ONE receipt naming BOTH replicas' packs — built from rows.
+    let fence_key = scarab_workspace_client::drain_fence_key("run-sc", "build", "a1");
+    use scarab_storage::ObjectStore as _;
+    let commit_doc: serde_json::Value = serde_json::from_slice(
+        &a.cold_store
+            .get(&format!("packs/{fence_key}/commit.pack"))
+            .await
+            .expect("the commit pack object"),
+    )
+    .expect("the commit pack parses");
+    let keys: Vec<&str> = commit_doc["packs"]
+        .as_array()
+        .expect("packs array")
+        .iter()
+        .map(|p| p["key"].as_str().expect("pack key"))
+        .collect();
+    assert!(
+        keys.contains(&staged_pack.as_str()),
+        "the receipt must name replica B's staged pack: {keys:?}"
+    );
+    assert!(
+        keys.len() >= 2,
+        "and replica A's own pack(s) beside it: {keys:?}"
+    );
+
+    // The flip: nothing of this fence stays staged after the record.
+    let uncommitted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM depot_packs WHERE fence_key = $1 AND NOT committed",
+    )
+    .bind(&fence_key)
+    .fetch_one(&a.pool)
+    .await
+    .expect("count uncommitted");
+    assert_eq!(uncommitted, 0);
+
+    // A third replica — empty warm, shared rows, shared bucket — serves the
+    // whole published closure, the scattered blob included.
+    let c = a.replica().await;
+    let reader = c.browse_client();
+    let entries = reader
+        .tree_entries(&pruned)
+        .await
+        .expect("the pruned root via cold replica C");
+    assert!(!entries.is_empty());
+    let bytes = reader
+        .get_blob(&BlobHash(scattered.clone()))
+        .await
+        .expect("the scattered blob via replica C");
+    assert_eq!(bytes, b"hello world");
 }

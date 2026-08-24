@@ -244,11 +244,12 @@ secrets:
 # set one gets no service rather than an open one.
 workspace:
   enabled: true
-  # One per failure domain. Per-AZ topology is a later slice; NOTHING in this
-  # design has been exercised with more than one instance, so treat >1 as
-  # unproven rather than supported.
-  # WARNING: >1 is UNSAFE for drains today — pack sessions and drain-closure
-  # validation are replica-local (see templates/service-workspace.yaml); keep at 1.
+  # One per failure domain. Drains are replica-safe by construction since
+  # git-bug afb13c2 — sealed packs are staged into the shared index at seal
+  # time and the record POST commits the fence's union (see
+  # templates/service-workspace.yaml) — so >1 is CORRECT. Per-AZ topology is a
+  # later slice, and >1 has been exercised at the acceptance-test grain
+  # (two routers, one Postgres, one bucket), not yet on a live cluster.
   replicaCount: 1
   # Where the warm tier lives inside the container — the PVC's mount point, and
   # the value of SCARAB_WORKSPACE_DATA_DIR.

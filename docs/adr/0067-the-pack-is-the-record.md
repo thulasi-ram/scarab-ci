@@ -350,11 +350,16 @@ is still unbuilt. None of these reverse a decision; two refine one.
   and part 11's rebuild-from-footers job is **not yet written**. Until it exists, "Postgres is a
   derived copy" is a design property with no exerciser — treat a lost row as a re-drive, not a
   rebuild.
-- **Replica safety is delivered for reads and records, not yet for the drain write path.** In-flight
-  pack sessions are per-replica memory and closure validation reads the local warm tier, so a
-  drain's PUTs and its `POST /v1/drains` must reach one replica. `replicaCount > 1` stays unsafe
-  for drains until the ticketed follow-up (shared validation or fence-scoped routing) lands. The
-  chart says the same at the `replicaCount` knob.
+- **Replica safety now covers the drain write path too** (git-bug afb13c2). A body pack's index
+  rows are **staged** (`depot_packs.committed = FALSE`) the moment its multipart upload completes
+  — per-pack bytes-before-pointers — and an idle tail pack is sealed by a 2 s linger, so the one
+  replica that receives `POST /v1/drains` builds the commit pack from the fence's rows across all
+  replicas and flips them committed inside the record transaction. Every durable-presence read
+  carries `committed OR fence_key = caller`: staged rows are visible only to the fence that owns
+  them, so no other fence can ever dedup against a drain that may never finish. Closure
+  validation reads trees warm-or-index for the same reason. Affinity stays refused as a
+  correctness mechanism (a possible warmth optimisation only); the chart's `replicaCount` note
+  says the same.
 - **Retention's deletion machinery is unbuilt** (see the 0065 pointer): packs are currently never
   deleted, which errs safe but means part 7's retention-grouping payoff is not yet collectable, and
   cross-fence dedup (a later fence's record depending on an earlier fence's pack) must be
