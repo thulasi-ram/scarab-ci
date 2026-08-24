@@ -314,13 +314,13 @@ impl TieredCas {
 impl Cas for TieredCas {
     async fn put_blob(&self, data: &[u8]) -> Result<BlobHash, StorageError> {
         // Cold first: this is the leg that licenses `Succeeded` — for whichever
-        // caller still writes through THIS type. As of ADR-0064 that is no
-        // longer every write in the system: the Data Depot's own drain writes
-        // warm directly and flushes cold in one batch instead of calling
-        // through here (see the module docs for why the two remaining
-        // `TieredCas` instances still order it this way). For those instances,
-        // cold's error is the caller's error and warm's failure is a counted,
-        // swallowed cache miss.
+        // caller still writes through THIS type. As of ADR-0067 that is no
+        // longer every write in the system: a Step's drain streams into packs
+        // on the Depot in one pass and never calls through here (see the
+        // module docs for the two remaining `TieredCas` instances and why
+        // they still order it this way). For those instances, cold's error is
+        // the caller's error and warm's failure is a counted, swallowed cache
+        // miss.
         let hash = self.cold.put_blob(data).await?;
         if let Err(e) = self.warm.put_blob(data).await {
             note_warm_write_failure("put_blob", &e);

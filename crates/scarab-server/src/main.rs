@@ -526,9 +526,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             token_secret: ws.token_secret.clone(),
                             fetcher_image: ws.fetcher_image.clone(),
                         });
-                        // The drain's WRITE half + durability gate (ADR-0064):
-                        // warm-first ingest through the Depot client and one
-                        // awaited flush per published root.
+                        // The drain's read-back half (ADR-0067): the Pod's
+                        // helper drains straight into packs on the Depot; the
+                        // control plane only reads the drain record through
+                        // this client — a success record already MEANS durable.
                         if let Some(client) = &depot_client {
                             exec = exec.with_workspace_depot(client.clone());
                         }
