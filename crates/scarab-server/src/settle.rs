@@ -1096,21 +1096,13 @@ fn components(path: &Path) -> Result<Vec<&str>, SettleError> {
 /// A file's mtime as unix-ms, or `None` if the platform will not report one.
 /// Pre-epoch timestamps come back negative rather than being dropped.
 ///
-/// The third copy of this conversion in the workspace (`scarab-storage-s3` and
-/// `scarab-workspace-client` each hold a private one). Its *inverse* is shared —
-/// `scarab_storage::system_time_from_unix_ms`, which was moved into the domain
-/// crate precisely because three checkout writers carried byte-identical copies and
-/// a sign slip in one of them is a silently wrong timestamp in exactly one code
-/// path. The forward direction deserves the same treatment; it is a small change in
-/// `scarab-storage`, and this module is not the place to make it.
+/// The arithmetic itself lives in the domain crate
+/// (`scarab_storage::unix_ms_from_system_time`, beside its inverse), because a
+/// private copy per adapter is a chance for one of them to round differently
+/// and move a snapshot root; only the `Metadata` read stays here.
 fn mtime_ms_of(meta: &std::fs::Metadata) -> Option<i64> {
     let modified = meta.modified().ok()?;
-    match modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-        Ok(since) => i64::try_from(since.as_millis()).ok(),
-        Err(before) => i64::try_from(before.duration().as_millis())
-            .ok()
-            .map(|ms| -ms),
-    }
+    scarab_storage::unix_ms_from_system_time(modified)
 }
 
 #[cfg(test)]
