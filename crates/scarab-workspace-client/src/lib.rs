@@ -684,10 +684,12 @@ pub struct IngestReport {
     pub blobs_uploaded: u64,
     /// Bytes of those uploads.
     pub bytes_uploaded: u64,
-    /// Distinct hashes the Depot already had: blobs + trees for
-    /// [`ingest_report`](WorkspaceClient::ingest_report), blobs only for
-    /// [`drain_ingest_report`](WorkspaceClient::drain_ingest_report) (which
-    /// never asks the tree question — see its doc).
+    /// Distinct hashes the dedup skipped uploading — against the answer that
+    /// matches each hash's promise (ADR-0067 part 4: durable content dedups
+    /// on the pack index, cache-only and feed-path seeding on warm). Blobs +
+    /// trees for [`ingest_report`](WorkspaceClient::ingest_report), blobs
+    /// only for [`drain_ingest_report`](WorkspaceClient::drain_ingest_report)
+    /// (which never asks the tree question — see its doc).
     pub have_hits: u64,
 }
 
