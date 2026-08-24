@@ -14,7 +14,7 @@
 //! | `SCARAB_ROLE` | CLI `--role` | which slice(s) this process runs |
 //! | `SCARAB_ADDR` | CLI `--addr` | bind address |
 //! | `SCARAB_DATABASE_URL` | CLI `--database-url` | Postgres URL — **mandatory for every role**, the `workspace` data plane included (ADR-0067 part 2: it connects for derived rows, never migrates) |
-//! | `SCARAB_OBJECT_DIR` | CLI `--object-dir` | local object-store directory (dev) |
+//! | `SCARAB_OBJECT_DIR` | CLI `--object-dir` | local object-store directory — **explicit only** (tests/dev); no silent default since ADR-0067 part 1 |
 //! | `SCARAB_NAMESPACE` | CLI `--namespace` | k8s namespace for step Pods |
 //! | `SCARAB_EXECUTOR` | CLI `--executor` | `k8s` (prod) or `local` (dev/CLI) |
 //! | `SCARAB_S3_BUCKET` | env | selects S3/MinIO object store when set |
@@ -155,10 +155,12 @@ pub struct Cli {
     #[arg(long, env = "SCARAB_DATABASE_URL")]
     pub database_url: Option<String>,
 
-    /// Local directory backing the object store (logs/artifacts). Swapped for
-    /// S3/MinIO in production; a plain directory needs no extra service for dev.
-    #[arg(long, env = "SCARAB_OBJECT_DIR", default_value = "./.scarab/objects")]
-    pub object_dir: String,
+    /// Local directory backing the object store (logs/artifacts) — a bucket
+    /// stand-in for tests and dev loops. EXPLICIT ONLY (ADR-0067 part 1): the
+    /// object store is a hard requirement, so there is no silent `./.scarab/
+    /// objects` fallback any more — set `SCARAB_S3_BUCKET` or pass this.
+    #[arg(long, env = "SCARAB_OBJECT_DIR")]
+    pub object_dir: Option<String>,
 
     /// Kubernetes namespace the executor launches step Pods into.
     #[arg(long, env = "SCARAB_NAMESPACE", default_value = "scarab")]
@@ -506,9 +508,20 @@ pub enum ConfigError {
     #[error(
         "SCARAB_S3_BUCKET is set but SCARAB_S3_ACCESS_KEY / SCARAB_S3_SECRET_KEY are \
          empty (ADR-0048). Empty credentials would fail at first use, not at boot — \
-         set both, or unset SCARAB_S3_BUCKET to use the local object dir."
+         set both, or unset SCARAB_S3_BUCKET and pass an explicit --object-dir /
+         SCARAB_OBJECT_DIR (a local-dir store, tests/dev)."
     )]
     MissingS3Credentials,
+
+    #[error(
+        "no object store configured (ADR-0067 part 1: Postgres AND an object \
+         store are hard requirements — warm-only is not a deployment mode). Set \
+         SCARAB_S3_BUCKET (+ endpoint/credentials) for S3/MinIO, or pass an \
+         explicit --object-dir / SCARAB_OBJECT_DIR for a local-directory store \
+         (tests/dev). There is no silent ./.scarab/objects fallback any more: a \
+         store nobody chose is a store nobody is watching."
+    )]
+    MissingObjectStore,
 
     #[error(
         "SCARAB_OIDC_ISSUER is set but SCARAB_OIDC_SIGNING_KEY_FILE is not (ADR-0048). \
@@ -636,7 +649,14 @@ impl Config {
                 }
                 StoreConfig::S3(s3)
             }
-            None => StoreConfig::LocalDir(cli.object_dir.clone()),
+            // No bucket: a local-dir store is still a valid bucket stand-in
+            // (tests, dev loops) but it must be CHOSEN, never defaulted
+            // (ADR-0067 part 1). An empty value is "unset", matching how the
+            // chart renders absent keys.
+            None => match cli.object_dir.as_deref().filter(|d| !d.is_empty()) {
+                Some(dir) => StoreConfig::LocalDir(dir.to_string()),
+                None => return Err(ConfigError::MissingObjectStore),
+            },
         };
 
         let oidc = match env("SCARAB_OIDC_ISSUER").filter(|v| !v.is_empty()) {
@@ -1210,7 +1230,7 @@ mod tests {
             serve: false,
             addr: "0.0.0.0:8080".into(),
             database_url: database_url.map(String::from),
-            object_dir: "./.scarab/objects".into(),
+            object_dir: Some("./.scarab/objects".into()),
             namespace: "scarab".into(),
             executor: ExecutorKind::K8s,
             emit_openapi: None,
@@ -1451,7 +1471,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_resolve_to_local_store_and_no_optional_features() {
+    fn an_explicit_object_dir_resolves_to_a_local_store_and_no_optional_features() {
+        // `cli()` passes --object-dir explicitly; that is the ONLY way a
+        // LocalDir store exists since ADR-0067 part 1.
         let cfg =
             Config::resolve_from(&cli(Some("postgres://u:pw@localhost/scarab")), dev_env(&[]))
                 .unwrap();
@@ -1460,6 +1482,23 @@ mod tests {
         assert!(cfg.github_webhook_secret.is_none());
         assert!(cfg.gate_token_secret.is_none());
         assert!(cfg.oidc.is_none());
+    }
+
+    /// ADR-0067 part 1: the object store is a hard requirement. No bucket and
+    /// no explicit local dir is a refusal at the gate — never a silent
+    /// `./.scarab/objects` that nobody chose.
+    #[test]
+    fn no_bucket_and_no_object_dir_refuses_the_boot() {
+        let mut c = cli(Some("postgres://u:pw@localhost/scarab"));
+        c.object_dir = None;
+        let err = Config::resolve_from(&c, dev_env(&[])).unwrap_err();
+        assert_eq!(err, ConfigError::MissingObjectStore);
+
+        // An empty value is "unset", matching how the chart renders absent
+        // keys — not a LocalDir("") that fails at first use.
+        c.object_dir = Some(String::new());
+        let err = Config::resolve_from(&c, dev_env(&[])).unwrap_err();
+        assert_eq!(err, ConfigError::MissingObjectStore);
     }
 
     /// `SCARAB_CAS_CONCURRENCY` (ADR-0061 s2) is a real knob, not an ambient env

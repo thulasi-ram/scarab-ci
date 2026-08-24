@@ -63,13 +63,15 @@ COPY --from=builder /usr/local/bin/scarab-server /usr/local/bin/scarab-server
 COPY --from=ui /ui/scarab-web-ui/dist /usr/share/scarab/ui
 ENV SCARAB_UI_DIR=/usr/share/scarab/ui
 
-# Default object-store fallback dir lives under the writable home when no S3 is
-# configured; production sets SCARAB_S3_BUCKET and never touches it.
+# No baked-in SCARAB_OBJECT_DIR (ADR-0067 part 1): the object store is a hard
+# requirement, so an install that configures no SCARAB_S3_BUCKET fails the boot
+# loudly instead of silently writing into this container's ephemeral home. A
+# dev container that really wants the local-dir store sets
+# SCARAB_OBJECT_DIR=/home/scarab/.scarab/objects explicitly.
 WORKDIR /home/scarab
 USER scarab
 
 EXPOSE 8080
-ENV SCARAB_ADDR=0.0.0.0:8080 \
-    SCARAB_OBJECT_DIR=/home/scarab/.scarab/objects
+ENV SCARAB_ADDR=0.0.0.0:8080
 
 ENTRYPOINT ["/usr/local/bin/scarab-server"]

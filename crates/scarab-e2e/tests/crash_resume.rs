@@ -19,8 +19,12 @@ use std::time::Duration;
 use support::*;
 
 /// Spawn a converged scarab-server on `port` against `db_url`, steps on the
-/// stack's kind cluster. S3 env is stripped so the instance uses its own
-/// local object dir (no coupling to the shared MinIO).
+/// stack's kind cluster. S3 env is stripped ON PURPOSE — this instance gets
+/// SIGKILLed mid-flight, and its debris must land in its own throwaway object
+/// dir, never in the stack's shared MinIO. That stays legal after ADR-0067
+/// part 1 (no silent LocalDir default) precisely because SCARAB_OBJECT_DIR is
+/// passed explicitly below: the store is chosen, not defaulted, so the strip
+/// is isolation rather than a smaller promise.
 fn spawn_server(port: u16, db_url: &str, object_dir: &std::path::Path, log: &std::path::Path) -> Child {
     let logfile = std::fs::File::create(log).expect("server log file");
     let errfile = logfile.try_clone().expect("clone log handle");

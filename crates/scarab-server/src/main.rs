@@ -176,7 +176,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db: Arc<dyn Db> = pg.clone();
 
     // Object store: MinIO/S3 when SCARAB_S3_BUCKET is set (the dev harness /
-    // prod), else a local directory (zero-dependency dev). One S3Storage backs
+    // prod), else the EXPLICITLY chosen local directory — the config gate
+    // refused to boot without one or the other (ADR-0067 part 1: the object
+    // store is a hard requirement, never a silent fallback). One S3Storage backs
     // BOTH ports: the log/artifact ObjectStore and the workspace Cas
     // (ADR-0029/0045).
     // The CAS-leg parallelism comes from validated config (ADR-0061 s2), not from
