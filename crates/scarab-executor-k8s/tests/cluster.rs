@@ -216,12 +216,13 @@ struct WorkspaceFixture {
 /// A direct handle on the COLD store the tier's Depot archives into, resolved
 /// exactly as the Depot resolves its own (`config.rs`): `SCARAB_S3_BUCKET` set
 /// → S3/MinIO, else the local object dir. Both runners line up by
-/// construction: `just kube-tests` sources `deploy/local-proc/.env`, so the
-/// test process sees the same `SCARAB_S3_*` MinIO the service was started
-/// with; the CI kind workflow runs the service with the LocalDir default,
-/// whose `./.scarab/objects` is relative to the REPO ROOT (the service's cwd
-/// there) — resolved here from `CARGO_MANIFEST_DIR`, because the test binary's
-/// own cwd is this crate's directory, not the root.
+/// construction, and both are MinIO now (ADR-0067): `just kube-tests` sources
+/// `deploy/local-proc/.env`, and the CI kind workflow exports the same
+/// `SCARAB_S3_*` it started the service with. The LocalDir arm survives for
+/// ad-hoc runs against a dir-backed service — its `./.scarab/objects` is
+/// relative to the REPO ROOT (the service's cwd there), resolved here from
+/// `CARGO_MANIFEST_DIR` because the test binary's own cwd is this crate's
+/// directory, not the root.
 ///
 /// Only ever called once the tier is opted in, so a partial S3 config is a
 /// wiring bug and panics ([`tier_var`]) — never a silent skip.

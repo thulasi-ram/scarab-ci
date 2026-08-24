@@ -25,6 +25,13 @@
 # used to pass) went silent the moment `tests/cluster.rs` started asking for
 # `SCARAB_TEST_WORKSPACE_*` that nothing here set; they now PANIC rather than
 # skip, so this wiring is load-bearing, not optional colour.
+#
+# ADR-0067: the Depot's two hard dependencies are real here too. Postgres
+# (a service container, migrated by the same migrator a converged boot runs)
+# carries the fence and pack rows; MinIO is the cold store the live tier
+# archives into — it used to be a local directory, which booted fine but
+# could never see S3 wire semantics, and which the boot write-probe (part 1)
+# exists to stop trusting on faith.
 name: kind
 
 on:
@@ -69,11 +76,36 @@ env:
   # tokens with and the service verifies them with. Throwaway, for one throwaway
   # cluster; it is in the clear because it grants nothing outside this job.
   WORKSPACE_SECRET: kind-tier-workspace-secret
+  # ADR-0067: the Depot's two hard dependencies (see the header note). One
+  # place for each value — the service boot, the migrator and the test env
+  # below must never disagree about where the database or the bucket is.
+  DATABASE_URL: postgres://scarab:scarab@127.0.0.1:55432/scarab
+  S3_ENDPOINT: http://127.0.0.1:9000
+  S3_BUCKET: scarab-kind
+  S3_ACCESS_KEY: scarab
+  S3_SECRET_KEY: scarabsecret
 
 jobs:
   cluster-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # The control plane's Postgres (ADR-0067 part 2): the workspace service
+    # refuses to boot without SCARAB_DATABASE_URL now, and the fence/pack rows
+    # live here. Same shape as ci.yml's service.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scarab
+          POSTGRES_PASSWORD: scarab
+          POSTGRES_DB: scarab
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U scarab -d scarab"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
     permissions:
       contents: read
       packages: read
@@ -225,16 +257,49 @@ jobs:
       # network's gateway (already resolved above — on a Linux runner that gateway
       # IS a host interface, which is what makes a host process viable here and
       # what does NOT hold on darwin; see the long note in up.sh).
+      # The cold store (ADR-0067 part 1). A plain step, not a `services:`
+      # container — GitHub's service containers cannot pass a command, and
+      # minio/minio needs `server /data`. Same image as the dev compose stack.
+      # The boot write-probe makes this load-bearing: a workspace service
+      # pointed at a bucket that does not exist refuses to serve, so the
+      # bucket is created before the service starts.
+      - name: Start MinIO (the Depot's cold store)
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER="$S3_ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$S3_SECRET_KEY" \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null && break
+            sleep 1
+          done
+          AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$S3_SECRET_KEY" \
+            aws --endpoint-url "$S3_ENDPOINT" --region us-east-1 \
+            s3 mb "s3://$S3_BUCKET"
+
       - name: Build scarab-server (the workspace service is the same binary)
         run: cargo build -p scarab-server
+
+      # The fence/pack tables (ADR-0067 part 2). The workspace role NEVER
+      # migrates, and this tier has no control-plane boot to do it — so run
+      # the same migrator a converged boot runs, once, from the tree.
+      - name: Migrate the database (the control plane's job, done by its migrator)
+        run: cargo run -p scarab-db-postgres --example migrate -- "$DATABASE_URL"
+
       - name: Start the workspace service (--role workspace)
         env:
           SCARAB_ADDR: 0.0.0.0:${{ env.WORKSPACE_PORT }}
           SCARAB_WORKSPACE_TOKEN_SECRET: ${{ env.WORKSPACE_SECRET }}
           SCARAB_WORKSPACE_DATA_DIR: ${{ github.workspace }}/.scarab/workspace-cas
+          # ADR-0067: both hard dependencies, for real. The role connects to
+          # Postgres (never migrates — the step above did) and write-probes
+          # the bucket at boot, so a typo in any of these five is a refusal
+          # in workspace.log, not a green boot that fails its first drain.
+          SCARAB_DATABASE_URL: ${{ env.DATABASE_URL }}
+          SCARAB_S3_BUCKET: ${{ env.S3_BUCKET }}
+          SCARAB_S3_ENDPOINT: ${{ env.S3_ENDPOINT }}
+          SCARAB_S3_ACCESS_KEY: ${{ env.S3_ACCESS_KEY }}
+          SCARAB_S3_SECRET_KEY: ${{ env.S3_SECRET_KEY }}
         run: |
-          # No SCARAB_DATABASE_URL, deliberately: the role's carve-out in the boot
-          # gate is scoped, and supplying one anyway would hide a regression in it.
           mkdir -p "$SCARAB_WORKSPACE_DATA_DIR"
           nohup ./target/debug/scarab-server --role workspace \
             > workspace.log 2>&1 &
@@ -280,6 +345,13 @@ jobs:
           SCARAB_TEST_SIDECAR_IMAGE: ${{ env.SIDECAR_IMAGE }}
           SCARAB_TEST_REGISTRY: registry.default.svc.cluster.local:5000
           SCARAB_TEST_HOST_IP: ${{ steps.hostip.outputs.ip }}
+          # ADR-0067: the test process resolves its cold-store handle exactly
+          # as the Depot resolves its own (tests/cluster.rs depot_cold_store),
+          # so it must see the SAME MinIO the service was started with.
+          SCARAB_S3_BUCKET: ${{ env.S3_BUCKET }}
+          SCARAB_S3_ENDPOINT: ${{ env.S3_ENDPOINT }}
+          SCARAB_S3_ACCESS_KEY: ${{ env.S3_ACCESS_KEY }}
+          SCARAB_S3_SECRET_KEY: ${{ env.S3_SECRET_KEY }}
         run: |
           cargo nextest run -p scarab-executor-k8s --test cluster \
             --run-ignored all --no-fail-fast

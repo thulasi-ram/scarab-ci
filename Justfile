@@ -174,6 +174,20 @@ test:
       docker compose -f deploy/local-proc/compose.yaml up -d --wait postgres
     fi
     export SCARAB_TEST_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab
+    # The live-S3 test (crates/scarab-storage-s3/tests/minio.rs) wants the
+    # compose MinIO too — same reuse-or-start dance as Postgres above.
+    if (exec 3<>/dev/tcp/127.0.0.1/9000) 2>/dev/null; then
+      # A `just up` stack already ran createbuckets; a foreign MinIO with
+      # different credentials would wedge it, so do not re-run it here.
+      echo "==> reusing the MinIO already listening on 127.0.0.1:9000"
+    else
+      docker compose -f deploy/local-proc/compose.yaml up -d --wait minio
+      docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets
+    fi
+    export SCARAB_TEST_S3_ENDPOINT=http://127.0.0.1:9000
+    export SCARAB_TEST_S3_BUCKET=scarab-logs
+    export SCARAB_TEST_S3_ACCESS_KEY=scarab
+    export SCARAB_TEST_S3_SECRET_KEY=scarabsecret
     if command -v cargo-nextest >/dev/null 2>&1; then
       cargo nextest run --workspace
     else
@@ -193,6 +207,20 @@ test-one FILTER:
       docker compose -f deploy/local-proc/compose.yaml up -d --wait postgres
     fi
     export SCARAB_TEST_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab
+    # The live-S3 test (crates/scarab-storage-s3/tests/minio.rs) wants the
+    # compose MinIO too — same reuse-or-start dance as Postgres above.
+    if (exec 3<>/dev/tcp/127.0.0.1/9000) 2>/dev/null; then
+      # A `just up` stack already ran createbuckets; a foreign MinIO with
+      # different credentials would wedge it, so do not re-run it here.
+      echo "==> reusing the MinIO already listening on 127.0.0.1:9000"
+    else
+      docker compose -f deploy/local-proc/compose.yaml up -d --wait minio
+      docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets
+    fi
+    export SCARAB_TEST_S3_ENDPOINT=http://127.0.0.1:9000
+    export SCARAB_TEST_S3_BUCKET=scarab-logs
+    export SCARAB_TEST_S3_ACCESS_KEY=scarab
+    export SCARAB_TEST_S3_SECRET_KEY=scarabsecret
     if command -v cargo-nextest >/dev/null 2>&1; then
       cargo nextest run --workspace -E 'test(~{{FILTER}})'
     else
