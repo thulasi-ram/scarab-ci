@@ -7070,6 +7070,11 @@ mod tests {
     /// ignored, it runs fetch and exits 0 with NO record, so classifying that
     /// as Transient re-runs the same stale binary to the 5-minute dead-letter.
     ///
+    /// The cause names exactly ONE plausible explanation since ADR-0067
+    /// part 2: record absence is Postgres-backed and replica-independent, so
+    /// "the Depot lost its drain records volume" stopped being possible and
+    /// the stale-binary signature is all that remains.
+    ///
     /// Mutation killed: reverting the `Exit(0)` arm to the transient catch-all,
     /// which disguises image/control-plane skew as weather.
     #[test]
@@ -7077,8 +7082,10 @@ mod tests {
         match classify_drain(None, &DrainExecOutcome::Exit(0)) {
             DrainDecision::FatalConfig(cause) => {
                 assert!(
-                    cause.contains("stale helper image") && cause.contains("drain records volume"),
-                    "the cause must name BOTH plausible causes: {cause}"
+                    cause.contains("stale-binary signature")
+                        && cause.contains("drain subcommand"),
+                    "the cause must name the one remaining plausible cause — the stale \
+                     helper image: {cause}"
                 );
             }
             other => panic!("0-with-no-record must be fatal config, got {other:?}"),

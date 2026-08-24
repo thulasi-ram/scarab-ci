@@ -471,20 +471,28 @@ async fn a_cold_only_snapshot_is_served_and_backfills_the_warm_tier() {
         h.warm.path().join("trees").join(&snapshot.root.0).exists(),
         "the root tree must have been backfilled into warm"
     );
-    let (missing, _) = h
-        .browse_client()
-        .missing(
-            &[scarab_storage::BlobHash(
-                // `hello world`'s sha256.
-                "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".into(),
-            )],
-            &[],
-        )
+    // The backfill claim is a WARM claim, so it is read off `/have`'s warm
+    // axis — the durable answer would name this blob missing forever (a
+    // legacy loose object is in no pack), and that is correct, not a failed
+    // backfill (ADR-0067 part 4).
+    let have: serde_json::Value = h
+        .raw()
+        .post(format!("{}/v1/cas/have", h.base))
+        .header("x-scarab-workspace-token", h.browse_token())
+        .json(&serde_json::json!({
+            // `hello world`'s sha256.
+            "blobs": ["b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"]
+        }))
+        .send()
         .await
-        .unwrap();
-    assert!(
-        missing.is_empty(),
-        "after a cold-only read the blob must be warm"
+        .expect("have request")
+        .json()
+        .await
+        .expect("have body");
+    assert_eq!(
+        have["missing_warm"],
+        serde_json::json!([]),
+        "after a cold-only read the blob must be warm: {have}"
     );
 }
 
@@ -600,10 +608,20 @@ async fn a_tagged_address_names_the_same_object_as_its_bare_form() {
         .unwrap();
     assert_eq!(have.status(), 200);
     let have: serde_json::Value = have.json().await.unwrap();
+    // One identity, proven on the WARM axis: warm holds the bare-stored
+    // object, so its tagged spelling is not warm-missing — a handler that
+    // forked the two spellings into two warm keys would list it. (Both
+    // spellings are durable-missing: an unfenced PUT joins no pack, and the
+    // durable answer does not consult warm — ADR-0067 part 4.)
+    assert_eq!(
+        have["missing_warm"],
+        serde_json::json!([absent]),
+        "present-under-bare is not warm-missing under tagged; absent echoes as sent"
+    );
     assert_eq!(
         have["missing_blobs"],
-        serde_json::json!([absent]),
-        "present-under-bare is not missing under tagged; absent echoes as sent"
+        serde_json::json!([format!("sha256:{hash}"), absent]),
+        "durable-missing either way (nothing packed it), each address echoed as sent"
     );
 
     // And a tree stored bare (through the client) is readable tagged.

@@ -4557,7 +4557,10 @@ mod tests {
         let foreign = h.step_token("r0", "seed", "a1");
         let foreign_root = seed_fenced_snapshot(&h, &foreign).await;
 
-        // The probing fence asks /have about it (answer: not missing) …
+        // The probing fence asks /have about it. The ANSWER is the two-axis
+        // contract (ADR-0067 part 4): the tree is durable-missing (warm-only,
+        // no pack holds it) but not warm-missing — and neither axis is what
+        // this test pins. What it pins is that asking cost the prober nothing.
         let prober = h.step_token("r1", "build", "a1");
         let (status, body) = h
             .call_as(
@@ -4568,9 +4571,16 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(
-            !body.contains(&foreign_root),
-            "warm holds the foreign tree, so /have must not report it missing: {body}"
+        let answer: serde_json::Value = serde_json::from_str(&body).expect("have body");
+        assert_eq!(
+            answer["missing_trees"],
+            serde_json::json!([foreign_root]),
+            "an unpacked tree is durable-missing whoever asks: {body}"
+        );
+        assert_eq!(
+            answer["missing_warm"],
+            serde_json::json!([]),
+            "and warm holds it, so the warm axis is empty: {body}"
         );
 
         // … and gains nothing: the read is still refused, and the ledger file
