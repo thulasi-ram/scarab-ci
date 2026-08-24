@@ -334,6 +334,32 @@ MinIO and `kind.yml` runs the live tier on a local directory. Note also that **n
   story: expiring one Run punches holes across many packs, which is the classic pack-garbage
   problem at full force.
 
+## Implementation notes (2026-08-24)
+
+Recorded when the branch landed, so the ADR stays honest about where the build diverged and what
+is still unbuilt. None of these reverse a decision; two refine one.
+
+- **Part 7, oversized members:** the text says "large members stay loose"; the build gives an
+  oversized member its **own single-member pack** instead — no loose-durable side channel, so pack
+  footers alone describe every durable byte. The refinement is deliberate (one code path, one
+  self-description story) and this note is its record.
+- **Parts 8 and 11, where the operational reads happen:** the *authority* is the bucket exactly as
+  written — the commit pack is written last and carries the receipt, the ledger and the index. But
+  the **operational read path is the Postgres rows** (`depot_drain_records`, `depot_fence_writes`,
+  `depot_pack_members`): `GET /v1/drains` and closure validation read rows, not the commit pack,
+  and part 11's rebuild-from-footers job is **not yet written**. Until it exists, "Postgres is a
+  derived copy" is a design property with no exerciser — treat a lost row as a re-drive, not a
+  rebuild.
+- **Replica safety is delivered for reads and records, not yet for the drain write path.** In-flight
+  pack sessions are per-replica memory and closure validation reads the local warm tier, so a
+  drain's PUTs and its `POST /v1/drains` must reach one replica. `replicaCount > 1` stays unsafe
+  for drains until the ticketed follow-up (shared validation or fence-scoped routing) lands. The
+  chart says the same at the `replicaCount` knob.
+- **Retention's deletion machinery is unbuilt** (see the 0065 pointer): packs are currently never
+  deleted, which errs safe but means part 7's retention-grouping payoff is not yet collectable, and
+  cross-fence dedup (a later fence's record depending on an earlier fence's pack) must be
+  refcounted or re-packed **before** pack-grain expiry is ever written — ticketed.
+
 ## References
 
 - [0007](0007-step-outputs.md) — `outputs:` as a precision tool, never a speed knob; the trim

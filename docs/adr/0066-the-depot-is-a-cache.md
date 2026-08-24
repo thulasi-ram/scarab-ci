@@ -17,9 +17,11 @@
 > is reversed: Postgres *and* object storage are hard requirements (owner decision, 2026-08-23).**
 > 0067 is the packing ADR point 7 called for, and it implements point 1's cache invariant by
 > **removing** the replica-local state rather than routing back to it — so points 2 and 3 are
-> overtaken: fence affinity and cordon stop being correctness requirements (they remain
-> freely-abandonable warmth optimisations), and point 4's eviction problem dissolves rather than
-> being solved. Point 10's carve-outs stand; point 11's layer 1 — algorithm-tagged addresses — is
+> overtaken **for reads and records**: any replica can serve committed content and answer for any
+> fence's record. The drain *write* path (in-flight pack sessions, warm-local closure validation)
+> is **still replica-local as of 2026-08-24** — `replicaCount > 1` remains unsafe for drains until
+> the ticketed follow-up lands — and point 4's eviction problem dissolves for committed content
+> rather than being solved. Point 10's carve-outs stand; point 11's layer 1 — algorithm-tagged addresses — is
 > **adopted** by 0067 part 12 (tags ship now, BLAKE3 stays the tagged-in follow-up).
 
 ## Context

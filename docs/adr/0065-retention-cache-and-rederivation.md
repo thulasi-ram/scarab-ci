@@ -9,10 +9,12 @@
   [0027](0027-restart-semantics.md)
 
 > **Amended 2026-08-24 by [0067](0067-the-pack-is-the-record.md) — the retention grain becomes the
-> pack, not the object.** Retention now operates over the bucket plus a derived Postgres index (on
-> any disagreement the bucket wins), and drain-aligned pack boundaries mean most of a pack dies
-> with its Run. Deletes are pointers-before-bytes behind a grace window longer than any in-flight
-> read — no WAL. The classes, the `RetentionProfile` knobs, and the Cache itself are untouched.
+> pack, not the object.** The *decided* shape: retention operates over the bucket plus a derived
+> Postgres index (on any disagreement the bucket wins), drain-aligned pack boundaries mean most of
+> a pack dies with its Run, and deletes are pointers-before-bytes behind a grace window longer
+> than any in-flight read — no WAL. **Built so far (2026-08-24): the packs and the index; the
+> deletion machinery (pack-grain reclaim, the grace window) is not yet written** — until it is,
+> packs are never deleted, which errs in the safe direction. The classes, the `RetentionProfile` knobs, and the Cache itself are untouched.
 
 ## Context
 
