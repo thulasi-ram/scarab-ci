@@ -220,7 +220,12 @@ steps:
         # the result name is the filename minus `.json`. Writing a bare
         # `/scarab/results/tag` (as this sample used to) silently publishes
         # nothing: the sidecar logs "no results to drain" and the step still
-        # passes, so `${{ outputs.version.tag }}` downstream resolves empty.
+        # passes, so the outputs.version.tag reference downstream resolves
+        # empty. (Deliberately NOT spelled with the interpolation braces here:
+        # launch-time interpolation is textual and reads this whole command
+        # string — a shell comment included — and a braced self-reference to
+        # this step's own outputs can never resolve, failing the step before
+        # any Pod exists. That was git-bug 8de85a8.)
         printf '"%s"\n' "$tag"     > /scarab/results/tag.json      # JSON string
         printf '"%s"\n' "$sha"     > /scarab/results/commit.json   # JSON string
         printf '%s\n'   "$commits" > /scarab/results/commits.json  # JSON number

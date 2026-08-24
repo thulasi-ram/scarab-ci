@@ -171,17 +171,26 @@ async fn a_missing_result_fails_the_consumer_fast() {
 
     // The consumer fails (fail-fast, ADR-0041 §5) rather than launching empty; the
     // run is therefore Failed.
-    let consumer_status = db
+    let consumer_run = db
         .steps_of_run(&run)
         .await
         .unwrap()
         .into_iter()
         .find(|s| s.step == consumer)
-        .map(|s| s.status);
+        .expect("consumer step exists");
     assert_eq!(
-        consumer_status,
-        Some(StepStatus::Failed),
+        consumer_run.status,
+        StepStatus::Failed,
         "unbound reference fails the step"
+    );
+    // Classified `Config`, never `Step` (git-bug 8de85a8): no process ever ran,
+    // so a `Step` verdict ("the author's command exited non-zero") would be a
+    // lie — and `retry: on: failure` must not churn on a reference that can
+    // never resolve.
+    assert_eq!(
+        consumer_run.attempts.last().and_then(|a| a.failure),
+        Some(scarab_engine::FailureKind::Config),
+        "a pre-Pod interpolation failure is a Config verdict, not Step"
     );
     assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Failed));
     // It never launched with an empty render.

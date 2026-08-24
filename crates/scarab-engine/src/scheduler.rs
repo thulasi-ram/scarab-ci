@@ -2020,21 +2020,29 @@ impl<'a> Scheduler<'a> {
 
                     // Launch-time interpolation (ADR-0041): resolve
                     // `${{ outputs.… }}` against upstream results before
-                    // launch. A bad reference fails fast — as a *step* failure
-                    // (not a scheduler error), so the run settles as Failed.
+                    // launch. A bad reference fails fast — as a step-level
+                    // verdict (not a scheduler error), so the run settles as
+                    // Failed.
                     let spec = match self.interpolate_spec(&run, &step, spec).await? {
                         Ok(spec) => spec,
                         // A bad `${{ … }}` reference fails the step before any Pod
                         // is created (ADR-0041 fail-fast). The reason rides the
                         // attempt/event grain as the failure cause (4cf03d7) — a
                         // Pod-less failure has no logs, so this IS its evidence.
+                        // Classified `Config`, not `Step` (8de85a8): `Step`
+                        // asserts "the author's command ran and exited non-zero",
+                        // which cannot be true when no process ever started. An
+                        // unresolvable reference is exactly the `Config` contract
+                        // — pre-start, permanent, author-fixable — so it fails
+                        // fast with a developer verdict and is never auto-retried
+                        // (re-launching the identical spec can never succeed).
                         Err(reason) => {
                             self.finalize_step(
                                 &run,
                                 &step,
                                 &attempt,
                                 StepStatus::Failed,
-                                Some(FailureKind::Step),
+                                Some(FailureKind::Config),
                                 Some(reason),
                             )
                             .await?;
