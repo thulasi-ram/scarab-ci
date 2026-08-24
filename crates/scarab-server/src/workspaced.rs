@@ -2748,7 +2748,17 @@ async fn read_drain_record_by_key(
 /// **first missing address** — which is the whole detail a 422 carries, because
 /// the drain that gets it back needs to know what to re-upload or re-PUT.
 enum ClosureVerdict {
-    Complete,
+    /// The walk succeeded. Carries the walked closure — every tree and blob
+    /// hex the effective root reaches — so `post_drain` can verify the SAME
+    /// set is durable (sealed into this drain's packs or already in the pack
+    /// index) before committing a success record: warm presence and ledger
+    /// membership both survive a Depot restart, the in-memory pack session
+    /// does not, and a success record over zero pack rows would be durable
+    /// evidence that does not exist.
+    Complete {
+        trees: HashSet<String>,
+        blobs: HashSet<String>,
+    },
     Missing(String),
 }
 
@@ -2807,9 +2817,9 @@ async fn validate_drain_closure(
     // re-skips the same upload. Durable presence is the stronger fact anyway;
     // reads range into the pack and backfill warm.
     let mut warm_missing: Vec<String> = Vec::new();
-    for blob in blobs {
-        if !warm_has(&warm_blob_path(state, &blob)).await? {
-            warm_missing.push(blob);
+    for blob in &blobs {
+        if !warm_has(&warm_blob_path(state, blob)).await? {
+            warm_missing.push(blob.clone());
         }
     }
     if !warm_missing.is_empty() {
@@ -2825,7 +2835,10 @@ async fn validate_drain_closure(
             )));
         }
     }
-    Ok(ClosureVerdict::Complete)
+    Ok(ClosureVerdict::Complete {
+        trees: visited,
+        blobs,
+    })
 }
 
 /// `POST /v1/drains` — an in-Pod drain deposits its record, and the answer is
@@ -2835,7 +2848,11 @@ async fn validate_drain_closure(
 /// Validation before persistence, in the pinned order (git-bug `212bb13`):
 /// the named roots must be in this fence's write ledger; the effective root's
 /// whole closure must be readable in warm (trees also ledgered, blobs present);
-/// only then is the record written. A `422` names the first missing address. An
+/// and — success records only — the same closure must be DURABLE (sealed into
+/// this POST's own packs or already in the pack index) before anything commits,
+/// because warm and the ledger both survive the Depot restart that destroys the
+/// in-memory pack session. Only then is the record written. A `422` names the
+/// first missing address. An
 /// **error** record skips the closure validation entirely — it exists precisely
 /// because the ingest may not have happened, and refusing it would erase the
 /// one classification (`OutputContract`) the control plane must not lose.
@@ -2873,6 +2890,21 @@ async fn post_drain(
         }
     }
 
+    let refusal = |detail: String| {
+        tracing::warn!(
+            run = %fence.run,
+            step = %fence.step,
+            attempt = %fence.attempt,
+            detail = %detail,
+            "workspace service: 422 — drain record refused"
+        );
+        (StatusCode::UNPROCESSABLE_ENTITY, detail).into_response()
+    };
+
+    // The effective root's walked closure — kept from the validation so the
+    // durable-presence gate below checks exactly the set that was validated.
+    let mut closure: Option<(HashSet<String>, HashSet<String>)> = None;
+
     if record.error.is_none() {
         // Normalized INTO the record: the ledger checks below and the persisted
         // record itself must see bare hex, whichever spelling arrived.
@@ -2885,16 +2917,6 @@ async fn post_drain(
         }
 
         let ledger = read_ledger(&state, &fence).await?;
-        let refusal = |detail: String| {
-            tracing::warn!(
-                run = %fence.run,
-                step = %fence.step,
-                attempt = %fence.attempt,
-                detail = %detail,
-                "workspace service: 422 — drain record refused"
-            );
-            (StatusCode::UNPROCESSABLE_ENTITY, detail).into_response()
-        };
         if !ledger.contains(&record.root) {
             return Ok(refusal(format!(
                 "root {} is not in this fence's write ledger",
@@ -2910,7 +2932,7 @@ async fn post_drain(
         }
         let effective = record.pruned_root.as_deref().unwrap_or(&record.root);
         match validate_drain_closure(&state, &ledger, effective).await? {
-            ClosureVerdict::Complete => {}
+            ClosureVerdict::Complete { trees, blobs } => closure = Some((trees, blobs)),
             ClosureVerdict::Missing(detail) => return Ok(refusal(detail)),
         }
     }
@@ -2929,6 +2951,54 @@ async fn post_drain(
     } else {
         (Vec::new(), None)
     };
+
+    // The durable-presence gate: a SUCCESS record commits only if the
+    // published closure is durable — every member either sealed into the
+    // packs THIS transaction is about to index, or already in
+    // `depot_pack_members` (durable_present_of is fence-blind, which is
+    // right: an earlier fence's pack is durable whoever asks). Without it, a
+    // Depot restart between the drain's PUTs and its record POST destroys
+    // the in-memory pack session, `seal_fence_packs` answers `(empty, None)`,
+    // the warm/ledger validation above still passes (both survive on the PVC
+    // and in Postgres) — and the commit would write a success record backed
+    // by zero pack rows. Error records skip this on purpose: they exist
+    // precisely because the ingest may not have happened.
+    if record.error.is_none() {
+        let (trees, blobs) = closure.as_ref().expect("success records were validated above");
+        let sealed_addresses: HashSet<&str> = sealed
+            .iter()
+            .flat_map(|p| p.members.iter().map(|m| m.address.as_str()))
+            .collect();
+        let mut lost: Vec<String> = Vec::new();
+        for (kind, members) in [(PackMemberKind::Tree, trees), (PackMemberKind::Blob, blobs)] {
+            let unsealed: Vec<&str> = members
+                .iter()
+                .map(String::as_str)
+                .filter(|hex| {
+                    !sealed_addresses.contains(tagged_address(HashAlgo::Sha256, hex).as_str())
+                })
+                .collect();
+            if unsealed.is_empty() {
+                continue;
+            }
+            let durable = durable_present_of(&state.db, kind, unsealed.iter().copied()).await?;
+            lost.extend(
+                unsealed
+                    .into_iter()
+                    .filter(|hex| !durable.contains(*hex))
+                    .map(|hex| format!("{} {hex}", kind.as_str())),
+            );
+        }
+        if !lost.is_empty() {
+            return Ok(refusal(format!(
+                "drain state lost — re-drive: {} member(s) of the published closure are \
+                 neither in this drain's sealed packs nor already durable in the pack \
+                 index: {}",
+                lost.len(),
+                lost.join(", ")
+            )));
+        }
+    }
 
     let stored = StoredDrainRecord {
         version: DRAIN_RECORD_VERSION,
@@ -4875,6 +4945,79 @@ mod tests {
             .expect("body");
         let record: serde_json::Value = serde_json::from_slice(&bytes).expect("record JSON");
         assert_eq!(record["root"], serde_json::json!(root));
+    }
+
+    /// The restart window (R1): the drain's PUTs went through router A, whose
+    /// process then died — warm (the PVC) and the write ledger (Postgres)
+    /// both survive, the in-memory pack session does not. The record POST
+    /// arrives at the restarted router, `seal_fence_packs` finds no session,
+    /// and before the durable-presence gate the old validation (warm + ledger)
+    /// passed — committing a SUCCESS record with zero pack rows behind it.
+    ///
+    /// Mutation killed: drop the durable-closure check in `post_drain` and
+    /// this POST answers 200 over durable evidence that does not exist.
+    #[tokio::test]
+    async fn a_restart_that_lost_the_pack_session_refuses_the_success_record() {
+        use tower::ServiceExt;
+
+        let Some(h) = ExportHarness::start().await else { return };
+        let f1 = h.step_token("r1", "build", "a1");
+        let root = seed_fenced_snapshot(&h, &f1).await;
+
+        // The restart: a FRESH state over the SAME warm volume and the SAME
+        // database — an empty pack-session map, exactly what the binary
+        // reopens with.
+        let reopened = open_state(
+            &h.tmp.path().join("warm"),
+            h.cold.clone(),
+            b"export-secret".to_vec(),
+            h.state.db.clone(),
+        )
+        .expect("reopen the workspace state over the same volume");
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/drains")
+            .header(WORKSPACE_TOKEN_HEADER, &f1)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&drain_record_body(&root)).expect("body"),
+            ))
+            .expect("request");
+        let response = build_router(reopened.clone())
+            .oneshot(request)
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a success record over a lost pack session must be refused: {body}"
+        );
+        assert!(
+            body.contains("drain state lost"),
+            "the refusal must say the drain state is gone: {body}"
+        );
+        assert!(
+            body.contains(&root),
+            "the refusal must name the missing address: {body}"
+        );
+
+        // And nothing committed — the re-driven drain starts from a clean slate.
+        let record = read_drain_record(
+            &reopened,
+            &Fence {
+                run: "r1".into(),
+                step: "build".into(),
+                attempt: "a1".into(),
+            },
+        )
+        .await
+        .expect("read the (absent) drain record");
+        assert!(record.is_none(), "a refused record must not be persisted");
     }
 
     /// Every `/v1/exports*` verb now requires `Scope::Browse` — before this,
