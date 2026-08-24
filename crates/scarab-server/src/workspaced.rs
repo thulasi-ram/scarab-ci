@@ -797,7 +797,10 @@ async fn sweep_exports_once(state: &WorkspaceState) {
     // more, so the open multipart upload is aborted (best-effort reclamation
     // of staged parts; an incomplete upload publishes nothing either way) and
     // the session forgotten. Sealed-but-uncommitted body packs stay behind as
-    // unreachable bytes for the grace-window reclaim job (a later slice).
+    // unreachable bytes for the grace-window reclaim job (git-bug ad79c90),
+    // which keys on `committed = FALSE AND fence residue expired AND no
+    // success record` — error POSTs never flip `committed`, so that predicate
+    // is exactly "staging of a drain that never finished".
     // `try_lock` skips any session a request is actively using, and the
     // session is TOMBSTONED under its own lock before the map entry goes
     // (git-bug 022aec8): a racer holding the `Arc` from before the removal

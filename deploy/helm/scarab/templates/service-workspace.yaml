@@ -13,7 +13,8 @@
   replica-safe too: a sealed body pack's index rows are staged the moment its
   multipart upload completes, an idle tail pack is sealed by a 2 s linger,
   and whichever replica receives POST /v1/drains commits the union of the
-  fence's packs — wherever the 16-wide PUTs scattered. No replica affinity is
+  fence's packs — wherever the 16-wide PUTs scattered (exercised at the
+  acceptance-test grain, not yet on a live cluster). No replica affinity is
   needed for correctness (it remains only a possible warmth optimisation);
   per-failure-domain placement (a later slice) is "which zone's service" — a
   second Service or a topology-aware hint, not per-Pod DNS.

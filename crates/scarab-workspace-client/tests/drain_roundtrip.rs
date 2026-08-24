@@ -1292,3 +1292,91 @@ async fn a_scattered_drain_commits_through_one_replica() {
         .expect("the scattered blob via replica C");
     assert_eq!(bytes, b"hello world");
 }
+
+/// The other half of the scatter (amendment 5, commit b1871f5): EVERY PUT —
+/// trees included — lands on replica B; the record POST lands on replica A,
+/// whose warm has never held a byte and whose session map has no entry for
+/// the fence. Closure validation's tree walk must fall through warm to the
+/// pack index (B's staged rows), the durable gate must accept off the
+/// fence's own staging, and A writes the commit pack from rows alone.
+///
+/// Mutations killed: reverting validate_drain_closure's tree arm to
+/// warm-only (this POST 422s "tree ... neither in the warm tier nor
+/// readable" forever — the pre-afb13c2 multi-replica hang, tree-shaped);
+/// the commit doc requiring a live session on the POST replica.
+#[tokio::test]
+async fn a_drain_whose_puts_all_landed_elsewhere_commits_through_a_cold_replica() {
+    use scarab_storage::Cas as _;
+    use scarab_storage::ObjectStore as _;
+
+    let linger = Some(std::time::Duration::from_millis(250));
+    let Some(a) = Harness::start_with_linger(linger).await else { return };
+    let b = a.replica_with_linger(linger).await;
+
+    let ws = tempfile::tempdir().unwrap();
+    build_workspace(ws.path());
+
+    // The whole drain's bytes go through replica B.
+    let helper_b = b.fence_client_for("run-tree", "build", "a1");
+    let report = helper_b
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
+        .await
+        .expect("drain ingest through replica B");
+    let root = report.snapshot.root.0.clone();
+
+    // B's linger ticker stages its tail. The ROOT TREE's row is the marker:
+    // trees are PUT serially after every blob, so the root is the LAST
+    // member appended — once its row exists, every pack of this drain is
+    // sealed and staged.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while member_rows_for(&a.pool, &root).await == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica B's linger ticker never staged the tail pack holding the root tree"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // The POST lands on replica A: cold warm, no session — rows only.
+    let helper_a = a.fence_client_for("run-tree", "build", "a1");
+    helper_a
+        .post_drain_record(&DrainRecord {
+            root: root.clone(),
+            pruned_root: None,
+            identity: report.snapshot.identity.as_ref().map(|t| t.0.clone()),
+            files: report.files,
+            tree_bytes: report.tree_bytes,
+            blobs_uploaded: report.blobs_uploaded,
+            bytes_uploaded: report.bytes_uploaded,
+            have_hits: report.have_hits,
+            ingest_ms: 2,
+            prune_ms: 0,
+            error: None,
+        })
+        .await
+        .expect(
+            "the record POST must commit through a replica that saw no PUT — closure \
+             trees read warm-OR-index (amendment 5)",
+        );
+
+    // Committed, receipted, and servable through A.
+    let fence_key = scarab_workspace_client::drain_fence_key("run-tree", "build", "a1");
+    let uncommitted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM depot_packs WHERE fence_key = $1 AND NOT committed",
+    )
+    .bind(&fence_key)
+    .fetch_one(&a.pool)
+    .await
+    .expect("count uncommitted");
+    assert_eq!(uncommitted, 0, "the record transaction must flip the whole fence");
+    a.cold_store
+        .get(&format!("packs/{fence_key}/commit.pack"))
+        .await
+        .expect("replica A wrote the commit pack from rows alone");
+    let entries = a
+        .browse_client()
+        .tree_entries(&report.snapshot.root)
+        .await
+        .expect("the root tree must be readable through A — a ranged read into B's pack");
+    assert!(!entries.is_empty());
+}
