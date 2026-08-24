@@ -38,7 +38,8 @@ services:
       /bin/sh -c "
       until mc alias set local http://minio:9000 scarab scarabsecret; do sleep 1; done;
       mc mb --ignore-existing local/scarab-logs;
-      echo 'bucket scarab-logs ready';
+      mc mb --ignore-existing local/scarab-test;
+      echo 'buckets scarab-logs (dev stack) and scarab-test (test suite) ready';
       "
 
 volumes:

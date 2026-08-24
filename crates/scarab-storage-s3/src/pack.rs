@@ -245,6 +245,13 @@ impl S3Storage {
         let trailer = self
             .get_range(key, meta.size - PACK_TRAILER_BYTES, PACK_TRAILER_BYTES)
             .await?;
+        if trailer.len() as u64 != PACK_TRAILER_BYTES {
+            return Err(StorageError::Backend(format!(
+                "pack {key} trailer read returned {} bytes, not {PACK_TRAILER_BYTES} — \
+                 a short read, not a trailer",
+                trailer.len()
+            )));
+        }
         if trailer[12..16] != PACK_MAGIC {
             return Err(StorageError::Backend(format!(
                 "pack {key} does not end in the pack magic — not a pack, or torn"

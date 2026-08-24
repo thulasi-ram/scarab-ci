@@ -178,14 +178,18 @@ test:
     # compose MinIO too — same reuse-or-start dance as Postgres above.
     if (exec 3<>/dev/tcp/127.0.0.1/9000) 2>/dev/null; then
       # A `just up` stack already ran createbuckets; a foreign MinIO with
-      # different credentials would wedge it, so do not re-run it here.
+      # different credentials would wedge it, so do not re-run it here. (A stack
+      # from before the scarab-test bucket existed needs one manual
+      # `docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets`.)
       echo "==> reusing the MinIO already listening on 127.0.0.1:9000"
     else
       docker compose -f deploy/local-proc/compose.yaml up -d --wait minio
       docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets
     fi
     export SCARAB_TEST_S3_ENDPOINT=http://127.0.0.1:9000
-    export SCARAB_TEST_S3_BUCKET=scarab-logs
+    # scarab-test, NOT scarab-logs: tests must never share the `just up` dev stack's
+    # bucket (A11) — a suite prune or fixture collision would eat dev-stack state.
+    export SCARAB_TEST_S3_BUCKET=scarab-test
     export SCARAB_TEST_S3_ACCESS_KEY=scarab
     export SCARAB_TEST_S3_SECRET_KEY=scarabsecret
     if command -v cargo-nextest >/dev/null 2>&1; then
@@ -211,14 +215,18 @@ test-one FILTER:
     # compose MinIO too — same reuse-or-start dance as Postgres above.
     if (exec 3<>/dev/tcp/127.0.0.1/9000) 2>/dev/null; then
       # A `just up` stack already ran createbuckets; a foreign MinIO with
-      # different credentials would wedge it, so do not re-run it here.
+      # different credentials would wedge it, so do not re-run it here. (A stack
+      # from before the scarab-test bucket existed needs one manual
+      # `docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets`.)
       echo "==> reusing the MinIO already listening on 127.0.0.1:9000"
     else
       docker compose -f deploy/local-proc/compose.yaml up -d --wait minio
       docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets
     fi
     export SCARAB_TEST_S3_ENDPOINT=http://127.0.0.1:9000
-    export SCARAB_TEST_S3_BUCKET=scarab-logs
+    # scarab-test, NOT scarab-logs: tests must never share the `just up` dev stack's
+    # bucket (A11) — a suite prune or fixture collision would eat dev-stack state.
+    export SCARAB_TEST_S3_BUCKET=scarab-test
     export SCARAB_TEST_S3_ACCESS_KEY=scarab
     export SCARAB_TEST_S3_SECRET_KEY=scarabsecret
     if command -v cargo-nextest >/dev/null 2>&1; then
