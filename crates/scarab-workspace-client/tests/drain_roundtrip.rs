@@ -904,14 +904,21 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
         0,
         "no member row may exist before the drain record commits"
     );
+    // Pack keys carry a per-session component (`<session>-<seq:06>.pack`), so
+    // the exact key cannot be guessed from outside — list the fence's whole
+    // prefix instead: no completed pack object may be visible yet.
+    let visible: Vec<String> = h
+        .cold_store
+        .list_objects(&format!("packs/{fence_key}/"))
+        .await
+        .expect("list the fence's pack prefix")
+        .into_iter()
+        .map(|o| o.key)
+        .filter(|k| k.ends_with(".pack"))
+        .collect();
     assert!(
-        matches!(
-            h.cold_store
-                .get(&format!("packs/{fence_key}/000001.pack"))
-                .await,
-            Err(StorageError::NotFound)
-        ),
-        "the open pack is a multipart upload — invisible until the drain seals it"
+        visible.is_empty(),
+        "the open pack is a multipart upload — invisible until the drain seals it: {visible:?}"
     );
     assert!(
         matches!(
@@ -946,9 +953,16 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
     assert!(rows("depot_pack_members", h.pool.clone()).await > 0);
     // The bucket self-describes (part 11): the sealed pack's own footer parses
     // back, off the bucket alone, and agrees with the index rows.
+    let body_pack_key: String = sqlx::query_scalar(
+        "SELECT pack_key FROM depot_packs WHERE fence_key = $1 AND kind = 'body' LIMIT 1",
+    )
+    .bind(&fence_key)
+    .fetch_one(&h.pool)
+    .await
+    .expect("a body pack row exists after the record POST");
     let index = h
         .cold_store
-        .pack_index(&format!("packs/{fence_key}/000001.pack"))
+        .pack_index(&body_pack_key)
         .await
         .expect("the sealed pack's footer index reads back off the bucket alone");
     assert!(!index.is_empty());

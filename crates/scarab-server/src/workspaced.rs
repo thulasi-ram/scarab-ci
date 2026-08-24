@@ -2072,6 +2072,15 @@ fn durability_of(headers: &HeaderMap) -> Result<Durability, WsError> {
 /// retried drain appends what is still missing and seals then.
 struct PackSession {
     fence_key: String,
+    /// Unique per in-memory session (R2). The sequence alone restarts at 1
+    /// with every session, so two sessions for one fence — concurrent
+    /// duplicate POSTs on two replicas, or a restart-recreated session — would
+    /// complete multipart uploads at the SAME key: the last completer
+    /// overwrites the pack while the other's `(offset, len)` member rows
+    /// survive and range into the wrong bytes. A session-unique component
+    /// makes every body-pack key write-once. `commit.pack` deliberately stays
+    /// un-suffixed: it is a whole self-describing document, last-full-doc-wins.
+    session: String,
     next_seq: u32,
     open: Option<PackWriter>,
     sealed: Vec<FinishedPack>,
@@ -2087,6 +2096,7 @@ impl PackSession {
     fn new(fence_key: String) -> Self {
         Self {
             fence_key,
+            session: uuid::Uuid::new_v4().simple().to_string(),
             next_seq: 1,
             open: None,
             sealed: Vec::new(),
@@ -2095,11 +2105,16 @@ impl PackSession {
         }
     }
 
-    /// `packs/<fence_key>/<seq>.pack` — drain-aligned keys (ADR-0067 part 7):
-    /// a pack never shares a fence, so retention that expires the fence
-    /// expires whole packs.
+    /// `packs/<fence_key>/<session>-<seq>.pack` — drain-aligned keys
+    /// (ADR-0067 part 7): a pack never shares a fence, so retention that
+    /// expires the fence expires whole packs. The session component keeps
+    /// two sessions of one fence from ever completing at the same key (R2 —
+    /// see [`PackSession::session`]).
     fn next_key(&mut self) -> String {
-        let key = format!("packs/{}/{:06}.pack", self.fence_key, self.next_seq);
+        let key = format!(
+            "packs/{}/{}-{:06}.pack",
+            self.fence_key, self.session, self.next_seq
+        );
         self.next_seq += 1;
         key
     }

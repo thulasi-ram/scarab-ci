@@ -1,8 +1,10 @@
 -- ADR-0067 parts 4, 8 and 9 (slice 3): the pack index.
 --
 -- A drain's DURABLE bytes now stream Depot -> object store as size-capped
--- packs (`packs/<fence_key>/<seq>.pack`), closed by a commit pack written
--- last (`packs/<fence_key>/commit.pack`). These two tables are the fast query
+-- packs (`packs/<fence_key>/<session>-<seq:06>.pack` — the session component
+-- is unique per in-memory pack session, so two sessions of one fence never
+-- complete a multipart upload at the same key), closed by a commit pack
+-- written last (`packs/<fence_key>/commit.pack`). These two tables are the fast query
 -- surface over what the bucket already says about itself: every pack carries
 -- its own footer index, so the bucket ALONE can rebuild both tables
 -- (ADR-0067 part 11 — on any disagreement the bucket wins; losing these rows
