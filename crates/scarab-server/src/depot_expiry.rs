@@ -87,8 +87,9 @@ fn is_terminal_status(status: &str) -> bool {
     )
 }
 
-/// The class TTLs the pass needs, in seconds (S1: the flat env knobs;
-/// RetentionProfile resolution replaces this as the per-run source in S2).
+/// The flat class TTLs, in seconds — the env knobs, and the fallback for any
+/// class a [`RetentionProfile`](scarab_pipeline::RetentionProfile) leaves
+/// unset.
 #[derive(Debug, Clone, Copy)]
 pub struct ExpiryTtls {
     /// How long a terminal run's PACKS are kept (`SCARAB_RETENTION_PACK_DAYS`).
@@ -99,6 +100,132 @@ pub struct ExpiryTtls {
     /// The workspace-CAS reachability TTL (`SCARAB_RETENTION_WORKSPACE_DAYS`)
     /// — the "still reachable" window of the pre-epoch floor.
     pub workspace_ttl_secs: i64,
+}
+
+/// The operator retention config file (`SCARAB_RETENTION_CONFIG_FILE`,
+/// ADR-0065 s2): the named [`RetentionProfile`](scarab_pipeline::
+/// RetentionProfile) registry, YAML/JSON, gitops-managed — the
+/// `SCARAB_PLACEMENT_CONFIG_FILE` shape exactly. A bad path/parse/validation
+/// is a boot failure (ADR-0048).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct RetentionConfigFile {
+    #[serde(default)]
+    pub profiles: Vec<scarab_pipeline::RetentionProfile>,
+}
+
+/// The per-run TTL source (ADR-0065 s2): the operator's named profiles over
+/// the flat env fallbacks. A run names a profile through its IR
+/// (`runs.ir->>'retention_profile'`), and the name is resolved against the
+/// CURRENT registry at sweep time — an operator retune applies retroactively,
+/// which is the point. Resolution: named profile; unknown name → warn + the
+/// `default`-flagged profile; no name → the `default` profile; no default →
+/// the flat env TTLs. A profile field left unset falls back per-class to the
+/// flat value.
+#[derive(Debug, Clone)]
+pub struct RetentionRegistry {
+    profiles: Vec<scarab_pipeline::RetentionProfile>,
+    flat: ExpiryTtls,
+}
+
+/// Days → seconds, for the profile fields (the env knobs arrive pre-scaled).
+fn days_secs(days: u32) -> i64 {
+    i64::from(days) * 24 * 60 * 60
+}
+
+impl RetentionRegistry {
+    /// No profiles configured: every run ages under the flat env TTLs.
+    pub fn flat(flat: ExpiryTtls) -> Self {
+        Self {
+            profiles: Vec::new(),
+            flat,
+        }
+    }
+
+    /// A validated registry: unique non-empty names, at most one `default`
+    /// (the shared [`scarab_pipeline::validate_profile_registry`] machinery),
+    /// and per profile the same floor the env knobs obey — resolved pack TTL
+    /// ≥ resolved workspace TTL, because packs back Workspace Snapshots.
+    pub fn new(
+        profiles: Vec<scarab_pipeline::RetentionProfile>,
+        flat: ExpiryTtls,
+    ) -> Result<Self, String> {
+        scarab_pipeline::validate_profile_registry(&profiles, "retention")?;
+        let registry = Self { profiles, flat };
+        for p in &registry.profiles {
+            let ttls = registry.ttls_of_profile(Some(p));
+            if ttls.pack_ttl_secs < ttls.workspace_ttl_secs {
+                return Err(format!(
+                    "retention profile `{}` resolves pack TTL below the workspace TTL \
+                     ({}s < {}s) — packs back Workspace Snapshots, so the pack TTL \
+                     must be >= it (ADR-0065/0067)",
+                    p.name, ttls.pack_ttl_secs, ttls.workspace_ttl_secs
+                ));
+            }
+        }
+        Ok(registry)
+    }
+
+    /// The TTLs one run ages under, from its (possibly absent) profile name.
+    fn ttls_of(&self, name: Option<&str>) -> ExpiryTtls {
+        let profile = match name {
+            Some(n) => match scarab_pipeline::profile_named(&self.profiles, n) {
+                Some(p) => Some(p),
+                None => {
+                    tracing::warn!(
+                        profile = %n,
+                        "depot expiry: run names a retention profile absent from the \
+                         current registry — falling back to the default profile / flat \
+                         TTLs (the registry is the operator's; renames apply \
+                         retroactively)"
+                    );
+                    scarab_pipeline::default_profile(&self.profiles)
+                }
+            },
+            None => scarab_pipeline::default_profile(&self.profiles),
+        };
+        self.ttls_of_profile(profile)
+    }
+
+    fn ttls_of_profile(&self, profile: Option<&scarab_pipeline::RetentionProfile>) -> ExpiryTtls {
+        match profile {
+            Some(p) => ExpiryTtls {
+                pack_ttl_secs: p
+                    .pack_ttl_days
+                    .map(days_secs)
+                    .unwrap_or(self.flat.pack_ttl_secs),
+                workspace_ttl_secs: p
+                    .workspace_ttl_days
+                    .map(days_secs)
+                    .unwrap_or(self.flat.workspace_ttl_secs),
+            },
+            None => self.flat,
+        }
+    }
+
+    /// The pack TTL a run with this profile name ages under, in seconds.
+    pub fn pack_ttl_secs(&self, name: Option<&str>) -> i64 {
+        self.ttls_of(name).pack_ttl_secs
+    }
+
+    /// The SHORTEST pack TTL any resolution can produce — the candidate
+    /// query's SQL bound must admit every run that could be a victim under
+    /// SOME profile; the exact per-run cutoff is applied in code.
+    fn min_pack_ttl_secs(&self) -> i64 {
+        self.profiles
+            .iter()
+            .map(|p| self.ttls_of_profile(Some(p)).pack_ttl_secs)
+            .fold(self.flat.pack_ttl_secs, i64::min)
+    }
+
+    /// The LONGEST workspace TTL any resolution can produce — the pre-epoch
+    /// reachability floor must hold while a pre-epoch run is reachable under
+    /// ANY profile, so the floor uses the conservative maximum.
+    fn max_workspace_ttl_secs(&self) -> i64 {
+        self.profiles
+            .iter()
+            .map(|p| self.ttls_of_profile(Some(p)).workspace_ttl_secs)
+            .fold(self.flat.workspace_ttl_secs, i64::max)
+    }
 }
 
 /// MILLIS cutoff from a SECONDS clock and TTL — the one place the units meet
@@ -124,12 +251,12 @@ pub(crate) static TEST_INJECT_IN_VICTIM_TXN: std::sync::Mutex<Option<(String, St
 /// transaction).
 pub fn spawn_expiry(
     db: PgPool,
-    ttls: ExpiryTtls,
+    registry: RetentionRegistry,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            match expire_committed_fences_once(&db, &ttls, EXPIRY_BATCH).await {
+            match expire_committed_fences_once(&db, &registry, EXPIRY_BATCH).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(
                     fences = n,
@@ -158,7 +285,7 @@ pub fn spawn_expiry(
 /// expired.
 pub async fn expire_committed_fences_once(
     db: &PgPool,
-    ttls: &ExpiryTtls,
+    registry: &RetentionRegistry,
     batch: u32,
 ) -> Result<u32, sqlx::Error> {
     // The advisory lock lives on ONE dedicated pooled connection — session
@@ -178,7 +305,7 @@ pub async fn expire_committed_fences_once(
         return Ok(0);
     }
 
-    let result = expire_pass(db, ttls, batch).await;
+    let result = expire_pass(db, registry, batch).await;
 
     match sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(PACK_RECLAIM_ADVISORY_LOCK)
@@ -200,7 +327,11 @@ pub async fn expire_committed_fences_once(
 
 /// The pass body, under the advisory lock: the floor, then the recorded arm,
 /// then (floor permitting) the recordless arm.
-async fn expire_pass(db: &PgPool, ttls: &ExpiryTtls, batch: u32) -> Result<u32, sqlx::Error> {
+async fn expire_pass(
+    db: &PgPool,
+    registry: &RetentionRegistry,
+    batch: u32,
+) -> Result<u32, sqlx::Error> {
     // One clock authority: Postgres `now()`, read beside the epoch (stamped
     // once, from that same clock, when migration 0048 ran).
     let (now_secs, epoch): (i64, i64) = sqlx::query_as(
@@ -208,8 +339,11 @@ async fn expire_pass(db: &PgPool, ttls: &ExpiryTtls, batch: u32) -> Result<u32, 
     )
     .fetch_one(db)
     .await?;
-    let pack_cutoff = cutoff_ms(now_secs, ttls.pack_ttl_secs);
-    let ws_cutoff = cutoff_ms(now_secs, ttls.workspace_ttl_secs);
+    // The SQL bound is the LOOSEST cutoff any profile can produce (ADR-0065
+    // s2 reshaped the query: per-run cutoffs are applied in code below, so
+    // the one bind can only be a bound, not the verdict).
+    let loosest_cutoff = cutoff_ms(now_secs, registry.min_pack_ttl_secs());
+    let ws_cutoff = cutoff_ms(now_secs, registry.max_workspace_ttl_secs());
     let epoch_ms = epoch.saturating_mul(1000);
 
     // The pre-epoch reachability floor (module docs): held while ANY
@@ -232,12 +366,12 @@ async fn expire_pass(db: &PgPool, ttls: &ExpiryTtls, batch: u32) -> Result<u32, 
 
     let mut expired = 0u32;
 
-    // --- The recorded arm: success records whose run is terminal, past the
-    // pack TTL and unpinned. `pre_epoch` (any pack older than the epoch) is
-    // what scopes the floor: a post-epoch fence's borrows are all recorded,
-    // so it expires on edges alone even while the floor is up.
-    let candidates: Vec<(String, bool)> = sqlx::query_as(&format!(
-        "SELECT r.fence_key, \
+    // --- The recorded arm: success records whose run is terminal, past its
+    // profile's pack TTL and unpinned. `pre_epoch` (any pack older than the
+    // epoch) is what scopes the floor: a post-epoch fence's borrows are all
+    // recorded, so it expires on edges alone even while the floor is up.
+    let candidates: Vec<(String, Option<String>, i64, bool)> = sqlx::query_as(&format!(
+        "SELECT r.fence_key, ru.ir->>'retention_profile', ru.updated_at, \
                 EXISTS (SELECT 1 FROM depot_packs p \
                         WHERE p.fence_key = r.fence_key AND p.created_at < $3) AS pre_epoch \
          FROM depot_drain_records r \
@@ -249,12 +383,17 @@ async fn expire_pass(db: &PgPool, ttls: &ExpiryTtls, batch: u32) -> Result<u32, 
          ORDER BY r.posted_at \
          LIMIT $2"
     ))
-    .bind(pack_cutoff)
+    .bind(loosest_cutoff)
     .bind(i64::from(batch))
     .bind(epoch)
     .fetch_all(db)
     .await?;
-    for (fence, pre_epoch) in candidates {
+    for (fence, profile, updated_at, pre_epoch) in candidates {
+        // The per-run cutoff, from the CURRENT registry (ADR-0065 s2).
+        let cutoff = cutoff_ms(now_secs, registry.pack_ttl_secs(profile.as_deref()));
+        if updated_at >= cutoff {
+            continue; // within its own profile's TTL — the SQL bound is loose
+        }
         if pre_epoch && floor_held {
             tracing::debug!(
                 fence_key = %fence,
@@ -263,7 +402,7 @@ async fn expire_pass(db: &PgPool, ttls: &ExpiryTtls, batch: u32) -> Result<u32, 
             );
             continue;
         }
-        match expire_one_fence(db, &fence, Victim::Recorded { cutoff_ms: pack_cutoff }).await {
+        match expire_one_fence(db, &fence, Victim::Recorded { now_secs }, registry).await {
             Ok(true) => expired += 1,
             Ok(false) => {}
             Err(e) if is_deadlock(&e) => {
@@ -300,7 +439,7 @@ async fn expire_pass(db: &PgPool, ttls: &ExpiryTtls, batch: u32) -> Result<u32, 
         .fetch_all(db)
         .await?;
         for fence in recordless {
-            match expire_one_fence(db, &fence, Victim::Recordless { epoch }).await {
+            match expire_one_fence(db, &fence, Victim::Recordless { epoch }, registry).await {
                 Ok(true) => expired += 1,
                 Ok(false) => {}
                 Err(e) if is_deadlock(&e) => {
@@ -323,8 +462,10 @@ async fn expire_pass(db: &PgPool, ttls: &ExpiryTtls, batch: u32) -> Result<u32, 
 /// Which arm nominated a victim — and therefore which predicate the victim
 /// transaction re-reads before deleting.
 enum Victim {
-    /// A live success record whose run answered the candidate query.
-    Recorded { cutoff_ms: i64 },
+    /// A live success record whose run answered the candidate query. Carries
+    /// the pass clock; the cutoff is re-resolved per run INSIDE the victim
+    /// transaction (the profile name is re-read with the row).
+    Recorded { now_secs: i64 },
     /// Committed packs with no record, all older than the epoch.
     Recordless { epoch: i64 },
 }
@@ -338,6 +479,7 @@ async fn expire_one_fence(
     db: &PgPool,
     fence_key: &str,
     victim: Victim,
+    registry: &RetentionRegistry,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = db.begin().await?;
 
@@ -372,9 +514,10 @@ async fn expire_one_fence(
     // Evaluated in code (fetch, then test) rather than as one EXISTS so the
     // S2 per-profile cutoff can be resolved per run without reshaping this.
     let still_a_victim = match victim {
-        Victim::Recorded { cutoff_ms } => {
-            let run_row: Option<(String, i64, Option<i64>)> = sqlx::query_as(
-                "SELECT ru.status, ru.updated_at, ru.snapshots_pinned_at \
+        Victim::Recorded { now_secs } => {
+            let run_row: Option<(String, i64, Option<i64>, Option<String>)> = sqlx::query_as(
+                "SELECT ru.status, ru.updated_at, ru.snapshots_pinned_at, \
+                        ru.ir->>'retention_profile' \
                  FROM depot_drain_records r \
                  JOIN runs ru ON ru.id = r.run \
                  WHERE r.fence_key = $1 AND r.record->>'error' IS NULL",
@@ -383,8 +526,9 @@ async fn expire_one_fence(
             .fetch_optional(&mut *tx)
             .await?;
             match run_row {
-                Some((status, updated_at, pinned_at)) => {
-                    is_terminal_status(&status) && updated_at < cutoff_ms && pinned_at.is_none()
+                Some((status, updated_at, pinned_at, profile)) => {
+                    let cutoff = cutoff_ms(now_secs, registry.pack_ttl_secs(profile.as_deref()));
+                    is_terminal_status(&status) && updated_at < cutoff && pinned_at.is_none()
                 }
                 // Record or run gone since nomination — not ours to judge.
                 None => false,
@@ -470,6 +614,86 @@ fn is_deadlock(e: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile(
+        name: &str,
+        default: bool,
+        pack_ttl_days: Option<u32>,
+        workspace_ttl_days: Option<u32>,
+    ) -> scarab_pipeline::RetentionProfile {
+        scarab_pipeline::RetentionProfile {
+            name: name.into(),
+            default,
+            pack_ttl_days,
+            log_ttl_days: None,
+            artifact_ttl_days: None,
+            workspace_ttl_days,
+        }
+    }
+
+    fn flat() -> ExpiryTtls {
+        ExpiryTtls {
+            pack_ttl_secs: days_secs(14),
+            workspace_ttl_secs: days_secs(7),
+        }
+    }
+
+    /// The shared registry validation, exercised through this consumer:
+    /// duplicate names, two defaults and empty names each refuse the
+    /// registry (= refuse the boot; the file is the operator's to fix).
+    #[test]
+    fn an_invalid_registry_refuses_the_boot() {
+        for (profiles, why) in [
+            (
+                vec![profile("a", true, None, None), profile("a", false, None, None)],
+                "duplicate name",
+            ),
+            (
+                vec![profile("a", true, None, None), profile("b", true, None, None)],
+                "two defaults",
+            ),
+            (vec![profile("", false, None, None)], "empty name"),
+        ] {
+            assert!(
+                RetentionRegistry::new(profiles, flat()).is_err(),
+                "{why} must be refused"
+            );
+        }
+        // And the per-profile floor: a pack TTL below the resolved workspace
+        // TTL would unback durable materialization while roots are reachable.
+        let err = RetentionRegistry::new(vec![profile("thin", false, Some(2), Some(9))], flat())
+            .expect_err("pack < workspace must refuse");
+        assert!(err.contains("thin"), "the refusal names the profile: {err}");
+    }
+
+    /// Resolution: named profile wins; an UNKNOWN name falls to the default
+    /// profile (warn — the registry is current truth, renames apply
+    /// retroactively); no name falls to the default profile; absent fields
+    /// and an empty registry fall to the flat env TTLs.
+    #[test]
+    fn resolution_falls_back_unknown_and_absent_to_default_then_flat() {
+        let reg = RetentionRegistry::new(
+            vec![
+                profile("short", false, Some(9), None),
+                profile("keep", true, Some(90), Some(30)),
+            ],
+            flat(),
+        )
+        .expect("valid registry");
+        assert_eq!(reg.pack_ttl_secs(Some("short")), days_secs(9));
+        assert_eq!(reg.pack_ttl_secs(Some("keep")), days_secs(90));
+        assert_eq!(reg.pack_ttl_secs(Some("nope")), days_secs(90), "unknown → default");
+        assert_eq!(reg.pack_ttl_secs(None), days_secs(90), "unnamed → default");
+        // `short` leaves workspace unset → flat 7d backs its floor check.
+        assert_eq!(reg.ttls_of(Some("short")).workspace_ttl_secs, days_secs(7));
+        // The query bounds: loosest pack cutoff, most conservative floor.
+        assert_eq!(reg.min_pack_ttl_secs(), days_secs(9));
+        assert_eq!(reg.max_workspace_ttl_secs(), days_secs(30));
+
+        let bare = RetentionRegistry::flat(flat());
+        assert_eq!(bare.pack_ttl_secs(Some("anything")), days_secs(14));
+        assert_eq!(bare.pack_ttl_secs(None), days_secs(14));
+    }
 
     /// [`TERMINAL_RUN_STATUSES_SQL`] and [`is_terminal_status`] against the
     /// domain's own `RunStatus::is_terminal`, exhaustively — a new run state

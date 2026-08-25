@@ -74,6 +74,13 @@ pub struct PipelineIr {
     /// cancelled). Absent for ordinary CI pipelines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
+    /// The operator [`RetentionProfile`] this pipeline's runs age under
+    /// (ADR-0065 s2) — a NAME only, resolved against the operator registry at
+    /// sweep time (so an operator retune applies retroactively, which is the
+    /// point). Absent = the registry's `default` profile, else the flat env
+    /// TTLs. Rides into `runs.ir` untouched; the author never defines values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_profile: Option<String>,
     /// The reuse **interface** of a Library pipeline (ADR-0038): the parameter
     /// names it requires and the output names it exposes to an `invoke:` caller.
     /// Only meaningful when this pipeline is invoked (it is authoring metadata for
@@ -783,6 +790,110 @@ pub struct PlacementProfile {
     pub k8s: Option<serde_json::Value>,
 }
 
+/// A **RetentionProfile** (ADR-0065 s2, git-bug 82c5775): an operator-owned,
+/// cluster-scoped named bundle of per-class retention TTLs. The exact
+/// [`PlacementProfile`] pattern: it lives in Scarab operator config
+/// (`SCARAB_RETENTION_CONFIG_FILE`), **not** in a pipeline; a Pipeline may
+/// *name* one via the top-level `retention_profile:` key but never defines
+/// values — where the substrate is expensive, the system pays, not the author
+/// (ADR-0061's governing principle).
+///
+/// **TTL-only** (2026-08-26 narrowing of ADR-0065's bundle): the warm space
+/// budget, Cache-eligible directories and drop-and-re-derive thresholds are
+/// deliberately NOT parsed — nothing consumes them yet, and an inert knob is
+/// a silent lie. Each TTL is optional: an absent field falls back to the
+/// operator's flat env default for that class (`SCARAB_RETENTION_*_DAYS`).
+/// `pack_ttl_days` and `workspace_ttl_days` drive committed-fence expiry and
+/// its reachability floor today; `log_ttl_days`/`artifact_ttl_days` are the
+/// same classes the retention sweeper prunes, adopted there in a follow-up.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionProfile {
+    /// The name a pipeline references in `retention_profile:`.
+    pub name: String,
+    /// Marks the profile applied when a run names none. At most one per registry.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default: bool,
+    /// How long a terminal run's Depot packs are kept, in days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_ttl_days: Option<u32>,
+    /// How long a terminal run's logs are kept, in days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_ttl_days: Option<u32>,
+    /// How long a terminal run's artifacts are kept, in days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_ttl_days: Option<u32>,
+    /// How long a terminal run's workspace CAS stays reachable, in days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_ttl_days: Option<u32>,
+}
+
+/// What every operator profile registry entry answers — the shared machinery
+/// ADR-0065 called for once a second profile type existed: lookup by name,
+/// the at-most-one `default`, and registry validation live HERE rather than
+/// being copy-pasted per profile kind.
+pub trait NamedProfile {
+    /// The name a pipeline/step references.
+    fn profile_name(&self) -> &str;
+    /// Whether this entry is the registry's default.
+    fn is_default(&self) -> bool;
+}
+
+impl NamedProfile for PlacementProfile {
+    fn profile_name(&self) -> &str {
+        &self.name
+    }
+    fn is_default(&self) -> bool {
+        self.default
+    }
+}
+
+impl NamedProfile for RetentionProfile {
+    fn profile_name(&self) -> &str {
+        &self.name
+    }
+    fn is_default(&self) -> bool {
+        self.default
+    }
+}
+
+/// Look one profile up by name.
+pub fn profile_named<'a, P: NamedProfile>(registry: &'a [P], name: &str) -> Option<&'a P> {
+    registry.iter().find(|p| p.profile_name() == name)
+}
+
+/// The registry's `default`-flagged profile, if any.
+pub fn default_profile<P: NamedProfile>(registry: &[P]) -> Option<&P> {
+    registry.iter().find(|p| p.is_default())
+}
+
+/// Validate an operator profile registry: non-empty, unique names and at most
+/// one `default`. `kind` names the registry in the message (a boot-failure
+/// message must say WHICH gitops file to fix).
+pub fn validate_profile_registry<P: NamedProfile>(registry: &[P], kind: &str) -> Result<(), String> {
+    let mut names = BTreeSet::new();
+    let mut defaults = 0usize;
+    for p in registry {
+        if p.profile_name().trim().is_empty() {
+            return Err(format!("{kind} registry contains an empty profile name"));
+        }
+        if !names.insert(p.profile_name()) {
+            return Err(format!(
+                "{kind} registry names `{}` more than once",
+                p.profile_name()
+            ));
+        }
+        if p.is_default() {
+            defaults += 1;
+        }
+    }
+    if defaults > 1 {
+        return Err(format!(
+            "{kind} registry marks {defaults} profiles as `default` — at most one"
+        ));
+    }
+    Ok(())
+}
+
 /// Requested compute resources for a step (ADR-0055). Exact `cpu`/`memory`, not
 /// named `size` tiers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -903,6 +1014,7 @@ pub fn compile_yaml_with_libs(
         triggers: authored.triggers,
         concurrency: authored.concurrency,
         environment: authored.environment,
+        retention_profile: authored.retention_profile,
         interface: authored.interface,
         budget: authored.budget,
         // Pipeline-level shared services (ADR-0058) are not DAG nodes and are not
@@ -1667,6 +1779,17 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
         diagnostics.push("`budget` must be greater than zero seconds".to_string());
     }
 
+    // Retention (ADR-0065 s2): a profile is named, never defined, and an
+    // empty name would silently resolve as "no profile" downstream.
+    if ir
+        .retention_profile
+        .as_deref()
+        .is_some_and(|p| p.trim().is_empty())
+    {
+        diagnostics
+            .push("`retention_profile` must be a non-empty operator profile name".to_string());
+    }
+
     // Unique ids.
     let mut seen = BTreeSet::new();
     let mut ids = BTreeSet::new();
@@ -2288,6 +2411,56 @@ mod tests {
     fn empty_placement_profile_name_is_rejected() {
         let errs = errors(r#"steps: [{ id: a, image: busybox, placement_profiles: ["", "x"] }]"#);
         assert!(errs.iter().any(|e| e.contains("empty profile name")));
+    }
+
+    /// ADR-0065 s2: the pipeline-level `retention_profile:` NAME rides into
+    /// the IR untouched (that is how it reaches `runs.ir` for sweep-time
+    /// resolution), is omitted from the serialized IR when absent, and an
+    /// empty name is rejected (it would silently resolve as "no profile").
+    #[test]
+    fn retention_profile_rides_into_the_ir_and_an_empty_name_is_rejected() {
+        let ir = compile(
+            r#"
+            retention_profile: keep-longer
+            steps: [{ id: a, image: busybox }]
+            "#,
+        );
+        assert_eq!(ir.retention_profile.as_deref(), Some("keep-longer"));
+        let json = serde_json::to_string(&ir).unwrap();
+        assert!(
+            json.contains(r#""retention_profile":"keep-longer""#),
+            "the name must survive into the stored IR: {json}"
+        );
+        let bare = compile("steps: [{ id: a, image: busybox }]");
+        assert!(
+            !serde_json::to_string(&bare).unwrap().contains("retention_profile"),
+            "absent means absent — no null key in every stored IR"
+        );
+        let errs = errors("retention_profile: \"\"\nsteps: [{ id: a, image: busybox }]");
+        assert!(errs.iter().any(|e| e.contains("retention_profile")));
+    }
+
+    /// The shared named-registry machinery (ADR-0065 consequence): one
+    /// helper serves both operator profile kinds — lookup, the default flag,
+    /// and registry validation (empty/duplicate names, two defaults).
+    #[test]
+    fn the_shared_profile_registry_helper_serves_both_profile_kinds() {
+        let placement = vec![
+            PlacementProfile { name: "arm64".into(), default: false, k8s: None },
+            PlacementProfile { name: "big".into(), default: true, k8s: None },
+        ];
+        assert_eq!(profile_named(&placement, "arm64").map(|p| &*p.name), Some("arm64"));
+        assert!(profile_named(&placement, "nope").is_none());
+        assert_eq!(default_profile(&placement).map(|p| &*p.name), Some("big"));
+        assert!(validate_profile_registry(&placement, "placement").is_ok());
+
+        let retention = vec![
+            RetentionProfile { name: "keep".into(), default: true, ..Default::default() },
+            RetentionProfile { name: "keep".into(), default: true, ..Default::default() },
+        ];
+        let err = validate_profile_registry(&retention, "retention")
+            .expect_err("duplicate names must be refused");
+        assert!(err.contains("retention"), "the message names the registry: {err}");
     }
 
     #[test]

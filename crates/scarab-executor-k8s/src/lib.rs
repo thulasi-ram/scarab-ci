@@ -122,7 +122,11 @@ pub struct PlacementConfig {
 
 impl PlacementConfig {
     fn profile(&self, name: &str) -> Option<&scarab_pipeline::PlacementProfile> {
-        self.profiles.iter().find(|p| p.name == name)
+        // The shared named-registry lookup (ADR-0065 consequence): two
+        // operator profile types exist now, so the machinery lives in
+        // scarab-pipeline instead of being copy-pasted per kind. Same
+        // behavior as the local `find` it replaces.
+        scarab_pipeline::profile_named(&self.profiles, name)
     }
 }
 

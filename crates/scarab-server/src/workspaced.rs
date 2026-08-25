@@ -5513,13 +5513,14 @@ mod tests {
     // git-bug 6499fb1 — committed-fence retention expiry (crate::depot_expiry)
     // -----------------------------------------------------------------------
 
-    /// The expiry tests' TTLs: pack = workspace = 1000s, so "past TTL" is a
-    /// run backdated an hour and "fresh" is one backdated a minute.
-    fn expiry_ttls() -> crate::depot_expiry::ExpiryTtls {
-        crate::depot_expiry::ExpiryTtls {
+    /// The expiry tests' TTL source: a profile-less registry over flat
+    /// pack = workspace = 1000s, so "past TTL" is a run backdated an hour
+    /// and "fresh" is one backdated a minute.
+    fn expiry_ttls() -> crate::depot_expiry::RetentionRegistry {
+        crate::depot_expiry::RetentionRegistry::flat(crate::depot_expiry::ExpiryTtls {
             pack_ttl_secs: 1000,
             workspace_ttl_secs: 1000,
-        }
+        })
     }
 
     /// Insert one `runs` row the candidate query can join — status and
@@ -5991,6 +5992,131 @@ mod tests {
         assert_eq!(expired, 0, "the borrower re-check must skip the victim");
         let (packs, _, records, _) = expiry_rows_of(db, &fa).await;
         assert!(packs > 0 && records > 0, "the victim survives intact");
+    }
+
+    /// A registry with profiles for the ADR-0065 s2 tests: `short` (1d packs)
+    /// and `keep` (the default, 30d packs), over a 1d flat workspace TTL.
+    fn expiry_profiles() -> crate::depot_expiry::RetentionRegistry {
+        let profile = |name: &str, default: bool, pack_ttl_days: Option<u32>| {
+            scarab_pipeline::RetentionProfile {
+                name: name.into(),
+                default,
+                pack_ttl_days,
+                log_ttl_days: None,
+                artifact_ttl_days: None,
+                workspace_ttl_days: None,
+            }
+        };
+        crate::depot_expiry::RetentionRegistry::new(
+            vec![profile("short", false, Some(1)), profile("keep", true, Some(30))],
+            crate::depot_expiry::ExpiryTtls {
+                pack_ttl_secs: 30 * 24 * 3600,
+                workspace_ttl_secs: 24 * 3600,
+            },
+        )
+        .expect("a valid test registry")
+    }
+
+    /// Stamp a run's IR with a retention profile NAME — all the expiry pass
+    /// ever reads from `runs.ir` (`ir->>'retention_profile'`).
+    async fn set_run_profile(db: &sqlx::PgPool, run: &str, profile: &str) {
+        sqlx::query(
+            "UPDATE runs SET ir = jsonb_build_object('retention_profile', $2::text) \
+             WHERE id = $1",
+        )
+        .bind(run)
+        .bind(profile)
+        .execute(db)
+        .await
+        .expect("stamp the run's retention profile");
+    }
+
+    /// Per-run RetentionProfile resolution changes candidacy (ADR-0065 s2):
+    /// three same-age terminal runs — one naming `short`, one naming nothing
+    /// (→ the `keep` default), one naming an UNKNOWN profile (→ warn + the
+    /// default) — and one pass expires exactly the `short` run's fence.
+    ///
+    /// Mutations killed: resolve against the name without the default
+    /// fallback and the unknown-name run's fence goes; bind the flat cutoff
+    /// in SQL as the verdict (the pre-s2 shape) and the default-profile runs
+    /// go too.
+    #[tokio::test]
+    async fn per_run_retention_profiles_change_candidacy() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        let fa = expiry_drain(&h, "pa", "prof-a").await; // short → expires
+        let fb = expiry_drain(&h, "pb", "prof-b").await; // unnamed → keep (30d)
+        let fc = expiry_drain(&h, "pc", "prof-c").await; // unknown → keep (30d)
+        let two_days = 2 * 24 * 3600;
+        seed_run(db, "pa", "succeeded", two_days, false).await;
+        seed_run(db, "pb", "succeeded", two_days, false).await;
+        seed_run(db, "pc", "succeeded", two_days, false).await;
+        set_run_profile(db, "pa", "short").await;
+        set_run_profile(db, "pc", "no-such-profile").await;
+
+        let expired =
+            crate::depot_expiry::expire_committed_fences_once(db, &expiry_profiles(), 100)
+                .await
+                .expect("expiry pass");
+        assert_eq!(expired, 1, "only the short-profile run is past ITS TTL");
+        assert_eq!(expiry_rows_of(db, &fa).await, (0, 0, 0, 0));
+        for (fence, why) in [(&fb, "default profile"), (&fc, "unknown → default")] {
+            let (packs, _, records, _) = expiry_rows_of(db, fence).await;
+            assert!(packs > 0 && records > 0, "the {why} run's fence must survive");
+        }
+    }
+
+    /// THE PIN WINS across retention classes (the contract's own words): a
+    /// short-TTL owner pack borrowed by a long-TTL borrower STAYS — the cost
+    /// is attribution, not waste; the remedy, if ever measured to matter, is
+    /// copy-forward compaction later.
+    #[tokio::test]
+    async fn a_short_ttl_owner_pinned_by_a_long_ttl_borrower_stays() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        // Owner A (short TTL, past it) and deduping borrower B (default 30d
+        // TTL, well within it) — the cross-class version of the borrow gate.
+        let ta = h.step_token("ka", "build", "a1");
+        let root = seed_fenced_snapshot(&h, &ta).await;
+        let (status, body) = h
+            .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "A's drain: {body}");
+        let fa = fence_key(&Fence { run: "ka".into(), step: "build".into(), attempt: "a1".into() });
+
+        let tb = h.step_token("kb", "build", "a1");
+        let blob_hash = hash_hex(b"drained output");
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "result.txt",
+            TreeTarget::Blob(BlobHash(blob_hash)),
+        )])
+        .expect("canonical tree");
+        let (status, body) = h
+            .put_raw_as(&tb, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .await;
+        assert!(status.is_success(), "B's tree PUT: {body}");
+        let (status, body) = h
+            .call_as(&tb, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "B's deduping drain: {body}");
+        let fb = fence_key(&Fence { run: "kb".into(), step: "build".into(), attempt: "a1".into() });
+
+        let two_days = 2 * 24 * 3600;
+        seed_run(db, "ka", "succeeded", two_days, false).await;
+        seed_run(db, "kb", "succeeded", two_days, false).await;
+        set_run_profile(db, "ka", "short").await;
+
+        let expired =
+            crate::depot_expiry::expire_committed_fences_once(db, &expiry_profiles(), 100)
+                .await
+                .expect("expiry pass");
+        assert_eq!(expired, 0, "the borrower's record pins the short-TTL owner");
+        for (fence, who) in [(&fa, "owner"), (&fb, "borrower")] {
+            let (packs, _, records, _) = expiry_rows_of(db, fence).await;
+            assert!(packs > 0 && records > 0, "the {who} must survive");
+        }
     }
 
     /// Seed and SEAL one fence's pack, so its rows are STAGED
@@ -6698,6 +6824,7 @@ mod tests {
             retention_artifact_days: 90,
             retention_workspace_days: 14,
             retention_pack_days: 14,
+            retention_config_file: None,
             cas_concurrency: 4,
             connections: vec![],
         };

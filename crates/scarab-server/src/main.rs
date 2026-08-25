@@ -353,17 +353,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .max_connections(2)
             .connect_lazy(&database_url)
             .map_err(|e| format!("depot expiry pool: {e}"))?;
+        // The per-run TTL source (ADR-0065 s2): the operator RetentionProfile
+        // registry over the flat env fallbacks. A bad path/parse/validation
+        // is a boot failure (ADR-0048), mirroring the placement config.
+        let flat_ttls = scarab_server::depot_expiry::ExpiryTtls {
+            pack_ttl_secs: (config.retention_pack_days as i64) * 24 * 60 * 60,
+            workspace_ttl_secs: (config.retention_workspace_days as i64) * 24 * 60 * 60,
+        };
+        let retention_registry = match &config.retention_config_file {
+            Some(path) => {
+                let raw = std::fs::read_to_string(path)
+                    .map_err(|e| format!("cannot read SCARAB_RETENTION_CONFIG_FILE {path}: {e}"))?;
+                let file: scarab_server::depot_expiry::RetentionConfigFile =
+                    serde_yaml::from_str(&raw)
+                        .map_err(|e| format!("invalid retention config {path}: {e}"))?;
+                scarab_server::depot_expiry::RetentionRegistry::new(file.profiles, flat_ttls)
+                    .map_err(|e| format!("invalid retention config {path}: {e}"))?
+            }
+            None => scarab_server::depot_expiry::RetentionRegistry::flat(flat_ttls),
+        };
         scarab_server::depot_expiry::spawn_expiry(
             expiry_pool,
-            scarab_server::depot_expiry::ExpiryTtls {
-                pack_ttl_secs: (config.retention_pack_days as i64) * 24 * 60 * 60,
-                workspace_ttl_secs: (config.retention_workspace_days as i64) * 24 * 60 * 60,
-            },
+            retention_registry,
             Duration::from_secs(300),
         );
         tracing::info!(
-            "depot committed-fence expiry on (packs {}d; pin wins, borrow edges gate, \
-             pre-epoch floor honoured — git-bug 6499fb1)",
+            "depot committed-fence expiry on (packs {}d default, per-run RetentionProfile \
+             honoured; pin wins, borrow edges gate, pre-epoch floor — git-bug 6499fb1)",
             config.retention_pack_days,
         );
     }

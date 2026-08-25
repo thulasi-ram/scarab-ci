@@ -50,6 +50,7 @@
 //! | `SCARAB_RETENTION_ARTIFACT_DAYS` | env | terminal runs' artifact TTL in days (ADR-0052); default 90 |
 //! | `SCARAB_RETENTION_WORKSPACE_DAYS` | env | terminal runs' workspace-CAS reachability TTL in days (ADR-0050 mark-sweep); default 14 — non-terminal runs always reachable |
 //! | `SCARAB_RETENTION_PACK_DAYS` | env | terminal runs' Depot pack TTL in days (git-bug 6499fb1, ADR-0065/0067); default = the workspace TTL, and must be ≥ it (packs back Workspace Snapshots) |
+//! | `SCARAB_RETENTION_CONFIG_FILE` | env | path to the operator retention config (ADR-0065 s2): the named RetentionProfile registry, TTL-only (YAML/JSON, gitops-managed); a bad path/parse/validation is a boot failure |
 //! | `SCARAB_OAUTH_OWNERS` | env | comma-separated entries granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer`. An entry matches the Principal subject (`sub`/`login`/`id`) **or** a provider-VERIFIED `email` claim (`email_verified`) — unverified/absent verification never grants `Owner` |
 //! | `SCARAB_CONNECTIONS` | env | the declarative `connections:` block inline (YAML/JSON, ADR-0060 part D): config-owned forge connections, provisioned at boot and read-only in the UI. Wins over `_FILE` |
 //! | `SCARAB_CONNECTIONS_FILE` | env | path to a file holding the same `connections:` block (the GitOps shape: a ConfigMap mount). A bad path/parse/validation is a boot failure |
@@ -436,6 +437,12 @@ pub struct Config {
     /// TTL would unback durable materialization while roots are still
     /// reachable.
     pub retention_pack_days: u32,
+    /// Path to the operator **retention config** file (ADR-0065 s2): the named
+    /// RetentionProfile registry (TTL-only), YAML/JSON, gitops-managed — the
+    /// `placement_config_file` shape exactly. `None` = no profiles; every run
+    /// ages under the flat `SCARAB_RETENTION_*` TTLs. Read at boot; a bad
+    /// path/parse/validation is a boot failure (ADR-0048).
+    pub retention_config_file: Option<String>,
     /// In-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2);
     /// default [`scarab_storage_s3::DEFAULT_CAS_CONCURRENCY`].
     ///
@@ -881,6 +888,7 @@ impl Config {
                 // correct floor and the default.
                 None => retention_workspace_days,
             },
+            retention_config_file: env("SCARAB_RETENTION_CONFIG_FILE").filter(|v| !v.is_empty()),
             cas_concurrency,
             connections,
         })
