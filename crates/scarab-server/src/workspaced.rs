@@ -2314,6 +2314,18 @@ async fn durable_present_of<'a, 'c>(
 /// transaction's own connection. Takes the caller's ONE tagged closure Vec
 /// (audit A4) — the same bind the borrow-edge INSERT uses — and answers bare
 /// hex for the caller's per-kind missing-member report.
+///
+/// **`FOR SHARE OF p`** is the record side of the future committed-expiry
+/// protocol (ec294b7 slice 2): every `depot_packs` row the closure stands on
+/// — foreign COMMITTED owners included — stays share-locked until this
+/// transaction commits. Expiry-first: its `FOR UPDATE` already holds the
+/// victim's rows, this query blocks, unblocks into the deletion's aftermath,
+/// sees the absence, and the caller 422s (re-drive). Record-first: expiry's
+/// `FOR UPDATE` blocks on these share locks until the record AND its borrow
+/// edges are committed, so its borrower re-check (READ COMMITTED, a later
+/// statement) sees the just-committed edge and skips the victim. No
+/// `DISTINCT` (audit A3): Postgres refuses `DISTINCT` + `FOR SHARE` (0A000),
+/// and the caller dedupes into a `HashSet` anyway.
 async fn recheck_closure_present(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     closure_tagged: &[String],
@@ -2323,10 +2335,11 @@ async fn recheck_closure_present(
         return Ok(HashSet::new());
     }
     let rows: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT m.address FROM depot_pack_members m \
+        "SELECT m.address FROM depot_pack_members m \
          JOIN depot_packs p ON p.pack_key = m.pack_key \
          WHERE m.address = ANY($1) \
-           AND (p.committed OR p.fence_key = $2)",
+           AND (p.committed OR p.fence_key = $2) \
+         FOR SHARE OF p",
     )
     .bind(closure_tagged)
     .bind(caller_fence)
@@ -5196,6 +5209,295 @@ mod tests {
             "a pre-epoch SUCCESS record keeps the TTL sweep — it is what drains \
              the epoch floor"
         );
+    }
+
+    /// The expiry-first order, constructed inside the real window (ec294b7
+    /// slice 2, mirroring the ad79c90 gate-vs-reclaim race test): fence B's
+    /// durable-presence gate passes against fence A's COMMITTED pack, and a
+    /// committed-expiry-shaped deletion of A's rows lands in the window
+    /// between B's gate and B's record transaction. The in-transaction
+    /// re-check — which since ec294b7 covers the WHOLE closure, foreign
+    /// owners included — must see the absence: 422 re-drive, no record, and
+    /// no borrow edge pointing at the dead owner.
+    ///
+    /// The window is a few queries wide, so the interleaving is CONSTRUCTED
+    /// via the fence-keyed one-shot hook, never scheduled.
+    ///
+    /// Mutations killed: scope the re-check to the fence's own rows and this
+    /// POST answers 200 — a committed record whose only durable blob was
+    /// deleted before the record existed, plus a borrow edge naming a pack
+    /// that is already gone.
+    #[tokio::test]
+    async fn an_owner_expiry_inside_the_gate_txn_window_is_caught_and_leaves_no_edge() {
+        use tower::ServiceExt;
+
+        let Some(h) = DepotHarness::start().await else { return };
+
+        // Fence A: the owner — a full success drain, packs committed.
+        let ta = h.step_token("ra", "build", "a1");
+        let root = seed_fenced_snapshot(&h, &ta).await;
+        let (status, body) = h
+            .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "A's drain must succeed: {body}");
+        let fa = fence_key(&Fence { run: "ra".into(), step: "build".into(), attempt: "a1".into() });
+
+        // Fence B: tree PUT only — the blob's durable copy is A's pack.
+        let tb = h.step_token("rb", "build", "a1");
+        let blob = b"drained output".to_vec();
+        let blob_hash = hash_hex(&blob);
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "result.txt",
+            TreeTarget::Blob(BlobHash(blob_hash.clone())),
+        )])
+        .expect("canonical tree");
+        let (status, body) = h
+            .put_raw_as(&tb, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .await;
+        assert!(status.is_success(), "B's tree PUT: {body}");
+        let fb = fence_key(&Fence { run: "rb".into(), step: "build".into(), attempt: "a1".into() });
+
+        // Arm the window with the committed-expiry DELETE shape on A —
+        // members, then packs, committed included: that is what expiry does.
+        {
+            let owner = fa.clone();
+            *AFTER_DRAIN_GATE_HOOK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some((
+                fb.clone(),
+                Box::new(move |pool: sqlx::PgPool| {
+                    Box::pin(async move {
+                        sqlx::query(
+                            "DELETE FROM depot_pack_members m USING depot_packs p \
+                             WHERE m.pack_key = p.pack_key AND p.fence_key = $1",
+                        )
+                        .bind(&owner)
+                        .execute(&pool)
+                        .await
+                        .expect("hook: delete the owner's members");
+                        sqlx::query("DELETE FROM depot_packs WHERE fence_key = $1")
+                            .bind(&owner)
+                            .execute(&pool)
+                            .await
+                            .expect("hook: delete the owner's packs");
+                    })
+                }),
+            ));
+        }
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/drains")
+            .header(WORKSPACE_TOKEN_HEADER, &tb)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&drain_record_body(&root)).expect("body"),
+            ))
+            .expect("request");
+        let response = build_router(h.state.clone())
+            .oneshot(request)
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&bytes).to_string();
+
+        assert!(
+            AFTER_DRAIN_GATE_HOOK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "the window hook must have been consumed by this POST"
+        );
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an owner expiry inside the window must be caught by the closure-wide \
+             in-txn re-check: {body}"
+        );
+        assert!(body.contains(&blob_hash), "the refusal names the lost blob: {body}");
+
+        let record = read_drain_record(
+            &h.state,
+            &Fence { run: "rb".into(), step: "build".into(), attempt: "a1".into() },
+        )
+        .await
+        .expect("read the (absent) drain record");
+        assert!(record.is_none(), "a refused record must not be persisted");
+        let edges: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM depot_fence_borrows WHERE borrower_fence = $1")
+                .bind(&fb)
+                .fetch_one(&h.state.db)
+                .await
+                .expect("count B's edges");
+        assert_eq!(
+            edges, 0,
+            "the rolled-back transaction must leave no edge naming a dead owner"
+        );
+    }
+
+    /// The lock protocol itself, in BOTH orders, at the SQL grain the two
+    /// passes will actually contend at (ec294b7 slice 2) — constructed, never
+    /// scheduled. The record side is [`recheck_closure_present`]'s
+    /// `FOR SHARE OF p` + [`record_borrow_edges`], run on a hand-held
+    /// transaction; the expiry side is the successor ticket's pinned shape:
+    /// `FOR UPDATE` the victim's `depot_packs` rows FIRST, then the borrower
+    /// re-check, then delete.
+    ///
+    /// Record-first: while the record transaction holds its share locks, the
+    /// expiry `FOR UPDATE` must BLOCK (asserted via `lock_timeout` — a
+    /// mutation that drops `FOR SHARE OF p` makes it succeed immediately and
+    /// fails this test), and after the record commits, the expiry's borrower
+    /// check sees the just-committed edge and skips the victim.
+    ///
+    /// Expiry-first: while the expiry transaction holds `FOR UPDATE`, the
+    /// re-check must BLOCK; once the expiry commits its deletion, the
+    /// re-driven re-check sees the absence — the 422 verdict.
+    #[tokio::test]
+    async fn the_share_lock_serializes_record_and_expiry_in_both_orders() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        // Fence A: the committed owner every closure below stands on.
+        let ta = h.step_token("ra", "build", "a1");
+        let root = seed_fenced_snapshot(&h, &ta).await;
+        let (status, body) = h
+            .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "A's drain must succeed: {body}");
+        let fa = fence_key(&Fence { run: "ra".into(), step: "build".into(), attempt: "a1".into() });
+
+        // The borrower's closure, in the ONE tagged form (audit A4).
+        let blob_hash = hash_hex(b"drained output");
+        let closure_tagged = vec![
+            tagged_address(HashAlgo::Sha256, &root),
+            tagged_address(HashAlgo::Sha256, &blob_hash),
+        ];
+        let fb = fence_key(&Fence { run: "rb".into(), step: "build".into(), attempt: "a1".into() });
+        let for_update_victim = "SELECT pack_key FROM depot_packs WHERE fence_key = $1 FOR UPDATE";
+        let borrower_check = "SELECT EXISTS ( \
+             SELECT 1 FROM depot_fence_borrows b \
+             JOIN depot_drain_records r ON r.fence_key = b.borrower_fence \
+             WHERE b.owner_fence = $1)";
+
+        // --- Order 1: record-first -----------------------------------------
+        let mut record_tx = db.begin().await.expect("begin the record txn");
+        let present = recheck_closure_present(&mut record_tx, &closure_tagged, &fb)
+            .await
+            .expect("the re-check under share locks");
+        assert!(
+            present.contains(&root) && present.contains(&blob_hash),
+            "precondition: the closure is durable via A's committed pack"
+        );
+
+        // The expiry FOR UPDATE must block on the held share locks.
+        let mut expiry_tx = db.begin().await.expect("begin the expiry txn");
+        sqlx::query("SET LOCAL lock_timeout = '500ms'")
+            .execute(&mut *expiry_tx)
+            .await
+            .expect("set lock_timeout");
+        let blocked = sqlx::query_scalar::<_, String>(for_update_victim)
+            .bind(&fa)
+            .fetch_all(&mut *expiry_tx)
+            .await;
+        assert!(
+            blocked.is_err(),
+            "expiry's FOR UPDATE must BLOCK while the record txn holds \
+             FOR SHARE OF p — an immediate success means the share lock is gone \
+             and expiry can delete under a committing record"
+        );
+        expiry_tx.rollback().await.expect("roll back the timed-out expiry txn");
+
+        // The record txn commits its edge and its record atomically.
+        record_borrow_edges(&mut record_tx, &fb, "rb", &closure_tagged, now_secs())
+            .await
+            .expect("record the borrow edges");
+        sqlx::query(
+            "INSERT INTO depot_drain_records \
+                 (fence_key, run, step, attempt, version, posted_at, record) \
+             VALUES ($1, 'rb', 'build', 'a1', 1, $2, '{}'::jsonb)",
+        )
+        .bind(&fb)
+        .bind(now_secs())
+        .execute(&mut *record_tx)
+        .await
+        .expect("persist the borrower's record");
+        record_tx.commit().await.expect("commit the record txn");
+
+        // Expiry re-driven: locks now free, and the borrower check sees the
+        // just-committed edge — the victim is skipped.
+        let mut expiry_tx = db.begin().await.expect("begin the re-driven expiry txn");
+        let locked: Vec<String> = sqlx::query_scalar(for_update_victim)
+            .bind(&fa)
+            .fetch_all(&mut *expiry_tx)
+            .await
+            .expect("FOR UPDATE after the record committed");
+        assert!(!locked.is_empty(), "A's pack rows are intact");
+        let borrowed: bool = sqlx::query_scalar(borrower_check)
+            .bind(&fa)
+            .fetch_one(&mut *expiry_tx)
+            .await
+            .expect("the borrower check");
+        assert!(
+            borrowed,
+            "record-first: the borrower check after the locks must see the edge \
+             the record txn committed — the victim is NOT deletable"
+        );
+        expiry_tx.rollback().await.expect("expiry skips the victim");
+
+        // --- Order 2: expiry-first ------------------------------------------
+        // A second borrower, so the surviving edge from order 1 is not what
+        // the borrower check would find.
+        let fc = fence_key(&Fence { run: "rc".into(), step: "build".into(), attempt: "a1".into() });
+        let mut expiry_tx = db.begin().await.expect("begin the expiry txn");
+        let doomed: Vec<String> = sqlx::query_scalar(for_update_victim)
+            .bind(&fa)
+            .fetch_all(&mut *expiry_tx)
+            .await
+            .expect("FOR UPDATE the victim first");
+        assert!(!doomed.is_empty());
+
+        // The record-side re-check must block on the FOR UPDATE.
+        let mut record_tx = db.begin().await.expect("begin the record txn");
+        sqlx::query("SET LOCAL lock_timeout = '500ms'")
+            .execute(&mut *record_tx)
+            .await
+            .expect("set lock_timeout");
+        let blocked = recheck_closure_present(&mut record_tx, &closure_tagged, &fc).await;
+        assert!(
+            blocked.is_err(),
+            "the re-check must BLOCK while expiry holds FOR UPDATE on the owner's \
+             rows — proceeding here would validate against rows mid-deletion"
+        );
+        record_tx.rollback().await.expect("roll back the timed-out record txn");
+
+        // Expiry completes its deletion (members, then packs, by the locked set).
+        sqlx::query("DELETE FROM depot_pack_members WHERE pack_key = ANY($1)")
+            .bind(&doomed)
+            .execute(&mut *expiry_tx)
+            .await
+            .expect("delete the victim's members");
+        sqlx::query("DELETE FROM depot_packs WHERE pack_key = ANY($1)")
+            .bind(&doomed)
+            .execute(&mut *expiry_tx)
+            .await
+            .expect("delete the victim's packs");
+        expiry_tx.commit().await.expect("commit the expiry txn");
+
+        // The re-driven re-check unblocks into the aftermath: absence — the
+        // caller's 422 verdict, never a record over deleted bytes.
+        let mut record_tx = db.begin().await.expect("re-drive the record txn");
+        let present = recheck_closure_present(&mut record_tx, &closure_tagged, &fc)
+            .await
+            .expect("the re-check after the expiry committed");
+        assert!(
+            !present.contains(&blob_hash),
+            "expiry-first: the re-driven re-check must see the deletion and refuse \
+             the record (422 re-drive)"
+        );
+        record_tx.rollback().await.expect("roll back");
     }
 
     /// Seed and SEAL one fence's pack, so its rows are STAGED
