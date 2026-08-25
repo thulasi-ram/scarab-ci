@@ -37,20 +37,6 @@ CREATE TABLE depot_packs (
 
 -- Retention expires Runs, and a pack never outlives its drain's fence
 -- (ADR-0067 part 7): pack-grain expiry looks packs up by fence.
---
--- WARNING to whoever writes committed-pack expiry (git-bug ec294b7): a
--- fence's committed pack may be the ONLY durable copy of members a LATER
--- fence's success record depends on — `/have` and the drain gate accept any
--- committed pack's row as durable, whoever owns it. The dependency IS
--- recorded (0048 `depot_fence_borrows`, written in the borrower's record
--- transaction), so expiry of fence F MUST, inside one transaction per victim
--- fence: FOR UPDATE F's `depot_packs` rows FIRST (the drain re-check takes
--- FOR SHARE on them), re-check that no borrow edge on F has a borrower whose
--- drain record still lives, honour the `depot_borrow_tracking_epoch` floor
--- (no committed expiry at all while any live success record predates the
--- epoch), and only then delete F's POINTERS — the bytes go rowless and the
--- orphan reclaimer collects them a cadence later. Deleting a committed pack
--- without that check silently unbacks committed evidence.
 CREATE INDEX depot_packs_fence_key ON depot_packs (fence_key);
 
 CREATE TABLE depot_pack_members (

@@ -32,6 +32,32 @@
 -- any live success record with `posted_at < epoch` exists. Time heals: those
 -- records keep their TTL sweep, and once the last one is gone the floor
 -- costs nothing. No closure re-walk migration.
+--
+-- 0043 and 0044 are APPLIED migrations (sqlx checksums freeze their bytes),
+-- so the two contract amendments that belong beside them live HERE instead:
+--
+-- 0043's residue contract, refined: `depot_fence_writes` rows and ERROR
+-- drain records are fence residue, TTL-swept by the Depot — no workspace
+-- token outlives the sweep bound, and deleting a stale ledger row only
+-- re-restricts reads, the safe direction. SUCCESS drain records posted
+-- at/after the epoch below are NOT residue: each is the anchor of its
+-- fence's borrow edges ("borrower still has a record" is committed expiry's
+-- whole gate), so it lives with its fence and fence expiry is its only
+-- deleter. Pre-epoch success records keep the TTL sweep — their borrows
+-- were never recorded, and sweeping them is what drains the epoch floor
+-- holding committed expiry shut. (The behavior and the same words live on
+-- `sweep_fence_residue` in workspaced.rs.)
+--
+-- 0044's warning to whoever writes committed-pack expiry: a fence's
+-- committed pack may be the ONLY durable copy of members a LATER fence's
+-- success record depends on — `/have` and the drain gate accept any
+-- committed pack's row as durable, whoever owns it. Expiry of fence F MUST,
+-- inside one transaction per victim fence: FOR UPDATE F's `depot_packs`
+-- rows FIRST (the drain re-check takes FOR SHARE on them), re-check that no
+-- borrow edge on F has a borrower whose drain record still lives, honour
+-- the epoch floor above, and only then delete F's POINTERS — the bytes go
+-- rowless and the orphan reclaimer collects them a cadence later. Deleting
+-- a committed pack without that check silently unbacks committed evidence.
 
 CREATE TABLE depot_fence_borrows (
     borrower_fence TEXT NOT NULL,

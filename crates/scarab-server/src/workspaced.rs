@@ -764,10 +764,15 @@ async fn sweep_fence_residue(db: &sqlx::PgPool, now: i64) -> Result<(u64, u64), 
 // STOP LINE — read before touching anything below. `NOT committed` is a HARD
 // boundary: everything in this reclaimer deletes only STAGED rows (staging of
 // a drain that never finished) and rowLESS bytes. COMMITTED packs are
-// pack-grain retention expiry, which is gated on the ec294b7 cross-fence
-// dedup work (a later fence's record may depend on an earlier fence's pack)
-// and is NOT built. Nothing in this file may ever delete a committed row or
-// the bytes a committed row points at.
+// pack-grain retention expiry, which is NOT built (git-bug 6499fb1). The
+// ec294b7 cross-fence dependency is now RECORDED — `depot_fence_borrows`,
+// written in every success record's transaction — so whoever builds that
+// expiry must gate every committed deletion on the borrow check (FOR UPDATE
+// the victim's `depot_packs` rows first, re-check that no borrow edge has a
+// borrower whose drain record still lives, honour the
+// `depot_borrow_tracking_epoch` floor; see 0048's migration header) and
+// delete POINTERS only. Until then, nothing in this file may ever delete a
+// committed row or the bytes a committed row points at.
 
 /// One pass of the pack reclaimer: the stale-staging ROW pass (pointers),
 /// then the orphan BYTE scan behind it. Serialised across replicas by

@@ -24,20 +24,11 @@
 -- everything below — this table included — sees bare hex only. Tags belong in
 -- pack footers and `depot_pack_members` (slice 3), not here.
 --
--- FENCE RESIDUE, refined by git-bug ec294b7 (`written_at` / `posted_at` are
--- unix seconds): `depot_fence_writes` rows and ERROR drain records are
--- residue, TTL-swept by the Depot — no workspace token outlives the sweep
--- bound, and deleting a stale ledger row only re-restricts reads, the safe
--- direction. SUCCESS drain records posted at/after `depot_borrow_tracking_epoch`
--- (0048) are NOT residue: each is the anchor of its fence's borrow edges
--- ("borrower still has a record" is committed expiry's gate), so it lives
--- with its fence and fence expiry is its only deleter. Pre-epoch success
--- records keep the TTL sweep — their borrows were never recorded, and
--- sweeping them is what drains the epoch floor holding committed expiry
--- shut. Losing either table entirely is a re-restriction plus a re-drain,
--- never data loss (ADR-0067 part 11: Postgres holds a derived index; the
--- bucket wins) — but a lost success record now also demands the borrow-edge
--- rebuild before any committed expiry may run.
+-- Both tables are FENCE RESIDUE, TTL-swept by the Depot (`written_at` /
+-- `posted_at` are unix seconds): no workspace token outlives the sweep bound,
+-- so deleting a stale ledger row only re-restricts reads — the safe direction.
+-- Losing either table entirely is a re-restriction plus a re-drain, never data
+-- loss (ADR-0067 part 11: Postgres holds a derived index; the bucket wins).
 
 CREATE TABLE depot_drain_records (
     fence_key TEXT PRIMARY KEY,
