@@ -44,13 +44,6 @@ sha2 = { workspace = true }
 # going through `scarab-db-postgres`; this is the data plane's own, deliberately
 # thin, SQL surface (`workspaced.rs` only).
 sqlx = { workspace = true }
-# ADR-0062 Snapshot Farm (`farm.rs`): the `FICLONE` ioctl on Linux and
-# `clonefile(2)` on macOS/APFS, which are the clone rung. Neither is in `std`.
-# `reflink-copy` (cargo-bins, MIT/Apache) covers both plus a plain `Unsupported`
-# error elsewhere, so the farm keeps one `reflink` wrapper and no per-OS arms.
-# NB *not* the crate named `reflink` — that one has been unmaintained since 2019.
-reflink-copy = { workspace = true }
-
 # every scarab crate — the server is the composition root
 scarab-engine = { workspace = true }
 scarab-pipeline = { workspace = true }

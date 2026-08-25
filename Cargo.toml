@@ -99,8 +99,10 @@ base64 = "0.22"
 jsonwebtoken = "9"
 tar = "0.4"
 tempfile = "3"
-# Reflink/CoW copy for the Snapshot Farm. Replaces hand-declared FICLONE +
-# clonefile FFI; covers Linux, APFS (the dev loop) and Windows ReFS.
+# Reflink/CoW copy — the blessed primitive for any future node-local cache
+# (git-bug 0ec3b39 carve-out; the Snapshot Farm that used it is deleted).
+# Replaces hand-declared FICLONE + clonefile FFI; covers Linux, APFS (the dev
+# loop) and Windows ReFS. Currently unreferenced by any crate on purpose.
 # NOT the `reflink` crate — that one has been abandoned since 2019.
 reflink-copy = "0.1"
 # l*xattr, for reading the overlay's trusted.* markers. Linux-only at the
