@@ -275,17 +275,64 @@ referenced output declared. Supplied inputs reach each inlined step as `SCARAB_P
 A step publishes **named, typed results** that a downstream step reads at launch via
 `${{ outputs.<step-id>.<name> }}`; launch parameters are read the same way as `${{ inputs.<name> }}`.
 Interpolation is resolved at launch time against the upstream step's captured results, so a
-consumer must `needs:` the producer:
+consumer must `needs:` the producer.
+
+**Results are not artifacts.** A result is a small typed value the DAG interpolates into a later
+step's command or environment; an [artifact](#steps-the-step-shape) is a file published from
+`/scarab/artifacts/` that you download after the run.
+
+### Publishing a result
+
+A step publishes result `<name>` by writing the file **`/scarab/results/<name>.json`** — the
+result's name is the filename minus `.json`, and the file must hold **valid JSON**: `"abc123"`
+(quotes included) for a string, `42` for a number — never bare text.
+
+```yaml
+- id: version
+  image: busybox
+  command:
+    - sh
+    - -c
+    - |
+      set -eu
+      mkdir -p /scarab/results
+      printf '"%s"' "1.4.2" > /scarab/results/tag.json     # string result "tag"
+      printf '%s' 42 > /scarab/results/build.json          # number result "build"
+
+- id: notify
+  image: busybox
+  needs: [version]
+  command: ["echo", "release ${{ outputs.version.tag }}"]
+```
+
+Capture is otherwise transparent: on Kubernetes a trusted per-Pod egress sidecar drains the
+step's results back to the control plane — nothing to wire up in the pipeline. A `build:` step
+emits an `image` result natively (BuildKit writes `--metadata-file /scarab/results/image.json`);
+its author writes nothing.
+
+### The trap: a bare filename publishes nothing, and the step still goes green
+
+The sidecar drains **`*.json` files only**. Writing a bare `/scarab/results/tag` — the obvious
+guess — publishes **nothing**: the glob matches no file, the sidecar logs only
+`no results to drain`, and the step still **exits 0**. The run goes green while
+`${{ outputs.version.tag }}` silently resolves to empty downstream. Nothing tells the author
+they produced no result.
+
+So make the consumer assert that its interpolation resolved — that is what turns the silent
+no-op into a failure at the point of use:
 
 ```yaml
 - id: notify
   image: busybox
-  needs: [deploy]
-  command: ["echo", "${{ outputs.deploy.url }}"]
+  needs: [version]
+  command:
+    - sh
+    - -c
+    - |
+      TAG='${{ outputs.version.tag }}'
+      test -n "$TAG"    # a producer-side typo fails HERE instead of shipping ""
+      echo "release $TAG"
 ```
-
-Result capture is transparent to authors: on Kubernetes a per-Pod egress sidecar drains each step's
-results back to the control plane, nothing to wire up in the pipeline.
 
 ## Environments & gates
 

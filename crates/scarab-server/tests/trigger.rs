@@ -211,7 +211,9 @@ async fn committed_scarab_authors_concurrency_and_gate() {
         .await
         .unwrap()
         .expect("run is in a concurrency group");
-    assert_eq!(group, "deploy-prod");
+    // Scoped to the owning repo since 5120335 — a literal author-chosen group
+    // name must never collide across tenants.
+    assert_eq!(group, "acme/app:deploy-prod");
     assert_eq!(policy, ConcurrencyPolicy::CancelInProgress);
 
     // The gate reached the engine: `approve` is a durable suspend point, the

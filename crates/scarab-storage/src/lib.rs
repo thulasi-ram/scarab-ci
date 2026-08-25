@@ -209,6 +209,30 @@ pub fn system_time_from_unix_ms(ms: i64) -> SystemTime {
     }
 }
 
+/// A [`SystemTime`] as unix-ms — the **forward** direction of
+/// [`system_time_from_unix_ms`], and what every snapshot writer records into a
+/// [`TreeEntry::mtime_ms`]. Pre-epoch times come back negative rather than being
+/// dropped; `None` only when the value does not fit an `i64` of milliseconds.
+///
+/// **Here, not in each adapter**, for the same reason as its inverse: this
+/// arithmetic decides a snapshot *root* (a root moves when an mtime moves), and
+/// three private copies — `scarab-storage-s3`, `scarab-workspace-client`, and
+/// `scarab-server`'s settle path — were three chances for one of them to round
+/// differently and produce a different address for identical bytes. Truncation,
+/// not rounding, toward the epoch from both sides: sub-millisecond remainders
+/// are discarded (`epoch + 1.5ms` → `1`, `epoch - 1.5ms` → `-1`).
+///
+/// Pure arithmetic despite the type, so it stays inside ADR-0031's I/O ban —
+/// *reading* an mtime off a file is filesystem I/O and stays in the adapters.
+pub fn unix_ms_from_system_time(t: SystemTime) -> Option<i64> {
+    match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since) => i64::try_from(since.as_millis()).ok(),
+        Err(before) => i64::try_from(before.duration().as_millis())
+            .ok()
+            .map(|ms| -ms),
+    }
+}
+
 /// The SHA-256 of `data`, lowercase hex — **the** content address in this
 /// system (ADR-0029). One definition, in the domain crate, because both
 /// adapters need to agree on it byte for byte.
@@ -556,6 +580,51 @@ pub async fn prune_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The forward conversion at its edges: the epoch is 0, pre-epoch is
+    /// negative (not dropped), and a far future beyond `i64` milliseconds is a
+    /// refusal, never a wrap.
+    #[test]
+    fn unix_ms_from_system_time_epoch_pre_epoch_and_far_future() {
+        let epoch = SystemTime::UNIX_EPOCH;
+        assert_eq!(unix_ms_from_system_time(epoch), Some(0));
+        assert_eq!(
+            unix_ms_from_system_time(epoch + Duration::from_millis(1_700_000_000_000)),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            unix_ms_from_system_time(epoch - Duration::from_millis(86_400_000)),
+            Some(-86_400_000)
+        );
+        // Beyond i64::MAX milliseconds: None, not a silent wrap.
+        assert_eq!(
+            unix_ms_from_system_time(epoch + Duration::from_millis(u64::MAX)),
+            None
+        );
+    }
+
+    /// Truncation-vs-rounding is exactly where two private copies would have
+    /// diverged, so pin it: sub-millisecond remainders truncate toward the
+    /// epoch on BOTH sides, and the ms → SystemTime → ms round-trip is exact.
+    #[test]
+    fn unix_ms_from_system_time_truncates_and_round_trips() {
+        let epoch = SystemTime::UNIX_EPOCH;
+        assert_eq!(
+            unix_ms_from_system_time(epoch + Duration::from_micros(1_500)),
+            Some(1)
+        );
+        assert_eq!(
+            unix_ms_from_system_time(epoch - Duration::from_micros(1_500)),
+            Some(-1)
+        );
+        for ms in [0i64, 1, -1, 1_700_000_000_000, -86_400_000] {
+            assert_eq!(
+                unix_ms_from_system_time(system_time_from_unix_ms(ms)),
+                Some(ms),
+                "round-trip of {ms}"
+            );
+        }
+    }
 
     /// ADR-0067 part 12: both spellings parse to the same (algorithm, hex) —
     /// the tag changes nothing about what the address names.

@@ -795,12 +795,7 @@ fn ctime_ms(meta: &std::fs::Metadata) -> Option<i64> {
 /// Pre-epoch timestamps come back negative rather than being dropped.
 fn mtime_ms(meta: &std::fs::Metadata) -> Option<i64> {
     let modified = meta.modified().ok()?;
-    match modified.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-        Ok(d) => i64::try_from(d.as_millis()).ok(),
-        Err(before) => i64::try_from(before.duration().as_millis())
-            .ok()
-            .map(|ms| -ms),
-    }
+    scarab_storage::unix_ms_from_system_time(modified)
 }
 
 /// Restore `mtime_ms` then `mode` on an existing **directory** — and the one
