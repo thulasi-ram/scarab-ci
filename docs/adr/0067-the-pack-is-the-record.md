@@ -372,7 +372,14 @@ is still unbuilt. None of these reverse a decision; two refine one.
   now recorded — every success record's transaction writes fence-grain borrow edges
   (`depot_fence_borrows`, keyed on the full published closure, share-locking the owners' pack
   rows) behind a migration-stamped backfill epoch, so committed expiry has its gate; the expiry
-  pass itself remains the ticketed successor.
+  pass itself remains the ticketed successor. **Update 2026-08-26 (git-bug 6499fb1): the expiry
+  pass shipped** (`crates/scarab-server/src/depot_expiry.rs`) — control-plane-side (victim
+  selection is run policy), one victim fence per transaction under the reclaimer's advisory lock,
+  FOR UPDATE on the victim's pack rows first, pointers only. The backfill floor shipped as
+  control-plane **reachability**, not record-existence: pre-epoch committed content is deletable
+  only once no pre-epoch run is still non-terminal, within the workspace TTL, or pinned — and the
+  floor scopes to pre-epoch victims (a pre-epoch borrower's owners are necessarily pre-epoch), so
+  post-epoch fences expire on their recorded edges alone from day one.
 
 ## References
 

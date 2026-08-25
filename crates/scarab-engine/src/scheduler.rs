@@ -166,6 +166,12 @@ pub struct ExpiredInput {
 ///
 /// Produced by [`plan_rerun`] (read-only dry run) and returned by
 /// [`rerun_step_widened`] / [`retry_step_widened`] (what was done).
+///
+/// Retention expiry now actually deletes committed packs (ADR-0065/0067,
+/// git-bug 6499fb1), so this is real product surface, not an edge case: a
+/// rerun of a retention-expired run must re-derive its ancestors through this
+/// widening or fail loudly on reads — never silently succeed against missing
+/// snapshots (git-bug 4afaa3e).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RerunPlan {
     /// The step the human targeted.
