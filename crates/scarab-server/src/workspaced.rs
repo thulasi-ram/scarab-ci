@@ -236,12 +236,15 @@ const PACK_RECLAIM_SWEEP_SECS: u64 = 3600;
 /// config-fed bound would turn a tuning mistake into a correctness lever.
 const PACK_RECLAIM_STALE_SECS: i64 = 2 * FENCE_RESIDUE_TTL_SECS;
 
-/// The advisory-lock key serialising the pack reclaimer across replicas.
-/// Economy only, never correctness: every delete below is idempotent and
-/// row-guarded, so two replicas racing a pass would merely duplicate work
-/// (and S3 LISTs). `pg_try_advisory_lock` on a dedicated pooled connection;
-/// a replica that loses the race simply skips its pass.
-const PACK_RECLAIM_ADVISORY_LOCK: i64 = 0x5cab_ad79_c90;
+/// The advisory-lock key serialising the pack reclaimer across replicas —
+/// and, since git-bug 6499fb1, the control plane's committed-fence expiry
+/// pass (`crate::depot_expiry`), which takes the SAME key so the two
+/// pack-deleting passes never overlap. Economy only, never correctness:
+/// every delete below is idempotent and row-guarded, so two replicas racing
+/// a pass would merely duplicate work (and S3 LISTs). `pg_try_advisory_lock`
+/// on a dedicated pooled connection; a replica that loses the race simply
+/// skips its pass.
+pub(crate) const PACK_RECLAIM_ADVISORY_LOCK: i64 = 0x5cab_ad79_c90;
 
 /// How long an OPEN pack writer may sit idle before the linger ticker seals
 /// and stages it (git-bug afb13c2). The tail-pack visibility bound for a
@@ -763,16 +766,17 @@ async fn sweep_fence_residue(db: &sqlx::PgPool, now: i64) -> Result<(u64, u64), 
 //
 // STOP LINE — read before touching anything below. `NOT committed` is a HARD
 // boundary: everything in this reclaimer deletes only STAGED rows (staging of
-// a drain that never finished) and rowLESS bytes. COMMITTED packs are
-// pack-grain retention expiry, which is NOT built (git-bug 6499fb1). The
-// ec294b7 cross-fence dependency is now RECORDED — `depot_fence_borrows`,
-// written in every success record's transaction — so whoever builds that
-// expiry must gate every committed deletion on the borrow check (FOR UPDATE
-// the victim's `depot_packs` rows first, re-check that no borrow edge has a
-// borrower whose drain record still lives, honour the
-// `depot_borrow_tracking_epoch` floor; see 0048's migration header) and
-// delete POINTERS only. Until then, nothing in this file may ever delete a
-// committed row or the bytes a committed row points at.
+// a drain that never finished) and rowLESS bytes. COMMITTED rows are deleted
+// ONLY by the control plane's expiry pass in `crate::depot_expiry` (git-bug
+// 6499fb1), which alone holds the license: per victim fence, one transaction
+// that takes FOR UPDATE on the victim's `depot_packs` rows first, re-reads
+// the full candidate predicate, re-checks that no borrow edge
+// (`depot_fence_borrows`, written in every success record's transaction —
+// git-bug ec294b7) has a borrower whose drain record still lives, honours the
+// `depot_borrow_tracking_epoch` reachability floor for pre-epoch content, and
+// deletes POINTERS only (the bytes go rowless for this reclaimer's byte
+// scan). Nothing in THIS file may ever delete a committed row or the bytes a
+// committed row points at.
 
 /// One pass of the pack reclaimer: the stale-staging ROW pass (pointers),
 /// then the orphan BYTE scan behind it. Serialised across replicas by
@@ -5505,6 +5509,490 @@ mod tests {
         record_tx.rollback().await.expect("roll back");
     }
 
+    // -----------------------------------------------------------------------
+    // git-bug 6499fb1 — committed-fence retention expiry (crate::depot_expiry)
+    // -----------------------------------------------------------------------
+
+    /// The expiry tests' TTLs: pack = workspace = 1000s, so "past TTL" is a
+    /// run backdated an hour and "fresh" is one backdated a minute.
+    fn expiry_ttls() -> crate::depot_expiry::ExpiryTtls {
+        crate::depot_expiry::ExpiryTtls {
+            pack_ttl_secs: 1000,
+            workspace_ttl_secs: 1000,
+        }
+    }
+
+    /// Insert one `runs` row the candidate query can join — status and
+    /// `updated_at` (MILLIS, `age_secs` ago), optionally pinned, `created_at`
+    /// defaulting to `updated_at` (post-epoch unless backdated separately).
+    async fn seed_run(db: &sqlx::PgPool, id: &str, status: &str, age_secs: i64, pinned: bool) {
+        let updated_ms = (now_secs() - age_secs) * 1000;
+        sqlx::query(
+            "INSERT INTO runs (id, status, ir_version, event_schema_version, created_at, \
+                               updated_at, snapshots_pinned_at) \
+             VALUES ($1, $2, 2, 1, $3, $3, $4)",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(updated_ms)
+        .bind(pinned.then(|| updated_ms))
+        .execute(db)
+        .await
+        .expect("seed run");
+    }
+
+    /// One full SUCCESS drain of per-test content (`salt` keeps fences from
+    /// deduping against each other's committed packs — a shared blob would
+    /// record a borrow edge and change what a test is testing). Answers the
+    /// fence key.
+    async fn expiry_drain(h: &DepotHarness, run: &str, salt: &str) -> String {
+        let token = h.step_token(run, "build", "a1");
+        let blob = format!("expiry content {salt}").into_bytes();
+        let blob_hash = hash_hex(&blob);
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "out.txt",
+            TreeTarget::Blob(BlobHash(blob_hash.clone())),
+        )])
+        .expect("canonical tree");
+        let (status, body) = h
+            .put_raw_as(&token, &format!("/v1/cas/blobs/{blob_hash}"), blob)
+            .await;
+        assert!(status.is_success(), "expiry seed blob: {body}");
+        let (status, body) = h
+            .put_raw_as(&token, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .await;
+        assert!(status.is_success(), "expiry seed tree: {body}");
+        let (status, body) = h
+            .call_as(&token, "POST", "/v1/drains", Some(drain_record_body(&tree_hash.0)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "expiry drain must succeed: {body}");
+        fence_key(&Fence {
+            run: run.into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        })
+    }
+
+    /// How many rows each of the four families holds for one fence.
+    async fn expiry_rows_of(db: &sqlx::PgPool, fence: &str) -> (i64, i64, i64, i64) {
+        let (packs, members) = pack_rows_of(db, fence).await;
+        let records: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM depot_drain_records WHERE fence_key = $1")
+                .bind(fence)
+                .fetch_one(db)
+                .await
+                .expect("count records");
+        let borrows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM depot_fence_borrows WHERE borrower_fence = $1")
+                .bind(fence)
+                .fetch_one(db)
+                .await
+                .expect("count borrows");
+        (packs, members, records, borrows)
+    }
+
+    /// The recorded arm over a mixed population: ONE pass deletes exactly the
+    /// terminal + past-TTL + unpinned + unborrowed fence — all four row
+    /// families — and NEVER the bucket's bytes (pointers only; the rowless
+    /// reclaimer owns the bytes, a cadence later). A non-terminal run, a
+    /// fresh terminal run, and a pinned run each keep their fences.
+    ///
+    /// Mutations killed: drop the terminal filter and the running run's fence
+    /// goes; compare `updated_at` against a seconds cutoff and the fresh
+    /// fence goes; drop the pin disjunct and the pinned fence goes; delete
+    /// bytes anywhere and the bucket count drops.
+    #[tokio::test]
+    async fn expiry_deletes_exactly_the_terminal_past_ttl_unpinned_fence_and_no_bytes() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        let fa = expiry_drain(&h, "xa", "a").await; // terminal, old → expires
+        let fb = expiry_drain(&h, "xb", "b").await; // running → survives
+        let fc = expiry_drain(&h, "xc", "c").await; // terminal, fresh → survives
+        let fd = expiry_drain(&h, "xd", "d").await; // terminal, old, PINNED → survives
+        seed_run(db, "xa", "succeeded", 3600, false).await;
+        seed_run(db, "xb", "running", 3600, false).await;
+        seed_run(db, "xc", "failed", 60, false).await;
+        seed_run(db, "xd", "cancelled", 3600, true).await;
+
+        let bucket_before = h.cold.list_objects("packs/").await.expect("list packs").len();
+        assert!(bucket_before > 0, "the drains left pack bytes in the bucket");
+
+        let expired = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
+            .await
+            .expect("expiry pass");
+        assert_eq!(expired, 1, "exactly the one eligible fence expires");
+
+        assert_eq!(
+            expiry_rows_of(db, &fa).await,
+            (0, 0, 0, 0),
+            "the victim's four row families are gone"
+        );
+        for (fence, why) in [
+            (&fb, "non-terminal run"),
+            (&fc, "within TTL"),
+            (&fd, "pinned — the pin wins"),
+        ] {
+            let (packs, _, records, _) = expiry_rows_of(db, fence).await;
+            assert!(
+                packs > 0 && records > 0,
+                "fence with {why} must survive the pass"
+            );
+        }
+        let bucket_after = h.cold.list_objects("packs/").await.expect("list packs").len();
+        assert_eq!(
+            bucket_after, bucket_before,
+            "expiry deletes POINTERS only — the bytes are the rowless reclaimer's"
+        );
+    }
+
+    /// The borrow gate and the transitive free (the deletion contract's
+    /// core): a victim with a live borrower is SKIPPED; once the borrower
+    /// fence itself expires (taking its record and its outbound edges with
+    /// it), the next pass collects the owner.
+    ///
+    /// Mutations killed: drop the borrower re-check and pass 1 unbacks B's
+    /// committed evidence; forget to delete the expiring fence's OUTBOUND
+    /// edges and A starves forever behind a dead borrower.
+    #[tokio::test]
+    async fn a_borrowed_victim_survives_until_its_borrower_expires() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        // A owns; B publishes the same root having PUT only the tree — its
+        // blob dedups against A's committed pack, recording the (B, A) edge.
+        let ta = h.step_token("ba", "build", "a1");
+        let root = seed_fenced_snapshot(&h, &ta).await;
+        let (status, body) = h
+            .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "A's drain: {body}");
+        let fa = fence_key(&Fence { run: "ba".into(), step: "build".into(), attempt: "a1".into() });
+
+        let tb = h.step_token("bb", "build", "a1");
+        let blob_hash = hash_hex(b"drained output");
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "result.txt",
+            TreeTarget::Blob(BlobHash(blob_hash)),
+        )])
+        .expect("canonical tree");
+        let (status, body) = h
+            .put_raw_as(&tb, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .await;
+        assert!(status.is_success(), "B's tree PUT: {body}");
+        let (status, body) = h
+            .call_as(&tb, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "B's deduping drain: {body}");
+        let fb = fence_key(&Fence { run: "bb".into(), step: "build".into(), attempt: "a1".into() });
+
+        // Both runs terminal and past TTL: A is gated only by B's liveness.
+        seed_run(db, "ba", "succeeded", 3600, false).await;
+        seed_run(db, "bb", "succeeded", 3600, false).await;
+        // Candidate order is by posted_at: make A nominate first, so the
+        // pass PROVABLY visits the borrowed owner before its borrower goes.
+        sqlx::query("UPDATE depot_drain_records SET posted_at = posted_at - 10 WHERE fence_key = $1")
+            .bind(&fa)
+            .execute(db)
+            .await
+            .expect("order the candidates");
+
+        let pass1 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
+            .await
+            .expect("pass 1");
+        assert_eq!(pass1, 1, "pass 1 expires only the borrower B");
+        let (packs_a, _, records_a, _) = expiry_rows_of(db, &fa).await;
+        assert!(
+            packs_a > 0 && records_a > 0,
+            "A survives pass 1 — B's record still anchors the edge"
+        );
+        assert_eq!(
+            expiry_rows_of(db, &fb).await,
+            (0, 0, 0, 0),
+            "B (unborrowed) expired, its outbound edges deleted with it"
+        );
+
+        let pass2 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
+            .await
+            .expect("pass 2");
+        assert_eq!(pass2, 1, "pass 2 collects the transitively-freed owner");
+        assert_eq!(expiry_rows_of(db, &fa).await, (0, 0, 0, 0), "A is gone");
+    }
+
+    /// The pre-epoch reachability floor, scoped exactly (the 2026-08-26
+    /// amendment): while ANY pre-epoch run is still reachable (here: pinned),
+    /// a PRE-epoch victim is untouchable even though its own run is terminal,
+    /// past TTL and unpinned — but a POST-epoch victim expires in the same
+    /// pass, on its (recorded) edges alone. Draining the floor frees the
+    /// pre-epoch victim on the next pass.
+    #[tokio::test]
+    async fn the_reachability_floor_gates_pre_epoch_victims_only() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+        let epoch: i64 = sqlx::query_scalar("SELECT epoch FROM depot_borrow_tracking_epoch")
+            .fetch_one(db)
+            .await
+            .expect("epoch");
+
+        // The pre-epoch victim: packs backdated below the epoch.
+        let f_pre = expiry_drain(&h, "fpre", "pre").await;
+        sqlx::query("UPDATE depot_packs SET created_at = $2 WHERE fence_key = $1")
+            .bind(&f_pre)
+            .bind(epoch - 5000)
+            .execute(db)
+            .await
+            .expect("backdate packs below the epoch");
+        seed_run(db, "fpre", "succeeded", 3600, false).await;
+
+        // The post-epoch victim.
+        let f_post = expiry_drain(&h, "fpost", "post").await;
+        seed_run(db, "fpost", "succeeded", 3600, false).await;
+
+        // What holds the floor: a PINNED pre-epoch run (terminal and ancient,
+        // so the pin is the only reachability disjunct keeping it).
+        seed_run(db, "fhold", "succeeded", 30 * 24 * 3600, true).await;
+        sqlx::query("UPDATE runs SET created_at = $1 WHERE id = 'fhold'")
+            .bind((epoch - 5000) * 1000)
+            .execute(db)
+            .await
+            .expect("make the holder pre-epoch");
+
+        let pass1 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
+            .await
+            .expect("pass 1");
+        assert_eq!(
+            pass1, 1,
+            "the post-epoch victim expires with the floor still up"
+        );
+        assert_eq!(expiry_rows_of(db, &f_post).await, (0, 0, 0, 0));
+        let (packs_pre, _, records_pre, _) = expiry_rows_of(db, &f_pre).await;
+        assert!(
+            packs_pre > 0 && records_pre > 0,
+            "the pre-epoch victim is held by the floor — a pre-epoch run could \
+             still silently borrow from it"
+        );
+
+        // Drain the floor: unpin the holder.
+        sqlx::query("UPDATE runs SET snapshots_pinned_at = NULL WHERE id = 'fhold'")
+            .execute(db)
+            .await
+            .expect("unpin the holder");
+        let pass2 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
+            .await
+            .expect("pass 2");
+        assert_eq!(pass2, 1, "the floor drained; the pre-epoch victim expires");
+        assert_eq!(expiry_rows_of(db, &f_pre).await, (0, 0, 0, 0));
+    }
+
+    /// The committed-recordless arm rides the SAME floor (audit A3, folded):
+    /// committed pre-epoch packs whose record was residue-swept are held
+    /// while the floor is up, and collected — through the same per-victim
+    /// borrower-checked transaction — once it drains.
+    #[tokio::test]
+    async fn the_recordless_arm_waits_for_the_same_floor_then_frees() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+        let epoch: i64 = sqlx::query_scalar("SELECT epoch FROM depot_borrow_tracking_epoch")
+            .fetch_one(db)
+            .await
+            .expect("epoch");
+
+        // A committed fence whose record the (pre-epoch) residue sweep took.
+        let f = expiry_drain(&h, "rl", "recordless").await;
+        sqlx::query("UPDATE depot_packs SET created_at = $2 WHERE fence_key = $1")
+            .bind(&f)
+            .bind(epoch - 5000)
+            .execute(db)
+            .await
+            .expect("backdate packs below the epoch");
+        sqlx::query("DELETE FROM depot_drain_records WHERE fence_key = $1")
+            .bind(&f)
+            .execute(db)
+            .await
+            .expect("sweep the record, pre-epoch style");
+
+        // Floor held: a non-terminal pre-epoch run.
+        seed_run(db, "rlhold", "running", 3600, false).await;
+        sqlx::query("UPDATE runs SET created_at = $1 WHERE id = 'rlhold'")
+            .bind((epoch - 5000) * 1000)
+            .execute(db)
+            .await
+            .expect("make the holder pre-epoch");
+
+        let pass1 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
+            .await
+            .expect("pass 1");
+        assert_eq!(pass1, 0, "the recordless arm never runs while the floor holds");
+        let (packs, members) = pack_rows_of(db, &f).await;
+        assert!(packs > 0 && members > 0, "the recordless fence survives");
+
+        // Drain the floor: the holder finishes and ages out.
+        sqlx::query(
+            "UPDATE runs SET status = 'succeeded', updated_at = $1 WHERE id = 'rlhold'",
+        )
+        .bind((now_secs() - 3600) * 1000)
+        .execute(db)
+        .await
+        .expect("terminate and age the holder");
+
+        let pass2 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
+            .await
+            .expect("pass 2");
+        assert_eq!(pass2, 1, "the floor drained; the recordless debris goes");
+        assert_eq!(pack_rows_of(db, &f).await, (0, 0), "packs and members gone");
+    }
+
+    /// The in-transaction re-read (audit A2): a rerun that flips the run
+    /// non-terminal between nomination and the victim transaction is CAUGHT —
+    /// the constructed interleaving, via the test hook that runs SQL inside
+    /// the victim transaction right after its FOR UPDATE. With the flip in
+    /// place the fence survives; without it, the same fence expires.
+    #[tokio::test]
+    async fn the_in_txn_re_read_catches_a_rerun_flipping_the_run_non_terminal() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        let f = expiry_drain(&h, "rrf", "reread").await;
+        seed_run(db, "rrf", "succeeded", 3600, false).await;
+
+        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN
+            .lock()
+            .unwrap() = Some((
+            f.clone(),
+            "UPDATE runs SET status = 'running' WHERE id = 'rrf'".to_string(),
+        ));
+        let expired = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
+            .await
+            .expect("pass under the flip");
+        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN.lock().unwrap() = None;
+        assert_eq!(
+            expired, 0,
+            "the re-read must see the rerun's flip and refuse the deletion"
+        );
+        let (packs, _, records, _) = expiry_rows_of(db, &f).await;
+        assert!(packs > 0 && records > 0, "every row family survives the skip");
+
+        // The skip rolled the (injected) flip back with the transaction, so
+        // the same fence is still nominable — and without the hook it goes.
+        let expired = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
+            .await
+            .expect("pass without the flip");
+        assert_eq!(expired, 1);
+        assert_eq!(expiry_rows_of(db, &f).await, (0, 0, 0, 0));
+    }
+
+    /// A deadlock (SQLSTATE 40P01) in ANY victim transaction aborts the WHOLE
+    /// pass — nothing deleted, next cadence retries. Constructed with the
+    /// same hook: a real Postgres `RAISE ... ERRCODE = '40P01'` inside the
+    /// first victim's transaction, with a second eligible victim behind it
+    /// that must NOT be processed.
+    #[tokio::test]
+    async fn a_deadlock_aborts_the_whole_pass_and_deletes_nothing() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        let f1 = expiry_drain(&h, "dl1", "dead1").await;
+        let f2 = expiry_drain(&h, "dl2", "dead2").await;
+        seed_run(db, "dl1", "succeeded", 3600, false).await;
+        seed_run(db, "dl2", "succeeded", 3600, false).await;
+        // Deterministic order: f1 nominates first.
+        sqlx::query("UPDATE depot_drain_records SET posted_at = posted_at - 10 WHERE fence_key = $1")
+            .bind(&f1)
+            .execute(db)
+            .await
+            .expect("order the candidates");
+
+        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN
+            .lock()
+            .unwrap() = Some((
+            f1.clone(),
+            "DO $$ BEGIN RAISE EXCEPTION 'constructed deadlock' USING ERRCODE = '40P01'; \
+             END $$"
+                .to_string(),
+        ));
+        let expired = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
+            .await
+            .expect("a 40P01 aborts the pass, it does not fail it");
+        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN.lock().unwrap() = None;
+        assert_eq!(expired, 0, "the pass aborted before deleting anything");
+        for fence in [&f1, &f2] {
+            let (packs, _, records, _) = expiry_rows_of(db, fence).await;
+            assert!(packs > 0 && records > 0, "no fence lost a row to the aborted pass");
+        }
+    }
+
+    /// The expiry side of the ec294b7 lock protocol, against the REAL pass
+    /// (the mirror of `the_share_lock_serializes_record_and_expiry_in_both_
+    /// orders`, which pinned the hand-rolled SQL shape): while a record
+    /// transaction holds `FOR SHARE OF p` on the victim's packs, the pass
+    /// BLOCKS at its FOR UPDATE; when the record commits — edge and record
+    /// atomically — the unblocked borrower re-check sees the just-committed
+    /// edge and SKIPS the victim.
+    #[tokio::test]
+    async fn the_expiry_pass_blocks_on_a_committing_record_and_honours_its_edge() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        // The victim: committed owner, terminal old run — fully eligible.
+        let ta = h.step_token("iva", "build", "a1");
+        let root = seed_fenced_snapshot(&h, &ta).await;
+        let (status, body) = h
+            .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "A's drain: {body}");
+        let fa = fence_key(&Fence { run: "iva".into(), step: "build".into(), attempt: "a1".into() });
+        seed_run(db, "iva", "succeeded", 3600, false).await;
+
+        // The record txn takes its share locks (the drain path's re-check).
+        let blob_hash = hash_hex(b"drained output");
+        let closure_tagged = vec![
+            tagged_address(HashAlgo::Sha256, &root),
+            tagged_address(HashAlgo::Sha256, &blob_hash),
+        ];
+        let fb = fence_key(&Fence { run: "ivb".into(), step: "build".into(), attempt: "a1".into() });
+        let mut record_tx = db.begin().await.expect("begin the record txn");
+        let present = recheck_closure_present(&mut record_tx, &closure_tagged, &fb)
+            .await
+            .expect("the re-check under share locks");
+        assert!(present.contains(&root), "precondition: durable via A's pack");
+
+        // The real pass, spawned: it must BLOCK on the held share locks.
+        let pass = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                crate::depot_expiry::expire_committed_fences_once(&db, &expiry_ttls(), 100).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !pass.is_finished(),
+            "the pass must be blocked at FOR UPDATE while the record txn holds \
+             FOR SHARE OF p — finishing here means it deleted under a committing record"
+        );
+
+        // The record commits its edge and its record atomically…
+        record_borrow_edges(&mut record_tx, &fb, "ivb", &closure_tagged, now_secs())
+            .await
+            .expect("record the borrow edges");
+        sqlx::query(
+            "INSERT INTO depot_drain_records \
+                 (fence_key, run, step, attempt, version, posted_at, record) \
+             VALUES ($1, 'ivb', 'build', 'a1', 1, $2, '{}'::jsonb)",
+        )
+        .bind(&fb)
+        .bind(now_secs())
+        .execute(&mut *record_tx)
+        .await
+        .expect("persist the borrower's record");
+        record_tx.commit().await.expect("commit the record txn");
+
+        // …and the unblocked pass sees the edge and skips the victim.
+        let expired = pass.await.expect("join").expect("the pass completes");
+        assert_eq!(expired, 0, "the borrower re-check must skip the victim");
+        let (packs, _, records, _) = expiry_rows_of(db, &fa).await;
+        assert!(packs > 0 && records > 0, "the victim survives intact");
+    }
+
     /// Seed and SEAL one fence's pack, so its rows are STAGED
     /// (`committed = FALSE`) — the state a dead drain leaves behind. Answers
     /// the fence key.
@@ -6209,6 +6697,7 @@ mod tests {
             retention_log_days: 30,
             retention_artifact_days: 90,
             retention_workspace_days: 14,
+            retention_pack_days: 14,
             cas_concurrency: 4,
             connections: vec![],
         };

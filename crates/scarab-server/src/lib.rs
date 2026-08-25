@@ -56,6 +56,7 @@ pub mod clone_executor;
 pub mod config;
 pub mod connections_config;
 pub mod converged;
+pub mod depot_expiry;
 pub mod forge_router;
 pub mod log_tail;
 pub mod logs;

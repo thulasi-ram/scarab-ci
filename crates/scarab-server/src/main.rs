@@ -340,6 +340,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.retention_log_days,
             config.retention_workspace_days,
         );
+
+        // Committed-fence expiry (git-bug 6499fb1, ADR-0065/0067): the
+        // control plane selects AND executes — pointers only; the Depot's
+        // rowless reclaimer collects the bytes a cadence later. On its own
+        // small pool (a composition-root concern: `PgDb`'s pool stays
+        // private, and the pass holds one connection for the reclaimer's
+        // advisory lock plus one per victim transaction), on the sweeper's
+        // cadence; cross-replica and cross-pass serialization is the
+        // advisory lock itself, so no lease is needed.
+        let expiry_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(&database_url)
+            .map_err(|e| format!("depot expiry pool: {e}"))?;
+        scarab_server::depot_expiry::spawn_expiry(
+            expiry_pool,
+            scarab_server::depot_expiry::ExpiryTtls {
+                pack_ttl_secs: (config.retention_pack_days as i64) * 24 * 60 * 60,
+                workspace_ttl_secs: (config.retention_workspace_days as i64) * 24 * 60 * 60,
+            },
+            Duration::from_secs(300),
+        );
+        tracing::info!(
+            "depot committed-fence expiry on (packs {}d; pin wins, borrow edges gate, \
+             pre-epoch floor honoured — git-bug 6499fb1)",
+            config.retention_pack_days,
+        );
     }
 
     // The OIDC issuer (ADR-0015), built BEFORE the driver so the launch path
