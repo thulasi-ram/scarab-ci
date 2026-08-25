@@ -368,7 +368,11 @@ is still unbuilt. None of these reverse a decision; two refine one.
   live commit into silent loss. COMMITTED packs are still never deleted: part 7's
   retention-grouping payoff is not yet collectable, and cross-fence dedup (a later fence's record
   depending on an earlier fence's pack) must be refcounted or re-packed **before** pack-grain
-  expiry is ever written — ticketed.
+  expiry is ever written — ticketed. **Update 2026-08-26 (git-bug ec294b7):** that dependency is
+  now recorded — every success record's transaction writes fence-grain borrow edges
+  (`depot_fence_borrows`, keyed on the full published closure, share-locking the owners' pack
+  rows) behind a migration-stamped backfill epoch, so committed expiry has its gate; the expiry
+  pass itself remains the ticketed successor.
 
 ## References
 

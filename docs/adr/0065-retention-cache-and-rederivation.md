@@ -19,6 +19,11 @@
 > COMMITTED packs — retention proper — is still not written**, gated on the ec294b7 cross-fence
 > dedup question; until it is, committed packs are never deleted, which errs in the safe
 > direction. The classes, the `RetentionProfile` knobs, and the Cache itself are untouched.
+> The ec294b7 gate itself is answered as of 2026-08-26: fence-grain borrow edges
+> (`depot_fence_borrows`) are recorded in every success record's transaction, so the expiry pass —
+> the ticketed successor — deletes a fence only when no live borrower record pins it, and the pin
+> wins across retention classes (a short-TTL pack held by a long-TTL borrower stays; the cost is
+> attribution, not waste).
 
 ## Context
 
