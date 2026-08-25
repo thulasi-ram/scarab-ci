@@ -151,6 +151,13 @@ const MAX_BLOB_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// reported the same volume unready. See [`warm_has`].
 static WARM_READ_FAILED: AtomicU64 = AtomicU64::new(0);
 
+/// Pack-reclaimer counters (git-bug ad79c90), exposed on `/metrics`.
+/// Process-wide like [`WARM_READ_FAILED`]: the reclaimer is one loop per
+/// replica and the numbers are operator evidence, not correctness state.
+static PACK_RECLAIM_ROWS: AtomicU64 = AtomicU64::new(0);
+static PACK_RECLAIM_PACKS: AtomicU64 = AtomicU64::new(0);
+static PACK_RECLAIM_PASS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
 /// How often the warm-tier size gauge is recomputed. Read on `/metrics` from an
 /// atomic rather than measured per scrape: a warm tier is tens of thousands of
 /// files, and walking it on every Prometheus scrape would make the observability
@@ -190,6 +197,49 @@ const DRAIN_RECORD_VERSION: u32 = 1;
 /// safe direction.
 const FENCE_RESIDUE_TTL_SECS: i64 =
     workspace_token::WORKSPACE_TOKEN_MAX_TTL_SECS + workspace_token::WORKSPACE_TOKEN_GRACE_SECS;
+
+/// How often the pack reclaimer runs (git-bug ad79c90) — the stale-staging
+/// row pass and the orphan-byte scan behind it.
+///
+/// Hourly, and the cadence is LOAD-BEARING for the byte half: the row pass
+/// returns the pack keys it deleted as an in-memory skip set, so a pack's
+/// bytes outlive its pointers by at least one full cadence. One hour is over
+/// 12x the longest read a deleted row could strand — a ranged read issued
+/// after `pack_member_of` answered, plus the client's whole in-process retry
+/// (`scarab-wsfetch.rs`, capped at 10 s), all bounded by the control plane's
+/// 5-minute drain clock.
+const PACK_RECLAIM_SWEEP_SECS: u64 = 3600;
+
+/// How old a fence's LAST sign of life must be before its staged
+/// (`NOT committed`) pack rows are reclaimed: **2 x [`FENCE_RESIDUE_TTL_SECS`]**
+/// (~48h20m), measured against Postgres `now()` — one clock authority, never
+/// a replica's.
+///
+/// The derivation (git-bug ad79c90): staging happens only under a live fence
+/// token, and no token outlives [`FENCE_RESIDUE_TTL_SECS`]. A retry is a NEW
+/// attempt and a NEW fence; only a crash-resume re-drive reuses one, and it
+/// is launchable only within the attempt deadline — one more token. So the
+/// last legitimate touch is at most 2 TTLs after the last sign of life, and
+/// any live drain refreshes that sign (a re-driven drain re-PUTs every
+/// closure tree, and `ledger_append` refreshes `written_at` on conflict).
+///
+/// The KNOWN case that exceeds this bound: a Step whose `timeout:` is over
+/// 24 hours, crash-resumed near its deadline — the resumed drain's staging
+/// can be older than 2 TTLs while the drain is still legitimate. The cost is
+/// a 422 "drain state lost — re-drive" (the post-drain gate re-checks rows,
+/// in and before its transaction) = a re-upload, NEVER silent loss; silent
+/// loss needs bytes gone while rows survive, which pointers-before-bytes
+/// forbids. That is why this bound stays a constant derived from the
+/// credential's TTL and is NEVER fed from per-step timeout config — a
+/// config-fed bound would turn a tuning mistake into a correctness lever.
+const PACK_RECLAIM_STALE_SECS: i64 = 2 * FENCE_RESIDUE_TTL_SECS;
+
+/// The advisory-lock key serialising the pack reclaimer across replicas.
+/// Economy only, never correctness: every delete below is idempotent and
+/// row-guarded, so two replicas racing a pass would merely duplicate work
+/// (and S3 LISTs). `pg_try_advisory_lock` on a dedicated pooled connection;
+/// a replica that loses the race simply skips its pass.
+const PACK_RECLAIM_ADVISORY_LOCK: i64 = 0x5cab_ad79_c90;
 
 /// How long an OPEN pack writer may sit idle before the linger ticker seals
 /// and stages it (git-bug afb13c2). The tail-pack visibility bound for a
@@ -450,6 +500,22 @@ pub fn router_with_pack_linger(
         });
     }
 
+    // The pack reclaimer (git-bug ad79c90), on its own slow cadence beside
+    // the residue sweep: stale STAGED pack rows, then the orphan bytes behind
+    // them. Work-first for the same reason as the sweep — the staging it
+    // collects belongs to drains that died before the last restart, and
+    // nothing else will ever collect it.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                pack_reclaim_pass(&state).await;
+                tokio::time::sleep(std::time::Duration::from_secs(PACK_RECLAIM_SWEEP_SECS))
+                    .await;
+            }
+        });
+    }
+
     // The idle-pack linger ticker (git-bug afb13c2), on its own fast cadence
     // beside the sweep above: an open pack writer idle past the linger is
     // sealed-and-staged, so a replica that received a scattered drain's PUTs
@@ -625,6 +691,209 @@ async fn sweep_fence_residue(db: &sqlx::PgPool, now: i64) -> Result<(u64, u64), 
         .await?
         .rows_affected();
     Ok((ledgers, records))
+}
+
+// ---------------------------------------------------------------------------
+// The pack reclaimer (git-bug ad79c90)
+// ---------------------------------------------------------------------------
+//
+// STOP LINE — read before touching anything below. `NOT committed` is a HARD
+// boundary: everything in this reclaimer deletes only STAGED rows (staging of
+// a drain that never finished) and rowLESS bytes. COMMITTED packs are
+// pack-grain retention expiry, which is gated on the ec294b7 cross-fence
+// dedup work (a later fence's record may depend on an earlier fence's pack)
+// and is NOT built. Nothing in this file may ever delete a committed row or
+// the bytes a committed row points at.
+
+/// One pass of the pack reclaimer: the stale-staging ROW pass (pointers),
+/// then — a later slice — the orphan BYTE scan behind it. Serialised across
+/// replicas by [`PACK_RECLAIM_ADVISORY_LOCK`] (economy only; every delete is
+/// idempotent).
+///
+/// Fail-closed: a Postgres error ABORTS the pass — the reclaimer must never
+/// infer "nothing to keep" from a database that could not answer
+/// (the same rule as [`pack_rows_error`]). A skipped pass increments
+/// `scarab_workspace_pack_reclaim_pass_skipped_total` and logs why; losing
+/// the advisory-lock race is not a skip (another replica is running the
+/// pass) and only logs at debug.
+async fn pack_reclaim_pass(state: &WorkspaceState) {
+    // The advisory lock lives on ONE dedicated pooled connection for the
+    // whole pass — session-scoped locks release with the session, so the
+    // connection is held, and if the explicit unlock fails the connection is
+    // closed rather than returned to the pool still holding the lock.
+    let mut conn = match state.db.acquire().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            PACK_RECLAIM_PASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                error = %e,
+                "pack reclaim: pass SKIPPED — no database connection for the advisory \
+                 lock; nothing was deleted, the next pass retries (git-bug ad79c90)"
+            );
+            return;
+        }
+    };
+    let locked: bool = match sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(PACK_RECLAIM_ADVISORY_LOCK)
+        .fetch_one(&mut *conn)
+        .await
+    {
+        Ok(locked) => locked,
+        Err(e) => {
+            PACK_RECLAIM_PASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                error = %e,
+                "pack reclaim: pass SKIPPED — the advisory-lock query failed; nothing \
+                 was deleted, the next pass retries (git-bug ad79c90)"
+            );
+            return;
+        }
+    };
+    if !locked {
+        tracing::debug!(
+            "pack reclaim: another replica holds the pass lock — not a skip, the \
+             work is happening elsewhere"
+        );
+        return;
+    }
+
+    match reclaim_stale_staging_once(state).await {
+        Ok((member_rows, pack_keys)) => {
+            if member_rows > 0 || !pack_keys.is_empty() {
+                PACK_RECLAIM_ROWS.fetch_add(member_rows, Ordering::Relaxed);
+                PACK_RECLAIM_PACKS.fetch_add(pack_keys.len() as u64, Ordering::Relaxed);
+                tracing::info!(
+                    member_rows,
+                    packs = pack_keys.len(),
+                    stale_after_secs = PACK_RECLAIM_STALE_SECS,
+                    "pack reclaim: deleted stale STAGED pack rows — staging of drains \
+                     that never finished, quiet past the staleness bound (git-bug \
+                     ad79c90); their bytes become rowless orphans for the byte scan"
+                );
+            }
+        }
+        Err(e) => {
+            PACK_RECLAIM_PASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                error = %e,
+                "pack reclaim: pass ABORTED on a Postgres error — nothing was deleted \
+                 (fail-closed: absence of an answer is never absence of rows); the \
+                 next pass retries (git-bug ad79c90)"
+            );
+        }
+    }
+
+    match sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(PACK_RECLAIM_ADVISORY_LOCK)
+        .execute(&mut *conn)
+        .await
+    {
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "pack reclaim: advisory unlock failed — closing the connection so the \
+                 pool never re-serves a session that still holds the pass lock"
+            );
+            let _ = sqlx::Connection::close(conn.detach()).await;
+        }
+    }
+}
+
+/// The stale-staging ROW pass (git-bug ad79c90, slice 1): delete the
+/// `NOT committed` pack rows — members first, then packs — of every fence
+/// that is BOTH stale (its newest staged pack is older than
+/// [`PACK_RECLAIM_STALE_SECS`]) and quiet (no ledger touch since the cutoff,
+/// and no drain record that is either recent or a SUCCESS). Success records
+/// are protected unconditionally: their staging was flipped committed in the
+/// record transaction, and any uncommitted remainder under a success record
+/// is a state this pass must leave for a human, never collect.
+///
+/// Answers `(member_rows_deleted, pack_keys_deleted)`; the keys are the
+/// pass's in-memory SKIP SET — the byte scan must not touch objects whose
+/// rows died this pass, so bytes outlive pointers by at least one cadence.
+///
+/// One transaction, and the cutoff comes from Postgres `now()` on that same
+/// transaction — one clock authority; replica clocks never decide staleness.
+/// See the STOP LINE above: `NOT committed` in every DELETE is the boundary.
+async fn reclaim_stale_staging_once(
+    state: &WorkspaceState,
+) -> Result<(u64, Vec<String>), sqlx::Error> {
+    let mut tx = state.db.begin().await?;
+    let cutoff: i64 =
+        sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM now())::bigint - $1")
+            .bind(PACK_RECLAIM_STALE_SECS)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    // Step 1 — LOCK the doomed pack rows (`FOR UPDATE`) before touching any
+    // member row. This is what makes the slice-0 interleaving argument hold
+    // on THIS side: the drain path's committed-flip UPDATE and this SELECT
+    // contend on the same `depot_packs` rows, so flip-first means this
+    // re-evaluates `NOT committed` on unblock and drops the row from the
+    // doomed set, while reclaim-first means the flip misses the row and the
+    // drain's in-transaction re-check sees the absence (422 re-drive). A
+    // member DELETE that only joined `depot_packs` would take no row locks
+    // there and could interleave with a live flip.
+    //
+    // `stale` keys on the newest STAGED pack per fence (0044's `created_at`,
+    // preserved across re-staging by ON CONFLICT DO NOTHING, is
+    // first-staging time); `quiet` then demands no ledger write since the
+    // cutoff (a live drain re-PUTs every closure tree and `ledger_append`
+    // refreshes `written_at` — slice 0) and no drain record that is either
+    // recent (a crash-resume may still re-drive it) or a SUCCESS (protected
+    // unconditionally).
+    let doomed: Vec<String> = sqlx::query_scalar(
+        "WITH stale AS ( \
+             SELECT p.fence_key FROM depot_packs p \
+             WHERE NOT p.committed \
+             GROUP BY p.fence_key \
+             HAVING max(p.created_at) < $1 \
+         ), quiet AS ( \
+             SELECT s.fence_key FROM stale s \
+             WHERE NOT EXISTS ( \
+                     SELECT 1 FROM depot_fence_writes w \
+                     WHERE w.fence_key = s.fence_key AND w.written_at >= $1) \
+               AND NOT EXISTS ( \
+                     SELECT 1 FROM depot_drain_records r \
+                     WHERE r.fence_key = s.fence_key \
+                       AND (r.posted_at >= $1 OR r.record->>'error' IS NULL)) \
+         ) \
+         SELECT p.pack_key FROM depot_packs p \
+         JOIN quiet q ON q.fence_key = p.fence_key \
+         WHERE NOT p.committed \
+         FOR UPDATE OF p",
+    )
+    .bind(cutoff)
+    .fetch_all(&mut *tx)
+    .await?;
+    if doomed.is_empty() {
+        tx.commit().await?;
+        return Ok((0, Vec::new()));
+    }
+
+    // Steps 2 and 3 — members first, then the packs themselves, both keyed by
+    // the exact locked set (never by re-evaluating the predicate: the locks
+    // are on these rows).
+    let member_rows =
+        sqlx::query("DELETE FROM depot_pack_members WHERE pack_key = ANY($1)")
+            .bind(&doomed)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+    // `AND NOT committed` is redundant under the FOR UPDATE locks — nothing
+    // can have flipped these rows — and stays anyway: the stop line above is
+    // enforced mechanically in every DELETE, not by an argument.
+    let pack_keys: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM depot_packs \
+         WHERE pack_key = ANY($1) AND NOT committed \
+         RETURNING pack_key",
+    )
+    .bind(&doomed)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((member_rows, pack_keys))
 }
 
 fn build_router(state: WorkspaceState) -> Router {
@@ -3150,6 +3419,15 @@ scarab_workspace_warm_backfill_failed_total {}
 # HELP scarab_workspace_warm_volume_read_failed_total Warm-volume reads that failed with something other than \"not there\" — a bad PersistentVolume, not a cache miss.
 # TYPE scarab_workspace_warm_volume_read_failed_total counter
 scarab_workspace_warm_volume_read_failed_total {}
+# HELP scarab_workspace_pack_reclaim_rows_total Stale staged pack-member rows deleted by the pack reclaimer (git-bug ad79c90).
+# TYPE scarab_workspace_pack_reclaim_rows_total counter
+scarab_workspace_pack_reclaim_rows_total {}
+# HELP scarab_workspace_pack_reclaim_packs_total Stale staged pack rows deleted by the pack reclaimer.
+# TYPE scarab_workspace_pack_reclaim_packs_total counter
+scarab_workspace_pack_reclaim_packs_total {}
+# HELP scarab_workspace_pack_reclaim_pass_skipped_total Reclaim passes skipped or aborted on an error (fail-closed: nothing was deleted).
+# TYPE scarab_workspace_pack_reclaim_pass_skipped_total counter
+scarab_workspace_pack_reclaim_pass_skipped_total {}
 ",
         state.warm_used_bytes.load(Ordering::Relaxed),
         tiered::cold_fallback_total(),
@@ -3157,6 +3435,9 @@ scarab_workspace_warm_volume_read_failed_total {}
         tiered::warm_full_total(),
         tiered::warm_backfill_failed_total(),
         WARM_READ_FAILED.load(Ordering::Relaxed),
+        PACK_RECLAIM_ROWS.load(Ordering::Relaxed),
+        PACK_RECLAIM_PACKS.load(Ordering::Relaxed),
+        PACK_RECLAIM_PASS_SKIPPED.load(Ordering::Relaxed),
     );
     let mut resp = body.into_response();
     resp.headers_mut().insert(
@@ -4373,6 +4654,219 @@ mod tests {
                 .await
                 .expect("count pack rows");
         assert_eq!(rows, 0, "the rolled-back transaction must persist no pack rows");
+    }
+
+    /// Seed and SEAL one fence's pack, so its rows are STAGED
+    /// (`committed = FALSE`) — the state a dead drain leaves behind. Answers
+    /// the fence key.
+    async fn seed_and_seal(h: &DepotHarness, run: &str, step: &str, attempt: &str) -> String {
+        let token = h.step_token(run, step, attempt);
+        seed_fenced_snapshot(h, &token).await;
+        let key = fence_key(&Fence {
+            run: run.into(),
+            step: step.into(),
+            attempt: attempt.into(),
+        });
+        let session = pack_session(&h.state, &key);
+        session.lock().await.seal_open().await.expect("seal the open pack");
+        key
+    }
+
+    /// Backdate one fence's reclaim clocks in Postgres — packs, ledger,
+    /// record, each only where asked — the tests' way of making a fence
+    /// stale/quiet without waiting two days.
+    async fn backdate(db: &sqlx::PgPool, fence_key: &str, packs: bool, ledger: bool, record: bool) {
+        let delta = PACK_RECLAIM_STALE_SECS + 3600;
+        if packs {
+            sqlx::query(
+                "UPDATE depot_packs SET created_at = \
+                 EXTRACT(EPOCH FROM now())::bigint - $2 WHERE fence_key = $1",
+            )
+            .bind(fence_key)
+            .bind(delta)
+            .execute(db)
+            .await
+            .expect("backdate packs");
+        }
+        if ledger {
+            sqlx::query(
+                "UPDATE depot_fence_writes SET written_at = \
+                 EXTRACT(EPOCH FROM now())::bigint - $2 WHERE fence_key = $1",
+            )
+            .bind(fence_key)
+            .bind(delta)
+            .execute(db)
+            .await
+            .expect("backdate ledger");
+        }
+        if record {
+            sqlx::query(
+                "UPDATE depot_drain_records SET posted_at = \
+                 EXTRACT(EPOCH FROM now())::bigint - $2 WHERE fence_key = $1",
+            )
+            .bind(fence_key)
+            .bind(delta)
+            .execute(db)
+            .await
+            .expect("backdate record");
+        }
+    }
+
+    async fn pack_rows_of(db: &sqlx::PgPool, fence_key: &str) -> (i64, i64) {
+        let packs: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM depot_packs WHERE fence_key = $1")
+                .bind(fence_key)
+                .fetch_one(db)
+                .await
+                .expect("count packs");
+        let members: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM depot_pack_members m \
+             JOIN depot_packs p ON p.pack_key = m.pack_key WHERE p.fence_key = $1",
+        )
+        .bind(fence_key)
+        .fetch_one(db)
+        .await
+        .expect("count members");
+        (packs, members)
+    }
+
+    /// The stale-staging ROW pass over a mixed population (git-bug ad79c90,
+    /// slice 1): ONE pass must delete exactly the stale-and-quiet staging and
+    /// nothing else. Six fences, one verdict each:
+    ///
+    /// - A stale + quiet, no record            → DELETED
+    /// - B committed (success drain), ancient  → untouched, any age
+    /// - C staged, fresh                       → untouched
+    /// - D staged, stale packs, FRESH ledger   → untouched (a live drain
+    ///   refreshes `written_at` — slice 0's DO UPDATE is what makes this arm
+    ///   real)
+    /// - E SUCCESS record over an un-flipped row, everything ancient
+    ///   → untouched (success records protect unconditionally; an
+    ///   uncommitted row under one is for a human, never this pass)
+    /// - F stale + quiet with an old ERROR record → DELETED (error records
+    ///   are precisely "the drain did not finish")
+    ///
+    /// Mutations killed: drop the `NOT committed` guard and B/E lose rows;
+    /// drop the ledger arm and D loses rows; drop the
+    /// `record->>'error' IS NULL` arm and E loses rows; compare against
+    /// replica time instead of PG `now()` and the backdates stop meaning
+    /// anything.
+    #[tokio::test]
+    async fn the_row_pass_deletes_exactly_the_stale_and_quiet_staging() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        // A — stale, quiet, recordless.
+        let fa = seed_and_seal(&h, "ra", "build", "a1").await;
+        backdate(db, &fa, true, true, false).await;
+
+        // B — a full success drain (rows committed), then everything ancient.
+        let tb = h.step_token("rb", "build", "a1");
+        let root_b = seed_fenced_snapshot(&h, &tb).await;
+        let (status, body) = h
+            .call_as(&tb, "POST", "/v1/drains", Some(drain_record_body(&root_b)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "B's drain must succeed: {body}");
+        let fb = fence_key(&Fence { run: "rb".into(), step: "build".into(), attempt: "a1".into() });
+        backdate(db, &fb, true, true, true).await;
+
+        // C — staged and fresh.
+        let fc = seed_and_seal(&h, "rc", "build", "a1").await;
+
+        // D — stale packs, fresh ledger.
+        let fd = seed_and_seal(&h, "rd", "build", "a1").await;
+        backdate(db, &fd, true, false, false).await;
+
+        // E — success record, then one row knocked back to staged, all ancient.
+        let te = h.step_token("re", "build", "a1");
+        let root_e = seed_fenced_snapshot(&h, &te).await;
+        let (status, body) = h
+            .call_as(&te, "POST", "/v1/drains", Some(drain_record_body(&root_e)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "E's drain must succeed: {body}");
+        let fe = fence_key(&Fence { run: "re".into(), step: "build".into(), attempt: "a1".into() });
+        sqlx::query(
+            "UPDATE depot_packs SET committed = FALSE \
+             WHERE fence_key = $1 AND kind = 'body'",
+        )
+        .bind(&fe)
+        .execute(db)
+        .await
+        .expect("knock E's body pack back to staged");
+        backdate(db, &fe, true, true, true).await;
+
+        // F — staged, then an ERROR record, all ancient.
+        let ff = seed_and_seal(&h, "rf", "build", "a1").await;
+        let tf = h.step_token("rf", "build", "a1");
+        let mut error_record = drain_record_body("f".repeat(64).as_str());
+        error_record["error"] =
+            serde_json::json!({ "kind": "Ingest", "detail": "drain died mid-flight" });
+        let (status, body) = h
+            .call_as(&tf, "POST", "/v1/drains", Some(error_record))
+            .await;
+        assert_eq!(status, StatusCode::OK, "F's error record must deposit: {body}");
+        backdate(db, &ff, true, true, true).await;
+
+        let (a_before, _) = pack_rows_of(db, &fa).await;
+        assert!(a_before > 0, "precondition: A has staged rows");
+
+        let (member_rows, deleted) =
+            reclaim_stale_staging_once(&h.state).await.expect("the row pass");
+
+        assert!(member_rows > 0, "A's and F's member rows were deleted");
+        assert_eq!(pack_rows_of(db, &fa).await, (0, 0), "A: stale quiet staging goes");
+        assert_eq!(pack_rows_of(db, &ff).await, (0, 0), "F: an old error record protects nothing");
+        let (b_packs, b_members) = pack_rows_of(db, &fb).await;
+        assert!(b_packs > 0 && b_members > 0, "B: committed rows are untouchable at any age");
+        let (c_packs, _) = pack_rows_of(db, &fc).await;
+        assert!(c_packs > 0, "C: fresh staging stays");
+        let (d_packs, _) = pack_rows_of(db, &fd).await;
+        assert!(d_packs > 0, "D: a fresh ledger keeps stale-looking staging alive");
+        let (e_packs, _) = pack_rows_of(db, &fe).await;
+        assert!(e_packs > 0, "E: a success record protects even an un-flipped row");
+        for key in &deleted {
+            let gone: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM depot_packs WHERE pack_key = $1")
+                    .bind(key)
+                    .fetch_one(db)
+                    .await
+                    .expect("check deleted key");
+            assert_eq!(gone, 0, "every returned skip-set key really is deleted: {key}");
+        }
+        assert!(
+            !deleted.is_empty(),
+            "the skip set carries the deleted pack keys for the byte scan"
+        );
+    }
+
+    /// Fail-closed (git-bug ad79c90): a Postgres error ABORTS the row pass —
+    /// `Err`, nothing deleted — never an empty "nothing stale" answer.
+    ///
+    /// Mutation killed: swallow the error into `Ok((0, vec![]))` and this
+    /// fails; a caller that then ran the byte scan would treat every object
+    /// as rowless and delete the world.
+    #[tokio::test]
+    async fn a_database_error_aborts_the_row_pass_with_nothing_deleted() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let fa = seed_and_seal(&h, "rerr", "build", "a1").await;
+        backdate(&h.state.db, &fa, true, true, false).await;
+
+        // A second pool onto the same database, closed — every acquire fails.
+        let url = swap_db(&h.pg.admin_url, &h.pg.dbname);
+        let dead_pool = sqlx::PgPool::connect(&url).await.expect("second pool");
+        dead_pool.close().await;
+        let dead = WorkspaceState {
+            db: dead_pool,
+            ..h.state.clone()
+        };
+
+        let result = reclaim_stale_staging_once(&dead).await;
+        assert!(result.is_err(), "a pool that cannot answer must abort the pass");
+        let (packs, members) = pack_rows_of(&h.state.db, &fa).await;
+        assert!(
+            packs > 0 && members > 0,
+            "and the stale rows must still be there — fail-closed deleted nothing"
+        );
     }
 
     /// The parent Workspace Snapshot's contents, as `(path, bytes)` plus one symlink
