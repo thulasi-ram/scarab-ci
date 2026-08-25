@@ -48,6 +48,9 @@ use scarab_identity::{Action, Principal, Session};
 
 /// ADR-0062 part 3: the **change set** of a Workspace Export — the exact paths an
 /// Attempt wrote, read out of an `overlayfs` upper layer rather than inferred.
+/// The Export lifecycle it fed was deleted when ADR-0066 cancelled lazy delivery
+/// (git-bug `0ec3b39`); this module survives as the revival package, exercised
+/// by `tests/changeset_overlay.rs`.
 pub mod changeset;
 pub mod clone_executor;
 pub mod config;

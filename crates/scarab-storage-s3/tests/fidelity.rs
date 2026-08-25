@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
-use scarab_storage::Cas;
+use scarab_storage::{Cas, TreeEntry, TreeTarget};
 use scarab_storage_s3::S3Storage;
 
 static N: AtomicU32 = AtomicU32::new(0);
@@ -82,6 +82,120 @@ fn build_fixture(root: &Path) {
         .expect("set mtime");
 
     std::os::unix::fs::symlink("plain.txt", root.join("link.txt")).expect("symlink");
+}
+
+/// Directory metadata lands **children before parent**, and within one
+/// directory **mtime before mode** — re-homed from the deleted Snapshot Farm's
+/// `directory_metadata_is_applied_deepest_last` (git-bug `0ec3b39`), because
+/// the ordering it pinned lives on in [`restore_dir_metadata`] and
+/// `materialize`'s directory pass.
+///
+/// Two fixture directories, one per hazard:
+///
+/// - `sealed` is `0o400` — readable, NOT searchable. Once that mode is on,
+///   nothing below it can be opened, so its own metadata must be applied
+///   strictly after its children's: flip the deepest-first order and the
+///   child's restore fails (or silently misses).
+/// - `dropbox` is `0o300` — writable and searchable, NOT readable, so it
+///   cannot be *opened*, which is what `futimens` needs. The only shape that
+///   can tell mtime-then-mode from mode-then-mtime: swap those two blocks in
+///   `restore_dir_metadata` and the materialize fails outright. (`0o400` and
+///   `0o500` would pass mode-first by luck — they still grant read.)
+///
+/// Built by hand rather than ingested: `ingest` could not walk such
+/// directories in the first place, and a snapshot may come from anywhere.
+#[tokio::test]
+async fn directory_metadata_is_applied_children_before_parent() {
+    const FIXED_MTIME_MS: i64 = (FIXED_MTIME_SECS as i64) * 1000;
+
+    let warm = temp_dir("deepest-warm");
+    let cas = S3Storage::local(&warm).expect("local cas");
+
+    let blob = cas.put_blob(b"deep").await.expect("put blob");
+    let inner = cas
+        .put_tree(vec![TreeEntry {
+            name: "deep.txt".into(),
+            target: TreeTarget::Blob(blob),
+            mode: Some(0o644),
+            mtime_ms: Some(FIXED_MTIME_MS),
+        }])
+        .await
+        .expect("put inner tree");
+    let middle = cas
+        .put_tree(vec![TreeEntry {
+            name: "inner".into(),
+            target: TreeTarget::Tree(inner),
+            mode: Some(0o755),
+            mtime_ms: Some(FIXED_MTIME_MS),
+        }])
+        .await
+        .expect("put middle tree");
+    let note = cas.put_blob(b"note").await.expect("put blob");
+    let dropbox_inner = cas
+        .put_tree(vec![TreeEntry {
+            name: "note.txt".into(),
+            target: TreeTarget::Blob(note),
+            mode: Some(0o644),
+            mtime_ms: Some(FIXED_MTIME_MS),
+        }])
+        .await
+        .expect("put dropbox tree");
+    let root = cas
+        .put_tree(vec![
+            TreeEntry {
+                name: "dropbox".into(),
+                target: TreeTarget::Tree(dropbox_inner),
+                mode: Some(0o300),
+                mtime_ms: Some(FIXED_MTIME_MS),
+            },
+            TreeEntry {
+                name: "sealed".into(),
+                target: TreeTarget::Tree(middle),
+                mode: Some(0o400),
+                mtime_ms: Some(FIXED_MTIME_MS),
+            },
+        ])
+        .await
+        .expect("put root tree");
+
+    let out = temp_dir("deepest-out");
+    cas.materialize(&root, out.to_str().unwrap()).await.expect(
+        "a checkout with a search-denied directory must still materialize — and \
+         one that denies READ must too, which fails the moment the mode is \
+         restored before the mtime",
+    );
+
+    // The read-denied one: its mtime is only settable while it is still
+    // openable, i.e. before its own mode goes on.
+    let dropbox = out.join("dropbox");
+    assert_eq!(mode_of(&dropbox), 0o300, "the recorded mode is restored");
+    std::fs::set_permissions(&dropbox, std::fs::Permissions::from_mode(0o700))
+        .expect("widen for inspection");
+    assert_eq!(
+        mtime_secs(&dropbox),
+        FIXED_MTIME_SECS,
+        "a directory that denies READ got its mtime before its mode — the other \
+         order cannot open it at all"
+    );
+    assert_eq!(
+        std::fs::read(dropbox.join("note.txt")).expect("read"),
+        b"note"
+    );
+
+    // The search-denied one: everything below it was restored before the seal.
+    let sealed = out.join("sealed");
+    assert_eq!(mode_of(&sealed), 0o400, "the recorded mode is restored");
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700))
+        .expect("widen for inspection");
+    assert_eq!(
+        mtime_secs(&sealed.join("inner")),
+        FIXED_MTIME_SECS,
+        "the sealed subtree got its metadata before the seal went on"
+    );
+    assert_eq!(
+        std::fs::read(sealed.join("inner/deep.txt")).expect("read"),
+        b"deep"
+    );
 }
 
 /// A workspace round-tripped through the CAS must come back byte-identical

@@ -702,21 +702,22 @@ fn mtime_ms(meta: &std::fs::Metadata) -> Option<i64> {
 /// trigger is the *absence of read*, which is rarer, which is exactly why this
 /// order needs writing down rather than rediscovering.
 ///
-/// The standing proof is `scarab_server::farm`'s
-/// `directory_metadata_is_applied_deepest_last`, which ingests a `0o300`
-/// directory and so goes red if these two blocks swap. `tests/fidelity.rs` pins
-/// the surrounding contract — file mode, file mtime, empty directories, symlinks
-/// across a round-trip — but note that it does **not** cover this swap: its
-/// fixture records no directory that denies read. Failures here are surfaced,
-/// never swallowed, for the same reason the order matters — a silently
-/// unfaithful checkout is the class of bug s7 exists to close.
+/// The standing proof is `tests/fidelity.rs`'s
+/// `directory_metadata_is_applied_children_before_parent`, which materialises a
+/// `0o300` directory and so goes red if these two blocks swap. The rest of
+/// `tests/fidelity.rs` pins the surrounding contract — file mode, file mtime,
+/// empty directories, symlinks across a round-trip — but its round-trip fixture
+/// records no directory that denies read, which is why the swap has its own
+/// hand-built fixture. Failures here are surfaced, never swallowed, for the
+/// same reason the order matters — a silently unfaithful checkout is the class
+/// of bug s7 exists to close.
 ///
 /// Files do not come through here: `write_file` does all three steps on the
-/// single handle it already holds (see the syscall note there), and the workspace
-/// service's snapshot farm (ADR-0062) does (1) by cloning or copying and then
-/// (2) on the entry's own handle. **The farm calls this function for its
-/// directories** rather than keeping the copy it was written with: two copies of
-/// an order-sensitive contract is two places to tidy and one place to notice.
+/// single handle it already holds (see the syscall note there). The caller is
+/// [`Cas::materialize`]'s directory pass, deepest first — children strictly
+/// before the parent whose restored mode could seal them off. (The ADR-0062
+/// Snapshot Farm was this helper's second caller until git-bug `0ec3b39`
+/// deleted it.)
 pub fn restore_dir_metadata(
     path: &std::path::Path,
     mode: Option<u32>,
@@ -748,11 +749,9 @@ pub fn restore_dir_metadata(
 
 /// Which step of a metadata restore failed, and the errno behind it.
 ///
-/// Deliberately **not** a [`StorageError`]: [`restore_dir_metadata`] is called
-/// from two crates with two error vocabularies (here it becomes a
-/// `StorageError`; in the snapshot farm it becomes a `FarmError` carrying the
-/// operation and the path), so the shared helper reports *what* failed and lets
-/// each caller say it in its own words.
+/// Deliberately **not** a [`StorageError`]: the helper reports *what* failed —
+/// a stable operation phrase plus the errno — and lets the caller say it in
+/// its own words (here it becomes a `StorageError`).
 #[derive(Debug)]
 pub struct MetadataError {
     /// A stable phrase naming the failed operation, for a caller's message.
@@ -1030,7 +1029,7 @@ impl Cas for S3Storage {
 
         // --- Phase 3: directory metadata, last and sequentially. -------------
         // mtime then mode, deepest first — see `restore_dir_metadata`, which owns
-        // the argument for that order and is shared with the snapshot farm.
+        // the argument for that order.
         let t = Instant::now();
         for (dir, mode, mtime) in dirs.into_iter().rev() {
             restore_dir_metadata(&dir, mode, mtime).map_err(|e| io_err(e.source))?;
