@@ -721,7 +721,20 @@ async fn sweep_residue_once(state: &WorkspaceState) {
 /// `posted_at` (refreshed when an error record is overwritten) — so only
 /// residue *nothing has touched* for a whole token lifetime goes. Sweeping a
 /// live fence's row is impossible by the TTL bound; sweeping a dead fence's
-/// only re-restricts reads, the safe direction.
+/// ledger only re-restricts reads, the safe direction.
+///
+/// **The borrow-anchor exemption** (git-bug ec294b7, audit A1): drain-record
+/// rows are no longer uniformly residue. A SUCCESS record posted at/after
+/// `depot_borrow_tracking_epoch` is the anchor of its fence's borrow edges —
+/// "borrower still has a record" is the committed-expiry gate's whole
+/// predicate, so borrower-record lifetime must equal borrower-FENCE lifetime,
+/// and fence expiry (the ec294b7 successor ticket) is that record's only
+/// deleter. ERROR records stay TTL-swept (they commit no evidence and pin
+/// nothing), and PRE-epoch success records keep the TTL sweep too: their
+/// drains predate edge recording, their borrows were never protected — no
+/// regression — and sweeping them is exactly what drains the epoch floor
+/// that holds committed expiry shut (a permanent exemption there would
+/// deadlock expiry forever).
 async fn sweep_fence_residue(db: &sqlx::PgPool, now: i64) -> Result<(u64, u64), sqlx::Error> {
     let cutoff = now - FENCE_RESIDUE_TTL_SECS;
     let ledgers = sqlx::query("DELETE FROM depot_fence_writes WHERE written_at < $1")
@@ -729,11 +742,18 @@ async fn sweep_fence_residue(db: &sqlx::PgPool, now: i64) -> Result<(u64, u64), 
         .execute(db)
         .await?
         .rows_affected();
-    let records = sqlx::query("DELETE FROM depot_drain_records WHERE posted_at < $1")
-        .bind(cutoff)
-        .execute(db)
-        .await?
-        .rows_affected();
+    let epoch: i64 = sqlx::query_scalar("SELECT epoch FROM depot_borrow_tracking_epoch")
+        .fetch_one(db)
+        .await?;
+    let records = sqlx::query(
+        "DELETE FROM depot_drain_records WHERE posted_at < $1 \
+           AND (record->>'error' IS NOT NULL OR posted_at < $2)",
+    )
+    .bind(cutoff)
+    .bind(epoch)
+    .execute(db)
+    .await?
+    .rows_affected();
     Ok((ledgers, records))
 }
 
@@ -2288,6 +2308,77 @@ async fn durable_present_of<'a, 'c>(
         .collect())
 }
 
+/// The in-transaction re-check's presence query (git-bug ad79c90 slice 0,
+/// re-shaped by ec294b7): which of these TAGGED closure addresses the pack
+/// index holds under the committed-OR-own-fence predicate, on the record
+/// transaction's own connection. Takes the caller's ONE tagged closure Vec
+/// (audit A4) — the same bind the borrow-edge INSERT uses — and answers bare
+/// hex for the caller's per-kind missing-member report.
+async fn recheck_closure_present(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    closure_tagged: &[String],
+    caller_fence: &str,
+) -> Result<HashSet<String>, WsError> {
+    if closure_tagged.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT m.address FROM depot_pack_members m \
+         JOIN depot_packs p ON p.pack_key = m.pack_key \
+         WHERE m.address = ANY($1) \
+           AND (p.committed OR p.fence_key = $2)",
+    )
+    .bind(closure_tagged)
+    .bind(caller_fence)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| pack_rows_error("re-check durable presence", e))?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|t| {
+            scarab_storage::parse_address(&t)
+                .ok()
+                .map(|(_, hex)| hex.to_string())
+        })
+        .collect())
+}
+
+/// Record the borrow edges of one success record (git-bug ec294b7), inside
+/// its open record transaction: one `depot_fence_borrows` row per foreign
+/// fence whose COMMITTED pack holds any member of the record's published
+/// closure. `closure_tagged` is the SAME Vec the in-transaction re-check
+/// bound (audit A4) — members are stored tagged, and a bare-hex bind here
+/// would record zero edges without erroring. `ON CONFLICT DO NOTHING`:
+/// re-driven drains and shared owners are expected, and an existing edge is
+/// already the truth.
+async fn record_borrow_edges(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    borrower_fence: &str,
+    run: &str,
+    closure_tagged: &[String],
+    now: i64,
+) -> Result<(), WsError> {
+    if closure_tagged.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO depot_fence_borrows (borrower_fence, owner_fence, run, created_at) \
+         SELECT DISTINCT $1, p.fence_key, $2, $3 \
+         FROM depot_pack_members m \
+         JOIN depot_packs p ON p.pack_key = m.pack_key \
+         WHERE m.address = ANY($4) AND p.committed AND p.fence_key <> $1 \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(borrower_fence)
+    .bind(run)
+    .bind(now)
+    .bind(closure_tagged)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| pack_rows_error("record borrow edges", e))?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // The pack: the one-pass durable write (ADR-0067 parts 4–10)
 // ---------------------------------------------------------------------------
@@ -3483,15 +3574,24 @@ async fn post_drain(
         // `NOT committed`, and skips. Members this POST itself sealed were
         // inserted above on this same transaction, so they are visible.
         let (trees, blobs) = closure.as_ref().expect("success records were validated above");
+
+        // ONE tagged Vec for the whole closure (git-bug ec294b7, audit A4):
+        // `depot_pack_members.address` is stored TAGGED (`sha256:<hex>`,
+        // ADR-0067 part 12) while the closure walk yields bare hex — so both
+        // the re-check below and the borrow-edge INSERT bind THIS Vec and
+        // nothing else. A bare-hex bind would not error: the re-check would
+        // 422 loudly, but the edge INSERT would match zero rows and record
+        // zero edges SILENTLY — and the committed-expiry gate that trusts
+        // these edges would then delete packs a committed record depends on.
+        let closure_tagged: Vec<String> = trees
+            .iter()
+            .chain(blobs.iter())
+            .map(|hex| tagged_address(HashAlgo::Sha256, hex))
+            .collect();
+
+        let present = recheck_closure_present(&mut tx, &closure_tagged, &key).await?;
         for (kind, members) in [(PackMemberKind::Tree, trees), (PackMemberKind::Blob, blobs)] {
-            let durable = durable_present_of(
-                &mut *tx,
-                kind,
-                members.iter().map(String::as_str),
-                Some(key.as_str()),
-            )
-            .await?;
-            if let Some(hex) = members.iter().find(|hex| !durable.contains(*hex)) {
+            if let Some(hex) = members.iter().find(|hex| !present.contains(*hex)) {
                 tx.rollback()
                     .await
                     .map_err(|e| fence_rows_error("roll back drain transaction", e))?;
@@ -3504,6 +3604,17 @@ async fn post_drain(
                 return Ok(drain_state_incomplete_422(&fence, detail));
             }
         }
+
+        // The borrow edges (git-bug ec294b7): every foreign COMMITTED pack
+        // this record's closure reaches into becomes a (borrower, owner)
+        // fence-grain row, in THIS transaction — the edge commits atomically
+        // with the record it protects, or not at all. Keyed on the FULL
+        // closure, not on what was actually deduped: recording every holder
+        // fence is the conservative direction, and it costs one indexed
+        // INSERT..SELECT at record time (nothing on the PUT / `/have` hot
+        // legs). Success records only — an error record commits no evidence
+        // and pins nothing.
+        record_borrow_edges(&mut tx, &key, &stored.run, &closure_tagged, now).await?;
     }
     sqlx::query(
         "INSERT INTO depot_drain_records \
@@ -4897,6 +5008,194 @@ mod tests {
                 .await
                 .expect("count pack rows");
         assert_eq!(rows, 0, "the rolled-back transaction must persist no pack rows");
+    }
+
+    // -----------------------------------------------------------------------
+    // git-bug ec294b7 — fence-grain borrow edges
+    // -----------------------------------------------------------------------
+
+    /// The MANDATORY acceptance test (audit A4): a drain that dedups against
+    /// a FOREIGN committed pack records at least one borrow edge, atomically
+    /// with its record. Fence A drains the fixture content; fence B publishes
+    /// the same root having PUT only the tree (its blob dedups against A's
+    /// committed pack via `/have`-shaped durable presence), and B's record
+    /// transaction must leave a `(B, A)` row in `depot_fence_borrows`
+    /// carrying B's run.
+    ///
+    /// This is what makes a silent form mismatch unshippable: members are
+    /// stored TAGGED and the closure walk yields bare hex, so an edge INSERT
+    /// bound with the wrong spelling matches zero rows and records nothing —
+    /// no error, no 422, just a deletion gate that starves. This assertion is
+    /// the only thing that catches that.
+    ///
+    /// Mutations killed: bind bare hex in `record_borrow_edges` (zero edges);
+    /// drop the INSERT entirely; scope it to deduped-only members and then
+    /// break the dedup bookkeeping (full-closure keying keeps it recorded).
+    #[tokio::test]
+    async fn a_drain_that_dedups_against_a_foreign_committed_pack_records_a_borrow_edge() {
+        let Some(h) = DepotHarness::start().await else { return };
+
+        // Fence A: the owner — a full success drain, packs committed.
+        let ta = h.step_token("ra", "build", "a1");
+        let root = seed_fenced_snapshot(&h, &ta).await;
+        let (status, body) = h
+            .call_as(&ta, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "A's drain must succeed: {body}");
+        let fa = fence_key(&Fence { run: "ra".into(), step: "build".into(), attempt: "a1".into() });
+
+        // A's own drain reached into no foreign pack: no edges, and never a
+        // self-edge.
+        let a_edges: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM depot_fence_borrows WHERE borrower_fence = $1")
+                .bind(&fa)
+                .fetch_one(&h.state.db)
+                .await
+                .expect("count A's edges");
+        assert_eq!(a_edges, 0, "the first drain borrows from nobody");
+
+        // Fence B: PUTs ONLY the tree (the ledger demands that much of the
+        // root); the blob is never uploaded — its durable copy is A's
+        // committed pack, which is exactly the cross-fence dedup ec294b7 is
+        // about.
+        let tb = h.step_token("rb", "build", "a1");
+        let blob = b"drained output".to_vec();
+        let blob_hash = hash_hex(&blob);
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "result.txt",
+            TreeTarget::Blob(BlobHash(blob_hash.clone())),
+        )])
+        .expect("canonical tree");
+        assert_eq!(tree_hash.0, root, "same content, same root");
+        let (status, body) = h
+            .put_raw_as(&tb, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .await;
+        assert!(status.is_success(), "B's tree PUT: {body}");
+        let (status, body) = h
+            .call_as(&tb, "POST", "/v1/drains", Some(drain_record_body(&root)))
+            .await;
+        assert_eq!(status, StatusCode::OK, "B's deduping drain must succeed: {body}");
+
+        let fb = fence_key(&Fence { run: "rb".into(), step: "build".into(), attempt: "a1".into() });
+        let edges: Vec<(String, String)> = sqlx::query_as(
+            "SELECT owner_fence, run FROM depot_fence_borrows WHERE borrower_fence = $1",
+        )
+        .bind(&fb)
+        .fetch_all(&h.state.db)
+        .await
+        .expect("read B's edges");
+        assert!(
+            !edges.is_empty(),
+            "a foreign-pack-dedup drain MUST record at least one borrow edge — zero \
+             edges here means the edge INSERT's bind does not match the stored \
+             member form (the silent-mismatch failure this test exists to make \
+             unshippable)"
+        );
+        assert!(
+            edges.iter().any(|(owner, _)| owner == &fa),
+            "the edge must name A as the owner: {edges:?}"
+        );
+        assert!(
+            edges.iter().all(|(owner, run)| owner != &fb && run == "rb"),
+            "no self-edges, and every edge carries the borrower's run: {edges:?}"
+        );
+    }
+
+    /// The refined residue sweep (audit A1): error records stay TTL-swept;
+    /// success records posted at/after the borrow-tracking epoch are the
+    /// borrow anchor and outlive the sweep (fence expiry is their only
+    /// deleter); success records posted BEFORE the epoch keep the TTL sweep —
+    /// their borrows were never recorded, and sweeping them is what drains
+    /// the epoch floor that holds committed expiry shut.
+    ///
+    /// Mutations killed: drop the exemption and the post-epoch success is
+    /// swept (its borrow edges dangle); exempt success records
+    /// unconditionally and the pre-epoch record survives forever (the epoch
+    /// floor deadlocks committed expiry); exempt error records and dead-drain
+    /// residue accretes without bound.
+    #[tokio::test]
+    async fn the_record_sweep_spares_exactly_the_post_epoch_success_records() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+        let now = now_secs();
+
+        // An ERROR record ("the drain did not finish") ...
+        let te = h.step_token("re", "build", "a1");
+        let error_record = serde_json::json!({
+            "root": "", "pruned_root": null, "identity": null,
+            "files": 0, "tree_bytes": 0, "blobs_uploaded": 0, "bytes_uploaded": 0,
+            "have_hits": 0, "ingest_ms": 0, "prune_ms": 0,
+            "error": { "kind": "Ingest", "detail": "the depot hung up" }
+        });
+        let (status, body) = h.call_as(&te, "POST", "/v1/drains", Some(error_record)).await;
+        assert_eq!(status, StatusCode::OK, "error record deposits: {body}");
+
+        // ... and two SUCCESS records, one to land after the epoch, one before.
+        for run in ["rs-post", "rs-pre"] {
+            let t = h.step_token(run, "build", "a1");
+            let root = seed_fenced_snapshot(&h, &t).await;
+            let (status, body) = h
+                .call_as(&t, "POST", "/v1/drains", Some(drain_record_body(&root)))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{run}'s drain must succeed: {body}");
+        }
+
+        let fe = fence_key(&Fence { run: "re".into(), step: "build".into(), attempt: "a1".into() });
+        let fpost =
+            fence_key(&Fence { run: "rs-post".into(), step: "build".into(), attempt: "a1".into() });
+        let fpre =
+            fence_key(&Fence { run: "rs-pre".into(), step: "build".into(), attempt: "a1".into() });
+
+        // Construct the timeline: epoch three TTLs ago; the error and the
+        // post-epoch success two TTLs ago (expired, at/after the epoch); the
+        // pre-epoch success four TTLs ago (expired, before the epoch).
+        sqlx::query("UPDATE depot_borrow_tracking_epoch SET epoch = $1")
+            .bind(now - 3 * FENCE_RESIDUE_TTL_SECS)
+            .execute(db)
+            .await
+            .expect("backdate the epoch");
+        for (key, age) in [
+            (&fe, 2 * FENCE_RESIDUE_TTL_SECS),
+            (&fpost, 2 * FENCE_RESIDUE_TTL_SECS),
+            (&fpre, 4 * FENCE_RESIDUE_TTL_SECS),
+        ] {
+            sqlx::query("UPDATE depot_drain_records SET posted_at = $2 WHERE fence_key = $1")
+                .bind(key)
+                .bind(now - age)
+                .execute(db)
+                .await
+                .expect("backdate a record");
+        }
+
+        let (_, records) = sweep_fence_residue(db, now).await.expect("sweep");
+        assert_eq!(records, 2, "exactly the error and the pre-epoch success go");
+
+        let live = |key: &str| {
+            let key = key.to_string();
+            let db = db.clone();
+            async move {
+                let n: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM depot_drain_records WHERE fence_key = $1")
+                        .bind(&key)
+                        .fetch_one(&db)
+                        .await
+                        .expect("count records");
+                n
+            }
+        };
+        assert_eq!(live(&fe).await, 0, "an expired ERROR record is still swept");
+        assert_eq!(
+            live(&fpost).await,
+            1,
+            "a post-epoch SUCCESS record is the borrow anchor — the TTL sweep must \
+             not touch it (fence expiry is its only deleter)"
+        );
+        assert_eq!(
+            live(&fpre).await,
+            0,
+            "a pre-epoch SUCCESS record keeps the TTL sweep — it is what drains \
+             the epoch floor"
+        );
     }
 
     /// Seed and SEAL one fence's pack, so its rows are STAGED
