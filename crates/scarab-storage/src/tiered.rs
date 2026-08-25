@@ -844,9 +844,10 @@ mod tests {
             let mut out: Vec<StoredObject> = objects
                 .iter()
                 .filter(|(k, _)| k.starts_with(prefix))
-                .map(|(k, _)| StoredObject {
+                .map(|(k, v)| StoredObject {
                     key: k.clone(),
                     modified_ms: 0,
+                    size: v.len() as u64,
                 })
                 .collect();
             out.sort_by(|a, b| a.key.cmp(&b.key));

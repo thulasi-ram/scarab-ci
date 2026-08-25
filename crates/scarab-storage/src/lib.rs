@@ -37,6 +37,9 @@ pub struct StoredObject {
     pub key: String,
     /// Last-modified, unix-ms — what the GC grace window compares against.
     pub modified_ms: i64,
+    /// Object size in bytes — observability for the reclaim passes (git-bug
+    /// ad79c90); `0` where a backend cannot answer cheaply.
+    pub size: u64,
 }
 
 /// The mode file-type bits that mark an entry as a symlink — `S_IFLNK`, which

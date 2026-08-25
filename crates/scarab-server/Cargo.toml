@@ -77,5 +77,6 @@ xattr = { workspace = true }
 
 [dev-dependencies]
 regex-lite = { workspace = true }
+filetime = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }

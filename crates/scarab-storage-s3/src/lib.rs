@@ -844,6 +844,7 @@ impl ObjectStore for S3Storage {
             .map(|m| scarab_storage::StoredObject {
                 key: m.location.to_string(),
                 modified_ms: m.last_modified.timestamp_millis(),
+                size: m.size as u64,
             })
             .collect())
     }

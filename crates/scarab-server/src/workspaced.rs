@@ -125,8 +125,8 @@ use scarab_executor_k8s::workspace_token::{
 use scarab_storage::content::{FlatDir, FlatEntry, FlatManifest};
 use scarab_storage::tiered::{TieredCas, TieredObjectStore};
 use scarab_storage::{
-    tagged_address, BlobHash, Cas, HashAlgo, ObjectStore, StorageError, TreeEntry, TreeHash,
-    TreeTarget,
+    tagged_address, BlobHash, Cas, HashAlgo, ObjectStore, StorageError, StoredObject, TreeEntry,
+    TreeHash, TreeTarget,
 };
 use scarab_storage_s3::pack::{FinishedPack, PackMember, PackMemberKind, PackWriter};
 use scarab_storage_s3::S3Storage;
@@ -156,6 +156,8 @@ static WARM_READ_FAILED: AtomicU64 = AtomicU64::new(0);
 /// replica and the numbers are operator evidence, not correctness state.
 static PACK_RECLAIM_ROWS: AtomicU64 = AtomicU64::new(0);
 static PACK_RECLAIM_PACKS: AtomicU64 = AtomicU64::new(0);
+static PACK_RECLAIM_ORPHAN_OBJECTS: AtomicU64 = AtomicU64::new(0);
+static PACK_RECLAIM_ORPHAN_BYTES: AtomicU64 = AtomicU64::new(0);
 static PACK_RECLAIM_PASS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 /// How often the warm-tier size gauge is recomputed. Read on `/metrics` from an
@@ -508,8 +510,11 @@ pub fn router_with_pack_linger(
     {
         let state = state.clone();
         tokio::spawn(async move {
+            // The first-seen-rowless map is per replica and per PROCESS —
+            // a restart forgets it, which only lengthens the byte grace.
+            let mut pending_rowless: HashSet<String> = HashSet::new();
             loop {
-                pack_reclaim_pass(&state).await;
+                pack_reclaim_pass(&state, &mut pending_rowless).await;
                 tokio::time::sleep(std::time::Duration::from_secs(PACK_RECLAIM_SWEEP_SECS))
                     .await;
             }
@@ -706,9 +711,13 @@ async fn sweep_fence_residue(db: &sqlx::PgPool, now: i64) -> Result<(u64, u64), 
 // the bytes a committed row points at.
 
 /// One pass of the pack reclaimer: the stale-staging ROW pass (pointers),
-/// then — a later slice — the orphan BYTE scan behind it. Serialised across
-/// replicas by [`PACK_RECLAIM_ADVISORY_LOCK`] (economy only; every delete is
+/// then the orphan BYTE scan behind it. Serialised across replicas by
+/// [`PACK_RECLAIM_ADVISORY_LOCK`] (economy only; every delete is
 /// idempotent).
+///
+/// `pending_rowless` is this replica's first-seen-rowless map (see
+/// [`reclaim_orphan_packs_once`]), owned by the loop and carried between
+/// passes.
 ///
 /// Fail-closed: a Postgres error ABORTS the pass — the reclaimer must never
 /// infer "nothing to keep" from a database that could not answer
@@ -716,7 +725,7 @@ async fn sweep_fence_residue(db: &sqlx::PgPool, now: i64) -> Result<(u64, u64), 
 /// `scarab_workspace_pack_reclaim_pass_skipped_total` and logs why; losing
 /// the advisory-lock race is not a skip (another replica is running the
 /// pass) and only logs at debug.
-async fn pack_reclaim_pass(state: &WorkspaceState) {
+async fn pack_reclaim_pass(state: &WorkspaceState, pending_rowless: &mut HashSet<String>) {
     // The advisory lock lives on ONE dedicated pooled connection for the
     // whole pass — session-scoped locks release with the session, so the
     // connection is held, and if the explicit unlock fails the connection is
@@ -757,7 +766,7 @@ async fn pack_reclaim_pass(state: &WorkspaceState) {
         return;
     }
 
-    match reclaim_stale_staging_once(state).await {
+    match reclaim_stale_staging_once(&state.db).await {
         Ok((member_rows, pack_keys)) => {
             if member_rows > 0 || !pack_keys.is_empty() {
                 PACK_RECLAIM_ROWS.fetch_add(member_rows, Ordering::Relaxed);
@@ -770,6 +779,35 @@ async fn pack_reclaim_pass(state: &WorkspaceState) {
                      that never finished, quiet past the staleness bound (git-bug \
                      ad79c90); their bytes become rowless orphans for the byte scan"
                 );
+            }
+            // The byte scan runs only behind a row pass that ANSWERED: its
+            // skip set is that pass's deletions, so bytes outlive pointers by
+            // at least one cadence even for rows deleted seconds ago.
+            let skip: HashSet<String> = pack_keys.into_iter().collect();
+            match reclaim_orphan_packs_once(&state.db, &state.cold, &skip, pending_rowless)
+                .await
+            {
+                Ok((0, _)) => {}
+                Ok((objects, bytes)) => {
+                    PACK_RECLAIM_ORPHAN_OBJECTS.fetch_add(objects, Ordering::Relaxed);
+                    PACK_RECLAIM_ORPHAN_BYTES.fetch_add(bytes, Ordering::Relaxed);
+                    tracing::info!(
+                        objects,
+                        bytes,
+                        stale_after_secs = PACK_RECLAIM_STALE_SECS,
+                        "pack reclaim: deleted rowless pack objects — bytes no index \
+                         row points at, past the staleness bound and seen rowless on \
+                         two consecutive scans (git-bug ad79c90)"
+                    );
+                }
+                Err(why) => {
+                    PACK_RECLAIM_PASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(
+                        why,
+                        "pack reclaim: byte scan SKIPPED — nothing was deleted \
+                         (fail-closed); the next pass retries (git-bug ad79c90)"
+                    );
+                }
             }
         }
         Err(e) => {
@@ -816,10 +854,15 @@ async fn pack_reclaim_pass(state: &WorkspaceState) {
 /// One transaction, and the cutoff comes from Postgres `now()` on that same
 /// transaction — one clock authority; replica clocks never decide staleness.
 /// See the STOP LINE above: `NOT committed` in every DELETE is the boundary.
-async fn reclaim_stale_staging_once(
-    state: &WorkspaceState,
+///
+/// `pub` for one caller class only: the cross-crate acceptance tests
+/// (`crates/scarab-workspace-client/tests/drain_roundtrip.rs`), which prove a
+/// reclaim pass mid-drain cannot damage a live scattered drain. Production
+/// entry is [`pack_reclaim_pass`].
+pub async fn reclaim_stale_staging_once(
+    db: &sqlx::PgPool,
 ) -> Result<(u64, Vec<String>), sqlx::Error> {
-    let mut tx = state.db.begin().await?;
+    let mut tx = db.begin().await?;
     let cutoff: i64 =
         sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM now())::bigint - $1")
             .bind(PACK_RECLAIM_STALE_SECS)
@@ -894,6 +937,151 @@ async fn reclaim_stale_staging_once(
     .await?;
     tx.commit().await?;
     Ok((member_rows, pack_keys))
+}
+
+/// The orphan BYTE scan (git-bug ad79c90, slice 2): delete `packs/` objects
+/// that no `depot_packs` row names — the byte half of pointers-before-bytes.
+/// That is crash debris (a drain that died between multipart-complete and
+/// row staging), commit packs whose record transaction never ran (a
+/// succeeded drain ALWAYS has a `kind = 'commit'` row, so a rowless old
+/// `commit.pack` is a pre-record crash), and the bytes behind rows the row
+/// pass deleted. See the STOP LINE above [`pack_reclaim_pass`]: an object
+/// with ANY row is untouchable here — committed-pack expiry is ec294b7's,
+/// not this scan's.
+///
+/// An object is deleted only when ALL of:
+/// - not in `skip` — the row pass's same-pass deletions, so bytes outlive
+///   pointers by at least one full cadence;
+/// - older than [`PACK_RECLAIM_STALE_SECS`] by its own `modified_ms`,
+///   against Postgres `now()` (one clock authority);
+/// - rowless in `depot_packs` (batched lookups; a query error aborts the
+///   scan — absence of an answer is never absence of rows, the
+///   [`pack_rows_error`] rule);
+/// - its fence is quiet (no fresh ledger write, no recent-or-success drain
+///   record, no fresh pack row — a mid-drain fence's staging failure must
+///   not cost it the pack another of its seals just landed);
+/// - and it was ALREADY seen rowless by this replica's PREVIOUS scan
+///   (`pending_rowless`, the per-replica first-seen-rowless map). The hazard
+///   this map answers is the RECENCY of another replica's row deletion —
+///   that replica's skip set is local to it, so this replica defers every
+///   first observation one full cadence. A restart empties the map, which
+///   only lengthens the grace (fails safe). Deliberately NOT an
+///   object-age or process-start bound: those encode the wrong fact.
+///
+/// Fail-closed: a list error or a Postgres error skips the whole scan
+/// (`Err(why)` — the caller counts and logs it); a single delete failure is
+/// logged and the object stays pending, so the next scan retries it.
+///
+/// `pub` for the same one caller class as [`reclaim_stale_staging_once`].
+pub async fn reclaim_orphan_packs_once(
+    db: &sqlx::PgPool,
+    cold: &S3Storage,
+    skip: &HashSet<String>,
+    pending_rowless: &mut HashSet<String>,
+) -> Result<(u64, u64), String> {
+    let listed = cold.list_objects("packs/").await.map_err(|e| {
+        format!("listing packs/ failed — cannot tell orphaned from live without a listing: {e}")
+    })?;
+    let pg_now: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM now())::bigint")
+        .fetch_one(db)
+        .await
+        .map_err(|e| format!("reading the clock authority failed: {e}"))?;
+    let cutoff = pg_now - PACK_RECLAIM_STALE_SECS;
+    let candidates: Vec<&StoredObject> = listed
+        .iter()
+        .filter(|o| !skip.contains(&o.key))
+        .filter(|o| o.modified_ms < cutoff * 1000)
+        .collect();
+
+    // Which candidates have a row — batched, fail-closed on error.
+    let mut rowed: HashSet<String> = HashSet::new();
+    for chunk in candidates.chunks(500) {
+        let keys: Vec<String> = chunk.iter().map(|o| o.key.clone()).collect();
+        let present: Vec<String> =
+            sqlx::query_scalar("SELECT pack_key FROM depot_packs WHERE pack_key = ANY($1)")
+                .bind(&keys)
+                .fetch_all(db)
+                .await
+                .map_err(|e| format!("the rowed-object lookup failed: {e}"))?;
+        rowed.extend(present);
+    }
+    let rowless: Vec<&StoredObject> = candidates
+        .into_iter()
+        .filter(|o| !rowed.contains(&o.key))
+        .collect();
+
+    // Which rowless objects belong to a fence that is still making noise —
+    // batched over the distinct fence keys parsed from
+    // `packs/<fence_key>/<name>`. An unparseable key has no fence to vouch
+    // for it AND no fence to indict; it is kept (fail-closed) and logged.
+    let fences: Vec<String> = rowless
+        .iter()
+        .filter_map(|o| o.key.split('/').nth(1))
+        .map(str::to_string)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut live_fences: HashSet<String> = HashSet::new();
+    for chunk in fences.chunks(500) {
+        let keys: Vec<String> = chunk.to_vec();
+        let live: Vec<String> = sqlx::query_scalar(
+            "SELECT f.fence_key FROM UNNEST($1::text[]) AS f(fence_key) \
+             WHERE EXISTS (SELECT 1 FROM depot_fence_writes w \
+                           WHERE w.fence_key = f.fence_key AND w.written_at >= $2) \
+                OR EXISTS (SELECT 1 FROM depot_drain_records r \
+                           WHERE r.fence_key = f.fence_key \
+                             AND (r.posted_at >= $2 OR r.record->>'error' IS NULL)) \
+                OR EXISTS (SELECT 1 FROM depot_packs p \
+                           WHERE p.fence_key = f.fence_key AND p.created_at >= $2)",
+        )
+        .bind(&keys)
+        .bind(cutoff)
+        .fetch_all(db)
+        .await
+        .map_err(|e| format!("the quiet-fence lookup failed: {e}"))?;
+        live_fences.extend(live);
+    }
+
+    let mut deleted_objects = 0u64;
+    let mut deleted_bytes = 0u64;
+    let mut next_pending: HashSet<String> = HashSet::new();
+    for obj in rowless {
+        let Some(fence) = obj.key.split('/').nth(1) else {
+            tracing::warn!(
+                key = %obj.key,
+                "pack reclaim: an object under packs/ has no fence path component — \
+                 kept, and worth a human look"
+            );
+            continue;
+        };
+        if live_fences.contains(fence) {
+            continue;
+        }
+        if !pending_rowless.contains(&obj.key) {
+            // First rowless observation by this replica: defer one cadence.
+            next_pending.insert(obj.key.clone());
+            continue;
+        }
+        match cold.delete(&obj.key).await {
+            Ok(()) => {
+                deleted_objects += 1;
+                deleted_bytes += obj.size;
+            }
+            Err(e) => {
+                // Per-object failure: logged, kept pending so the next scan
+                // retries without another first-seen deferral.
+                tracing::warn!(
+                    key = %obj.key,
+                    error = %e,
+                    "pack reclaim: deleting a rowless pack object failed — it stays \
+                     pending for the next scan"
+                );
+                next_pending.insert(obj.key.clone());
+            }
+        }
+    }
+    *pending_rowless = next_pending;
+    Ok((deleted_objects, deleted_bytes))
 }
 
 fn build_router(state: WorkspaceState) -> Router {
@@ -3425,6 +3613,12 @@ scarab_workspace_pack_reclaim_rows_total {}
 # HELP scarab_workspace_pack_reclaim_packs_total Stale staged pack rows deleted by the pack reclaimer.
 # TYPE scarab_workspace_pack_reclaim_packs_total counter
 scarab_workspace_pack_reclaim_packs_total {}
+# HELP scarab_workspace_pack_reclaim_orphan_objects_total Rowless pack objects deleted from the bucket by the reclaim byte scan.
+# TYPE scarab_workspace_pack_reclaim_orphan_objects_total counter
+scarab_workspace_pack_reclaim_orphan_objects_total {}
+# HELP scarab_workspace_pack_reclaim_orphan_bytes_total Bytes of rowless pack objects deleted from the bucket by the reclaim byte scan.
+# TYPE scarab_workspace_pack_reclaim_orphan_bytes_total counter
+scarab_workspace_pack_reclaim_orphan_bytes_total {}
 # HELP scarab_workspace_pack_reclaim_pass_skipped_total Reclaim passes skipped or aborted on an error (fail-closed: nothing was deleted).
 # TYPE scarab_workspace_pack_reclaim_pass_skipped_total counter
 scarab_workspace_pack_reclaim_pass_skipped_total {}
@@ -3437,6 +3631,8 @@ scarab_workspace_pack_reclaim_pass_skipped_total {}
         WARM_READ_FAILED.load(Ordering::Relaxed),
         PACK_RECLAIM_ROWS.load(Ordering::Relaxed),
         PACK_RECLAIM_PACKS.load(Ordering::Relaxed),
+        PACK_RECLAIM_ORPHAN_OBJECTS.load(Ordering::Relaxed),
+        PACK_RECLAIM_ORPHAN_BYTES.load(Ordering::Relaxed),
         PACK_RECLAIM_PASS_SKIPPED.load(Ordering::Relaxed),
     );
     let mut resp = body.into_response();
@@ -4811,7 +5007,7 @@ mod tests {
         assert!(a_before > 0, "precondition: A has staged rows");
 
         let (member_rows, deleted) =
-            reclaim_stale_staging_once(&h.state).await.expect("the row pass");
+            reclaim_stale_staging_once(&h.state.db).await.expect("the row pass");
 
         assert!(member_rows > 0, "A's and F's member rows were deleted");
         assert_eq!(pack_rows_of(db, &fa).await, (0, 0), "A: stale quiet staging goes");
@@ -4855,18 +5051,189 @@ mod tests {
         let url = swap_db(&h.pg.admin_url, &h.pg.dbname);
         let dead_pool = sqlx::PgPool::connect(&url).await.expect("second pool");
         dead_pool.close().await;
-        let dead = WorkspaceState {
-            db: dead_pool,
-            ..h.state.clone()
-        };
-
-        let result = reclaim_stale_staging_once(&dead).await;
+        let result = reclaim_stale_staging_once(&dead_pool).await;
         assert!(result.is_err(), "a pool that cannot answer must abort the pass");
         let (packs, members) = pack_rows_of(&h.state.db, &fa).await;
         assert!(
             packs > 0 && members > 0,
             "and the stale rows must still be there — fail-closed deleted nothing"
         );
+    }
+
+    /// Plant one raw object under `packs/` in the harness's cold store; `old`
+    /// backdates its mtime past the staleness bound (the local cold store's
+    /// `modified_ms` is the file's mtime).
+    async fn plant_pack_object(h: &DepotHarness, key: &str, old: bool) {
+        h.cold
+            .put(key, b"not a real pack, just bytes".to_vec())
+            .await
+            .expect("plant object");
+        if old {
+            backdate_pack_object(h, key);
+        }
+    }
+
+    fn backdate_pack_object(h: &DepotHarness, key: &str) {
+        filetime::set_file_mtime(
+            h.tmp.path().join("cold").join(key),
+            filetime::FileTime::from_unix_time(1_000_000_000, 0), // 2001 — ancient
+        )
+        .expect("backdate object mtime");
+    }
+
+    async fn cold_has(h: &DepotHarness, key: &str) -> bool {
+        h.cold
+            .list_objects("packs/")
+            .await
+            .expect("list packs/")
+            .iter()
+            .any(|o| o.key == key)
+    }
+
+    /// The orphan BYTE scan's whole verdict table (git-bug ad79c90, slice 2),
+    /// over one population and two scans:
+    ///
+    /// - old + rowless             → kept on the FIRST look (first-seen-rowless
+    ///   map), deleted on the SECOND
+    /// - old + rowless commit.pack → same lifecycle (a succeeded drain always
+    ///   has a `kind='commit'` row, so rowless-old = pre-record crash)
+    /// - young + rowless           → kept, both looks
+    /// - old + ROWED               → kept forever (the stop line: any row,
+    ///   committed or staged, makes bytes untouchable here)
+    /// - old + rowless under a fence with FRESH staging → kept (a live fence
+    ///   whose one seal failed to stage must not lose the object)
+    ///
+    /// Mutations killed: drop the pending map and the first scan deletes;
+    /// drop the rowed lookup and the rowed object dies; drop the quiet-fence
+    /// arm and the live fence's object dies; invert the age filter and the
+    /// young object dies.
+    #[tokio::test]
+    async fn the_byte_scan_deletes_old_rowless_objects_only_on_the_second_look() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        let orphan = format!("packs/{}/dead-000001.pack", "1".repeat(64));
+        let orphan_commit = format!("packs/{}/commit.pack", "2".repeat(64));
+        let young = format!("packs/{}/young-000001.pack", "3".repeat(64));
+        let rowed = format!("packs/{}/rowed-000001.pack", "4".repeat(64));
+        plant_pack_object(&h, &orphan, true).await;
+        plant_pack_object(&h, &orphan_commit, true).await;
+        plant_pack_object(&h, &young, false).await;
+        plant_pack_object(&h, &rowed, true).await;
+        // The rowed object's row: committed, ancient — age must not matter.
+        sqlx::query(
+            "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes, committed) \
+             VALUES ($1, $2, 'body', 0, 27, TRUE)",
+        )
+        .bind(&rowed)
+        .bind("4".repeat(64))
+        .execute(db)
+        .await
+        .expect("the rowed object's row");
+        // The live fence: real fresh staging, plus one old rowless object of
+        // its own (a seal whose row staging failed).
+        let live_fence = seed_and_seal(&h, "rlive", "build", "a1").await;
+        let live_orphan = format!("packs/{live_fence}/lost-000001.pack");
+        plant_pack_object(&h, &live_orphan, true).await;
+
+        let skip = HashSet::new();
+        let mut pending = HashSet::new();
+
+        let (deleted, _) =
+            reclaim_orphan_packs_once(db, &h.state.cold, &skip, &mut pending)
+                .await
+                .expect("first scan");
+        assert_eq!(deleted, 0, "the FIRST look at a rowless object never deletes");
+        assert!(pending.contains(&orphan) && pending.contains(&orphan_commit));
+        assert!(
+            !pending.contains(&young) && !pending.contains(&rowed),
+            "young and rowed objects are not pending-rowless"
+        );
+        assert!(
+            !pending.contains(&live_orphan),
+            "a live fence's object is not pending-rowless"
+        );
+
+        let (deleted, bytes) =
+            reclaim_orphan_packs_once(db, &h.state.cold, &skip, &mut pending)
+                .await
+                .expect("second scan");
+        assert_eq!(deleted, 2, "the second look deletes both true orphans");
+        assert!(bytes > 0, "and reports their bytes");
+        assert!(!cold_has(&h, &orphan).await, "the orphan body pack is gone");
+        assert!(!cold_has(&h, &orphan_commit).await, "the orphan commit.pack is gone");
+        assert!(cold_has(&h, &young).await, "young rowless bytes stay");
+        assert!(cold_has(&h, &rowed).await, "rowed bytes are untouchable at any age");
+        assert!(cold_has(&h, &live_orphan).await, "a live fence keeps its rowless object");
+
+        // Fail-closed: with a database that cannot answer, the scan is an
+        // Err and deletes nothing — even for an object it has already seen
+        // rowless twice.
+        let survivor = format!("packs/{}/survivor-000001.pack", "5".repeat(64));
+        plant_pack_object(&h, &survivor, true).await;
+        pending.insert(survivor.clone());
+        let url = swap_db(&h.pg.admin_url, &h.pg.dbname);
+        let dead_pool = sqlx::PgPool::connect(&url).await.expect("second pool");
+        dead_pool.close().await;
+        let result =
+            reclaim_orphan_packs_once(&dead_pool, &h.state.cold, &skip, &mut pending).await;
+        assert!(result.is_err(), "no database answer must skip the scan");
+        assert!(cold_has(&h, &survivor).await, "and delete nothing");
+    }
+
+    /// The skip set is the cadence guarantee (git-bug ad79c90): a pack whose
+    /// ROWS died in this pass keeps its BYTES through this pass (skip set)
+    /// AND the next (first-seen-rowless map) — deleted only on the scan
+    /// after that. Three passes, wired exactly as `pack_reclaim_pass` wires
+    /// them.
+    ///
+    /// Mutation killed: feed the byte scan an empty skip set and the bytes
+    /// die one cadence early (the second pass's deletion count trips).
+    #[tokio::test]
+    async fn a_row_pass_deletion_keeps_its_bytes_for_a_full_cadence() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        let fa = seed_and_seal(&h, "rcad", "build", "a1").await;
+        backdate(db, &fa, true, true, false).await;
+        // The sealed pack's object is fresh on disk; make it old so ONLY the
+        // skip set and the pending map are keeping it alive.
+        let (member_rows, keys) =
+            reclaim_stale_staging_once(db).await.expect("row pass");
+        assert!(member_rows > 0 && keys.len() == 1, "A's staging died: {keys:?}");
+        let pack_object = keys[0].clone();
+        assert!(cold_has(&h, &pack_object).await, "the sealed pack object exists");
+        backdate_pack_object(&h, &pack_object);
+
+        // Pass 1 (same pass as the row deletions): the skip set protects.
+        let skip: HashSet<String> = keys.into_iter().collect();
+        let mut pending = HashSet::new();
+        let (deleted, _) =
+            reclaim_orphan_packs_once(db, &h.state.cold, &skip, &mut pending)
+                .await
+                .expect("scan 1");
+        assert_eq!(deleted, 0);
+        assert!(cold_has(&h, &pack_object).await, "skip-set bytes survive their pass");
+        assert!(
+            !pending.contains(&pack_object),
+            "a skipped object is not even observed rowless yet"
+        );
+
+        // Pass 2: skip set empty (fresh pass), first rowless observation.
+        let (deleted, _) =
+            reclaim_orphan_packs_once(db, &h.state.cold, &HashSet::new(), &mut pending)
+                .await
+                .expect("scan 2");
+        assert_eq!(deleted, 0);
+        assert!(cold_has(&h, &pack_object).await, "first-seen bytes survive one more pass");
+
+        // Pass 3: second consecutive rowless observation — now it goes.
+        let (deleted, _) =
+            reclaim_orphan_packs_once(db, &h.state.cold, &HashSet::new(), &mut pending)
+                .await
+                .expect("scan 3");
+        assert_eq!(deleted, 1);
+        assert!(!cold_has(&h, &pack_object).await, "reclaimed two full cadences after its rows");
     }
 
     /// The parent Workspace Snapshot's contents, as `(path, bytes)` plus one symlink

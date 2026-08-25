@@ -1380,3 +1380,155 @@ async fn a_drain_whose_puts_all_landed_elsewhere_commits_through_a_cold_replica(
         .expect("the root tree must be readable through A — a ranged read into B's pack");
     assert!(!entries.is_empty());
 }
+
+/// The pack reclaimer against a LIVE scattered drain (git-bug ad79c90): one
+/// blob staged through replica B, the drain mid-flight (rows staged, record
+/// not yet posted) — then BOTH reclaim passes run at the replica grain, the
+/// row pass and the byte scan twice over (so even the second-look arm of the
+/// first-seen-rowless map is exercised). Nothing of the live drain may go:
+/// its staging is fresh, its fence is loud, its bytes are rowed. The drain
+/// must then commit through replica A, and a THIRD cold-warm replica must
+/// range-read every indexed member of the fence out of the shared bucket.
+///
+/// Mutations killed: drop the staleness cutoff (the row pass eats the live
+/// staging and the record POST 422s); drop the rowed-object or quiet-fence
+/// filter from the byte scan (the staged pack's bytes go and replica C's
+/// member reads 404).
+#[tokio::test]
+async fn a_mid_flight_scattered_drain_survives_both_reclaim_passes() {
+    use scarab_storage::{BlobHash, Cas as _};
+    use std::collections::HashSet;
+
+    let linger = Some(std::time::Duration::from_millis(250));
+    let Some(a) = Harness::start_with_linger(linger).await else { return };
+    let b = a.replica_with_linger(linger).await;
+
+    let ws = tempfile::tempdir().unwrap();
+    build_workspace(ws.path());
+    let declared = vec!["src".to_string(), "plain.txt".to_string()];
+    let scattered = scarab_storage::sha256_hex(b"hello world");
+
+    let fence_token = workspace_token::mint(
+        SECRET,
+        &workspace_token::step_claims(
+            Fence {
+                run: "run-rec".into(),
+                step: "build".into(),
+                attempt: "a1".into(),
+            },
+            far_future(),
+            Vec::new(),
+        ),
+    );
+    let put = reqwest::Client::new()
+        .put(format!("{}/v1/cas/blobs/{scattered}", b.base))
+        .header("x-scarab-workspace-token", &fence_token)
+        .body(b"hello world".to_vec())
+        .send()
+        .await
+        .expect("durable PUT via replica B");
+    assert!(put.status().is_success(), "PUT via B: {}", put.status());
+
+    // B's linger ticker stages its tail pack — the drain is now mid-flight:
+    // staged rows, sealed bytes, no record.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while member_rows_for(&a.pool, &scattered).await == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica B's linger ticker never staged its idle tail pack"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // MID-FLIGHT: the row pass, then the byte scan TWICE (a first-seen entry
+    // matures into a deletable one only if the object stays rowless — the
+    // live drain's pack must never even enter the map).
+    let (rows, keys) = scarab_server::workspaced::reclaim_stale_staging_once(&b.pool)
+        .await
+        .expect("the row pass must answer");
+    assert_eq!(
+        (rows, keys.len()),
+        (0, 0),
+        "a live drain's staging is not stale: {keys:?}"
+    );
+    let mut pending: HashSet<String> = HashSet::new();
+    for scan in 1..=2 {
+        let (objects, bytes) = scarab_server::workspaced::reclaim_orphan_packs_once(
+            &b.pool,
+            &b.cold_store,
+            &HashSet::new(),
+            &mut pending,
+        )
+        .await
+        .expect("the byte scan must answer");
+        assert_eq!(
+            (objects, bytes),
+            (0, 0),
+            "scan {scan}: a live drain's bytes are not orphans"
+        );
+    }
+    assert!(
+        pending.is_empty(),
+        "the live drain's pack must not even be pending-rowless: {pending:?}"
+    );
+
+    // The drain completes through replica A, deduping against B's staging.
+    let helper = a.fence_client_for("run-rec", "build", "a1");
+    let report = helper
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
+        .await
+        .expect("drain ingest through replica A");
+    let memo = MemoCas::new(&helper, report.trees);
+    let pruned = scarab_storage::prune_tree(&memo, &report.snapshot.root, &declared)
+        .await
+        .expect("prune");
+    helper
+        .post_drain_record(&DrainRecord {
+            root: report.snapshot.root.0.clone(),
+            pruned_root: Some(pruned.0.clone()),
+            identity: None,
+            files: report.files,
+            tree_bytes: report.tree_bytes,
+            blobs_uploaded: report.blobs_uploaded,
+            bytes_uploaded: report.bytes_uploaded,
+            have_hits: report.have_hits,
+            ingest_ms: 4,
+            prune_ms: 1,
+            error: None,
+        })
+        .await
+        .expect("the record POST must succeed after the reclaim passes");
+
+    // A cold-warm replica range-reads EVERY indexed member of the fence out
+    // of the shared bucket — the strongest "nothing was harmed" there is.
+    let fence_key = scarab_workspace_client::drain_fence_key("run-rec", "build", "a1");
+    let members: Vec<(String, String)> = sqlx::query_as(
+        "SELECT m.address, m.kind FROM depot_pack_members m \
+         JOIN depot_packs p ON p.pack_key = m.pack_key WHERE p.fence_key = $1",
+    )
+    .bind(&fence_key)
+    .fetch_all(&a.pool)
+    .await
+    .expect("the fence's member rows");
+    assert!(!members.is_empty(), "the drain must have indexed members");
+    let c = a.replica().await;
+    let reader = c.browse_client();
+    for (address, kind) in members {
+        let (_, hex) = scarab_storage::parse_address(&address).expect("tagged address");
+        match kind.as_str() {
+            "blob" => {
+                reader
+                    .get_blob(&BlobHash(hex.to_string()))
+                    .await
+                    .unwrap_or_else(|e| panic!("member blob {hex} via replica C: {e}"));
+            }
+            "tree" => {
+                reader
+                    .tree_entries(&TreeHash(hex.to_string()))
+                    .await
+                    .unwrap_or_else(|e| panic!("member tree {hex} via replica C: {e}"));
+            }
+            other => panic!("unexpected member kind {other}"),
+        }
+    }
+}

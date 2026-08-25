@@ -2147,11 +2147,12 @@ impl ObjectStore for InMemoryObjectStore {
         let objects = self.blobs.lock().unwrap();
         let modified = self.modified.lock().unwrap();
         Ok(objects
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .map(|k| scarab_storage::StoredObject {
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| scarab_storage::StoredObject {
                 key: k.clone(),
                 modified_ms: modified.get(k).copied().unwrap_or(0),
+                size: v.len() as u64,
             })
             .collect())
     }
