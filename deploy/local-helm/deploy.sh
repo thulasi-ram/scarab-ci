@@ -151,7 +151,7 @@ scarab:
 # The workspace service (ADR-0061) — a StatefulSet with a real PVC, in the
 # standard path. This is also what kills the emptyDir-CAS failure class that has
 # been biting this dogfood: the local-dir cold fallback lives on the server Pod's
-# `scratch` emptyDir, so every deploy (which rolls the Pod) wiped every workspace
+# 'scratch' emptyDir, so every deploy (which rolls the Pod) wiped every workspace
 # snapshot and a rerun of an older Run hung at Init:1/3 and dead-lettered. A warm
 # tier on a PV survives the roll.
 workspace:
@@ -159,7 +159,7 @@ workspace:
   replicaCount: 1
   persistence:
     size: "${WS_PV_SIZE}"
-  # The ADR-0061 s3-feed fetcher. `just local-helm local` builds it from the tree
+  # The ADR-0061 s3-feed fetcher. 'just local-helm local' builds it from the tree
   # like the other three images; otherwise it tracks the published tag.
   # ⚠ DELETE ME with the node driver (git-bug 0628369).
   fetcherImage: "${SCARAB_WSFETCH_IMAGE:-ghcr.io/thulasi-ram/scarab-wsfetch:edge}"
@@ -227,7 +227,7 @@ fi
 # database and no network — and it reports the truth for ANY image version rather
 # than us inferring it from a tag name.
 ROLES="$(docker run --rm "$SERVER_IMAGE" --role __scarab_preflight__ 2>&1 \
-          | sed -n 's/.*\[possible values: \([^]]*\)\].*/\1/p' | tr -d ' ')"
+          | sed -n 's/.*\[possible values: \([^]]*\)\].*/\1/p' | tr -d ' ' || true)"
 if [ -z "$ROLES" ]; then
   cat >&2 <<EOF
 refusing: could not determine which roles $SERVER_IMAGE supports.
