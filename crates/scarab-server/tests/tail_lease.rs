@@ -50,6 +50,11 @@ impl Executor for TwoChunkExec {
     async fn cancel(&self, _h: &ExecHandle) -> Result<(), ExecError> {
         Ok(())
     }
+    // ADR-0064 s2: required (never defaulted) so the compiler makes every impl —
+    // wrappers included — decide; this stub snapshots nothing, so no stamp.
+    async fn output_durability(&self, _h: &ExecHandle) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
     async fn log_stream(&self, _s: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         self.opened.fetch_add(1, Ordering::SeqCst);
         Ok(Some(Box::new(TwoChunks {
@@ -67,6 +72,8 @@ fn running_step() -> StepRun {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],
@@ -199,6 +206,8 @@ fn running_step_with_run(run: &str) -> StepRun {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],

@@ -160,6 +160,8 @@ async fn secret_used_not_logged_oidc_verifies_and_build_produces_digest() {
         DEFAULT_STEP_TIMEOUT_SECS,
         false,
         DEFAULT_CLONE_IMAGE,
+        // No workspace flow here, so no ADR-0061 workspace service is needed.
+        None,
     );
     let container = &pod.spec.as_ref().unwrap().containers[0];
     assert_eq!(container.image.as_deref(), Some("moby/buildkit:rootless"));

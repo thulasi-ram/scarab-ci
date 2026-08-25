@@ -117,7 +117,11 @@ fn state_of(status: std::process::ExitStatus) -> ExecState {
                 never_started: false,
             },
         };
-        ExecState::Failed { exit_code, class }
+        ExecState::Failed {
+            exit_code,
+            class,
+            cause: None,
+        }
     }
 }
 
@@ -247,6 +251,7 @@ impl Executor for LocalExecutor {
                         let state = ExecState::Failed {
                             exit_code: None,
                             class: FailureClass::Timeout,
+                            cause: None,
                         };
                         *slot = Proc::Done(state.clone());
                         Ok(state)
@@ -271,6 +276,7 @@ impl Executor for LocalExecutor {
                     class: FailureClass::Infra {
                         never_started: false,
                     },
+                    cause: None,
                 }),
             );
         }
@@ -278,6 +284,12 @@ impl Executor for LocalExecutor {
     }
 
     // `output` uses the port default (`None`): no workspace CAS locally (ADR-0036).
+
+    /// No workspace data plane locally (ADR-0036): nothing is flushed, so there
+    /// is never a durability tier to report (ADR-0064 s2).
+    async fn output_durability(&self, _handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
 
     /// Read the step's named results (ADR-0041) from its results dir: every
     /// `<name>.json` file becomes result `<name>` with the file's parsed JSON

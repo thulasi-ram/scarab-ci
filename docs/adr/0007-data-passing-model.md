@@ -53,6 +53,23 @@ per-file merkle store, so a tree *is* a hashed list of `name -> blob|tree` entri
 snapshot to a path subset is a walk plus a bottom-up rebuild over primitives that already existed,
 sharing every blob with the full snapshot. No new storage capability was required.
 
+## Amendment (2026-07-26) — `outputs:` is a precision tool, never a performance tax
+
+[0061](0061-workspace-data-path.md) makes wide edges cheap in the substrate (lazy
+materialisation + content addressing), and adopts the principle that **the system pays for
+its own idiosyncrasies, not the author**. So the implicit inherit-everything default stated
+above is permanent, and neither `inputs:` nor `outputs:` may become something an author has
+to declare *for speed*. They remain what this ADR made them: tools for precise cache keys,
+safe fan-out, and restricting what flows.
+
+The same principle retires "don't put your cache in the workspace" as advice. **Cache**
+remains the better-fitting concept for `~/.cargo` / `node_modules`, but using it is an
+optimisation, not a rule authors must learn.
+
+Also note the vocabulary split in [CONTEXT.md](../../CONTEXT.md): the mutable filesystem a
+Step runs in is a **Workspace**; the immutable content-addressed tree on the DAG edge — the
+thing this ADR's `inputs:`/`outputs:` actually govern — is a **Workspace Snapshot**.
+
 ## Alternatives considered
 
 - **Workspace + Result only** — folds artifacts/caches into "DIY object store"; users rebuild

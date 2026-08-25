@@ -32,6 +32,30 @@ Pure, total, deterministic computation libraries (CEL evaluation, hashing, parsi
 - Determinism for DST ([0017](0017-testing-strategy.md)) is preserved: no wall-clock/RNG means
   fakes still fully control the world.
 
+### Amendment (2026-07-27): facades, not just computation
+
+"Pure, total, deterministic *computation*" covers CEL, hashing and parsing, but it does not
+describe a **facade** — a crate that performs no I/O because, with nothing installed behind it,
+it does nothing at all. `tracing` is the case: without a subscriber every macro compiles away,
+and the subscriber is installed by the composition root. It touches no network, filesystem,
+clock, process or runtime, so it passes the I/O test on the merits while failing the
+"computation" wording on a technicality.
+
+**A no-op-by-default facade is admissible on the same terms as pure computation**, with one
+addition: the *backend* behind it is still infra and stays out. So `tracing` is allowed in a pure
+crate; `tracing-subscriber`, which actually writes, is not.
+
+The motivating case is `scarab-storage`'s `TieredCas` ([0061](0061-workspace-data-path.md)): a
+warm-tier write failure must **succeed** the caller, because the cold tier is the durability
+promise — so the entire observable behaviour of that branch is a log line. Denying the domain a
+facade would have forced the choice between swallowing the failure silently (the "silent facade"
+this codebase refuses) and inventing a port + adapter whose only implementation writes to
+stderr. Neither is architecture; both are ceremony.
+
+The same reasoning does **not** extend to metrics or error-reporting clients that buffer, batch,
+or open a socket even nominally — those are backends wearing a facade's name, and the I/O test
+catches them.
+
 ## Consequences
 
 - CEL lives in `scarab-pipeline` directly (no port/adapter ceremony for a pure function).

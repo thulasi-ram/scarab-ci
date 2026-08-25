@@ -673,6 +673,35 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
   gap: 6px;
 }
 
+/* Workspace-Snapshot retention (ADR-0061 s5). A rerun WIDENED by expired inputs
+   is a bigger action than the button implies, so the button stops looking like a
+   plain ghost action — the visual change and the label change land together.
+   `--copper` is the theme's cautionary ink (never a fill), which is exactly the
+   register here: this is not an error, it is a bigger job than you asked for. */
+.run-toolbar .btn.widened {
+  border-color: var(--border-copper);
+  color: var(--copper);
+}
+/* A pinned run is holding storage on purpose: mark the toggle as engaged. */
+.run-toolbar .btn.pinned {
+  border-color: color-mix(in srgb, var(--emerald) 45%, transparent);
+  color: var(--emerald);
+}
+/* The two notes under the toolbar. Right-aligned to sit under the actions they
+   explain, and always visible — a scope change discovered on hover is still a
+   surprise. */
+.rd-widened,
+.rd-retention {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin: -14px 0 16px;
+  font-size: 12.5px;
+  text-align: right;
+}
+.rd-widened { color: var(--copper); }
+
 .run-id {
   font-size: 26px;
   letter-spacing: -0.4px;

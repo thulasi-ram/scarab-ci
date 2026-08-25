@@ -58,6 +58,12 @@ data:
   {{- with .Values.scarab.stepTimeoutSecs }}
   SCARAB_STEP_TIMEOUT_SECS: {{ . | quote }}
   {{- end }}
+  {{- with .Values.scarab.casConcurrency }}
+  {{- /* ADR-0061 s2. Read by BOTH workloads that touch the CAS: the server's
+         ingest/materialize legs and the workspace StatefulSet sharing this
+         ConfigMap. Peak memory scales with it — see values.yaml. */}}
+  SCARAB_CAS_CONCURRENCY: {{ . | quote }}
+  {{- end }}
   {{- if .Values.secrets.githubAppPemSecret.name }}
   {{- /* File-mounted App PEM (enh 245a99c): the path is not sensitive — only
          the mounted Secret is — so it belongs in the ConfigMap. */}}
@@ -68,6 +74,19 @@ data:
          mounted ConfigMap; only its path is env. A bad path/parse/validation
          fails the boot loudly, never a degraded start. */}}
   SCARAB_CONNECTIONS_FILE: {{ include "scarab.connectionsPath" . | quote }}
+  {{- end }}
+  {{- if include "scarab.workspaceEnabled" . }}
+  {{- /* The workspace service (ADR-0061). This key is read by BOTH workloads:
+         the server dials the URL, and the workspace StatefulSet — which consumes
+         the same ConfigMap — reads the data dir. The StatefulSet overrides
+         SCARAB_ROLE with an explicit `env` entry, which wins over envFrom. */}}
+  SCARAB_WORKSPACE_URL: {{ include "scarab.workspaceUrl" . | quote }}
+  SCARAB_WORKSPACE_DATA_DIR: {{ .Values.workspace.dataDir | quote }}
+  {{- /* The fetcher image (ADR-0061 s3-feed): the init container every Step with
+         `needs:` runs to pull its inputs from the service above. Set even though
+         the server has its own default, so a chart-pinned digest is possible.
+         ⚠ DELETE ME with the node driver (git-bug 0628369). */}}
+  SCARAB_WSFETCH_IMAGE: {{ .Values.workspace.fetcherImage | quote }}
   {{- end }}
   {{- if .Values.secrets.resultsTokenSecret }}
   SCARAB_SIDECAR_IMAGE: {{ .Values.scarab.sidecarImage | quote }}

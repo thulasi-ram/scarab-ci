@@ -43,6 +43,16 @@
 # colima. Holds no credentials (it names a context and nothing else) but it is
 # machine-local state, and must not exist until the local cluster does.
 /deploy/local-helm/.kubeconfig-colima
+# The workspace-service token secret deploy.sh generates once (ADR-0061). Kept on
+# disk rather than regenerated per deploy so tokens the control plane already
+# minted keep verifying; it is a secret, so it is never committed.
+/deploy/local-helm/.workspace-token-secret
+# Proc-mode workspace service (ADR-0061): its pidfile and its log. Its warm tier
+# lands under /.scarab/, which lines 12-15 above already ignore while keeping the
+# committed pipeline configs tracked — do NOT add a bare `/.scarab/` here, it
+# would shadow .scarab/dogfood.yaml.
+/deploy/local-proc/workspace.pid
+/deploy/local-proc/workspace.log
 
 # `.cargo/config.toml` IS tracked — repo-level build settings belong in version
 # control. `cargo login` writes a registry token next to it, and that must never

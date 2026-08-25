@@ -19,6 +19,56 @@ pub struct Lease {
     pub expires_at: Timestamp,
 }
 
+/// One run's **cold-tier retention facts** for its Workspace Snapshots
+/// (ADR-0061 s5 / ADR-0050).
+///
+/// The cold tier is bounded by **time**, and that bound is the only promise the
+/// product makes about a Workspace Snapshot; the warm workspace service is
+/// bounded by space and promises nothing (a miss there is slower, never wrong).
+/// This carries the two facts a caller needs to state the promise honestly:
+/// when the TTL clock started, and whether a human **pinned** the Run out of the
+/// sweep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRetention {
+    /// The Run is TERMINAL, so its snapshots are on the TTL clock at all. A
+    /// non-terminal Run — including one suspended on a gate for weeks — is never
+    /// GC-eligible regardless of age (ADR-0050), so its snapshots are promised
+    /// unconditionally.
+    pub terminal: bool,
+    /// The Run's last transition — the instant the cold-tier TTL is measured
+    /// from. Exactly the column [`Db::gc_workspace_roots`] compares against its
+    /// cutoff, so a caller computing "expires at" agrees with the sweeper by
+    /// construction rather than by coincidence.
+    pub settled_at: Timestamp,
+    /// When a human pinned this Run's Workspace Snapshots ("keep this Run's
+    /// snapshots"), if pinned. A pin holds the **cold** tier open past its TTL
+    /// and promises nothing about the warm tier.
+    pub pinned_at: Option<Timestamp>,
+    /// Who pinned it — the audit half of the pin (`None` only when auth is off).
+    pub pinned_by: Option<String>,
+}
+
+/// Whether the **immutable Workspace Snapshot** a DAG edge names can still be
+/// materialised (ADR-0061 s5).
+///
+/// The cold tier is time-bounded, so a snapshot the durable record still
+/// references can legitimately be **gone** — and a Run reopened after its TTL
+/// must degrade gracefully (widen its rerun upstream) rather than fail a Step
+/// that could never have been provisioned. That decision belongs to the engine,
+/// *before* dispatch, which is why the pure domain needs this one bit of truth
+/// about the store behind a port.
+///
+/// A `bool` rather than a `Result` on purpose: only *proof of absence* may widen
+/// a rerun. A transient store error is not proof, and treating it as one would
+/// re-run a whole pipeline on a network blip — so an adapter reports `true`
+/// (assume present) for anything that is not a definitive not-found, and the
+/// executor's own input-missing fail-fast remains the backstop.
+#[async_trait]
+pub trait WorkspaceSnapshots: Send + Sync {
+    /// Is the Workspace Snapshot rooted at `root` still materialisable?
+    async fn snapshot_present(&self, root: &str) -> bool;
+}
+
 /// Opaque handle to a launched unit of execution (a pod, a local process…).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecHandle(pub String);
@@ -59,10 +109,17 @@ pub enum ExecState {
     Succeeded,
     /// Terminal failure, classified by the adapter (ADR-0047). `exit_code` is
     /// the step container's exit code when one exists (`Step` failures); infra
-    /// failures that never produced a verdict carry `None`.
+    /// failures that never produced a verdict carry `None`. `cause` is the
+    /// adapter's human-readable diagnosis when it has one (ticket 4cf03d7 —
+    /// e.g. "cold tier refused: …" from a lost-evidence drain, or an
+    /// `outputs:` contract violation): the class says what POLICY applies,
+    /// the cause says what actually happened. `None` when the class alone is
+    /// the whole story.
     Failed {
         exit_code: Option<i32>,
         class: FailureClass,
+        #[serde(default)]
+        cause: Option<String>,
     },
     /// The backend lost the execution (vanished Pod, node stopped reporting).
     /// Conservatively treated as post-start — it cannot be proven the process
@@ -146,12 +203,27 @@ pub trait Db: Send + Sync {
     /// writes the attempt's own immutable copy AND the step's latest-evidence
     /// denormalization (what dependents consume) atomically, stamping which
     /// attempt the denormalized row came from.
+    ///
+    /// **Two coordinates, ADR-0061 s8.** `snapshot` is *where the bytes are* —
+    /// the address a dependent materializes. `identity` is *what the bytes are* —
+    /// the mtime-free merkle fold that restart invalidation compares
+    /// (`Executor::output_identity`). `None` for a backend that cannot compute
+    /// one; readers then fall back to the root.
+    ///
+    /// `durability` is the third coordinate (ADR-0064 s2): *how durable the
+    /// bytes were when `Succeeded` was granted* — the Depot's self-reported
+    /// tier (`Executor::output_durability`), stamped on the ATTEMPT row only
+    /// (per-attempt evidence, never denormalized: the question it answers is
+    /// historical, "what did this attempt's verdict actually license?").
+    /// `None` = no workspace, a pre-s2 backend, or unknown.
     async fn set_step_output(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
         snapshot: &str,
+        identity: Option<&str>,
+        durability: Option<&str>,
     ) -> Result<(), DbError>;
 
     /// The output workspace snapshot a step produced, or `None` if it has not
@@ -159,6 +231,21 @@ pub trait Db: Send + Sync {
     /// latest-evidence read (workspace inheritance); per-attempt history is
     /// [`attempt_output`](Db::attempt_output).
     async fn step_output(&self, run: &RunId, step: &StepId) -> Result<Option<String>, DbError>;
+
+    /// The **content identity** of that snapshot (ADR-0061 s8), or `None` if the
+    /// step produced no workspace or the producing backend recorded no identity
+    /// (a pre-0061-s8 row). Latest-evidence read, beside
+    /// [`step_output`](Db::step_output).
+    ///
+    /// A caller comparing snapshots for sameness must use this **falling back to
+    /// the root**, never one or the other alone: the fallback is what keeps an old
+    /// row safe (it cascades where it might have skipped), and using the root when
+    /// an identity exists is the bug `945b1f4` records.
+    async fn step_output_identity(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<String>, DbError>;
 
     /// A single attempt's output workspace snapshot (ADR-0056) — the evidence
     /// a Take view reads; never overwritten by a later attempt.
@@ -528,13 +615,17 @@ pub trait Db: Send + Sync {
 
     /// Record the classified failure on a finished attempt (ADR-0047). Also
     /// stamps the attempt's [`AttemptOutcome::Failed`] outcome, so `failure` and
-    /// `outcome` never diverge.
+    /// `outcome` never diverge. `detail` is the executor's human-readable cause
+    /// when it reported one (ticket 4cf03d7) — persisted alongside the class so
+    /// an operator sees WHY, not just which retry policy applied; `None` writes
+    /// NULL (the class alone is the whole story).
     async fn set_attempt_failure(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
         failure: FailureKind,
+        detail: Option<&str>,
     ) -> Result<(), DbError>;
 
     /// Record the terminal (or in-flight) [`AttemptOutcome`] on an attempt
@@ -647,7 +738,50 @@ pub trait Db: Send + Sync {
     /// non-terminal, so its roots are ALWAYS marked, regardless of age.
     /// Covers EVERY attempt's snapshot, not just each step's latest
     /// (ADR-0056): an old Take's workspace view must never race the GC.
-    async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError>;
+    ///
+    /// A **pinned** run (ADR-0061 s5 — [`pin_run_snapshots`](Db::pin_run_snapshots))
+    /// is in the mark set unconditionally, exactly like a non-terminal one. The
+    /// pin belongs *here*, in the mark, and never as a filter over the delete
+    /// list: a pinned root's whole transitive tree — every shared subtree and
+    /// blob under it — must survive, and only marking achieves that.
+    ///
+    /// Each root travels with the time its reference was **recorded** (the
+    /// EARLIEST recording when several rows share a root). The sweeper's
+    /// torn-cold detection compares this against its grace window: a root
+    /// recorded moments ago may have an ADR-0064 cold flush still in flight,
+    /// so its missing-from-cold objects are counted but not alarmed, while one
+    /// old recording proves the flush had time to land.
+    async fn gc_workspace_roots(
+        &self,
+        terminal_cutoff: Timestamp,
+    ) -> Result<Vec<(String, Timestamp)>, DbError>;
+
+    /// **Pin** a Run's Workspace Snapshots (ADR-0061 s5): hold them out of the
+    /// cold-tier sweep past their TTL, for an investigation. Durable and
+    /// auditable — `by` and `at` are recorded, so "who kept this and when" is
+    /// answerable later. Idempotent: re-pinning an already-pinned Run
+    /// re-stamps it. Returns `false` when there is no such Run.
+    ///
+    /// The pin acts on the **cold** tier's *time* bound only. It cannot promise
+    /// anything about the warm workspace service, which is bounded by space and
+    /// evicts LRU by design.
+    async fn pin_run_snapshots(
+        &self,
+        run: &RunId,
+        by: Option<&str>,
+        at: Timestamp,
+    ) -> Result<bool, DbError>;
+
+    /// Release a [pin](Db::pin_run_snapshots), returning the Run's snapshots to
+    /// the ordinary TTL. Idempotent; `false` when there is no such Run.
+    async fn unpin_run_snapshots(&self, run: &RunId) -> Result<bool, DbError>;
+
+    /// One Run's cold-tier retention facts (ADR-0061 s5) — the TTL clock plus
+    /// any pin. `None` when there is no such Run.
+    async fn run_snapshot_retention(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<SnapshotRetention>, DbError>;
 
     /// Forget a workspace-CAS root that GC proved ABSENT from the object store
     /// (ADR-0050): clear every recorded output snapshot equal to `root`,
@@ -702,14 +836,50 @@ pub trait Executor: Send + Sync {
 
     /// The content-addressed output workspace snapshot the (successfully
     /// finished) unit produced — the CAS merkle-root hash the orchestrator
-    /// records so a dependent can materialize it and so restart can compare
-    /// outputs for skip-if-unchanged (ADR-0027, 0029). `None` when the unit
+    /// records so a dependent can materialize it (ADR-0029). `None` when the unit
     /// produced no workspace (a side-effecting step) or the backend does not
     /// compute one. Default `None` so a backend that doesn't snapshot need not
     /// implement it.
+    ///
+    /// This is **where the bytes are** — an address. What restart invalidation
+    /// compares is [`output_identity`](Executor::output_identity).
     async fn output(&self, _handle: &ExecHandle) -> Result<Option<String>, ExecError> {
         Ok(None)
     }
+
+    /// The **content identity** of that same snapshot (ADR-0061 s8): the merkle
+    /// fold with mtimes dropped — **what the bytes are**, not where they live.
+    ///
+    /// This, not [`output`](Executor::output), is what skip-if-unchanged compares
+    /// (ADR-0027), and the two are different digests for a reason found on a live
+    /// cluster (git-bug `945b1f4`): a tree hash covers each file's mtime, so a
+    /// producer re-running writes identical bytes at a new wall clock and can
+    /// never reproduce its own root. Comparing roots therefore always says
+    /// "changed" and nothing downstream is ever skipped.
+    ///
+    /// `None` means the backend cannot tell, and the orchestrator then falls back
+    /// to the root — which is the pre-identity behaviour: cascade, never a false
+    /// skip.
+    async fn output_identity(&self, _handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        Ok(None)
+    }
+
+    /// Where that same snapshot is **durable** (ADR-0064 s2): the Depot's
+    /// self-reported tier at flush time — the wire strings `"object"` |
+    /// `"separate-volume"` | `"warm-only"` — or `None` when the unit produced
+    /// no workspace or the backend predates the stamp. The orchestrator
+    /// records it per Attempt beside the snapshot root, so "what did this
+    /// attempt's `Succeeded` actually license?" stays answerable per row long
+    /// after the deployment's tier has changed.
+    ///
+    /// Deliberately **required, not defaulted** — unlike its two siblings
+    /// above. A defaulted `Ok(None)` on a decorator silently swallows the
+    /// stamp: the exact forward-or-drop hazard [`artifacts`](Self::artifacts)
+    /// documents (98ea804, and `SecretInjectingExecutor` has dropped evidence
+    /// that way before). The compiler must force every impl — and every
+    /// future wrapper — to decide.
+    async fn output_durability(&self, handle: &ExecHandle)
+        -> Result<Option<String>, ExecError>;
 
     /// The **named results** the (successfully finished) unit emitted via the
     /// results channel (ADR-0008: its `/scarab/results/*.json`), read back

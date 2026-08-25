@@ -24,6 +24,15 @@ scarab-forge-github = { workspace = true }
 # The k8s log tail (ADR-0013): kube's `log_stream` yields a `futures::AsyncBufRead`
 # we chunk with `AsyncReadExt`.
 futures = { workspace = true }
+# Structured logging (ADR-0053): the `ws-timing` phase breakdown of a Step
+# boundary that ADR-0061 s0 measures. The server installs the subscriber.
+tracing = { workspace = true }
+# The Depot handle for the drain (ADR-0064 control-plane half): warm-first
+# ingest + the awaited `flush` that gates Succeeded. A REAL dependency now, not
+# only the dev one it used to be — `drive_workspace` calls `flush`, which is a
+# concrete client capability, not a `Cas` port method. No cycle: the reverse
+# edge (workspace-client → scarab-server → this crate) is dev-only.
+scarab-workspace-client = { workspace = true }
 
 [dev-dependencies]
 scarab-storage-s3 = { workspace = true }

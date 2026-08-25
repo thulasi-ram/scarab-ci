@@ -20,6 +20,10 @@ export type Attempt = components["schemas"]["AttemptDto"];
 export type StepStatus = components["schemas"]["StepStatusDto"];
 /** A run-scoped shared service instance (ADR-0058) — not a DAG node. */
 export type Service = components["schemas"]["ServiceStatusDto"];
+/** The cold tier's Workspace-Snapshot retention promise + any pin (ADR-0061 s5). */
+export type RetentionInfo = components["schemas"]["SnapshotRetentionDto"];
+/** A rerun preview: the resolved scope, and any widening over expired inputs. */
+export type RerunPlan = components["schemas"]["RerunPlanResponse"];
 
 export const api = createClient<paths>({ baseUrl: "/" });
 
@@ -610,6 +614,38 @@ export async function retryStep(id: string, step: string): Promise<void> {
     params: { path: { id, step } },
   });
   if (error) throw new Error(`failed to retry ${step}`);
+}
+
+/** Preview a rerun (`GET …/steps/{step}/rerun-plan`, ADR-0061 s5): what it would
+ * actually execute, and whether expired workspace snapshots widen the scope
+ * upstream. Read BEFORE the rerun, so a widened rerun is never a surprise
+ * (ADR-0027 — smart never means mysterious). */
+export async function fetchRerunPlan(id: string, step: string): Promise<RerunPlan> {
+  const { data, error } = await api.GET("/v1/runs/{id}/steps/{step}/rerun-plan", {
+    params: { path: { id, step } },
+  });
+  if (error || !data) throw new Error(`failed to plan rerun of ${step}`);
+  return data;
+}
+
+/** Pin this run's Workspace Snapshots (`POST …/snapshots-pin`, ADR-0061 s5):
+ * keep them past the retention window for an investigation. Returns the run's
+ * updated retention state. */
+export async function pinSnapshots(id: string): Promise<RetentionInfo> {
+  const { data, error } = await api.POST("/v1/runs/{id}/snapshots-pin", {
+    params: { path: { id } },
+  });
+  if (error || !data) throw new Error(`failed to pin snapshots of run ${id}`);
+  return data;
+}
+
+/** Release the pin (`DELETE …/snapshots-pin`) — back to the ordinary window. */
+export async function unpinSnapshots(id: string): Promise<RetentionInfo> {
+  const { data, error } = await api.DELETE("/v1/runs/{id}/snapshots-pin", {
+    params: { path: { id } },
+  });
+  if (error || !data) throw new Error(`failed to unpin snapshots of run ${id}`);
+  return data;
 }
 
 /** Cancel a run — steps settle Cancelled, Pods tear down (`POST …/cancel`). */

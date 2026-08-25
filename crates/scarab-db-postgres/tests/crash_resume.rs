@@ -79,6 +79,8 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
             id: AttemptId("a1".into()),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         }],
         needs: vec![],

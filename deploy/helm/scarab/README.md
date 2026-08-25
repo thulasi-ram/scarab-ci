@@ -183,6 +183,83 @@ Projects — and their Environments, secrets and RBAC — hang off its repo bind
 the running server can store it). `SCARAB_GITHUB_APP_PEM[_FILE]` above is the same
 mechanism, applied kind-wide to GitHub App-mode connections.
 
+## The workspace service (`workspace`, ADR-0061)
+
+A second workload in the same release: a **StatefulSet** running the **same
+image** with `SCARAB_ROLE=workspace`, holding a warm content-addressed store of
+**Workspace Snapshots** on a PVC, with your object store behind it as the cold
+archive. It is meant to be in the standard path, not an optional accelerator — a
+fast path plus a fallback path is two mental models.
+
+```sh
+helm upgrade --install scarab deploy/helm/scarab -n scarab \
+  --set secrets.workspaceTokenSecret="$(head -c 32 /dev/urandom | base64)" \
+  --set workspace.persistence.size=50Gi
+```
+
+Why it is shaped the way it is:
+
+- **Same image, one release.** That is what makes server↔service version skew
+  structurally impossible. It is why this is a *role* on the converged binary
+  and not a fourth published artifact.
+- **`SCARAB_ROLE=workspace` is set as an explicit `env` entry**, which wins over
+  the ConfigMap arriving via `envFrom`. That single line is load-bearing: get the
+  precedence wrong and this StatefulSet quietly runs a second converged control
+  plane, complete with a driver loop. Confirm it after any edit:
+  ```sh
+  helm template scarab deploy/helm/scarab -n scarab \
+    --set scarab.devInsecure=true --set secrets.databaseUrl=x \
+    --set secrets.masterKey=y --set secrets.workspaceTokenSecret=z \
+    | yq 'select(.kind=="StatefulSet").spec.template.spec.containers[0].env'
+  ```
+- **The volume attaches to the SERVICE, never to a step Pod.** Every problem PVCs
+  have at step grain — attach/detach latency at each boundary, stuck volumes when
+  a spot node is reclaimed, per-node attachment quotas — comes from binding
+  volumes to short-lived pods.
+- **No RBAC.** It gets its own ServiceAccount with **no RoleBinding**. That looks
+  like an omission and is deliberate: a workspace replica creates no Pods, reads
+  no Secrets through the API and execs into nothing.
+- **`secrets.workspaceTokenSecret` must be different from
+  `secrets.resultsTokenSecret`.** The results token carries no verb and never
+  expires, so reusing it would turn a results-write credential into a content
+  read+write credential — and would let the workspace service forge step results
+  for any `{run, step, attempt}`.
+- **Nothing renders without that secret.** A workspace service with no token
+  secret would serve every step's inputs to anything that can reach the port, so
+  the chart renders nothing rather than an open service.
+
+Operating it: `/readyz` is *warm writable + cold reachable*, deliberately not the
+control plane's database check. The warm tier is bounded by **space** and **LRU
+eviction is not implemented yet**, so `scarab_workspace_warm_used_bytes` on
+`/metrics` is the whole budget — alert on it against
+`workspace.persistence.size`. `scarab_workspace_warm_write_failed_total`
+climbing means snapshots are still durable (cold succeeded) but the cache is
+not being filled.
+
+**`workspace.persistence.storageClass` picks which rung the Snapshot Farm runs
+on** (ADR-0062), and nothing in the install will tell you which one you got.
+Materialising a Workspace Snapshot is one local operation per file on that
+volume — a copy-on-write clone where the filesystem can do one, a full byte copy
+where it cannot. The Farm measures this rather than guessing: it clones a probe
+file on the target and does *not* switch on the filesystem's name, and any
+refusal falls back per file, so a part-cloned build is a modelled outcome and
+not a fault. A wrong class is never *incorrect*, only silently slow — watch
+`rung=` on the `ws-timing` log line. **ext4** has no reflink, so it is the copy
+rung always. **xfs** clones only if the filesystem was made with `reflink=1`,
+and most CSI drivers expose no mkfs options, so you inherit that node image's
+`mkfs.xfs` defaults — worth checking rather than assuming, with `xfs_info
+<dataDir> | grep reflink` inside the workspace pod. **btrfs** and **ZFS** clone
+in principle (ZFS only with OpenZFS block cloning enabled: off by default in 2.2
+after a corruption bug, on from 2.3). **Do not point this at network storage.**
+An NFS-backed class is the actively harmful choice for this volume: no reflink,
+*and* overlayfs does not support an `upperdir` on NFS, while the Export rung
+probe asks only about `CAP_SYS_ADMIN` — so the overlay rung is still selected
+and the mount then fails outright. The Depot's warm volume wants local disk.
+
+> **Unverified in this chart version:** more than one replica, per-availability-
+> zone placement, and reachability from a step Pod. `workspace.replicaCount > 1`
+> has not been exercised.
+
 ## Key values
 
 | Key | Default | Notes |
@@ -198,6 +275,12 @@ mechanism, applied kind-wide to GitHub App-mode connections.
 | `secrets.oauthClientSecret.name` / `.key` | — / `oauth-client-secret` | OAuth client secret by reference from your own Secret (above) |
 | `secrets.githubAppPemSecret.name` / `.key` | — / `github-app.pem` | mount the App PEM from your own Secret (above) |
 | `scarab.connections` | `[]` | declarative, config-owned forge connections (above) |
+| `workspace.enabled` | `true` | the ADR-0061 workspace service; renders only when a workspace token secret exists (above) |
+| `workspace.dataDir` | `/var/lib/scarab/cas` | where the warm tier's PVC is mounted (`SCARAB_WORKSPACE_DATA_DIR`) |
+| `workspace.persistence.size` / `.storageClass` | `20Gi` / cluster default | the warm tier's volume — bounded by SPACE, with no eviction policy yet; the class also picks the Snapshot Farm's rung, and NFS forfeits both rungs (above) |
+| `workspace.replicaCount` | `1` | one per failure domain; `>1` is **unverified** |
+| `secrets.workspaceTokenSecret` | — | HMAC secret for the workspace token; MUST differ from `resultsTokenSecret` (above) |
+| `scarab.workspaceUrl` | — | override the in-cluster workspace Service URL (split installs) |
 | `rbac.create` | `true` | Role/RoleBinding for Pod execution |
 | `ingress.enabled` | `false` | expose the HTTP API |
 
@@ -215,3 +298,5 @@ or supply them as keys of your own `secrets.existingSecret`.
 - [ADR-0046 — Forge auth is adapter-internal; GitHub + Forgejo adapters in v1](../../../docs/adr/0046-forge-auth-and-multi-adapter.md)
 - [ADR-0048 — Fail-closed startup](../../../docs/adr/0048-fail-closed-startup.md)
 - [ADR-0049 — Identity & access: forge-agnostic OAuth/OIDC login](../../../docs/adr/0049-identity-and-access.md)
+- [ADR-0061 — Workspace data path: workspace service + node driver, lazy materialisation](../../../docs/adr/0061-workspace-data-path.md)
+- [ADR-0062 — Workspace Export: laziness without a node driver (the Farm and Export rungs)](../../../docs/adr/0062-workspace-export-lazy-without-node-driver.md)

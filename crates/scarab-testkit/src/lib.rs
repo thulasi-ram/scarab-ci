@@ -84,8 +84,12 @@ struct StepRec {
     spec: Option<StepSpec>,
     needs: Vec<StepId>,
     attempts: Vec<Attempt>,
-    /// Output workspace snapshot (CAS root hash) this step produced.
+    /// Output workspace snapshot (CAS root hash) this step produced — *where*
+    /// the bytes are.
     output: Option<String>,
+    /// Its content identity — *what* the bytes are (ADR-0061 s8). What
+    /// skip-if-unchanged compares; `None` falls back to `output`.
+    output_identity: Option<String>,
     /// Named results (ADR-0041) this step emitted, captured on success.
     results: std::collections::BTreeMap<String, serde_json::Value>,
     /// Input signature consumed on the last run (restart skip-if-unchanged).
@@ -163,6 +167,9 @@ struct InMemoryState {
     slots: HashMap<String, RunId>,
     /// Per-run creation time (for supersede ordering).
     run_created: HashMap<RunId, Timestamp>,
+    /// Per-run Workspace-Snapshot **pin** (ADR-0061 s5): `(by, at)` while pinned,
+    /// absent otherwise — mirrors `runs.snapshots_pinned_{at,by}`.
+    snapshot_pins: HashMap<RunId, (Option<String>, Timestamp)>,
     /// Per-run supersede key `(repo, ref, pipeline)`.
     supersede_keys: HashMap<RunId, String>,
     /// Per-run project (fairness) and admission priority.
@@ -260,6 +267,7 @@ impl InMemoryDb {
                 needs: Vec::new(),
                 attempts: Vec::new(),
                 output: None,
+                output_identity: None,
                 results: Default::default(),
                 input: None,
                 gate_kind: None,
@@ -282,6 +290,7 @@ impl InMemoryDb {
                     needs: s.needs,
                     attempts: s.attempts,
                     output: None,
+                    output_identity: None,
                     results: Default::default(),
                     input: None,
                     gate_kind: None,
@@ -402,6 +411,7 @@ impl Db for InMemoryDb {
                 needs: needs.to_vec(),
                 attempts: Vec::new(),
                 output: None,
+                output_identity: None,
                 results: Default::default(),
                 input: None,
                 gate_kind: None,
@@ -419,6 +429,8 @@ impl Db for InMemoryDb {
         step: &StepId,
         attempt: &AttemptId,
         snapshot: &str,
+        identity: Option<&str>,
+        durability: Option<&str>,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
         let rec = st
@@ -426,7 +438,14 @@ impl Db for InMemoryDb {
             .get_mut(&(run.clone(), step.clone()))
             .ok_or(DbError::Conflict)?;
         rec.output = Some(snapshot.to_string());
+        rec.output_identity = identity.map(str::to_string);
         rec.evidence_attempt = Some(attempt.clone());
+        // The durability stamp (ADR-0064 s2) lands on the ATTEMPT row only —
+        // mirrors the postgres `UPDATE attempts SET … output_durability` in
+        // the same call; a missing attempt row is a silent no-op there too.
+        if let Some(a) = rec.attempts.iter_mut().find(|a| &a.id == attempt) {
+            a.output_durability = durability.map(str::to_string);
+        }
         st.attempt_evidence
             .entry((run.clone(), step.clone(), attempt.clone()))
             .or_default()
@@ -457,6 +476,22 @@ impl Db for InMemoryDb {
             .steps
             .get(&(run.clone(), step.clone()))
             .and_then(|r| r.output.clone()))
+    }
+
+    async fn step_output_identity(
+        &self,
+        run: &RunId,
+        step: &StepId,
+    ) -> Result<Option<String>, DbError> {
+        // Same fallback the Postgres adapter does with COALESCE: no recorded
+        // identity means compare by the root (ADR-0061 s8).
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .steps
+            .get(&(run.clone(), step.clone()))
+            .and_then(|r| r.output_identity.clone().or_else(|| r.output.clone())))
     }
 
     async fn set_step_results(
@@ -1125,6 +1160,8 @@ impl Db for InMemoryDb {
                     id: attempt,
                     started_at: Timestamp(0),
                     failure: None,
+                    failure_detail: None,
+                    output_durability: None,
                     outcome: AttemptOutcome::Running,
                 });
             }
@@ -1208,6 +1245,7 @@ impl Db for InMemoryDb {
         step: &StepId,
         attempt: &AttemptId,
         failure: FailureKind,
+        detail: Option<&str>,
     ) -> Result<(), DbError> {
         let mut st = self.state.lock().unwrap();
         if let Some(rec) = st.steps.get_mut(&(run.clone(), step.clone())) {
@@ -1220,8 +1258,10 @@ impl Db for InMemoryDb {
                     a.outcome,
                     AttemptOutcome::Superseded | AttemptOutcome::Cancelled
                 ) {
-                    // Failure and outcome move together (ADR-0056 amendment).
+                    // Failure, cause and outcome move together (ADR-0056
+                    // amendment; 4cf03d7) — mirrors the single postgres UPDATE.
                     a.failure = Some(failure);
+                    a.failure_detail = detail.map(str::to_string);
                     a.outcome = AttemptOutcome::Failed;
                 }
             }
@@ -1498,32 +1538,101 @@ impl Db for InMemoryDb {
         Ok(())
     }
 
-    async fn gc_workspace_roots(&self, terminal_cutoff: Timestamp) -> Result<Vec<String>, DbError> {
+    async fn gc_workspace_roots(
+        &self,
+        terminal_cutoff: Timestamp,
+    ) -> Result<Vec<(String, Timestamp)>, DbError> {
         let st = self.state.lock().unwrap();
+        // Third disjunct, matching the Postgres mark query (ADR-0061 s5): a
+        // PINNED run's roots are marked unconditionally, so its whole transitive
+        // tree survives the sweep.
         let run_live = |run: &RunId| {
             st.runs.get(run).is_some_and(|status| {
                 !status.is_terminal()
                     || st.run_created.get(run).copied().unwrap_or(Timestamp(0)).0
                         >= terminal_cutoff.0
+                    || st.snapshot_pins.contains_key(run)
             })
         };
+        // The pair's second half is the root's RECORDING clock — the sweeper's
+        // torn-cold suppression window. The fake keeps no per-row write stamp,
+        // so it reports run creation time, the same clock its TTL arm above
+        // already uses; earliest wins when several runs share a root, matching
+        // the Postgres `MIN` (one old recording proves the flush had time).
+        let recorded = |run: &RunId| st.run_created.get(run).copied().unwrap_or(Timestamp(0));
         // Latest denorm roots + EVERY attempt's root (ADR-0056): an old
         // Take's workspace must never race the sweeper.
-        let mut roots: Vec<String> = st
-            .steps
-            .iter()
-            .filter(|((run, _), rec)| rec.output.is_some() && run_live(run))
-            .filter_map(|(_, rec)| rec.output.clone())
-            .chain(
-                st.attempt_evidence
-                    .iter()
-                    .filter(|((run, _, _), e)| e.output.is_some() && run_live(run))
-                    .filter_map(|(_, e)| e.output.clone()),
-            )
-            .collect();
-        roots.sort();
-        roots.dedup();
-        Ok(roots)
+        let mut roots: std::collections::BTreeMap<String, Timestamp> =
+            std::collections::BTreeMap::new();
+        let mut note = |root: &String, at: Timestamp| {
+            roots
+                .entry(root.clone())
+                .and_modify(|t| {
+                    if at.0 < t.0 {
+                        *t = at;
+                    }
+                })
+                .or_insert(at);
+        };
+        for ((run, _), rec) in &st.steps {
+            if let Some(root) = &rec.output {
+                if run_live(run) {
+                    note(root, recorded(run));
+                }
+            }
+        }
+        for ((run, _, _), e) in &st.attempt_evidence {
+            if let Some(root) = &e.output {
+                if run_live(run) {
+                    note(root, recorded(run));
+                }
+            }
+        }
+        Ok(roots.into_iter().collect())
+    }
+
+    async fn pin_run_snapshots(
+        &self,
+        run: &RunId,
+        by: Option<&str>,
+        at: Timestamp,
+    ) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        if !st.runs.contains_key(run) {
+            return Ok(false);
+        }
+        st.snapshot_pins
+            .insert(run.clone(), (by.map(str::to_string), at));
+        Ok(true)
+    }
+
+    async fn unpin_run_snapshots(&self, run: &RunId) -> Result<bool, DbError> {
+        let mut st = self.state.lock().unwrap();
+        if !st.runs.contains_key(run) {
+            return Ok(false);
+        }
+        st.snapshot_pins.remove(run);
+        Ok(true)
+    }
+
+    async fn run_snapshot_retention(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<scarab_engine::SnapshotRetention>, DbError> {
+        let st = self.state.lock().unwrap();
+        let Some(status) = st.runs.get(run).copied() else {
+            return Ok(None);
+        };
+        let pin = st.snapshot_pins.get(run).cloned();
+        Ok(Some(scarab_engine::SnapshotRetention {
+            terminal: status.is_terminal(),
+            // The fake tracks only creation time, and `gc_workspace_roots` above
+            // already uses it as the TTL clock — so the two agree here too. The
+            // real adapter uses `updated_at` (the settle instant).
+            settled_at: st.run_created.get(run).copied().unwrap_or(Timestamp(0)),
+            pinned_at: pin.as_ref().map(|(_, at)| *at),
+            pinned_by: pin.and_then(|(by, _)| by),
+        }))
     }
 
     async fn forget_workspace_root(&self, root: &str) -> Result<u32, DbError> {
@@ -1602,6 +1711,19 @@ struct FakeExecState {
     /// across a step's re-runs models an unchanged output (restart skips its
     /// dependents); changing it models a changed output (dependents cascade).
     outputs: HashMap<String, String>,
+    /// The **content identity** each step's output has (ADR-0061 s8), keyed by
+    /// step id. Absent means "the backend computed none", which is a real case
+    /// (a pre-s8 row) and makes the engine fall back to the root.
+    identities: HashMap<String, String>,
+    /// Steps whose snapshot ROOT differs per attempt while their CONTENT does
+    /// not — the git-bug `945b1f4` shape, see
+    /// [`FakeExecutor::set_output_identical_content`].
+    churning_roots: std::collections::HashSet<String>,
+    /// The **durability tier** each step's output flush reported (ADR-0064
+    /// s2), keyed by step id — what `Executor::output_durability` returns.
+    /// Absent means "no stamp" (no workspace / a pre-s2 backend), the `None`
+    /// the engine records as NULL.
+    durabilities: HashMap<String, String>,
     /// Named results (ADR-0041) each *step* emits on success, keyed by step id.
     results: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
     /// Artifacts of record (ADR-0052) each *step* published, keyed by step id —
@@ -1673,6 +1795,58 @@ impl FakeExecutor {
             .unwrap()
             .outputs
             .insert(step.to_string(), snapshot.to_string());
+    }
+
+    /// Model the real k8s backend's shape (ADR-0061 s8, git-bug `945b1f4`): a
+    /// step whose **content never changes** but whose **snapshot root does, on
+    /// every attempt**.
+    ///
+    /// That is not a contrivance, it is what a real CAS does. A tree hash covers
+    /// each file's mtime, so a producer re-running writes byte-identical content
+    /// at a new wall clock and gets a new root every time. Any test that models a
+    /// re-run with a *fixed* output string (`set_output`) is deterministic by
+    /// construction and can never see the failure that shape caused: the input
+    /// signature always changed, so no descendant was ever skipped.
+    ///
+    /// `identity` is what `Executor::output_identity` reports and what the engine
+    /// must compare; the root reported by `output` is derived from the attempt id.
+    pub fn set_output_identical_content(&self, step: &str, identity: &str) {
+        let mut st = self.inner.lock().unwrap();
+        st.outputs.insert(step.to_string(), identity.to_string());
+        st.identities.insert(step.to_string(), identity.to_string());
+        st.churning_roots.insert(step.to_string());
+    }
+
+    /// The content identity `step` reports, independently of its root. Use this
+    /// to model "the content changed" while `set_output_identical_content` models
+    /// "it did not".
+    pub fn set_output_identity(&self, step: &str, identity: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .identities
+            .insert(step.to_string(), identity.to_string());
+    }
+
+    /// The durability tier `step`'s output flush reports (ADR-0064 s2) — what
+    /// `Executor::output_durability` returns for any of that step's attempts:
+    /// one of the wire strings `object` | `separate-volume` | `warm-only`.
+    /// Unset (the default) models a stamp-less backend, i.e. `None`.
+    pub fn set_output_durability(&self, step: &str, tier: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .durabilities
+            .insert(step.to_string(), tier.to_string());
+    }
+
+    /// `(step id, attempt id)` out of a `fake://{run}/{step}/{attempt}` handle.
+    fn step_and_attempt(handle: &ExecHandle) -> Option<(String, String)> {
+        let rest = handle.0.strip_prefix("fake://")?;
+        let mut parts = rest.split('/').skip(1);
+        let step = parts.next()?.to_string();
+        let attempt = parts.next()?.to_string();
+        Some((step, attempt))
     }
 
     /// Set the named results `step` (by id) emits on success (ADR-0041).
@@ -1838,12 +2012,36 @@ impl Executor for FakeExecutor {
     }
 
     async fn output(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
-        // Handle format is `fake://{run}/{step}/{attempt}` — key outputs by step.
-        let step = handle
-            .0
-            .strip_prefix("fake://")
-            .and_then(|rest| rest.split('/').nth(1));
-        Ok(step.and_then(|s| self.inner.lock().unwrap().outputs.get(s).cloned()))
+        let Some((step, attempt)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        let st = self.inner.lock().unwrap();
+        let Some(base) = st.outputs.get(&step).cloned() else {
+            return Ok(None);
+        };
+        // A churning step's root is a function of the ATTEMPT, not of its
+        // content — deterministic per attempt (so a re-poll of one attempt is
+        // stable, as a Pod annotation is) and different across attempts.
+        if st.churning_roots.contains(&step) {
+            return Ok(Some(format!("{base}@{attempt}")));
+        }
+        Ok(Some(base))
+    }
+
+    async fn output_identity(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        let Some((step, _)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        Ok(self.inner.lock().unwrap().identities.get(&step).cloned())
+    }
+
+    async fn output_durability(&self, handle: &ExecHandle) -> Result<Option<String>, ExecError> {
+        // Required, not defaulted (ADR-0064 s2): the fake decides explicitly —
+        // the configured tier, or `None` for a step no test stamped.
+        let Some((step, _)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        Ok(self.inner.lock().unwrap().durabilities.get(&step).cloned())
     }
 
     async fn results(

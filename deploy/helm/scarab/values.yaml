@@ -45,6 +45,12 @@ scarab:
   # Global default step deadline in seconds (ADR-0047). Empty => server
   # default (3600). Per-step `timeout:` always overrides.
   stepTimeoutSecs: ""
+  # In-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2).
+  # Empty => server default (32). The legs are latency-bound, so 32 is a FLOOR
+  # for remote object storage — raise it the further away the bucket is. Lower it
+  # when blobs are large: a blob is buffered whole, so peak memory is roughly
+  # `casConcurrency × largest blob`. A non-positive/junk value fails the boot.
+  casConcurrency: ""
 
   # --- declarative forge connections (ADR-0060 part D) --------------------
   # Config-owned connections: provisioned at boot, AUTHORITATIVE, and read-only
@@ -143,6 +149,11 @@ scarab:
   # Service DNS name derived from the release.
   resultsApiUrl: ""
 
+  # Base URL of the workspace service (ADR-0061). Empty => the in-cluster
+  # Service DNS name derived from the release, which is right unless you run the
+  # service from a separate release (e.g. one per availability zone).
+  workspaceUrl: ""
+
 # Sensitive config. Two modes:
 #   1. existingSecret: reference a Secret you manage out-of-band (recommended
 #      for production). Keys must match the env var names below.
@@ -168,6 +179,16 @@ secrets:
   forgejoWebhookSecret: ""
   gateTokenSecret: ""
   resultsTokenSecret: ""
+  # HMAC secret for the workspace token (ADR-0061): the credential a step Pod
+  # presents to the workspace service. Set this to enable the service — the
+  # StatefulSet refuses to boot without it, because a workspace service with no
+  # token secret would serve every step's inputs to any caller that can reach the
+  # port. It MUST be different from resultsTokenSecret: that one carries no verb
+  # and never expires, so reusing it would turn a results-write credential into a
+  # content read+write credential, and would let the workspace service forge step
+  # results for any {run, step, attempt} — the workspace service being precisely
+  # the component ADR-0061 moves out of the trusted control plane.
+  workspaceTokenSecret: ""
   # GitHub App private-key PEM (enh 245a99c): supplies the App credential at
   # boot, GitOps-style — no PUT /v1/secrets reseed, and it survives DB recreate.
   # Overrides any DB-stored `_forge` credential. For existingSecret mode, add a
@@ -195,7 +216,98 @@ secrets:
     name: ""                     # Secret holding it; empty => no env var
     key: oauth-client-secret     # key within that Secret
 
+# --- the workspace service (ADR-0061) ---------------------------------------
+# A warm content-addressed store on a PERSISTENT VOLUME, in front of the
+# configured object store as the cold archive. In the standard path in every
+# deployment mode, because a fast path plus a fallback path is two mental models
+# and the taxonomy cost is worse than the component cost.
+#
+# This is the chart's FIRST StatefulSet and its first PVC. The volume attaches to
+# the SERVICE, never to a step Pod — every problem PVCs have at step grain
+# (attach/detach latency per boundary, stuck volumes when a spot node is
+# reclaimed, per-node attachment quotas) comes from binding volumes to
+# short-lived pods.
+#
+# It runs the SAME IMAGE as the server with SCARAB_ROLE=workspace, which is what
+# makes server↔service version skew structurally impossible under one release.
+#
+# `enabled: true` but nothing renders unless secrets.workspaceTokenSecret is set:
+# the service needs a token secret to verify anything, so an install that has not
+# set one gets no service rather than an open one.
+workspace:
+  enabled: true
+  # One per failure domain. Per-AZ topology is a later slice; NOTHING in this
+  # design has been exercised with more than one instance, so treat >1 as
+  # unproven rather than supported.
+  replicaCount: 1
+  # Where the warm tier lives inside the container — the PVC's mount point, and
+  # the value of SCARAB_WORKSPACE_DATA_DIR.
+  dataDir: /var/lib/scarab/cas
+  # The scarab-wsfetch image, and it is ONE knob for TWO containers in every
+  # workspace Step Pod (ADR-0061):
+  #   - the FETCHER init container (s3-feed): pulls a Step's input snapshots
+  #     from the service when it has `needs:`;
+  #   - the EGRESS helper (s3-drain): `scarab-wsfetch hold` keeps the Pod open
+  #     after the step exits, and the control plane execs `scarab-wsfetch
+  #     drain` in it to publish /workspace to the Depot in-Pod.
+  # Digest-pin in production, exactly as with scarab.cloneImage.
+  #
+  # ⚠ ROLLOUT ORDER: publish/load this image BEFORE (or with) a control plane
+  # that expects the s3-drain helper. A stale wsfetch has no subcommands — the
+  # `drain` argv is ignored, it runs fetch and exits 0 with NO drain record —
+  # and the control plane fails the Attempt promptly as a Config error naming
+  # the skew (fast and legible, never wedged to the step budget) — but it
+  # fails it. Image first, control plane second.
+  #
+  # The EAGER feed remains a stepping stone: ADR-0062's Workspace Export
+  # replaces how an in-cluster Step gets its inputs, but this image does NOT
+  # die with it (the old node-driver deletion note, git-bug 0628369, is
+  # closed as superseded) — it stays the fetch path for modes without an
+  # Export, and the drain helper regardless. While the eager feed is live,
+  # `eager_fetch_total` on the server is climbing.
+  fetcherImage: ghcr.io/thulasi-ram/scarab-wsfetch:edge
+  persistence:
+    # The warm tier is bounded by SPACE (cold is bounded by time). LRU eviction
+    # is NOT implemented yet, so until it is, watch the
+    # `scarab_workspace_warm_used_bytes` gauge: this number is the whole budget.
+    size: 20Gi
+    # ⚠ THIS KEY SILENTLY SELECTS THE SNAPSHOT FARM'S RUNG (ADR-0062). Giving a
+    # Workspace Snapshot tree shape is one local operation per file ON THIS
+    # VOLUME: a copy-on-write clone (`FICLONE`) where the filesystem can do one,
+    # else a full `std::fs::copy` of every byte. The Farm decides that
+    # EMPIRICALLY per target — it clones a probe file, it does NOT switch on the
+    # filesystem's name — and ANY ioctl refusal falls back per file, so a
+    # part-cloned build is a modelled outcome (`FarmRung::Mixed`), not a bug. A
+    # wrong storageClass is therefore never *incorrect*; it is silently SLOW,
+    # and the only place it surfaces is `rung=` on the build's `ws-timing` line.
+    #   ext4        no reflink, ever — the copy rung, always.
+    #   xfs         clones ONLY if the filesystem was made with `reflink=1`.
+    #               Most CSI drivers expose no mkfs options, so you get whatever
+    #               that node image's `mkfs.xfs` defaults to. Verify rather than
+    #               assume: `xfs_info <dataDir> | grep reflink` in the workspace
+    #               pod.
+    #   btrfs/ZFS   clone in principle (ZFS only with OpenZFS block cloning
+    #               enabled — off by default in 2.2 after a corruption bug, on
+    #               from 2.3).
+    # Do NOT point this at network storage. An NFS-backed class is the actively
+    # harmful choice for THIS volume: no reflink, AND overlayfs does not support
+    # an `upperdir` on NFS — while the Export rung probe asks only about
+    # CAP_SYS_ADMIN, so the overlay rung is still chosen and then `mount(2)`
+    # fails outright. The Depot's warm volume wants local disk.
+    storageClass: ""       # "" = the cluster default
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+  nodeSelector: {}
+  tolerations: []
+
 # RBAC the k8s executor needs to run one Pod per step in scarab.namespace.
+# NOTE: the workspace StatefulSet gets its own ServiceAccount with NO
+# RoleBinding — see templates/serviceaccount-workspace.yaml for why that is
+# deliberate rather than an omission.
 rbac:
   create: true
 

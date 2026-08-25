@@ -13,7 +13,7 @@
 //! |------|-------|---------|
 //! | `SCARAB_ROLE` | CLI `--role` | which slice(s) this process runs |
 //! | `SCARAB_ADDR` | CLI `--addr` | bind address |
-//! | `SCARAB_DATABASE_URL` | CLI `--database-url` | Postgres URL — **mandatory** for every serving role |
+//! | `SCARAB_DATABASE_URL` | CLI `--database-url` | Postgres URL — **mandatory** for every role that touches the durable core; the ADR-0061 `workspace` data-plane role is the one carve-out |
 //! | `SCARAB_OBJECT_DIR` | CLI `--object-dir` | local object-store directory (dev) |
 //! | `SCARAB_NAMESPACE` | CLI `--namespace` | k8s namespace for step Pods |
 //! | `SCARAB_EXECUTOR` | CLI `--executor` | `k8s` (prod) or `local` (dev/CLI) |
@@ -22,9 +22,14 @@
 //! | `SCARAB_S3_REGION` | env | S3 region (default `us-east-1`) |
 //! | `SCARAB_S3_ACCESS_KEY` | env | S3 access key |
 //! | `SCARAB_S3_SECRET_KEY` | env | S3 secret key |
+//! | `SCARAB_CAS_CONCURRENCY` | env | in-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2); default 32. The legs are latency-bound, so this is a *floor* for remote storage — raise it when the store is far away, lower it when blobs are large, because peak memory is roughly `concurrency × largest blob` |
 //! | `SCARAB_RESULTS_TOKEN_SECRET` | env | enables results-egress sidecar + ingest (ADR-0042) |
 //! | `SCARAB_RESULTS_API_URL` | env | base URL the sidecar posts results to |
 //! | `SCARAB_SIDECAR_IMAGE` | env | results-egress sidecar image |
+//! | `SCARAB_WORKSPACE_TOKEN_SECRET` | env | enables the workspace service + the token Step Pods present to it (ADR-0061). **Required** under `--role workspace`; deliberately a DIFFERENT secret from `SCARAB_RESULTS_TOKEN_SECRET` |
+//! | `SCARAB_WORKSPACE_URL` | env | base URL of the workspace service; default `http://scarab-workspace` |
+//! | `SCARAB_WORKSPACE_DATA_DIR` | env | the workspace service's **warm tier** directory (its persistent volume); default `./.scarab/workspace-cas`. Only read under `--role workspace` |
+//! | `SCARAB_WSFETCH_IMAGE` | env | the workspace **helper** image every workspace Step Pod carries (ADR-0061): the fetch init container (s3-feed) AND the egress hold/drain sidecar (`scarab-wsfetch hold` / the in-Pod `drain` the control plane execs); default `ghcr.io/thulasi-ram/scarab-wsfetch:edge`. ADR-0062 stage 2 replaces only the **eager-fetch** role; the egress role survives it — the old "dies with the node driver" note (git-bug 0628369) applied to the fetch role alone and is closed as superseded |
 //! | `SCARAB_GITHUB_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/github` |
 //! | `SCARAB_FORGEJO_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/forgejo` (ADR-0046 — each forge endpoint binds its own secret) |
 //! | `SCARAB_GATE_TOKEN_SECRET` | env | enables external-gate release tokens (ADR-0034) |
@@ -48,10 +53,15 @@
 //! | `SCARAB_CONNECTIONS` | env | the declarative `connections:` block inline (YAML/JSON, ADR-0060 part D): config-owned forge connections, provisioned at boot and read-only in the UI. Wins over `_FILE` |
 //! | `SCARAB_CONNECTIONS_FILE` | env | path to a file holding the same `connections:` block (the GitOps shape: a ConfigMap mount). A bad path/parse/validation is a boot failure |
 //!
-//! Step-runtime env (`SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`/
-//! `SCARAB_RESULTS*`/`SCARAB_PARAM_*`) is injected *into* step containers by
-//! the executors and is not boot configuration; `SCARAB_SERVER`/`SCARAB_TOKEN`
-//! belong to `scarab` (the CLI client).
+//! Step-runtime env is injected *into* step containers (or their init/sidecar
+//! containers) by the executors and is **not** boot configuration — this table
+//! does not cover it. Today that is `SCARAB_RUN`/`SCARAB_STEP`/`SCARAB_ATTEMPT`,
+//! `SCARAB_RESULTS*`, `SCARAB_PARAM_*`, and the ADR-0061 workspace-fetch set
+//! (`SCARAB_WORKSPACE_TOKEN_FILE`, `SCARAB_WORKSPACE_URL`,
+//! `SCARAB_SNAPSHOT_ROOTS`, `SCARAB_WORKSPACE_TARGET`) — note that
+//! `SCARAB_WORKSPACE_URL` appears in BOTH lists: the same value is boot config
+//! for this process and injected env for a Step Pod's fetcher.
+//! `SCARAB_SERVER`/`SCARAB_TOKEN` belong to `scarab` (the CLI client).
 
 use base64::Engine;
 use clap::{Parser, ValueEnum};
@@ -70,12 +80,34 @@ pub enum Role {
     Executor,
     /// Ingest and normalize inbound forge webhooks only.
     Webhook,
+    /// Serve the **workspace service** (ADR-0061): a warm content-addressed
+    /// store on a persistent volume, in front of the cold object-storage
+    /// archive. A **data-plane** role — it shares this binary (one image, so
+    /// server↔service version skew is structurally impossible under one Helm
+    /// release) but not the durable core.
+    Workspace,
 }
 
 impl Role {
     /// Roles that drive the scheduler + executor background loop.
     pub fn runs_driver(self) -> bool {
         matches!(self, Role::Converged | Role::Scheduler | Role::Executor)
+    }
+
+    /// Roles that touch the durable core.
+    ///
+    /// The workspace service (ADR-0061) is a **data-plane** component: it holds
+    /// no state Postgres owns, it decrypts nothing, and it must keep serving
+    /// **through** a Postgres outage — a Step reading its inputs does not care
+    /// that the control plane is briefly blind. Requiring a database URL there
+    /// would be a false dependency, and running `migrate()` from N per-failure-
+    /// domain replicas would be actively dangerous.
+    ///
+    /// This is a **narrow carve-out, not a weakening**: every other role still
+    /// refuses to boot without Postgres and without a KEK. There is still no
+    /// API-only mode.
+    pub fn needs_durable_core(self) -> bool {
+        !matches!(self, Role::Workspace)
     }
 }
 
@@ -172,6 +204,38 @@ pub struct ResultsEgressConfig {
     pub api_url: String,
     /// The sidecar container image.
     pub sidecar_image: String,
+}
+
+/// Workspace service wiring (ADR-0061), present when
+/// `SCARAB_WORKSPACE_TOKEN_SECRET` is set. Mirrors [`ResultsEgressConfig`]:
+/// one shared HMAC secret both mints the token a Step Pod carries and verifies
+/// it at the service.
+///
+/// **Vocabulary**: this configures access to **Workspace Snapshots** — the
+/// immutable content-addressed trees that flow along DAG edges — never to a
+/// **Workspace**, which is the mutable pod-local filesystem a Step executes in
+/// (CONTEXT.md §4.2). The knob names keep the service's name; the data they
+/// point at is snapshots.
+#[derive(Debug, Clone)]
+pub struct WorkspaceServiceConfig {
+    /// Shared HMAC secret for the workspace token (ADR-0061). Deliberately NOT
+    /// the results-egress secret: that one carries no verb and never expires,
+    /// and sharing it would let the workspace service forge step results.
+    pub token_secret: Vec<u8>,
+    /// Base URL of the workspace service — what the control plane and (once the
+    /// fetcher lands) a Step Pod's helper dial.
+    pub url: String,
+    /// The **warm tier's** directory: the persistent volume the service holds
+    /// its content-addressed store on. Only meaningful for `--role workspace`.
+    pub data_dir: String,
+    /// The **fetcher** image a Step Pod's init container runs to pull its input
+    /// snapshots from the service (ADR-0061 s3-feed). Digest-pin in production,
+    /// exactly as with `clone_image`.
+    ///
+    /// ⚠ A temporally-ordered stepping stone, not the design: it is *eager*, and
+    /// the CSI/FUSE node driver replaces it — at which point this knob, the image
+    /// and `WorkspaceFetch` all disappear together (git-bug 0628369).
+    pub fetcher_image: String,
 }
 
 /// OIDC issuer settings (selected by `SCARAB_OIDC_ISSUER`). The signing key is
@@ -295,12 +359,20 @@ struct RawCredential {
 pub struct Config {
     pub role: Role,
     pub addr: String,
-    /// Always present — construction fails without it (no API-only mode).
-    pub database_url: String,
+    /// Present for every role that touches the durable core — construction
+    /// fails without it, and there is still no API-only mode. `None` **only**
+    /// for [`Role::Workspace`], the ADR-0061 data-plane role (see
+    /// [`Role::needs_durable_core`]). The type carries that fact so the one
+    /// `expect` can live at the durable-core dispatch site instead of a `""`
+    /// sentinel travelling through the whole composition root.
+    pub database_url: Option<String>,
     pub namespace: String,
     pub executor: ExecutorKind,
     pub store: StoreConfig,
     pub results_egress: Option<ResultsEgressConfig>,
+    /// Workspace service wiring (ADR-0061). `None` = no workspace service in
+    /// this deployment; `--role workspace` refuses to boot without it.
+    pub workspace: Option<WorkspaceServiceConfig>,
     pub github_webhook_secret: Option<Vec<u8>>,
     pub forgejo_webhook_secret: Option<Vec<u8>>,
     pub gate_token_secret: Option<Vec<u8>>,
@@ -353,6 +425,14 @@ pub struct Config {
     /// (ADR-0050 mark-sweep; default 14). Non-terminal runs are always
     /// reachable regardless of age.
     pub retention_workspace_days: u32,
+    /// In-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2);
+    /// default [`scarab_storage_s3::DEFAULT_CAS_CONCURRENCY`].
+    ///
+    /// Resolved *here* rather than by an ambient `std::env::var` in the adapter,
+    /// so it obeys the same three rules as every other knob (ADR-0048): one
+    /// documented place, a junk value fails the boot, and the live value appears
+    /// in [`Config::startup_report`] where an operator can actually read it.
+    pub cas_concurrency: usize,
     /// Config-owned forge connections (ADR-0060 part D), parsed and fully
     /// resolved at boot from `SCARAB_CONNECTIONS[_FILE]`. Empty = every
     /// connection is DB-owned (the pre-0060 world). Each of these is
@@ -463,12 +543,31 @@ pub enum ConfigError {
     InvalidStepTimeout,
 
     #[error(
+        "SCARAB_CAS_CONCURRENCY is set but invalid — want a positive integer number of \
+         in-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2; default \
+         32). Falling back to the default would silently serve a throughput the \
+         operator did not ask for, which is exactly the kind of quiet substitution \
+         SCARAB_STEP_TIMEOUT_SECS already refuses."
+    )]
+    InvalidCasConcurrency,
+
+    #[error(
         "the declarative `connections:` block is invalid (ADR-0060 part D): {0}\n\
          A connection Scarab cannot construct would fail at first webhook, not at boot \
          (ADR-0048), so this refuses to start. Fix SCARAB_CONNECTIONS[_FILE] \
          (Helm: scarab.connections) and redeploy."
     )]
     InvalidConnections(String),
+
+    #[error(
+        "--role workspace is set but SCARAB_WORKSPACE_TOKEN_SECRET is not (ADR-0048/0061). \
+         The workspace service serves Workspace Snapshots — every byte of every step's \
+         inputs — so without a token secret it would serve them to any unauthenticated \
+         caller. Set the same secret the control plane mints tokens with, or drop \
+         --role workspace. SCARAB_DEV_INSECURE does NOT relax this: it covers missing \
+         authenticators, not an open data plane."
+    )]
+    MissingWorkspaceTokenSecret,
 }
 
 impl Config {
@@ -480,13 +579,17 @@ impl Config {
 
     /// [`resolve`](Self::resolve) with an injectable environment (tests).
     fn resolve_from(cli: &Cli, env: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
-        // Postgres first: mandatory for every serving role, and deliberately
-        // NOT relaxed by the dev escape hatch (ADR-0048).
-        let database_url = cli
-            .database_url
-            .clone()
-            .filter(|u| !u.is_empty())
-            .ok_or(ConfigError::MissingDatabaseUrl)?;
+        // Postgres first: mandatory for every role that touches the durable
+        // core, and deliberately NOT relaxed by the dev escape hatch
+        // (ADR-0048). The ONE carve-out is the ADR-0061 workspace service,
+        // which is a data-plane role — see `Role::needs_durable_core`. The
+        // check is scoped, not weakened: `--role workspace` is the only value
+        // that reaches the `None` branch.
+        let database_url = match cli.database_url.clone().filter(|u| !u.is_empty()) {
+            Some(url) => Some(url),
+            None if !cli.role.needs_durable_core() => None,
+            None => return Err(ConfigError::MissingDatabaseUrl),
+        };
 
         let dev_insecure = matches!(
             env("SCARAB_DEV_INSECURE").as_deref(),
@@ -506,6 +609,10 @@ impl Config {
                 Some(key)
             }
             None if dev_insecure => None,
+            // Same carve-out, same reason: the workspace service decrypts
+            // nothing. It never constructs a `SecretProvider`, so a KEK there
+            // would be a key nothing uses.
+            None if !cli.role.needs_durable_core() => None,
             None => return Err(ConfigError::MissingMasterKey),
         };
 
@@ -608,10 +715,51 @@ impl Config {
             None => 3_600,
         };
 
+        // ADR-0061 s2's CAS-leg parallelism. Read here, not in the adapter: an
+        // ambient env read there could neither fail the boot nor be reported.
+        let cas_concurrency = match env(scarab_storage_s3::CAS_CONCURRENCY_ENV)
+            .filter(|v| !v.trim().is_empty())
+        {
+            Some(v) => v
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or(ConfigError::InvalidCasConcurrency)?,
+            None => scarab_storage_s3::DEFAULT_CAS_CONCURRENCY,
+        };
+
         // Declarative connections (ADR-0060 part D). Parsed, validated AND
         // credential-resolved here: the whole point of the block is that a boot
         // either has working config-owned connections or refuses.
         let connections = connections_from_env(&env)?;
+
+        // Workspace service (ADR-0061). Selected by its token secret, mirroring
+        // the results-egress knob. `--role workspace` without one would serve
+        // Workspace Snapshots to any unauthenticated caller, so that
+        // combination refuses the boot rather than starting an open service.
+        let workspace = match env("SCARAB_WORKSPACE_TOKEN_SECRET").filter(|v| !v.is_empty()) {
+            Some(secret) => Some(WorkspaceServiceConfig {
+                token_secret: secret.into_bytes(),
+                url: env("SCARAB_WORKSPACE_URL")
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "http://scarab-workspace".into()),
+                data_dir: env("SCARAB_WORKSPACE_DATA_DIR")
+                    .filter(|v| !v.is_empty())
+                    // Dev default beside the object dir; the chart sets
+                    // /var/lib/scarab/cas on the PV.
+                    .unwrap_or_else(|| "./.scarab/workspace-cas".into()),
+                fetcher_image: env("SCARAB_WSFETCH_IMAGE")
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| {
+                        scarab_executor_k8s::DEFAULT_WSFETCH_IMAGE.to_string()
+                    }),
+            }),
+            None if matches!(cli.role, Role::Workspace) => {
+                return Err(ConfigError::MissingWorkspaceTokenSecret)
+            }
+            None => None,
+        };
 
         let results_egress = env("SCARAB_RESULTS_TOKEN_SECRET").map(|secret| ResultsEgressConfig {
             token_secret: secret.into_bytes(),
@@ -629,6 +777,7 @@ impl Config {
             executor: cli.executor,
             store,
             results_egress,
+            workspace,
             github_webhook_secret: env("SCARAB_GITHUB_WEBHOOK_SECRET").map(String::into_bytes),
             forgejo_webhook_secret: env("SCARAB_FORGEJO_WEBHOOK_SECRET").map(String::into_bytes),
             gate_token_secret: env("SCARAB_GATE_TOKEN_SECRET").map(String::into_bytes),
@@ -675,6 +824,7 @@ impl Config {
                     .ok_or(ConfigError::InvalidRetention)?,
                 None => 14,
             },
+            cas_concurrency,
             connections,
         })
     }
@@ -718,11 +868,21 @@ impl Config {
         vec![
             format!("role: {:?}", self.role),
             format!("addr: {}", self.addr),
-            format!(
-                "database: {} (mandatory, ADR-0048)",
-                redact_url(&self.database_url)
-            ),
+            match &self.database_url {
+                Some(url) => format!("database: {} (mandatory, ADR-0048)", redact_url(url)),
+                None => "database: NONE — data-plane role, no durable core (ADR-0061)".to_string(),
+            },
             format!("object store: {store}"),
+            format!(
+                "cas leg concurrency: {} in-flight round-trips{} (ADR-0061 s2; \
+                 peak memory ≈ concurrency × largest blob)",
+                self.cas_concurrency,
+                if self.cas_concurrency == scarab_storage_s3::DEFAULT_CAS_CONCURRENCY {
+                    " (default)"
+                } else {
+                    " (SCARAB_CAS_CONCURRENCY)"
+                },
+            ),
             format!(
                 "executor: {:?} (namespace={}, driver {})",
                 self.executor,
@@ -771,6 +931,14 @@ impl Config {
                 "results egress: {} (ADR-0042)",
                 on_off(self.results_egress.is_some())
             ),
+            match (&self.workspace, self.role) {
+                (Some(ws), Role::Workspace) => format!(
+                    "workspace service: SERVING (ADR-0061; warm tier {}, cold = object store above)",
+                    ws.data_dir,
+                ),
+                (Some(ws), _) => format!("workspace service: client at {} (ADR-0061)", ws.url),
+                (None, _) => "workspace service: disabled (ADR-0061)".to_string(),
+            },
             format!(
                 "github webhook: {}",
                 on_off(self.github_webhook_secret.is_some())
@@ -1080,6 +1248,75 @@ mod tests {
         assert_eq!(err, ConfigError::MissingDatabaseUrl);
     }
 
+    /// ADR-0061 D1.1a: the workspace service is a data-plane role, so the
+    /// durable-core gate is SCOPED to the roles that have a durable core. It is
+    /// not weakened — see the two tests below it.
+    #[test]
+    fn the_workspace_role_boots_without_postgres_or_a_kek() {
+        let mut cli = cli(None);
+        cli.role = Role::Workspace;
+        let config = Config::resolve_from(
+            &cli,
+            dev_env(&[("SCARAB_WORKSPACE_TOKEN_SECRET", "ws-secret")]),
+        )
+        .expect("the data-plane role needs neither Postgres nor a KEK");
+        assert!(config.database_url.is_none());
+        assert!(config.master_key.is_none());
+        assert_eq!(
+            config.workspace.as_ref().map(|w| w.token_secret.clone()),
+            Some(b"ws-secret".to_vec())
+        );
+        // And the report says so out loud, rather than printing a blank URL.
+        assert!(config
+            .startup_report()
+            .iter()
+            .any(|l| l.contains("database: NONE")));
+    }
+
+    /// The carve-out must be exactly one role wide. If this ever passes for
+    /// `Api`, the ADR-0048 "no API-only mode" rule has been quietly repealed.
+    #[test]
+    fn no_other_role_gets_the_workspace_carve_out() {
+        for role in [Role::Converged, Role::Api, Role::Scheduler, Role::Executor, Role::Webhook] {
+            let mut cli = cli(None);
+            cli.role = role;
+            assert_eq!(
+                Config::resolve_from(&cli, dev_env(&[])).unwrap_err(),
+                ConfigError::MissingDatabaseUrl,
+                "{role:?} must still require Postgres"
+            );
+        }
+    }
+
+    /// A workspace service with no token secret would serve every step's inputs
+    /// to anyone who can reach the port. That is not a dev convenience.
+    #[test]
+    fn the_workspace_role_refuses_to_boot_without_a_token_secret() {
+        let mut cli = cli(None);
+        cli.role = Role::Workspace;
+        assert_eq!(
+            Config::resolve_from(&cli, dev_env(&[])).unwrap_err(),
+            ConfigError::MissingWorkspaceTokenSecret,
+        );
+    }
+
+    /// The workspace token secret is NOT the results-egress secret: sharing one
+    /// would turn a results-write credential into a content read+write
+    /// credential and let the workspace service forge step results.
+    #[test]
+    fn the_workspace_and_results_secrets_are_separate_knobs() {
+        let config = Config::resolve_from(
+            &cli(Some("postgres://l/scarab")),
+            dev_env(&[("SCARAB_RESULTS_TOKEN_SECRET", "results-secret")]),
+        )
+        .unwrap();
+        assert!(config.results_egress.is_some());
+        assert!(
+            config.workspace.is_none(),
+            "the results secret must not enable the workspace service"
+        );
+    }
+
     #[test]
     fn missing_master_key_refuses_without_the_dev_flag() {
         let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), no_env).unwrap_err();
@@ -1191,6 +1428,63 @@ mod tests {
         assert!(cfg.github_webhook_secret.is_none());
         assert!(cfg.gate_token_secret.is_none());
         assert!(cfg.oidc.is_none());
+    }
+
+    /// `SCARAB_CAS_CONCURRENCY` (ADR-0061 s2) is a real knob, not an ambient env
+    /// read in the adapter: it defaults, it is reported, and — the part that was
+    /// wrong — a junk value FAILS THE BOOT instead of silently substituting 32.
+    /// An operator who typos this knob is asking for a specific throughput; the
+    /// old fallback answered "sure" and served a different one.
+    #[test]
+    fn cas_concurrency_defaults_is_reported_and_refuses_junk() {
+        let base = cli(Some("postgres://l/scarab"));
+
+        let cfg = Config::resolve_from(&base, dev_env(&[])).unwrap();
+        assert_eq!(
+            cfg.cas_concurrency,
+            scarab_storage_s3::DEFAULT_CAS_CONCURRENCY
+        );
+        // Reported, so the live value is answerable from the boot log alone.
+        let report = cfg.startup_report().join("\n");
+        assert!(
+            report.contains("cas leg concurrency: 32 in-flight round-trips (default)"),
+            "the default must be in the startup report: {report}"
+        );
+
+        let cfg = Config::resolve_from(&base, dev_env(&[("SCARAB_CAS_CONCURRENCY", " 96 ")]))
+            .expect("a padded integer is still an integer");
+        assert_eq!(cfg.cas_concurrency, 96);
+        assert!(cfg
+            .startup_report()
+            .join("\n")
+            .contains("cas leg concurrency: 96 in-flight round-trips (SCARAB_CAS_CONCURRENCY)"));
+
+        // Empty is "unset" (a Helm `casConcurrency: ""` renders no key, but an
+        // explicit empty env var must not be a boot failure either).
+        assert_eq!(
+            Config::resolve_from(&base, dev_env(&[("SCARAB_CAS_CONCURRENCY", "")]))
+                .unwrap()
+                .cas_concurrency,
+            scarab_storage_s3::DEFAULT_CAS_CONCURRENCY
+        );
+
+        // Junk and zero both refuse. Zero especially: `with_concurrency` clamps
+        // it to 1, i.e. the serial behaviour ADR-0061 s2 exists to remove — a
+        // 30× slowdown is not a reasonable reading of a typo.
+        for vars in [
+            &[("SCARAB_CAS_CONCURRENCY", "nonsense")] as &'static [(&str, &str)],
+            &[("SCARAB_CAS_CONCURRENCY", "0")],
+            &[("SCARAB_CAS_CONCURRENCY", "-4")],
+            &[("SCARAB_CAS_CONCURRENCY", "32.5")],
+        ] {
+            let bad = vars[0].1;
+            let err = Config::resolve_from(&base, dev_env(vars))
+                .expect_err("junk CAS concurrency must refuse the boot");
+            assert!(
+                matches!(err, ConfigError::InvalidCasConcurrency),
+                "{bad:?} gave {err:?}"
+            );
+        }
     }
 
     #[test]

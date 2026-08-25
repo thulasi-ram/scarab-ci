@@ -45,9 +45,9 @@ pub const MAX_DELIVERY_ATTEMPTS: u32 = 10;
 /// and the grace keeps the two from racing in the normal case.
 const TIMEOUT_BACKSTOP_GRACE_MS: i64 = 60_000;
 use crate::{
-    Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db, DbError, EventKind,
-    EventPayload, ExecError, Executor, FailureKind, OutboxMessage, RunId, RunStatus, StepId,
-    StepRun, StepSpec, StepStatus, Timestamp, TransitionError, EVENT_VERSION,
+    ports::WorkspaceSnapshots, Attempt, AttemptId, AttemptOutcome, Clock, ConcurrencyPolicy, Db,
+    DbError, EventKind, EventPayload, ExecError, Executor, FailureKind, OutboxMessage, RunId,
+    RunStatus, StepId, StepRun, StepSpec, StepStatus, Timestamp, TransitionError, EVENT_VERSION,
 };
 
 /// Outbox `kind` for "launch this step".
@@ -146,6 +146,239 @@ pub enum RerunError {
     GateNotPending { step: StepId, status: StepStatus },
 }
 
+/// One expired input on a rerun: the Workspace Snapshot `consumer` would have
+/// materialised, the step that `produced` it, and the merkle `root` the store no
+/// longer holds (ADR-0061 s5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpiredInput {
+    /// The step whose input workspace is incomplete.
+    pub consumer: StepId,
+    /// The upstream step that produced the missing snapshot — the step the rerun
+    /// is widened to include, so the data comes back.
+    pub produced_by: StepId,
+    /// The CAS merkle root that is gone.
+    pub root: String,
+}
+
+/// What a rerun/retry of a target will actually execute — resolved *before*
+/// anything is re-armed, so a widened scope can be shown to a human before they
+/// confirm it (ADR-0027: smart never means mysterious).
+///
+/// Produced by [`plan_rerun`] (read-only dry run) and returned by
+/// [`rerun_step_widened`] / [`retry_step_widened`] (what was done).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RerunPlan {
+    /// The step the human targeted.
+    pub target: StepId,
+    /// Every step that will re-execute, sorted — the invalidation set
+    /// (`target` + transitive descendants, ADR-0027) **after** any widening.
+    pub invalidated: Vec<StepId>,
+    /// The subset of `invalidated` that is there only because a Workspace
+    /// Snapshot expired (ADR-0061 s5) — upstream steps dragged in to regenerate
+    /// data, plus their own descendants. Empty on an ordinary rerun.
+    pub widened: Vec<StepId>,
+    /// The expired snapshots that caused the widening, in discovery order.
+    pub expired: Vec<ExpiredInput>,
+    /// The steps the widened run effectively **starts from**: members of
+    /// `invalidated` with no dependency inside `invalidated`. On an ordinary
+    /// rerun that is just `[target]`; when inputs expired all the way back it is
+    /// the `clone` step (ADR-0045) — which is exactly the phrase the rerun
+    /// affordance must say out loud.
+    pub starts_from: Vec<StepId>,
+}
+
+impl RerunPlan {
+    /// Did expired Workspace Snapshots widen this rerun beyond what the human
+    /// pointed at?
+    pub fn is_widened(&self) -> bool {
+        !self.widened.is_empty()
+    }
+}
+
+/// Resolve, **without mutating anything**, what a rerun of `target` would
+/// execute — the preview behind the rerun affordance (ADR-0061 s5).
+///
+/// Pass the [`WorkspaceSnapshots`] oracle to get the widened answer; pass `None`
+/// for the plain invalidation set. `StepNotFound` for an unknown target; unlike
+/// [`rerun_step`] this does **not** reject on an unsatisfied prerequisite,
+/// because a preview of a blocked rerun is still a useful thing to render (the
+/// UI already knows the prerequisite rule and the POST still enforces it).
+pub async fn plan_rerun(
+    db: &dyn Db,
+    snapshots: Option<&dyn WorkspaceSnapshots>,
+    run: &RunId,
+    target: &StepId,
+) -> Result<RerunPlan, RerunError> {
+    let steps = db.steps_of_run(run).await?;
+    if !steps.iter().any(|s| &s.step == target) {
+        return Err(RerunError::StepNotFound(target.clone()));
+    }
+    plan_rerun_over(db, snapshots, run, target, &steps).await
+}
+
+/// [`plan_rerun`] over an already-read step snapshot (the rerun path has one in
+/// hand and must not re-read it — the plan it records has to describe the same
+/// instant its prerequisite check ran against).
+async fn plan_rerun_over(
+    db: &dyn Db,
+    snapshots: Option<&dyn WorkspaceSnapshots>,
+    run: &RunId,
+    target: &StepId,
+    steps: &[StepRun],
+) -> Result<RerunPlan, RerunError> {
+    let base = crate::invalidation_set(target, steps);
+    let mut invalid = base.clone();
+    let mut expired: Vec<ExpiredInput> = Vec::new();
+
+    if let Some(oracle) = snapshots {
+        // The consumption sets and recorded output snapshots, read once. Both are
+        // the *same* resolutions the launch path uses (`workspace_inputs` over the
+        // explicit `inputs:` subset, else all `needs`), so what the plan reasons
+        // about is exactly what a Step would try to materialise (ADR-0007).
+        let mut consumed_of: HashMap<StepId, Vec<StepId>> = HashMap::new();
+        let mut output_of: HashMap<StepId, String> = HashMap::new();
+        for s in steps {
+            let explicit = db.step_inputs(run, &s.step).await?;
+            consumed_of.insert(s.step.clone(), explicit.unwrap_or_else(|| s.needs.clone()));
+            if let Some(o) = db.step_output(run, &s.step).await? {
+                output_of.insert(s.step.clone(), o);
+            }
+        }
+
+        // Fixpoint. For the current set, look at its BOUNDARY — the producers it
+        // consumes that are NOT themselves re-running, and whose recorded snapshot
+        // must therefore still exist. A proven-absent snapshot makes its producer a
+        // new invalidation root, and re-running a producer cascades to ALL of its
+        // descendants, so widening reuses `invalidation_set` rather than poking
+        // members in one at a time (ADR-0027 owns what a re-execution drags with
+        // it; this only changes where it starts). Monotone over a finite DAG, so it
+        // terminates — in the limit at `clone`, which consumes nothing.
+        let mut present: HashMap<String, bool> = HashMap::new();
+        loop {
+            let mut new_roots: Vec<StepId> = Vec::new();
+            let mut boundary: Vec<(StepId, StepId, String)> = Vec::new();
+            for s in steps {
+                if !invalid.contains(&s.step) {
+                    continue;
+                }
+                for p in consumed_of.get(&s.step).into_iter().flatten() {
+                    if invalid.contains(p) {
+                        continue; // producer re-runs too — its old snapshot is moot
+                    }
+                    if let Some(root) = output_of.get(p) {
+                        boundary.push((s.step.clone(), p.clone(), root.clone()));
+                    }
+                }
+            }
+            // Deterministic order, so the recorded plan and the reported diagnostic
+            // do not depend on map iteration order.
+            boundary.sort_by(|a, b| (&a.0 .0, &a.1 .0, &a.2).cmp(&(&b.0 .0, &b.1 .0, &b.2)));
+            boundary.dedup();
+            for (consumer, producer, root) in boundary {
+                let ok = match present.get(&root) {
+                    Some(ok) => *ok,
+                    None => {
+                        let ok = oracle.snapshot_present(&root).await;
+                        present.insert(root.clone(), ok);
+                        ok
+                    }
+                };
+                if !ok && !new_roots.contains(&producer) {
+                    expired.push(ExpiredInput {
+                        consumer,
+                        produced_by: producer.clone(),
+                        root,
+                    });
+                    new_roots.push(producer);
+                }
+            }
+            if new_roots.is_empty() {
+                break;
+            }
+            for r in &new_roots {
+                for s in crate::invalidation_set(r, steps) {
+                    invalid.insert(s);
+                }
+            }
+        }
+    }
+
+    let mut invalidated: Vec<StepId> = invalid.iter().cloned().collect();
+    invalidated.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut widened: Vec<StepId> = invalid.difference(&base).cloned().collect();
+    widened.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Where the run effectively restarts: the members with no dependency inside
+    // the set. `needs` (not the consumption subset) is the right edge here — a
+    // step waits on all of its `needs` whether or not it inherits their
+    // workspaces, so a dependency inside the set means this member is not the
+    // starting point.
+    let mut starts_from: Vec<StepId> = steps
+        .iter()
+        .filter(|s| invalid.contains(&s.step) && !s.needs.iter().any(|n| invalid.contains(n)))
+        .map(|s| s.step.clone())
+        .collect();
+    starts_from.sort_by(|a, b| a.0.cmp(&b.0));
+
+    Ok(RerunPlan {
+        target: target.clone(),
+        invalidated,
+        widened,
+        expired,
+        starts_from,
+    })
+}
+
+/// **Pin** a Run's Workspace Snapshots (ADR-0061 s5): keep them past the cold
+/// tier's retention TTL so an investigation is not raced by the sweeper.
+/// Durable fact + audit event, in that order. `Ok(false)` = no such Run.
+///
+/// The pin acts on the cold tier's *time* bound only — it says nothing about the
+/// warm workspace service, which is bounded by space and evicts LRU. That is the
+/// whole point of two tiers: only the time-bounded one carries a promise, so
+/// only it can be extended.
+pub async fn pin_run_snapshots(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    by: Option<String>,
+) -> Result<bool, DbError> {
+    let now = clock.now().await;
+    if !db.pin_run_snapshots(run, by.as_deref(), now).await? {
+        return Ok(false);
+    }
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::RunSnapshotsPinned { by },
+        at: now,
+    })
+    .await?;
+    Ok(true)
+}
+
+/// Release a [pin](pin_run_snapshots), returning the Run's Workspace Snapshots
+/// to the ordinary TTL. `Ok(false)` = no such Run.
+pub async fn unpin_run_snapshots(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    run: &RunId,
+    by: Option<String>,
+) -> Result<bool, DbError> {
+    if !db.unpin_run_snapshots(run).await? {
+        return Ok(false);
+    }
+    let now = clock.now().await;
+    db.append_event(&EventKind {
+        version: EVENT_VERSION,
+        run: run.clone(),
+        kind: EventPayload::RunSnapshotsUnpinned { by },
+        at: now,
+    })
+    .await?;
+    Ok(true)
+}
+
 /// Rerun a step (ADR-0027): re-arm `target` and every step that transitively
 /// depends on it back to `Pending`, then reopen a settled run. A subsequent
 /// admission mints a fresh [`Attempt`] for each re-armed step and re-runs them
@@ -155,15 +388,26 @@ pub enum RerunError {
 /// Needs only the [`Db`] and [`Clock`] ports (no executor), so the API role can
 /// call it directly without an execution backend.
 ///
-/// ACCEPTED INEFFICIENCY — deliberately not built (see ADR-0027 amendment
-/// 2026-07-24). Content-addressed *skip*-if-unchanged (skip a descendant when
-/// the rerun step's new output hash equals its old one) would spare downstream
-/// steps whose inputs did not actually change. We do NOT do this: every
-/// re-armed descendant re-runs — the always-cascade branch. That is correct
-/// (downstream never sees stale inputs), merely wasteful when a rerun
-/// reproduces an identical output. Left unbuilt on purpose; revisit only if
-/// identical-rebuild waste becomes a real, measured pain — the per-step
-/// output-snapshot substrate it would need is already in place.
+/// **Skip-if-unchanged IS built** — this comment used to say the opposite, ~1000
+/// lines above the admission code that implements it, and ADR-0027's 2026-07-24
+/// amendment said the same. Both were wrong. What re-arming does is put the
+/// invalidation set back to `Pending`; **admission** then decides per step
+/// whether to run it, by comparing the step's recomputed input signature to the
+/// one it last consumed (`tick`, "Skip-if-unchanged"). A descendant whose
+/// upstreams produced the same content is skipped and carries its prior output
+/// forward; the explicit target has its stored signature cleared here, so it
+/// always re-runs.
+///
+/// **Why reading this function and concluding "not built" is so easy** — because
+/// it is a correct reading of *this* function. `rerun_step` compares nothing; it
+/// re-arms and stops. Admission is the only place a `Pending` step's fate is
+/// decided, so "is skip-if-unchanged built?" is not answerable here. The
+/// 2026-07-24 claim was wrong by twelve days (`7ea905d` shipped it on 07-12), and
+/// then ADR-0061 s7 accidentally made it *true in effect* on 07-27 by putting
+/// mtimes in the tree-hash preimage — a re-run could no longer reproduce its own
+/// root, so nothing was ever skipped (git-bug `945b1f4`). The signature is over
+/// **content identities** now (ADR-0061 s8), which is what makes the rule live
+/// again as well as present.
 pub async fn rerun_step(
     db: &dyn Db,
     clock: &dyn Clock,
@@ -171,6 +415,33 @@ pub async fn rerun_step(
     target: &StepId,
     by: Option<String>,
 ) -> Result<(), RerunError> {
+    rerun_step_widened(db, clock, None, run, target, by)
+        .await
+        .map(|_| ())
+}
+
+/// [`rerun_step`], plus the ADR-0061 s5 **graceful degradation**: with a
+/// [`WorkspaceSnapshots`] oracle, an input Workspace Snapshot the store no
+/// longer holds *widens* the rerun upstream — the producing steps are dragged
+/// into the invalidation set so the data is regenerated — instead of dispatching
+/// a Step that could never be provisioned.
+///
+/// `rerun_step` is this function with the oracle omitted, which is the pre-0061
+/// behaviour: no presence check, no widening. Callers that hold the store (the
+/// API) pass it; callers that do not (in-process tests, the local executor
+/// wiring) keep the plain entry point.
+///
+/// Returns the [`RerunPlan`] that was executed, so the caller can tell the user
+/// what actually happened — the widened scope is *never* a silent expansion
+/// (ADR-0027: smart never means mysterious).
+pub async fn rerun_step_widened(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    snapshots: Option<&dyn WorkspaceSnapshots>,
+    run: &RunId,
+    target: &StepId,
+    by: Option<String>,
+) -> Result<RerunPlan, RerunError> {
     let steps = db.steps_of_run(run).await?;
     let Some(target_step) = steps.iter().find(|s| &s.step == target) else {
         return Err(RerunError::StepNotFound(target.clone()));
@@ -187,22 +458,22 @@ pub async fn rerun_step(
             blocker,
         });
     }
-    let invalid = crate::invalidation_set(target, &steps);
+    let plan = plan_rerun_over(db, snapshots, run, target, &steps).await?;
 
     // The Take boundary (ADR-0056): record the human intervention FIRST, so a
     // Take view — a pure event-log replay up to this event — sees the run
     // exactly as it stood when the button was pressed. Carries the resolved
-    // invalidation set (deterministic record) and the acting principal.
+    // invalidation set (deterministic record), the widened subset (ADR-0061 s5)
+    // and the acting principal.
     let now = clock.now().await;
-    let mut invalidated: Vec<StepId> = invalid.iter().cloned().collect();
-    invalidated.sort_by(|a, b| a.0.cmp(&b.0));
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
         kind: EventPayload::RunRerunRequested {
             target: target.clone(),
-            invalidated,
+            invalidated: plan.invalidated.clone(),
             by: by.clone(),
+            widened: plan.widened.clone(),
         },
         at: now,
     })
@@ -227,7 +498,8 @@ pub async fn rerun_step(
         }
     }
 
-    rearm_invalidation_set(db, clock, run, target, &invalid, &steps, by).await
+    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by).await?;
+    Ok(plan)
 }
 
 /// Retry a **Failed** step (ADR-0056 amendment 2026-07-22): re-execute it (and
@@ -244,6 +516,23 @@ pub async fn retry_step(
     target: &StepId,
     by: Option<String>,
 ) -> Result<(), RerunError> {
+    retry_step_widened(db, clock, None, run, target, by)
+        .await
+        .map(|_| ())
+}
+
+/// [`retry_step`] with the ADR-0061 s5 snapshot oracle — see
+/// [`rerun_step_widened`]. Widening is orthogonal to the Take question: a Retry
+/// whose inputs expired still has to regenerate them, and it still does so
+/// *within* the current Take.
+pub async fn retry_step_widened(
+    db: &dyn Db,
+    clock: &dyn Clock,
+    snapshots: Option<&dyn WorkspaceSnapshots>,
+    run: &RunId,
+    target: &StepId,
+    by: Option<String>,
+) -> Result<RerunPlan, RerunError> {
     let steps = db.steps_of_run(run).await?;
     let Some(target_step) = steps.iter().find(|s| &s.step == target) else {
         return Err(RerunError::StepNotFound(target.clone()));
@@ -262,26 +551,26 @@ pub async fn retry_step(
             blocker,
         });
     }
-    let invalid = crate::invalidation_set(target, &steps);
+    let plan = plan_rerun_over(db, snapshots, run, target, &steps).await?;
 
     // Attribution/audit fact — NOT a Take boundary (`deriveTakes` ignores it),
     // so the retried attempts land in the current Take's history.
     let now = clock.now().await;
-    let mut invalidated: Vec<StepId> = invalid.iter().cloned().collect();
-    invalidated.sort_by(|a, b| a.0.cmp(&b.0));
     db.append_event(&EventKind {
         version: EVENT_VERSION,
         run: run.clone(),
         kind: EventPayload::StepRetryRequested {
             target: target.clone(),
-            invalidated,
+            invalidated: plan.invalidated.clone(),
             by: by.clone(),
+            widened: plan.widened.clone(),
         },
         at: now,
     })
     .await?;
 
-    rearm_invalidation_set(db, clock, run, target, &invalid, &steps, by).await
+    rearm_invalidation_set(db, clock, run, target, &plan, &steps, by).await?;
+    Ok(plan)
 }
 
 /// The first `need` of `step` that is **not** in a non-failing terminal state
@@ -312,15 +601,30 @@ async fn rearm_invalidation_set(
     clock: &dyn Clock,
     run: &RunId,
     target: &StepId,
-    invalid: &std::collections::HashSet<StepId>,
+    plan: &RerunPlan,
     steps: &[StepRun],
     by: Option<String>,
 ) -> Result<(), RerunError> {
+    // The set to re-arm comes from the PLAN, not from a second `invalidation_set`
+    // call: the plan is what was recorded on the boundary event and (for a widened
+    // rerun) what the user was shown, so re-deriving it here could only ever
+    // disagree with both.
+    let invalid: std::collections::HashSet<&StepId> = plan.invalidated.iter().collect();
     // Force the explicit target to re-run: clear its stored input signature so
     // admission never mistakes it for an unchanged descendant and skips it
     // (ADR-0027). Its descendants keep their signatures, so they skip-if-unchanged
     // once the target has re-run and its output is known.
     db.set_step_input(run, target, None).await?;
+
+    // Every WIDENED step likewise (ADR-0061 s5). This is load-bearing, not
+    // belt-and-braces: a widened step is upstream, so it is *not* a descendant of
+    // the target, and its stored signature still matches what it consumed last
+    // time (a re-run `clone` reproduces the same tree hash by construction). Left
+    // alone, admission would "skip — inputs unchanged" and carry the DEAD
+    // snapshot forward, and the widening would have achieved nothing.
+    for w in &plan.widened {
+        db.set_step_input(run, w, None).await?;
+    }
 
     // Reopen a settled run so admission picks the re-armed steps back up.
     if let Some(current) = db.run_status(run).await? {
@@ -1205,10 +1509,23 @@ impl<'a> Scheduler<'a> {
 
         // Outputs recorded so far — the material for each step's input signature
         // (restart skip-if-unchanged, ADR-0027).
-        let mut output_of: HashMap<StepId, String> = HashMap::new();
+        //
+        // The signature is built over each upstream's **content identity**, not
+        // its snapshot root, and that distinction is the whole of git-bug
+        // `945b1f4`: a root covers every file's mtime, so a producer re-running
+        // writes identical bytes at a new wall clock and can never reproduce it.
+        // Signing roots therefore always reports "changed" and nothing downstream
+        // is ever skipped — skip-if-unchanged looked built and was dead.
+        // `Db::step_output_identity` falls back to the root when a row carries no
+        // identity, which cascades rather than falsely skipping.
+        //
+        // The map is named for what it holds: comparison digests, NOT snapshot
+        // roots. The launch path further down builds its own from `step_output`,
+        // because materializing a workspace needs the address.
+        let mut signature_of: HashMap<StepId, String> = HashMap::new();
         for s in &steps {
-            if let Some(out) = self.db.step_output(run, &s.step).await? {
-                output_of.insert(s.step.clone(), out);
+            if let Some(id) = self.db.step_output_identity(run, &s.step).await? {
+                signature_of.insert(s.step.clone(), id);
             }
         }
 
@@ -1301,11 +1618,11 @@ impl<'a> Scheduler<'a> {
                 let cur = crate::input_signature(
                     &step.needs,
                     explicit_inputs.as_deref(),
-                    &output_of,
+                    &signature_of,
                 );
                 let prev = self.db.step_input(run, &step.step).await?;
-                let unchanged =
-                    output_of.contains_key(&step.step) && prev.as_deref() == Some(cur.as_str());
+                let unchanged = signature_of.contains_key(&step.step)
+                    && prev.as_deref() == Some(cur.as_str());
                 if unchanged {
                     self.skip_unchanged(run, &step.step).await?;
                 } else {
@@ -1334,6 +1651,8 @@ impl<'a> Scheduler<'a> {
                         id: attempt.clone(),
                         started_at: now,
                         failure: None,
+                        failure_detail: None,
+                        output_durability: None,
                         outcome: AttemptOutcome::Running,
                     },
                 )
@@ -1707,17 +2026,17 @@ impl<'a> Scheduler<'a> {
                     let spec = match self.interpolate_spec(&run, &step, spec).await? {
                         Ok(spec) => spec,
                         // A bad `${{ … }}` reference fails the step before any Pod
-                        // is created (ADR-0041 fail-fast). NOTE: the reason is
-                        // currently dropped, so this surfaces as a bare `step`
-                        // failure with no logs — see follow-up to thread a failure
-                        // message out to the event/attempt grain.
-                        Err(_reason) => {
+                        // is created (ADR-0041 fail-fast). The reason rides the
+                        // attempt/event grain as the failure cause (4cf03d7) — a
+                        // Pod-less failure has no logs, so this IS its evidence.
+                        Err(reason) => {
                             self.finalize_step(
                                 &run,
                                 &step,
                                 &attempt,
                                 StepStatus::Failed,
                                 Some(FailureKind::Step),
+                                Some(reason),
                             )
                             .await?;
                             self.db.mark_dispatched(msg.id).await?;
@@ -1734,6 +2053,8 @@ impl<'a> Scheduler<'a> {
                             id: attempt.clone(),
                             started_at: self.clock.now().await,
                             failure: None,
+                            failure_detail: None,
+                            output_durability: None,
                             outcome: AttemptOutcome::Running,
                         }],
                         needs: Vec::new(),
@@ -1753,26 +2074,36 @@ impl<'a> Scheduler<'a> {
             match self.executor.poll(&handle).await? {
                 ExecState::Succeeded => {
                     // Record the output workspace snapshot (if the backend
-                    // produced one) so dependents can materialize it and restart
-                    // can compare it for skip-if-unchanged (ADR-0027, 0029).
+                    // produced one) so dependents can materialize it, plus its
+                    // content identity so restart can ask whether the content
+                    // changed (ADR-0027, 0029, 0061 s8 — the two are different
+                    // digests, see `Executor::output_identity`).
                     // Attempt-grain (ADR-0056): the write lands on both the
                     // attempt's immutable evidence row and the step's
                     // latest-evidence denormalization.
                     //
-                    // DEFERRED — the sibling `outputs:` per-PATH publishing
-                    // selection (scarab_pipeline::StepSpec::outputs) is NOT honored
-                    // here. This records the merkle root of the WHOLE workspace
-                    // (shipped behavior). Restricting the published snapshot to an
-                    // authored path subset needs CAS *sub-tree* addressing — the
-                    // ability to snapshot/materialize a path prefix of a tree — which
-                    // scarab-storage-s3 does not have (it is whole-file / whole-tree
-                    // only). Until that lands, `outputs:` is authored + validated in
-                    // the pipeline spec but deliberately not consumed: it is a no-op,
-                    // NOT silently narrowing. Blocked on CAS sub-tree addressing; see
-                    // docs/followups.md. Do not wire this half without that support.
+                    // (`outputs:` per-path publishing IS honored — by the egress
+                    // leg, which prunes the post-step snapshot with
+                    // `scarab_storage::prune_tree` before the root reaches us. This
+                    // comment used to say it was blocked on "CAS sub-tree
+                    // addressing"; that premise was false and ADR-0007's 2026-07-25
+                    // amendment records why.)
                     if let Some(output) = self.executor.output(&handle).await? {
+                        let identity = self.executor.output_identity(&handle).await?;
+                        // The durability stamp (ADR-0064 s2): the tier the
+                        // Depot reported when the flush released this verdict,
+                        // recorded on the attempt row beside the root — the
+                        // per-attempt answer to "what did Succeeded license?".
+                        let durability = self.executor.output_durability(&handle).await?;
                         self.db
-                            .set_step_output(&run, &step, &attempt, &output)
+                            .set_step_output(
+                                &run,
+                                &step,
+                                &attempt,
+                                &output,
+                                identity.as_deref(),
+                                durability.as_deref(),
+                            )
                             .await?;
                     }
                     // Capture the step's named results (ADR-0041) under the fence,
@@ -1794,11 +2125,11 @@ impl<'a> Scheduler<'a> {
                             .put_artifacts(&run, &step, &attempt, true, &artifacts, now)
                             .await?;
                     }
-                    self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None)
+                    self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
-                ExecState::Failed { class, .. } => {
+                ExecState::Failed { class, cause, .. } => {
                     // A failed attempt's artifacts are evidence — often THE
                     // evidence (the test report of the failure a retry
                     // recovered from). Harvest them too (ADR-0056), marked
@@ -1820,7 +2151,7 @@ impl<'a> Scheduler<'a> {
                         FailureClass::Timeout => FailureKind::Timeout,
                         FailureClass::Config => FailureKind::Config,
                     };
-                    self.settle_failed_attempt(&run, &step, &attempt, kind)
+                    self.settle_failed_attempt(&run, &step, &attempt, kind, cause)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
@@ -1829,7 +2160,7 @@ impl<'a> Scheduler<'a> {
                 // (assertion-gated retry on a NEW fence, budget consumed).
                 // No artifact harvest: the backend object is gone.
                 ExecState::Lost => {
-                    self.settle_failed_attempt(&run, &step, &attempt, FailureKind::Lost)
+                    self.settle_failed_attempt(&run, &step, &attempt, FailureKind::Lost, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
                 }
@@ -1852,8 +2183,14 @@ impl<'a> Scheduler<'a> {
                         let now = self.clock.now().await;
                         if now.0 >= started_at.0 + timeout_ms + TIMEOUT_BACKSTOP_GRACE_MS {
                             let _ = self.executor.cancel(&handle).await;
-                            self.settle_failed_attempt(&run, &step, &attempt, FailureKind::Timeout)
-                                .await?;
+                            self.settle_failed_attempt(
+                                &run,
+                                &step,
+                                &attempt,
+                                FailureKind::Timeout,
+                                None,
+                            )
+                            .await?;
                             self.db.mark_dispatched(msg.id).await?;
                         }
                     }
@@ -2378,12 +2715,17 @@ impl<'a> Scheduler<'a> {
     /// Every retry consumes the attempt budget. A retry re-arms the step to
     /// `Ready`; the next admission claims it and mints a **new Attempt with a
     /// new monotonic fence** — the zombie-fencing mechanism.
+    /// `cause` is the executor's human-readable diagnosis when it reported one
+    /// (ticket 4cf03d7); it rides the attempt row (`failure_detail`) and the
+    /// `AttemptFinished` event, never the retry decision — `kind` alone owns
+    /// policy.
     async fn settle_failed_attempt(
         &self,
         run: &RunId,
         step: &StepId,
         attempt: &AttemptId,
         kind: FailureKind,
+        cause: Option<String>,
     ) -> Result<(), SchedulerError> {
         // Stale-/self-inflicted-observation guard — evaluated BEFORE any write so
         // a doomed observation never touches the attempt row. Two conditions
@@ -2414,7 +2756,7 @@ impl<'a> Scheduler<'a> {
 
         // Record the classified failure on the (frontier) attempt row (idempotent).
         self.db
-            .set_attempt_failure(run, step, attempt, kind)
+            .set_attempt_failure(run, step, attempt, kind, cause.as_deref())
             .await?;
 
         // The author `retry:` budget is per-Take (ADR-0056): a Rerun opens a new
@@ -2455,9 +2797,9 @@ impl<'a> Scheduler<'a> {
         };
 
         if used < allowed {
-            self.rearm_step(run, step, attempt, kind).await
+            self.rearm_step(run, step, attempt, kind, cause).await
         } else {
-            self.finalize_step(run, step, attempt, StepStatus::Failed, Some(kind))
+            self.finalize_step(run, step, attempt, StepStatus::Failed, Some(kind), cause)
                 .await
         }
     }
@@ -2519,6 +2861,7 @@ impl<'a> Scheduler<'a> {
         step: &StepId,
         attempt: &AttemptId,
         kind: FailureKind,
+        cause: Option<String>,
     ) -> Result<(), SchedulerError> {
         match self
             .db
@@ -2533,6 +2876,7 @@ impl<'a> Scheduler<'a> {
                         step: step.clone(),
                         attempt: attempt.clone(),
                         failure: Some(kind),
+                        cause,
                     },
                     now,
                 )
@@ -2601,6 +2945,7 @@ impl<'a> Scheduler<'a> {
         attempt: &AttemptId,
         to: StepStatus,
         failure: Option<FailureKind>,
+        cause: Option<String>,
     ) -> Result<(), SchedulerError> {
         // Optimistic guard: if a peer already finalized this step, our UPDATE
         // matches zero rows (Conflict) — we skip the duplicate events but still
@@ -2626,7 +2971,7 @@ impl<'a> Scheduler<'a> {
                     StepStatus::Failed => {
                         if let Some(kind) = failure {
                             self.db
-                                .set_attempt_failure(run, step, attempt, kind)
+                                .set_attempt_failure(run, step, attempt, kind, cause.as_deref())
                                 .await?;
                         } else {
                             self.db
@@ -2643,6 +2988,7 @@ impl<'a> Scheduler<'a> {
                         step: step.clone(),
                         attempt: attempt.clone(),
                         failure,
+                        cause,
                     },
                     now,
                 )

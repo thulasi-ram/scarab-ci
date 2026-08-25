@@ -87,17 +87,23 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 | **Grant** | A named, closed-vocabulary escalation above the hardened "restricted" step baseline (ADR-0039). `run-as-root` (self-service — does not escape the sandbox); `add-capabilities` and `privileged` (**governed** — require an Environment whitelist entry keyed on the image **digest**, Administer-only). Requested by the pipeline author, granted by the Environment admin, admitted fail-closed. A grant is a ceiling, not a default. |
 | **`placement_profiles`** | A Step field (ADR-0055): a list of **`PlacementProfile`** names. Their admin-defined k8s overlays are merged (in listed order) onto the Step's Pod; empty → the `default` profile. The author **names profiles**, never raw k8s → no topology/k8s leak. Sibling of **`resources`** (exact `cpu`/`memory` — no `size` tiers, ADR-0055). |
 | **PlacementProfile** | An **operator-owned, cluster-scoped** named bundle (ADR-0055) mapping a name → concrete k8s **Placement** (nodeSelector/tolerations/runtimeClass/annotations — an *opaque overlay*, not a fixed schema). Lives in Scarab operator config (gitops), **not** per-Project. One may be `default`. It is *where a Step lands* — **not** an **Environment** (deploy governance), **not** settings of a **Run** (a Pipeline instance). Composed atop the control-plane **placement baseline** (default tolerations/nodeSelector/resources stamped on *every* step Pod). |
+| **RetentionProfile** | An **operator-owned, cluster-scoped** named bundle (ADR-0065) mapping a name → a retention policy: the Data Depot's space budget, per-class TTLs, which directories are Cache-eligible, and the thresholds at which a Snapshot is dropped in favour of re-deriving it. Lives in Scarab operator config (gitops), **not** per-Project. A Pipeline may **name** one; it never defines the values — so no byte cost enters authored YAML. Deliberate sibling of **PlacementProfile**: same pattern, different axis (*how long things are kept* vs *where a Step lands*). Composed with ADR-0061's manual **pin** ("keep this Run's workspaces"), which is the per-Run escape hatch for investigations. |
 | **`k8s_overlay`** | A Step's **governed escape hatch** (ADR-0055): a raw pod-spec fragment merged **last** onto the Pod. Carries **no authority** — like a governed **Grant**, it takes effect only if the Run's Environment permits raw overlays, else the Run is rejected **fail-closed**. The `k8s_` prefix marks the backend-coupling (won't run on the local executor). For the rare *dynamic per-job* k8s need; static placement belongs in a `PlacementProfile`. |
 
-### 4.2 Data plane (five distinct concepts — never conflate)
+### 4.2 Data plane (nine distinct concepts — never conflate)
 
 | Term | Scope | Lifetime | Purpose |
 |---|---|---|---|
 | **Parameter** | launch-time input, supplied from *outside* the run | resolved once at launch, then persisted for the run's life | a typed value a launcher supplies to start a Pipeline. Declared in the Pipeline's `interface.inputs`; each is `required` (static bool) with an optional `default` and optional `validate:` CEL predicate. Supplied by a human/API on a `manual`/`api` launch **and** by an `invoke:` caller's `with:` — one declaration, one env rail (`SCARAB_PARAM_<NAME>`), one launch-time CEL binding `${{ inputs.<name> }}`. **Not** the per-Step workspace `inputs:` (ADR-0007), which is a different concept sharing the word. |
-| **Workspace** | intra-run, flows along DAG edges | ephemeral (per run) | the filesystem/checkout Steps build on. **Content-addressed** (per-file merkle CAS). Implicit-by-default (inherit `needs`), explicit-on-demand (`inputs:`/`outputs:`). |
-| **Result** | intra-run, flows along DAG edges | ephemeral | small typed values (a version, a bool) for params/conditionals. |
-| **Artifact** | output of record | retained (TTL), downloadable, UI-visible | binaries, reports, coverage, images. **Immutable per Attempt** — a retry never overwrites a prior Attempt's version; the name-addressed record resolves to the latest *successful* Attempt's version. |
-| **Cache** | cross-run | best-effort, evictable | `~/.cargo`, `node_modules` — keyed (e.g. lockfile hash). **Not** correctness-critical. |
+| **Workspace** | one Step's execution | ephemeral (dies with the Attempt) | the **mutable** filesystem a Step executes in. A Step may write anywhere in it; nothing outside the Step reads it directly. **Where its bytes live is not part of the concept** — they may sit on the Pod's node, on the workspace service, or be split across both (ADR-0061), and a Step cannot tell which. The Workspace is the *view* a Step executes against; it never outlives the Attempt. |
+| **Workspace Snapshot** | intra-run, flows along DAG edges | retained per policy, then archived, then gone (ADR-0061) | the **immutable**, content-addressed tree (per-file merkle CAS) that crosses a DAG edge and that an Attempt owns as evidence. Implicit-by-default (inherit `needs`), explicit-on-demand (`inputs:`/`outputs:`). Two coordinates, never conflated: the **snapshot root** is *where the bytes are* — the address a Step materialises, GC marks from, and an Attempt records; the **content identity** is *what the bytes are* — the same merkle fold with mtimes dropped, which is what restart invalidation compares (ADR-0027, 0061 s8). A root moves when a file's mtime moves and an identity does not, so **only the root is an address**: nothing is stored under an identity and nothing can be fetched by one. |
+| **Workspace Export** | one Attempt | dies with the Attempt; reaped, never archived | the **delivered** form of a **Workspace**: a per-Attempt, writable, network-mounted view of one **Workspace Snapshot** that a Step Pod receives *as* its Workspace (ADR-0062). Distinct from the Snapshot it is a view of, and the distinction has consequences: losing an Export fails that Attempt, which retries; losing a Snapshot widens a rerun's scope (ADR-0061 retention). Its address is a **capability** — unguessable, TTL'd to the Step deadline, client-pinned — not a name, because the mount protocol cannot carry a per-Step identity. |
+| **Change set** | one Attempt | derived; folded into a Snapshot, then discarded | the set of paths an Attempt wrote — what the drain hashes, and the reason it need not re-read an unchanged tree. **Known** where the Attempt had a **Workspace Export**: the `overlayfs` upper layer is the kernel's own record of what was touched (ADR-0062), so it is exact and rests on nothing. **Derived** where there was none (the local executor): each file's `(size, mtime, ctime)` compared against the input manifest. The derived form is sound but *conditionally* — it assumes ctime cannot be forged (no syscall sets it), a capture stamped after materialisation completed, a filesystem whose ctime is not coarse, and a Step that cannot move the clock back. `(size, mtime)` alone is **not** sound: `cp -p`, `touch -r` and `tar -xp` defeat it deterministically, not as a race. |
+| **Result** | intra-run, flows along DAG edges | ephemeral | small typed values (a version, a bool) for params/conditionals. **No bytes anywhere** — the value *is* JSONB in Postgres (`attempts.results`); nothing is stored in the CAS or the object store. Interpolated as `${{ results.<id>.<name> }}` (ADR-0041, renamed from `outputs.` — see **`outputs:`** below). |
+| **Artifact** | output of record | retained (TTL), downloadable, UI-visible | binaries, reports, coverage, images. Bytes in the object store; Postgres holds only metadata. **Immutable per Attempt** — a retry never overwrites a prior Attempt's version; the name-addressed record resolves to the latest *successful* Attempt's version. |
+| **Cache** | cross-run | best-effort, evictable | `~/.cargo`, `node_modules` — **author-declared** directories under a key (e.g. a lockfile hash), restored at Step start and saved at Step end (ADR-0065). Stored as a content-addressed tree, so it rides the same Farm/Export machinery as a Snapshot and materialises lazily. **Not** correctness-critical and **never evidence** — which is what puts it outside the durability rules. A keyed *directory* cache, never a shared mutable *mount*: two concurrent Runs writing one `node_modules` is corruption. |
+| **`outputs:`** | a Step field | — | the workspace-relative **paths** a Step publishes downstream (ADR-0007) — bytes on a filesystem, narrowing what flows along an edge. A *precision* tool for cache keys, safe fan-out and remapping; **never** something an author declares for speed (ADR-0007 amendment, ADR-0065). **Not** a **Result**: until 2026-07-28 the Result interpolation namespace was also spelled `outputs.<id>.<name>`, so one word named both a list of file paths and a namespace of typed scalars. The namespace is now **`results.`** and this term means paths only. |
+| **Step logs** | one Attempt | own retention class, long TTL | an Attempt's stdout/stderr. Bytes on the **Data Depot**, keyed `{run, step, attempt}` and **not** in the CAS — content addressing buys nothing for an append-only stream (ADR-0063). Postgres holds byte offsets only, never bodies. **The one class that cannot be re-derived**: re-running a Step yields *different* logs, so eviction here is real loss, not a latency event — hence pinned until a durable sink acknowledges them, and when the bytes are **gone for any reason at all**, said so out loud — absence is authoritative and the eviction record only explains it, because a lost volume was evicted by nobody. External log systems (Loki, VictoriaLogs) are **additional sinks, never the system of record**. |
 
 ### 4.3 Run-time / instance plane (what the durable engine tracks)
 
@@ -117,6 +123,7 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 | **Event log** | Append-only, versioned, immutable record of state transitions. Drives SSE, timeline, audit, time-travel. State tables are the source of truth; the event log is derived-but-durable (via the outbox). |
 | **Admission** | *Scarab's* scheduling decision — which Runs/Steps are allowed to run (concurrency groups, fairness, priority, backpressure). Distinct from k8s **Placement** (node fit). |
 | **Fence** | A monotonic `{run, step, attempt}` token handed to each Attempt and to cooperating external systems (idempotency keys, digest/generation checks) to neutralize the double-effect hazard. |
+| **Provisioning deadline** | The bound on how long an Attempt may spend **getting ready to run** — scheduling, image pull, workspace feed — as opposed to **running** (ADR-0066). A **separate clock** from the Step's authored `timeout:`, which measures execution only, from the moment the step container starts. The principle: **waiting for infrastructure must not bill the Step's execution budget** — before the split, queueing delay ate the author's timeout and a Step that never ran could fail as `Timeout`. Overrunning it is its own **failure class**, never `Timeout`, so the two causes are distinguishable in the record. Distinct again from the **Run budget**, which is a wall-clock spend limit over a whole Run and is not split. |
 
 ### 4.4 Structural / architectural
 
@@ -126,6 +133,8 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
 | **Adapter** | A concrete implementation of a Port, in a **separate vendor crate** (`scarab-forge-github`, `scarab-db-postgres`, …), holding all infra deps. |
 | **IR** | The typed, versioned **Pipeline Intermediate Representation** — the *real* DSL. YAML is one frontend; the API schema *is* the IR. |
 | **Forge** | The domain *concept* of a source-of-repos/sink-of-status (GitHub, GitLab, Forgejo). Vendors are **adapters**, never their own domain. |
+| **Data Depot** | The long-lived Scarab-operated service that holds the data plane **near where Steps run**: the warm CAS, **Snapshot Farms**, live **Workspace Exports**, the **Step log** namespace, and **Cache** (ADR-0061, 0062, 0063, 0065). Same binary as the control plane, different role (`--role depot`) and **no durable core** — it never connects to Postgres. Was "the workspace service" until 2026-07-28; renamed because that named it after *one of its tenants* and broke as soon as a second kind of data arrived. `warm store` was rejected for naming it after one of its *properties*, which encodes a tiering decision and dates the same way. **Not** a **Workspace**, a **Workspace Snapshot** or a **Workspace Export** — those are data it holds, and they keep their names. **Definitionally a cache** (ADR-0066): it holds nothing that cannot be recreated, which is what makes running more replicas a sufficient HA story, eviction safe by construction, and a lost replica a latency event. Anything that makes it a system of record is a defect. |
+| **Warm-only** | The named deployment mode in which **no independent cold tier is configured** (ADR-0064's `st_dev` test) — object storage is a **soft, recommended** requirement, not a hard one (ADR-0066). Supported, with a **smaller, true** guarantee rather than a silent downgrade: the **Data Depot** offers a bounded *recent window*, every Attempt is stamped `warm-only` in `attempts.output_durability`, and warm eviction is genuine loss rather than a latency event. It does **not** mean the Depot becomes the system of record — it means there **is** no system of record for **Workspace Snapshots** in that deployment, which is disclosable because they are reproducible from the forge. **Step logs** are the exception, having no recompute path: they fall back to compressed, size-capped bodies in Postgres (ADR-0013 amendment). Depot **HA requires object storage** — a documented consequence, not a gap. |
 
 ### 4.5 Tenancy & forge binding
 
@@ -154,19 +163,61 @@ Durable execution here means a **durable orchestrator**, *not* replayable step i
                                     · priority · backpressure   │
                                                                 ▼ (outbox)
                                     [executor role]  Executor port
-                                    ├─ scarab-executor-k8s  ── Pod per Step
+                                    ├─ scarab-executor-k8s
                                     └─ scarab-executor-local ─ kind/local
-                                                                │
-   Postgres  ◀── state tables + append-only event log ──────────┤
-   Object store (S3/MinIO) ◀── workspace (merkle CAS) · logs · artifacts · cache
+                                             │        │
+   Postgres ◀── state tables + event log ────┘        │  creates + watches
+                                                      │  ROOT HASHES ONLY (tens of bytes)
+                                                      ▼
+                                                 [ Step Pod ]  one per Step
+                                                      │  ▲
+                                 BULK snapshot bytes  │  │  ✅ feed  (Scarab-owned fetcher)
+                                                      ▼  │  ⛔ drain (s3-drain, NOT built)
+                                          [workspace role]  the workspace service (ADR-0061)
+                                          warm merkle CAS on a PersistentVolume, one per
+                                          failure domain · bounded by SPACE · no Postgres
+                                                      │
+   Object store (S3/MinIO) ◀── logs · artifacts · cache ┘
+                           ◀── Workspace Snapshots: the COLD archive, bounded by TIME
+                           ◀── ⚠ BULK, TODAY: the DRAIN tars every byte out of the Step Pod
+                               over `kubectl exec` into the control plane, which hashes it
+                               and writes it here. Artifact harvest is a third `exec` tar.
+                               So ADR-0061 part 3 is HALF done: the read path left the
+                               control plane, the write path has not.
 ```
 
-- **One binary, many roles** (`scarab-server --role converged|api|scheduler|executor|webhook`).
+Which edge carries bulk is the whole point of ADR-0061, so the four labels are load-bearing.
+**control plane ↔ Step Pod** carries root hashes only — that property belongs to *this* edge
+and no other. **Step Pod ↔ workspace service** is the bulk edge by design; its feed half is
+real, its drain half is s3-drain and is not built. **control plane → object store** is bulk
+*today*, for the drain, and a diagram without that edge asserts part 3 is finished.
+**control plane ↔ workspace service** is small and off the critical path: Browse reads
+snapshots through the service (falling through to the object store when it cannot answer),
+and the drain seeds it as a warm tier.
+
+- **One binary, many roles**
+  (`scarab-server --role converged|api|scheduler|executor|webhook|workspace`).
   Postgres (outbox) is the coordination bus; no service-to-service RPC required internally.
+  `workspace` is the one **data-plane** role: it never connects to Postgres and never runs
+  a migration (ADR-0061), so it keeps serving a Step its inputs through a database outage.
 - **Control-plane / data-plane split:** the durable *brain* records intent ("Step S should
   run"); the *executor* observes it, creates the Pod, watches it, writes back terminal state.
-- **Two stateful dependencies only:** Postgres (state + event log) and an object store
-  (blobs). Nothing else.
+  The intent is that bulk **data** does not cross the brain — the control plane exchanges root
+  hashes and Step Pods talk to the workspace service. **Half true today**: ADR-0061 supersedes
+  the `kubectl exec` tar tunnel on the **feed** side, where a Scarab-owned fetcher has replaced
+  it. The **drain** still tars every byte out through the Kubernetes API server, and artifact
+  harvest is a third `exec` tar; both go with s3-drain. Do not read this bullet as a
+  description of the running system's write path.
+- **Three stateful components — and the third is deliberate.** Postgres (state + event log),
+  an object store (blobs), and the **workspace service**'s persistent volume.
+  [ADR-0004](docs/adr/0004-execution-topology.md) called object storage "the second (and
+  last)"; [ADR-0061](docs/adr/0061-workspace-data-path.md) knowingly adds a third, because
+  one standard path beats a fast path plus a fallback path, and because binding volumes to a
+  long-lived service removes every cost PVCs have when bound to short-lived Step Pods.
+  The two storage tiers carry **different promises**, and that asymmetry is load-bearing:
+  the workspace service's volume is bounded by **space** and promises nothing (a miss is
+  slower, never wrong), while the object store is bounded by **time** (a retention TTL) and
+  **is** the guarantee users are given. Nothing else is stateful.
 
 ## 6. Crate map (hexagonal, domain-first)
 
@@ -185,8 +236,16 @@ scarab-project     Org/Project/Environment + protection rules (Project = governe
 Adapter crates (infra lives here; one per vendor):
 
 ```
-scarab-db-postgres · scarab-forge-github · scarab-secrets-postgres
+scarab-db-postgres · scarab-forge-github · scarab-forge-forgejo · scarab-secrets-postgres
 scarab-storage-s3 · scarab-executor-k8s · scarab-executor-local
+scarab-workspace-client   the workspace service's client (ADR-0061), behind BOTH
+                          scarab-storage ports: `Cas` (so Browse and the executor
+                          can point at the service with no call-site change) and
+                          `ContentSource` (byte ranges, sizes without reads,
+                          batched existence, one-call tree manifests — what a lazy
+                          mount needs and `Cas` structurally cannot express).
+                          Over reqwest, with NO kube dep, so the node driver can
+                          use it without linking the kubernetes executor.
 ```
 
 Testing substrate + composition:
@@ -209,6 +268,9 @@ scarab-cli         generated-from-OpenAPI CLI
 4. **Pure domain crates import no infra.** If `scarab-engine`'s `Cargo.toml` ever lists
    `sqlx`/`kube`/`reqwest`, that is a bug.
 5. **The UI eats the same API as everyone else.** No private UI backchannel.
+6. **The Data Depot is a cache.** Nothing on its volume may be irreplaceable; anything that
+   makes it a system of record is a defect (ADR-0066). Guarantee what cannot be recreated,
+   degrade what can.
 
 ---
 

@@ -232,9 +232,13 @@ async fn diamond_workspace_flows_to_d_which_sees_both() {
             &StepId(id.clone()),
             &AttemptId("a1".into()),
             &snap.root.0,
+            snap.identity.as_ref().map(|i| i.0.as_str()),
+            None,
         )
         .await
         .unwrap();
+        // `output_of` feeds `workspace_inputs`, which materializes — so it holds
+        // ROOTS, never identities (ADR-0061 s8: an identity is not an address).
         output_of.insert(StepId(id.clone()), snap.root.0.clone());
         let _ = std::fs::remove_dir_all(&work);
     }

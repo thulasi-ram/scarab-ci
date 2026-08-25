@@ -76,6 +76,8 @@ async fn rerun_supersedes_in_flight_descendant_pod() {
             id: a1.clone(),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -490,6 +492,8 @@ async fn same_tick_supersessions_get_distinct_outbox_keys() {
                 id: att.clone(),
                 started_at: Timestamp(0),
                 failure: None,
+                failure_detail: None,
+                output_durability: None,
                 outcome: AttemptOutcome::Running,
             },
         )
@@ -572,6 +576,8 @@ async fn superseded_attempt_survives_teardown_induced_lost() {
             id: a1.clone(),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -598,6 +604,8 @@ async fn superseded_attempt_survives_teardown_induced_lost() {
             id: a2.clone(),
             started_at: Timestamp(1_000),
             failure: None,
+            failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -705,6 +713,8 @@ async fn cancelled_attempt_survives_teardown_induced_lost() {
             id: a1.clone(),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -822,6 +832,8 @@ async fn attempts_order_by_mint_sequence_on_started_at_tie() {
         id: AttemptId(id.into()),
         started_at: Timestamp(7),
         failure: None,
+        failure_detail: None,
+        output_durability: None,
         outcome: AttemptOutcome::Running,
     };
     db.record_attempt(&run, &step, &running("a2"))
@@ -891,6 +903,8 @@ async fn record_attempt_never_downgrades_recorded_evidence() {
             id: a1.clone(),
             started_at: Timestamp(5),
             failure: None,
+            failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -899,7 +913,7 @@ async fn record_attempt_never_downgrades_recorded_evidence() {
 
     // Evidence recorded: the attempt failed (failure + Failed outcome move
     // together — ADR-0056 amendment).
-    db.set_attempt_failure(&run, &step, &a1, FailureKind::Step)
+    db.set_attempt_failure(&run, &step, &a1, FailureKind::Step, None)
         .await
         .unwrap();
 
@@ -912,6 +926,8 @@ async fn record_attempt_never_downgrades_recorded_evidence() {
             id: a1.clone(),
             started_at: Timestamp(999),
             failure: None,
+            failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
@@ -968,6 +984,8 @@ async fn seed_supersede_teardown(db: &InMemoryDb, run_name: &str) -> (RunId, Str
             id: a1.clone(),
             started_at: Timestamp(0),
             failure: None,
+            failure_detail: None,
+            output_durability: None,
             outcome: AttemptOutcome::Running,
         },
     )
