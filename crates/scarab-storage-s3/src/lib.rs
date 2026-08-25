@@ -70,9 +70,6 @@ use std::time::Instant;
 use async_trait::async_trait;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore as OsObjectStore, ObjectStoreExt};
-use scarab_storage::statcache::{
-    DrainTally, Observed, Reason as StatReason, StatCache, Verdict,
-};
 use scarab_storage::{
     system_time_from_unix_ms, BlobHash, Cas, ObjectStore, Snapshot, StorageError, TreeEntry,
     TreeHash, TreeTarget,
@@ -243,9 +240,6 @@ struct Stored {
 #[derive(Default)]
 struct Counters {
     files: u64,
-    /// Files whose blob hash came from the stat-cache baseline, so they were
-    /// never read, hashed, or asked about (ADR-0062 part 3).
-    blobs_reused: u64,
     trees: u64,
     objects_put: u64,
     objects_present: u64,
@@ -296,13 +290,6 @@ enum WalkEntry {
     Blob {
         name: String,
         path: std::path::PathBuf,
-        /// Byte length from the walk's `lstat`. Not part of a tree entry — it is
-        /// here for the stat cache, which compares it against the baseline's
-        /// (ADR-0062 part 3).
-        size: u64,
-        /// Inode-change time from the same `lstat`. Also not part of a tree
-        /// entry, and for the same reason — see [`ctime_ms`].
-        ctime_ms: Option<i64>,
         mode: u32,
         mtime_ms: Option<i64>,
     },
@@ -371,8 +358,6 @@ fn walk(
             entries.push(WalkEntry::Blob {
                 name,
                 path: item.path(),
-                size: meta.len(),
-                ctime_ms: ctime_ms(&meta),
                 mode: meta.permissions().mode() & 0o7777,
                 mtime_ms: mtime_ms(&meta),
             });
@@ -384,19 +369,6 @@ fn walk(
 
 fn missing(what: &str) -> StorageError {
     StorageError::Backend(format!("internal: {what} was not resolved during ingest"))
-}
-
-/// A walked path as a [`StatCache`] keys it: workspace-relative, `/`-separated,
-/// no leading slash — the `FlatEntry` convention.
-///
-/// A path that is somehow not under `root` falls back to itself, which cannot
-/// match any baseline key and so re-reads the file. That is the safe direction,
-/// and it is the only direction this function is allowed to be wrong in.
-fn relative(root: &std::path::Path, path: &std::path::Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
 }
 
 impl S3Storage {
@@ -512,28 +484,12 @@ impl S3Storage {
     /// `tar` legs this replaces preserved both, an executable that returns
     /// `0644` cannot be run, and cargo/make/tsc decide what to rebuild by
     /// comparing timestamps.
-    ///
-    /// With a `baseline` (ADR-0062 part 3), phase 2 skips a file the baseline
-    /// still vouches for **entirely**: no read, no hash, and no `head` either —
-    /// the blob is reachable from the input snapshot the baseline describes, so a
-    /// drain that could not trust it to be stored could not have trusted the
-    /// checkout it was handed. That is the whole win; ADR-0061 measured the
-    /// read-to-hash at 88% of a drain leg, and the round-trip is the other thing
-    /// it went after. Phase 3 is untouched: the tree entry is always built from
-    /// what the walk saw on disk, never from the baseline, so a file whose mode
-    /// moved while its bytes stood still gets the same blob and a **different**
-    /// entry.
-    async fn ingest_tree(
-        &self,
-        root: std::path::PathBuf,
-        baseline: Option<&StatCache>,
-    ) -> Result<(Snapshot, DrainTally), StorageError> {
+    async fn ingest_tree(&self, root: std::path::PathBuf) -> Result<Snapshot, StorageError> {
         use futures::StreamExt;
 
         let started = Instant::now();
         let limit = self.concurrency;
         let mut counters = Counters::default();
-        let mut tally = DrainTally::default();
 
         // --- Phase 1: walk. Local syscalls only, nothing in flight. ----------
         let t = Instant::now();
@@ -553,56 +509,20 @@ impl S3Storage {
         for (d, dir) in arena.iter().enumerate() {
             for (e, entry) in dir.entries.iter().enumerate() {
                 match entry {
-                    WalkEntry::Blob {
-                        path,
-                        size,
-                        ctime_ms,
-                        mtime_ms,
-                        ..
-                    } => {
-                        // With no baseline every file is read, which is exactly
-                        // what every drain did before ADR-0062 part 3 — spelled
-                        // as a verdict so the one tally covers both modes.
-                        let verdict = match baseline {
-                            Some(cache) => cache.verdict(
-                                &relative(&root, path),
-                                &Observed {
-                                    size: *size,
-                                    mtime_ms: *mtime_ms,
-                                    ctime_ms: *ctime_ms,
-                                    is_symlink: false,
-                                },
-                            ),
-                            None => Verdict::Rehash(StatReason::Unknown),
-                        };
-                        // Each counter is incremented *in the arm that takes the
-                        // action it names*, never from the verdict alone, so
-                        // `hashed == 0` cannot be true of a drain that queued a
-                        // read anyway.
-                        match verdict {
-                            Verdict::Reuse(blob) => {
-                                tally.reused += 1;
-                                hashes[d][e] = Some(blob);
-                            }
-                            Verdict::Rehash(_) => {
-                                tally.hashed += 1;
-                                jobs.push((d, e, BlobSource::File(path.clone())));
-                            }
-                        }
+                    WalkEntry::Blob { path, .. } => {
+                        counters.files += 1;
+                        jobs.push((d, e, BlobSource::File(path.clone())));
                     }
                     WalkEntry::Symlink { dest, .. } => {
                         // A symlink's "content" is the link target the walk
-                        // already read — never trusted from a baseline (nothing
-                        // records a link's mtime), never a content read either.
-                        tally.links += 1;
+                        // already read — never a content read.
+                        counters.files += 1;
                         jobs.push((d, e, BlobSource::Link(dest.clone())))
                     }
                     WalkEntry::Dir { .. } => {}
                 }
             }
         }
-        counters.files = tally.total();
-        counters.blobs_reused = tally.reused;
 
         let mut stream = futures::stream::iter(jobs)
             .map(|(d, e, src)| async move {
@@ -720,12 +640,6 @@ impl S3Storage {
         tracing::info!(
             cas = "ingest",
             files = counters.files,
-            // ADR-0062's "a build must report which rung it took", for the drain:
-            // `blobs_reused` is how much of the read-to-hash the stat cache
-            // actually bought, and `0` with a baseline wired is a live signal
-            // that it is buying nothing.
-            baseline = baseline.is_some(),
-            blobs_reused = counters.blobs_reused,
             trees = counters.trees,
             objects_put = counters.objects_put,
             objects_present = counters.objects_present,
@@ -744,51 +658,11 @@ impl S3Storage {
             .next()
             .flatten()
             .ok_or_else(|| missing("the root tree"))?;
-        Ok((
-            Snapshot {
-                root,
-                identity: identities.into_iter().next().flatten(),
-            },
-            tally,
-        ))
+        Ok(Snapshot {
+            root,
+            identity: identities.into_iter().next().flatten(),
+        })
     }
-
-    /// Snapshot a directory tree the way [`Cas::ingest`] does, but skipping the
-    /// read-and-hash of every file the `baseline` still vouches for — the
-    /// **no-Export drain** of ADR-0062 part 3.
-    ///
-    /// `baseline` describes the *input* snapshot this Workspace was materialised
-    /// from, and **when that was true**. Its correctness argument, and the one
-    /// way to break it, are in [`scarab_storage::statcache`]; the short version is
-    /// that a stale "unchanged" silently publishes the wrong bytes under the
-    /// right hash, so the comparison re-reads on any doubt at all.
-    ///
-    /// Returns the snapshot and a [`DrainTally`] — what the drain actually did,
-    /// which is the only honest way to assert that an untouched checkout cost
-    /// nothing.
-    pub async fn ingest_with_baseline(
-        &self,
-        path: &str,
-        baseline: &StatCache,
-    ) -> Result<(Snapshot, DrainTally), StorageError> {
-        self.ingest_tree(std::path::PathBuf::from(path), Some(baseline))
-            .await
-    }
-}
-
-/// A file's **inode-change** time as unix-ms — `st_ctime`/`st_ctime_nsec`.
-///
-/// Not part of a tree entry and never will be: a ctime describes *this
-/// checkout's inode*, not the Workspace Snapshot the checkout came from. It
-/// exists for the stat cache, where it is the only timestamp userspace cannot
-/// forge (see `scarab_storage::statcache`) — `utimensat` moves an mtime anywhere
-/// but bumps ctime to now while doing it, and there is no syscall for ctime at
-/// all.
-fn ctime_ms(meta: &std::fs::Metadata) -> Option<i64> {
-    use std::os::unix::fs::MetadataExt;
-    meta.ctime()
-        .checked_mul(1_000)?
-        .checked_add(meta.ctime_nsec() / 1_000_000)
 }
 
 /// A file's mtime as unix-ms, or `None` if the platform will not report one.
@@ -1179,13 +1053,6 @@ impl Cas for S3Storage {
     }
 
     async fn ingest(&self, path: &str) -> Result<Snapshot, StorageError> {
-        // No baseline: every file is read and hashed, unchanged behaviour. The
-        // baseline-aware drain is [`S3Storage::ingest_with_baseline`] — an
-        // inherent method, not a widening of the port, because a caller that has
-        // no input manifest (Browse, GC, the `clone` step's first snapshot) has
-        // nothing to pass and should not be made to say so.
-        self.ingest_tree(std::path::PathBuf::from(path), None)
-            .await
-            .map(|(snapshot, _tally)| snapshot)
+        self.ingest_tree(std::path::PathBuf::from(path)).await
     }
 }

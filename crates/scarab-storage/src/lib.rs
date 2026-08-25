@@ -19,11 +19,6 @@ use serde::{Deserialize, Serialize};
 /// The data-plane content port (ADR-0061): byte ranges, sizes, batched
 /// existence and one-call tree manifests. Additive — [`Cas`] is unchanged.
 pub mod content;
-/// The stat cache (ADR-0062 part 3): which files a drain may skip re-reading,
-/// by comparing `(size, mtime)` against the input manifest it materialised.
-/// The **no-Export fallback** — conservative by construction, never the
-/// mechanism where an `overlayfs` upper layer can give the change set exactly.
-pub mod statcache;
 /// Warm-then-cold tiering (ADR-0061): the workspace service's volume in front
 /// of the cold object-storage archive.
 pub mod tiered;

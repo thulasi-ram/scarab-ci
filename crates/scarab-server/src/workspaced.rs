@@ -3083,14 +3083,12 @@ scarab_workspace_warm_volume_read_failed_total {}
 /// `spawn_blocking`.
 ///
 /// **`DirEntry::metadata` is `lstat`, not `stat`** — unlike the free
-/// `fs::metadata`, it does not traverse a link — and that is load-bearing rather
-/// than incidental now that ADR-0062 puts Snapshot Farms under
-/// `<warm_dir>/farms`. The warm tier used to hold only `blobs/` and `trees/`,
-/// flat directories of regular files, so there was no link here to follow. A Farm
-/// is a materialised *tree* and recreates a snapshot's symlinks as symlinks
-/// (`farm::SnapshotFarm::fill`), so this walk now meets them, and swapping in the
-/// traversing call would cost two ways: a link to a directory inside the same
-/// Farm counts that subtree twice, and a link to `.` or to an ancestor makes this
+/// `fs::metadata`, it does not traverse a link. The warm tier holds `blobs/`
+/// and `trees/` (flat directories of regular files) plus the `readyz/` probe
+/// key, so no symlink should appear here since the Snapshot Farms went
+/// (git-bug 0ec3b39) — but the `lstat` stays, because the traversing call
+/// would cost two ways the day a link does appear: a link to a directory
+/// counts its subtree twice, and a link to `.` or to an ancestor makes this
 /// loop without bound, wedging the task that owns the warm-size metric.
 fn dir_size(dir: &std::path::Path) -> u64 {
     let mut total = 0u64;
@@ -3267,8 +3265,9 @@ mod tests {
         );
     }
 
-    /// The warm-size walk must not descend a symlink, because ADR-0062's Farms
-    /// put symlinks on the warm volume for the first time.
+    /// The warm-size walk must not descend a symlink — nothing should plant
+    /// one on the warm volume any more (the Snapshot Farms that did are gone,
+    /// git-bug 0ec3b39), and this pins that an unexpected one stays harmless.
     ///
     /// `alias` points at a sibling directory, so a walk that follows it counts
     /// `nested/big` twice and reports 2024. That is the assertion, because it
