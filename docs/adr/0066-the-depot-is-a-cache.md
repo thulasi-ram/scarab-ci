@@ -439,6 +439,18 @@ splitting *that* clock is a different question with a different owner.
 
 ### 10. Delete the Export / Farm / change-set machinery — with three carve-outs.
 
+> **Executed 2026-08-25** (git-bug `0ec3b39`): `export.rs`, `farm.rs`, `settle.rs` and the
+> `/v1/exports*` surface are deleted. Carve-outs (b) and (c) stand; (a) was already its own
+> function (`sweep_fence_residue`), so the host loop was **renamed, not extracted**
+> (`sweep_exports_once` → `sweep_residue_once`), keeping the fence-residue sweep and the
+> ADR-0067 pack-session sweep verbatim. Two deviations from the letter of this point:
+> **`settle.rs` went wholesale**, not "the Export half" — line-verified against `0215cb7`,
+> every entry point was reachable only from the Export settle path and `post_drain` touches
+> none of it (the fold stays in git; `changeset.rs`, the upper-layer *reader*, survives). And
+> **the stat cache went too** (`scarab-storage/src/statcache.rs` + `ingest_with_baseline`), an
+> orphan this point did not name: its only production caller was the copy rung's re-ingest
+> drain, deleted with the Export half.
+
 Roughly **10k lines** across `crates/scarab-server/src/export.rs`, `farm.rs`, `changeset.rs` and the
 Export half of `settle.rs`. **No control-plane or executor caller exists** — established by an
 HTTP-route grep, which is the form of search that **cannot** miss trait-object dispatch (the routes

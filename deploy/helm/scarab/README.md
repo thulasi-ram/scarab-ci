@@ -236,25 +236,11 @@ eviction is not implemented yet**, so `scarab_workspace_warm_used_bytes` on
 climbing means snapshots are still durable (cold succeeded) but the cache is
 not being filled.
 
-**`workspace.persistence.storageClass` picks which rung the Snapshot Farm runs
-on** (ADR-0062), and nothing in the install will tell you which one you got.
-Materialising a Workspace Snapshot is one local operation per file on that
-volume — a copy-on-write clone where the filesystem can do one, a full byte copy
-where it cannot. The Farm measures this rather than guessing: it clones a probe
-file on the target and does *not* switch on the filesystem's name, and any
-refusal falls back per file, so a part-cloned build is a modelled outcome and
-not a fault. A wrong class is never *incorrect*, only silently slow — watch
-`rung=` on the `ws-timing` log line. **ext4** has no reflink, so it is the copy
-rung always. **xfs** clones only if the filesystem was made with `reflink=1`,
-and most CSI drivers expose no mkfs options, so you inherit that node image's
-`mkfs.xfs` defaults — worth checking rather than assuming, with `xfs_info
-<dataDir> | grep reflink` inside the workspace pod. **btrfs** and **ZFS** clone
-in principle (ZFS only with OpenZFS block cloning enabled: off by default in 2.2
-after a corruption bug, on from 2.3). **Do not point this at network storage.**
-An NFS-backed class is the actively harmful choice for this volume: no reflink,
-*and* overlayfs does not support an `upperdir` on NFS, while the Export rung
-probe asks only about `CAP_SYS_ADMIN` — so the overlay rung is still selected
-and the mount then fails outright. The Depot's warm volume wants local disk.
+**`workspace.persistence.storageClass` backs the warm CAS** — the Depot's
+local cache tier in front of the cold object store (ADR-0066: the Depot is a
+cache). Its whole point is local-syscall reads and writes, so prefer local
+disk: an NFS-backed class puts a network round trip back under every blob,
+which is exactly the cost the warm tier exists to remove.
 
 > **Unverified in this chart version:** more than one replica, per-availability-
 > zone placement, and reachability from a step Pod. `workspace.replicaCount > 1`
@@ -277,7 +263,7 @@ and the mount then fails outright. The Depot's warm volume wants local disk.
 | `scarab.connections` | `[]` | declarative, config-owned forge connections (above) |
 | `workspace.enabled` | `true` | the ADR-0061 workspace service; renders only when a workspace token secret exists (above) |
 | `workspace.dataDir` | `/var/lib/scarab/cas` | where the warm tier's PVC is mounted (`SCARAB_WORKSPACE_DATA_DIR`) |
-| `workspace.persistence.size` / `.storageClass` | `20Gi` / cluster default | the warm tier's volume — bounded by SPACE, with no eviction policy yet; the class also picks the Snapshot Farm's rung, and NFS forfeits both rungs (above) |
+| `workspace.persistence.size` / `.storageClass` | `20Gi` / cluster default | the warm tier's volume — bounded by SPACE, with no eviction policy yet; prefer local disk (above) |
 | `workspace.replicaCount` | `1` | one per failure domain; `>1` is **unverified** |
 | `secrets.workspaceTokenSecret` | — | HMAC secret for the workspace token; MUST differ from `resultsTokenSecret` (above) |
 | `scarab.workspaceUrl` | — | override the in-cluster workspace Service URL (split installs) |
