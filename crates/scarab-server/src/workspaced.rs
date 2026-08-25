@@ -875,11 +875,17 @@ async fn read_ledger(
     Ok(rows.into_iter().collect())
 }
 
-/// Append one tree hash to a fence's write ledger. One row per PUT; duplicates
-/// are harmless (`ON CONFLICT DO NOTHING` — the reader is a set). A failure
-/// fails the PUT — the client's re-PUT is idempotent, and a tree stored
-/// without its ledger row would 422 that fence's own drain record later, which
-/// is the worse diagnosis.
+/// Append one tree hash to a fence's write ledger. One row per PUT; a
+/// duplicate REFRESHES the row's `written_at` rather than being dropped
+/// (`ON CONFLICT DO UPDATE`, git-bug ad79c90): the pack reclaimer's staleness
+/// bound leans on "any live drain refreshes its fence's ledger", and a
+/// re-driven drain re-PUTs every closure tree (identical content included) —
+/// with `DO NOTHING` those re-PUTs would leave `written_at` at first-upload
+/// time and a long crash-resume chain could look quiet while alive. The cost
+/// is one WAL'd row update per duplicate tree PUT, bounded by the drain's own
+/// upload volume. A failure fails the PUT — the client's re-PUT is
+/// idempotent, and a tree stored without its ledger row would 422 that
+/// fence's own drain record later, which is the worse diagnosis.
 async fn ledger_append(
     state: &WorkspaceState,
     fence: &Fence,
@@ -887,7 +893,8 @@ async fn ledger_append(
 ) -> Result<(), WsError> {
     sqlx::query(
         "INSERT INTO depot_fence_writes (fence_key, tree_address, written_at) \
-         VALUES ($1, $2, $3) ON CONFLICT (fence_key, tree_address) DO NOTHING",
+         VALUES ($1, $2, $3) ON CONFLICT (fence_key, tree_address) \
+         DO UPDATE SET written_at = EXCLUDED.written_at",
     )
     .bind(fence_key(fence))
     .bind(hash)
@@ -1751,8 +1758,8 @@ async fn have(
 /// caller allowed to trust staged rows is the fence that staged them: its
 /// retried drain must not re-upload what it already sealed, and its own
 /// record transaction is the only thing that can commit those rows.
-async fn durable_present_of<'a>(
-    db: &sqlx::PgPool,
+async fn durable_present_of<'a, 'c>(
+    db: impl sqlx::PgExecutor<'c>,
     kind: PackMemberKind,
     bares: impl Iterator<Item = &'a str>,
     caller_fence: Option<&str>,
@@ -2704,6 +2711,65 @@ async fn validate_drain_closure(
     })
 }
 
+/// The ONE machine-readable 422 (git-bug afb13c2): a scattered drain's
+/// members can sit in another replica's open tail pack for up to the linger,
+/// so the client retries THIS refusal in-process — every retry sees a
+/// strictly larger index. A `code` field, not prose-matching; every other 422
+/// stays prose because retrying a ledger/closure violation cannot help.
+fn drain_state_incomplete_422(fence: &Fence, detail: String) -> Response {
+    tracing::warn!(
+        run = %fence.run,
+        step = %fence.step,
+        attempt = %fence.attempt,
+        detail = %detail,
+        "workspace service: 422 — drain record refused (retryable: staged packs \
+         may still be inside another replica's linger window)"
+    );
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({
+            "code": DRAIN_STATE_INCOMPLETE_CODE,
+            "detail": detail,
+        })),
+    )
+        .into_response()
+}
+
+/// A one-shot seam for the tests ONLY: run something in the window between
+/// [`post_drain`]'s durable-presence gate and its record transaction —
+/// exactly where a concurrent pack-reclaim pass can delete the fence's staged
+/// rows out from under a gate that already passed (git-bug ad79c90). The
+/// repo's concurrency-test lesson applies: this window is a few queries wide,
+/// so a scheduled race would miss it essentially always — the interleaving is
+/// CONSTRUCTED instead. Keyed by fence so parallel tests in one binary cannot
+/// trip each other's hooks.
+#[cfg(test)]
+type AfterDrainGateHook = Box<
+    dyn FnOnce(sqlx::PgPool) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send,
+>;
+#[cfg(test)]
+static AFTER_DRAIN_GATE_HOOK: Mutex<Option<(String, AfterDrainGateHook)>> = Mutex::new(None);
+
+#[cfg(test)]
+async fn run_after_drain_gate_hook(state: &WorkspaceState, fence_key: &str) {
+    let hook = {
+        let mut slot = AFTER_DRAIN_GATE_HOOK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match slot.take() {
+            Some((key, hook)) if key == fence_key => Some(hook),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    if let Some(hook) = hook {
+        hook(state.db.clone()).await;
+    }
+}
+
 /// `POST /v1/drains` — an in-Pod drain deposits its record, and the answer is
 /// the deposit having *happened*: persisted on disk, keyed by the **token's**
 /// fence, before the 200.
@@ -2857,12 +2923,6 @@ async fn post_drain(
             );
         }
         if !lost.is_empty() {
-            // The ONE machine-readable 422 (git-bug afb13c2): a scattered
-            // drain's members can sit in another replica's open tail pack for
-            // up to the linger, so the client retries THIS refusal in-process
-            // — every retry sees a strictly larger index. A `code` field, not
-            // prose-matching; every other 422 stays prose because retrying a
-            // ledger/closure violation cannot help.
             let detail = format!(
                 "drain state lost — re-drive: {} member(s) of the published closure are \
                  neither in this drain's sealed packs nor already durable in the pack \
@@ -2870,24 +2930,12 @@ async fn post_drain(
                 lost.len(),
                 lost.join(", ")
             );
-            tracing::warn!(
-                run = %fence.run,
-                step = %fence.step,
-                attempt = %fence.attempt,
-                detail = %detail,
-                "workspace service: 422 — drain record refused (retryable: staged packs \
-                 may still be inside another replica's linger window)"
-            );
-            return Ok((
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "code": DRAIN_STATE_INCOMPLETE_CODE,
-                    "detail": detail,
-                })),
-            )
-                .into_response());
+            return Ok(drain_state_incomplete_422(&fence, detail));
         }
     }
+
+    #[cfg(test)]
+    run_after_drain_gate_hook(&state, &fence_key(&fence)).await;
 
     let stored = StoredDrainRecord {
         version: DRAIN_RECORD_VERSION,
@@ -2913,6 +2961,45 @@ async fn post_drain(
     // an aborted drain's bytes durable evidence.
     if stored.record.error.is_none() {
         insert_pack_rows(&mut tx, &key, &sealed, &commit, now).await?;
+
+        // The in-transaction re-check (git-bug ad79c90, slice 0): the gate
+        // above ran BEFORE this transaction, and a concurrent pack-reclaim
+        // pass may have deleted this fence's staged rows in the window
+        // between the two — the gate would have passed against rows that no
+        // longer exist, and committing here would write a success record
+        // backed by nothing (silent committed loss once the bytes go). So the
+        // whole published closure is re-checked HERE, strictly after
+        // `insert_pack_rows`' committed-flip UPDATE, on this transaction's
+        // own connection, with the same committed-OR-own-fence predicate.
+        // Airtight at READ COMMITTED because the flip UPDATE and the
+        // reclaimer's single-transaction DELETE target the same
+        // `NOT committed` rows: reclaim-first means the flip missed them and
+        // this re-check sees the absence (rollback, 422 re-drive);
+        // flip-first means the reclaimer blocks on the row locks, re-evaluates
+        // `NOT committed`, and skips. Members this POST itself sealed were
+        // inserted above on this same transaction, so they are visible.
+        let (trees, blobs) = closure.as_ref().expect("success records were validated above");
+        for (kind, members) in [(PackMemberKind::Tree, trees), (PackMemberKind::Blob, blobs)] {
+            let durable = durable_present_of(
+                &mut *tx,
+                kind,
+                members.iter().map(String::as_str),
+                Some(key.as_str()),
+            )
+            .await?;
+            if let Some(hex) = members.iter().find(|hex| !durable.contains(*hex)) {
+                tx.rollback()
+                    .await
+                    .map_err(|e| fence_rows_error("roll back drain transaction", e))?;
+                let detail = format!(
+                    "drain state lost — re-drive: {} {hex} of the published closure \
+                     left the pack index between validation and commit (reclaimed \
+                     staging); nothing was persisted",
+                    kind.as_str()
+                );
+                return Ok(drain_state_incomplete_422(&fence, detail));
+            }
+        }
     }
     sqlx::query(
         "INSERT INTO depot_drain_records \
@@ -4148,6 +4235,144 @@ mod tests {
         .await
         .expect("read the (absent) drain record");
         assert!(record.is_none(), "a refused record must not be persisted");
+    }
+
+    /// The reclaim race (git-bug ad79c90, slice 0): the durable-presence gate
+    /// passes against the fence's STAGED rows, and a pack-reclaim pass then
+    /// deletes exactly those rows before the record transaction begins. The
+    /// pre-slice-0 outcome was a 200 over a success record backed by zero
+    /// member rows — silent committed loss once the bytes go. The in-txn
+    /// re-check (strictly after the committed-flip UPDATE, same
+    /// committed-OR-own-fence predicate) must catch the absence: 422
+    /// re-drive, NOTHING persisted.
+    ///
+    /// The window is a few queries wide, so the interleaving is CONSTRUCTED,
+    /// not scheduled (the repo's concurrency-test lesson): a fence-keyed
+    /// one-shot hook in `post_drain` runs the reclaimer's DELETE shape inside
+    /// the exact window between the gate and `begin()`.
+    ///
+    /// Mutation killed: delete the in-txn re-check and this POST answers 200 —
+    /// with a drain record on disk and zero member rows behind it.
+    #[tokio::test]
+    async fn a_reclaim_between_the_gate_and_the_record_txn_is_caught_inside_the_txn() {
+        use tower::ServiceExt;
+
+        let Some(h) = DepotHarness::start().await else { return };
+        let fence = Fence {
+            run: "r-race".into(),
+            step: "build".into(),
+            attempt: "a1".into(),
+        };
+        let f1 = h.step_token("r-race", "build", "a1");
+        let root = seed_fenced_snapshot(&h, &f1).await;
+        let key = fence_key(&fence);
+
+        // Seal the open pack so its rows are STAGED (committed = FALSE) — the
+        // state a Depot restart leaves behind.
+        let session = pack_session(&h.state, &key);
+        session.lock().await.seal_open().await.expect("seal the open pack");
+        let staged: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM depot_packs WHERE fence_key = $1 AND NOT committed",
+        )
+        .bind(&key)
+        .fetch_one(&h.state.db)
+        .await
+        .expect("count staged packs");
+        assert!(staged > 0, "precondition: the seal must have staged rows");
+
+        // The restart: a fresh state over the same volume and database — the
+        // in-memory session is gone, so the gate can only pass via the staged
+        // rows the hook below is about to delete.
+        let reopened = open_state(
+            &h.tmp.path().join("warm"),
+            h.cold.clone(),
+            b"export-secret".to_vec(),
+            h.state.db.clone(),
+        )
+        .expect("reopen the workspace state over the same volume");
+
+        // Arm the window: the reclaimer's own DELETE shape (members, then
+        // packs — NOT committed only), run between the gate and the txn.
+        {
+            let key_for_hook = key.clone();
+            *AFTER_DRAIN_GATE_HOOK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some((
+                key.clone(),
+                Box::new(move |pool: sqlx::PgPool| {
+                    Box::pin(async move {
+                        sqlx::query(
+                            "DELETE FROM depot_pack_members m USING depot_packs p \
+                             WHERE m.pack_key = p.pack_key \
+                               AND p.fence_key = $1 AND NOT p.committed",
+                        )
+                        .bind(&key_for_hook)
+                        .execute(&pool)
+                        .await
+                        .expect("hook: delete staged members");
+                        sqlx::query(
+                            "DELETE FROM depot_packs WHERE fence_key = $1 AND NOT committed",
+                        )
+                        .bind(&key_for_hook)
+                        .execute(&pool)
+                        .await
+                        .expect("hook: delete staged packs");
+                    })
+                }),
+            ));
+        }
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/drains")
+            .header(WORKSPACE_TOKEN_HEADER, &f1)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&drain_record_body(&root)).expect("body"),
+            ))
+            .expect("request");
+        let response = build_router(reopened.clone())
+            .oneshot(request)
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&bytes).to_string();
+
+        // The hook must actually have fired, or this test asserted nothing.
+        assert!(
+            AFTER_DRAIN_GATE_HOOK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "the window hook must have been consumed by this POST"
+        );
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a reclaim inside the gate→txn window must be caught by the in-txn \
+             re-check: {body}"
+        );
+        assert!(
+            body.contains(DRAIN_STATE_INCOMPLETE_CODE),
+            "the refusal must carry the machine-readable retry code: {body}"
+        );
+
+        // NOTHING persisted: no record, and the rolled-back transaction left
+        // no pack rows behind (the commit-pack row died with the rollback).
+        let record = read_drain_record(&reopened, &fence)
+            .await
+            .expect("read the (absent) drain record");
+        assert!(record.is_none(), "a refused record must not be persisted");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM depot_packs WHERE fence_key = $1")
+                .bind(&key)
+                .fetch_one(&reopened.db)
+                .await
+                .expect("count pack rows");
+        assert_eq!(rows, 0, "the rolled-back transaction must persist no pack rows");
     }
 
     /// The parent Workspace Snapshot's contents, as `(path, bytes)` plus one symlink
