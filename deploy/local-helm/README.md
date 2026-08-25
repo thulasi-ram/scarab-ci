@@ -13,6 +13,16 @@ server Pod's `scratch` emptyDir, so — since every deploy now rolls the Pod —
 would wipe all workspaces and any rerun of a prior run would hang restoring its
 input. Override `SCARAB_S3_*` in `.env` to use real S3 (then MinIO is skipped).
 
+**Incomplete multipart uploads (git-bug ad79c90):** the Depot streams drain
+bytes as multipart pack uploads; a crashed replica cannot abort its own. The
+in-cluster MinIO needs nothing — it expires stale multipart uploads natively
+(`api` config: `stale_uploads_expiry=24h`, swept every
+`stale_uploads_cleanup_interval=6h`; its `mc` ships no
+abort-incomplete-multipart ILM flag at all). If you point `SCARAB_S3_*` at
+real S3, the bucket **must** carry an `AbortIncompleteMultipartUpload`
+lifecycle rule (`DaysAfterInitiation: 1`) — see the `scarab.s3` comment in
+`deploy/helm/scarab/values.yaml`.
+
 **Workspace service (ADR-0061):** `deploy.sh` also deploys the workspace service —
 a StatefulSet running the **same image** with `SCARAB_ROLE=workspace`, holding a
 warm content-addressed store of Workspace Snapshots on its own PVC, with MinIO

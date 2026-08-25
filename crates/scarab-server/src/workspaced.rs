@@ -382,7 +382,13 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         .connect_lazy(&config.database_url)
         .map_err(|e| format!("SCARAB_DATABASE_URL does not parse: {e}"))?;
 
-    let app = router(&ws.data_dir, cold_store, ws.token_secret.clone(), db)?;
+    let (app, state) = router_and_state(
+        &ws.data_dir,
+        cold_store,
+        ws.token_secret.clone(),
+        db,
+        Some(PACK_IDLE_LINGER),
+    )?;
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     tracing::info!(
         addr = %config.addr,
@@ -394,6 +400,23 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    // Graceful shutdown reached: abort every open pack writer, best-effort
+    // (git-bug ad79c90). A dropped multipart upload never sends its abort;
+    // on real S3 the staged parts would bill until the bucket lifecycle rule
+    // collects them. `try_lock` only — a session a request still holds is
+    // that request's to finish, and a crash gets no courtesy pass either
+    // way: the lifecycle rule (see the chart's `scarab.s3` comment) is the
+    // backstop this abort merely economises.
+    let sessions: Vec<Arc<tokio::sync::Mutex<PackSession>>> = {
+        let map = state.packs.lock().unwrap_or_else(PoisonError::into_inner);
+        map.values().cloned().collect()
+    };
+    for session in sessions {
+        let Ok(mut guard) = session.try_lock() else { continue };
+        if let Some(writer) = guard.open.take() {
+            writer.abort().await;
+        }
+    }
     tracing::info!("workspace service shutdown complete");
     Ok(())
 }
@@ -469,6 +492,20 @@ pub fn router_with_pack_linger(
     db: sqlx::PgPool,
     pack_linger: Option<std::time::Duration>,
 ) -> Result<Router, StorageError> {
+    router_and_state(warm_dir, cold, token_secret, db, pack_linger).map(|(router, _)| router)
+}
+
+/// [`router_with_pack_linger`], also handing back the state — for [`run`],
+/// whose graceful-shutdown path aborts every open pack writer (git-bug
+/// ad79c90: a dropped multipart upload never sends its abort, and on real S3
+/// the staged parts bill until the bucket lifecycle rule collects them).
+fn router_and_state(
+    warm_dir: impl AsRef<std::path::Path>,
+    cold: Arc<S3Storage>,
+    token_secret: Vec<u8>,
+    db: sqlx::PgPool,
+    pack_linger: Option<std::time::Duration>,
+) -> Result<(Router, WorkspaceState), StorageError> {
     let warm_dir = warm_dir.as_ref().to_path_buf();
     let state = open_state(&warm_dir, cold, token_secret, db)?;
 
@@ -538,7 +575,7 @@ pub fn router_with_pack_linger(
         });
     }
 
-    Ok(build_router(state))
+    Ok((build_router(state.clone()), state))
 }
 
 /// One pass of the linger ticker: seal-and-stage every open pack writer idle
@@ -636,10 +673,12 @@ async fn sweep_residue_once(state: &WorkspaceState) {
     // more, so the open multipart upload is aborted (best-effort reclamation
     // of staged parts; an incomplete upload publishes nothing either way) and
     // the session forgotten. Sealed-but-uncommitted body packs stay behind as
-    // unreachable bytes for the grace-window reclaim job (git-bug ad79c90),
-    // which keys on `committed = FALSE AND fence residue expired AND no
-    // success record` — error POSTs never flip `committed`, so that predicate
-    // is exactly "staging of a drain that never finished".
+    // unreachable bytes for the pack reclaimer (git-bug ad79c90):
+    // [`reclaim_stale_staging_once`] collects their rows once the fence is
+    // stale and quiet — error POSTs never flip `committed`, so `NOT
+    // committed` staging with no fresh ledger touch and no success record is
+    // exactly "staging of a drain that never finished" — and
+    // [`reclaim_orphan_packs_once`] collects the bytes a cadence later.
     // `try_lock` skips any session a request is actively using, and the
     // session is TOMBSTONED under its own lock before the map entry goes
     // (git-bug 022aec8): a racer holding the `Arc` from before the removal
@@ -2482,9 +2521,17 @@ impl PackSession {
             for member in writer.members() {
                 self.packed.remove(&member.address);
             }
-            // Dropped, not awaited: abort is best-effort reclamation and this
-            // is an error path already holding the session lock.
-            drop(writer);
+            // Spawned, not dropped (git-bug ad79c90): a dropped writer never
+            // sends the AbortMultipartUpload, and on real S3 the staged parts
+            // bill until a bucket lifecycle rule collects them. Spawned, not
+            // awaited: this is an error path already holding the session
+            // lock, and abort is best-effort reclamation either way — an
+            // incomplete upload publishes nothing. Deliberately NOTHING more
+            // aggressive than the error paths and shutdown: an in-process
+            // abort sweep could kill a live scattered drain's tail; crashes
+            // and leaks stay the deployment lifecycle rule's job (see the
+            // chart's `scarab.s3` comment).
+            tokio::spawn(writer.abort());
         }
     }
 }

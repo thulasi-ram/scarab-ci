@@ -88,4 +88,13 @@ spec:
             - |
               until mc alias set local http://scarab-minio:9000 scarab scarabsecret; do sleep 1; done
               mc mb --ignore-existing local/scarab-logs
+              # Incomplete-multipart hygiene (git-bug ad79c90): nothing to
+              # configure HERE — MinIO expires stale multipart uploads
+              # natively (api: stale_uploads_expiry=24h, swept every
+              # stale_uploads_cleanup_interval=6h; verified against these
+              # images 2026-08-25), and minio/mc ships NO
+              # abort-incomplete-multipart ILM flag ('mc ilm rule add --help'
+              # lists none). On real S3 the equivalent is a REQUIRED bucket
+              # lifecycle rule — see the scarab.s3 comment in
+              # deploy/helm/scarab/values.yaml.
               echo 'bucket scarab-logs ready'

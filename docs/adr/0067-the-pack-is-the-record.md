@@ -360,10 +360,15 @@ is still unbuilt. None of these reverse a decision; two refine one.
   validation reads trees warm-or-index for the same reason. Affinity stays refused as a
   correctness mechanism (a possible warmth optimisation only); the chart's `replicaCount` note
   says the same.
-- **Retention's deletion machinery is unbuilt** (see the 0065 pointer): packs are currently never
-  deleted, which errs safe but means part 7's retention-grouping payoff is not yet collectable, and
-  cross-fence dedup (a later fence's record depending on an earlier fence's pack) must be
-  refcounted or re-packed **before** pack-grain expiry is ever written — ticketed.
+- **Reclaim of never-finished drains is built; retention proper is not** (updated 2026-08-25,
+  git-bug ad79c90 — see the 0065 pointer). Stale STAGED rows (`NOT committed`, fence quiet past
+  2x the token TTL) and the rowless orphan bytes behind them are collected by the pack reclaimer
+  in `workspaced.rs` — pointers first, bytes at least one hourly cadence later, with the drain
+  path re-checking durable presence inside its record transaction so a reclaim can never race a
+  live commit into silent loss. COMMITTED packs are still never deleted: part 7's
+  retention-grouping payoff is not yet collectable, and cross-fence dedup (a later fence's record
+  depending on an earlier fence's pack) must be refcounted or re-packed **before** pack-grain
+  expiry is ever written — ticketed.
 
 ## References
 

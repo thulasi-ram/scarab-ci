@@ -12,9 +12,13 @@
 > pack, not the object.** The *decided* shape: retention operates over the bucket plus a derived
 > Postgres index (on any disagreement the bucket wins), drain-aligned pack boundaries mean most of
 > a pack dies with its Run, and deletes are pointers-before-bytes behind a grace window longer
-> than any in-flight read — no WAL. **Built so far (2026-08-24): the packs and the index; the
-> deletion machinery (pack-grain reclaim, the grace window) is not yet written** — until it is,
-> packs are never deleted, which errs in the safe direction. The classes, the `RetentionProfile` knobs, and the Cache itself are untouched.
+> than any in-flight read — no WAL. **Built so far (updated 2026-08-25, git-bug ad79c90): the
+> packs, the index, and the reclaim of *never-finished* drains — stale staged rows and the
+> rowless orphan bytes behind them (`reclaim_stale_staging_once` / `reclaim_orphan_packs_once`
+> in `workspaced.rs`, pointers-before-bytes behind the grace cadence). Pack-grain expiry of
+> COMMITTED packs — retention proper — is still not written**, gated on the ec294b7 cross-fence
+> dedup question; until it is, committed packs are never deleted, which errs in the safe
+> direction. The classes, the `RetentionProfile` knobs, and the Cache itself are untouched.
 
 ## Context
 

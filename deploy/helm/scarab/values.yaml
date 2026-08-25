@@ -99,6 +99,27 @@ scarab:
   # to run without a bucket is an explicit SCARAB_OBJECT_DIR via
   # scarab.extraEnv — a tests/dev stand-in whose contents die with the Pod;
   # never production.
+  #
+  # DEPLOYMENT REQUIREMENT (git-bug ad79c90): the bucket MUST have a
+  # lifecycle rule aborting incomplete multipart uploads. The Depot streams
+  # drain bytes as multipart pack uploads; it aborts them on its own error
+  # paths and on graceful shutdown, but a CRASHED replica cannot — and an
+  # S3-compatible store gives a server no way to list uploads it does not
+  # know about, so the leaked parts bill forever without this rule. On AWS
+  # S3 (and compatibles that implement lifecycle):
+  #
+  #   Rules:
+  #     - ID: abort-incomplete-multipart
+  #       Status: Enabled
+  #       AbortIncompleteMultipartUpload:
+  #         DaysAfterInitiation: 1
+  #
+  # One day is safe by construction: no live upload outlives its drain (the
+  # control plane's drain clock is minutes, the fence token's ceiling ~24h).
+  # MinIO needs nothing — it expires stale multipart uploads natively
+  # (`mc admin config get <alias> api` → stale_uploads_expiry=24h, swept
+  # every stale_uploads_cleanup_interval=6h by default), and its mc ships no
+  # abort-incomplete-multipart ILM flag at all.
   s3:
     bucket: ""
     endpoint: ""       # e.g. http://minio.scarab.svc:9000 ; empty => AWS S3
