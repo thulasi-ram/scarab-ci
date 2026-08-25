@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1787635217,"nonce":"j/A98I1xmBeMNPjS2Vv+boFo2Dw=","added":["parked"],"removed":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1787635217,"nonce":"kvnv5LCzqKUBIevHEdofRIyGaIE=","message":"Reopened as PARKED (label) per owner 2026-08-25 — deliberately untracked-for-now work; the handoff comment above is the pickup point.","files":null}]}
