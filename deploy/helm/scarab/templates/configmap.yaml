@@ -87,15 +87,6 @@ data:
          the server has its own default, so a chart-pinned digest is possible.
          ⚠ DELETE ME with the node driver (git-bug 0628369). */}}
   SCARAB_WSFETCH_IMAGE: {{ .Values.workspace.fetcherImage | quote }}
-  {{- /* Helper container resources (ticket 16a7768): requests==limits on both
-         wsfetch containers; memory also derives the transfer byte budget.
-         Rendered only when set — "" keeps the server's own defaults. */}}
-  {{- if ne (toString .Values.workspace.helperMemoryMib) "" }}
-  SCARAB_WSFETCH_MEMORY_MIB: {{ .Values.workspace.helperMemoryMib | quote }}
-  {{- end }}
-  {{- if ne (toString .Values.workspace.helperCpuMillis) "" }}
-  SCARAB_WSFETCH_CPU_MILLIS: {{ .Values.workspace.helperCpuMillis | quote }}
-  {{- end }}
   {{- end }}
   {{- if .Values.secrets.resultsTokenSecret }}
   SCARAB_SIDECAR_IMAGE: {{ .Values.scarab.sidecarImage | quote }}

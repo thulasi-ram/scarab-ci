@@ -112,17 +112,6 @@ pub enum FailureClass {
     /// developer verdict (`Failed`) instead of churning the infra auto-retry
     /// budget and dead-lettering as an operator problem it is not.
     Config,
-    /// The step's input **Workspace Snapshot no longer exists anywhere** —
-    /// a live Depot answered 404, meaning its warm tier, its pack index AND
-    /// the cold archive all miss it (evicted past retention, or the store was
-    /// wiped). Ticket e140121. Like `Config` the process never ran and
-    /// re-launching the identical spec can never succeed — but unlike it the
-    /// author configured nothing wrong and the operator broke nothing: the
-    /// CONTENT is gone, and the recovery is a Rerun/Retry, whose planner
-    /// already widens to the producing steps via the `WorkspaceSnapshots`
-    /// oracle (ADR-0061 s5). One attempt, run `Failed` (never
-    /// `DeadLettered`), cause names that recovery.
-    MissingInputs,
 }
 
 /// Observed state of a launched execution when polled.

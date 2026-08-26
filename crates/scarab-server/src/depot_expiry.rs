@@ -68,9 +68,7 @@ use crate::workspaced::PACK_RECLAIM_ADVISORY_LOCK;
 
 /// Victim fences processed per arm per pass — bounds one pass's work; the
 /// loop catches up. Same figure as the retention sweeper's `SWEEP_BATCH`.
-/// `pub(crate)` so the starvation test seeds its blocker population FROM
-/// this figure — a retune must retune the test with it.
-pub(crate) const EXPIRY_BATCH: u32 = 100;
+const EXPIRY_BATCH: u32 = 100;
 
 /// The DB spellings of the terminal run states, as one SQL `IN` list. The
 /// same literal set every retention query in `scarab-db-postgres` uses
@@ -209,17 +207,14 @@ impl RetentionRegistry {
         self.ttls_of(name).pack_ttl_secs
     }
 
-    /// Every profile's (name, resolved pack TTL) pair — the nomination
-    /// query's CASE arms, rebuilt at every pass start so each pass is
-    /// self-contained. The registry itself is boot-loaded: an ADR-0065 s2
-    /// operator retune lands on the next reboot, and from there applies to
-    /// every run, old ones included. The registry is small; the CASE is
-    /// bounded by it.
-    fn profile_pack_ttls(&self) -> Vec<(&str, i64)> {
+    /// The SHORTEST pack TTL any resolution can produce — the candidate
+    /// query's SQL bound must admit every run that could be a victim under
+    /// SOME profile; the exact per-run cutoff is applied in code.
+    fn min_pack_ttl_secs(&self) -> i64 {
         self.profiles
             .iter()
-            .map(|p| (p.name.as_str(), self.ttls_of_profile(Some(p)).pack_ttl_secs))
-            .collect()
+            .map(|p| self.ttls_of_profile(Some(p)).pack_ttl_secs)
+            .fold(self.flat.pack_ttl_secs, i64::min)
     }
 
     /// The LONGEST workspace TTL any resolution can produce — the pre-epoch
@@ -345,25 +340,6 @@ pub enum ExpiryPass {
     LockBusy,
 }
 
-/// One pass's declined-candidate accumulator, recorded into
-/// [`crate::metrics::record_depot_expiry_candidates_skipped`] on DROP — so
-/// EVERY exit from the pass records it: the normal return, the 40P01 aborts,
-/// and the hard-error `?`/`return Err` paths alike. A decline that happened
-/// is evidence regardless of how the pass ended.
-struct SkippedCandidates(u32);
-
-impl SkippedCandidates {
-    fn bump(&mut self) {
-        self.0 += 1;
-    }
-}
-
-impl Drop for SkippedCandidates {
-    fn drop(&mut self) {
-        crate::metrics::record_depot_expiry_candidates_skipped(self.0);
-    }
-}
-
 /// The pass body, under the advisory lock: the floor, then the recorded arm,
 /// then (floor permitting) the recordless arm.
 async fn expire_pass(
@@ -378,6 +354,10 @@ async fn expire_pass(
     )
     .fetch_one(db)
     .await?;
+    // The SQL bound is the LOOSEST cutoff any profile can produce (ADR-0065
+    // s2 reshaped the query: per-run cutoffs are applied in code below, so
+    // the one bind can only be a bound, not the verdict).
+    let loosest_cutoff = cutoff_ms(now_secs, registry.min_pack_ttl_secs());
     let ws_cutoff = cutoff_ms(now_secs, registry.max_workspace_ttl_secs());
     let epoch_ms = epoch.saturating_mul(1000);
 
@@ -400,74 +380,46 @@ async fn expire_pass(
     crate::metrics::set_depot_expiry_floor_held(floor_held);
 
     let mut expired = 0u32;
-    // Nominated candidates the pass declined without expiring (the victim
-    // transaction's re-read said no: a live borrower, a rerun flip, a
-    // vanished record). Counted per pass so a starved window — skips
-    // climbing while `expired` stays flat — is VISIBLE, never silent
-    // (git-bug a543fef). The drop-guard records on every exit path.
-    let mut skipped = SkippedCandidates(0);
 
-    // --- The recorded arm: success records whose run is terminal, past ITS
-    // OWN profile's pack TTL and unpinned. The per-run cutoff is resolved
-    // INTO the query (git-bug a543fef): one CASE arm per registry profile,
-    // built at pass start. The pre-s2 shape — nominate under the loosest
-    // cutoff, `continue` in code — starved the window: >= `batch` old
-    // long-TTL runs sat first in posted_at order, every pass re-fetched
-    // exactly them, and genuinely-expired victims behind them were never
-    // nominated until the blockers aged out. The pre-epoch floor gate is a
-    // WHERE clause ($2/$3) for the same reason: a floor-held backlog must
-    // not occupy the window either. A post-epoch fence (no pack older than
-    // the epoch) expires on its recorded edges alone even while the floor
-    // is up.
-    let profile_cutoffs: Vec<(&str, i64)> = registry
-        .profile_pack_ttls()
-        .into_iter()
-        .map(|(name, ttl)| (name, cutoff_ms(now_secs, ttl)))
-        .collect();
-    // No name and an unknown name both resolve to the default profile /
-    // flat TTLs — CASE's ELSE (a NULL scrutinee never matches a WHEN); the
-    // unknown-name warn still fires in the victim transaction's re-read.
-    let default_cutoff = cutoff_ms(now_secs, registry.pack_ttl_secs(None));
-    let cutoff_expr = if profile_cutoffs.is_empty() {
-        // `CASE x ELSE y END` with zero WHEN arms is not SQL.
-        "$4".to_string()
-    } else {
-        let mut expr = String::from("CASE ru.ir->>'retention_profile' ");
-        let mut n = 5;
-        for _ in &profile_cutoffs {
-            expr.push_str(&format!("WHEN ${n} THEN ${} ", n + 1));
-            n += 2;
-        }
-        expr.push_str("ELSE $4 END");
-        expr
-    };
-    let sql = format!(
-        "SELECT r.fence_key \
+    // --- The recorded arm: success records whose run is terminal, past its
+    // profile's pack TTL and unpinned. `pre_epoch` (any pack older than the
+    // epoch) is what scopes the floor: a post-epoch fence's borrows are all
+    // recorded, so it expires on edges alone even while the floor is up.
+    let candidates: Vec<(String, Option<String>, i64, bool)> = sqlx::query_as(&format!(
+        "SELECT r.fence_key, ru.ir->>'retention_profile', ru.updated_at, \
+                EXISTS (SELECT 1 FROM depot_packs p \
+                        WHERE p.fence_key = r.fence_key AND p.created_at < $3) AS pre_epoch \
          FROM depot_drain_records r \
          JOIN runs ru ON ru.id = r.run \
          WHERE r.record->>'error' IS NULL \
            AND ru.status IN {TERMINAL_RUN_STATUSES_SQL} \
+           AND ru.updated_at < $1 \
            AND ru.snapshots_pinned_at IS NULL \
-           AND ru.updated_at < {cutoff_expr} \
-           AND (NOT $2 OR NOT EXISTS \
-                (SELECT 1 FROM depot_packs p \
-                 WHERE p.fence_key = r.fence_key AND p.created_at < $3)) \
          ORDER BY r.posted_at \
-         LIMIT $1"
-    );
-    let mut query = sqlx::query_scalar::<_, String>(&sql)
-        .bind(i64::from(batch))
-        .bind(floor_held)
-        .bind(epoch)
-        .bind(default_cutoff);
-    for (name, cutoff) in &profile_cutoffs {
-        query = query.bind(*name).bind(*cutoff);
-    }
-    let candidates: Vec<String> = query.fetch_all(db).await?;
-    for fence in candidates {
+         LIMIT $2"
+    ))
+    .bind(loosest_cutoff)
+    .bind(i64::from(batch))
+    .bind(epoch)
+    .fetch_all(db)
+    .await?;
+    for (fence, profile, updated_at, pre_epoch) in candidates {
+        // The per-run cutoff, from the CURRENT registry (ADR-0065 s2).
+        let cutoff = cutoff_ms(now_secs, registry.pack_ttl_secs(profile.as_deref()));
+        if updated_at >= cutoff {
+            continue; // within its own profile's TTL — the SQL bound is loose
+        }
+        if pre_epoch && floor_held {
+            tracing::debug!(
+                fence_key = %fence,
+                "depot expiry: pre-epoch victim held by the reachability floor — a \
+                 pre-epoch run could still silently borrow from it"
+            );
+            continue;
+        }
         match expire_one_fence(db, &fence, Victim::Recorded { now_secs }, registry).await {
             Ok(true) => expired += 1,
-            Ok(false) => skipped.bump(),
+            Ok(false) => {}
             Err(e) if is_deadlock(&e) => {
                 crate::metrics::record_depot_expiry_pass_skipped();
                 tracing::warn!(
@@ -504,7 +456,7 @@ async fn expire_pass(
         for fence in recordless {
             match expire_one_fence(db, &fence, Victim::Recordless { epoch }, registry).await {
                 Ok(true) => expired += 1,
-                Ok(false) => skipped.bump(),
+                Ok(false) => {}
                 Err(e) if is_deadlock(&e) => {
                     crate::metrics::record_depot_expiry_pass_skipped();
                     tracing::warn!(
@@ -519,7 +471,6 @@ async fn expire_pass(
         }
     }
 
-    // `skipped` drops here (as on every earlier return), recording the count.
     Ok(expired)
 }
 
@@ -750,13 +701,8 @@ mod tests {
         assert_eq!(reg.pack_ttl_secs(None), days_secs(90), "unnamed → default");
         // `short` leaves workspace unset → flat 7d backs its floor check.
         assert_eq!(reg.ttls_of(Some("short")).workspace_ttl_secs, days_secs(7));
-        // The nomination CASE arms: every profile with its resolved pack TTL
-        // (`short` leaves it to itself, `keep` to itself) — and the floor's
-        // bound stays the most conservative workspace TTL.
-        assert_eq!(
-            reg.profile_pack_ttls(),
-            vec![("short", days_secs(9)), ("keep", days_secs(90))]
-        );
+        // The query bounds: loosest pack cutoff, most conservative floor.
+        assert_eq!(reg.min_pack_ttl_secs(), days_secs(9));
         assert_eq!(reg.max_workspace_ttl_secs(), days_secs(30));
 
         let bare = RetentionRegistry::flat(flat());

@@ -79,33 +79,25 @@
 //! precisely for that. This binary does the same as a final pass, in-process:
 //! see [`widen_for_the_group`].
 //!
-//! # Fetch exit codes (ticket e140121)
+//! # Exit codes
 //!
-//! The table lives on the constants —
-//! [`scarab_workspace_client::EXIT_FETCH_TRANSIENT`] and siblings — shared
-//! with the executor so the two sides cannot drift. In short: 0 provisioned,
-//! 1 transient-after-retry-window, 2 missing inputs (`NotFound` ONLY — a live
-//! Depot said warm + packs + cold all miss), 3 denied (401/403), 4 config
-//! (env/skew permanents). Before this ticket, 2 lumped every "permanent"
-//! together and every non-zero exit burned the full infra auto-retry budget.
+//! | code | meaning | what the executor does |
+//! |---|---|---|
+//! | 0 | the workspace is provisioned | the Step runs |
+//! | 1 | transient (service unreachable, 5xx, I/O) | the Pod fails; the engine's bounded retry may land elsewhere |
+//! | 2 | permanent (a snapshot the store does not have) | same class, and the message says it is permanent |
 //!
-//! # A Depot outage DELAYS a boundary, it never fails it (ADR-0066)
-//!
-//! Transient failures (connect refused/reset, 5xx, idle-read timeout, a torn
-//! read) are retried inside a window proportional to the step's own deadline
-//! — `clamp(timeout/10, 5s, 60s)`, timeout via
-//! [`scarab_workspace_client::STEP_TIMEOUT_ENV`] — with 1s→10s backoff. One
-//! window bounds the WHOLE leg (all roots share the deadline), so a Step with
-//! ten inputs does not wait ten windows. The wait bills the step budget
-//! (stated in the design; the clock split is a separate ticket).
+//! Both failures surface as `Infra { never_started: true }` — the Step's main
+//! process never ran, so no side effect is possible. That is deliberately the
+//! same verdict the deleted control-plane path produced for
+//! `DriveErr::InputMissing`.
 
 use std::os::unix::fs::PermissionsExt;
 
 use scarab_storage::{PruneError, StorageError, TreeHash};
 use scarab_workspace_client::{
     exclude_paths, DrainErrorKind, DrainErrorRecord, DrainPostOutcome, DrainRecord, IngestReport,
-    MemoCas, WorkspaceClient, EXIT_FETCH_CONFIG, EXIT_FETCH_DENIED, EXIT_FETCH_MISSING_INPUTS,
-    EXIT_FETCH_TRANSIENT, STEP_TIMEOUT_ENV,
+    MemoCas, WorkspaceClient,
 };
 
 /// The env var naming the tmpfs file holding the workspace token. Must agree
@@ -160,21 +152,13 @@ fn main() {
         None | Some("fetch") => {
             let code = match run() {
                 Ok(()) => 0,
-                Err(FetchError::MissingInputs(msg)) => {
-                    eprintln!("scarab-wsfetch: MISSING INPUTS: {msg}");
-                    EXIT_FETCH_MISSING_INPUTS
-                }
-                Err(FetchError::Denied(msg)) => {
-                    eprintln!("scarab-wsfetch: DENIED: {msg}");
-                    EXIT_FETCH_DENIED
-                }
-                Err(FetchError::Config(msg)) => {
-                    eprintln!("scarab-wsfetch: CONFIG: {msg}");
-                    EXIT_FETCH_CONFIG
+                Err(FetchError::Permanent(msg)) => {
+                    eprintln!("scarab-wsfetch: PERMANENT: {msg}");
+                    2
                 }
                 Err(FetchError::Transient(msg)) => {
                     eprintln!("scarab-wsfetch: {msg}");
-                    EXIT_FETCH_TRANSIENT
+                    1
                 }
             };
             std::process::exit(code);
@@ -187,9 +171,7 @@ fn main() {
                  `hold`, or `drain`. If the control plane passed this, this image is older \
                  than the executor driving it (image/CP skew)."
             );
-            // Config, not the old exit 2: rerunning producers cannot fix skew,
-            // and 2 now means "an input snapshot is gone" (ticket e140121).
-            std::process::exit(EXIT_FETCH_CONFIG);
+            std::process::exit(2);
         }
     }
 }
@@ -235,140 +217,16 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 }
 
 enum FetchError {
-    /// An input snapshot is GONE (`StorageError::NotFound` only): a live Depot
-    /// answered 404, which means warm, the pack index and the cold archive all
-    /// miss it. Retrying the identical spec cannot re-create content — exit
-    /// [`EXIT_FETCH_MISSING_INPUTS`], and the recovery is a Rerun/Retry (the
-    /// rerun planner widens to the producing steps, ADR-0061 s5).
-    MissingInputs(String),
-    /// The Depot refused the token (401/403). Retrying with the SAME token
-    /// cannot heal — exit [`EXIT_FETCH_DENIED`] immediately; a fresh attempt
-    /// mints a fresh fence token.
-    Denied(String),
-    /// This invocation can never work: required env absent, an address shape
-    /// this binary cannot parse — env/image skew, operator-fixable. Exit
-    /// [`EXIT_FETCH_CONFIG`].
-    Config(String),
-    /// Anything else: unreachable service, 5xx, local I/O — exit
-    /// [`EXIT_FETCH_TRANSIENT`] (after the retry window, where applicable).
+    /// The snapshot cannot ever be provisioned — retrying the identical spec
+    /// cannot fix it.
+    Permanent(String),
+    /// Anything else: unreachable service, 5xx, local I/O.
     Transient(String),
 }
 
 impl From<std::io::Error> for FetchError {
     fn from(e: std::io::Error) -> Self {
         FetchError::Transient(e.to_string())
-    }
-}
-
-/// What one [`StorageError`] means for the retry loop — the PURE half of the
-/// policy (the loop supplies the clock), so a table test can hold it without
-/// scheduling anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetryVerdict {
-    /// Weather: transport/local-I/O failures (`Backend` — no HTTP answer at
-    /// all), retryable statuses (5xx, 429, 408), or a torn read mid-restart
-    /// (`HashMismatch` — one re-read is cheap). Retry in the window.
-    Retry,
-    /// `NotFound` from a live Depot: warm + packs + cold all miss. Permanent.
-    MissingInputs,
-    /// 401/403 — the same token cannot heal it.
-    Denied,
-    /// Permanent, non-content: a 4xx the service will answer identically
-    /// forever (malformed/contract-violating request — skew or a bug), an
-    /// address shape this binary cannot parse (`UnknownAlgorithm`), or an
-    /// input nothing can process (`Unsupported`). Retrying only delays the
-    /// honest verdict.
-    Config,
-}
-
-fn retry_verdict(e: &StorageError) -> RetryVerdict {
-    match e {
-        // `Backend` is TRANSPORT-only since the e140121 review fix (connect
-        // refused/reset, idle timeout, local I/O) — always worth the window.
-        // `HashMismatch` stays retryable: a torn read mid-restart heals on
-        // one re-read, and a persistent mismatch exhausts the window into
-        // exit 1 where the bounded re-launch takes over.
-        StorageError::Backend(_) | StorageError::HashMismatch => RetryVerdict::Retry,
-        // With the status carried, only server weather retries: 5xx (a cold-
-        // tier outage surfaces as 5xx, never 404), 429 (asked to back off —
-        // backing off IS the loop), 408 (the request died of time, not of
-        // shape). Every other 4xx is the service refusing THIS request's
-        // form; it will refuse the retry identically, so it is skew/config,
-        // not weather.
-        StorageError::Status { status, .. } => match status {
-            500..=599 | 429 | 408 => RetryVerdict::Retry,
-            _ => RetryVerdict::Config,
-        },
-        StorageError::NotFound => RetryVerdict::MissingInputs,
-        StorageError::Denied(_) => RetryVerdict::Denied,
-        StorageError::UnknownAlgorithm(_) | StorageError::Unsupported(_) => RetryVerdict::Config,
-    }
-}
-
-/// The transient-retry window for one whole leg (fetch OR drain):
-/// `clamp(step_timeout / 10, 5s, 60s)` — proportional cost (ADR-0066: a Depot
-/// outage delays a boundary; the delay must stay a fraction of the budget it
-/// bills).
-fn retry_window(step_timeout_secs: u64) -> std::time::Duration {
-    std::time::Duration::from_secs((step_timeout_secs / 10).clamp(5, 60))
-}
-
-/// Parse the executor-stamped step timeout ([`STEP_TIMEOUT_ENV`]). Absent or
-/// garbage (image/CP skew — an OLD executor stamps nothing) → 300s, i.e. a
-/// 30s window: patient enough to ride out a Depot rollout, small next to any
-/// real deadline. Never an error — the timeout only sizes the window.
-fn parse_step_timeout_secs(raw: Option<String>) -> u64 {
-    raw.and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(300)
-}
-
-fn step_timeout_secs() -> u64 {
-    parse_step_timeout_secs(std::env::var(STEP_TIMEOUT_ENV).ok())
-}
-
-/// The backoff pause after `pause`, capped at 10s.
-fn next_pause(pause: std::time::Duration) -> std::time::Duration {
-    std::cmp::min(pause * 2, std::time::Duration::from_secs(10))
-}
-
-/// One leg's transient-retry window, **armed at the first transient failure**
-/// — never at leg start (review fix on e140121). Arming at leg start made
-/// successful transfer time consume the retry budget: a fetch whose downloads
-/// alone take longer than the window would reach its first outage with the
-/// window already spent and get ZERO retries — the feature inert exactly for
-/// the expensive legs that need it most. Arming on failure keeps the
-/// guarantee that matters (at most ONE window of outage-waiting per leg,
-/// shared across roots/retries — never N × window) while transfer time stays
-/// the step budget's business, not the window's.
-struct LegWindow {
-    window: std::time::Duration,
-    /// The deadline, set by the first transient failure.
-    armed: Option<std::time::Instant>,
-}
-
-impl LegWindow {
-    fn new(window: std::time::Duration) -> Self {
-        Self {
-            window,
-            armed: None,
-        }
-    }
-
-    /// Called on a transient failure observed at `now`: arms the deadline on
-    /// the first call, then answers how long to sleep before the next try —
-    /// `pause`, capped to what remains of the window — or `None` once the
-    /// window is exhausted.
-    fn next_delay(
-        &mut self,
-        now: std::time::Instant,
-        pause: std::time::Duration,
-    ) -> Option<std::time::Duration> {
-        let deadline = *self.armed.get_or_insert(now + self.window);
-        if now >= deadline {
-            return None;
-        }
-        Some(pause.min(deadline - now))
     }
 }
 
@@ -449,13 +307,13 @@ fn run() -> Result<(), FetchError> {
     }
 
     let base = std::env::var(URL_ENV).map_err(|_| {
-        FetchError::Config(format!(
+        FetchError::Permanent(format!(
             "{URL_ENV} is not set — this Pod has input snapshots but no workspace service \
              to fetch them from (ADR-0061)"
         ))
     })?;
     let token_file = std::env::var(TOKEN_FILE_ENV).map_err(|_| {
-        FetchError::Config(format!(
+        FetchError::Permanent(format!(
             "{TOKEN_FILE_ENV} is not set — the workspace token is delivered on tmpfs and is \
              never read from env (ADR-0061)"
         ))
@@ -473,26 +331,6 @@ fn run() -> Result<(), FetchError> {
     Ok(())
 }
 
-/// Apply the executor-stamped transfer byte budget, if any (ticket 16a7768
-/// item 1). The executor derives [`scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV`]
-/// from the helper container's memory limit, so the k8s limit and the client's
-/// in-flight byte cap move on ONE knob — for the FETCH (downloads) and the
-/// DRAIN (uploads) alike, both of which wear the same image and the same
-/// limit. Unset/blank = the client's own default; garbage errors with the
-/// value named rather than silently running unbudgeted.
-fn apply_transfer_budget(client: WorkspaceClient) -> Result<WorkspaceClient, String> {
-    match std::env::var(scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV) {
-        Ok(v) if !v.trim().is_empty() => match v.trim().parse::<u64>() {
-            Ok(bytes) => Ok(client.with_transfer_byte_budget(bytes)),
-            Err(_) => Err(format!(
-                "{}={v:?} is not a byte count",
-                scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV
-            )),
-        },
-        _ => Ok(client),
-    }
-}
-
 async fn fetch(
     base: &str,
     token_file: &str,
@@ -502,76 +340,21 @@ async fn fetch(
 ) -> Result<(), FetchError> {
     let client = WorkspaceClient::from_token_file(base, token_file)
         .map_err(|e| FetchError::Transient(format!("workspace token: {e}")))?;
-    // Config, not Transient (review fix): a garbled budget env is stamped by
-    // the EXECUTOR — image/executor skew — and re-launching re-stamps the
-    // identical garbage, so the infra retry budget cannot heal it.
-    let client = apply_transfer_budget(client).map_err(FetchError::Config)?;
-    // ONE window for the whole fetch leg (ticket e140121): every root's
-    // retries share this deadline, so the worst-case delay is proportional to
-    // the step's own budget, not to its input count. Armed at the FIRST
-    // transient failure (see [`LegWindow`]) so transfer time never eats the
-    // retry budget. Only transient failures (see `retry_verdict`) retry;
-    // NotFound/Denied/skew exit immediately.
-    let mut win = LegWindow::new(retry_window(step_timeout_secs()));
     for (i, root) in roots.iter().enumerate() {
         let started = std::time::Instant::now();
-        let mut pause = std::time::Duration::from_secs(1);
         // Merge-in-order (ADR-0007): later roots overlay earlier ones, so this
         // loop is sequential ON PURPOSE. Parallelising it would make the result
         // depend on which download finished first.
-        loop {
-            // Whole-ROOT retry: `materialize` is a merge-in-order overlay, so
-            // re-running a root over its own partial restore overwrites
-            // correctly (idempotent). Re-downloading the root's blobs is the
-            // accepted cost — per-blob resume is future perf work.
-            let err = match scarab_storage::Cas::materialize(
-                &client,
-                &TreeHash(root.clone()),
-                target,
-            )
+        scarab_storage::Cas::materialize(&client, &TreeHash(root.clone()), target)
             .await
-            {
-                Ok(()) => break,
-                Err(e) => e,
-            };
-            match retry_verdict(&err) {
-                RetryVerdict::Retry => {
-                    let Some(sleep) = win.next_delay(std::time::Instant::now(), pause) else {
-                        return Err(FetchError::Transient(format!(
-                            "materialize {root}: {err} — still failing after the \
-                             {}s retry window (a Depot outage longer than this \
-                             delays the attempt into a bounded re-launch)",
-                            win.window.as_secs()
-                        )));
-                    };
-                    eprintln!(
-                        "scarab-wsfetch: materialize {root}: {err} — transient, \
-                         retrying in {} ms (window {}s)",
-                        sleep.as_millis(),
-                        win.window.as_secs()
-                    );
-                    tokio::time::sleep(sleep).await;
-                    pause = next_pause(pause);
-                }
-                RetryVerdict::MissingInputs => {
-                    return Err(FetchError::MissingInputs(format!(
-                        "input snapshot {root} is not in the workspace service, its pack \
-                         index or its cold archive — this Step can never be provisioned \
-                         from the identical spec (evicted, or the store was wiped); \
-                         Rerun/Retry regenerates it"
-                    )))
-                }
-                RetryVerdict::Denied => {
-                    return Err(FetchError::Denied(format!(
-                        "materialize {root}: {err} — retrying with the same workspace \
-                         token cannot heal a denial; a fresh attempt mints a fresh one"
-                    )))
-                }
-                RetryVerdict::Config => {
-                    return Err(FetchError::Config(format!("materialize {root}: {err}")))
-                }
-            }
-        }
+            .map_err(|e| match e {
+                StorageError::NotFound => FetchError::Permanent(format!(
+                    "input snapshot {root} is not in the workspace service or its cold \
+                     archive — this Step can never be provisioned (evicted, or the store \
+                     was wiped)"
+                )),
+                other => FetchError::Transient(format!("materialize {root}: {other}")),
+            })?;
         println!(
             "scarab-wsfetch: input {}/{} {} materialised in {} ms",
             i + 1,
@@ -773,13 +556,6 @@ fn drain_main(args: &[String]) -> i32 {
             return EXIT_DRAIN_TRANSIENT;
         }
     };
-    let client = match apply_transfer_budget(client) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("scarab-wsfetch: drain: {e}");
-            return EXIT_DRAIN_TRANSIENT;
-        }
-    };
     // Multi-thread for the same reason as `fetch`: the ingest overlaps
     // hashing/reading with uploads.
     let runtime = match tokio::runtime::Runtime::new() {
@@ -807,47 +583,12 @@ async fn run_drain(
     // The DRAIN variant: trees are PUT unconditionally so every tree of the
     // closure enters this fence's write ledger (only a PUT appends it), or
     // the record POST below would 422 on any incremental workspace.
-    //
-    // WHOLE-LEG retry (ticket e140121 F6): a transient failure re-runs
-    // `drain_ingest_report` from the top inside the same window the fetch leg
-    // uses — never per-op retries inside the client lib (the lib is shared
-    // with the control plane, whose TieredCas has its own fallback policy).
-    // From-scratch is idempotent by construction: the re-scan is local, the
-    // batched `/have` keys durable content on the pack index so bytes a Depot
-    // restart lost re-upload while surviving packs dedup, a PUT of identical
-    // bytes is an idempotent overwrite, and the write-ledger append upserts
-    // (`ON CONFLICT DO UPDATE` on `depot_fence_writes`).
-    // Armed at the first transient failure, like the fetch leg's — hashing
-    // and uploading the workspace can alone outlast the window, and a window
-    // armed at leg start would leave such a drain ZERO retries.
-    let mut win = LegWindow::new(retry_window(step_timeout_secs()));
-    let mut ingest_pause = std::time::Duration::from_secs(1);
-    let report = loop {
-        let err = match client.drain_ingest_report(workspace, outputs, cache_dirs).await {
-            Ok(r) => break r,
-            Err(e) => e,
-        };
-        if retry_verdict(&err) != RetryVerdict::Retry {
-            // Non-transient (denied / a permanent 4xx / an unscannable
-            // workspace): exit 10 immediately — classification is
-            // record-first on the control plane, and its bounded outer
-            // re-drive stays the correctness path.
-            eprintln!("scarab-wsfetch: drain: ingest {workspace}: {err}");
+    let report = match client.drain_ingest_report(workspace, outputs, cache_dirs).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("scarab-wsfetch: drain: ingest {workspace}: {e}");
             return EXIT_DRAIN_TRANSIENT;
         }
-        let Some(sleep) = win.next_delay(std::time::Instant::now(), ingest_pause) else {
-            // Window exhausted: same exit, the outer re-drive takes over.
-            eprintln!("scarab-wsfetch: drain: ingest {workspace}: {err}");
-            return EXIT_DRAIN_TRANSIENT;
-        };
-        eprintln!(
-            "scarab-wsfetch: drain: ingest {workspace}: {err} — transient, retrying \
-             the whole leg in {} ms (window {}s)",
-            sleep.as_millis(),
-            win.window.as_secs()
-        );
-        tokio::time::sleep(sleep).await;
-        ingest_pause = next_pause(ingest_pause);
     };
     let ingest_ms = t_ingest.elapsed().as_millis() as u64;
     let IngestReport {
@@ -999,18 +740,6 @@ async fn run_drain(
                 );
                 return 0;
             }
-            // 409: a success record already stands under this fence — ours by
-            // construction (the fence key includes the attempt), i.e. an
-            // earlier POST landed but its 2xx was lost. The record is
-            // deposited; exit 0 for exit-code honesty (ticket e140121 F5).
-            Ok(DrainPostOutcome::AlreadyPosted) => {
-                println!(
-                    "scarab-wsfetch: drain — record was ALREADY posted under this fence \
-                     (a lost 2xx retried into 409): root={}",
-                    rec.root,
-                );
-                return 0;
-            }
             Ok(DrainPostOutcome::StateIncomplete(detail)) => {
                 if waited >= DRAIN_INCOMPLETE_RETRY_CAP {
                     eprintln!(
@@ -1068,137 +797,6 @@ fn classify_prune(err: PruneError, declared: &[String]) -> PruneVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The retry policy at the fn grain (ticket e140121; repo rule: construct
-    /// the decision, don't schedule it). The table IS the contract: weather
-    /// retries — transport, 5xx, 429, 408, a torn read — and NOTHING else:
-    /// absence is MissingInputs, a denial is Denied, a permanent 4xx / an
-    /// unparseable address / an unscannable input is Config. Mutations killed
-    /// in each direction — retrying NotFound would grind an evicted snapshot
-    /// against the window and then burn 3 attempts; NOT retrying transport or
-    /// 5xx re-opens the ticket's bug (a 20s Depot restart dead-lettering
-    /// runs); retrying a 400/405/409/422 (review finding) grinds the whole
-    /// window and 3 Infra attempts on a request the service refuses
-    /// identically forever.
-    #[test]
-    fn retry_verdict_retries_weather_and_only_weather() {
-        let status = |status: u16| StorageError::Status {
-            status,
-            body: "x".into(),
-        };
-        for (err, want) in [
-            // Transport: no HTTP answer at all.
-            (
-                StorageError::Backend("workspace service unreachable: connect refused".into()),
-                RetryVerdict::Retry,
-            ),
-            // Server weather, status-carried.
-            (status(500), RetryVerdict::Retry),
-            (status(503), RetryVerdict::Retry),
-            (status(429), RetryVerdict::Retry),
-            (status(408), RetryVerdict::Retry),
-            // A torn read mid-restart: one re-read is cheap.
-            (StorageError::HashMismatch, RetryVerdict::Retry),
-            (StorageError::NotFound, RetryVerdict::MissingInputs),
-            (
-                StorageError::Denied("workspace service 401 Unauthorized: expired".into()),
-                RetryVerdict::Denied,
-            ),
-            // Permanent 4xx: the service refuses THIS request's shape, and
-            // will refuse the retry identically — skew/config, not weather.
-            (status(400), RetryVerdict::Config),
-            (status(405), RetryVerdict::Config),
-            (status(409), RetryVerdict::Config),
-            (status(422), RetryVerdict::Config),
-            (
-                StorageError::UnknownAlgorithm("blake3".into()),
-                RetryVerdict::Config,
-            ),
-            // An input nothing can process (a FIFO in the workspace): the
-            // re-scan re-refuses identically — never worth the window.
-            (
-                StorageError::Unsupported("refusing to snapshot a FIFO".into()),
-                RetryVerdict::Config,
-            ),
-        ] {
-            assert_eq!(retry_verdict(&err), want, "{err:?}");
-        }
-    }
-
-    /// `clamp(timeout/10, 5s, 60s)`: the floor keeps a tiny timeout from
-    /// producing a useless sub-second window, the ceiling keeps a 23h step
-    /// from stalling Init for over two hours, and in between the cost is
-    /// proportional (a 300s default-when-unstamped step waits ≤30s).
-    #[test]
-    fn the_retry_window_is_a_clamped_tenth_of_the_step_timeout() {
-        use std::time::Duration;
-        assert_eq!(retry_window(1), Duration::from_secs(5), "floor");
-        assert_eq!(retry_window(50), Duration::from_secs(5), "floor edge");
-        assert_eq!(retry_window(300), Duration::from_secs(30), "proportional");
-        assert_eq!(retry_window(600), Duration::from_secs(60), "ceiling edge");
-        assert_eq!(retry_window(23 * 3600), Duration::from_secs(60), "ceiling");
-    }
-
-    /// The env parse is skew-tolerant BY CONTRACT: an old executor stamps
-    /// nothing and a garbled value must not fail the fetch (the timeout only
-    /// sizes the window) — both fall back to 300s, i.e. a 30s window.
-    #[test]
-    fn a_missing_or_garbled_step_timeout_defaults_to_300s() {
-        assert_eq!(parse_step_timeout_secs(None), 300);
-        assert_eq!(parse_step_timeout_secs(Some("".into())), 300);
-        assert_eq!(parse_step_timeout_secs(Some("not-a-number".into())), 300);
-        assert_eq!(parse_step_timeout_secs(Some("0".into())), 300);
-        assert_eq!(parse_step_timeout_secs(Some(" 7200 ".into())), 7200);
-    }
-
-    /// Backoff doubles and caps at 10s — the cap is what keeps a 60s window
-    /// useful (1+2+4+8+10+10+… tries ~7 times, not 3).
-    #[test]
-    fn backoff_doubles_to_a_10s_cap() {
-        use std::time::Duration;
-        assert_eq!(next_pause(Duration::from_secs(1)), Duration::from_secs(2));
-        assert_eq!(next_pause(Duration::from_secs(4)), Duration::from_secs(8));
-        assert_eq!(next_pause(Duration::from_secs(8)), Duration::from_secs(10));
-        assert_eq!(next_pause(Duration::from_secs(10)), Duration::from_secs(10));
-    }
-
-    /// The window arms at the FIRST transient failure, never at leg start
-    /// (review fix): a leg whose successful transfers alone outlast the whole
-    /// window still gets its full retry budget when the outage finally hits.
-    /// Mutation killed: reverting to `deadline = leg_start + window`, which
-    /// made the feature inert for exactly the expensive fetches that need it.
-    #[test]
-    fn the_window_arms_at_the_first_failure_not_at_leg_start() {
-        use std::time::{Duration, Instant};
-        let mut win = LegWindow::new(Duration::from_secs(5));
-        let leg_start = Instant::now();
-        // Transfers ran 100s — 20x the window — before the first failure…
-        let first_failure = leg_start + Duration::from_secs(100);
-        // …and the first transient still gets its full pause: the window is
-        // only NOW being armed.
-        assert_eq!(
-            win.next_delay(first_failure, Duration::from_secs(1)),
-            Some(Duration::from_secs(1)),
-            "transfer time must not consume the retry budget"
-        );
-        // Inside the armed window the sleep is capped to what remains…
-        assert_eq!(
-            win.next_delay(first_failure + Duration::from_secs(4), Duration::from_secs(10)),
-            Some(Duration::from_secs(1)),
-            "the sleep never overshoots the armed deadline"
-        );
-        // …and once the armed deadline passes, the window is exhausted. Still
-        // ONE window per leg: arming happened exactly once.
-        assert_eq!(
-            win.next_delay(first_failure + Duration::from_secs(5), Duration::from_secs(1)),
-            None
-        );
-        assert_eq!(
-            win.next_delay(first_failure + Duration::from_secs(60), Duration::from_secs(1)),
-            None,
-            "a later failure must not re-arm a second window"
-        );
-    }
 
     /// The b04697f contract, at the grain the fetcher owns it: after the pass a
     /// group member can read, write and traverse everything, directories are
