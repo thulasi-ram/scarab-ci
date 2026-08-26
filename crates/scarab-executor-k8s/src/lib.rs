@@ -1861,12 +1861,23 @@ fn classify_drain(
         // wsfetch with no subcommands ignores the `drain` argv, runs fetch,
         // and exits 0 having published nothing. Re-driving it re-runs the
         // same binary forever.
+        // The class stays FatalConfig (ticket e140121, amendment 3: the
+        // Transient flip's counterexamples cannot occur — the fence-residue
+        // sweep needs >24h while the token caps at 24h, and a PG failover
+        // losing committed rows co-corrupts far more than drain records — and
+        // Transient would hand a REAL stale image 5-minute escalation laps ×
+        // the author's `retry:`). What changed is the CAUSE: it now names
+        // both hypotheses instead of asserting only one.
         DrainExecOutcome::Exit(0) => DrainDecision::FatalConfig(
-            "the drain exec reported success but the Depot holds no drain \
-             record — the stale-binary signature: a helper image lacking the \
-             drain subcommand (publish the wsfetch image before the control \
-             plane). Record absence is Postgres-backed and replica-independent, \
-             so a lost volume cannot explain it."
+            "the drain exec reported success but the Depot holds no drain record. \
+             Two known ways here: (1) the stale-binary signature — a wsfetch image \
+             lacking the drain subcommand ignores the argv, runs fetch and exits 0 \
+             (publish the matching wsfetch image BEFORE rolling the control plane); \
+             (2) the drain record row was lost from Postgres after posting (record \
+             absence is Postgres-backed and replica-independent, so this takes a \
+             restore/failover that lost committed rows — audit the database if the \
+             images match). A re-drive would re-run the same binary, so this fails \
+             fast either way."
                 .to_string(),
         ),
         DrainExecOutcome::Exit(code) => DrainDecision::Transient(format!(
@@ -2850,7 +2861,16 @@ impl DebugLauncher for K8sExecutor {
                 .as_ref()
                 .ok_or(ExecError::Unavailable)?;
             let roots = vec![root.to_string()];
-            init_containers.push(workspace_fetch_container(&name, fetch, &roots, &[], &ws_mount));
+            init_containers.push(workspace_fetch_container(
+                &name,
+                fetch,
+                &roots,
+                &[],
+                &ws_mount,
+                // A debug Pod has no per-step timeout; the operator default
+                // sizes its fetch retry window like a timeout-less step's.
+                self.default_step_timeout_secs,
+            ));
             volumes.push(workspace_token_volume(&name));
         }
         let shell = Container {
@@ -3113,6 +3133,7 @@ fn workspace_fetch_container(
     roots: &[String],
     cache_restore: &[(String, String)],
     ws_mount: &VolumeMount,
+    step_timeout_secs: u32,
 ) -> Container {
     EAGER_FETCH_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The other half of guard #1: loud on the control plane too, so an operator
@@ -3133,6 +3154,15 @@ fn workspace_fetch_container(
         // earlier ones, so this join must not be sorted.
         env_var(WSFETCH_ROOTS_ENV, &roots.join(",")),
         env_var(WSFETCH_TARGET_ENV, WORKSPACE_MOUNT_PATH),
+        // The step's RESOLVED timeout (ticket e140121) — the SAME number this
+        // Pod's `activeDeadlineSeconds` is set to — sizing the fetcher's
+        // Depot-outage retry window (clamp(timeout/10, 5s, 60s)). A distinct
+        // env name from the server boot knob `SCARAB_STEP_TIMEOUT_SECS`,
+        // which means the global DEFAULT deadline, not this step's.
+        env_var(
+            scarab_workspace_client::STEP_TIMEOUT_ENV,
+            &step_timeout_secs.to_string(),
+        ),
     ];
     // Transfer byte budget from the memory limit (ticket 16a7768 item 1): the
     // fetch whole-buffers each downloaded blob just as the drain does uploads,
@@ -3686,6 +3716,9 @@ pub fn build_pod(
                     &spec.workspace_inputs,
                     cache_restore,
                     &ws,
+                    // The same resolved number `activeDeadlineSeconds` gets
+                    // below — the retry window is a fraction of THIS deadline.
+                    spec.timeout_seconds.unwrap_or(default_timeout_secs),
                 ));
             }
         }
@@ -3704,10 +3737,21 @@ pub fn build_pod(
         // The control plane execs `scarab-wsfetch drain` in this container
         // after the step exits; the Depot URL + token file ride its env, the
         // same pair the fetch mode reads.
-        let mut egress_env = vec![env_var(
-            workspace_token::WORKSPACE_TOKEN_FILE_ENV,
-            &workspace_token::workspace_token_path(),
-        )];
+        let mut egress_env = vec![
+            env_var(
+                workspace_token::WORKSPACE_TOKEN_FILE_ENV,
+                &workspace_token::workspace_token_path(),
+            ),
+            // The drain's whole-leg retry window is sized off the same
+            // resolved step timeout the fetcher's is (ticket e140121).
+            env_var(
+                scarab_workspace_client::STEP_TIMEOUT_ENV,
+                &spec
+                    .timeout_seconds
+                    .unwrap_or(default_timeout_secs)
+                    .to_string(),
+            ),
+        ];
         // The drain's in-flight byte cap rides the SAME knob as the memory
         // limit (ticket 16a7768 item 1) — half the limit, so raising one
         // raises the other and they cannot drift apart.
@@ -4541,15 +4585,11 @@ pub fn pod_state(pod: &Pod) -> ExecState {
             // it did before.
             if let Some(fetch_exit) = workspace_fetch_failed(pod) {
                 if exit_code.is_none() {
+                    let (class, cause) = classify_fetch_exit(fetch_exit);
                     return ExecState::Failed {
                         exit_code: None,
-                        class: FailureClass::Infra {
-                            never_started: true,
-                        },
-                        cause: Some(format!(
-                            "workspace fetch init container failed (exit {fetch_exit}) — \
-                             the step's inputs were never provisioned (ADR-0061 s3-feed)"
-                        )),
+                        class,
+                        cause: Some(cause),
                     };
                 }
             }
@@ -4595,15 +4635,11 @@ pub fn pod_state(pod: &Pod) -> ExecState {
             // under `restartPolicy: Never` is never retried by the kubelet, so
             // there is nothing to wait for even before the phase flips to Failed.
             if let Some(fetch_exit) = workspace_fetch_failed(pod) {
+                let (class, cause) = classify_fetch_exit(fetch_exit);
                 ExecState::Failed {
                     exit_code: None,
-                    class: FailureClass::Infra {
-                        never_started: true,
-                    },
-                    cause: Some(format!(
-                        "workspace fetch init container failed (exit {fetch_exit}) — \
-                         the step's inputs were never provisioned (ADR-0061 s3-feed)"
-                    )),
+                    class,
+                    cause: Some(cause),
                 }
             } else if let Some(class) = terminal_waiting_class(pod) {
                 ExecState::Failed {
@@ -4718,6 +4754,75 @@ fn step_container_started(pod: &Pod) -> bool {
 ///
 /// `last_state` is consulted too, so a status snapshot taken after the Pod moved
 /// on still yields the verdict.
+/// Map a failed workspace fetcher's exit code to a failure class + cause
+/// (ticket e140121) — the executor's half of the exit-code table pinned on
+/// [`scarab_workspace_client::EXIT_FETCH_TRANSIENT`] and siblings. Runs only
+/// after [`workspace_fetch_failed`] said the FETCHER failed, so `exit` is that
+/// container's own code, never the step's.
+fn classify_fetch_exit(exit: i32) -> (FailureClass, String) {
+    match exit {
+        // NotFound-only: a LIVE Depot answered 404, so warm, the pack index
+        // and the cold archive all miss the snapshot (a cold-tier outage is a
+        // 5xx → exit 1). Retrying the identical spec burns pods on content
+        // that cannot come back — the old Infra class did exactly that, 3
+        // times, then dead-lettered a run the operator could not fix.
+        code if code == scarab_workspace_client::EXIT_FETCH_MISSING_INPUTS => (
+            FailureClass::MissingInputs,
+            "an input snapshot was evicted from the workspace service, its pack index \
+             and its cold archive (fetch exit 2) — re-running the identical spec cannot \
+             re-create it; Rerun/Retry regenerates it (the rerun planner widens to the \
+             steps whose snapshots expired, ADR-0061 s5)"
+                .to_string(),
+        ),
+        // Denied: still never-started infra — the retry budget is what mints
+        // a fresh fence token (each auto-attempt's token is re-minted with
+        // exp = launch + step timeout + 600s grace, capped at 24h), so an
+        // expired token heals on the next attempt, while persistent
+        // secret-skew exhausts the 3 attempts and dead-letters naming auth.
+        code if code == scarab_workspace_client::EXIT_FETCH_DENIED => (
+            FailureClass::Infra {
+                never_started: true,
+            },
+            "the workspace service refused this Pod's token (fetch exit 3, 401/403). \
+             A fresh attempt mints a fresh fence token (exp = launch + step timeout \
+             + 600s grace, capped at 24h), which heals an expired one; if all \
+             attempts fail THIS way, the workspace token secret is skewed between \
+             the control plane and the Depot"
+                .to_string(),
+        ),
+        // Env/skew permanents (previously lumped into exit 2): the fetch
+        // container's env is incomplete or the image cannot understand its
+        // invocation. Author didn't cause it, but re-launching the identical
+        // spec can never succeed — the Config fail-fast is the honest verdict
+        // and it names the operator-owned remedy.
+        code if code == scarab_workspace_client::EXIT_FETCH_CONFIG => (
+            FailureClass::Config,
+            "the workspace fetch container refused its own configuration (fetch exit \
+             4): required env absent or an invocation this wsfetch image cannot parse \
+             — control-plane/image skew or a broken deployment, not the pipeline. \
+             Fix the deployment (matching wsfetch image + workspace env), then retry"
+                .to_string(),
+        ),
+        // PINNED default (binding amendment 1): exit 1 (transient after the
+        // in-Pod retry window) and EVERY unlisted code — 137 (OOM/SIGKILL),
+        // signal deaths, codes a newer image might add — stay
+        // `Infra { never_started: true }`. This arm PREEMPTS
+        // `classify_failed_pod` (the caller returns before reaching it), so
+        // narrowing it would silently reclassify kills of the FETCHER; the
+        // step's main process never ran either way, so bounded auto-retry is
+        // always safe here.
+        other => (
+            FailureClass::Infra {
+                never_started: true,
+            },
+            format!(
+                "workspace fetch init container failed (exit {other}) — the step's \
+                 inputs were never provisioned (ADR-0061 s3-feed)"
+            ),
+        ),
+    }
+}
+
 fn workspace_fetch_failed(pod: &Pod) -> Option<i32> {
     pod.status
         .as_ref()?
@@ -7320,7 +7425,7 @@ mod tests {
     /// Kills treating every unexplained exit as fatal: 10 (transient), 12
     /// (record POST failed after ingest) and a lost status frame are all "ask
     /// again next poll". Exit 0 is deliberately NOT in this list any more —
-    /// see [`no_record_and_exit_0_is_fatal_config_naming_the_skew`].
+    /// see [`no_record_and_exit_0_is_fatal_config_naming_both_hypotheses`].
     #[test]
     fn indeterminate_outcomes_without_a_record_re_drive() {
         for exec in [
@@ -7347,22 +7452,29 @@ mod tests {
     /// ignored, it runs fetch and exits 0 with NO record, so classifying that
     /// as Transient re-runs the same stale binary to the 5-minute dead-letter.
     ///
-    /// The cause names exactly ONE plausible explanation since ADR-0067
-    /// part 2: record absence is Postgres-backed and replica-independent, so
-    /// "the Depot lost its drain records volume" stopped being possible and
-    /// the stale-binary signature is all that remains.
+    /// The class survived the e140121 audit (amendment 3 overruled the
+    /// design's Transient flip: the flip's counterexamples cannot occur, and
+    /// Transient would hand a REAL stale image 5-minute escalation laps).
+    /// What the audit DID change is the cause: it must name BOTH hypotheses —
+    /// the stale-binary signature AND a lost Postgres record row — because
+    /// asserting only one misdirects the operator on the rare day it is the
+    /// other.
     ///
-    /// Mutation killed: reverting the `Exit(0)` arm to the transient catch-all,
-    /// which disguises image/control-plane skew as weather.
+    /// Mutations killed: reverting the `Exit(0)` arm to the transient
+    /// catch-all (disguises image/control-plane skew as weather), and
+    /// narrowing the cause back to a single hypothesis.
     #[test]
-    fn no_record_and_exit_0_is_fatal_config_naming_the_skew() {
+    fn no_record_and_exit_0_is_fatal_config_naming_both_hypotheses() {
         match classify_drain(None, &DrainExecOutcome::Exit(0)) {
             DrainDecision::FatalConfig(cause) => {
                 assert!(
                     cause.contains("stale-binary signature")
                         && cause.contains("drain subcommand"),
-                    "the cause must name the one remaining plausible cause — the stale \
-                     helper image: {cause}"
+                    "the cause must name the stale helper image: {cause}"
+                );
+                assert!(
+                    cause.contains("Postgres") && cause.contains("lost"),
+                    "the cause must ALSO name the lost-record-row hypothesis: {cause}"
                 );
             }
             other => panic!("0-with-no-record must be fatal config, got {other:?}"),
@@ -7687,15 +7799,68 @@ mod tests {
                  the step's inputs were never provisioned (ADR-0061 s3-feed)"
             )),
         };
-        // Transient (1) and permanent (2) both land here: the class is about
-        // whether a side effect was possible, not about why the fetch failed.
+        // Transient (1) is never-started infra: bounded auto-retry, and a
+        // short Depot outage is absorbed INSIDE attempt 1's in-Pod window.
         assert_eq!(pod_state(&pod("Failed", 1)), never_started(1));
-        assert_eq!(pod_state(&pod("Failed", 2)), never_started(2));
         // And before the phase flips: an init container that exited non-zero under
         // `restartPolicy: Never` is never retried, so there is nothing to wait for.
         assert_eq!(pod_state(&pod("Pending", 1)), never_started(1));
         // A fetcher that SUCCEEDED is not a failure signal.
         assert_eq!(pod_state(&pod("Pending", 0)), ExecState::Pending);
+        // Exit 2 stopped being infra (ticket e140121): NotFound-only means the
+        // snapshot is gone from every tier — MissingInputs, one attempt, and
+        // the cause names the recovery that exists (Rerun/Retry widening).
+        match pod_state(&pod("Failed", 2)) {
+            ExecState::Failed {
+                class: FailureClass::MissingInputs,
+                cause: Some(cause),
+                ..
+            } => assert!(
+                cause.contains("Rerun/Retry") && cause.contains("evicted"),
+                "the cause must name the recovery: {cause}"
+            ),
+            other => panic!("fetch exit 2 must classify MissingInputs, got {other:?}"),
+        }
+    }
+
+    /// The e140121 exit-code table at the fn grain, both phases sharing it via
+    /// `classify_fetch_exit`. Mutations killed: 2→Infra burns 3 pods on
+    /// evicted content then dead-letters a run the operator cannot fix;
+    /// 4→Infra grinds a broken deployment against the auto-retry budget;
+    /// 3→Config makes an EXPIRED token permanent when the next attempt's
+    /// fresh mint would have healed it; and any unlisted code (137!) leaving
+    /// `Infra{never_started: true}` is pinned because this classification
+    /// PREEMPTS `classify_failed_pod` — narrowing the default arm would
+    /// silently reclassify kills of the fetcher.
+    #[test]
+    fn fetch_exit_codes_map_to_the_e140121_table() {
+        use scarab_workspace_client as wc;
+        let infra = FailureClass::Infra {
+            never_started: true,
+        };
+        // 1: transient after the in-Pod window.
+        assert_eq!(classify_fetch_exit(wc::EXIT_FETCH_TRANSIENT).0, infra);
+        // 2: gone from every tier.
+        let (class, cause) = classify_fetch_exit(wc::EXIT_FETCH_MISSING_INPUTS);
+        assert_eq!(class, FailureClass::MissingInputs);
+        assert!(cause.contains("Rerun/Retry"), "{cause}");
+        // 3: denied — infra (a fresh attempt mints a fresh token), cause
+        // names the token's exp story so persistent skew is diagnosable.
+        let (class, cause) = classify_fetch_exit(wc::EXIT_FETCH_DENIED);
+        assert_eq!(class, infra);
+        assert!(
+            cause.contains("token") && cause.contains("24h"),
+            "the auth cause must name the credential and its exp: {cause}"
+        );
+        // 4: env/skew permanents — Config, fail fast.
+        let (class, cause) = classify_fetch_exit(wc::EXIT_FETCH_CONFIG);
+        assert_eq!(class, FailureClass::Config);
+        assert!(cause.contains("skew"), "{cause}");
+        // PINNED default: 137 (OOM/SIGKILL of the fetcher) and unknown codes
+        // stay never-started infra.
+        for code in [137, 5, 42, 255] {
+            assert_eq!(classify_fetch_exit(code).0, infra, "exit {code}");
+        }
     }
 
     /// The narrowness of `workspace_fetch_failed` is load-bearing: the egress

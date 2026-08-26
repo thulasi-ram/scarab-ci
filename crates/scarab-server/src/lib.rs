@@ -1007,6 +1007,7 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
             scarab_engine::FailureKind::Timeout => "timeout",
             scarab_engine::FailureKind::Lost => "lost",
             scarab_engine::FailureKind::Config => "config",
+            scarab_engine::FailureKind::MissingInputs => "missing-inputs",
         }
         .to_string()
     });
