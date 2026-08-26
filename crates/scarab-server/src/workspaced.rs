@@ -190,6 +190,9 @@ const WARM_SIZE_REFRESH_SECS: u64 = 60;
 /// grain — the 16-wide eager feed re-reading a hot workspace costs one touch
 /// per file per hour, not one per read. Backfill composes with this for free:
 /// it rewrites the file, and a refetch IS a use.
+///
+/// The honest edge: protection lapses one grain after the last WRITE or
+/// touch, not the last use — a hit inside the grain does not extend it.
 const WARM_TOUCH_GRAIN_SECS: u64 = 3600;
 
 /// The eviction floor (git-bug cba7165): the sweep never unlinks a warm file
@@ -1631,7 +1634,8 @@ async fn warm_has(path: &std::path::Path) -> Result<bool, WsError> {
 /// one: a hit younger than the grain returns without spawning anything, which
 /// is what keeps the hot path at zero added syscalls. Callers that hold no
 /// metadata (`get_tree`'s `warm.get`) pass `None` and the age check moves
-/// into the blocking task with the write.
+/// into the blocking task with the write — so the zero-added-syscall claim
+/// is blob-only; a tree hit pays one off-path `lstat` per read.
 ///
 /// Fire-and-forget because recency is advice, never correctness: the read was
 /// already served off the open handle, and the worst a lost touch costs is an
@@ -4136,6 +4140,29 @@ fn resolve_warm_budget(warm_dir: &std::path::Path, explicit: Option<u64>) -> u64
     }
 }
 
+/// The unlink-time re-check (cba7165 A2): re-`lstat` the PATH immediately
+/// before its unlink and answer the victim's byte length — or `None` to spare
+/// it. Spared: vanished since the scan (another unlink, or the file was never
+/// there), no longer a regular file, or **re-warmed** — a touch-on-read or a
+/// backfill moved the mtime back inside `min_age`, which means someone is
+/// using the bytes the scan thought were cold. Warm PUTs are
+/// stage-then-rename, so the path re-check is airtight; the residual
+/// microsecond window can only lose a recoverable warm copy.
+///
+/// A named fn so the LOGIC is unit-pinned even though the walk→unlink
+/// interleaving itself is not constructed in tests.
+fn relstat_victim(path: &std::path::Path, min_age: std::time::Duration) -> Option<u64> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mtime = meta.modified().ok()?;
+    match std::time::SystemTime::now().duration_since(mtime) {
+        Ok(age) if age >= min_age => Some(meta.len()),
+        _ => None,
+    }
+}
+
 /// One pass of the warm sweep: gauge the volume and, over the budget, evict
 /// down to the low-water mark (80% of budget — evict-ahead, so the write hot
 /// path never pays for space). Returns the used-bytes answer for the gauge;
@@ -4168,6 +4195,22 @@ pub async fn warm_evict_once(
     budget_bytes: u64,
     min_age: std::time::Duration,
 ) -> Option<u64> {
+    // Under-budget fast path: the gauge needs only bytes, so the common pass
+    // is the cheap count-and-sum walk ([`dir_size`]) — no per-file
+    // allocation. At millions of warm objects, collecting a candidate struct
+    // (PathBuf + hex + mtime) per file per minute would be hundreds of MB of
+    // RSS churn spent proving there is nothing to do.
+    let dir = warm_dir.to_path_buf();
+    let Ok(total) = tokio::task::spawn_blocking(move || dir_size(&dir)).await else {
+        WARM_EVICT_PASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    if total <= budget_bytes {
+        return Some(total);
+    }
+
+    // Over the high-water mark — the rare case: pay a second walk that also
+    // collects the candidates. Its total supersedes the first (more current).
     let dir = warm_dir.to_path_buf();
     let Ok((total, objects)) = tokio::task::spawn_blocking(move || warm_scan(&dir)).await else {
         WARM_EVICT_PASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
@@ -4245,18 +4288,9 @@ pub async fn warm_evict_once(
                 break;
             }
             // A2: re-lstat the PATH immediately before the unlink — skip
-            // whatever vanished, changed shape, or was re-warmed (a touch or
-            // a backfill moves the mtime) since the scan.
-            let Ok(meta) = std::fs::symlink_metadata(&o.path) else { continue };
-            if !meta.is_file() {
-                continue;
-            }
-            let Ok(mtime) = meta.modified() else { continue };
-            match std::time::SystemTime::now().duration_since(mtime) {
-                Ok(age) if age >= min_age => {}
-                _ => continue,
-            }
-            let len = meta.len();
+            // whatever vanished, changed shape, or was re-warmed since the
+            // scan ([`relstat_victim`]).
+            let Some(len) = relstat_victim(&o.path, min_age) else { continue };
             if std::fs::remove_file(&o.path).is_ok() {
                 used = used.saturating_sub(len);
                 let (bytes, count) = if is_durable {
@@ -4812,6 +4846,44 @@ mod tests {
             WARM_EVICT_PASS_SKIPPED.load(Ordering::Relaxed) > skipped_before,
             "the degraded pass must leave evidence on the counter"
         );
+    }
+
+    /// The unlink-time re-check (cba7165 A2), at its own grain: a victim the
+    /// walk collected as cold but that was re-warmed before its unlink — a
+    /// touch-on-read or a backfill moved the mtime — must be SPARED, while a
+    /// still-cold victim answers its length and a vanished one answers
+    /// nothing. Kills the mutant that unlinks on the walk-time verdict alone.
+    #[test]
+    fn the_unlink_time_recheck_spares_a_rewarmed_victim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bb".repeat(32));
+        std::fs::write(&path, b"twelve bytes").unwrap();
+        let floor = std::time::Duration::from_secs(WARM_EVICT_MIN_AGE_SECS);
+
+        // Cold at walk time AND at unlink time: evictable, length answered.
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_unix_time(1_000_000_000, 0),
+        )
+        .unwrap();
+        assert_eq!(
+            relstat_victim(&path, floor),
+            Some(12),
+            "a still-cold victim is confirmed with its fresh length"
+        );
+
+        // Re-warmed between the walk and the unlink (the mtime is now inside
+        // the floor): spared — someone is using the bytes.
+        filetime::set_file_mtime(&path, filetime::FileTime::now()).unwrap();
+        assert_eq!(
+            relstat_victim(&path, floor),
+            None,
+            "a re-warmed victim must be spared at unlink time"
+        );
+
+        // Vanished since the walk: nothing to do, nothing to count.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(relstat_victim(&path, floor), None);
     }
 
     /// The boot reap (cba7165 A4): a dead `farms/` root from the deleted
