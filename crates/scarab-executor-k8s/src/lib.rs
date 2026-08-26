@@ -475,6 +475,20 @@ impl K8sExecutor {
             now,
             spec.timeout_seconds.unwrap_or(self.default_step_timeout_secs),
         );
+        // The readable roots: the Step's declared inputs, plus the launch-
+        // resolved cache restore roots (ADR-0065 s1) — claims ONLY, never
+        // `workspace_inputs` itself, which feeds skip-signatures and the
+        // fetcher's merge order. The pod's cross-run cache read rides the
+        // existing exact-roots mechanism: zero new auth surface, and keys
+        // never cross the trust boundary.
+        let mut roots = spec.workspace_inputs.clone();
+        if let Some(cache) = &spec.cache {
+            for (_, root) in &cache.restore {
+                if !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
+        }
         let claims = workspace_token::step_claims(
             workspace_token::Fence {
                 run: step.run.0.clone(),
@@ -482,7 +496,7 @@ impl K8sExecutor {
                 attempt,
             },
             exp,
-            spec.workspace_inputs.clone(),
+            roots,
         );
         workspace_token::mint(&fetch.token_secret, &claims)
     }
@@ -2751,7 +2765,7 @@ impl DebugLauncher for K8sExecutor {
                 .as_ref()
                 .ok_or(ExecError::Unavailable)?;
             let roots = vec![root.to_string()];
-            init_containers.push(workspace_fetch_container(&name, fetch, &roots, &ws_mount));
+            init_containers.push(workspace_fetch_container(&name, fetch, &roots, &[], &ws_mount));
             volumes.push(workspace_token_volume(&name));
         }
         let shell = Container {
@@ -2931,6 +2945,10 @@ const WORKSPACE_TOKEN_VOLUME: &str = "scarab-workspace-token";
 /// materialises the mutable Workspace *from* these immutable trees. Must agree
 /// with `scarab-wsfetch`'s `ROOTS_ENV`.
 const WSFETCH_ROOTS_ENV: &str = "SCARAB_SNAPSHOT_ROOTS";
+
+/// Cache restore hints for the fetcher (ADR-0065 s1): `dir=root,dir=root`.
+/// Mirrors `scarab-wsfetch`'s `CACHE_ROOTS_ENV` — a wire contract.
+const WSFETCH_CACHE_ROOTS_ENV: &str = "SCARAB_CACHE_ROOTS";
 /// The env var telling the fetcher where to build the Workspace.
 const WSFETCH_TARGET_ENV: &str = "SCARAB_WORKSPACE_TARGET";
 
@@ -3008,6 +3026,7 @@ fn workspace_fetch_container(
     pod_name: &str,
     fetch: &WorkspaceFetch,
     roots: &[String],
+    cache_restore: &[(String, String)],
     ws_mount: &VolumeMount,
 ) -> Container {
     EAGER_FETCH_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3019,21 +3038,34 @@ fn workspace_fetch_container(
         image = %fetch.fetcher_image,
         "mode=eager (ADR-0061 s3-feed stepping stone — the node driver replaces this)"
     );
+    let mut env = vec![
+        env_var(workspace_token::WORKSPACE_URL_ENV, &fetch.url),
+        env_var(
+            workspace_token::WORKSPACE_TOKEN_FILE_ENV,
+            &workspace_token::workspace_token_path(),
+        ),
+        // Merge order is the LIST order (ADR-0007): later inputs overlay
+        // earlier ones, so this join must not be sorted.
+        env_var(WSFETCH_ROOTS_ENV, &roots.join(",")),
+        env_var(WSFETCH_TARGET_ENV, WORKSPACE_MOUNT_PATH),
+    ];
+    // Cache restore hints (ADR-0065 s1): `dir=root,dir=root`. Parseable
+    // because validation forbids `=`/`,` in dir names; the fetcher restores
+    // each AFTER the source, tolerating every failure (a miss is slower and
+    // never wrong) and skipping loudly when the source already produced the
+    // dir (source wins).
+    if !cache_restore.is_empty() {
+        let pairs: Vec<String> = cache_restore
+            .iter()
+            .map(|(dir, root)| format!("{dir}={root}"))
+            .collect();
+        env.push(env_var(WSFETCH_CACHE_ROOTS_ENV, &pairs.join(",")));
+    }
     Container {
         name: WORKSPACE_INIT_CONTAINER.to_string(),
         image: Some(fetch.fetcher_image.clone()),
         // The image's entrypoint IS the fetcher; nothing to override.
-        env: Some(vec![
-            env_var(workspace_token::WORKSPACE_URL_ENV, &fetch.url),
-            env_var(
-                workspace_token::WORKSPACE_TOKEN_FILE_ENV,
-                &workspace_token::workspace_token_path(),
-            ),
-            // Merge order is the LIST order (ADR-0007): later inputs overlay
-            // earlier ones, so this join must not be sorted.
-            env_var(WSFETCH_ROOTS_ENV, &roots.join(",")),
-            env_var(WSFETCH_TARGET_ENV, WORKSPACE_MOUNT_PATH),
-        ]),
+        env: Some(env),
         volume_mounts: Some(vec![
             ws_mount.clone(),
             VolumeMount {
@@ -3514,13 +3546,21 @@ pub fn build_pod(
         // input snapshots from the workspace service and exits. There is no marker
         // file and no `until [ -f … ]` wait loop, because there is nothing left to
         // wait for — the container does the work itself. A Step with no inputs gets
-        // no init container at all, rather than a `busybox` that runs `exit 0`.
-        if !spec.workspace_inputs.is_empty() {
+        // no init container at all, rather than a `busybox` that runs `exit 0` —
+        // unless it has cache restore hints (ADR-0065 s1), which the same
+        // fetcher materialises after the source (tolerantly: a 404 is a miss).
+        let cache_restore: &[(String, String)] = spec
+            .cache
+            .as_ref()
+            .map(|c| c.restore.as_slice())
+            .unwrap_or(&[]);
+        if !spec.workspace_inputs.is_empty() || !cache_restore.is_empty() {
             if let Some(fetch) = fetch {
                 init_containers.push(workspace_fetch_container(
                     name,
                     fetch,
                     &spec.workspace_inputs,
+                    cache_restore,
                     &ws,
                 ));
             }

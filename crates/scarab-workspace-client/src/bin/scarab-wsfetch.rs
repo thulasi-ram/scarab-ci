@@ -111,6 +111,12 @@ const URL_ENV: &str = "SCARAB_WORKSPACE_URL";
 /// Comma-separated **Workspace Snapshot** roots, in merge order — the immutable
 /// trees this fetcher materialises the mutable Workspace from (CONTEXT.md §4.2).
 const ROOTS_ENV: &str = "SCARAB_SNAPSHOT_ROOTS";
+
+/// Cache restore hints (ADR-0065 s1): `dir=root,dir=root`, minted by the
+/// executor from the launch-resolved restore pairs. Parseable because
+/// pipeline validation forbids `=` and `,` in cache dir names. Mirrors the
+/// executor's `WSFETCH_CACHE_ROOTS_ENV` — a wire contract.
+const CACHE_ROOTS_ENV: &str = "SCARAB_CACHE_ROOTS";
 /// Where to build the Workspace. Overridable only so the binary is testable.
 const TARGET_ENV: &str = "SCARAB_WORKSPACE_TARGET";
 const DEFAULT_TARGET: &str = "/workspace";
@@ -242,20 +248,56 @@ fn parse_roots(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Parse `SCARAB_CACHE_ROOTS` (`dir=root,dir=root`) into restore pairs
+/// (ADR-0065 s1). Named for the same reason [`parse_roots`] is. Entries
+/// without a `=` are dropped loudly-by-shape (an empty result restores
+/// nothing, the safe direction); dir names cannot contain `=`/`,` by
+/// pipeline validation, so a well-formed producer always round-trips.
+fn parse_cache_roots(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .filter_map(|pair| {
+            let (dir, root) = pair.split_once('=')?;
+            if dir.is_empty() || root.is_empty() {
+                return None;
+            }
+            Some((dir.to_string(), root.to_string()))
+        })
+        .collect()
+}
+
+/// The source-wins backstop (dbe05e5 amendment #2): a cache root restores
+/// ONLY into a directory that is absent or empty after the source snapshots
+/// materialised. `Ok(true)` = safe to restore; `Ok(false)` = the source
+/// produced content here (skip, loudly — validation should have made this
+/// unreachable, which is exactly why the runtime refuses to clobber);
+/// `Err` = the question could not be answered (a file where a directory was
+/// expected, permissions) — the caller skips, loudly, restoring nothing.
+fn dir_absent_or_empty(path: &std::path::Path) -> Result<bool, std::io::Error> {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => Ok(entries.next().is_none()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
 fn run() -> Result<(), FetchError> {
     let target = env_or(TARGET_ENV, DEFAULT_TARGET);
     let roots: Vec<String> = parse_roots(&env_or(ROOTS_ENV, ""));
+    let cache_roots: Vec<(String, String)> = parse_cache_roots(&env_or(CACHE_ROOTS_ENV, ""));
 
     // Guard #1 of ADR-0061 D2.3's three anti-calcification guards: this line is
     // printed into every Step Pod's own log, on every Pod, forever — until the
     // node driver deletes this binary. Observable, not silent.
     println!(
         "scarab-wsfetch: mode=eager (ADR-0061 s3-feed stepping stone — the node driver \
-         replaces this) inputs={} target={target}",
-        roots.len()
+         replaces this) inputs={} caches={} target={target}",
+        roots.len(),
+        cache_roots.len()
     );
 
-    if roots.is_empty() {
+    if roots.is_empty() && cache_roots.is_empty() {
         // Nothing to provision. The executor does not schedule this container in
         // that case, so reaching here means a Pod spec drifted — say so and
         // succeed, because an empty workspace is exactly what a no-`needs` Step
@@ -282,7 +324,7 @@ fn run() -> Result<(), FetchError> {
     // two would serialise — which is the property this binary exists to have.
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| FetchError::Transient(format!("tokio runtime: {e}")))?;
-    runtime.block_on(fetch(&base, &token_file, &roots, &target))?;
+    runtime.block_on(fetch(&base, &token_file, &roots, &cache_roots, &target))?;
 
     widen_for_the_group(std::path::Path::new(&target))?;
     println!("scarab-wsfetch: workspace provisioned at {target}");
@@ -293,6 +335,7 @@ async fn fetch(
     base: &str,
     token_file: &str,
     roots: &[String],
+    cache_roots: &[(String, String)],
     target: &str,
 ) -> Result<(), FetchError> {
     let client = WorkspaceClient::from_token_file(base, token_file)
@@ -320,7 +363,63 @@ async fn fetch(
             started.elapsed().as_millis()
         );
     }
+    // Cache restores (ADR-0065 s1) come strictly AFTER the source snapshots
+    // and are tolerant end to end: the required roots above stay fail-closed,
+    // while a cache that cannot restore — evicted from warm, on another
+    // replica, racing eviction between mint and fetch — is a logged MISS the
+    // Step recovers from by rebuilding (slower, never wrong; that property is
+    // the licence for evicting a Cache at all).
+    for (dir, root) in cache_roots {
+        restore_cache(&client, target, dir, root).await;
+    }
     Ok(())
+}
+
+/// Restore one cache dir, best-effort (ADR-0065 s1). Never returns an error:
+/// every outcome is a log line — `hit` (materialised), `miss` (the root could
+/// not be fetched; any partial restore is removed so the Step sees
+/// absent-not-torn), or `skipped (source wins)` (dbe05e5 amendment #2: the
+/// source snapshots already produced a non-empty dir here, and a cache must
+/// never clobber source-derived content — validation makes this unreachable
+/// for well-formed pipelines, and the backstop holds even when it is not).
+async fn restore_cache(client: &WorkspaceClient, target: &str, dir: &str, root: &str) {
+    let at = std::path::Path::new(target).join(dir);
+    match dir_absent_or_empty(&at) {
+        Ok(true) => {}
+        Ok(false) => {
+            println!(
+                "scarab-wsfetch: cache restore skipped (source wins) dir={dir} — \
+                 the workspace already has content here"
+            );
+            return;
+        }
+        Err(e) => {
+            println!(
+                "scarab-wsfetch: cache restore skipped dir={dir} — cannot inspect \
+                 the target ({e})"
+            );
+            return;
+        }
+    }
+    let Some(at_str) = at.to_str() else {
+        println!("scarab-wsfetch: cache restore skipped dir={dir} — non-UTF-8 target path");
+        return;
+    };
+    let started = std::time::Instant::now();
+    match scarab_storage::Cas::materialize(client, &TreeHash(root.to_string()), at_str).await {
+        Ok(()) => println!(
+            "scarab-wsfetch: cache restore hit dir={dir} root={root} in {} ms",
+            started.elapsed().as_millis()
+        ),
+        Err(e) => {
+            // Absent-not-torn: a half-materialised cache dir would be WRONG
+            // (a truncated node_modules passes for a whole one); an absent
+            // one is only slow. Best-effort removal — a leftover empty dir
+            // is harmless.
+            let _ = std::fs::remove_dir_all(&at);
+            println!("scarab-wsfetch: cache restore miss dir={dir} root={root}: {e}");
+        }
+    }
 }
 
 /// Make the restored workspace **group**-writable, and make directories setgid so
@@ -714,6 +813,72 @@ mod tests {
             std::fs::metadata(&outside).unwrap().permissions().mode() & 0o7777,
             0o400,
             "the symlink's target must be untouched"
+        );
+    }
+
+    /// The `dir=root,…` parse (ADR-0065 s1): well-formed pairs round-trip in
+    /// order; malformed fragments (no `=`, empty halves, empties from
+    /// trailing commas) drop rather than restore something half-named.
+    #[test]
+    fn cache_roots_parse_pairs_and_drop_malformed_fragments() {
+        assert_eq!(
+            parse_cache_roots("node_modules=abc, .cargo=def ,"),
+            vec![
+                ("node_modules".to_string(), "abc".to_string()),
+                (".cargo".to_string(), "def".to_string()),
+            ]
+        );
+        assert!(parse_cache_roots("").is_empty());
+        assert!(parse_cache_roots("no-separator").is_empty());
+        assert!(parse_cache_roots("=root").is_empty());
+        assert!(parse_cache_roots("dir=").is_empty());
+    }
+
+    /// The source-wins backstop's decision (dbe05e5 amendment #2): absent and
+    /// empty dirs restore; a dir the source populated does not; a FILE where
+    /// the dir would go is an `Err` (the caller skips loudly).
+    #[test]
+    fn source_wins_decision_restores_only_into_absent_or_empty_dirs() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        assert!(dir_absent_or_empty(&tmp.path().join("absent")).expect("absent"));
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).expect("mkdir");
+        assert!(dir_absent_or_empty(&empty).expect("empty"));
+        let full = tmp.path().join("full");
+        std::fs::create_dir(&full).expect("mkdir");
+        std::fs::write(full.join("index.js"), b"source").expect("file");
+        assert!(!dir_absent_or_empty(&full).expect("full"));
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"a file, not a dir").expect("file");
+        assert!(dir_absent_or_empty(&file).is_err());
+    }
+
+    /// The backstop end to end (dbe05e5 amendment #2): a cache restore into a
+    /// dir the source populated is a SKIP that touches neither the dir's
+    /// content nor the network — the client below points at nothing routable,
+    /// so reaching for it would fail the test by timeout/panic rather than
+    /// silently clobbering. And a restore whose fetch fails (same dead
+    /// client, absent dir) leaves the dir ABSENT — miss, not torn.
+    #[tokio::test]
+    async fn restore_never_clobbers_source_content_and_a_failed_restore_leaves_absence() {
+        let dead = WorkspaceClient::new("http://127.0.0.1:1", "unused-token");
+        let tmp = tempfile::tempdir().expect("tmp");
+        let ws = tmp.path().join("ws");
+        std::fs::create_dir_all(ws.join("node_modules")).expect("mkdir");
+        std::fs::write(ws.join("node_modules/index.js"), b"from the source").expect("file");
+
+        let target = ws.to_str().expect("utf-8");
+        restore_cache(&dead, target, "node_modules", &"a".repeat(64)).await;
+        assert_eq!(
+            std::fs::read(ws.join("node_modules/index.js")).expect("still there"),
+            b"from the source",
+            "source wins — the cache must not clobber it"
+        );
+
+        restore_cache(&dead, target, "vendor", &"b".repeat(64)).await;
+        assert!(
+            !ws.join("vendor").exists(),
+            "a failed restore leaves the dir absent (miss), never torn"
         );
     }
 
