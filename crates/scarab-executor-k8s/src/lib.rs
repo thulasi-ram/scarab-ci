@@ -79,6 +79,21 @@ pub struct WorkspaceFetch {
     pub token_secret: Vec<u8>,
     /// The fetcher image. Digest-pin in production, exactly like the clone image.
     pub fetcher_image: String,
+    /// Requests==limits for BOTH wsfetch helper containers (the fetch init
+    /// container and the egress hold/drain sidecar) — ticket 16a7768 item 1:
+    /// the drain hashes and uploads the whole workspace inside the Pod, and a
+    /// helper with no requests was invisible to the scheduler and first
+    /// against the wall under node pressure (an OOM-kill classifies Transient
+    /// and loops). Operator-owned (`SCARAB_WSFETCH_CPU_MILLIS` /
+    /// `SCARAB_WSFETCH_MEMORY_MIB`, chart `workspace.helper*`), never
+    /// per-pipeline. Empty axes are simply not set (pre-ticket behavior).
+    ///
+    /// The memory limit also derives the drain's upload byte budget
+    /// ([`scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV`] = half the
+    /// limit), so the two cannot be raised apart. Residual, disclosed: the
+    /// drain whole-reads each file, so a SINGLE output file approaching the
+    /// limit needs the knob raised.
+    pub helper_resources: scarab_pipeline::Resources,
 }
 
 /// Configuration for the trusted per-Pod results-egress sidecar (ADR-0042). When
@@ -3119,6 +3134,15 @@ fn workspace_fetch_container(
         env_var(WSFETCH_ROOTS_ENV, &roots.join(",")),
         env_var(WSFETCH_TARGET_ENV, WORKSPACE_MOUNT_PATH),
     ];
+    // Transfer byte budget from the memory limit (ticket 16a7768 item 1): the
+    // fetch whole-buffers each downloaded blob just as the drain does uploads,
+    // so it gets the same cap the same way.
+    if let Some(budget) = helper_transfer_budget_bytes(&fetch.helper_resources) {
+        env.push(env_var(
+            scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV,
+            &budget.to_string(),
+        ));
+    }
     // Cache restore hints (ADR-0065 s1): `dir=root,dir=root`. Parseable
     // because validation forbids `=`/`,` in dir names; the fetcher restores
     // each AFTER the source, tolerating every failure (a miss is slower and
@@ -3136,6 +3160,10 @@ fn workspace_fetch_container(
         image: Some(fetch.fetcher_image.clone()),
         // The image's entrypoint IS the fetcher; nothing to override.
         env: Some(env),
+        // Operator helper resources (ticket 16a7768 item 1): same knob as the
+        // egress helper — both containers wear the wsfetch image and both
+        // move the whole workspace.
+        resources: helper_resource_requirements(&fetch.helper_resources),
         volume_mounts: Some(vec![
             ws_mount.clone(),
             VolumeMount {
@@ -3680,6 +3708,16 @@ pub fn build_pod(
             workspace_token::WORKSPACE_TOKEN_FILE_ENV,
             &workspace_token::workspace_token_path(),
         )];
+        // The drain's in-flight byte cap rides the SAME knob as the memory
+        // limit (ticket 16a7768 item 1) — half the limit, so raising one
+        // raises the other and they cannot drift apart.
+        if let Some(budget) = fetch.and_then(|f| helper_transfer_budget_bytes(&f.helper_resources))
+        {
+            egress_env.push(env_var(
+                scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV,
+                &budget.to_string(),
+            ));
+        }
         let mut egress_mounts = match artifacts_mount.clone() {
             Some(am) => vec![ws, ctl, am],
             None => vec![ws, ctl],
@@ -3707,6 +3745,11 @@ pub fn build_pod(
             restart_policy: Some("Always".to_string()),
             command: Some(vec!["scarab-wsfetch".into(), "hold".into()]),
             env: Some(egress_env),
+            // Operator helper resources (ticket 16a7768 item 1): with none,
+            // this container was invisible to the scheduler and unbounded —
+            // the drain's peak tracked workspace content, and node pressure
+            // OOM-killed it into a Transient loop with nothing naming why.
+            resources: fetch.and_then(|f| helper_resource_requirements(&f.helper_resources)),
             // Pinned root, deliberately: root-read is the privilege the drain
             // has ALWAYS had — the busybox barrier this replaces ran as root,
             // and the control plane's `tar` read the workspace through it. A
@@ -3911,6 +3954,26 @@ fn resource_requirements(cpu_millis: Option<u32>, memory_mib: Option<u32>) -> Re
         limits: Some(map),
         ..Default::default()
     }
+}
+
+/// [`resource_requirements`] for the wsfetch helper containers, from the
+/// operator's [`WorkspaceFetch::helper_resources`] — `None` when neither axis
+/// is set, so an unconfigured deployment keeps the pre-ticket-16a7768 Pod
+/// shape byte for byte.
+fn helper_resource_requirements(res: &scarab_pipeline::Resources) -> Option<ResourceRequirements> {
+    (res.cpu_millis.is_some() || res.memory_mib.is_some())
+        .then(|| resource_requirements(res.cpu_millis, res.memory_mib))
+}
+
+/// The drain/fetch transfer byte budget derived from the helper's memory
+/// limit: HALF the limit, leaving the other half for the scan's structures,
+/// TLS buffers, and the runtime. One knob (`workspace.helperMemoryMib`) moves
+/// the k8s limit and the client's cap together — see
+/// [`scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV`].
+fn helper_transfer_budget_bytes(res: &scarab_pipeline::Resources) -> Option<u64> {
+    res.memory_mib
+        .map(|mib| u64::from(mib) * 1024 * 1024 / 2)
+        .map(|bytes| bytes.max(1))
 }
 
 /// The trusted results-egress sidecar (ADR-0042). A native sidecar sharing the
@@ -5670,6 +5733,7 @@ mod tests {
             url: "http://scarab-workspace".into(),
             token_secret: b"ws-secret".to_vec(),
             fetcher_image: "ghcr.io/acme/scarab-wsfetch:test".into(),
+            helper_resources: scarab_pipeline::Resources::default(),
         }
     }
 
@@ -7035,6 +7099,80 @@ mod tests {
             sc.capabilities.is_none(),
             "dropping capabilities here would strip DAC_OVERRIDE and make \
              0600 files vanish from snapshots"
+        );
+    }
+
+    /// Ticket 16a7768 item 1: the operator's helper resources land on BOTH
+    /// wsfetch containers (fetch init + egress hold/drain) as
+    /// requests==limits, and the memory limit derives the transfer byte
+    /// budget env (HALF the limit) on both — one knob, so the k8s bound and
+    /// the client's in-flight byte cap cannot be raised apart.
+    #[test]
+    fn helper_resources_land_on_both_wsfetch_containers_with_a_derived_budget() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let mut fetch = sample_fetch();
+        fetch.helper_resources = scarab_pipeline::Resources {
+            cpu_millis: Some(500),
+            memory_mib: Some(512),
+        };
+        let mut spec = busybox();
+        // An input, so the FETCH init container exists too.
+        spec.workspace_inputs = vec!["root-a".into()];
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            DEFAULT_CLONE_IMAGE,
+            Some(&fetch),
+        );
+        let inits = pod.spec.as_ref().unwrap().init_containers.as_ref().unwrap();
+        for name in [WORKSPACE_INIT_CONTAINER, WORKSPACE_EGRESS_CONTAINER] {
+            let c = inits
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let res = c
+                .resources
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} must carry the helper resources"));
+            for map in [res.requests.as_ref().unwrap(), res.limits.as_ref().unwrap()] {
+                assert_eq!(map.get("memory"), Some(&Quantity("512Mi".into())), "{name}");
+                assert_eq!(map.get("cpu"), Some(&Quantity("500m".into())), "{name}");
+            }
+            let budget = c
+                .env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|e| e.name == scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV)
+                .unwrap_or_else(|| panic!("{name} must carry the derived byte budget"));
+            assert_eq!(
+                budget.value.as_deref(),
+                Some("268435456"),
+                "{name}: the budget is HALF the 512Mi limit, in bytes"
+            );
+        }
+    }
+
+    /// With no helper resources configured, the Pod keeps the pre-16a7768
+    /// shape byte for byte: no resources on the helpers and no budget env —
+    /// the wsfetch binary's own default budget carries the in-flight cap.
+    #[test]
+    fn unconfigured_helper_resources_leave_the_helper_shape_alone() {
+        let egress = egress_of(&drain_shape_pod());
+        assert!(egress.resources.is_none(), "no knob, no resources");
+        assert!(
+            egress
+                .env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|e| e.name != scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV),
+            "no memory limit, no derived budget — the client default rules"
         );
     }
 

@@ -595,6 +595,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             url: ws.url.clone(),
                             token_secret: ws.token_secret.clone(),
                             fetcher_image: ws.fetcher_image.clone(),
+                            helper_resources: scarab_pipeline::Resources {
+                                cpu_millis: ws.helper_cpu_millis,
+                                memory_mib: ws.helper_memory_mib,
+                            },
                         });
                         // The drain's read-back half (ADR-0067): the Pod's
                         // helper drains straight into packs on the Depot; the
@@ -745,6 +749,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         url: ws.url.clone(),
                         token_secret: ws.token_secret.clone(),
                         fetcher_image: ws.fetcher_image.clone(),
+                        helper_resources: scarab_pipeline::Resources {
+                            cpu_millis: ws.helper_cpu_millis,
+                            memory_mib: ws.helper_memory_mib,
+                        },
                     });
                 }
                 let exec = Arc::new(exec);

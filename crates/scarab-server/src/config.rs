@@ -31,6 +31,8 @@
 //! | `SCARAB_WORKSPACE_DATA_DIR` | env | the workspace service's **warm tier** directory (its persistent volume); default `./.scarab/workspace-cas`. Only read under `--role workspace` |
 //! | `SCARAB_WORKSPACE_WARM_BUDGET_BYTES` | env | warm-tier space bound (git-bug cba7165): over it the Depot's LRU sweep evicts. Unset = 90% of the warm volume's `statvfs` capacity — right on a dedicated PVC, **effectively unbounded on a shared disk** (a dev machine), which is why `deploy/local-proc` sets one explicitly. Only meaningful under `--role workspace` |
 //! | `SCARAB_WSFETCH_IMAGE` | env | the workspace **helper** image every workspace Step Pod carries (ADR-0061): the fetch init container (s3-feed) AND the egress hold/drain sidecar (`scarab-wsfetch hold` / the in-Pod `drain` the control plane execs); default `ghcr.io/thulasi-ram/scarab-wsfetch:edge`. ADR-0062 stage 2 replaces only the **eager-fetch** role; the egress role survives it — the old "dies with the node driver" note (git-bug 0628369) applied to the fetch role alone and is closed as superseded |
+//! | `SCARAB_WSFETCH_CPU_MILLIS` | env | requests==limits CPU (millicpu) for BOTH wsfetch helper containers (ticket 16a7768). Default unset — a CPU limit throttles the drain's hashing. `0` = explicitly unset |
+//! | `SCARAB_WSFETCH_MEMORY_MIB` | env | requests==limits memory (MiB) for both wsfetch helper containers; default 512. Also derives the helper's transfer byte budget (half the limit, `SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES` on the containers) so the limit and the in-flight cap move on one knob. The helper whole-reads each file: a single workspace file approaching the limit needs it raised. `0` opts out of the limit AND the derived budget |
 //! | `SCARAB_GITHUB_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/github` |
 //! | `SCARAB_FORGEJO_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/forgejo` (ADR-0046 — each forge endpoint binds its own secret) |
 //! | `SCARAB_GATE_TOKEN_SECRET` | env | enables external-gate release tokens (ADR-0034) |
@@ -250,6 +252,34 @@ pub struct WorkspaceServiceConfig {
     /// dedicated PVC and **effectively unbounded on a shared disk**, so dev
     /// modes set an explicit value. Only meaningful for `--role workspace`.
     pub warm_budget_bytes: Option<u64>,
+    /// Requests==limits CPU (millicpu) for BOTH wsfetch helper containers —
+    /// the fetch init container and the egress hold/drain sidecar (ticket
+    /// 16a7768 item 1). `None` = axis unset. Default unset: a CPU limit
+    /// throttles the drain's hashing and the 5-minute drain clock is already
+    /// the liveness bound.
+    pub helper_cpu_millis: Option<u32>,
+    /// Requests==limits memory (MiB) for both wsfetch helper containers.
+    /// Default 512. Also derives the helper's transfer byte budget (HALF the
+    /// limit — `SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES`), so the k8s limit
+    /// and the client's in-flight byte cap move on one knob. Residual,
+    /// disclosed: the helper whole-reads each file, so a single workspace
+    /// file approaching the limit needs it raised. `None` (= env `0`) opts
+    /// out of both the limit and the derived budget's coupling.
+    pub helper_memory_mib: Option<u32>,
+}
+
+/// One axis of the wsfetch helper resources: unset/blank = `default`,
+/// `0` = the axis explicitly opted out, a positive integer = that value.
+/// Garbage returns the raw value for the error message.
+fn helper_axis(raw: Option<String>, default: Option<u32>) -> Result<Option<u32>, String> {
+    match raw.filter(|v| !v.trim().is_empty()) {
+        None => Ok(default),
+        Some(v) => match v.trim().parse::<u32>() {
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some(n)),
+            Err(_) => Err(v),
+        },
+    }
 }
 
 /// OIDC issuer settings (selected by `SCARAB_OIDC_ISSUER`). The signing key is
@@ -618,6 +648,13 @@ pub enum ConfigError {
     InvalidStepTimeout,
 
     #[error(
+        "{0} is set but invalid (got {1:?}) — want a non-negative integer: the wsfetch \
+         helper resource axes (ticket 16a7768) are millicpu / MiB, applied requests==limits \
+         to both helper containers of every workspace Step Pod; 0 opts the axis out."
+    )]
+    InvalidWsfetchResource(&'static str, String),
+
+    #[error(
         "SCARAB_CAS_CONCURRENCY is set but invalid — want a positive integer number of \
          in-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2; default \
          32). Falling back to the default would silently serve a throughput the \
@@ -903,6 +940,18 @@ impl Config {
                     })?),
                     None => None,
                 },
+                // Helper container resources (ticket 16a7768 item 1),
+                // requests==limits on both wsfetch containers. Memory
+                // defaults to 512Mi and derives the transfer byte budget;
+                // `0` opts an axis out explicitly.
+                helper_cpu_millis: helper_axis(env("SCARAB_WSFETCH_CPU_MILLIS"), None)
+                    .map_err(|raw| {
+                        ConfigError::InvalidWsfetchResource("SCARAB_WSFETCH_CPU_MILLIS", raw)
+                    })?,
+                helper_memory_mib: helper_axis(env("SCARAB_WSFETCH_MEMORY_MIB"), Some(512))
+                    .map_err(|raw| {
+                        ConfigError::InvalidWsfetchResource("SCARAB_WSFETCH_MEMORY_MIB", raw)
+                    })?,
             }),
             None if matches!(cli.role, Role::Workspace) => {
                 return Err(ConfigError::MissingWorkspaceTokenSecret)

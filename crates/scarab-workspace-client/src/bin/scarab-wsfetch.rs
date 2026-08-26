@@ -331,6 +331,26 @@ fn run() -> Result<(), FetchError> {
     Ok(())
 }
 
+/// Apply the executor-stamped transfer byte budget, if any (ticket 16a7768
+/// item 1). The executor derives [`scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV`]
+/// from the helper container's memory limit, so the k8s limit and the client's
+/// in-flight byte cap move on ONE knob — for the FETCH (downloads) and the
+/// DRAIN (uploads) alike, both of which wear the same image and the same
+/// limit. Unset/blank = the client's own default; garbage errors with the
+/// value named rather than silently running unbudgeted.
+fn apply_transfer_budget(client: WorkspaceClient) -> Result<WorkspaceClient, String> {
+    match std::env::var(scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV) {
+        Ok(v) if !v.trim().is_empty() => match v.trim().parse::<u64>() {
+            Ok(bytes) => Ok(client.with_transfer_byte_budget(bytes)),
+            Err(_) => Err(format!(
+                "{}={v:?} is not a byte count",
+                scarab_workspace_client::TRANSFER_BYTE_BUDGET_ENV
+            )),
+        },
+        _ => Ok(client),
+    }
+}
+
 async fn fetch(
     base: &str,
     token_file: &str,
@@ -340,6 +360,7 @@ async fn fetch(
 ) -> Result<(), FetchError> {
     let client = WorkspaceClient::from_token_file(base, token_file)
         .map_err(|e| FetchError::Transient(format!("workspace token: {e}")))?;
+    let client = apply_transfer_budget(client).map_err(FetchError::Transient)?;
     for (i, root) in roots.iter().enumerate() {
         let started = std::time::Instant::now();
         // Merge-in-order (ADR-0007): later roots overlay earlier ones, so this
@@ -553,6 +574,13 @@ fn drain_main(args: &[String]) -> i32 {
         Ok(c) => c,
         Err(e) => {
             eprintln!("scarab-wsfetch: drain: workspace token: {e}");
+            return EXIT_DRAIN_TRANSIENT;
+        }
+    };
+    let client = match apply_transfer_budget(client) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("scarab-wsfetch: drain: {e}");
             return EXIT_DRAIN_TRANSIENT;
         }
     };

@@ -63,6 +63,25 @@ use serde::{Deserialize, Serialize};
 /// wants a measurement on a real cluster, which nothing here has done.
 const CONCURRENCY: usize = 16;
 
+/// Default cap on ingest-upload bytes in memory at once: 256 MiB.
+///
+/// Without it the upload leg's peak was `CONCURRENCY × largest blob` —
+/// unbounded by anything but the workspace's own content, inside a container
+/// that (since ticket 16a7768) carries a memory limit. Whole-blob reads are
+/// kept (see [`read_blob_source`] for why streaming was rejected); the budget
+/// bounds their SUM instead: each transfer charges `min(len, budget)` against
+/// a byte semaphore before reading, so aggregate in-flight bytes never exceed
+/// the budget, and a single over-budget blob simply runs alone.
+pub const DEFAULT_TRANSFER_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// Env override for [`DEFAULT_TRANSFER_BYTE_BUDGET`], read by `scarab-wsfetch`
+/// (never by this library — ambient env reads in a lib can neither fail a
+/// boot nor be reported; the control plane sets its own via
+/// [`WorkspaceClient::with_transfer_byte_budget`]). The executor stamps it onto
+/// the egress container, derived from the helper's memory limit, so ONE knob
+/// (`workspace.helperMemoryMib`) moves both.
+pub const TRANSFER_BYTE_BUDGET_ENV: &str = "SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES";
+
 /// Hashes per `POST /v1/cas/have`. The service caps the batch; the client chunks
 /// to stay under it.
 const HAVE_CHUNK: usize = 5_000;
@@ -168,6 +187,9 @@ pub struct WorkspaceClient {
     /// parents via [`MemoCas`]) ride the Depot's fenced absent-header default,
     /// which is `durable` — the correct promise for them.
     cas_cache_only: bool,
+    /// Cap on ingest-upload bytes held in memory at once — see
+    /// [`TRANSFER_BYTE_BUDGET_ENV`]. Default [`DEFAULT_TRANSFER_BYTE_BUDGET`].
+    transfer_byte_budget: u64,
 }
 
 #[derive(Serialize)]
@@ -228,7 +250,16 @@ impl WorkspaceClient {
             base: base.into().trim_end_matches('/').to_string(),
             token,
             cas_cache_only: false,
+            transfer_byte_budget: DEFAULT_TRANSFER_BYTE_BUDGET,
         }
+    }
+
+    /// Cap ingest-upload bytes held in memory at once (default
+    /// [`DEFAULT_TRANSFER_BYTE_BUDGET`]). Zero is treated as 1 — a zero budget
+    /// could admit nothing and would deadlock the first transfer.
+    pub fn with_transfer_byte_budget(mut self, bytes: u64) -> Self {
+        self.transfer_byte_budget = bytes.max(1);
+        self
     }
 
     /// A twin of this client whose [`Cas`] PUTs (`put_blob`/`put_tree`) carry
@@ -246,6 +277,7 @@ impl WorkspaceClient {
             base: self.base.clone(),
             token: self.token.clone(),
             cas_cache_only: true,
+            transfer_byte_budget: self.transfer_byte_budget,
         }
     }
 
@@ -616,8 +648,24 @@ impl WorkspaceClient {
         let blob_hits = (blob_hashes.len() - uploads.len()) as u64;
         let blobs_uploaded = uploads.len() as u64;
         let plan = &plan;
+        // Bytes in flight are BOUNDED, not just transfer count (ticket 16a7768
+        // item 1): `CONCURRENCY` alone left the peak at 16 × largest blob.
+        // Each transfer charges `min(len, budget)` against this semaphore
+        // BEFORE reading and holds it through the PUT; a blob bigger than the
+        // whole budget clamps to all of it, so it runs alone rather than
+        // deadlocking (its memory is then bounded by its own size — the
+        // disclosed residual on `read_blob_source`). Budget ≤ u32::MAX because
+        // `acquire_many` takes a u32; 4 GiB of in-flight uploads is beyond any
+        // sane setting anyway.
+        let budget = self.transfer_byte_budget.clamp(1, u64::from(u32::MAX));
+        let gate = Arc::new(tokio::sync::Semaphore::new(budget as usize));
+        let gate = &gate;
         let results: Vec<Result<u64, StorageError>> = futures::stream::iter(uploads)
             .map(|(hash, source)| async move {
+                let charge = source.len().min(budget) as u32;
+                let _permit = gate.acquire_many(charge).await.map_err(|_| {
+                    StorageError::Backend("upload byte-budget semaphore closed".into())
+                })?;
                 let data = read_blob_source(&source).await?;
                 let len = data.len() as u64;
                 self.put_bytes("blobs", &hash, data, plan.label_of(&hash))
@@ -1068,11 +1116,24 @@ impl Cas for WorkspaceClient {
         // inside a `buffer_unordered` would park the runtime's worker threads,
         // and at 50 000 files that turns "concurrent" back into "sequential with
         // extra steps" — the exact property this is here to provide.
+        // Downloads whole-buffer each blob, so bytes in flight are bounded by
+        // the transfer byte budget exactly as the ingest leg's uploads are
+        // (ticket 16a7768 item 1): each entry charges `min(size, budget)` —
+        // the manifest carries sizes — before its GET and holds the charge
+        // through the write. Without this the peak was 16 × largest blob,
+        // inside a fetch container that now carries a memory limit.
+        let budget = self.transfer_byte_budget.clamp(1, u64::from(u32::MAX));
+        let gate = Arc::new(tokio::sync::Semaphore::new(budget as usize));
+        let gate = &gate;
         let results: Vec<Result<(), StorageError>> =
             futures::stream::iter(manifest.entries.iter().cloned())
                 .map(|entry| {
                     let root = root.clone();
                     async move {
+                        let charge = entry.size.min(budget) as u32;
+                        let _permit = gate.acquire_many(charge).await.map_err(|_| {
+                            StorageError::Backend("transfer byte-budget semaphore closed".into())
+                        })?;
                         let data = self.get_blob(&entry.blob).await?;
                         tokio::task::spawn_blocking(move || write_entry(&root, &entry, &data))
                             .await
@@ -1334,16 +1395,38 @@ fn apply_metadata(
 /// Where a blob's bytes come from during `ingest`.
 #[derive(Clone)]
 enum BlobSource {
-    File(std::path::PathBuf),
+    File {
+        path: std::path::PathBuf,
+        /// Size from the scan's `lstat` — what the upload byte budget charges
+        /// BEFORE reading, so the read itself can never overshoot the budget.
+        len: u64,
+    },
     /// A symlink's target path, already read.
     Link(Vec<u8>),
 }
 
+impl BlobSource {
+    fn len(&self) -> u64 {
+        match self {
+            BlobSource::File { len, .. } => *len,
+            BlobSource::Link(bytes) => bytes.len() as u64,
+        }
+    }
+}
+
 /// `tokio::fs`, not `std::fs`: this runs inside a `buffer_unordered`, and a
 /// blocking read there would serialise the very uploads it is feeding.
+///
+/// Whole-file, on purpose (ticket 16a7768 item 1): a streamed `PUT` body would
+/// drop the Content-Length (chunked encoding — a wire change the Depot and
+/// anything fronting it would have to be re-proven against) for a peak the
+/// byte budget in [`ingest_report_inner`] already bounds. The residual is a
+/// SINGLE file larger than the budget: it is read whole (its acquire is
+/// clamped), so the helper's memory limit must exceed the largest single
+/// output file — disclosed on the `workspace.helperMemoryMib` knob.
 async fn read_blob_source(source: &BlobSource) -> Result<Vec<u8>, StorageError> {
     match source {
-        BlobSource::File(path) => tokio::fs::read(path).await.map_err(io_err),
+        BlobSource::File { path, .. } => tokio::fs::read(path).await.map_err(io_err),
         BlobSource::Link(bytes) => Ok(bytes.clone()),
     }
 }
@@ -1678,11 +1761,18 @@ fn scan_one(
                 item.path(),
             )));
         } else {
-            let data = std::fs::read(item.path()).map_err(io_err)?;
-            let hash = hash_hex(&data);
-            blobs
-                .entry(hash.clone())
-                .or_insert(BlobSource::File(item.path()));
+            // Stream-hash, never `fs::read` (ticket 16a7768 item 1): the scan
+            // used to hold each whole file while hashing it, sizing the
+            // helper's peak by the largest file in the workspace for no
+            // reason — the address needs one pass over the bytes, not the
+            // bytes in memory. The `is_file` guard above is what makes this
+            // `open` safe: opening a writer-less FIFO would block forever.
+            let mut file = std::fs::File::open(item.path()).map_err(io_err)?;
+            let hash = scarab_storage::sha256_hex_reader(&mut file).map_err(io_err)?;
+            blobs.entry(hash.clone()).or_insert(BlobSource::File {
+                path: item.path(),
+                len: meta.len(),
+            });
             *files += 1;
             (
                 TreeTarget::Blob(BlobHash(hash.clone())),
@@ -1772,8 +1862,10 @@ mod tests {
         let sock_path = dir.path().join("weird.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&sock_path).expect("bind socket");
 
-        let err = scan_dir(dir.path()).expect_err("a socket must refuse the scan");
-        let msg = err.to_string();
+        let msg = match scan_dir(dir.path()) {
+            Ok(_) => panic!("a socket must refuse the scan"),
+            Err(e) => e.to_string(),
+        };
         assert!(
             msg.contains("weird.sock"),
             "the error must name the offending path, got: {msg}"

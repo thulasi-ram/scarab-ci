@@ -236,7 +236,28 @@ pub fn unix_ms_from_system_time(t: SystemTime) -> Option<i64> {
 /// adapters need to agree on it byte for byte.
 pub fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(data);
+    digest_hex(Sha256::digest(data).as_slice())
+}
+
+/// [`sha256_hex`] over a reader, 64 KiB at a time — the same address, computed
+/// without ever holding the content in memory. For hashing a large file inside
+/// a memory-limited container (the in-Pod drain's scan): `sha256_hex` would
+/// size the peak by the largest file in the tree.
+pub fn sha256_hex_reader<R: std::io::Read>(reader: &mut R) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(digest_hex(hasher.finalize().as_slice()))
+}
+
+fn digest_hex(digest: &[u8]) -> String {
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write;
@@ -578,6 +599,27 @@ pub async fn prune_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The streaming digest IS the content address: byte-identical to the
+    /// one-shot `sha256_hex` on empty input, on input smaller than one chunk,
+    /// and on input that crosses the 64 KiB chunk boundary — the case where a
+    /// buggy chunk loop would diverge.
+    #[test]
+    fn sha256_hex_reader_matches_the_one_shot_digest() {
+        for data in [
+            Vec::new(),
+            b"abc".to_vec(),
+            vec![0xabu8; 64 * 1024 + 17],
+        ] {
+            let mut cursor = std::io::Cursor::new(&data);
+            assert_eq!(
+                sha256_hex_reader(&mut cursor).expect("in-memory read"),
+                sha256_hex(&data),
+                "len {}",
+                data.len()
+            );
+        }
+    }
 
     /// The forward conversion at its edges: the epoch is 0, pre-epoch is
     /// negative (not dropped), and a far future beyond `i64` milliseconds is a
