@@ -108,8 +108,8 @@ pub const STEP_TIMEOUT_ENV: &str = "SCARAB_WORKSPACE_STEP_TIMEOUT_SECS";
 /// | exit | meaning | executor class |
 /// |---|---|---|
 /// | 0 | workspace provisioned | — |
-/// | 1 | transient, retry window exhausted (unreachable Depot, 5xx, idle
-///       timeout, local I/O, torn read) | `Infra { never_started: true }` |
+/// | 1 | transient, retry window exhausted (unreachable Depot, 5xx/429/408,
+///       idle timeout, local I/O, torn read) | `Infra { never_started: true }` |
 /// | 2 | an input snapshot is GONE — a live Depot answered 404, meaning warm,
 ///       the pack index and the cold archive all miss it (`NotFound` ONLY;
 ///       a cold-tier outage is a 5xx → exit 1) | `MissingInputs` |
@@ -117,8 +117,9 @@ pub const STEP_TIMEOUT_ENV: &str = "SCARAB_WORKSPACE_STEP_TIMEOUT_SECS";
 ///       same token cannot heal; a fresh attempt mints a fresh one | `Infra
 ///       { never_started: true }` + auth cause |
 /// | 4 | this invocation can never work: required env absent, an address
-///       shape the binary cannot parse, an unknown subcommand — env/image
-///       skew, operator-fixable | `Config` |
+///       shape the binary cannot parse, an unknown subcommand, a permanent
+///       4xx the service will answer identically forever — env/image skew,
+///       operator-fixable | `Config` |
 ///
 /// Anything ELSE (137, signals) is not this table's verdict and stays
 /// `Infra { never_started: true }` in the executor's pinned default arm.
@@ -462,7 +463,15 @@ impl WorkspaceClient {
         {
             return StorageError::Denied(format!("workspace service {status}: {body}"));
         }
-        StorageError::Backend(format!("workspace service {status}: {body}"))
+        // Everything else keeps its status on the error (e140121 review fix):
+        // retry policy needs to split 5xx/429/408 (server weather, worth
+        // waiting out) from the other 4xx (a request the service will refuse
+        // identically forever — skew or a bug, never weather). `Backend`
+        // stays the transport-only error: no HTTP answer at all.
+        StorageError::Status {
+            status: status.as_u16(),
+            body,
+        }
     }
 
     /// Which of these the service does not have — durable-set answers plus
@@ -1918,7 +1927,11 @@ fn scan_one(
             // snapshot can only hold regular files, directories and symlinks
             // anyway (there is no tree-entry encoding for anything else), so
             // this is the honest answer, not a limitation of the walk.
-            return Err(StorageError::Backend(format!(
+            // `Unsupported`, not `Backend` (e140121 review fix): the drain's
+            // whole-leg retry treats `Backend` as weather, and a FIFO in the
+            // workspace re-refuses identically on every re-scan — retrying it
+            // would grind the whole window before the same honest refusal.
+            return Err(StorageError::Unsupported(format!(
                 "refusing to snapshot {} at {:?}: a Workspace Snapshot holds only \
                  regular files, directories and symlinks — reading a FIFO/device/\
                  socket can block the drain forever (remove it or create it \

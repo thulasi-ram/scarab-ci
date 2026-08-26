@@ -265,25 +265,43 @@ impl From<std::io::Error> for FetchError {
 /// scheduling anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RetryVerdict {
-    /// Weather: unreachable/5xx/idle-timeout (`Backend`) or a torn read mid-
-    /// restart (`HashMismatch` — one re-read is cheap). Retry in the window.
+    /// Weather: transport/local-I/O failures (`Backend` — no HTTP answer at
+    /// all), retryable statuses (5xx, 429, 408), or a torn read mid-restart
+    /// (`HashMismatch` — one re-read is cheap). Retry in the window.
     Retry,
     /// `NotFound` from a live Depot: warm + packs + cold all miss. Permanent.
     MissingInputs,
     /// 401/403 — the same token cannot heal it.
     Denied,
-    /// An address shape this binary cannot parse (`UnknownAlgorithm`) — skew.
+    /// Permanent, non-content: a 4xx the service will answer identically
+    /// forever (malformed/contract-violating request — skew or a bug), an
+    /// address shape this binary cannot parse (`UnknownAlgorithm`), or an
+    /// input nothing can process (`Unsupported`). Retrying only delays the
+    /// honest verdict.
     Config,
 }
 
 fn retry_verdict(e: &StorageError) -> RetryVerdict {
     match e {
-        // A cold-tier outage surfaces as 5xx (`Backend`), never as 404 — the
-        // Depot maps only a true three-tier miss to NotFound.
+        // `Backend` is TRANSPORT-only since the e140121 review fix (connect
+        // refused/reset, idle timeout, local I/O) — always worth the window.
+        // `HashMismatch` stays retryable: a torn read mid-restart heals on
+        // one re-read, and a persistent mismatch exhausts the window into
+        // exit 1 where the bounded re-launch takes over.
         StorageError::Backend(_) | StorageError::HashMismatch => RetryVerdict::Retry,
+        // With the status carried, only server weather retries: 5xx (a cold-
+        // tier outage surfaces as 5xx, never 404), 429 (asked to back off —
+        // backing off IS the loop), 408 (the request died of time, not of
+        // shape). Every other 4xx is the service refusing THIS request's
+        // form; it will refuse the retry identically, so it is skew/config,
+        // not weather.
+        StorageError::Status { status, .. } => match status {
+            500..=599 | 429 | 408 => RetryVerdict::Retry,
+            _ => RetryVerdict::Config,
+        },
         StorageError::NotFound => RetryVerdict::MissingInputs,
         StorageError::Denied(_) => RetryVerdict::Denied,
-        StorageError::UnknownAlgorithm(_) => RetryVerdict::Config,
+        StorageError::UnknownAlgorithm(_) | StorageError::Unsupported(_) => RetryVerdict::Config,
     }
 }
 
@@ -1049,23 +1067,33 @@ mod tests {
     use super::*;
 
     /// The retry policy at the fn grain (ticket e140121; repo rule: construct
-    /// the decision, don't schedule it). The table IS the contract:
-    /// weather retries, absence is MissingInputs, a denial is Denied, an
-    /// unparseable address is Config. Mutation killed in each direction —
-    /// retrying NotFound would grind an evicted snapshot against the window
-    /// and then burn 3 attempts; NOT retrying Backend re-opens the ticket's
-    /// bug (a 20s Depot restart dead-lettering runs).
+    /// the decision, don't schedule it). The table IS the contract: weather
+    /// retries — transport, 5xx, 429, 408, a torn read — and NOTHING else:
+    /// absence is MissingInputs, a denial is Denied, a permanent 4xx / an
+    /// unparseable address / an unscannable input is Config. Mutations killed
+    /// in each direction — retrying NotFound would grind an evicted snapshot
+    /// against the window and then burn 3 attempts; NOT retrying transport or
+    /// 5xx re-opens the ticket's bug (a 20s Depot restart dead-lettering
+    /// runs); retrying a 400/405/409/422 (review finding) grinds the whole
+    /// window and 3 Infra attempts on a request the service refuses
+    /// identically forever.
     #[test]
     fn retry_verdict_retries_weather_and_only_weather() {
+        let status = |status: u16| StorageError::Status {
+            status,
+            body: "x".into(),
+        };
         for (err, want) in [
+            // Transport: no HTTP answer at all.
             (
                 StorageError::Backend("workspace service unreachable: connect refused".into()),
                 RetryVerdict::Retry,
             ),
-            (
-                StorageError::Backend("workspace service 503 Service Unavailable: draining".into()),
-                RetryVerdict::Retry,
-            ),
+            // Server weather, status-carried.
+            (status(500), RetryVerdict::Retry),
+            (status(503), RetryVerdict::Retry),
+            (status(429), RetryVerdict::Retry),
+            (status(408), RetryVerdict::Retry),
             // A torn read mid-restart: one re-read is cheap.
             (StorageError::HashMismatch, RetryVerdict::Retry),
             (StorageError::NotFound, RetryVerdict::MissingInputs),
@@ -1073,8 +1101,20 @@ mod tests {
                 StorageError::Denied("workspace service 401 Unauthorized: expired".into()),
                 RetryVerdict::Denied,
             ),
+            // Permanent 4xx: the service refuses THIS request's shape, and
+            // will refuse the retry identically — skew/config, not weather.
+            (status(400), RetryVerdict::Config),
+            (status(405), RetryVerdict::Config),
+            (status(409), RetryVerdict::Config),
+            (status(422), RetryVerdict::Config),
             (
                 StorageError::UnknownAlgorithm("blake3".into()),
+                RetryVerdict::Config,
+            ),
+            // An input nothing can process (a FIFO in the workspace): the
+            // re-scan re-refuses identically — never worth the window.
+            (
+                StorageError::Unsupported("refusing to snapshot a FIFO".into()),
                 RetryVerdict::Config,
             ),
         ] {

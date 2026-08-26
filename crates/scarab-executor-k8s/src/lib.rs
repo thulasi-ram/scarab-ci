@@ -4767,6 +4767,13 @@ fn classify_fetch_exit(exit: i32) -> (FailureClass, String) {
         // 5xx → exit 1). Retrying the identical spec burns pods on content
         // that cannot come back — the old Infra class did exactly that, 3
         // times, then dead-lettered a run the operator could not fix.
+        //
+        // Rolling-skew window: a wsfetch image from BEFORE the e140121 split
+        // exits 2 for its env-missing permanents too, which this arm would
+        // misread as evicted content (run Failed, Rerun advice — bounded, but
+        // pointing at the wrong remedy). Same rollout rule the drain side
+        // already prescribes for its exit codes: publish the matching
+        // scarab-wsfetch image BEFORE rolling the control plane.
         code if code == scarab_workspace_client::EXIT_FETCH_MISSING_INPUTS => (
             FailureClass::MissingInputs,
             "an input snapshot was evicted from the workspace service, its pack index \

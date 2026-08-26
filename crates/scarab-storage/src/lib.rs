@@ -443,6 +443,24 @@ pub enum StorageError {
     /// credential (a fresh attempt's fence token, for the in-Pod helpers).
     #[error("access denied: {0}")]
     Denied(String),
+    /// A non-2xx HTTP answer from a storage service, with the status carried
+    /// (ticket e140121 review fix) so retry policy can split retryable server
+    /// weather (5xx, 429, 408) from PERMANENT client errors (any other 4xx —
+    /// a malformed or contract-violating request answers identically forever,
+    /// and retrying it would grind a whole retry window before failing with
+    /// the wrong class). 404 stays [`NotFound`](Self::NotFound), 401/403 stay
+    /// [`Denied`](Self::Denied); transport failures — no status at all —
+    /// stay [`Backend`](Self::Backend).
+    #[error("storage service {status}: {body}")]
+    Status { status: u16, body: String },
+    /// A local, permanent refusal: the INPUT itself can never be processed
+    /// (e.g. a FIFO/device/socket inside a workspace scan). Distinct from
+    /// [`Backend`](Self::Backend) (ticket e140121 review fix) because a retry
+    /// loop answering "is this weather?" must say no — re-running the
+    /// identical scan re-refuses identically, and spending a retry window on
+    /// it only delays the honest verdict.
+    #[error("{0}")]
+    Unsupported(String),
     #[error("storage backend error: {0}")]
     Backend(String),
 }
