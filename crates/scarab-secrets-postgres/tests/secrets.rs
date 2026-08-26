@@ -573,3 +573,117 @@ async fn rewrap_cas_loses_to_a_concurrent_put() {
     tdb.cleanup().await;
 }
 
+
+/// The boot sweep rewraps rows nobody ever reads, upgrades legacy rows whole,
+/// counts-and-skips an unreadable row (never an error), and reports what is
+/// still under a non-active key afterwards (the gauge value).
+#[tokio::test]
+async fn sweep_rewraps_unread_rows_and_skips_unreadable() {
+    use rand::RngCore;
+    use scarab_secrets_postgres::RewrapSummary;
+
+    let Some(tdb) = fresh_db().await else {
+        eprintln!("skipping: SCARAB_TEST_DATABASE_URL unset");
+        return;
+    };
+    let (k1, k2) = ([71u8; 32], [72u8; 32]);
+    let old = PostgresSecrets::with_master(tdb.pool.clone(), k1);
+    old.migrate().await.unwrap();
+
+    // Three stamped rows under K1 that will NEVER be read before the sweep.
+    for name in ["A", "B", "Z"] {
+        old.put(
+            &repo_scope("app"),
+            Secret {
+                key: name.into(),
+                value: format!("v-{name}").into_bytes(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    // One legacy empty-AAD NULL row, openable under K1.
+    let mut dk = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut dk);
+    let (ct, vn) = legacy_seal(&dk, b"legacy-value");
+    let (wk, kn) = legacy_seal(&k1, &dk);
+    sqlx::query(
+        "INSERT INTO secrets (scope, key, ciphertext, value_nonce, wrapped_key, key_nonce)
+         VALUES ('repo:acme/app', 'LEG', $1, $2, $3, $4)",
+    )
+    .bind(&ct)
+    .bind(&vn)
+    .bind(&wk)
+    .bind(&kn)
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    // One unreadable row: legacy NULL, sealed under a key nobody configures.
+    let k_gone = [73u8; 32];
+    let mut dk2 = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut dk2);
+    let (ct2, vn2) = legacy_seal(&dk2, b"orphaned");
+    let (wk2, kn2) = legacy_seal(&k_gone, &dk2);
+    sqlx::query(
+        "INSERT INTO secrets (scope, key, ciphertext, value_nonce, wrapped_key, key_nonce)
+         VALUES ('repo:acme/app', 'GONE', $1, $2, $3, $4)",
+    )
+    .bind(&ct2)
+    .bind(&vn2)
+    .bind(&wk2)
+    .bind(&kn2)
+    .execute(&tdb.pool)
+    .await
+    .unwrap();
+    let orphan_before = fetch_sealed(&tdb.pool, "repo:acme/app", "GONE").await;
+
+    // Rotate: [K2 active, K1 decrypt-only]; sweep as every core replica does.
+    let rotated =
+        PostgresSecrets::with_keys(tdb.pool.clone(), MasterKeySet::new(vec![k2, k1]).unwrap());
+    let summary = rotated.rewrap_all(false).await.unwrap();
+    assert_eq!(
+        summary,
+        RewrapSummary {
+            rewrapped: 3,
+            upgraded_legacy: 1,
+            lost_races: 0,
+            unreadable: 1,
+            remaining: 1,
+        }
+    );
+
+    // Never-read rows are stamped to the active key and still open under it
+    // alone; the legacy row was upgraded; the orphan is untouched.
+    let only_new = PostgresSecrets::with_master(tdb.pool.clone(), k2);
+    for name in ["A", "B", "Z"] {
+        let row = fetch_sealed(&tdb.pool, "repo:acme/app", name).await;
+        assert_eq!(row.key_id, Some(fingerprint(&k2)), "{name}");
+        let got = only_new.get(&repo_scope("app"), name).await.unwrap();
+        assert_eq!(got.value, format!("v-{name}").into_bytes());
+    }
+    let leg = fetch_sealed(&tdb.pool, "repo:acme/app", "LEG").await;
+    assert_eq!(leg.key_id, Some(fingerprint(&k2)));
+    assert_eq!(
+        only_new.get(&repo_scope("app"), "LEG").await.unwrap().value,
+        b"legacy-value".to_vec()
+    );
+    let orphan_after = fetch_sealed(&tdb.pool, "repo:acme/app", "GONE").await;
+    assert_eq!(orphan_after.wrapped_key, orphan_before.wrapped_key, "skipped, not touched");
+    assert_eq!(orphan_after.key_id, None);
+
+    // A second sweep is idempotent: nothing left to do but the orphan.
+    let again = rotated.rewrap_all(false).await.unwrap();
+    assert_eq!(
+        again,
+        RewrapSummary {
+            rewrapped: 0,
+            upgraded_legacy: 0,
+            lost_races: 0,
+            unreadable: 1,
+            remaining: 1,
+        }
+    );
+
+    tdb.cleanup().await;
+}
+

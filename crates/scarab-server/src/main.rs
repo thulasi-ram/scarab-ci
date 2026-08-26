@@ -305,6 +305,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let s = scarab_secrets_postgres::PostgresSecrets::connect(&database_url, master_keys)
             .await?;
         s.migrate().await?;
+        // Boot rewrap sweep (f37463a): converge every row to the active key,
+        // on EVERY core replica — the per-row CAS makes concurrent sweeps
+        // safe and the work converges to zero, so no leader lease. A sweep
+        // failure never blocks boot: reads still rewrap lazily.
+        match s.rewrap_all(config.dev_insecure).await {
+            Ok(sum) => {
+                tracing::info!(
+                    "secrets rewrap sweep: {} rewrapped, {} legacy rows upgraded, \
+                     {} lost races, {} unreadable (skipped), {} still under \
+                     non-active keys",
+                    sum.rewrapped,
+                    sum.upgraded_legacy,
+                    sum.lost_races,
+                    sum.unreadable,
+                    sum.remaining,
+                );
+                scarab_server::metrics::set_secrets_rows_under_nonactive_key(sum.remaining);
+            }
+            Err(e) => tracing::warn!(
+                "secrets rewrap sweep failed (boot continues; reads rewrap lazily): {e}"
+            ),
+        }
         Arc::new(s)
     };
 

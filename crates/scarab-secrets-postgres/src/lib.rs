@@ -150,6 +150,25 @@ pub enum RewrapOutcome {
     LostRace,
 }
 
+/// Summary of one [`PostgresSecrets::rewrap_all`] sweep pass. Counts only —
+/// never row contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RewrapSummary {
+    /// Rows whose data key was re-wrapped under the active key (value untouched).
+    pub rewrapped: u64,
+    /// Legacy empty-AAD rows upgraded whole (value resealed AAD-bound).
+    pub upgraded_legacy: u64,
+    /// Rows a concurrent write beat us to — converged by the winner, not us.
+    pub lost_races: u64,
+    /// Rows that could not be opened (sealing key absent, or corrupt):
+    /// warned and skipped, never a boot failure.
+    pub unreadable: u64,
+    /// Rows still under a non-active key AFTER the pass — the value of the
+    /// `scarab_secrets_rows_under_nonactive_key` gauge. Zero (plus no
+    /// warnings) means the old key is safe to drop.
+    pub remaining: u64,
+}
+
 /// Which arm of the decrypt ladder opened a wrap: AAD-bound (post-#4e1e40d
 /// writes) or the legacy empty-AAD format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +414,103 @@ impl PostgresSecrets {
                 })
             }
         }
+    }
+
+    /// The boot sweep (f37463a): converge every row to the active key —
+    /// batched keyset pagination, **one row processed per iteration** (a
+    /// legacy value's plaintext exists only transiently inside that row's
+    /// [`rewrap_row`](Self::rewrap_row); nothing is collected). Runs on every
+    /// core replica: the per-row CAS makes concurrent sweeps safe and the
+    /// work converges to zero, so no leader lease is needed. Unreadable rows
+    /// are logged (fingerprint-naming errors; at `debug` when
+    /// `unreadable_at_debug` — dev-insecure debris) and skipped — the sweep
+    /// never fails boot over a row.
+    pub async fn rewrap_all(
+        &self,
+        unreadable_at_debug: bool,
+    ) -> Result<RewrapSummary, SecretError> {
+        const SWEEP_BATCH: i64 = 100;
+        let active_fp = self.keys.active_fingerprint().to_string();
+        let mut summary = RewrapSummary::default();
+        // Keyset cursor (strictly-greater on the PK) rather than re-querying
+        // the filter from the top: unreadable rows keep matching the filter,
+        // and a moving cursor is what stops them from wedging the loop.
+        let mut cursor: Option<(String, String)> = None;
+        loop {
+            let query = match &cursor {
+                Some((s, k)) => sqlx::query(
+                    "SELECT scope, key, ciphertext, value_nonce, wrapped_key, key_nonce, key_id
+                     FROM secrets
+                     WHERE (scope, key) > ($1, $2) AND key_id IS DISTINCT FROM $3
+                     ORDER BY scope, key LIMIT $4",
+                )
+                .bind(s.clone())
+                .bind(k.clone())
+                .bind(&active_fp)
+                .bind(SWEEP_BATCH),
+                None => sqlx::query(
+                    "SELECT scope, key, ciphertext, value_nonce, wrapped_key, key_nonce, key_id
+                     FROM secrets
+                     WHERE key_id IS DISTINCT FROM $1
+                     ORDER BY scope, key LIMIT $2",
+                )
+                .bind(&active_fp)
+                .bind(SWEEP_BATCH),
+            };
+            let rows = query
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| SecretError::Backend(e.to_string()))?;
+            let batch_len = rows.len();
+            for db_row in rows {
+                let scope_text = db_row.get::<String, _>("scope");
+                let key = db_row.get::<String, _>("key");
+                let sealed = SealedRow {
+                    ciphertext: db_row.get::<Vec<u8>, _>("ciphertext"),
+                    value_nonce: db_row.get::<Vec<u8>, _>("value_nonce"),
+                    wrapped_key: db_row.get::<Vec<u8>, _>("wrapped_key"),
+                    key_nonce: db_row.get::<Vec<u8>, _>("key_nonce"),
+                    key_id: db_row.get::<Option<String>, _>("key_id"),
+                };
+                match self.rewrap_row(&scope_text, &key, &sealed).await {
+                    Ok(RewrapOutcome::Rewrapped) => summary.rewrapped += 1,
+                    Ok(RewrapOutcome::UpgradedLegacy) => summary.upgraded_legacy += 1,
+                    Ok(RewrapOutcome::LostRace) => summary.lost_races += 1,
+                    // Filtered out by the WHERE; a concurrent read may still
+                    // have converged the row between SELECT and here.
+                    Ok(RewrapOutcome::AlreadyActive) => {}
+                    Err(e) => {
+                        summary.unreadable += 1;
+                        if unreadable_at_debug {
+                            tracing::debug!(
+                                scope = %scope_text,
+                                key,
+                                "rewrap sweep: row skipped (dev-insecure debris?): {e}"
+                            );
+                        } else {
+                            tracing::warn!(
+                                scope = %scope_text,
+                                key,
+                                "rewrap sweep: row skipped: {e}"
+                            );
+                        }
+                    }
+                }
+                cursor = Some((scope_text, key));
+            }
+            if batch_len < SWEEP_BATCH as usize {
+                break;
+            }
+        }
+        // What is still under a non-active key AFTER the pass — the gauge.
+        let remaining = sqlx::query("SELECT count(*) AS n FROM secrets WHERE key_id IS DISTINCT FROM $1")
+            .bind(&active_fp)
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| SecretError::Backend(e.to_string()))?
+            .get::<i64, _>("n");
+        summary.remaining = remaining.max(0) as u64;
+        Ok(summary)
     }
 }
 
