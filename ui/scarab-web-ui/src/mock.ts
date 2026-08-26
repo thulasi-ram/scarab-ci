@@ -548,18 +548,28 @@ function route(pathname: string, search: string): Response | null {
     });
   if (p === `/v1/runs/${RICH_RUN_ID}/artifacts`) return json(richArtifacts);
   if (p === `/v1/runs/${RICH_RUN_ID}/services`) return json(richServices);
-  // The rerun PREVIEW (ADR-0061 s5). Both mock runs are non-terminal, so
-  // RunDetail never asks for this — but a real answer beats the catch-all `{}`,
-  // which would deserialize into a plan with no arrays at all.
+  // The rerun PREVIEW (ADR-0061 s5 + git-bug 4afaa3e). RunDetail fetches this
+  // per selection for LIVE runs too now, and the confirm popover renders it —
+  // so the mock answers with a small realistic cascade over the acme fixture's
+  // chain (clone → build → test → approve[gate]) rather than understating the
+  // scope as just the target. An off-chain target degrades to itself.
   if ((m = p.match(/^\/v1\/runs\/[^/]+\/steps\/([^/]+)\/rerun-plan$/))) {
     const target = m[1];
+    const chain = ["clone", "build", "test", "approve"];
+    const from = chain.indexOf(target);
+    const members = from >= 0 ? chain.slice(from) : [target];
     return json({
       target,
-      invalidated: [target],
+      invalidated: [...members].sort(),
       widened: [],
       starts_from: [target],
       expired_inputs: [],
-      steps: [{ step: target, reason: "target", is_gate: false }],
+      steps: members.map((step, i) => ({
+        step,
+        reason: i === 0 ? "target" : "cascade",
+        ...(i > 0 ? { because_of: members[i - 1] } : {}),
+        is_gate: step === "approve",
+      })),
     });
   }
   if (/\/steps\/[^/]+\/results$/.test(p)) return json(testResults);
