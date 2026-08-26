@@ -4577,12 +4577,13 @@ pub fn pod_state(pod: &Pod) -> ExecState {
             // `Pending` until the engine's timeout backstop — an hour, by default,
             // for a failure we already know about.
             //
-            // `Infra { never_started: true }` is deliberately the SAME verdict the
-            // deleted `DriveErr::InputMissing` produced: the Step's main process
-            // never ran, so no side effect is possible, and a bounded retry may
-            // land on a node that can reach the service. A permanently-missing
-            // snapshot simply exhausts that budget and dead-letters, which is what
-            // it did before.
+            // The class comes from the fetcher's exit code (ticket e140121,
+            // `classify_fetch_exit`): transient/auth failures are
+            // `Infra { never_started: true }` — the Step's main process never
+            // ran, so no side effect is possible, and a bounded retry may land
+            // on a node (or a moment) that can reach the service — while a
+            // permanently-missing snapshot is `MissingInputs` (one attempt,
+            // run Failed, Rerun/Retry named) and env/skew is `Config`.
             if let Some(fetch_exit) = workspace_fetch_failed(pod) {
                 if exit_code.is_none() {
                     let (class, cause) = classify_fetch_exit(fetch_exit);
@@ -7795,10 +7796,12 @@ mod tests {
 
     /// The fetcher can FAIL where the doorstop it replaced structurally could not,
     /// so a Pod whose workspace was never provisioned must get a verdict instead
-    /// of sitting `Pending` until the step timeout. It is
-    /// `Infra { never_started: true }` — the same verdict the deleted
-    /// `DriveErr::InputMissing` produced, because the same thing is true: the
-    /// step's process never ran, so no side effect is possible.
+    /// of sitting `Pending` until the step timeout. Transient fetch failures are
+    /// `Infra { never_started: true }` — the step's process never ran, so no
+    /// side effect is possible — while exit 2 is `MissingInputs` since ticket
+    /// e140121 (the full table lives in
+    /// [`fetch_exit_codes_map_to_the_e140121_table`]; this test pins the two
+    /// PHASES — Failed and still-Pending — sharing the classification).
     #[test]
     fn a_failed_workspace_fetch_is_never_started_infra_not_a_hang() {
         use k8s_openapi::api::core::v1::{
