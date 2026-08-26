@@ -925,6 +925,19 @@ pub fn validate_profile_registry<P: NamedProfile>(registry: &[P], kind: &str) ->
     Ok(())
 }
 
+/// The ceiling on a step's `timeout:`, in seconds — 23 hours (ticket 16a7768
+/// item 3).
+///
+/// Not arbitrary: the workspace token a step Pod's drain authenticates with
+/// expires at `min(timeout + grace, 24h)`
+/// (`scarab_executor_k8s::workspace_token::expiry_for`; a compile-time assert
+/// there ties the numbers). A timeout past the ceiling would let a step
+/// **outlive its own drain credential**: the drain 401s, exits transient, and
+/// the attempt loops without ever publishing — 24 hours into the run.
+/// Validation refuses it here, where the author is still looking. The hour of
+/// slack above 23h keeps the token's full post-timeout grace un-truncated.
+pub const MAX_STEP_TIMEOUT_SECS: u32 = 23 * 60 * 60;
+
 /// Requested compute resources for a step (ADR-0055). Exact `cpu`/`memory`, not
 /// named `size` tiers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2156,6 +2169,18 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                         step.id
                     ));
                 }
+                // And a deadline past [`MAX_STEP_TIMEOUT_SECS`] would outlive
+                // the step's own drain credential (ticket 16a7768 item 3) —
+                // refused at authoring time, not discovered 24h into the run.
+                if step.timeout.is_some_and(|t| t > MAX_STEP_TIMEOUT_SECS) {
+                    diagnostics.push(format!(
+                        "step `{}`: `timeout` must be at most {MAX_STEP_TIMEOUT_SECS} seconds \
+                         (23 hours) — the workspace token the step's drain authenticates \
+                         with is capped at 24 hours, and a longer step would expire its own \
+                         credential before its workspace could publish",
+                        step.id
+                    ));
+                }
                 // Retry budget bounds (ADR-0047): a liveness bound. Zero re-runs
                 // is "no retry" (omit the field); an unbounded budget hides
                 // flakiness and burns minutes on doomed code.
@@ -2456,6 +2481,26 @@ mod tests {
             Err(PipelineError::Validation(d)) => d,
             other => panic!("expected validation error, got {other:?}"),
         }
+    }
+
+    /// The timeout ceiling (ticket 16a7768 item 3): a step past 23h would
+    /// outlive its own 24h-capped workspace drain token — refused at
+    /// authoring time. The ceiling itself is valid: the token still keeps its
+    /// full post-timeout grace there.
+    #[test]
+    fn a_timeout_past_the_drain_token_ceiling_is_refused_and_the_ceiling_is_not() {
+        let ds = errors(&format!(
+            "steps: [{{ id: a, image: busybox, timeout: {} }}]",
+            MAX_STEP_TIMEOUT_SECS + 1
+        ));
+        assert!(
+            ds.iter().any(|d| d.contains("at most") && d.contains("drain")),
+            "the refusal must say WHY (the drain credential), got: {ds:?}"
+        );
+        let ir = compile(&format!(
+            "steps: [{{ id: a, image: busybox, timeout: {MAX_STEP_TIMEOUT_SECS} }}]"
+        ));
+        assert_eq!(ir.steps[0].timeout, Some(MAX_STEP_TIMEOUT_SECS));
     }
 
     #[test]

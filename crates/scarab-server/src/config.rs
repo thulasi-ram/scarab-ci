@@ -643,7 +643,10 @@ pub enum ConfigError {
 
     #[error(
         "SCARAB_STEP_TIMEOUT_SECS is set but invalid — want a positive integer number \
-         of seconds (the global default step deadline, ADR-0047)."
+         of seconds, at most 82800 (23h; the global default step deadline, ADR-0047). \
+         The ceiling is the workspace drain token's: it expires at min(timeout + 10min, \
+         24h), and a longer default would expire every timeout-less step's drain \
+         credential mid-run (ticket 16a7768)."
     )]
     InvalidStepTimeout,
 
@@ -888,7 +891,12 @@ impl Config {
             Some(v) => v
                 .parse::<u32>()
                 .ok()
-                .filter(|s| *s > 0)
+                // Same ceiling pipeline validation puts on a per-step
+                // `timeout:` (ticket 16a7768 item 3): this default feeds the
+                // SAME token-expiry math (`workspace_token::expiry_for`) for
+                // steps that declare no timeout, and a default past 23h would
+                // silently expire every such step's drain credential.
+                .filter(|s| (1..=scarab_pipeline::MAX_STEP_TIMEOUT_SECS).contains(s))
                 .ok_or(ConfigError::InvalidStepTimeout)?,
             None => 3_600,
         };

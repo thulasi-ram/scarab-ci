@@ -73,10 +73,27 @@ pub const WORKSPACE_URL_ENV: &str = "SCARAB_WORKSPACE_URL";
 /// can still finish talking to the service.
 pub const WORKSPACE_TOKEN_GRACE_SECS: i64 = 600;
 
-/// Hard ceiling on a token's lifetime regardless of the step timeout. A step
-/// may legitimately declare a multi-day `timeout:`; a multi-day bearer
-/// credential in an untrusted Pod is a different question, and the answer is no.
+/// Hard ceiling on a token's lifetime regardless of the step timeout: a
+/// multi-day bearer credential in an untrusted Pod is not a thing this system
+/// mints.
+///
+/// The ceiling is only SAFE because pipeline validation enforces the matching
+/// step-timeout ceiling (`scarab_pipeline::MAX_STEP_TIMEOUT_SECS`, 23h —
+/// ticket 16a7768 item 3): before that, a step whose `timeout:` reached this
+/// cap would run past its own token's expiry and its drain could only 401 →
+/// exit 10 → Transient-loop, stranding an open PackSession for the abandoned-
+/// session sweep. The compile-time assert below is what keeps the two
+/// constants from drifting apart: every legal timeout leaves the token its
+/// full [`WORKSPACE_TOKEN_GRACE_SECS`] beyond the deadline, un-truncated.
 pub const WORKSPACE_TOKEN_MAX_TTL_SECS: i64 = 24 * 60 * 60;
+
+const _: () = assert!(
+    scarab_pipeline::MAX_STEP_TIMEOUT_SECS as i64 + WORKSPACE_TOKEN_GRACE_SECS
+        <= WORKSPACE_TOKEN_MAX_TTL_SECS,
+    "the validation-side step-timeout ceiling must leave the workspace token \
+     its full post-deadline grace under the 24h cap — raising one constant \
+     means re-deciding the other (ticket 16a7768 item 3)"
+);
 
 /// The absolute path of the mounted token file — the value of
 /// [`WORKSPACE_TOKEN_FILE_ENV`]. One definition so the PodSpec and the reader
@@ -216,6 +233,14 @@ fn message(claims: &WorkspaceClaims) -> String {
 /// When a token minted for a Pod launching now should expire: the step deadline
 /// plus [`WORKSPACE_TOKEN_GRACE_SECS`], capped at
 /// [`WORKSPACE_TOKEN_MAX_TTL_SECS`].
+///
+/// The cap looks like it could truncate the grace for a long-enough timeout —
+/// it cannot: pipeline validation refuses any `timeout:` above
+/// `scarab_pipeline::MAX_STEP_TIMEOUT_SECS`, and the compile-time assert on
+/// [`WORKSPACE_TOKEN_MAX_TTL_SECS`] holds `ceiling + grace <= cap`. The `min`
+/// stays as defense in depth for a caller that bypasses validation (the
+/// operator-set default timeout is clamped in server config for the same
+/// reason).
 pub fn expiry_for(launch_unix: i64, step_timeout_secs: u32) -> i64 {
     let ttl = i64::from(step_timeout_secs)
         .saturating_add(WORKSPACE_TOKEN_GRACE_SECS)
@@ -459,6 +484,19 @@ mod tests {
         assert!(claims.may_read_tree("anything"));
         let token = mint(SECRET, &claims);
         assert_eq!(verify(SECRET, &token, 0).unwrap().scope, Scope::Browse);
+    }
+
+    /// Every timeout pipeline validation admits leaves the drain its FULL
+    /// grace (ticket 16a7768 item 3): at the 23h ceiling, expiry is exactly
+    /// timeout + grace — the 24h cap does not truncate it — so the
+    /// expired-token 401 → exit 10 → Transient loop is unreachable for any
+    /// valid pipeline. The cap only bites timeouts validation already refuses.
+    #[test]
+    fn the_maximal_valid_timeout_keeps_the_full_drain_grace() {
+        let ceiling = scarab_pipeline::MAX_STEP_TIMEOUT_SECS;
+        let exp = expiry_for(0, ceiling);
+        assert_eq!(exp, i64::from(ceiling) + WORKSPACE_TOKEN_GRACE_SECS);
+        assert!(exp <= WORKSPACE_TOKEN_MAX_TTL_SECS);
     }
 
     #[test]
