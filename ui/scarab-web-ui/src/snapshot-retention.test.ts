@@ -100,16 +100,17 @@ describe("rerunTitle", () => {
     );
   });
 
-  it("explains the widening, naming retention GENERICALLY (amendment F9)", () => {
-    const t = rerunTitle(widenedPlan, "test");
-    // Never a day count: the flat configured number is not the number that
-    // expired a profiled run's packs — a wrong number is worse than none.
-    expect(t).not.toMatch(/\d+-day/);
-    expect(t).toContain("past retention");
+  it("explains the widening, with the window as the reason", () => {
+    const t = rerunTitle(widenedPlan, "test", 14);
+    expect(t).toContain("14-day retention window");
     expect(t).toContain("re-runs clone first to regenerate them");
     expect(t).toContain("3 steps in a new version");
     // Honest about the cost and about what is NOT lost.
     expect(t).toContain("Nothing is lost");
+  });
+
+  it("omits the window when the run detail did not supply one", () => {
+    expect(rerunTitle(widenedPlan, "test")).not.toContain("retention window");
   });
 });
 

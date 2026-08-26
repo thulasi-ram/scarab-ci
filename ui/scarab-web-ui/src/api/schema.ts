@@ -1720,29 +1720,6 @@ export interface components {
              */
             sha: string;
         };
-        /**
-         * @description Why a step is in a rerun plan (git-bug 4afaa3e).
-         * @enum {string}
-         */
-        PlanReasonDto: "target" | "cascade" | "regenerate" | "regenerate_cascade";
-        /** @description One member of a rerun plan, with its WHY (git-bug 4afaa3e). */
-        PlannedStepDto: {
-            /**
-             * @description The in-set step this one is here because of: the cascade parent
-             *     (minimum in-set need by id, deterministic) or, for `regenerate`, the
-             *     consumer whose expired input dragged it in. Absent only on the target.
-             */
-            because_of?: string | null;
-            /**
-             * @description A gate (ADR-0008): the rerun pauses for approval here — the plan never
-             *     claims a gate will run.
-             */
-            is_gate: boolean;
-            /** @description Why it is in the set. */
-            reason: components["schemas"]["PlanReasonDto"];
-            /** @description The step that re-runs (a gate re-arms and pauses instead of running). */
-            step: string;
-        };
         /** @description One registered project (governed repo, ADR-0046) in the repos list. */
         ProjectDto: {
             /**
@@ -1832,12 +1809,6 @@ export interface components {
              *     the affordance says out loud — "this re-runs from *clone*".
              */
             starts_from: string[];
-            /**
-             * @description The same set as `invalidated`, **execution-ordered** and carrying each
-             *     member's WHY (git-bug 4afaa3e) — computed by the engine, identically for
-             *     this preview and for the plan a POST rerun/retry executes and returns.
-             */
-            steps: components["schemas"]["PlannedStepDto"][];
             /** @description The step the plan is for. */
             target: string;
             /**
@@ -3879,14 +3850,12 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description rerun accepted — the body is the EXECUTED plan */
+            /** @description rerun accepted */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["RerunPlanResponse"];
-                };
+                content?: never;
             };
             /** @description no such run or step */
             404: {
@@ -4019,14 +3988,12 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description retry accepted — the body is the EXECUTED plan */
+            /** @description retry accepted */
             202: {
                 headers: {
                     [name: string]: unknown;
                 };
-                content: {
-                    "application/json": components["schemas"]["RerunPlanResponse"];
-                };
+                content?: never;
             };
             /** @description no such run or step */
             404: {

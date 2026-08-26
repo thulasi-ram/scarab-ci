@@ -272,22 +272,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    `cache_only_cas` twin: a fenceless PUT opens no pack and can never
     //    be durable on the Depot, so the cache-only label states on the wire
     //    what was always true — the durable copy is the direct cold write.
-    // The rerun-widening oracle's OWN handle (git-bug 4afaa3e amendment F1):
-    // same warm + cold legs, but WITHOUT `fall_through_on_warm_error`. The
-    // Depot answers presence over its warm cache + pack index, so a warm-leg
-    // NotFound is definitive — but a warm-leg ERROR (Depot down, rolling,
-    // 500ing) must propagate: falling through would consult only LOOSE cold
-    // objects, answer a definitive NotFound for packed content, and launder an
-    // outage into "expired" — widening a rerun back to `clone` because of a
-    // restart. Propagated, the error reaches `CasSnapshots`' "a transient error
-    // is not proof of expiry" guard, which assumes present. Browse/GC keep the
-    // fall-through handle below: for them a stale-but-served answer beats a 404.
-    let widening_cas: Option<Arc<dyn scarab_storage::Cas>> = depot_client.as_ref().map(|client| {
-        Arc::new(scarab_storage::tiered::TieredCas::new(
-            Arc::new(client.cache_only_cas()),
-            cold_cas.clone(),
-        )) as Arc<dyn scarab_storage::Cas>
-    });
     let workspace_cas: Arc<dyn scarab_storage::Cas> = match &depot_client {
         Some(client) => {
             tracing::info!(
@@ -702,12 +686,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 clock.clone(),
                 executor,
                 // Cache-key resolution at launch (ADR-0065 s1): the same CAS
-                // the rerun-widening oracle reads — the STRICT handle (git-bug
-                // 4afaa3e amendment F1), so a Depot outage surfaces as an error
-                // ("cannot key — disable") rather than falling through to a
-                // loose-only cold read that mis-answers for packed content.
+                // the rerun-widening oracle reads.
                 Some(Arc::new(scarab_server::retention::CasSnapshots(
-                    widening_cas.clone().unwrap_or_else(|| workspace_cas.clone()),
+                    workspace_cas.clone(),
                 ))),
                 Some(forge.clone()),
                 // Feed the log pipeline from the executor's live tail (ADR-0013).
@@ -757,12 +738,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // (ADR-0060 part D), so the Settings health readout reports a
         // config-supplied credential as present rather than MISSING.
         .with_credential_overrides(credential_overrides.clone());
-    // The rerun-widening oracle's strict handle (git-bug 4afaa3e amendment F1):
-    // only exists when a Depot is configured — without one, `workspace_cas` IS
-    // the cold store and there is no warm leg to launder an outage through.
-    if let Some(cas) = widening_cas.clone() {
-        state = state.with_widening_cas(cas);
-    }
     // Debug shell (step-attach): only the k8s executor can exec into a running
     // Pod. A dedicated kube client, independent of the runs driver, so a
     // UI-only replica can still serve attach. Absent a cluster it stays off.

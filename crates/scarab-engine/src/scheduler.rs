@@ -160,44 +160,6 @@ pub struct ExpiredInput {
     pub root: String,
 }
 
-/// WHY one step is in a [`RerunPlan`] (git-bug 4afaa3e: the affordance names
-/// the whole cascade, and each member's membership must be attributable —
-/// derived HERE so the preview, the executed plan and the record can never
-/// disagree about semantics).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanReason {
-    /// The step the human pointed at — always re-runs.
-    Target,
-    /// A transitive descendant of the target (ADR-0027 smart invalidation).
-    Cascade,
-    /// Dragged in upstream because its output Workspace Snapshot is gone
-    /// (ADR-0061 s5) — it re-runs to regenerate data, not because it changed.
-    Regenerate,
-    /// A descendant of a [`Regenerate`](PlanReason::Regenerate) root that the
-    /// target's own cascade did not already contain.
-    RegenerateCascade,
-}
-
-/// One member of a [`RerunPlan`], with its WHY — the per-step disclosure the
-/// confirm affordance renders (git-bug 4afaa3e).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlannedStep {
-    /// The step that re-runs (or re-arms — a gate pauses instead of running).
-    pub step: StepId,
-    /// Why it is in the set.
-    pub reason: PlanReason,
-    /// The in-set step this one is here BECAUSE OF: the cascade parent for
-    /// `Cascade`/`RegenerateCascade` (multi-parent members attribute to the
-    /// minimum in-set `need` by id — deterministic), the consumer whose input
-    /// expired for `Regenerate`. `None` only for the target.
-    pub because_of: Option<StepId>,
-    /// This member is a gate (ADR-0008): re-arming it pauses the run for a
-    /// decision — the copy must say "pauses for approval at X", never claim it
-    /// will run.
-    pub is_gate: bool,
-}
-
 /// What a rerun/retry of a target will actually execute — resolved *before*
 /// anything is re-armed, so a widened scope can be shown to a human before they
 /// confirm it (ADR-0027: smart never means mysterious).
@@ -229,19 +191,6 @@ pub struct RerunPlan {
     /// the `clone` step (ADR-0045) — which is exactly the phrase the rerun
     /// affordance must say out loud.
     pub starts_from: Vec<StepId>,
-    /// The same set as `invalidated`, **execution-ordered** (topological over
-    /// `needs` restricted to the set, ties broken by step id) and carrying each
-    /// member's WHY (git-bug 4afaa3e).
-    ///
-    /// This list exists only in the plan itself (the GET preview and the POST
-    /// 202 body); the recorded `RunRerunRequested`/`StepRetryRequested` events
-    /// deliberately carry the compact `invalidated`+`widened` form and NOT the
-    /// reasons. They are *mostly* re-derivable from that form plus the DAG —
-    /// but not entirely: a `Regenerate` root's `because_of` (the consumer whose
-    /// expired input dragged it in) comes from the oracle probes at plan time
-    /// and cannot be reconstructed from the event later. Enriching the event
-    /// payload is an open owner decision, not an accident of this field.
-    pub steps: Vec<PlannedStep>,
 }
 
 impl RerunPlan {
@@ -377,117 +326,13 @@ async fn plan_rerun_over(
         .collect();
     starts_from.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let planned = planned_steps(target, steps, &invalid, &base, &expired);
-
     Ok(RerunPlan {
         target: target.clone(),
         invalidated,
         widened,
         expired,
         starts_from,
-        steps: planned,
     })
-}
-
-/// Derive the per-step disclosure list (git-bug 4afaa3e): the invalidation set
-/// in execution order, each member tagged with WHY it re-runs.
-///
-/// Partition (mutually exclusive, exhaustive over `invalid`):
-/// - `Target` — the step the human pointed at;
-/// - `Regenerate` — a producer of an expired snapshot (`expired[].produced_by`);
-/// - `RegenerateCascade` — in the widened set (`invalid − base`) but not a
-///   producer: a descendant of a Regenerate root the base cascade missed;
-/// - `Cascade` — the rest: an ordinary descendant of the target.
-///
-/// `because_of` attribution: `Cascade`/`RegenerateCascade` members point at
-/// their minimum in-set `need` (by id — a deterministic tie-break for
-/// multi-parent members); a `Regenerate` root points at the consumer whose
-/// expired input dragged it in. The order is topological over `needs`
-/// restricted to the set, ties broken by step id — so two identical plans
-/// render identically, always.
-fn planned_steps(
-    target: &StepId,
-    steps: &[StepRun],
-    invalid: &std::collections::HashSet<StepId>,
-    base: &std::collections::HashSet<StepId>,
-    expired: &[ExpiredInput],
-) -> Vec<PlannedStep> {
-    // A Regenerate root appears at most once in `expired` (the widening loop
-    // guards on `new_roots`), but `.or_insert`-style first-wins keeps the
-    // attribution deterministic regardless.
-    let mut consumer_of: HashMap<&StepId, &StepId> = HashMap::new();
-    for e in expired {
-        consumer_of.entry(&e.produced_by).or_insert(&e.consumer);
-    }
-
-    let reason_of = |s: &StepRun| -> (PlanReason, Option<StepId>) {
-        if &s.step == target {
-            return (PlanReason::Target, None);
-        }
-        if let Some(consumer) = consumer_of.get(&s.step) {
-            return (PlanReason::Regenerate, Some((*consumer).clone()));
-        }
-        // Multi-parent tie-break: the minimum in-set need, by id.
-        let parent = s
-            .needs
-            .iter()
-            .filter(|n| invalid.contains(n))
-            .min_by(|a, b| a.0.cmp(&b.0))
-            .cloned();
-        if base.contains(&s.step) {
-            (PlanReason::Cascade, parent)
-        } else {
-            (PlanReason::RegenerateCascade, parent)
-        }
-    };
-
-    // Kahn's algorithm over `needs` restricted to the set, the ready frontier
-    // kept sorted by id. `needs` (not the consumption subset) is the execution
-    // ordering — a step waits on all of its needs.
-    let mut remaining: BTreeMap<String, &StepRun> = steps
-        .iter()
-        .filter(|s| invalid.contains(&s.step))
-        .map(|s| (s.step.0.clone(), s))
-        .collect();
-    let mut emitted: std::collections::HashSet<StepId> = std::collections::HashSet::new();
-    let mut out: Vec<PlannedStep> = Vec::with_capacity(remaining.len());
-    while !remaining.is_empty() {
-        let ready: Vec<String> = remaining
-            .iter()
-            .filter(|(_, s)| {
-                s.needs
-                    .iter()
-                    .all(|n| !invalid.contains(n) || emitted.contains(n))
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        if ready.is_empty() {
-            // A cycle cannot exist in a validated DAG; emit the rest in id
-            // order rather than looping forever if one ever does.
-            for (_, s) in std::mem::take(&mut remaining) {
-                let (reason, because_of) = reason_of(s);
-                out.push(PlannedStep {
-                    step: s.step.clone(),
-                    reason,
-                    because_of,
-                    is_gate: s.is_gate(),
-                });
-            }
-            break;
-        }
-        for id in ready {
-            let s = remaining.remove(&id).expect("ready keys come from the map");
-            let (reason, because_of) = reason_of(s);
-            emitted.insert(s.step.clone());
-            out.push(PlannedStep {
-                step: s.step.clone(),
-                reason,
-                because_of,
-                is_gate: s.is_gate(),
-            });
-        }
-    }
-    out
 }
 
 /// **Pin** a Run's Workspace Snapshots (ADR-0061 s5): keep them past the cold

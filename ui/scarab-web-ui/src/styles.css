@@ -702,57 +702,6 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .rd-widened { color: var(--copper); }
 
-/* The rerun/retry CONFIRM popover (git-bug 4afaa3e): portalled + fixed, the
-   SearchSelect machinery, sized for a sentence or a grouped step list. */
-.rc-pop {
-  position: fixed; z-index: 1000;
-  width: 360px; max-width: calc(100vw - 16px);
-  padding: 12px 14px;
-  background: var(--emerald-elevated); border: 1px solid var(--border);
-  border-radius: var(--radius-sm); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
-  font-size: 13px;
-}
-.rc-headline { margin: 0 0 8px; font-weight: 600; }
-.rc-warning {
-  display: flex; align-items: center; gap: 6px;
-  margin: 0 0 8px; color: var(--copper); font-size: 12.5px;
-}
-.rc-sentence { margin: 0 0 10px; line-height: 1.45; }
-.rc-unavailable { margin: 0 0 10px; color: var(--muted-sage); font-style: italic; }
-.rc-group { margin: 0 0 8px; }
-.rc-group-title {
-  margin: 0 0 4px; font-size: 11.5px; letter-spacing: 0.02em;
-  color: var(--muted-sage); text-transform: uppercase;
-}
-.rc-row {
-  display: flex; align-items: baseline; gap: 10px;
-  padding: 2px 0 2px 8px;
-}
-.rc-step { flex: none; font-size: 12.5px; }
-.rc-note { color: var(--muted-sage); font-size: 12px; }
-.rc-gate {
-  display: flex; align-items: center; gap: 6px;
-  margin: 0 0 8px; font-size: 12.5px; color: var(--emerald);
-}
-.rc-foot { margin: 0 0 10px; font-size: 12px; color: var(--muted-sage); }
-.rc-actions { display: flex; justify-content: flex-end; gap: 8px; }
-
-/* The TOCTOU disclosure toast (git-bug 4afaa3e): the executed plan was wider
-   than the previewed one. Fixed, dismissible, auto-fades via timer in JS. */
-.rd-toast {
-  position: fixed; z-index: 1100;
-  right: 16px; bottom: 16px;
-  display: flex; align-items: center; gap: 8px;
-  max-width: 420px; padding: 10px 12px;
-  background: var(--emerald-elevated); border: 1px solid var(--copper);
-  border-radius: var(--radius-sm); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
-  color: var(--copper); font-size: 12.5px;
-}
-.rd-toast-x {
-  border: none; background: none; cursor: pointer;
-  color: var(--muted-sage); font-size: 12px; padding: 0 0 0 4px;
-}
-
 .run-id {
   font-size: 26px;
   letter-spacing: -0.4px;

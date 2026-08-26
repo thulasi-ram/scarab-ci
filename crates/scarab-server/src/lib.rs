@@ -152,18 +152,6 @@ pub struct AppState {
     /// workspace-browse endpoints (404) — e.g. the local executor doesn't
     /// snapshot workspaces.
     pub workspace_cas: Option<Arc<dyn scarab_storage::Cas>>,
-    /// The `Cas` handle the rerun-widening oracle answers over (git-bug 4afaa3e,
-    /// amendment F1). Unlike `workspace_cas` — the Browse/GC read handle, whose
-    /// tiered composition falls through to cold on ANY warm error — this one
-    /// must let a warm-leg error PROPAGATE: the control plane's warm leg is the
-    /// Depot (warm cache + pack index), so during a Depot outage a fall-through
-    /// read consults only loose cold objects and answers a definitive NotFound
-    /// for packed content — laundering an outage into "expired" and widening a
-    /// rerun back to `clone`. With the error surfaced, `CasSnapshots`' "a
-    /// transient error is not proof of expiry" guard assumes present instead.
-    /// `None` = fall back to `workspace_cas` (correct where the two coincide,
-    /// e.g. a cold-only deployment with no warm leg to launder).
-    pub widening_cas: Option<Arc<dyn scarab_storage::Cas>>,
     /// The step attacher (debug shell): opens an interactive TTY into a running
     /// step's Pod. `None` disables the attach endpoint (404) — only the k8s
     /// executor can exec; the local executor runs no Pods.
@@ -228,7 +216,6 @@ impl AppState {
             results_token_secret: None,
             artifact_store: None,
             workspace_cas: None,
-            widening_cas: None,
             attacher: None,
             debug_launcher: None,
             ui_dir: None,
@@ -363,15 +350,6 @@ impl AppState {
     /// (ADR-0029). Serves a step's output snapshot tree + file bytes.
     pub fn with_workspace_cas(mut self, cas: Arc<dyn scarab_storage::Cas>) -> Self {
         self.workspace_cas = Some(cas);
-        self
-    }
-
-    /// Give the rerun-widening oracle its own `Cas` handle — one whose warm-leg
-    /// errors PROPAGATE instead of falling through to cold (git-bug 4afaa3e
-    /// amendment F1: a Depot outage must never be laundered into "expired").
-    /// Without this the oracle answers over `workspace_cas`.
-    pub fn with_widening_cas(mut self, cas: Arc<dyn scarab_storage::Cas>) -> Self {
-        self.widening_cas = Some(cas);
         self
     }
 
@@ -2181,15 +2159,13 @@ async fn get_service_logs(
     Ok(Sse::new(replay_stream.chain(live).boxed()))
 }
 
-/// Map a rerun/retry outcome to the API's error space (the success half rides
-/// through untouched — the POST handlers return the **executed plan** as their
-/// `202` body, git-bug 4afaa3e). `404` for an unknown step; `409` when the
-/// request conflicts with the step's state (ADR-0056 amendment: rerunning a step
-/// whose dependency has not succeeded, or retrying a non-failed step). Generic
-/// so the error mapping is never forked per handler.
-fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
+/// Map a rerun/retry outcome to an HTTP status. `202` on success; `404` for an
+/// unknown step; `409` when the request conflicts with the step's state (ADR-0056
+/// amendment: rerunning a step whose dependency has not succeeded, or retrying a
+/// non-failed step).
+fn rerun_outcome(res: Result<(), RerunError>) -> Result<StatusCode, ApiError> {
     match res {
-        Ok(v) => Ok(v),
+        Ok(()) => Ok(StatusCode::ACCEPTED),
         Err(RerunError::StepNotFound(_)) => Err(ApiError::NotFound),
         Err(e @ RerunError::DependencyNotSatisfied { .. }) => {
             Err(ApiError::Conflict(e.to_string()))
@@ -2217,7 +2193,7 @@ fn rerun_outcome<T>(res: Result<T, RerunError>) -> Result<T, ApiError> {
         ("step" = String, Path, description = "step id")
     ),
     responses(
-        (status = 202, description = "rerun accepted — the body is the EXECUTED plan", body = RerunPlanResponse),
+        (status = 202, description = "rerun accepted"),
         (status = 404, description = "no such run or step"),
         (status = 409, description = "target's dependencies have not succeeded")
     )
@@ -2226,7 +2202,7 @@ async fn rerun_step(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
-) -> Result<(StatusCode, Json<RerunPlanResponse>), ApiError> {
+) -> Result<StatusCode, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     // Bind the principal (ADR-0056): a rerun is a Take boundary and the
@@ -2234,11 +2210,7 @@ async fn rerun_step(
     // gate approval.
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
     let oracle = snapshot_oracle(&st);
-    // The EXECUTED plan comes back as the body (git-bug 4afaa3e): the preview →
-    // confirm window is a real TOCTOU (a snapshot can expire between the two),
-    // and returning what actually happened lets the UI disclose a divergence
-    // instead of silently showing a stale scope.
-    let plan = rerun_outcome(
+    rerun_outcome(
         scarab_engine::rerun_step_widened(
             &*st.db,
             &*st.clock,
@@ -2247,27 +2219,19 @@ async fn rerun_step(
             &StepId(step),
             Some(principal.subject),
         )
-        .await,
-    )?;
-    Ok((StatusCode::ACCEPTED, Json(plan_response(plan))))
+        .await
+        .map(|_| ()),
+    )
 }
 
 /// The ADR-0061 s5 snapshot-availability oracle, when this deployment has a
 /// workspace CAS wired. `None` (the local executor, which snapshots nothing)
 /// means no presence check and therefore no widening — the pre-0061 behaviour,
 /// which is correct there because there are no snapshots to expire.
-///
-/// Answers over `widening_cas` when one is wired (git-bug 4afaa3e amendment F1:
-/// the handle whose warm-leg errors propagate, so a Depot outage reaches
-/// `CasSnapshots`' transient-error guard as an ERROR — assumed present — and is
-/// never laundered into a definitive cold-leg NotFound, i.e. "expired").
 fn snapshot_oracle(st: &AppState) -> Option<Box<dyn scarab_engine::WorkspaceSnapshots>> {
-    st.widening_cas
-        .clone()
-        .or_else(|| st.workspace_cas.clone())
-        .map(|cas| {
-            Box::new(retention::CasSnapshots(cas)) as Box<dyn scarab_engine::WorkspaceSnapshots>
-        })
+    st.workspace_cas.clone().map(|cas| {
+        Box::new(retention::CasSnapshots(cas)) as Box<dyn scarab_engine::WorkspaceSnapshots>
+    })
 }
 
 /// Retry a **Failed** step (ADR-0056 amendment) — another Attempt **in the
@@ -2281,7 +2245,7 @@ fn snapshot_oracle(st: &AppState) -> Option<Box<dyn scarab_engine::WorkspaceSnap
         ("step" = String, Path, description = "step id")
     ),
     responses(
-        (status = 202, description = "retry accepted — the body is the EXECUTED plan", body = RerunPlanResponse),
+        (status = 202, description = "retry accepted"),
         (status = 404, description = "no such run or step"),
         (status = 409, description = "step is not failed")
     )
@@ -2290,12 +2254,12 @@ async fn retry_step(
     State(st): State<AppState>,
     headers: HeaderMap,
     Path((id, step)): Path<(String, String)>,
-) -> Result<(StatusCode, Json<RerunPlanResponse>), ApiError> {
+) -> Result<StatusCode, ApiError> {
     let run = RunId(id);
     let scope = run_scope(&st, &run).await;
     let principal = authorize_scoped(&st, &headers, Action::Write, scope.as_ref()).await?;
     let oracle = snapshot_oracle(&st);
-    let plan = rerun_outcome(
+    rerun_outcome(
         scarab_engine::retry_step_widened(
             &*st.db,
             &*st.clock,
@@ -2304,9 +2268,9 @@ async fn retry_step(
             &StepId(step),
             Some(principal.subject),
         )
-        .await,
-    )?;
-    Ok((StatusCode::ACCEPTED, Json(plan_response(plan))))
+        .await
+        .map(|_| ()),
+    )
 }
 
 /// `GET …/steps/{step}/rerun-plan` body: what a rerun/retry of this step would
@@ -2336,78 +2300,6 @@ pub struct RerunPlanResponse {
     /// Each expired input that caused the widening: the consuming step, the step
     /// that produced the missing snapshot, and its CAS root.
     pub expired_inputs: Vec<ExpiredInputDto>,
-    /// The same set as `invalidated`, **execution-ordered** and carrying each
-    /// member's WHY (git-bug 4afaa3e) — computed by the engine, identically for
-    /// this preview and for the plan a POST rerun/retry executes and returns.
-    pub steps: Vec<PlannedStepDto>,
-}
-
-/// Why a step is in a rerun plan (git-bug 4afaa3e).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanReasonDto {
-    /// The step the human pointed at — always re-runs.
-    Target,
-    /// A transitive descendant of the target (ADR-0027 smart invalidation).
-    Cascade,
-    /// Dragged in upstream: its output Workspace Snapshot is gone (ADR-0061 s5).
-    Regenerate,
-    /// A descendant of a regenerate root the target's cascade did not contain.
-    RegenerateCascade,
-}
-
-/// One member of a rerun plan, with its WHY (git-bug 4afaa3e).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PlannedStepDto {
-    /// The step that re-runs (a gate re-arms and pauses instead of running).
-    pub step: String,
-    /// Why it is in the set.
-    pub reason: PlanReasonDto,
-    /// The in-set step this one is here because of: the cascade parent
-    /// (minimum in-set need by id, deterministic) or, for `regenerate`, the
-    /// consumer whose expired input dragged it in. Absent only on the target.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub because_of: Option<String>,
-    /// A gate (ADR-0008): the rerun pauses for approval here — the plan never
-    /// claims a gate will run.
-    pub is_gate: bool,
-}
-
-/// The one `RerunPlan → RerunPlanResponse` mapping — shared by the GET preview
-/// and both POST bodies, so a shape drift between them is unrepresentable.
-fn plan_response(plan: scarab_engine::RerunPlan) -> RerunPlanResponse {
-    RerunPlanResponse {
-        target: plan.target.0,
-        invalidated: plan.invalidated.into_iter().map(|s| s.0).collect(),
-        widened: plan.widened.into_iter().map(|s| s.0).collect(),
-        starts_from: plan.starts_from.into_iter().map(|s| s.0).collect(),
-        expired_inputs: plan
-            .expired
-            .into_iter()
-            .map(|e| ExpiredInputDto {
-                consumer: e.consumer.0,
-                produced_by: e.produced_by.0,
-                root: e.root,
-            })
-            .collect(),
-        steps: plan
-            .steps
-            .into_iter()
-            .map(|s| PlannedStepDto {
-                step: s.step.0,
-                reason: match s.reason {
-                    scarab_engine::PlanReason::Target => PlanReasonDto::Target,
-                    scarab_engine::PlanReason::Cascade => PlanReasonDto::Cascade,
-                    scarab_engine::PlanReason::Regenerate => PlanReasonDto::Regenerate,
-                    scarab_engine::PlanReason::RegenerateCascade => {
-                        PlanReasonDto::RegenerateCascade
-                    }
-                },
-                because_of: s.because_of.map(|b| b.0),
-                is_gate: s.is_gate,
-            })
-            .collect(),
-    }
 }
 
 /// One expired Workspace Snapshot behind a widened rerun (ADR-0061 s5).
@@ -2453,7 +2345,21 @@ async fn rerun_plan(
             RerunError::Db(e) => ApiError::Db(e),
             other => ApiError::Conflict(other.to_string()),
         })?;
-    Ok(Json(plan_response(plan)))
+    Ok(Json(RerunPlanResponse {
+        target: plan.target.0,
+        invalidated: plan.invalidated.into_iter().map(|s| s.0).collect(),
+        widened: plan.widened.into_iter().map(|s| s.0).collect(),
+        starts_from: plan.starts_from.into_iter().map(|s| s.0).collect(),
+        expired_inputs: plan
+            .expired
+            .into_iter()
+            .map(|e| ExpiredInputDto {
+                consumer: e.consumer.0,
+                produced_by: e.produced_by.0,
+                root: e.root,
+            })
+            .collect(),
+    }))
 }
 
 /// **Pin** this run's Workspace Snapshots (ADR-0061 s5): keep them past the cold
@@ -7832,8 +7738,6 @@ impl utoipa::Modify for TagGroups {
         RunStatusResponse,
         SnapshotRetentionDto,
         RerunPlanResponse,
-        PlannedStepDto,
-        PlanReasonDto,
         ExpiredInputDto,
         StepStatusDto,
         StepServiceDto,

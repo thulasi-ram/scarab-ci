@@ -120,6 +120,11 @@ pub const STEP_TIMEOUT_ENV: &str = "SCARAB_WORKSPACE_STEP_TIMEOUT_SECS";
 ///       shape the binary cannot parse, an unknown subcommand, a permanent
 ///       4xx the service will answer identically forever — env/image skew,
 ///       operator-fixable | `Config` |
+/// | 5 | fan-in **type conflict** (ticket 2e1a458): two input snapshots carry
+///       the same path as incompatible kinds (a directory in one, a file or
+///       symlink in the other). Refused BEFORE any write — permanent and
+///       author-fixable | `Config` + the termination-log cause naming the
+///       path and both roots |
 ///
 /// Anything ELSE (137, signals) is not this table's verdict and stays
 /// `Infra { never_started: true }` in the executor's pinned default arm.
@@ -130,6 +135,13 @@ pub const EXIT_FETCH_MISSING_INPUTS: i32 = 2;
 pub const EXIT_FETCH_DENIED: i32 = 3;
 /// See [`EXIT_FETCH_TRANSIENT`]. Env/skew permanents (previously exit 2).
 pub const EXIT_FETCH_CONFIG: i32 = 4;
+/// See [`EXIT_FETCH_TRANSIENT`]. A fan-in type conflict (dir vs file/symlink
+/// at one path across two input snapshots, ticket 2e1a458) — refused before a
+/// byte is written. This closes a real traversal: before the refusal, root A's
+/// symlink `dist → X` + root B's directory `dist` silently wrote B's files
+/// THROUGH the symlink (outside the workspace when X is absolute), because
+/// `create_dir_all` follows links and `safe_join` is lexical.
+pub const EXIT_FETCH_INPUT_CONFLICT: i32 = 5;
 
 /// Hashes per `POST /v1/cas/have`. The service caps the batch; the client chunks
 /// to stay under it.
@@ -912,6 +924,101 @@ impl WorkspaceClient {
             .await
             .map_err(|e| StorageError::Backend(format!("malformed flat manifest: {e}")))
     }
+
+    /// Apply an already-fetched [`FlatManifest`] onto `path` — the write half
+    /// of [`materialize`](scarab_storage::Cas::materialize), split out (ticket
+    /// 2e1a458) so the fan-in pre-pass in `scarab-wsfetch` can fetch every
+    /// root's manifest ONCE (fold/classify collisions across them) and then
+    /// materialize from those same manifests, never paying a second `/flat`
+    /// per root. Same fidelity contract as `materialize`: restores mode,
+    /// mtime, symlinks and empty directories, and overlays into an existing
+    /// directory (merge-in-order, ADR-0007).
+    pub async fn materialize_flat(
+        &self,
+        manifest: &FlatManifest,
+        path: &str,
+    ) -> Result<(), StorageError> {
+        let root = std::path::PathBuf::from(path);
+        std::fs::create_dir_all(&root).map_err(io_err)?;
+
+        // Directories first, parents before children (the manifest guarantees
+        // that order). Their mode and mtime are applied at the END, because
+        // creating a child bumps a parent's mtime and a restrictive mode applied
+        // now would lock this very walk out of its own subtree — so what to
+        // restore is decided here and carried to the deferred pass below.
+        let mut deferred: Vec<(std::path::PathBuf, Option<u32>, Option<i64>)> =
+            Vec::with_capacity(manifest.dirs.len());
+        for dir in &manifest.dirs {
+            let target = safe_join(&root, &dir.path)?;
+            // Read BEFORE the create, so a directory an earlier input left
+            // read-only is seen as it was rather than as `create_dir_all` finds
+            // it. Same order as `S3Storage::materialize`.
+            let pre = std::fs::metadata(&target)
+                .ok()
+                .map(|m| m.permissions().mode() & 0o7777);
+            std::fs::create_dir_all(&target).map_err(io_err)?;
+            let mut restore = dir.mode.map(|m| m & 0o7777);
+            // Widen for the walk if an earlier input left it read-only.
+            if let Some(cur) = pre {
+                if cur & 0o700 != 0o700 {
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(cur | 0o700))
+                        .map_err(io_err)?;
+                    // With no recorded mode, put back exactly what was there.
+                    // Without this the widening is permanent and a pre-metadata
+                    // tree (`FlatDir::mode == None`, a live wire shape) silently
+                    // leaves every restrictive directory at `0o700`.
+                    restore = restore.or(Some(cur));
+                }
+            }
+            deferred.push((target, restore, dir.mtime_ms));
+        }
+
+        // Files, in parallel. This is the leg s0 measured as dominant.
+        //
+        // The filesystem work goes through `spawn_blocking`: `std::fs` calls
+        // inside a `buffer_unordered` would park the runtime's worker threads,
+        // and at 50 000 files that turns "concurrent" back into "sequential with
+        // extra steps" — the exact property this is here to provide.
+        // Downloads whole-buffer each blob, so bytes in flight are bounded by
+        // the transfer byte budget exactly as the ingest leg's uploads are
+        // (ticket 16a7768 item 1): each entry charges `min(size, budget)` —
+        // the manifest carries sizes — before its GET and holds the charge
+        // through the write. Without this the peak was 16 × largest blob,
+        // inside a fetch container that now carries a memory limit.
+        let budget = self.transfer_byte_budget.clamp(1, u64::from(u32::MAX));
+        let gate = tokio::sync::Semaphore::new(budget as usize);
+        let gate = &gate;
+        let results: Vec<Result<(), StorageError>> =
+            futures::stream::iter(manifest.entries.iter().cloned())
+                .map(|entry| {
+                    let root = root.clone();
+                    async move {
+                        let charge = entry.size.min(budget) as u32;
+                        let _permit = gate.acquire_many(charge).await.map_err(|_| {
+                            StorageError::Backend("transfer byte-budget semaphore closed".into())
+                        })?;
+                        let data = self.get_blob(&entry.blob).await?;
+                        tokio::task::spawn_blocking(move || write_entry(&root, &entry, &data))
+                            .await
+                            .map_err(|e| StorageError::Backend(e.to_string()))?
+                    }
+                })
+                .buffer_unordered(CONCURRENCY)
+                .collect()
+                .await;
+        for result in results {
+            result?;
+        }
+
+        // Now the directory metadata, deepest first, for the reason above. A
+        // descendant always sorts after its ancestor, so descending order is
+        // deepest-first regardless of what order the service listed them in.
+        deferred.sort_by(|a, b| b.0.cmp(&a.0));
+        for (target, mode, mtime_ms) in deferred {
+            apply_metadata(&target, mode, mtime_ms)?;
+        }
+        Ok(())
+    }
 }
 
 /// One fence — `{run, step, attempt}` — as the Depot's **fence key**: SHA-256
@@ -1250,86 +1357,7 @@ impl Cas for WorkspaceClient {
     /// read-only file or a symlink an earlier one left behind.
     async fn materialize(&self, tree: &TreeHash, path: &str) -> Result<(), StorageError> {
         let manifest = self.flat(tree).await?;
-        let root = std::path::PathBuf::from(path);
-        std::fs::create_dir_all(&root).map_err(io_err)?;
-
-        // Directories first, parents before children (the manifest guarantees
-        // that order). Their mode and mtime are applied at the END, because
-        // creating a child bumps a parent's mtime and a restrictive mode applied
-        // now would lock this very walk out of its own subtree — so what to
-        // restore is decided here and carried to the deferred pass below.
-        let mut deferred: Vec<(std::path::PathBuf, Option<u32>, Option<i64>)> =
-            Vec::with_capacity(manifest.dirs.len());
-        for dir in &manifest.dirs {
-            let target = safe_join(&root, &dir.path)?;
-            // Read BEFORE the create, so a directory an earlier input left
-            // read-only is seen as it was rather than as `create_dir_all` finds
-            // it. Same order as `S3Storage::materialize`.
-            let pre = std::fs::metadata(&target)
-                .ok()
-                .map(|m| m.permissions().mode() & 0o7777);
-            std::fs::create_dir_all(&target).map_err(io_err)?;
-            let mut restore = dir.mode.map(|m| m & 0o7777);
-            // Widen for the walk if an earlier input left it read-only.
-            if let Some(cur) = pre {
-                if cur & 0o700 != 0o700 {
-                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(cur | 0o700))
-                        .map_err(io_err)?;
-                    // With no recorded mode, put back exactly what was there.
-                    // Without this the widening is permanent and a pre-metadata
-                    // tree (`FlatDir::mode == None`, a live wire shape) silently
-                    // leaves every restrictive directory at `0o700`.
-                    restore = restore.or(Some(cur));
-                }
-            }
-            deferred.push((target, restore, dir.mtime_ms));
-        }
-
-        // Files, in parallel. This is the leg s0 measured as dominant.
-        //
-        // The filesystem work goes through `spawn_blocking`: `std::fs` calls
-        // inside a `buffer_unordered` would park the runtime's worker threads,
-        // and at 50 000 files that turns "concurrent" back into "sequential with
-        // extra steps" — the exact property this is here to provide.
-        // Downloads whole-buffer each blob, so bytes in flight are bounded by
-        // the transfer byte budget exactly as the ingest leg's uploads are
-        // (ticket 16a7768 item 1): each entry charges `min(size, budget)` —
-        // the manifest carries sizes — before its GET and holds the charge
-        // through the write. Without this the peak was 16 × largest blob,
-        // inside a fetch container that now carries a memory limit.
-        let budget = self.transfer_byte_budget.clamp(1, u64::from(u32::MAX));
-        let gate = tokio::sync::Semaphore::new(budget as usize);
-        let gate = &gate;
-        let results: Vec<Result<(), StorageError>> =
-            futures::stream::iter(manifest.entries.iter().cloned())
-                .map(|entry| {
-                    let root = root.clone();
-                    async move {
-                        let charge = entry.size.min(budget) as u32;
-                        let _permit = gate.acquire_many(charge).await.map_err(|_| {
-                            StorageError::Backend("transfer byte-budget semaphore closed".into())
-                        })?;
-                        let data = self.get_blob(&entry.blob).await?;
-                        tokio::task::spawn_blocking(move || write_entry(&root, &entry, &data))
-                            .await
-                            .map_err(|e| StorageError::Backend(e.to_string()))?
-                    }
-                })
-                .buffer_unordered(CONCURRENCY)
-                .collect()
-                .await;
-        for result in results {
-            result?;
-        }
-
-        // Now the directory metadata, deepest first, for the reason above. A
-        // descendant always sorts after its ancestor, so descending order is
-        // deepest-first regardless of what order the service listed them in.
-        deferred.sort_by(|a, b| b.0.cmp(&a.0));
-        for (target, mode, mtime_ms) in deferred {
-            apply_metadata(&target, mode, mtime_ms)?;
-        }
-        Ok(())
+        self.materialize_flat(&manifest, path).await
     }
 
     /// Snapshot `path` into the service.
@@ -1429,6 +1457,302 @@ impl ContentSource for WorkspaceClient {
     async fn flatten(&self, root: &TreeHash) -> Result<FlatManifest, StorageError> {
         self.flat(root).await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fan-in merge pre-pass (ticket 2e1a458)
+// ---------------------------------------------------------------------------
+//
+// The pure fold/classify half of the fan-in collision diagnostic. The loop
+// that fetches manifests, retries transients and turns a conflict into exit 5
+// stays in the `scarab-wsfetch` binary (the fetch_retry.rs placement rule:
+// retry policy must not leak into this lib, which the control plane shares);
+// only what a table test can hold without scheduling anything lives here.
+
+/// What one path IS in a [`FlatManifest`], for the fan-in fold. Derived from
+/// the manifest's own vocabulary (an entry whose mode file-type bits are
+/// `MODE_SYMLINK` is a symlink; everything else in `entries` is a file; `dirs`
+/// are directories) — deliberately no fourth variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanInKind {
+    File,
+    Symlink,
+    Dir,
+}
+
+impl std::fmt::Display for FanInKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FanInKind::File => write!(f, "file"),
+            FanInKind::Symlink => write!(f, "symlink"),
+            FanInKind::Dir => write!(f, "directory"),
+        }
+    }
+}
+
+/// One fan-in **collision**: two input roots both carry `path`, and their
+/// content differs. Collision identity is `(blob, kind, mode)` — the same
+/// path with the same blob but a differing kind (file vs symlink) or mode IS
+/// a collision; only a byte-, kind- and mode-identical duplicate is silent
+/// (no author action exists for it, so counting it would be noise). The
+/// winner is always the LAST root in declared order (ADR-0007 last-wins);
+/// this record only makes the overwrite loud.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputCollision {
+    /// Workspace-relative path, byte-exact as the manifests carry it — no
+    /// case folding, no unicode normalization (prod Steps run on Linux, where
+    /// distinct byte strings are distinct paths).
+    pub path: String,
+    /// Index (into the declared root order) of the root whose entry wins.
+    pub winner: usize,
+    /// Index of the root whose entry is overwritten.
+    pub loser: usize,
+}
+
+/// A fan-in **type conflict**: the same path is a directory in one root and a
+/// file or symlink in another (either direction). Refused — mapped to
+/// [`EXIT_FETCH_INPUT_CONFLICT`] by the binary — because no write order makes
+/// it coherent, and the symlink case is a real traversal: writing root B's
+/// directory contents over root A's symlink follows the link out of the
+/// workspace (`create_dir_all` follows; `safe_join` is lexical). Within a
+/// single root the tree structure makes this unrepresentable, so refusing it
+/// at fan-in is sufficient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputTypeConflict {
+    pub path: String,
+    pub earlier_root: usize,
+    pub earlier_kind: FanInKind,
+    pub later_root: usize,
+    pub later_kind: FanInKind,
+}
+
+impl std::fmt::Display for InputTypeConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "workspace input type conflict at {:?}: input root[{}] carries a {} and \
+             input root[{}] carries a {} — no merge order makes that coherent, so the \
+             fetch is refused before any write (declare `inputs:` to drop one side, \
+             or rename the path in one producer; ADR-0007)",
+            self.path, self.earlier_root, self.earlier_kind, self.later_root, self.later_kind
+        )
+    }
+}
+
+/// What the fold found across all roots. `collisions` is in fold order (each
+/// later root's re-declarations as they were seen); with three or more roots
+/// one path can appear more than once (each overwrite is its own record).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FanInReport {
+    pub collisions: Vec<InputCollision>,
+}
+
+/// The kind of one manifest entry, from its recorded mode.
+fn entry_kind(entry: &FlatEntry) -> FanInKind {
+    match entry.mode {
+        Some(m) if m & 0o170_000 == scarab_storage::MODE_SYMLINK => FanInKind::Symlink,
+        _ => FanInKind::File,
+    }
+}
+
+/// Fold every root's [`FlatManifest`] — `dirs` INCLUDED, which is what makes
+/// the dir-through-symlink case detectable at all — into per-path outcomes,
+/// in declared order:
+///
+/// - **directory vs directory**: union, silent (materialize applies the later
+///   root's metadata; there is nothing for an author to fix).
+/// - **file/symlink vs file/symlink, identical `(blob, kind, mode)`**: silent
+///   benign duplicate.
+/// - **file/symlink vs file/symlink, anything differs**: a recorded
+///   [`InputCollision`] — the later root wins (ADR-0007), loudly.
+/// - **directory vs file/symlink (either direction)**: [`InputTypeConflict`]
+///   — the caller refuses the whole fetch before writing a byte.
+///
+/// Memory: the fold holds one `(path → seen)` map over all roots' manifests,
+/// which the binary already holds one-at-a-time to materialize — order
+/// ~15–20 MB per large root, inside the helper container whose memory limit
+/// the executor already budgets (ticket 16a7768). Path keys are byte-exact
+/// (no case/NFC normalization; Linux is prod).
+pub fn fold_manifests(manifests: &[FlatManifest]) -> Result<FanInReport, InputTypeConflict> {
+    struct Seen {
+        root: usize,
+        kind: FanInKind,
+        /// `None` for directories.
+        blob: Option<String>,
+        mode: Option<u32>,
+    }
+    let mut seen: std::collections::HashMap<String, Seen> = std::collections::HashMap::new();
+    let mut report = FanInReport::default();
+    for (i, manifest) in manifests.iter().enumerate() {
+        for dir in &manifest.dirs {
+            match seen.get_mut(dir.path.as_str()) {
+                None => {
+                    seen.insert(
+                        dir.path.clone(),
+                        Seen {
+                            root: i,
+                            kind: FanInKind::Dir,
+                            blob: None,
+                            mode: dir.mode,
+                        },
+                    );
+                }
+                Some(prev) if prev.kind == FanInKind::Dir => {
+                    // Directories union (ADR-0007): silent, later root's
+                    // metadata applies.
+                    prev.root = i;
+                    prev.mode = dir.mode;
+                }
+                Some(prev) => {
+                    return Err(InputTypeConflict {
+                        path: dir.path.clone(),
+                        earlier_root: prev.root,
+                        earlier_kind: prev.kind,
+                        later_root: i,
+                        later_kind: FanInKind::Dir,
+                    });
+                }
+            }
+        }
+        for entry in &manifest.entries {
+            let kind = entry_kind(entry);
+            match seen.get_mut(entry.path.as_str()) {
+                None => {
+                    seen.insert(
+                        entry.path.clone(),
+                        Seen {
+                            root: i,
+                            kind,
+                            blob: Some(entry.blob.0.clone()),
+                            mode: entry.mode,
+                        },
+                    );
+                }
+                Some(prev) if prev.kind == FanInKind::Dir => {
+                    return Err(InputTypeConflict {
+                        path: entry.path.clone(),
+                        earlier_root: prev.root,
+                        earlier_kind: prev.kind,
+                        later_root: i,
+                        later_kind: kind,
+                    });
+                }
+                Some(prev) => {
+                    // Collision identity (blob, kind, mode): only a fully
+                    // identical re-declaration is silent.
+                    let identical = prev.blob.as_deref() == Some(entry.blob.0.as_str())
+                        && prev.kind == kind
+                        && prev.mode == entry.mode;
+                    if !identical {
+                        report.collisions.push(InputCollision {
+                            path: entry.path.clone(),
+                            winner: i,
+                            loser: prev.root,
+                        });
+                    }
+                    prev.root = i;
+                    prev.kind = kind;
+                    prev.blob = Some(entry.blob.0.clone());
+                    prev.mode = entry.mode;
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Cap on the number of collision samples the termination summary carries.
+pub const TERMINATION_SUMMARY_MAX_SAMPLES: usize = 8;
+/// Cap on the serialized summary's byte length — well under the kubelet's
+/// 4 KiB `terminationMessagePath` cap, leaving room for anything else a
+/// future summary version wants to carry. The full list lives only in the
+/// provisioning log.
+pub const TERMINATION_SUMMARY_MAX_BYTES: usize = 1536;
+
+/// The bounded JSON the fetcher writes to `/dev/termination-log` and the k8s
+/// executor reads back from the fetch init container's `terminated.message`
+/// (`Executor::workspace_provisioning`). Field names are the wire contract —
+/// deliberately terse, because the kubelet caps the message at 4 KiB and this
+/// stays well under it (`v`/`collisions`/`sample.{p,w,l}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchTerminationSummary {
+    /// Summary format version; 1 today.
+    pub v: u32,
+    /// TOTAL collision count — always kept, even when `sample` was truncated
+    /// (or emptied) to fit the byte budget.
+    pub collisions: u64,
+    #[serde(default)]
+    pub sample: Vec<FetchCollisionSample>,
+}
+
+/// One sampled collision: path, winning root index, losing root index (both
+/// into the declared `SCARAB_SNAPSHOT_ROOTS` order — the control plane maps
+/// them back to step ids through the same filter `workspace_inputs` applies).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchCollisionSample {
+    pub p: String,
+    pub w: usize,
+    pub l: usize,
+}
+
+/// Middle-out truncation for a too-long sampled path: keep both ends (the
+/// filename usually IS the signal) and elide the middle. Char-boundary safe.
+fn truncate_path_middle_out(path: &str, keep_each_side: usize) -> String {
+    if path.chars().count() <= keep_each_side * 2 + 1 {
+        return path.to_string();
+    }
+    let head: String = path.chars().take(keep_each_side).collect();
+    let tail_start = path.chars().count() - keep_each_side;
+    let tail: String = path.chars().skip(tail_start).collect();
+    format!("{head}…{tail}")
+}
+
+/// Build the bounded summary: at most [`TERMINATION_SUMMARY_MAX_SAMPLES`]
+/// samples AND at most [`TERMINATION_SUMMARY_MAX_BYTES`] serialized bytes.
+/// Paths are truncated middle-out first; if the budget still does not fit,
+/// samples are dropped from the end — the total `collisions` count is ALWAYS
+/// kept (with zero samples the summary is ~40 bytes, so it always fits).
+pub fn termination_summary(report: &FanInReport) -> FetchTerminationSummary {
+    let mut summary = FetchTerminationSummary {
+        v: 1,
+        collisions: report.collisions.len() as u64,
+        sample: report
+            .collisions
+            .iter()
+            .take(TERMINATION_SUMMARY_MAX_SAMPLES)
+            .map(|c| FetchCollisionSample {
+                p: c.path.clone(),
+                w: c.winner,
+                l: c.loser,
+            })
+            .collect(),
+    };
+    let fits = |s: &FetchTerminationSummary| {
+        serde_json::to_string(s)
+            .map(|j| j.len() <= TERMINATION_SUMMARY_MAX_BYTES)
+            .unwrap_or(false)
+    };
+    if fits(&summary) {
+        return summary;
+    }
+    for s in &mut summary.sample {
+        s.p = truncate_path_middle_out(&s.p, 40);
+    }
+    while !fits(&summary) && !summary.sample.is_empty() {
+        summary.sample.pop();
+    }
+    summary
+}
+
+/// Parse a fetch container's `terminated.message` back into the summary.
+/// Lenient BY CONTRACT: `None` for anything that is not this JSON — an old
+/// image's absent message, a kubelet-truncated write, the plain-text conflict
+/// cause an exit-5 fetch leaves, or garbage. The caller warns and moves on;
+/// a malformed summary must never fail a settle.
+pub fn parse_termination_summary(message: &str) -> Option<FetchTerminationSummary> {
+    serde_json::from_str::<FetchTerminationSummary>(message.trim())
+        .ok()
+        .filter(|s| s.v >= 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -2188,5 +2512,238 @@ mod tests {
             safe_join(root, "/abs").unwrap(),
             std::path::Path::new("/w/abs")
         );
+    }
+
+    // -- fan-in fold (ticket 2e1a458) ---------------------------------------
+
+    fn file(path: &str, blob: &str, mode: u32) -> FlatEntry {
+        FlatEntry {
+            path: path.into(),
+            blob: BlobHash(blob.into()),
+            size: 1,
+            mode: Some(mode),
+            mtime_ms: Some(0),
+        }
+    }
+
+    fn symlink(path: &str, target_blob: &str) -> FlatEntry {
+        FlatEntry {
+            path: path.into(),
+            blob: BlobHash(target_blob.into()),
+            size: 1,
+            mode: Some(scarab_storage::MODE_SYMLINK),
+            mtime_ms: None,
+        }
+    }
+
+    fn manifest(entries: Vec<FlatEntry>, dirs: Vec<&str>) -> FlatManifest {
+        FlatManifest {
+            root: TreeHash("t".into()),
+            entries,
+            dirs: dirs
+                .into_iter()
+                .map(|p| scarab_storage::content::FlatDir {
+                    path: p.into(),
+                    mode: Some(0o755),
+                    mtime_ms: Some(0),
+                })
+                .collect(),
+        }
+    }
+
+    /// The collision matrix, at the fold's own grain (the classify is pure —
+    /// a table test holds it without a service or a filesystem). Collision
+    /// identity is `(blob, kind, mode)` (binding amendment F7): same blob with
+    /// a differing kind or mode still collides; only the fully identical
+    /// duplicate is silent.
+    #[test]
+    fn fold_classifies_the_collision_matrix() {
+        // Different blob at one path: a collision, last root wins.
+        let r = fold_manifests(&[
+            manifest(vec![file("shared", "aaaa", 0o644)], vec![]),
+            manifest(vec![file("shared", "bbbb", 0o644)], vec![]),
+        ])
+        .expect("no type conflict");
+        assert_eq!(
+            r.collisions,
+            vec![InputCollision {
+                path: "shared".into(),
+                winner: 1,
+                loser: 0
+            }]
+        );
+
+        // Byte-kind-mode-identical duplicate: silent (no author action exists).
+        let r = fold_manifests(&[
+            manifest(vec![file("shared", "aaaa", 0o644)], vec![]),
+            manifest(vec![file("shared", "aaaa", 0o644)], vec![]),
+        ])
+        .expect("no type conflict");
+        assert!(r.collisions.is_empty(), "identical duplicate must be silent");
+
+        // Same blob, differing MODE: still a collision (F7) — the merged
+        // workspace's permission bits depend on order, so it is order-derived
+        // content like any other.
+        let r = fold_manifests(&[
+            manifest(vec![file("shared", "aaaa", 0o644)], vec![]),
+            manifest(vec![file("shared", "aaaa", 0o755)], vec![]),
+        ])
+        .expect("no type conflict");
+        assert_eq!(r.collisions.len(), 1, "a mode difference is a collision");
+
+        // Same blob, differing KIND (file vs symlink whose target happens to
+        // hash identically is contrived, but the identity rule is mechanical):
+        // a collision, never a refusal — `write_entry` replaces either way.
+        let r = fold_manifests(&[
+            manifest(vec![file("shared", "aaaa", 0o644)], vec![]),
+            manifest(vec![symlink("shared", "aaaa")], vec![]),
+        ])
+        .expect("file vs symlink is NOT a type conflict");
+        assert_eq!(r.collisions.len(), 1, "a kind difference is a collision");
+
+        // Directories union silently, whatever their modes.
+        let r = fold_manifests(&[
+            manifest(vec![], vec!["dist"]),
+            manifest(vec![], vec!["dist"]),
+        ])
+        .expect("dir/dir unions");
+        assert!(r.collisions.is_empty());
+
+        // Three roots: each overwrite is its own record and the LAST root is
+        // the final winner.
+        let r = fold_manifests(&[
+            manifest(vec![file("shared", "aaaa", 0o644)], vec![]),
+            manifest(vec![file("shared", "bbbb", 0o644)], vec![]),
+            manifest(vec![file("shared", "cccc", 0o644)], vec![]),
+        ])
+        .expect("no type conflict");
+        assert_eq!(
+            r.collisions
+                .iter()
+                .map(|c| (c.winner, c.loser))
+                .collect::<Vec<_>>(),
+            vec![(1, 0), (2, 1)]
+        );
+    }
+
+    /// Every dir-involving cross-kind pair is a TYPE CONFLICT (binding
+    /// amendment F2) — including dir-vs-symlink, which before the refusal was
+    /// a real traversal (root B's files written THROUGH root A's symlink,
+    /// outside the workspace when the target is absolute). The fold sees it
+    /// only because `manifest.dirs` is in the fold.
+    #[test]
+    fn fold_refuses_every_dir_cross_kind_pair() {
+        // file then dir
+        let e = fold_manifests(&[
+            manifest(vec![file("dist", "aaaa", 0o644)], vec![]),
+            manifest(vec![], vec!["dist"]),
+        ])
+        .expect_err("file vs dir must refuse");
+        assert_eq!(
+            (e.earlier_kind, e.later_kind),
+            (FanInKind::File, FanInKind::Dir)
+        );
+        assert_eq!((e.earlier_root, e.later_root), (0, 1));
+        assert_eq!(e.path, "dist");
+
+        // dir then file
+        let e = fold_manifests(&[
+            manifest(vec![], vec!["dist"]),
+            manifest(vec![file("dist", "aaaa", 0o644)], vec![]),
+        ])
+        .expect_err("dir vs file must refuse");
+        assert_eq!(
+            (e.earlier_kind, e.later_kind),
+            (FanInKind::Dir, FanInKind::File)
+        );
+
+        // symlink then dir — the traversal shape this refusal exists to close.
+        let e = fold_manifests(&[
+            manifest(vec![symlink("dist", "aaaa")], vec![]),
+            manifest(vec![], vec!["dist"]),
+        ])
+        .expect_err("symlink vs dir must refuse (dir-through-symlink traversal)");
+        assert_eq!(
+            (e.earlier_kind, e.later_kind),
+            (FanInKind::Symlink, FanInKind::Dir)
+        );
+        // The refusal message names the path and BOTH roots (amendment F8):
+        // it becomes exit 5's author-facing cause via the termination log.
+        let msg = e.to_string();
+        assert!(msg.contains("\"dist\""), "{msg}");
+        assert!(msg.contains("root[0]") && msg.contains("root[1]"), "{msg}");
+
+        // dir then symlink
+        let e = fold_manifests(&[
+            manifest(vec![], vec!["dist"]),
+            manifest(vec![symlink("dist", "aaaa")], vec![]),
+        ])
+        .expect_err("dir vs symlink must refuse");
+        assert_eq!(
+            (e.earlier_kind, e.later_kind),
+            (FanInKind::Dir, FanInKind::Symlink)
+        );
+    }
+
+    /// The termination summary's two budgets (binding amendment F5): ≤ 8
+    /// samples AND ≤ 1.5 KiB serialized, count ALWAYS kept — the truncation
+    /// order is paths-middle-out first, then samples dropped from the end.
+    #[test]
+    fn termination_summary_holds_both_budgets_and_always_keeps_the_count() {
+        // More collisions than the sample cap: count keeps the truth.
+        let many = FanInReport {
+            collisions: (0..20)
+                .map(|i| InputCollision {
+                    path: format!("p{i}"),
+                    winner: 1,
+                    loser: 0,
+                })
+                .collect(),
+        };
+        let s = termination_summary(&many);
+        assert_eq!(s.collisions, 20);
+        assert_eq!(s.sample.len(), TERMINATION_SUMMARY_MAX_SAMPLES);
+        assert!(serde_json::to_string(&s).unwrap().len() <= TERMINATION_SUMMARY_MAX_BYTES);
+
+        // Pathological paths: middle-out truncation, then sample dropping —
+        // the serialized form must land under the byte budget with the count
+        // intact even when every path is enormous.
+        let huge = FanInReport {
+            collisions: (0..8)
+                .map(|i| InputCollision {
+                    path: format!("deep/{}/{i}.txt", "x".repeat(4000)),
+                    winner: 1,
+                    loser: 0,
+                })
+                .collect(),
+        };
+        let s = termination_summary(&huge);
+        assert_eq!(s.collisions, 8, "the count survives any truncation");
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            json.len() <= TERMINATION_SUMMARY_MAX_BYTES,
+            "byte budget must hold: {} bytes",
+            json.len()
+        );
+        // Round-trips through the lenient parse.
+        let parsed = parse_termination_summary(&json).expect("own JSON parses");
+        assert_eq!(parsed.collisions, 8);
+    }
+
+    /// The read side is lenient BY CONTRACT: absent/truncated/plain-text
+    /// messages (an exit-5 conflict cause, an old image, kubelet truncation)
+    /// parse to `None`, never an error — a malformed summary must never fail
+    /// a settle.
+    #[test]
+    fn parse_termination_summary_is_lenient() {
+        assert!(parse_termination_summary("").is_none());
+        assert!(parse_termination_summary("scarab-wsfetch: INPUT CONFLICT: …").is_none());
+        assert!(parse_termination_summary("{\"v\":1,\"collisions\":2,\"sam").is_none());
+        let ok = parse_termination_summary(
+            "{\"v\":1,\"collisions\":2,\"sample\":[{\"p\":\"a\",\"w\":1,\"l\":0}]}",
+        )
+        .expect("well-formed parses");
+        assert_eq!(ok.collisions, 2);
+        assert_eq!(ok.sample.len(), 1);
     }
 }
