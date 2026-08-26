@@ -70,6 +70,27 @@ Also note the vocabulary split in [CONTEXT.md](../../CONTEXT.md): the mutable fi
 Step runs in is a **Workspace**; the immutable content-addressed tree on the DAG edge — the
 thing this ADR's `inputs:`/`outputs:` actually govern — is a **Workspace Snapshot**.
 
+## Amendment (2026-08-26) — fan-in merge semantics, stated exactly
+
+"The merged content-addressed workspace of its `needs`" above left *merged* undefined. It has one
+meaning, now pinned: the workspace is built by replaying each consumed input's Workspace Snapshot,
+**in the declared order** — the pinned IR's `needs:` order, or the `inputs:` order when declared —
+never completion order, never sorted. The replay is a **per-path union**: directories union; on a
+file (or symlink) both inputs carry, **the last root in declared order wins**. A file-vs-directory
+conflict (either direction, symlinks included) is refused — the fetch fails with an author-fixable
+verdict, never a silent replace. For the symlink case this refusal is **new semantics, not a
+pinning**: before it, one input's directory could be written *through* another input's symlink —
+outside the workspace when the link target was absolute — and the refusal closes that traversal.
+Collisions are diagnosed (a provisioning-log line per path, and a `WorkspaceInputCollisions` event
+on the run), but they are not errors: last-wins is the semantics, not an accident.
+
+**Deletions are not representable across fan-in**, and this is inherent to union-of-snapshots: a
+file one branch deleted reappears in the merged workspace if any other branch still carries it.
+A step that must see the deletion should consume only the deleting branch (`inputs:`).
+
+The rerun signature (`input_signature`, [0027](0027-restart-semantics.md)) is order-sensitive for
+the same reason the merge is: order determines bytes, so it is part of what "unchanged" means.
+
 ## Alternatives considered
 
 - **Workspace + Result only** — folds artifacts/caches into "DIY object store"; users rebuild
