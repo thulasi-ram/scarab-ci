@@ -658,7 +658,7 @@ impl WorkspaceClient {
         // `acquire_many` takes a u32; 4 GiB of in-flight uploads is beyond any
         // sane setting anyway.
         let budget = self.transfer_byte_budget.clamp(1, u64::from(u32::MAX));
-        let gate = Arc::new(tokio::sync::Semaphore::new(budget as usize));
+        let gate = tokio::sync::Semaphore::new(budget as usize);
         let gate = &gate;
         let results: Vec<Result<u64, StorageError>> = futures::stream::iter(uploads)
             .map(|(hash, source)| async move {
@@ -1123,7 +1123,7 @@ impl Cas for WorkspaceClient {
         // through the write. Without this the peak was 16 × largest blob,
         // inside a fetch container that now carries a memory limit.
         let budget = self.transfer_byte_budget.clamp(1, u64::from(u32::MAX));
-        let gate = Arc::new(tokio::sync::Semaphore::new(budget as usize));
+        let gate = tokio::sync::Semaphore::new(budget as usize);
         let gate = &gate;
         let results: Vec<Result<(), StorageError>> =
             futures::stream::iter(manifest.entries.iter().cloned())
