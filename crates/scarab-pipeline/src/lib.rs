@@ -381,14 +381,6 @@ pub struct StepSpec {
     /// (ADR-0029); authored + validated here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<String>>,
-    /// Keyed directory Cache (ADR-0065 s1): workspace-relative directories
-    /// restored at Step start and saved at Step end, keyed by the blob hashes
-    /// of declared key files (typically a lockfile). Best-effort and
-    /// warm-only: a miss is slower and never wrong, and a cache dir never
-    /// flows downstream via the workspace (it is pruned from the published
-    /// root and rides the cache instead).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache: Option<CacheSpec>,
     /// Per-step execution deadline in **seconds** (ADR-0047). Absent = the
     /// global default (1h). Enforced primarily by the backend (kubelet
     /// `activeDeadlineSeconds` / the local kill-timer — it survives
@@ -646,29 +638,6 @@ pub struct CloneSpec {
     /// its resolved SHA (ADR-0043/0044) — restarts always re-clone that SHA.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
     pub r#ref: Option<String>,
-}
-
-/// A step's keyed directory Cache declaration (ADR-0065 s1):
-/// `cache: { dirs: [node_modules], key: [package-lock.json] }`.
-///
-/// `dirs` are the workspace-relative directories to restore/save; `key` names
-/// the files whose **blob hashes** (from the input snapshots' tree entries —
-/// no content reads) key the cache, scoped by project. Both lists are
-/// required and validated by [`validate`]: workspace-relative, no `..`, no
-/// `.git*`, no `=`/`,` in dir names (they ride a `dir=root,…` env), no mutual
-/// prefix-overlap among dirs, and no overlap with the step's `outputs:` (a
-/// cached dir is scratch — publishing it too would be a self-contradictory
-/// label plan). `CARGO_HOME=/workspace/.cargo` is the documented pattern for
-/// tool caches that default to `$HOME`; dirs outside the workspace are
-/// deliberately unsupported in v1.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheSpec {
-    /// Workspace-relative directories to cache.
-    #[serde(default)]
-    pub dirs: Vec<String>,
-    /// Workspace-relative files whose blob hashes form the cache key.
-    #[serde(default)]
-    pub key: Vec<String>,
 }
 
 /// Configuration of a `build` step (ADR-0018): what to build and where to
@@ -1802,107 +1771,6 @@ pub fn lint(ir: &PipelineIr) -> Vec<String> {
     warnings
 }
 
-/// Validate one step's [`CacheSpec`] (ADR-0065 s1). All diagnostics are
-/// author-fixable submit-time errors; nothing here is enforced at runtime
-/// except the fetcher's source-wins backstop (which this validation exists to
-/// make unreachable).
-fn validate_cache(
-    step_id: &str,
-    cache: &CacheSpec,
-    outputs: Option<&[String]>,
-    diagnostics: &mut Vec<String>,
-) {
-    if cache.dirs.is_empty() {
-        diagnostics.push(format!(
-            "step `{step_id}`: `cache.dirs` must list at least one directory"
-        ));
-    }
-    if cache.key.is_empty() {
-        diagnostics.push(format!(
-            "step `{step_id}`: `cache.key` must list at least one key file \
-             (typically a lockfile) — a keyless cache would never invalidate"
-        ));
-    }
-    for dir in &cache.dirs {
-        let d = dir.trim_end_matches('/');
-        // `=` and `,` are the separators of the `SCARAB_CACHE_ROOTS`
-        // `dir=root,dir=root` env the fetcher parses; a dir name carrying
-        // either would be unparseable on the other side.
-        if d.contains('=') || d.contains(',') {
-            diagnostics.push(format!(
-                "step `{step_id}`: cache dir `{dir}` must not contain `=` or `,`"
-            ));
-            continue;
-        }
-        if d.is_empty() || dir.starts_with('/') {
-            diagnostics.push(format!(
-                "step `{step_id}`: cache dir `{dir}` must be workspace-relative \
-                 (no leading `/`, non-empty)"
-            ));
-            continue;
-        }
-        // `.` would make the whole workspace a cache dir (clobbering the
-        // clone, which lands at the workspace root); `..` escapes it; `.git*`
-        // components would clobber source control state on restore.
-        if d.split('/').any(|c| {
-            c.is_empty() || c == "." || c == ".." || c.starts_with(".git")
-        }) {
-            diagnostics.push(format!(
-                "step `{step_id}`: cache dir `{dir}` must not contain empty, \
-                 `.`, `..`, or `.git*` path components"
-            ));
-        }
-    }
-    // Mutual prefix-overlap among cache dirs: restoring `a` and `a/b`
-    // double-writes the same tree region in an order nothing defines.
-    for (i, a) in cache.dirs.iter().enumerate() {
-        for b in cache.dirs.iter().skip(i + 1) {
-            if paths_overlap(a, b) {
-                diagnostics.push(format!(
-                    "step `{step_id}`: cache dirs `{a}` and `{b}` overlap — \
-                     one contains the other"
-                ));
-            }
-        }
-    }
-    // outputs ∩ cache.dirs (binding amendment #4): a path that is both
-    // published downstream and cache-labelled scratch is a self-contradictory
-    // label plan; refuse it at submit rather than resolving it silently.
-    if let Some(outputs) = outputs {
-        for out in outputs {
-            for dir in &cache.dirs {
-                if paths_overlap(out, dir) {
-                    diagnostics.push(format!(
-                        "step `{step_id}`: output `{out}` overlaps cache dir \
-                         `{dir}` — a cached directory is scratch and cannot \
-                         also be published (drop it from `outputs:` or from \
-                         `cache.dirs`)"
-                    ));
-                }
-            }
-        }
-    }
-    for path in &cache.key {
-        if path.is_empty() || path.starts_with('/') || path.split('/').any(|c| c == "..") {
-            diagnostics.push(format!(
-                "step `{step_id}`: cache key file `{path}` must be \
-                 workspace-relative (no leading `/`, no `..`)"
-            ));
-        }
-    }
-}
-
-/// Do two workspace-relative paths name overlapping tree regions? True when
-/// one's components are a prefix of the other's, where a component containing
-/// `*` (outputs may be globs) conservatively matches anything.
-fn paths_overlap(a: &str, b: &str) -> bool {
-    let ac: Vec<&str> = a.trim_end_matches('/').split('/').collect();
-    let bc: Vec<&str> = b.trim_end_matches('/').split('/').collect();
-    ac.iter()
-        .zip(bc.iter())
-        .all(|(x, y)| x == y || x.contains('*') || y.contains('*'))
-}
-
 pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
     let mut diagnostics = Vec::new();
 
@@ -2206,15 +2074,6 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                     ));
                 }
             }
-        }
-        // Keyed directory Cache (ADR-0065 s1): dirs and key files must be
-        // workspace-relative and well-formed, dirs must not clobber each
-        // other (mutual prefix-overlap) or the source (`.git*`, `.`), must
-        // not carry `=`/`,` (they ride a `dir=root,…` env var), and must not
-        // overlap the step's `outputs:` (a cached dir is scratch by
-        // definition — also publishing it is a self-contradictory label plan).
-        if let Some(cache) = &step.cache {
-            validate_cache(&step.id, cache, step.outputs.as_deref(), &mut diagnostics);
         }
         // Submit-time CEL: `when:` guards and every `${{ … }}` interpolation
         // must parse now, not fail mid-run (ADR-0009).
@@ -3092,94 +2951,6 @@ mod tests {
         assert!(errors(r#"steps: [{ id: b, image: rust, outputs: [] }]"#)
             .iter()
             .any(|d| d.contains("at least one path")));
-    }
-
-    /// ADR-0065 s1: a well-formed `cache:` compiles through; the malformed
-    /// shapes are submit-time diagnostics, never runtime surprises.
-    #[test]
-    fn cache_compiles_and_its_validation_rejects_the_dangerous_shapes() {
-        let ir = compile(
-            r#"steps: [{ id: b, image: node, cache: { dirs: [node_modules, .cargo],
-               key: [package-lock.json] } }]"#,
-        );
-        let b = ir.steps.iter().find(|s| s.id == "b").unwrap();
-        let cache = b.cache.as_ref().expect("cache compiled through");
-        assert_eq!(cache.dirs, vec!["node_modules", ".cargo"]);
-        assert_eq!(cache.key, vec!["package-lock.json"]);
-
-        // Empty dirs / empty key.
-        assert!(
-            errors(r#"steps: [{ id: b, image: n, cache: { dirs: [], key: [l] } }]"#)
-                .iter()
-                .any(|d| d.contains("at least one directory"))
-        );
-        assert!(
-            errors(r#"steps: [{ id: b, image: n, cache: { dirs: [d], key: [] } }]"#)
-                .iter()
-                .any(|d| d.contains("at least one key file"))
-        );
-        // Dir-clobber shapes (amendment #2): `.`, `..`, `.git*`, absolute.
-        for bad in [".", "a/..", ".git", ".github/x", "/abs"] {
-            assert!(
-                !errors(&format!(
-                    r#"steps: [{{ id: b, image: n, cache: {{ dirs: ["{bad}"], key: [l] }} }}]"#
-                ))
-                .is_empty(),
-                "cache dir {bad:?} must be rejected"
-            );
-        }
-        // `=`/`,` would break the `dir=root,…` env the fetcher parses.
-        for bad in ["a=b", "a,b"] {
-            assert!(
-                errors(&format!(
-                    r#"steps: [{{ id: b, image: n, cache: {{ dirs: ["{bad}"], key: [l] }} }}]"#
-                ))
-                .iter()
-                .any(|d| d.contains("`=` or `,`")),
-                "cache dir {bad:?} must be rejected"
-            );
-        }
-        // Mutual prefix-overlap among dirs.
-        assert!(errors(
-            r#"steps: [{ id: b, image: n, cache: { dirs: [a, a/b], key: [l] } }]"#
-        )
-        .iter()
-        .any(|d| d.contains("overlap")));
-        // outputs ∩ cache.dirs (amendment #4), both directions + glob:
-        // equality, an output INSIDE a cache dir, an output that is a PREFIX
-        // of a cache dir, and a glob that covers it.
-        for (outputs, dirs) in [
-            ("[node_modules]", "[node_modules]"),
-            ("[node_modules/pkg]", "[node_modules]"),
-            ("[dist]", "[dist/cache]"),
-            ("[\"*\"]", "[node_modules]"),
-        ] {
-            assert!(
-                errors(&format!(
-                    r#"steps: [{{ id: b, image: n, outputs: {outputs},
-                       cache: {{ dirs: {dirs}, key: [l] }} }}]"#
-                ))
-                .iter()
-                .any(|d| d.contains("overlaps cache dir")),
-                "outputs {outputs} must conflict with cache dirs {dirs}"
-            );
-        }
-        // Disjoint outputs COEXIST with a cache dir — the amendment rejects
-        // overlap, never coexistence. (`compile`, not `errors`: the helper
-        // panics on a pipeline that compiles, which is the point here.)
-        let ok = compile(
-            r#"steps: [{ id: b, image: n, outputs: [dist],
-               cache: { dirs: [node_modules], key: [l] } }]"#,
-        );
-        let b = ok.steps.iter().find(|s| s.id == "b").unwrap();
-        assert_eq!(b.outputs.as_deref(), Some(["dist".to_string()].as_slice()));
-        assert!(b.cache.is_some(), "the disjoint cache survives compile");
-        // Key files are workspace-relative.
-        assert!(errors(
-            r#"steps: [{ id: b, image: n, cache: { dirs: [d], key: ["../x"] } }]"#
-        )
-        .iter()
-        .any(|d| d.contains("workspace-relative")));
     }
 
     #[test]

@@ -44,6 +44,10 @@ sha2 = { workspace = true }
 # going through `scarab-db-postgres`; this is the data plane's own, deliberately
 # thin, SQL surface (`workspaced.rs` only).
 sqlx = { workspace = true }
+# git-bug cba7165: the Depot's warm-tier LRU key is the file's mtime, and a
+# warm HIT refreshes it (coarsely, at most once per grain) via `utimensat` —
+# which std cannot express without opening the file for write.
+filetime = { workspace = true }
 # every scarab crate — the server is the composition root
 scarab-engine = { workspace = true }
 scarab-pipeline = { workspace = true }
@@ -77,6 +81,5 @@ xattr = { workspace = true }
 
 [dev-dependencies]
 regex-lite = { workspace = true }
-filetime = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }

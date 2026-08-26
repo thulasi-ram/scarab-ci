@@ -154,23 +154,6 @@ pub fn depot_expiry_floor_held() -> u64 {
     DEPOT_EXPIRY_FLOOR_HELD.load(Ordering::Relaxed)
 }
 
-/// Secrets rows still sealed under a NON-active master key (git-bug f37463a),
-/// SET by the boot rewrap sweep on this replica. Zero (with no unreadable-row
-/// warnings) is the operator's "safe to drop the old key" signal; non-zero
-/// after a rotation deploy means unreadable rows (the pre-rotation key is
-/// gone, or corruption) or a sweep that has not run since the last write.
-static SECRETS_ROWS_UNDER_NONACTIVE_KEY: AtomicU64 = AtomicU64::new(0);
-
-/// Set the count of secrets rows under a non-active master key (per sweep).
-pub fn set_secrets_rows_under_nonactive_key(n: u64) {
-    SECRETS_ROWS_UNDER_NONACTIVE_KEY.store(n, Ordering::Relaxed);
-}
-
-/// Secrets rows under a non-active master key, as of the last boot sweep.
-pub fn secrets_rows_under_nonactive_key() -> u64 {
-    SECRETS_ROWS_UNDER_NONACTIVE_KEY.load(Ordering::Relaxed)
-}
-
 /// Append the counters to a Prometheus text exposition body.
 pub(crate) fn render(out: &mut String) {
     out.push_str(&format!(
@@ -217,13 +200,6 @@ scarab_depot_expiry_floor_held {}
         depot_expired_fences(),
         depot_expiry_pass_skipped(),
         depot_expiry_floor_held()
-    ));
-    out.push_str(&format!(
-        "# HELP scarab_secrets_rows_under_nonactive_key Secrets rows still sealed under a non-active master key as of this replica's boot rewrap sweep (0 = rotation drained, old key safe to drop).
-# TYPE scarab_secrets_rows_under_nonactive_key gauge
-scarab_secrets_rows_under_nonactive_key {}
-",
-        secrets_rows_under_nonactive_key()
     ));
     // The control plane's own view of the ADR-0061 tiering. The workspace
     // *service* exports the same counters from its own `/metrics`, and both are

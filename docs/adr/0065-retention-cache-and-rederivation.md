@@ -80,31 +80,6 @@ This **implements [0007](0007-data-passing-model.md) as originally written** and
 amendment forbids making Cache *mandatory for speed*, not making it available. 0007 already specified
 it as keyed and author-declared.
 
-> **Built 2026-08-26 (git-bug `dbe05e5`), and the durability question is DECIDED: warm-only**
-> (owner decision, 2026-08-26). A Cache tree is drained **cache-only** — warm, evictable, never
-> packed, never consuming pack-index rows or object storage for evictable content — and the
-> `cache_entries` mapping row is **a hint, never a promise**. The mechanism: `cache: { dirs, key }`
-> on a step; the control plane folds the key from the key files' **blob hashes** (already in the
-> tree entries — no content reads) and mints the restore roots into the workspace token's existing
-> exact-roots claim (zero new auth surface; keys never cross the trust boundary); the drain excludes
-> cache dirs from the published root and reports each dir's subtree root on the `DrainRecord`, which
-> the Depot verifies against the fence's **own write ledger** before accepting (a forged root 422s
-> the whole drain). Everything else is best-effort: an unresolvable key, a 404 restore, a failed
-> upsert are all a slower attempt, never a wrong one — asserted by the miss-never-wrong test.
->
-> **The evidence bar that would reopen durable-drained caches:** measured miss-after-eviction cost.
-> If `cache_entries` provenance shows the median warm lifetime of a saved tree is **shorter than the
-> median key lifetime** (the lockfile-change interval), caches are dying before reuse, and the
-> re-derive spend (miss-rate × cold-build minutes) can be priced against pack-row + object-storage
-> cost. The `saved_at` refresh and the fetcher's hit/miss log lines built here are exactly that
-> instrumentation.
->
-> **Honesty at replicaCount > 1: cache hits assume `replicaCount = 1`.** Warm is replica-local and a
-> restore's blob GETs scatter independently, so at N replicas the effective hit rate for a real
-> directory is **~zero** (every GET must land on the holder: ~(1/N)^files) — each such restore
-> degrades to the tolerated miss. Follow-up filed as git-bug `12e2f6b` (warmth-affinity restore
-> routing OR durable cache copies, priced with this arithmetic).
-
 **2. A Cache is another content-addressed tree**, so it rides
 [0062](0062-workspace-export-lazy-without-node-driver.md)'s Snapshot Farm and Workspace Export
 machinery. A Step that touches 5% of `node_modules` materialises 5% of it. Cache differs from a

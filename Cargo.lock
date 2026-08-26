@@ -2664,7 +2664,6 @@ dependencies = [
  "scarab-pipeline",
  "serde",
  "serde_json",
- "sha2",
  "thiserror 2.0.18",
 ]
 
@@ -2796,7 +2795,6 @@ dependencies = [
  "async-trait",
  "rand 0.8.7",
  "scarab-secrets",
- "sha2",
  "sqlx",
  "tokio",
  "tracing",

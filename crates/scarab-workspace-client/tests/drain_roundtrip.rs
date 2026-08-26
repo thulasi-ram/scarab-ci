@@ -332,7 +332,7 @@ async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
     let before = h.tree_puts.load(Ordering::SeqCst);
     let report = h
         .fence_client()
-        .drain_ingest_report(path, &[], &[])
+        .drain_ingest_report(path, &[])
         .await
         .expect("drain ingest");
     assert_eq!(
@@ -367,7 +367,6 @@ async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
             have_hits: report.have_hits,
             ingest_ms: 1,
             prune_ms: 0,
-            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -377,7 +376,7 @@ async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
     // are durable now, so `/have`'s durable answer skips every upload.
     let report2 = h
         .fence_client_for("run-1", "build", "a2")
-        .drain_ingest_report(path, &[], &[])
+        .drain_ingest_report(path, &[])
         .await
         .expect("second drain ingest");
     assert_eq!(report2.blobs_uploaded, 0, "durable blobs must dedup");
@@ -403,7 +402,7 @@ async fn a_drain_record_round_trips_ingest_prune_record_get() {
     // appended only on PUT), memo-fed prune+identity, record LAST.
     let helper = h.fence_client();
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
         .await
         .expect("ingest with the fence token");
     let root: TreeHash = report.snapshot.root.clone();
@@ -425,7 +424,6 @@ async fn a_drain_record_round_trips_ingest_prune_record_get() {
         have_hits: report.have_hits,
         ingest_ms: 12,
         prune_ms: 3,
-        cache_roots: Default::default(),
         error: None,
     };
     helper
@@ -470,7 +468,7 @@ async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
 
     let helper = h.fence_client_for("run-1", "fmt/check", "a1");
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
         .await
         .expect("ingest with the slash-stepped fence token");
     let rec = DrainRecord {
@@ -484,7 +482,6 @@ async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
         have_hits: report.have_hits,
         ingest_ms: 1,
         prune_ms: 0,
-        cache_roots: Default::default(),
         error: None,
     };
     helper
@@ -531,7 +528,7 @@ async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
     build_workspace(ws.path());
     let helper = a.fence_client();
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
         .await
         .expect("drain ingest against replica A");
     let root = report.snapshot.root.0.clone();
@@ -546,7 +543,6 @@ async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
         have_hits: report.have_hits,
         ingest_ms: 5,
         prune_ms: 1,
-        cache_roots: Default::default(),
         error: None,
     };
     helper
@@ -672,7 +668,7 @@ async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_addres
     // The drain exactly as `scarab-wsfetch drain` composes it.
     let helper = a.fence_client();
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &declared, &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
         .await
         .expect("drain ingest with labels");
     let memo = MemoCas::new(&helper, report.trees);
@@ -694,7 +690,6 @@ async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_addres
             have_hits: report.have_hits,
             ingest_ms: 7,
             prune_ms: 2,
-            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -815,7 +810,7 @@ async fn have_answers_the_durable_index_identically_across_replicas() {
 
     let helper = a.fence_client();
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &declared, &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
         .await
         .expect("drain ingest with labels");
     let memo = MemoCas::new(&helper, report.trees);
@@ -834,7 +829,6 @@ async fn have_answers_the_durable_index_identically_across_replicas() {
             have_hits: report.have_hits,
             ingest_ms: 1,
             prune_ms: 0,
-            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -923,7 +917,7 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
 
     let helper = h.fence_client_for("run-9", "pack-order", "a1");
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
         .await
         .expect("drain ingest, everything durable");
 
@@ -1031,7 +1025,6 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
             have_hits: report.have_hits,
             ingest_ms: 3,
             prune_ms: 0,
-            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -1220,7 +1213,7 @@ async fn a_scattered_drain_commits_through_one_replica() {
     // `scarab-wsfetch drain` composes it.
     let helper = a.fence_client_for("run-sc", "build", "a1");
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &declared, &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
         .await
         .expect("drain ingest through replica A");
     assert!(
@@ -1244,7 +1237,6 @@ async fn a_scattered_drain_commits_through_one_replica() {
             have_hits: report.have_hits,
             ingest_ms: 4,
             prune_ms: 1,
-            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -1327,7 +1319,7 @@ async fn a_drain_whose_puts_all_landed_elsewhere_commits_through_a_cold_replica(
     // The whole drain's bytes go through replica B.
     let helper_b = b.fence_client_for("run-tree", "build", "a1");
     let report = helper_b
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
         .await
         .expect("drain ingest through replica B");
     let root = report.snapshot.root.0.clone();
@@ -1359,7 +1351,6 @@ async fn a_drain_whose_puts_all_landed_elsewhere_commits_through_a_cold_replica(
             have_hits: report.have_hits,
             ingest_ms: 2,
             prune_ms: 0,
-            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -1484,7 +1475,7 @@ async fn a_mid_flight_scattered_drain_survives_both_reclaim_passes() {
     // The drain completes through replica A, deduping against B's staging.
     let helper = a.fence_client_for("run-rec", "build", "a1");
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &declared, &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
         .await
         .expect("drain ingest through replica A");
     let memo = MemoCas::new(&helper, report.trees);
@@ -1503,7 +1494,6 @@ async fn a_mid_flight_scattered_drain_survives_both_reclaim_passes() {
             have_hits: report.have_hits,
             ingest_ms: 4,
             prune_ms: 1,
-            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -1542,314 +1532,3 @@ async fn a_mid_flight_scattered_drain_survives_both_reclaim_passes() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Keyed directory Cache (ADR-0065 s1, git-bug dbe05e5)
-// ---------------------------------------------------------------------------
-
-/// A cached workspace: durable source beside a cache dir the drain must treat
-/// as scratch.
-fn build_cached_workspace(root: &std::path::Path) {
-    std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
-    std::fs::write(root.join("package-lock.json"), b"{\"lock\": 1}").unwrap();
-    std::fs::create_dir_all(root.join("node_modules/leftpad")).unwrap();
-    std::fs::write(
-        root.join("node_modules/leftpad/index.js"),
-        b"module.exports = cache-only bytes, unique to the cache dir",
-    )
-    .unwrap();
-}
-
-/// Pack-absence (dbe05e5 mandatory test): a drain with a cache dir and NO
-/// declared `outputs:` publishes the root with the cache dir EXCLUDED, labels
-/// the cache subtree cache-only, and seals **none** of it into pack rows —
-/// while the durable remainder packs as ever and the record's `cache_roots`
-/// carries the dir's subtree root.
-///
-/// Mutations killed: keep AllDurable when only cache dirs narrow the drain
-/// (the cache blob gains a pack row); skip the exclusion (pruned_root absent,
-/// the cache subtree lands in the published closure); drop the cache_roots
-/// report (the save side has nothing to record).
-#[tokio::test]
-async fn a_cache_dir_is_excluded_from_the_publish_and_never_packs() {
-    let Some(h) = Harness::start().await else { return };
-    let ws = tempfile::tempdir().unwrap();
-    build_cached_workspace(ws.path());
-    let cache_dirs = vec!["node_modules".to_string()];
-    let cache_blob = scarab_storage::sha256_hex(
-        b"module.exports = cache-only bytes, unique to the cache dir",
-    );
-    let durable_blob = scarab_storage::sha256_hex(b"fn main() {}");
-
-    let helper = h.fence_client_for("run-c1", "build", "a1");
-    let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &cache_dirs)
-        .await
-        .expect("drain ingest with a cache dir");
-    let cache_root = report
-        .cache_roots
-        .get("node_modules")
-        .expect("the present cache dir reports its subtree root")
-        .clone();
-
-    // The helper's real exclusion over MemoCas — what run_drain publishes.
-    let memo = MemoCas::new(&helper, report.trees);
-    let excluded =
-        scarab_workspace_client::exclude_paths(&memo, &report.snapshot.root, &cache_dirs)
-            .await
-            .expect("exclusion");
-    assert_ne!(
-        excluded, report.snapshot.root,
-        "a present cache dir must narrow the published root"
-    );
-    let identity = scarab_storage::content_identity(&memo, &excluded)
-        .await
-        .expect("excluded identity");
-
-    helper
-        .post_drain_record(&DrainRecord {
-            root: report.snapshot.root.0.clone(),
-            pruned_root: Some(excluded.0.clone()),
-            identity: Some(identity.0.clone()),
-            files: report.files,
-            tree_bytes: report.tree_bytes,
-            blobs_uploaded: report.blobs_uploaded,
-            bytes_uploaded: report.bytes_uploaded,
-            have_hits: report.have_hits,
-            ingest_ms: 1,
-            prune_ms: 0,
-            cache_roots: report.cache_roots.clone(),
-            error: None,
-        })
-        .await
-        .expect("a drain whose cache_roots are its own ledgered trees posts clean");
-
-    // The cache subtree — tree and blob alike — must be absent from the pack
-    // index; the durable remainder must be in it.
-    assert_eq!(
-        member_rows_for(&h.pool, &cache_root).await,
-        0,
-        "the cache dir's subtree root must never enter pack rows"
-    );
-    assert_eq!(
-        member_rows_for(&h.pool, &cache_blob).await,
-        0,
-        "a cache-only blob must never enter pack rows"
-    );
-    assert!(
-        member_rows_for(&h.pool, &durable_blob).await > 0,
-        "the durable remainder still packs"
-    );
-    // And the cache subtree is still SERVABLE from warm — that is the whole
-    // deal: warm-only, evictable, restorable while it lives.
-    let restored = tempfile::tempdir().unwrap();
-    scarab_storage::Cas::materialize(
-        &h.browse_client(),
-            &TreeHash(cache_root.clone()),
-            restored.path().to_str().unwrap(),
-        )
-        .await
-        .expect("the cache subtree restores from warm");
-    assert!(restored.path().join("leftpad/index.js").exists());
-}
-
-/// The dbe05e5 amendment-#3 422 (mandatory test): a drain record naming a
-/// cache root that is NOT in the posting fence's own write ledger — a forged
-/// mapping, a foreign hash the client merely learned — is refused as a WHOLE
-/// (422, nothing persisted), and an honest retry then lands.
-///
-/// Mutations killed: drop-and-warn instead of refusing (the record persists
-/// and the CP would upsert a poisoned mapping); checking warm presence
-/// instead of the ledger (the foreign tree IS warm — the refusal below would
-/// wave it through).
-#[tokio::test]
-async fn a_forged_cache_root_422s_the_whole_drain() {
-    let Some(h) = Harness::start().await else { return };
-    let ws = tempfile::tempdir().unwrap();
-    build_cached_workspace(ws.path());
-
-    // A FOREIGN fence drains first — its trees are warm, ledgered to IT.
-    let foreign = h.fence_client_for("run-f", "other", "a1");
-    let foreign_report = foreign
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &[])
-        .await
-        .expect("foreign drain");
-    let foreign_tree = foreign_report.snapshot.root.0.clone();
-    foreign
-        .post_drain_record(&DrainRecord {
-            root: foreign_tree.clone(),
-            pruned_root: None,
-            identity: foreign_report.snapshot.identity.as_ref().map(|t| t.0.clone()),
-            files: foreign_report.files,
-            tree_bytes: foreign_report.tree_bytes,
-            blobs_uploaded: foreign_report.blobs_uploaded,
-            bytes_uploaded: foreign_report.bytes_uploaded,
-            have_hits: foreign_report.have_hits,
-            ingest_ms: 1,
-            prune_ms: 0,
-            cache_roots: Default::default(),
-            error: None,
-        })
-        .await
-        .expect("foreign record posts");
-
-    // The victim fence drains a DIFFERENT workspace, then posts a record
-    // claiming the foreign tree as its cache save.
-    let ws2 = tempfile::tempdir().unwrap();
-    build_workspace(ws2.path());
-    let helper = h.fence_client_for("run-c2", "build", "a1");
-    let report = helper
-        .drain_ingest_report(ws2.path().to_str().unwrap(), &[], &[])
-        .await
-        .expect("victim drain ingest");
-    let mut rec = DrainRecord {
-        root: report.snapshot.root.0.clone(),
-        pruned_root: None,
-        identity: report.snapshot.identity.as_ref().map(|t| t.0.clone()),
-        files: report.files,
-        tree_bytes: report.tree_bytes,
-        blobs_uploaded: report.blobs_uploaded,
-        bytes_uploaded: report.bytes_uploaded,
-        have_hits: report.have_hits,
-        ingest_ms: 1,
-        prune_ms: 0,
-        cache_roots: std::collections::BTreeMap::from([(
-            "node_modules".to_string(),
-            foreign_tree,
-        )]),
-        error: None,
-    };
-    let err = helper
-        .post_drain_record(&rec)
-        .await
-        .expect_err("a cache root outside this fence's ledger must 422 the whole drain");
-    assert!(
-        err.to_string().contains("write ledger"),
-        "the refusal names the ledger: {err}"
-    );
-    // NOTHING persisted — the fence has no record at all.
-    assert!(
-        h.browse_client()
-            .drain_record("run-c2", "build", "a1")
-            .await
-            .expect("record lookup")
-            .is_none(),
-        "a refused record must not persist"
-    );
-    // The honest retry (no forged save) lands.
-    rec.cache_roots.clear();
-    helper
-        .post_drain_record(&rec)
-        .await
-        .expect("the honest record posts after the refusal");
-}
-
-/// The miss-is-never-wrong e2e (dbe05e5 mandatory test — the property that
-/// licences evicting a Cache at all): a caching drain publishes; warm is
-/// WIPED (eviction, replica loss); the recorded cache root now fails to
-/// restore (the MISS — a logged degradation, never an error); and the re-run
-/// over identical content drains clean with the IDENTICAL published identity
-/// and the identical re-saved cache root. Slower, never wrong.
-#[tokio::test]
-async fn a_wiped_warm_tier_degrades_to_a_miss_and_the_rerun_publishes_identically() {
-    let Some(h) = Harness::start().await else { return };
-    let ws = tempfile::tempdir().unwrap();
-    build_cached_workspace(ws.path());
-    let cache_dirs = vec!["node_modules".to_string()];
-
-    let drain_once = |attempt: &'static str| {
-        let base = h.base.clone();
-        let ws_path = ws.path().to_str().unwrap().to_string();
-        let cache_dirs = cache_dirs.clone();
-        async move {
-            let claims = workspace_token::step_claims(
-                Fence {
-                    run: "run-miss".into(),
-                    step: "build".into(),
-                    attempt: attempt.into(),
-                },
-                far_future(),
-                Vec::new(),
-            );
-            let helper = WorkspaceClient::new(&base, workspace_token::mint(SECRET, &claims));
-            let report = helper
-                .drain_ingest_report(&ws_path, &[], &cache_dirs)
-                .await
-                .expect("drain ingest");
-            let memo = MemoCas::new(&helper, report.trees);
-            let excluded = scarab_workspace_client::exclude_paths(
-                &memo,
-                &report.snapshot.root,
-                &cache_dirs,
-            )
-            .await
-            .expect("exclusion");
-            let identity = scarab_storage::content_identity(&memo, &excluded)
-                .await
-                .expect("identity");
-            helper
-                .post_drain_record(&DrainRecord {
-                    root: report.snapshot.root.0.clone(),
-                    pruned_root: Some(excluded.0.clone()),
-                    identity: Some(identity.0.clone()),
-                    files: report.files,
-                    tree_bytes: report.tree_bytes,
-                    blobs_uploaded: report.blobs_uploaded,
-                    bytes_uploaded: report.bytes_uploaded,
-                    have_hits: report.have_hits,
-                    ingest_ms: 1,
-                    prune_ms: 0,
-                    cache_roots: report.cache_roots.clone(),
-                    error: None,
-                })
-                .await
-                .expect("post record");
-            (
-                identity.0,
-                report
-                    .cache_roots
-                    .get("node_modules")
-                    .cloned()
-                    .expect("saved"),
-            )
-        }
-    };
-    let (identity_1, cache_root_1) = drain_once("a1").await;
-
-    // Eviction: wipe the WARM tier wholesale. Postgres and the bucket — the
-    // durable record — survive; that asymmetry is the whole point.
-    for entry in std::fs::read_dir(h.warm.path()).expect("list warm") {
-        let path = entry.expect("entry").path();
-        if path.is_dir() {
-            std::fs::remove_dir_all(&path).expect("wipe warm dir");
-        } else {
-            std::fs::remove_file(&path).expect("wipe warm file");
-        }
-    }
-
-    // The restore the next launch would mint is now a MISS: cache-only
-    // content is warm-only by design, and warm is gone. Degradation, not
-    // corruption — in-Pod, `restore_cache` logs the miss and moves on.
-    let restored = tempfile::tempdir().unwrap();
-    scarab_storage::Cas::materialize(
-        &h.browse_client(),
-            &TreeHash(cache_root_1.clone()),
-            restored.path().to_str().unwrap(),
-        )
-        .await
-        .expect_err("a wiped warm tier must miss — cache-only content is unpromised");
-
-    // Run 2, identical content (the step rebuilt node_modules from scratch):
-    // the drain succeeds and publishes the IDENTICAL identity.
-    let (identity_2, cache_root_2) = drain_once("a2").await;
-    assert_eq!(
-        identity_1, identity_2,
-        "the re-run after a cache miss must publish the identical content identity"
-    );
-    assert_eq!(
-        cache_root_1, cache_root_2,
-        "identical cache content re-saves the identical root (the mapping refresh)"
-    );
-}
-

@@ -197,16 +197,8 @@ secrets:
   s3AccessKey: ""
   s3SecretKey: ""
   # base64 32-byte key so encrypted secrets survive restarts (ADR-0014).
-  # MANDATORY (one of masterKey / masterKeys) unless scarab.devInsecure is on
-  # (ADR-0048). Set EITHER this or masterKeys, never both — the chart fails
-  # the render on both.
+  # MANDATORY unless scarab.devInsecure is on (ADR-0048).
   masterKey: ""
-  # Rotation-aware form (git-bug f37463a): comma-separated base64 32-byte
-  # keys; the FIRST is the active writer, the rest decrypt-only. To rotate,
-  # set "<new>,<old>", deploy (the boot sweep + reads rewrap every row),
-  # confirm via the startup-report KEK line / the
-  # scarab_secrets_rows_under_nonactive_key gauge reaching 0, then drop <old>.
-  masterKeys: ""
   # HMAC secrets for webhook verification / gate + results token minting.
   # Each forge binds its own secret (ADR-0046): githubWebhookSecret renders
   # SCARAB_GITHUB_WEBHOOK_SECRET (/webhooks/github) and forgejoWebhookSecret

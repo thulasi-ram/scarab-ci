@@ -13,6 +13,3 @@ async-trait = { workspace = true }
 # interpolation of upstream results (ADR-0041). No cycle: pipeline never depends
 # on the engine.
 scarab-pipeline = { workspace = true }
-# I/O-free-library carve-out (ADR-0031): the cache key (ADR-0065 s1) is a
-# domain fact — sha256 over the project and the key files' blob hashes.
-sha2 = { workspace = true }

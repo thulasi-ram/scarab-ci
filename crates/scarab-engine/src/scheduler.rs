@@ -1181,11 +1181,6 @@ pub struct Scheduler<'a> {
     db: &'a dyn Db,
     clock: &'a dyn Clock,
     executor: &'a dyn Executor,
-    /// The snapshot oracle (ADR-0061 s5 / ADR-0065 s1), when the deployment
-    /// has one: the launch path resolves cache-key files to their blob hashes
-    /// through it. `None` (the local executor) disables the cache — correct
-    /// there, because there are no snapshots to key on.
-    snapshots: Option<&'a dyn WorkspaceSnapshots>,
     owner: String,
     cfg: Config,
     /// See [`Supervision`]. Defaults to a fresh set (fine when the Scheduler
@@ -1207,7 +1202,6 @@ impl<'a> Scheduler<'a> {
             db,
             clock,
             executor,
-            snapshots: None,
             owner: owner.into(),
             supervised: Supervision::new(),
             health: TickHealth::new(),
@@ -1222,14 +1216,6 @@ impl<'a> Scheduler<'a> {
                 tick_failure_deadline_ms: 300_000,
             },
         }
-    }
-
-    /// Wire the snapshot oracle (ADR-0065 s1): enables launch-time cache-key
-    /// resolution. Without it every step's cache is silently disabled — the
-    /// correct degradation for deployments with no workspace CAS.
-    pub fn with_snapshots(mut self, snapshots: Option<&'a dyn WorkspaceSnapshots>) -> Self {
-        self.snapshots = snapshots;
-        self
     }
 
     /// Override the shared-service readiness timeout (ADR-0058).
@@ -2038,15 +2024,6 @@ impl<'a> Scheduler<'a> {
                         }
                     }
 
-                    // Keyed directory Cache (ADR-0065 s1): resolve the cache
-                    // key from the merged input roots and look up the restore
-                    // hints. Strictly best-effort — an unresolvable key, a
-                    // missing oracle, or a lookup error DISABLES the cache
-                    // for this attempt; it never fails or delays the launch.
-                    // Deterministic on re-drive, like `workspace_inputs`:
-                    // the same inputs fold the same key.
-                    self.enrich_cache(&run, &mut spec).await;
-
                     // Launch-time interpolation (ADR-0041): resolve
                     // `${{ outputs.… }}` against upstream results before
                     // launch. A bad reference fails fast — as a step-level
@@ -2148,13 +2125,6 @@ impl<'a> Scheduler<'a> {
                             .put_artifacts(&run, &step, &attempt, true, &artifacts, now)
                             .await?;
                     }
-                    // Keyed-cache saves (ADR-0065 s1): upsert the key→root
-                    // mapping, best-effort BOTH ways — a read or upsert
-                    // failure never fails the step (the drain already treats
-                    // cache-only bytes as unpromised). PR-context runs never
-                    // write (dbe05e5 amendment #1).
-                    self.record_cache_saves(&run, &step, &attempt, &handle)
-                        .await;
                     self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
@@ -2228,117 +2198,6 @@ impl<'a> Scheduler<'a> {
             }
         }
         Ok(())
-    }
-
-    /// Settle-time cache recording (ADR-0065 s1): upsert each reported save
-    /// into the `cache_entries` mapping. **Best-effort both ways** — nothing
-    /// here may fail the step: a save is an optimisation hint, and the drain
-    /// already treats cache-only bytes as unpromised.
-    ///
-    /// Write scope (dbe05e5 amendment #1): DENIED for any pull-request
-    /// context, fork or not — a PR head must not poison the mapping other
-    /// runs restore from, while push/tag/manual writes add no capability
-    /// (push rights already imply pipeline-edit rights). An error answering
-    /// the PR question fails CLOSED for the write. Reads stay open to every
-    /// context, forks included.
-    async fn record_cache_saves(
-        &self,
-        run: &RunId,
-        step: &StepId,
-        attempt: &AttemptId,
-        handle: &ExecHandle,
-    ) {
-        let saves = match self.executor.cache_saves(handle).await {
-            Ok(Some(saves)) => saves,
-            _ => return,
-        };
-        if saves.key.is_empty() || saves.roots.is_empty() {
-            return;
-        }
-        match self.db.run_pr_context(run).await {
-            Ok(false) => {}
-            // PR context, or unanswerable: no write. Fail-closed is safe —
-            // the only cost is a cold cache.
-            _ => return,
-        }
-        let project = match self.db.run_project(run).await {
-            Ok(Some(p)) if !p.is_empty() => p,
-            _ => return,
-        };
-        let now = self.clock.now().await;
-        for (dir, root) in &saves.roots {
-            // Per-row best-effort: one failed upsert must not lose the rest.
-            let _ = self
-                .db
-                .cache_record(&project, &saves.key, dir, root, run, step, attempt, now)
-                .await;
-        }
-    }
-
-    /// Launch-time cache enrichment (ADR-0065 s1): fold the cache key from
-    /// the key files' blob hashes (resolved through the merged input roots,
-    /// last-overlay-wins — the same order the workspace materialises in) and
-    /// fill `spec.cache.{key, restore}` from the `cache_entries` mapping.
-    ///
-    /// **Best-effort by principle**: every early return below leaves the
-    /// cache DISABLED for this attempt (`key: None`, no restore) — a missing
-    /// oracle, an untenanted run, a key file absent from every input
-    /// (author-visible misconfiguration, surfaced by the fetcher's own log
-    /// line rather than an error), or a transient oracle/lookup failure. None
-    /// of these may fail or delay the launch; a mis-keyed cache would be
-    /// wrong, a disabled one is only slower.
-    async fn enrich_cache(&self, run: &RunId, spec: &mut StepSpec) {
-        let Some(cache) = &spec.cache else { return };
-        if cache.dirs.is_empty() || cache.key_files.is_empty() {
-            return;
-        }
-        let Some(oracle) = self.snapshots else { return };
-        // Cache rows are namespaced by the run's project (org/repo): an
-        // untenanted inline run has no namespace to save under, so its cache
-        // stays off rather than sharing a global one across tenants.
-        let project = match self.db.run_project(run).await {
-            Ok(Some(p)) if !p.is_empty() => p,
-            _ => return,
-        };
-        let mut resolved: Vec<(String, String)> = Vec::new();
-        'files: for path in &cache.key_files {
-            // Last-overlay-wins: the LAST input root to hold the file owns
-            // it, so probe the merge order in reverse and take the first hit.
-            for root in spec.workspace_inputs.iter().rev() {
-                match oracle.file_blob_hash(root, path).await {
-                    Ok(Some(hash)) => {
-                        resolved.push((path.clone(), hash));
-                        continue 'files;
-                    }
-                    // Definitively not in this overlay — try the next-earlier.
-                    Ok(None) => continue,
-                    // Transient: NOT proof of absence. Disabling beats
-                    // mis-keying (a key folded over a partial view would
-                    // restore the wrong tree as if it were right).
-                    Err(_) => return,
-                }
-            }
-            // Absent from every input ⇒ the author keyed on a file this step
-            // never receives — cache off for the attempt, never an error.
-            return;
-        }
-        let key = crate::cache_key(&project, &resolved);
-        // Lookup failures degrade to a cold cache (key still set, so the
-        // save side records under it and the next attempt hits).
-        let rows = self.db.cache_lookup(&project, &key).await.unwrap_or_default();
-        let restore: Vec<(String, String)> = cache
-            .dirs
-            .iter()
-            .filter_map(|dir| {
-                rows.iter()
-                    .find(|(d, _)| d == dir)
-                    .map(|(_, root)| (dir.clone(), root.clone()))
-            })
-            .collect();
-        if let Some(cache) = &mut spec.cache {
-            cache.key = Some(key);
-            cache.restore = restore;
-        }
     }
 
     /// Resolve `${{ … }}` interpolations in a step's launch spec against its

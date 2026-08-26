@@ -11,12 +11,11 @@ scarab-server is deployed as release "{{ .Release.Name }}" in namespace "{{ .Rel
      (ADR-0048: Postgres is mandatory; there is no API-only mode). Set
      secrets.databaseUrl (or secrets.existingSecret) before the Pod can boot.
 {{- end }}
-{{- if and (not .Values.secrets.masterKey) (not .Values.secrets.masterKeys) (not .Values.scarab.devInsecure) }}
+{{- if and (not .Values.secrets.masterKey) (not .Values.scarab.devInsecure) }}
 
-  ⚠  No master key is set — scarab-server will REFUSE TO START
-     (ADR-0048). Set secrets.masterKey (base64, 32 bytes), or the
-     rotation-aware secrets.masterKeys (comma-separated; first = active
-     writer), or use secrets.existingSecret.
+  ⚠  No SCARAB_MASTER_KEY is set — scarab-server will REFUSE TO START
+     (ADR-0048). Set secrets.masterKey (base64, 32 bytes) or use
+     secrets.existingSecret.
 {{- end }}
 {{- end }}
 {{- if .Values.scarab.devInsecure }}

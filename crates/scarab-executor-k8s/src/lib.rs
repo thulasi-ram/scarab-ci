@@ -479,20 +479,6 @@ impl K8sExecutor {
             now,
             spec.timeout_seconds.unwrap_or(self.default_step_timeout_secs),
         );
-        // The readable roots: the Step's declared inputs, plus the launch-
-        // resolved cache restore roots (ADR-0065 s1) — claims ONLY, never
-        // `workspace_inputs` itself, which feeds skip-signatures and the
-        // fetcher's merge order. The pod's cross-run cache read rides the
-        // existing exact-roots mechanism: zero new auth surface, and keys
-        // never cross the trust boundary.
-        let mut roots = spec.workspace_inputs.clone();
-        if let Some(cache) = &spec.cache {
-            for (_, root) in &cache.restore {
-                if !roots.contains(root) {
-                    roots.push(root.clone());
-                }
-            }
-        }
         let claims = workspace_token::step_claims(
             workspace_token::Fence {
                 run: step.run.0.clone(),
@@ -500,7 +486,7 @@ impl K8sExecutor {
                 attempt,
             },
             exp,
-            roots,
+            spec.workspace_inputs.clone(),
         );
         workspace_token::mint(&fetch.token_secret, &claims)
     }
@@ -749,19 +735,6 @@ impl K8sExecutor {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    // Cache dirs (ADR-0065 s1) ride their own annotation the
-                    // same way: the drain excludes them from the published
-                    // root and reports each present dir's subtree root.
-                    let cache_dirs: Vec<String> = annotations
-                        .get(ANNOTATION_CACHE_DIRS)
-                        .map(|csv| {
-                            csv.split(',')
-                                .map(str::trim)
-                                .filter(|p| !p.is_empty())
-                                .map(str::to_string)
-                                .collect()
-                        })
-                        .unwrap_or_default();
                     // ADR-0061 s3-drain: the Depot is the drain's rendezvous —
                     // the helper ingests to it and posts its record there, and
                     // this side reads the record back. No Depot handle means
@@ -796,7 +769,7 @@ impl K8sExecutor {
                     // DrainRecord LAST — so a record's existence implies the
                     // ingest completed.
                     let t_leg = std::time::Instant::now();
-                    let exec_outcome = self.exec_drain(pods, &name, &declared, &cache_dirs).await;
+                    let exec_outcome = self.exec_drain(pods, &name, &declared).await;
                     let exec_drain_ms = t_leg.elapsed().as_millis();
                     // RECORD-FIRST classification: the record on the Depot is
                     // the truth about what the drain did; the exec outcome is
@@ -875,19 +848,6 @@ impl K8sExecutor {
                         ANNOTATION_WS_IDENTITY.to_string(),
                         serde_json::Value::String(identity.unwrap_or_default()),
                     );
-                    // Cache saves (ADR-0065 s1): the drain's dir → subtree-
-                    // root map, in the SAME patch as the root so a crash
-                    // cannot record an output without its saves (or vice
-                    // versa). The Depot already ledger-verified every root
-                    // in this map before accepting the record.
-                    if !rec.cache_roots.is_empty() {
-                        if let Ok(json) = serde_json::to_string(&rec.cache_roots) {
-                            annotation_patch.insert(
-                                ANNOTATION_CACHE_ROOTS.to_string(),
-                                serde_json::Value::String(json),
-                            );
-                        }
-                    }
                     let patch = serde_json::json!({
                         "metadata": { "annotations": annotation_patch }
                     });
@@ -1413,7 +1373,6 @@ impl K8sExecutor {
         pods: &Api<Pod>,
         pod: &str,
         output_globs: &[String],
-        cache_dirs: &[String],
     ) -> DrainExecOutcome {
         use tokio::io::AsyncReadExt as _;
         let mut cmd: Vec<String> = vec![
@@ -1425,13 +1384,6 @@ impl K8sExecutor {
         for glob in output_globs {
             cmd.push("--outputs".to_string());
             cmd.push(glob.clone());
-        }
-        // Cache dirs (ADR-0065 s1): excluded from the published root and
-        // reported as saves. Sourced from the Pod annotation, like the
-        // outputs — the argv is only the transport of that truth.
-        for dir in cache_dirs {
-            cmd.push("--cache-dirs".to_string());
-            cmd.push(dir.clone());
         }
         let params = AttachParams::default()
             .container(WORKSPACE_EGRESS_CONTAINER)
@@ -2375,38 +2327,6 @@ impl Executor for K8sExecutor {
     }
 
 
-    /// The step's cache saves (ADR-0065 s1): the launch-stamped key plus the
-    /// drain-reported dir → subtree-root map, both off Pod annotations
-    /// (durable with the Pod across restarts, so an adopted Pod's settle
-    /// upserts under the same key). `None` when either half is absent — a
-    /// step with no cache, a disabled key, or a drain that saved nothing.
-    async fn cache_saves(
-        &self,
-        handle: &ExecHandle,
-    ) -> Result<Option<scarab_engine::CacheSaves>, ExecError> {
-        if self.workspace_cas.is_none() {
-            return Ok(None);
-        }
-        let pods = self.pods()?;
-        let pod = pods
-            .get_opt(&handle.0)
-            .await
-            .map_err(|e| ExecError::Other(e.to_string()))?;
-        Ok(pod.and_then(|p| {
-            let annotations = p.metadata.annotations.as_ref()?;
-            let key = annotations
-                .get(ANNOTATION_CACHE_KEY)
-                .filter(|v| !v.is_empty())?
-                .clone();
-            let roots: std::collections::BTreeMap<String, String> =
-                serde_json::from_str(annotations.get(ANNOTATION_CACHE_ROOTS)?).ok()?;
-            if roots.is_empty() {
-                return None;
-            }
-            Some(scarab_engine::CacheSaves { key, roots })
-        }))
-    }
-
     /// The artifacts the step published (ADR-0052), from the Pod annotation
     /// the harvest recorded (durable with the Pod across restarts).
     async fn artifacts(
@@ -2835,7 +2755,7 @@ impl DebugLauncher for K8sExecutor {
                 .as_ref()
                 .ok_or(ExecError::Unavailable)?;
             let roots = vec![root.to_string()];
-            init_containers.push(workspace_fetch_container(&name, fetch, &roots, &[], &ws_mount));
+            init_containers.push(workspace_fetch_container(&name, fetch, &roots, &ws_mount));
             volumes.push(workspace_token_volume(&name));
         }
         let shell = Container {
@@ -3015,10 +2935,6 @@ const WORKSPACE_TOKEN_VOLUME: &str = "scarab-workspace-token";
 /// materialises the mutable Workspace *from* these immutable trees. Must agree
 /// with `scarab-wsfetch`'s `ROOTS_ENV`.
 const WSFETCH_ROOTS_ENV: &str = "SCARAB_SNAPSHOT_ROOTS";
-
-/// Cache restore hints for the fetcher (ADR-0065 s1): `dir=root,dir=root`.
-/// Mirrors `scarab-wsfetch`'s `CACHE_ROOTS_ENV` — a wire contract.
-const WSFETCH_CACHE_ROOTS_ENV: &str = "SCARAB_CACHE_ROOTS";
 /// The env var telling the fetcher where to build the Workspace.
 const WSFETCH_TARGET_ENV: &str = "SCARAB_WORKSPACE_TARGET";
 
@@ -3096,7 +3012,6 @@ fn workspace_fetch_container(
     pod_name: &str,
     fetch: &WorkspaceFetch,
     roots: &[String],
-    cache_restore: &[(String, String)],
     ws_mount: &VolumeMount,
 ) -> Container {
     EAGER_FETCH_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3108,34 +3023,21 @@ fn workspace_fetch_container(
         image = %fetch.fetcher_image,
         "mode=eager (ADR-0061 s3-feed stepping stone — the node driver replaces this)"
     );
-    let mut env = vec![
-        env_var(workspace_token::WORKSPACE_URL_ENV, &fetch.url),
-        env_var(
-            workspace_token::WORKSPACE_TOKEN_FILE_ENV,
-            &workspace_token::workspace_token_path(),
-        ),
-        // Merge order is the LIST order (ADR-0007): later inputs overlay
-        // earlier ones, so this join must not be sorted.
-        env_var(WSFETCH_ROOTS_ENV, &roots.join(",")),
-        env_var(WSFETCH_TARGET_ENV, WORKSPACE_MOUNT_PATH),
-    ];
-    // Cache restore hints (ADR-0065 s1): `dir=root,dir=root`. Parseable
-    // because validation forbids `=`/`,` in dir names; the fetcher restores
-    // each AFTER the source, tolerating every failure (a miss is slower and
-    // never wrong) and skipping loudly when the source already produced the
-    // dir (source wins).
-    if !cache_restore.is_empty() {
-        let pairs: Vec<String> = cache_restore
-            .iter()
-            .map(|(dir, root)| format!("{dir}={root}"))
-            .collect();
-        env.push(env_var(WSFETCH_CACHE_ROOTS_ENV, &pairs.join(",")));
-    }
     Container {
         name: WORKSPACE_INIT_CONTAINER.to_string(),
         image: Some(fetch.fetcher_image.clone()),
         // The image's entrypoint IS the fetcher; nothing to override.
-        env: Some(env),
+        env: Some(vec![
+            env_var(workspace_token::WORKSPACE_URL_ENV, &fetch.url),
+            env_var(
+                workspace_token::WORKSPACE_TOKEN_FILE_ENV,
+                &workspace_token::workspace_token_path(),
+            ),
+            // Merge order is the LIST order (ADR-0007): later inputs overlay
+            // earlier ones, so this join must not be sorted.
+            env_var(WSFETCH_ROOTS_ENV, &roots.join(",")),
+            env_var(WSFETCH_TARGET_ENV, WORKSPACE_MOUNT_PATH),
+        ]),
         volume_mounts: Some(vec![
             ws_mount.clone(),
             VolumeMount {
@@ -3203,19 +3105,6 @@ const ANNOTATION_WS_IDENTITY: &str = "scarab.io/snapshot-identity";
 /// comma-separated. Absent/empty = publish the whole workspace. Read at egress,
 /// so an adopted Pod prunes identically with no in-memory state.
 const ANNOTATION_WS_OUTPUTS: &str = "scarab.io/workspace-outputs";
-/// The launch-resolved cache KEY (ADR-0065 s1), written at Pod creation.
-/// Evidence + transport for the settle-side upsert: `cache_saves` reads it
-/// back, so an adopted Pod records under the same key after a control-plane
-/// restart without recomputing anything.
-const ANNOTATION_CACHE_KEY: &str = "scarab.io/cache-key";
-/// The authored cache dirs (csv), written at Pod creation — the drain argv's
-/// transport, exactly like [`ANNOTATION_WS_OUTPUTS`]: the annotation is the
-/// truth, the exec argv only carries it, so an adopted Pod drains identically.
-const ANNOTATION_CACHE_DIRS: &str = "scarab.io/cache-dirs";
-/// The drain-reported cache saves (JSON `{dir: subtree_root}`), patched by
-/// the drain leg in the same patch as the root — what `cache_saves` reports
-/// to the scheduler for the best-effort mapping upsert.
-const ANNOTATION_CACHE_ROOTS: &str = "scarab.io/cache-roots";
 /// The Pod annotation recording (epoch ms) the FIRST time this Pod's workspace
 /// drain failed against the Depot (ADR-0064 control-plane half, ticket
 /// 4cf03d7). Written once, only if absent — it anchors the wall-clock bound in
@@ -3623,40 +3512,19 @@ pub fn build_pod(
                 spec.workspace_outputs.join(","),
             );
         }
-        // The cache context (ADR-0065 s1) rides the Pod for the same reason:
-        // the drain's --cache-dirs and the settle-side upsert's key must be
-        // identical after a control-plane restart. Written only when the key
-        // RESOLVED — a disabled cache (key: None) leaves no trace, so neither
-        // the drain exclusion nor the upsert ever fires for it.
-        if let Some(cache) = &spec.cache {
-            if let Some(key) = &cache.key {
-                if !cache.dirs.is_empty() {
-                    annotations.insert(ANNOTATION_CACHE_KEY.to_string(), key.clone());
-                    annotations.insert(ANNOTATION_CACHE_DIRS.to_string(), cache.dirs.join(","));
-                }
-            }
-        }
         let ws = workspace_mount.clone().unwrap();
         let ctl = ctl_mount.clone().unwrap();
         // The feed (ADR-0061 s3-feed): an init container that FETCHES the merged
         // input snapshots from the workspace service and exits. There is no marker
         // file and no `until [ -f … ]` wait loop, because there is nothing left to
         // wait for — the container does the work itself. A Step with no inputs gets
-        // no init container at all, rather than a `busybox` that runs `exit 0` —
-        // unless it has cache restore hints (ADR-0065 s1), which the same
-        // fetcher materialises after the source (tolerantly: a 404 is a miss).
-        let cache_restore: &[(String, String)] = spec
-            .cache
-            .as_ref()
-            .map(|c| c.restore.as_slice())
-            .unwrap_or(&[]);
-        if !spec.workspace_inputs.is_empty() || !cache_restore.is_empty() {
+        // no init container at all, rather than a `busybox` that runs `exit 0`.
+        if !spec.workspace_inputs.is_empty() {
             if let Some(fetch) = fetch {
                 init_containers.push(workspace_fetch_container(
                     name,
                     fetch,
                     &spec.workspace_inputs,
-                    cache_restore,
                     &ws,
                 ));
             }
@@ -4855,7 +4723,6 @@ mod tests {
             timeout_seconds: None,
             workspace_inputs: vec![],
             workspace_outputs: vec![],
-            cache: None,
             clone: None,
             build: None,
             artifacts: vec![],
@@ -5072,7 +4939,6 @@ mod tests {
             timeout_seconds: None,
             workspace_inputs: vec![],
             workspace_outputs: vec![],
-            cache: None,
             clone: None,
             build: None,
             artifacts: vec![],
@@ -7098,7 +6964,6 @@ mod tests {
             have_hits: 1,
             ingest_ms: 5,
             prune_ms: 0,
-            cache_roots: Default::default(),
             error: None,
         }
     }

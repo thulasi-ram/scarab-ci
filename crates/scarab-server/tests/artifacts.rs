@@ -610,7 +610,6 @@ async fn published_artifacts_are_durably_indexed_in_postgres() {
         timeout_seconds: None,
         workspace_inputs: vec![],
         workspace_outputs: vec![],
-        cache: None,
         clone: None,
         build: None,
         // The feature: this step publishes artifacts of record (ADR-0052).

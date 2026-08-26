@@ -67,7 +67,6 @@ async fn compile_and_create(db: &PostgresDb, run: &RunId) -> Vec<scarab_pipeline
             timeout_seconds: None,
             workspace_inputs: vec![],
             workspace_outputs: vec![],
-            cache: None,
             clone: None,
             build: None,
             artifacts: vec![],

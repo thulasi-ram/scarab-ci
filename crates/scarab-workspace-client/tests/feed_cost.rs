@@ -190,7 +190,7 @@ async fn measure(files: usize, runs: usize) -> Row {
         // dedup, but every tree is PUT unconditionally (ledger requirement).
         let t = Instant::now();
         writer
-            .drain_ingest_report(src.path().to_str().unwrap(), &[], &[])
+            .drain_ingest_report(src.path().to_str().unwrap(), &[])
             .await
             .unwrap();
         row.drain_ingest.push(t.elapsed().as_millis());

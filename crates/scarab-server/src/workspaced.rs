@@ -166,6 +166,20 @@ static PACK_RECLAIM_PASS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 /// more expensive than the thing observed.
 const WARM_SIZE_REFRESH_SECS: u64 = 60;
 
+/// The warm tier's recency grain (git-bug cba7165): a warm HIT refreshes the
+/// file's mtime to *now*, but only when the current mtime is at least this
+/// old. mtime is the eviction sweep's LRU key — it is the only timestamp the
+/// filesystem keeps for us across restarts, and before this a hit never moved
+/// it, so "least recently used" silently meant "least recently *written*",
+/// which is meaningless for immutable content (the banked 24476bc finding).
+///
+/// Coarse on purpose: the hit paths already `stat`, so the age check is free,
+/// and the `utimensat` write amortises to at most one syscall per object per
+/// grain — the 16-wide eager feed re-reading a hot workspace costs one touch
+/// per file per hour, not one per read. Backfill composes with this for free:
+/// it rewrites the file, and a refetch IS a use.
+const WARM_TOUCH_GRAIN_SECS: u64 = 3600;
+
 /// How often the residue sweep runs — expired fence rows
 /// ([`sweep_fence_residue`]) and abandoned pack sessions.
 ///
@@ -1570,6 +1584,57 @@ async fn warm_has(path: &std::path::Path) -> Result<bool, WsError> {
     }
 }
 
+/// Fire-and-forget touch-on-read (git-bug cba7165): refresh a warm hit's
+/// mtime — the eviction sweep's LRU key — at most once per
+/// [`WARM_TOUCH_GRAIN_SECS`].
+///
+/// `known_mtime` is the hit path's already-paid `stat` answer, when it has
+/// one: a hit younger than the grain returns without spawning anything, which
+/// is what keeps the hot path at zero added syscalls. Callers that hold no
+/// metadata (`get_tree`'s `warm.get`) pass `None` and the age check moves
+/// into the blocking task with the write.
+///
+/// Fire-and-forget because recency is advice, never correctness: the read was
+/// already served off the open handle, and the worst a lost touch costs is an
+/// earlier (still safe) eviction. In particular `ENOENT` — the sweep
+/// unlinking this very file between the read and the touch — is swallowed in
+/// [`touch_if_stale`], not surfaced.
+fn touch_warm_read(path: std::path::PathBuf, known_mtime: Option<std::time::SystemTime>) {
+    let grain = std::time::Duration::from_secs(WARM_TOUCH_GRAIN_SECS);
+    if let Some(mtime) = known_mtime {
+        match std::time::SystemTime::now().duration_since(mtime) {
+            Ok(age) if age >= grain => {}
+            // Within the grain — or an mtime in the future (clock skew), which
+            // the sweep reads as recent, the safe direction. No task, no write.
+            _ => return,
+        }
+    }
+    tokio::task::spawn_blocking(move || {
+        touch_if_stale(&path, grain);
+    });
+}
+
+/// Blocking half of [`touch_warm_read`]: re-check the age on the path itself,
+/// then bump. Returns whether it wrote — the tests' observable.
+///
+/// Every error is swallowed by design: a missing file was just evicted (the
+/// read it belonged to was already answered), and a volume that cannot
+/// `utimensat` still serves reads — the content routes' own error handling is
+/// where a broken volume gets loud ([`warm_volume_error`]), not here.
+fn touch_if_stale(path: &std::path::Path, grain: std::time::Duration) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    match std::time::SystemTime::now().duration_since(mtime) {
+        Ok(age) if age >= grain => {}
+        _ => return false,
+    }
+    filetime::set_file_mtime(path, filetime::FileTime::now()).is_ok()
+}
+
 /// Record and log a warm-volume failure that is **not** a miss, and turn it into
 /// a backend error.
 ///
@@ -1669,11 +1734,12 @@ async fn get_blob(
             // broken volume, and answering `content-length: 0` while then
             // streaming real bytes is a lie the client cannot detect — reqwest
             // would report a body length that disagrees with the body.
-            let len = file
+            let meta = file
                 .metadata()
                 .await
-                .map(|m| m.len())
                 .map_err(|e| warm_volume_error("get_blob metadata", &path, e))?;
+            let len = meta.len();
+            touch_warm_read(path.clone(), meta.modified().ok());
             let mut resp = Body::from_stream(file_chunks(file)).into_response();
             let h = resp.headers_mut();
             h.insert(
@@ -1726,11 +1792,12 @@ async fn ranged_blob(
             // not empty. A `500` gets retried; a `416` never does, and the caller
             // (a lazy mount's `read`) would treat it as end-of-file and silently
             // serve a truncated workspace.
-            let total = file
+            let meta = file
                 .metadata()
                 .await
-                .map(|m| m.len())
                 .map_err(|e| warm_volume_error("ranged_blob metadata", &warm, e))?;
+            let total = meta.len();
+            touch_warm_read(warm.clone(), meta.modified().ok());
             if first >= total {
                 // RFC 9110 §15.5.17: an unsatisfiable range.
                 let mut resp = Response::new(Body::empty());
@@ -1819,7 +1886,12 @@ async fn head_blob(
 
     let path = warm_blob_path(&state, &hash);
     let len = match tokio::fs::metadata(&path).await {
-        Ok(meta) => meta.len(),
+        Ok(meta) => {
+            // A `getattr` is a use: a lazily-mounted workspace that only ever
+            // HEADs a file must not look eviction-cold.
+            touch_warm_read(path.clone(), meta.modified().ok());
+            meta.len()
+        }
         // Not warm: the pack index answers the size with NO read at all
         // (ADR-0067 part 9); only a loose-only legacy blob still pays the
         // full cold read (which backfills warm, so the second HEAD is cheap).
@@ -1928,7 +2000,10 @@ async fn get_tree(
     let hash = valid_address(&hash)?;
     authorize_tree(&state, &headers, &hash, TreeRead::Single).await?;
     let bytes = match state.warm.get(&format!("trees/{hash}")).await {
-        Ok(bytes) => bytes,
+        Ok(bytes) => {
+            touch_warm_read(warm_tree_path(&state, &hash), None);
+            bytes
+        }
         // Warm miss: pack index first, loose cold second (dual-read).
         Err(StorageError::NotFound) => tree_bytes_via_pack_then_loose(&state, &hash).await?,
         Err(e) => return Err(e.into()),
@@ -3102,7 +3177,10 @@ async fn tree_entries_anywhere(
     tree: &TreeHash,
 ) -> Result<Vec<TreeEntry>, WsError> {
     let bytes = match state.warm.get(&format!("trees/{}", tree.0)).await {
-        Ok(bytes) => bytes,
+        Ok(bytes) => {
+            touch_warm_read(warm_tree_path(state, &tree.0), None);
+            bytes
+        }
         Err(StorageError::NotFound) => tree_bytes_via_pack_then_loose(state, &tree.0).await?,
         Err(e) => return Err(e.into()),
     };
@@ -3154,15 +3232,6 @@ pub struct DrainRecord {
     pub have_hits: u64,
     pub ingest_ms: u64,
     pub prune_ms: u64,
-    /// Keyed-cache saves (ADR-0065 s1): declared cache dir → its subtree
-    /// root. Additive, serde-defaulted (the 212bb13 wire rule) — an older
-    /// helper posts none. Every named root must be in the posting fence's
-    /// OWN write ledger or the whole drain is refused 422 (dbe05e5 amendment
-    /// #3): a root the fence never PUT is a forged mapping (cache poisoning
-    /// with a foreign hash) or a serious client bug, and integrity is never
-    /// best-effort.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub cache_roots: std::collections::BTreeMap<String, String>,
     /// Absent = success. A success record is write-once (`409` on a second
     /// POST); an error record may be overwritten by any later POST.
     #[serde(default)]
@@ -3494,29 +3563,6 @@ async fn post_drain(
                     "pruned_root {pruned} is not in this fence's write ledger"
                 )));
             }
-        }
-        // Cache saves (ADR-0065 s1, dbe05e5 amendment #3): every reported
-        // cache root must be in this fence's OWN write ledger — the drain
-        // PUTs all scan trees unconditionally, so a legitimate client
-        // satisfies this by construction. A root that is NOT ledgered is a
-        // forged mapping attempt (poisoning a key with a foreign tree the
-        // client merely learned the hash of) or a serious client bug; both
-        // fail the WHOLE drain loudly. Integrity is never best-effort —
-        // availability is. Normalized into the record like the roots above,
-        // so the persisted record and the CP's upsert see bare hex.
-        {
-            let mut normalized = std::collections::BTreeMap::new();
-            for (dir, root) in std::mem::take(&mut record.cache_roots) {
-                let root = valid_address(&root)?;
-                if !ledger.contains(&root) {
-                    return Ok(refusal(format!(
-                        "cache root {root} (dir `{dir}`) is not in this fence's \
-                         write ledger"
-                    )));
-                }
-                normalized.insert(dir, root);
-            }
-            record.cache_roots = normalized;
         }
         let effective = record.pruned_root.as_deref().unwrap_or(&record.root);
         match validate_drain_closure(&state, &ledger, effective, &fence_key(&fence)).await? {
@@ -4079,6 +4125,99 @@ mod tests {
             1024,
             "only the two real files count: a followed `alias` reports 2024"
         );
+    }
+
+    // --- the warm recency key (git-bug cba7165) -----------------------------
+
+    /// A warm hit older than the grain bumps the file's mtime to now; within
+    /// the grain it writes nothing; on a vanished file (evicted between the
+    /// read and the touch) it swallows the `ENOENT`. The blocking half is
+    /// tested directly because the async wrapper is fire-and-forget by design
+    /// — there is deliberately nothing to await.
+    ///
+    /// Mutation killed: drop the age re-check in `touch_if_stale` and the
+    /// within-grain assertion fails (every read would pay the write the grain
+    /// exists to amortise away).
+    #[test]
+    fn a_warm_hit_bumps_a_stale_mtime_once_per_grain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("aa".repeat(32));
+        std::fs::write(&path, b"immutable content").unwrap();
+        let grain = std::time::Duration::from_secs(WARM_TOUCH_GRAIN_SECS);
+
+        // Older than the grain: the touch writes, and the mtime lands at now.
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_unix_time(1_000_000_000, 0), // 2001 — ancient
+        )
+        .unwrap();
+        assert!(
+            touch_if_stale(&path, grain),
+            "a hit on a stale file must refresh the LRU key"
+        );
+        let bumped = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let age = std::time::SystemTime::now()
+            .duration_since(bumped)
+            .unwrap_or_default();
+        assert!(age < grain, "the bumped mtime must read as recent, got {age:?}");
+
+        // Within the grain: no write — the mtime must not move again.
+        assert!(
+            !touch_if_stale(&path, grain),
+            "a second hit within the grain must not write"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            bumped,
+            "the within-grain hit moved the mtime"
+        );
+
+        // Evicted underneath: swallowed, not surfaced.
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            !touch_if_stale(&path, grain),
+            "ENOENT is the sweep winning a race the read already survived"
+        );
+    }
+
+    /// The wiring, at the route grain: a `GET /v1/cas/blobs/{hash}` warm hit
+    /// on a stale file refreshes its mtime. Polled, because the touch is
+    /// fire-and-forget off the response path on purpose.
+    #[tokio::test]
+    async fn a_blob_get_refreshes_the_warm_lru_key() {
+        let Some(h) = DepotHarness::start().await else { return };
+
+        let blob = b"recency-keyed content".to_vec();
+        let hash = hash_hex(&blob);
+        let (status, body) = h.put_raw(&format!("/v1/cas/blobs/{hash}"), blob).await;
+        assert!(status.is_success(), "seed blob: {body}");
+
+        let path = warm_blob_path(&h.state, &hash);
+        filetime::set_file_mtime(
+            &path,
+            filetime::FileTime::from_unix_time(1_000_000_000, 0),
+        )
+        .unwrap();
+
+        let (status, _) = h.call("GET", &format!("/v1/cas/blobs/{hash}"), None).await;
+        assert!(status.is_success(), "the warm hit itself");
+
+        let grain = std::time::Duration::from_secs(WARM_TOUCH_GRAIN_SECS);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+            let age = std::time::SystemTime::now()
+                .duration_since(mtime)
+                .unwrap_or_default();
+            if age < grain {
+                break; // bumped
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the GET never refreshed the warm file's mtime (still {age:?} old)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 
     /// "Not there" and "the volume could not answer" must not be one answer.
@@ -6856,8 +6995,7 @@ mod tests {
             forgejo_webhook_secret: None,
             gate_token_secret: None,
             oidc: None,
-            master_keys: None,
-            master_key_warnings: vec![],
+            master_key: None,
             dev_insecure: false,
             step_timeout_secs: 3600,
             public_url: "http://localhost:8080".into(),
