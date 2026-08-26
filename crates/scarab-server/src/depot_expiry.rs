@@ -401,11 +401,10 @@ async fn expire_pass(
 
     let mut expired = 0u32;
     // Nominated candidates the pass declined without expiring (the victim
-    // transaction's re-read said no: a rerun flip, a vanished record, or a
-    // borrower that arrived after the advisory prefilter below). Counted per
-    // pass so a starved window — skips climbing while `expired` stays flat —
-    // is VISIBLE, never silent (git-bug a543fef). The drop-guard records on
-    // every exit path.
+    // transaction's re-read said no: a live borrower, a rerun flip, a
+    // vanished record). Counted per pass so a starved window — skips
+    // climbing while `expired` stays flat — is VISIBLE, never silent
+    // (git-bug a543fef). The drop-guard records on every exit path.
     let mut skipped = SkippedCandidates(0);
 
     // --- The recorded arm: success records whose run is terminal, past ITS
@@ -419,16 +418,7 @@ async fn expire_pass(
     // WHERE clause ($2/$3) for the same reason: a floor-held backlog must
     // not occupy the window either. A post-epoch fence (no pack older than
     // the epoch) expires on its recorded edges alone even while the floor
-    // is up. The borrower NOT EXISTS below (git-bug 5cde838) is the same
-    // move for the dominant in-txn decliner: >= `batch` past-TTL fences
-    // pinned by live borrowers would otherwise own the window forever, each
-    // nominated and declined every pass. It is ADVISORY — lock-free,
-    // mirroring the victim transaction's authoritative check (same join
-    // keys, same borrower-record liveness, minus the locks) purely to keep
-    // the window useful: a borrower appearing between here and the
-    // transaction is caught by the in-lock re-check, and one disappearing
-    // merely delays that fence to the next pass. Only the in-txn check ever
-    // permits a deletion.
+    // is up.
     let profile_cutoffs: Vec<(&str, i64)> = registry
         .profile_pack_ttls()
         .into_iter()
@@ -462,10 +452,6 @@ async fn expire_pass(
            AND (NOT $2 OR NOT EXISTS \
                 (SELECT 1 FROM depot_packs p \
                  WHERE p.fence_key = r.fence_key AND p.created_at < $3)) \
-           AND NOT EXISTS \
-                (SELECT 1 FROM depot_fence_borrows b \
-                 JOIN depot_drain_records dr ON dr.fence_key = b.borrower_fence \
-                 WHERE b.owner_fence = r.fence_key) \
          ORDER BY r.posted_at \
          LIMIT $1"
     );
@@ -499,19 +485,13 @@ async fn expire_pass(
     // record was residue-swept before this pass existed. Gated on the SAME
     // floor — never a standalone rule — and `HAVING max(created_at) < epoch`
     // so a fence with any post-epoch pack (whose record should exist) never
-    // qualifies. The same advisory borrower prefilter as the recorded arm
-    // (git-bug 5cde838): this window is `LIMIT batch` too, and a recordless
-    // fence can carry live post-epoch borrowers just as a recorded one can.
+    // qualifies.
     if !floor_held {
         let recordless: Vec<String> = sqlx::query_scalar(
             "SELECT p.fence_key FROM depot_packs p \
              WHERE p.committed \
                AND NOT EXISTS (SELECT 1 FROM depot_drain_records r \
                                WHERE r.fence_key = p.fence_key) \
-               AND NOT EXISTS \
-                    (SELECT 1 FROM depot_fence_borrows b \
-                     JOIN depot_drain_records dr ON dr.fence_key = b.borrower_fence \
-                     WHERE b.owner_fence = p.fence_key) \
              GROUP BY p.fence_key \
              HAVING max(p.created_at) < $1 \
              ORDER BY max(p.created_at) \

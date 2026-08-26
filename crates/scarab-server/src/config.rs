@@ -30,6 +30,7 @@
 //! | `SCARAB_WORKSPACE_URL` | env | base URL of the workspace service; default `http://scarab-workspace` |
 //! | `SCARAB_WORKSPACE_DATA_DIR` | env | the workspace service's **warm tier** directory (its persistent volume); default `./.scarab/workspace-cas`. Only read under `--role workspace` |
 //! | `SCARAB_WORKSPACE_WARM_BUDGET_BYTES` | env | warm-tier space bound (git-bug cba7165): over it the Depot's LRU sweep evicts. Unset = 90% of the warm volume's `statvfs` capacity — right on a dedicated PVC, **effectively unbounded on a shared disk** (a dev machine), which is why `deploy/local-proc` sets one explicitly. Only meaningful under `--role workspace` |
+//! | `SCARAB_DEPOT_BLOB_AUTHZ` | env | blob-read authorization mode on the Depot (ticket 52ef3aa): `off` (authenticated-only, the pre-ticket behavior), `log` (compute the roots-closure allowlist, count and sample-log would-denies, never refuse), `enforce` (403 outside the token's roots closure). Default `log` for one release; flip to `enforce` after `scarab_depot_blob_authz_would_deny_total` stays zero over a representative window. Only meaningful under `--role workspace` |
 //! | `SCARAB_WSFETCH_IMAGE` | env | the workspace **helper** image every workspace Step Pod carries (ADR-0061): the fetch init container (s3-feed) AND the egress hold/drain sidecar (`scarab-wsfetch hold` / the in-Pod `drain` the control plane execs); default `ghcr.io/thulasi-ram/scarab-wsfetch:edge`. ADR-0062 stage 2 replaces only the **eager-fetch** role; the egress role survives it — the old "dies with the node driver" note (git-bug 0628369) applied to the fetch role alone and is closed as superseded |
 //! | `SCARAB_WSFETCH_CPU_MILLIS` | env | requests==limits CPU (millicpu) for BOTH wsfetch helper containers (ticket 16a7768). Default unset — a CPU limit throttles the drain's hashing. `0` = explicitly unset |
 //! | `SCARAB_WSFETCH_MEMORY_MIB` | env | requests==limits memory (MiB) for both wsfetch helper containers; **default unset — opt-in** (a defaulted limit could OOM-loop a workspace holding one file above it). When set it also derives the helper's transfer byte budget (half the limit, `SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES` on the containers) so the limit and the in-flight cap move on one knob; unset, the wsfetch binary's own 256 MiB budget still bounds transfer memory. The helper whole-reads each file: a single workspace file approaching a configured limit needs it raised. `0` = explicitly unset |
@@ -271,6 +272,51 @@ pub struct WorkspaceServiceConfig {
     /// so a single workspace file approaching a configured limit needs it
     /// raised. `None` (= env unset or `0`) = no limit, no derived budget.
     pub helper_memory_mib: Option<u32>,
+    /// Blob-read authorization mode (`SCARAB_DEPOT_BLOB_AUTHZ`, ticket
+    /// 52ef3aa). Default [`BlobAuthzMode::Log`] — see the enum docs for the
+    /// flip-to-enforce criterion. Only meaningful for `--role workspace`.
+    pub blob_authz: BlobAuthzMode,
+}
+
+/// Blob-read authorization mode on the Depot (`SCARAB_DEPOT_BLOB_AUTHZ`,
+/// ticket 52ef3aa) — the rollout knob for moving blob GET/HEAD/Range from
+/// fence-*authenticated* to fence-*authorized* (a per-token allowlist of the
+/// blob closure of the token's `roots` claim).
+///
+/// `Log` is the shipped default: it computes the IDENTICAL allowlist —
+/// same `/flat` piggyback population, same fallback closure walk — and only
+/// the deny site differs (a counter and a sampled warn instead of a 403), so
+/// an operator flips to `Enforce` on evidence
+/// (`scarab_depot_blob_authz_would_deny_total` flat at zero over a
+/// representative window), not on faith.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobAuthzMode {
+    /// Authenticated-only blob reads — the pre-ticket behavior. No allowlist
+    /// work at all (no population, no walks, no counters).
+    Off,
+    /// Compute the allowlist and count/log would-denies; never refuse.
+    Log,
+    /// Refuse (403) a blob read outside the token's roots closure.
+    Enforce,
+}
+
+impl BlobAuthzMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Log => "log",
+            Self::Enforce => "enforce",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "off" => Some(Self::Off),
+            "log" => Some(Self::Log),
+            "enforce" => Some(Self::Enforce),
+            _ => None,
+        }
+    }
 }
 
 /// One axis of the wsfetch helper resources: unset/blank = `default`,
@@ -696,6 +742,14 @@ pub enum ConfigError {
          eviction must not be guessed at (ADR-0048)."
     )]
     InvalidWorkspaceWarmBudget(String),
+
+    #[error(
+        "SCARAB_DEPOT_BLOB_AUTHZ is set but is not a mode: {0:?}. \
+         Want `off`, `log`, or `enforce` (ticket 52ef3aa). Guessing here could \
+         silently run a LESS enforcing mode than the operator asked for, so a \
+         typo refuses the boot (ADR-0048)."
+    )]
+    InvalidBlobAuthzMode(String),
 }
 
 impl Config {
@@ -967,6 +1021,17 @@ impl Config {
                     .map_err(|raw| {
                         ConfigError::InvalidWsfetchResource("SCARAB_WSFETCH_MEMORY_MIB", raw)
                     })?,
+                // Blob-read authorization (ticket 52ef3aa). Unset/blank = the
+                // rollout default (`log`); garbage refuses the boot rather
+                // than silently running a *less* enforcing mode than asked.
+                blob_authz: match env("SCARAB_DEPOT_BLOB_AUTHZ")
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                {
+                    None => BlobAuthzMode::Log,
+                    Some(raw) => BlobAuthzMode::parse(&raw)
+                        .ok_or(ConfigError::InvalidBlobAuthzMode(raw))?,
+                },
             }),
             None if matches!(cli.role, Role::Workspace) => {
                 return Err(ConfigError::MissingWorkspaceTokenSecret)
@@ -1668,6 +1733,43 @@ mod tests {
             err.to_string().contains("SCARAB_WSFETCH_MEMORY_MIB"),
             "{err}"
         );
+    }
+
+    /// The blob-authz rollout knob (ticket 52ef3aa): unset defaults to `log`
+    /// (compute-but-never-refuse, the safe rollout mode), each spelled mode
+    /// parses, and garbage refuses the boot — a typo must not silently run a
+    /// LESS enforcing mode than the operator asked for.
+    #[test]
+    fn blob_authz_defaults_to_log_and_garbage_refuses() {
+        let ws = |extra: &'static [(&'static str, &'static str)]| {
+            let mut base = vec![("SCARAB_WORKSPACE_TOKEN_SECRET", "s3cret")];
+            base.extend_from_slice(extra);
+            let leaked: &'static [(&'static str, &'static str)] =
+                Box::leak(base.into_boxed_slice());
+            Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(leaked))
+                .unwrap()
+                .workspace
+                .unwrap()
+        };
+        assert_eq!(ws(&[]).blob_authz, BlobAuthzMode::Log, "the rollout default");
+        assert_eq!(
+            ws(&[("SCARAB_DEPOT_BLOB_AUTHZ", "off")]).blob_authz,
+            BlobAuthzMode::Off
+        );
+        assert_eq!(
+            ws(&[("SCARAB_DEPOT_BLOB_AUTHZ", "enforce")]).blob_authz,
+            BlobAuthzMode::Enforce
+        );
+
+        let err = Config::resolve_from(
+            &cli(Some("postgres://l/scarab")),
+            dev_env(&[
+                ("SCARAB_WORKSPACE_TOKEN_SECRET", "s3cret"),
+                ("SCARAB_DEPOT_BLOB_AUTHZ", "yes"),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(err, ConfigError::InvalidBlobAuthzMode("yes".into()));
     }
 
     #[test]
