@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1787758402,"nonce":"VWQipRDpj025Mov90r2iq3dGlVo=","message":"PARKED 2026-08-26 (owner call): deliberately trigger-less — fusion trades away per-step restart granularity (ADR-0027/0056 collision); do not start without an explicit design decision.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1787758420,"nonce":"YyknLDT1zcKa8yGVVTL5pGHkass=","added":["parked"],"removed":null}]}
