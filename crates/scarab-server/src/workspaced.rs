@@ -2861,26 +2861,35 @@ async fn stage_pack_rows(
     pack: &FinishedPack,
 ) -> Result<(), sqlx::Error> {
     let mut tx = db.begin().await?;
-    insert_one_body_pack(&mut tx, fence_key, pack, now_secs()).await?;
+    insert_one_body_pack(&mut tx, fence_key, pack).await?;
     tx.commit().await
 }
 
 /// One body pack's `depot_packs` + `depot_pack_members` rows, into an open
 /// transaction — shared by seal-time staging ([`stage_pack_rows`]) and the
 /// record transaction's backstop re-insert ([`insert_pack_rows`]).
+///
+/// `created_at` is stamped by **Postgres**, not by this process's clock, and
+/// that is load-bearing: the expiry pass classifies a fence *pre-epoch* by
+/// `created_at < depot_borrow_tracking_epoch.epoch` — a STRICT second-grain
+/// comparison against a value migration 0048 stamped from Postgres `now()`.
+/// Stamping rows from the host clock let a pack staged moments after that
+/// migration land a second BELOW the epoch whenever Postgres runs
+/// fractionally ahead (a VM-hosted database does), silently parking the fence
+/// behind the pre-epoch reachability floor. One clock authority — the same
+/// rule `depot_expiry`'s pass already states for its own reads.
 async fn insert_one_body_pack(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     fence_key: &str,
     pack: &FinishedPack,
-    now: i64,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes) \
-         VALUES ($1, $2, 'body', $3, $4) ON CONFLICT (pack_key) DO NOTHING",
+         VALUES ($1, $2, 'body', EXTRACT(EPOCH FROM now())::bigint, $3) \
+         ON CONFLICT (pack_key) DO NOTHING",
     )
     .bind(&pack.key)
     .bind(fence_key)
-    .bind(now)
     .bind(i64::try_from(pack.bytes).unwrap_or(i64::MAX))
     .execute(&mut **tx)
     .await?;
@@ -2923,21 +2932,22 @@ async fn insert_pack_rows(
     fence_key: &str,
     sealed: &[FinishedPack],
     commit: &Option<(String, u64)>,
-    now: i64,
 ) -> Result<(), WsError> {
     for pack in sealed {
-        insert_one_body_pack(tx, fence_key, pack, now)
+        insert_one_body_pack(tx, fence_key, pack)
             .await
             .map_err(|e| pack_rows_error("insert pack rows", e))?;
     }
     if let Some((commit_key, commit_bytes)) = commit {
+        // `created_at` from Postgres, same as the body rows — see
+        // [`insert_one_body_pack`] on why the clock authority matters.
         sqlx::query(
             "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes) \
-             VALUES ($1, $2, 'commit', $3, $4) ON CONFLICT (pack_key) DO NOTHING",
+             VALUES ($1, $2, 'commit', EXTRACT(EPOCH FROM now())::bigint, $3) \
+             ON CONFLICT (pack_key) DO NOTHING",
         )
         .bind(commit_key)
         .bind(fence_key)
-        .bind(now)
         .bind(i64::try_from(*commit_bytes).unwrap_or(i64::MAX))
         .execute(&mut **tx)
         .await
@@ -3577,7 +3587,7 @@ async fn post_drain(
     // that has not finished (git-bug afb13c2), and committing it would make
     // an aborted drain's bytes durable evidence.
     if stored.record.error.is_none() {
-        insert_pack_rows(&mut tx, &key, &sealed, &commit, now).await?;
+        insert_pack_rows(&mut tx, &key, &sealed, &commit).await?;
 
         // The in-transaction re-check (git-bug ad79c90, slice 0): the gate
         // above ran BEFORE this transaction, and a concurrent pack-reclaim
