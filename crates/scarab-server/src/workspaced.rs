@@ -7981,9 +7981,14 @@ mod tests {
     /// fence itself expires (taking its record and its outbound edges with
     /// it), the next pass collects the owner.
     ///
-    /// Mutations killed: drop the borrower re-check and pass 1 unbacks B's
-    /// committed evidence; forget to delete the expiring fence's OUTBOUND
-    /// edges and A starves forever behind a dead borrower.
+    /// Mutations killed: drop BOTH borrower checks — the advisory nomination
+    /// prefilter (git-bug 5cde838) and the victim transaction's authoritative
+    /// re-check — and pass 1 unbacks B's committed evidence (each alone is
+    /// pinned by its own test: the prefilter by `a_window_of_borrowed_
+    /// blockers_cannot_starve_a_victim_behind_them`, the in-txn check by
+    /// `a_borrower_arriving_inside_the_victim_txn_is_caught_and_counted`);
+    /// forget to delete the expiring fence's OUTBOUND edges and A starves
+    /// forever behind a dead borrower.
     #[tokio::test]
     async fn a_borrowed_victim_survives_until_its_borrower_expires() {
         let Some(h) = DepotHarness::start().await else { return };
@@ -8019,24 +8024,17 @@ mod tests {
         // Both runs terminal and past TTL: A is gated only by B's liveness.
         seed_run(db, "ba", "succeeded", 3600, false).await;
         seed_run(db, "bb", "succeeded", 3600, false).await;
-        // Candidate order is by posted_at: make A nominate first, so the
-        // pass PROVABLY visits the borrowed owner before its borrower goes.
+        // Candidate order is by posted_at: put A FIRST, so pass 1 proves the
+        // borrower prefilter (git-bug 5cde838) keeps the borrowed owner out
+        // of the window even from the window's front — B still expires.
         sqlx::query("UPDATE depot_drain_records SET posted_at = posted_at - 10 WHERE fence_key = $1")
             .bind(&fa)
             .execute(db)
             .await
             .expect("order the candidates");
 
-        let skipped_before = crate::metrics::depot_expiry_skipped_candidates();
         let pass1 = expire_now(db, &expiry_ttls()).await;
         assert_eq!(pass1, 1, "pass 1 expires only the borrower B");
-        // The borrow-gated decline is VISIBLE (git-bug a543fef): A was
-        // nominated and skipped, so the counter moved. `>=` because the
-        // counter is process-global and the suite runs in parallel.
-        assert!(
-            crate::metrics::depot_expiry_skipped_candidates() >= skipped_before + 1,
-            "a nominated-but-borrowed victim must count as a skipped candidate"
-        );
         let (packs_a, _, records_a, _) = expiry_rows_of(db, &fa).await;
         assert!(
             packs_a > 0 && records_a > 0,
@@ -8521,6 +8519,219 @@ mod tests {
             blockers, blocker_count,
             "every blocker survives, within its own TTL"
         );
+    }
+
+    /// The borrowed-blocker starvation shape (git-bug 5cde838): the per-
+    /// profile-cutoff fix above still nominated a full window of fences that
+    /// are past TTL yet pinned by LIVE borrowers — each declined inside its
+    /// victim transaction, every pass, forever — so a genuinely expired
+    /// unborrowed victim behind them re-starved exactly the same way. The
+    /// ADVISORY borrower prefilter (the nomination-side mirror of the
+    /// authoritative in-txn check, minus the locks) keeps them out of the
+    /// window: the victim expires in ONE pass, every borrowed blocker
+    /// survives.
+    ///
+    /// Mutations killed: drop the prefilter's NOT EXISTS and `expired` is 0
+    /// here (the window is all blockers, each nominated then declined
+    /// in-txn). The OTHER direction — weakening the liveness join to
+    /// edge-alone, stricter than the in-txn authority — is killed by
+    /// `a_dangling_edge_without_a_borrower_record_does_not_hide_the_owner`,
+    /// not here: fence expiry deletes the expiring borrower's outbound edges
+    /// in the same transaction, so every edge THIS test leaves behind has a
+    /// living record anyway.
+    #[tokio::test]
+    async fn a_window_of_borrowed_blockers_cannot_starve_a_victim_behind_them() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        // The victim: a real drained fence, terminal an hour — genuinely past
+        // the flat 1000s TTL, borrowed by nobody.
+        let victim = expiry_drain(&h, "bstarve-v", "borrow-starved-victim").await;
+        seed_run(db, "bstarve-v", "succeeded", 3600, false).await;
+        let victim_posted: i64 =
+            sqlx::query_scalar("SELECT posted_at FROM depot_drain_records WHERE fence_key = $1")
+                .bind(&victim)
+                .fetch_one(db)
+                .await
+                .expect("the victim's posted_at");
+
+        // ONE live borrower anchors every blocker's edge: its drain record
+        // lives (the liveness the prefilter and the in-txn check both key
+        // on) and its run is non-terminal, so the borrower is never a
+        // candidate itself and never stops anchoring mid-test.
+        seed_run(db, "bstarve-brw", "running", 60, false).await;
+        sqlx::query(
+            "INSERT INTO depot_drain_records \
+                 (fence_key, run, step, attempt, version, posted_at, record) \
+             VALUES ('bstarve-borrower-fence', 'bstarve-brw', 'build', 'a1', 1, $1, '{}'::jsonb)",
+        )
+        .bind(victim_posted)
+        .execute(db)
+        .await
+        .expect("seed the live borrower's record");
+
+        // A full window of blockers plus slack — DERIVED from the real batch
+        // constant, so a retune retunes this test with it — terminal, past
+        // TTL, posted BEFORE the victim so they own the whole `ORDER BY
+        // posted_at LIMIT <batch>` window, and each pinned by a live
+        // borrower edge. Rows only: blockers exist to crowd nomination, they
+        // need no packs.
+        let blocker_count = i64::from(crate::depot_expiry::EXPIRY_BATCH) + 20;
+        for i in 0..blocker_count {
+            let run = format!("bstarve-b{i}");
+            let fence = format!("bstarve-blocker-fence-{i}");
+            seed_run(db, &run, "succeeded", 3600, false).await;
+            sqlx::query(
+                "INSERT INTO depot_drain_records \
+                     (fence_key, run, step, attempt, version, posted_at, record) \
+                 VALUES ($1, $2, 'build', 'a1', 1, $3, '{}'::jsonb)",
+            )
+            .bind(&fence)
+            .bind(&run)
+            .bind(victim_posted - 10_000 + i)
+            .execute(db)
+            .await
+            .expect("seed a blocker record");
+            sqlx::query(
+                "INSERT INTO depot_fence_borrows (borrower_fence, owner_fence, run, created_at) \
+                 VALUES ('bstarve-borrower-fence', $1, 'bstarve-brw', $2)",
+            )
+            .bind(&fence)
+            .bind(victim_posted)
+            .execute(db)
+            .await
+            .expect("seed the live borrower edge");
+        }
+
+        let expired = expire_now(db, &expiry_ttls()).await;
+        assert_eq!(
+            expired, 1,
+            "the victim behind a full window of borrowed blockers must expire \
+             in ONE pass — 0 here is the re-starved window (the blockers were \
+             nominated and declined in-txn), >1 means a borrowed fence expired"
+        );
+        assert_eq!(expiry_rows_of(db, &victim).await, (0, 0, 0, 0));
+        let blockers: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM depot_drain_records \
+             WHERE fence_key LIKE 'bstarve-blocker-fence-%'",
+        )
+        .fetch_one(db)
+        .await
+        .expect("count blocker records");
+        assert_eq!(blockers, blocker_count, "every borrowed blocker survives");
+        let edges: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM depot_fence_borrows \
+             WHERE borrower_fence = 'bstarve-borrower-fence'",
+        )
+        .fetch_one(db)
+        .await
+        .expect("count borrow edges");
+        assert_eq!(edges, blocker_count, "every live borrower edge survives");
+    }
+
+    /// A borrower arriving BETWEEN the advisory prefilter and the victim
+    /// transaction — the race the prefilter deliberately does not close — is
+    /// caught by the authoritative in-lock re-check, and the residual
+    /// decline is VISIBLE on the skipped-candidates counter (git-bug
+    /// a543fef). Constructed with the in-txn hook: the borrow edge lands
+    /// right after the victim's FOR UPDATE, anchored by a pre-existing live
+    /// borrower record the prefilter saw no edge for.
+    ///
+    /// Mutations killed: drop the in-txn borrower re-check (lean on the
+    /// prefilter alone) and the late-borrowed fence is unbacked here; drop
+    /// the `skipped.bump()` on the decline and the counter assertion fails.
+    #[tokio::test]
+    async fn a_borrower_arriving_inside_the_victim_txn_is_caught_and_counted() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        let f = expiry_drain(&h, "lbw", "late-borrow").await;
+        seed_run(db, "lbw", "succeeded", 3600, false).await;
+
+        // The borrower's record exists BEFORE the pass — but no edge does,
+        // so the prefilter nominates f. Non-terminal run: the borrower fence
+        // is never itself a candidate.
+        seed_run(db, "lbw-b", "running", 60, false).await;
+        sqlx::query(
+            "INSERT INTO depot_drain_records \
+                 (fence_key, run, step, attempt, version, posted_at, record) \
+             VALUES ('lbw-borrower-fence', 'lbw-b', 'build', 'a1', 1, $1, '{}'::jsonb)",
+        )
+        .bind(now_secs())
+        .execute(db)
+        .await
+        .expect("seed the borrower's record");
+
+        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN
+            .lock()
+            .unwrap() = Some((
+            f.clone(),
+            format!(
+                "INSERT INTO depot_fence_borrows \
+                     (borrower_fence, owner_fence, run, created_at) \
+                 VALUES ('lbw-borrower-fence', '{f}', 'lbw-b', 0)"
+            ),
+        ));
+        let skipped_before = crate::metrics::depot_expiry_skipped_candidates();
+        let expired = expire_now(db, &expiry_ttls()).await;
+        *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN.lock().unwrap() = None;
+        assert_eq!(
+            expired, 0,
+            "the in-txn borrower re-check must catch the late edge and refuse \
+             the deletion"
+        );
+        // The decline moved the counter. `>=` because the counter is
+        // process-global and the suite runs in parallel.
+        assert!(
+            crate::metrics::depot_expiry_skipped_candidates() >= skipped_before + 1,
+            "a nominated-then-borrowed victim must count as a skipped candidate"
+        );
+        let (packs, _, records, _) = expiry_rows_of(db, &f).await;
+        assert!(packs > 0 && records > 0, "every row family survives the skip");
+
+        // The skip rolled the (injected) edge back with the transaction, so
+        // the same fence is still nominable — and without the hook it goes.
+        let expired = expire_now(db, &expiry_ttls()).await;
+        assert_eq!(expired, 1);
+        assert_eq!(expiry_rows_of(db, &f).await, (0, 0, 0, 0));
+    }
+
+    /// A DANGLING borrow edge — one whose borrower fence has NO drain record
+    /// (the migration-0048 `run`-column insurance case: the record went away
+    /// without the borrower fence expiring — rebuilds, manual sweeps) — pins
+    /// NOTHING, at nomination exactly as in the victim transaction. The
+    /// prefilter's liveness is the same edge-JOIN-record shape as the in-txn
+    /// authority; edge-alone would be STRICTER than the authority and would
+    /// hide this owner from nomination forever, unnominated and uncounted.
+    ///
+    /// Mutations killed: weaken the prefilter's liveness join to edge-alone
+    /// (drop the JOIN on the borrower's living drain record) and `expired`
+    /// is 0 here — the one direction none of the live-borrower tests can see.
+    #[tokio::test]
+    async fn a_dangling_edge_without_a_borrower_record_does_not_hide_the_owner() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        let f = expiry_drain(&h, "dang", "dangling-edge").await;
+        seed_run(db, "dang", "succeeded", 3600, false).await;
+        // The bare edge: no drain record exists for its borrower fence.
+        sqlx::query(
+            "INSERT INTO depot_fence_borrows (borrower_fence, owner_fence, run, created_at) \
+             VALUES ('dang-borrower-fence', $1, 'dang-brw', $2)",
+        )
+        .bind(&f)
+        .bind(now_secs())
+        .execute(db)
+        .await
+        .expect("seed the dangling edge");
+
+        let expired = expire_now(db, &expiry_ttls()).await;
+        assert_eq!(
+            expired, 1,
+            "a borrow edge whose borrower record is gone pins nothing — the \
+             owner must be nominated and expire in ONE pass"
+        );
+        assert_eq!(expiry_rows_of(db, &f).await, (0, 0, 0, 0));
     }
 
     /// Seed and SEAL one fence's pack, so its rows are STAGED
