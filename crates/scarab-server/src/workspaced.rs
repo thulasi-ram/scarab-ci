@@ -5394,6 +5394,439 @@ mod tests {
         }
     }
 
+    // --- blob-read authorization (ticket 52ef3aa) ----------------------------
+
+    /// A fenced token over the harness secret with an arbitrary roots claim —
+    /// the fixture for tokens whose claim does NOT name the parent snapshot.
+    fn token_with_roots(run: &str, roots: Vec<String>) -> String {
+        workspace_token::mint(
+            b"export-secret",
+            &workspace_token::step_claims(
+                Fence {
+                    run: run.into(),
+                    step: "build".into(),
+                    attempt: "a1".into(),
+                },
+                i64::MAX / 2,
+                roots,
+            ),
+        )
+    }
+
+    /// The parent snapshot's `keep.txt` blob — inside the closure every
+    /// `step_token` (which claims the parent root) may reach.
+    fn in_closure_blob() -> String {
+        hash_hex(b"inherited")
+    }
+
+    /// Seed a blob NO roots claim reaches — another tenant's content, as far
+    /// as any fenced token is concerned. Fenceless browse PUT: warm-only,
+    /// exactly the shape of a foreign workspace's bytes sitting in the tier.
+    async fn seed_foreign_blob(h: &DepotHarness) -> String {
+        let foreign = b"another tenant's secret bytes".to_vec();
+        let hash = hash_hex(&foreign);
+        let (status, body) = h.put_raw(&format!("/v1/cas/blobs/{hash}"), foreign).await;
+        assert!(status.is_success(), "seed foreign blob: {body}");
+        hash
+    }
+
+    /// One GET with a `Range` header — the harness's `call_as` has no header
+    /// seam, and only this suite needs one.
+    async fn ranged_get_as(h: &DepotHarness, token: &str, uri: &str) -> StatusCode {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header(WORKSPACE_TOKEN_HEADER, token)
+            .header(axum::http::header::RANGE, "bytes=0-3")
+            .body(Body::empty())
+            .expect("request");
+        build_router(h.state.clone())
+            .oneshot(request)
+            .await
+            .expect("response")
+            .status()
+    }
+
+    /// Enforce mode, whole surface (amendments F2a + F7): a fenced token
+    /// reads a blob inside its roots closure via the FALLBACK WALK (no /flat
+    /// first — the cold-start path), and is refused a blob outside it on GET,
+    /// ranged GET and HEAD alike, with the 403 body naming blob and fence.
+    /// Browse reads anything — its authorization is the API's RBAC, upstream,
+    /// and the bypass is deliberate, not an oversight.
+    #[tokio::test]
+    async fn enforce_gates_get_head_and_range_to_the_roots_closure() {
+        let Some(h) = DepotHarness::start().await else { return };
+        h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
+
+        let fenced = h.step_token("run-authz", "build", "a1");
+        let inside = in_closure_blob();
+        let (status, body) = h
+            .call_as(&fenced, "GET", &format!("/v1/cas/blobs/{inside}"), None)
+            .await;
+        assert!(
+            status.is_success(),
+            "an in-closure blob must serve via the fallback walk: {body}"
+        );
+        assert!(
+            h.state.blob_allow.walks.load(Ordering::Relaxed) >= 1,
+            "no /flat ran, so this authorization must have walked"
+        );
+
+        let foreign = seed_foreign_blob(&h).await;
+        let (status, body) = h
+            .call_as(&fenced, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "GET outside the closure");
+        assert!(
+            body.contains(&foreign) && body.contains("run-authz"),
+            "the 403 body must name the blob and the fence (F2a): {body}"
+        );
+
+        let (status, _) = h
+            .call_as(&fenced, "HEAD", &format!("/v1/cas/blobs/{foreign}"), None)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "HEAD discloses the size and shares the gate (F7)"
+        );
+        assert_eq!(
+            ranged_get_as(&h, &fenced, &format!("/v1/cas/blobs/{foreign}")).await,
+            StatusCode::FORBIDDEN,
+            "a ranged GET is the same bytes through a window (F7)"
+        );
+
+        // Browse bypasses the allowlist BY DESIGN.
+        let (status, _) = h
+            .call("GET", &format!("/v1/cas/blobs/{foreign}"), None)
+            .await;
+        assert!(status.is_success(), "browse reads anything");
+    }
+
+    /// The production hot path pays nothing (the piggyback): an authorized
+    /// Read-scope `/flat` seeds the token's allowlist, so the blob GETs that
+    /// follow it — the fetch sequence — check a binary search and never walk.
+    #[tokio::test]
+    async fn the_flat_piggyback_seeds_the_allowlist_so_the_hot_path_never_walks() {
+        let Some(h) = DepotHarness::start().await else { return };
+        h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
+
+        let fenced = h.step_token("run-piggyback", "build", "a1");
+        let (status, body) = h
+            .call_as(
+                &fenced,
+                "GET",
+                &format!("/v1/cas/trees/{}/flat", h.parent.root.0),
+                None,
+            )
+            .await;
+        assert!(status.is_success(), "the authorized /flat itself: {body}");
+
+        let inside = in_closure_blob();
+        let (status, _) = h
+            .call_as(&fenced, "GET", &format!("/v1/cas/blobs/{inside}"), None)
+            .await;
+        assert!(status.is_success(), "the piggybacked entry authorizes");
+        assert_eq!(
+            h.state.blob_allow.walks.load(Ordering::Relaxed),
+            0,
+            "the fetch sequence (/flat then blobs) must never pay a fallback walk"
+        );
+    }
+
+    /// THE KEYSTONE (amendment F1): the write ledger is NEVER an input to
+    /// blob authorization. A fence PUTs (and thereby ledgers) a parent tree
+    /// naming a FOREIGN blob it merely learned the address of; under enforce
+    /// the blob GET is 403 and `/flat` of that tree is 403 (roots-only,
+    /// unchanged) — while the single-tree GET of the ledgered bytes stays
+    /// 200, pinning exactly where the ledger's vouching ends. Copying
+    /// `authorize_tree`'s Single arm into the blob gate would flip the first
+    /// assertion and reopen the ledger→blob escalation.
+    #[tokio::test]
+    async fn a_ledgered_tree_naming_a_foreign_blob_authorizes_neither_the_blob_nor_flat() {
+        let Some(h) = DepotHarness::start().await else { return };
+        h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
+
+        let foreign = seed_foreign_blob(&h).await;
+        // The attacker: a legitimate fenced token whose roots claim names the
+        // parent snapshot — nothing reaching the foreign blob.
+        let attacker = h.step_token("run-escalate", "build", "a1");
+
+        // The escalation attempt: PUT (= ledger) a tree naming the foreign blob.
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "stolen.bin",
+            TreeTarget::Blob(BlobHash(foreign.clone())),
+        )])
+        .expect("canonical tree");
+        let (status, body) = h
+            .put_raw_as(
+                &attacker,
+                &format!("/v1/cas/trees/{}", tree_hash.0),
+                tree_bytes,
+            )
+            .await;
+        assert!(status.is_success(), "the tree PUT itself is legal: {body}");
+
+        // The ledger vouches for the exact bytes the fence uploaded…
+        let (status, _) = h
+            .call_as(&attacker, "GET", &format!("/v1/cas/trees/{}", tree_hash.0), None)
+            .await;
+        assert!(
+            status.is_success(),
+            "single-tree GET of a ledgered hash is the drain's read-back — unchanged"
+        );
+        // …and for NOTHING reachable from them.
+        let (status, _) = h
+            .call_as(
+                &attacker,
+                "GET",
+                &format!("/v1/cas/trees/{}/flat", tree_hash.0),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "/flat stays roots-only");
+        let (status, body) = h
+            .call_as(&attacker, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the ledger must never authorize a blob read — the F1 keystone: {body}"
+        );
+    }
+
+    /// Amendment F3, both directions: only a COMPLETE walk with a negative
+    /// answer denies. A roots claim whose tree exists walks to completion and
+    /// 403s a foreign blob; a roots claim naming a tree the Depot does not
+    /// hold cannot complete the walk, and the SAME read is a 500 — retryable
+    /// weather, never a terminal denial.
+    #[tokio::test]
+    async fn an_incomplete_walk_is_a_500_and_only_a_complete_walk_denies() {
+        let Some(h) = DepotHarness::start().await else { return };
+        h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
+        let foreign = seed_foreign_blob(&h).await;
+
+        // Complete walk, negative answer: deny.
+        let complete = token_with_roots("run-complete", vec![h.parent.root.0.clone()]);
+        let (status, _) = h
+            .call_as(&complete, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // Incomplete walk (a root in no tier): 500, never 403.
+        let broken = token_with_roots("run-broken", vec!["ab".repeat(32)]);
+        let (status, body) = h
+            .call_as(&broken, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a walk that cannot complete proves nothing (F3): {body}"
+        );
+    }
+
+    /// Log mode (amendment 8) computes the identical allowlist and only the
+    /// deny site differs: the out-of-closure read serves 200, the would-deny
+    /// counter climbs (and shows on /metrics), and enforce's counter stays
+    /// untouched. Off computes NOTHING — no walk, no counter.
+    #[tokio::test]
+    async fn log_mode_counts_would_denies_and_off_mode_does_no_work() {
+        let Some(h) = DepotHarness::start().await else { return };
+        // The harness default IS the shipped default (log) — asserted, since
+        // the rollout story depends on it.
+        assert_eq!(h.state.blob_allow.mode(), BlobAuthzMode::Log);
+
+        let fenced = h.step_token("run-log", "build", "a1");
+        let foreign = seed_foreign_blob(&h).await;
+        let (status, _) = h
+            .call_as(&fenced, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
+            .await;
+        assert!(status.is_success(), "log mode never refuses");
+        assert_eq!(
+            h.state.blob_allow.would_deny_log.load(Ordering::Relaxed),
+            1,
+            "…but it counts what enforce WOULD have refused"
+        );
+        assert_eq!(
+            h.state.blob_allow.would_deny_enforce.load(Ordering::Relaxed),
+            0
+        );
+        let walks_after_log = h.state.blob_allow.walks.load(Ordering::Relaxed);
+        assert!(walks_after_log >= 1, "log mode ran the real walk");
+        let (_, metrics_body) = h.call("GET", "/metrics", None).await;
+        assert!(
+            metrics_body.contains("scarab_depot_blob_authz_would_deny_total{mode=\"log\"} 1"),
+            "the flip-to-enforce evidence is on /metrics: {metrics_body}"
+        );
+
+        h.state.blob_allow.set_mode(BlobAuthzMode::Off);
+        let (status, _) = h
+            .call_as(&fenced, "GET", &format!("/v1/cas/blobs/{foreign}"), None)
+            .await;
+        assert!(status.is_success());
+        assert_eq!(
+            h.state.blob_allow.walks.load(Ordering::Relaxed),
+            walks_after_log,
+            "off mode does no allowlist work at all"
+        );
+        assert_eq!(
+            h.state.blob_allow.would_deny_log.load(Ordering::Relaxed),
+            1,
+            "off mode counts nothing"
+        );
+    }
+
+    /// Eviction is an economy, never an answer: an entry LRU-evicted under a
+    /// shrunken cap rebuilds on the next read (one more walk, same 200), and
+    /// an EXPIRED token dies at `authenticate` (401) — the allowlist is never
+    /// consulted for a credential that no longer verifies.
+    #[tokio::test]
+    async fn an_evicted_entry_rebuilds_and_an_expired_token_dies_at_authenticate() {
+        let Some(h) = DepotHarness::start().await else { return };
+        h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
+        // Small enough that two parent-closure entries cannot coexist.
+        h.state
+            .blob_allow
+            .inner
+            .lock()
+            .unwrap()
+            .cap_bytes = 64;
+
+        let inside = in_closure_blob();
+        let t1 = h.step_token("run-evict-1", "build", "a1");
+        let t2 = h.step_token("run-evict-2", "build", "a1");
+        let uri = format!("/v1/cas/blobs/{inside}");
+
+        let (status, _) = h.call_as(&t1, "GET", &uri, None).await;
+        assert!(status.is_success());
+        let (status, _) = h.call_as(&t2, "GET", &uri, None).await;
+        assert!(status.is_success(), "t2's grant evicts t1's entry");
+        let (status, _) = h.call_as(&t1, "GET", &uri, None).await;
+        assert!(status.is_success(), "t1 rebuilds after eviction");
+        assert_eq!(
+            h.state.blob_allow.walks.load(Ordering::Relaxed),
+            3,
+            "three cold reads under a starved cap = three walks (the rebuild is real)"
+        );
+
+        let expired = workspace_token::mint(
+            b"export-secret",
+            &workspace_token::step_claims(
+                Fence {
+                    run: "run-expired".into(),
+                    step: "build".into(),
+                    attempt: "a1".into(),
+                },
+                1_000, // 2001 — long past
+                vec![h.parent.root.0.clone()],
+            ),
+        );
+        let (status, _) = h.call_as(&expired, "GET", &uri, None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "expiry is authenticate's refusal; the allowlist never sees the token"
+        );
+    }
+
+    /// The singleflight, with the interleaving CONSTRUCTED (the repo's
+    /// concurrency lesson — never race a few-syscall window): the first
+    /// miss's walk is parked on the test gate, the second miss provably
+    /// attaches to the SAME in-flight walk (its first poll returns Pending
+    /// instead of starting walk #2), and after release both callers hold the
+    /// closure while the walk counter reads ONE.
+    #[tokio::test]
+    async fn concurrent_misses_on_one_token_share_one_walk() {
+        let Some(h) = DepotHarness::start().await else { return };
+        h.state.blob_allow.set_mode(BlobAuthzMode::Enforce);
+
+        let run = "run-singleflight";
+        let claims = workspace_token::step_claims(
+            Fence {
+                run: run.into(),
+                step: "build".into(),
+                attempt: "a1".into(),
+            },
+            i64::MAX / 2,
+            vec![h.parent.root.0.clone()],
+        );
+        let token = workspace_token::mint(b"export-secret", &claims);
+        let key = {
+            let headers = {
+                let mut m = HeaderMap::new();
+                m.insert(WORKSPACE_TOKEN_HEADER, token.parse().unwrap());
+                m
+            };
+            blob_authz_key(&headers).expect("key")
+        };
+
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+        *BLOB_WALK_GATE.lock().unwrap() = Some((run.to_string(), arrived_tx, proceed_rx));
+
+        let mut f1 = Box::pin(singleflight_walk(&h.state, key, &claims));
+        assert!(
+            futures::future::poll_immediate(f1.as_mut()).await.is_none(),
+            "walk #1 is parked on the gate"
+        );
+        arrived_rx.await.expect("the gated walk signalled arrival");
+
+        // The window under test: a second miss while walk #1 is in flight.
+        let mut f2 = Box::pin(singleflight_walk(&h.state, key, &claims));
+        assert!(
+            futures::future::poll_immediate(f2.as_mut()).await.is_none(),
+            "walk #2 must attach to walk #1, not run"
+        );
+
+        proceed_tx.send(()).expect("release the gate");
+        let (r1, r2) = futures::join!(f1, f2);
+        let (r1, r2) = (r1.expect("walk result"), r2.expect("walk result"));
+        assert_eq!(r1, r2, "both callers hold the same closure");
+        assert!(
+            r1.binary_search(&hex32(&in_closure_blob()).unwrap()).is_ok(),
+            "and it is the real closure"
+        );
+        assert_eq!(
+            h.state.blob_allow.walks.load(Ordering::Relaxed),
+            1,
+            "ONE walk served both misses"
+        );
+        assert!(
+            h.state.blob_allow.inflight.lock().unwrap().is_empty(),
+            "the singleflight slot is cleared after completion"
+        );
+    }
+
+    /// Amendment F4 at the unit grain: a closure over the per-entry cap is
+    /// never cached — the entry is dropped, so a monorepo token walks
+    /// per-request instead of thrashing every other token out of the LRU —
+    /// while an under-cap closure caches normally.
+    #[test]
+    fn an_over_threshold_closure_is_never_cached() {
+        let list = BlobAllowlist::new(BlobAuthzMode::Enforce);
+        let key = [7u8; 32];
+        let roots = vec!["r".repeat(64)];
+
+        let mut huge: Vec<[u8; 32]> = Vec::with_capacity(BLOB_AUTHZ_MAX_ENTRY_BLOBS + 1);
+        for i in 0..=BLOB_AUTHZ_MAX_ENTRY_BLOBS as u64 {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&i.to_be_bytes());
+            huge.push(b);
+        }
+        list.grant(key, i64::MAX / 2, &roots, huge);
+        assert!(
+            list.inner.lock().unwrap().entries.is_empty(),
+            "a pathological token must not occupy the LRU (F4)"
+        );
+
+        list.grant(key, i64::MAX / 2, &roots, vec![[1u8; 32]]);
+        assert!(matches!(
+            list.lookup(&key, &[1u8; 32], &roots, 0),
+            BlobAllowVerdict::Allowed
+        ));
+    }
+
     // --- the warm space bound (git-bug cba7165) ------------------------------
 
     /// Rewind every file under `dir` by `secs_back` — the fixture for "this
