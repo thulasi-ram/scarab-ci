@@ -337,6 +337,18 @@ workspace:
   # only to hold the sweep BELOW the volume (e.g. to leave headroom for
   # filesystem overhead on a small PVC).
   warmBudgetBytes: ""
+  # Blob-read authorization mode (SCARAB_DEPOT_BLOB_AUTHZ, ticket 52ef3aa):
+  # a fenced token may read only blobs in the closure of its own roots claim.
+  # "" = the binary's rollout default (`log`: compute the allowlist, count
+  # would-denies on scarab_depot_blob_authz_would_deny_total, never refuse
+  # a DENIAL). One caveat: log mode still runs the real closure walk, so a
+  # token whose roots claim contains an unwalkable root (absent from warm,
+  # packs and cold alike) will 500 blob reads that miss the allowlist -
+  # where off would have served them. Intended fail-closed-on-availability
+  # behavior, listed so flipping off->log is not a surprise.
+  # Set `enforce` once that counter has stayed zero over a representative
+  # window; `off` restores the pre-ticket authenticated-only reads.
+  blobAuthz: ""
   persistence:
     # The warm tier is bounded by SPACE (cold is bounded by time). The service
     # enforces the bound itself (git-bug cba7165): its LRU sweep holds usage
