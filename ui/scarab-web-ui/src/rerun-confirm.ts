@@ -55,7 +55,10 @@ export function confirmWarning(plan: RerunPlan | null | undefined): string | nul
 export function confirmSentence(plan: RerunPlan, kind: ConfirmKind): string {
   const widened = isWidened(plan);
   const roots = widened ? plan.starts_from : [plan.target];
-  const others = plan.invalidated.filter((s) => !roots.includes(s));
+  // Gates never join the "re-runs" claim (amendment F4): the run PAUSES at a
+  // gate, and saying it re-runs would contradict the gate note right below.
+  const gates = new Set(stepsOf(plan).filter((s) => s.is_gate).map((s) => s.step));
+  const others = plan.invalidated.filter((s) => !roots.includes(s) && !gates.has(s));
   const also = others.length > 0 ? `, which also re-runs ${nameList(others)}` : "";
   if (kind === "retry") {
     return `This retries ${plan.target} — another attempt in this version${

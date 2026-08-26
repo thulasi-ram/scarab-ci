@@ -76,6 +76,20 @@ describe("confirmSentence — the one-sentence common case", () => {
     );
   });
 
+  it("never claims a gate re-runs — gates live in the gate note only", () => {
+    const p = plan({
+      invalidated: ["approve-prod", "deploy", "push"],
+      steps: [
+        { step: "push", reason: "target", is_gate: false },
+        { step: "approve-prod", reason: "cascade", because_of: "push", is_gate: true },
+        { step: "deploy", reason: "cascade", because_of: "approve-prod", is_gate: false },
+      ],
+    });
+    // "approve-prod" must NOT appear in the re-runs claim; gateNote carries it.
+    expect(confirmSentence(p, "rerun")).toBe("This re-runs push, which also re-runs deploy.");
+    expect(gateNote(p)).toBe("Pauses for approval at approve-prod.");
+  });
+
   it("starts from the regeneration roots when widened", () => {
     expect(confirmSentence(widenedPlan, "rerun")).toBe(
       "This re-runs from clone, which also re-runs build, deploy-staging, push and smoke-test.",
