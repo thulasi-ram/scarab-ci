@@ -5523,6 +5523,27 @@ mod tests {
         })
     }
 
+    /// Run one expiry pass to a VERDICT. [`crate::depot_expiry::ExpiryPass::
+    /// LockBusy`] is retried (bounded, yielding — never sleeping): busy means
+    /// "some other session is mid-pass", which a fully parallel suite may
+    /// produce, and a test must never read it as "ran and found nothing" —
+    /// that distinction existing at all is what this helper leans on.
+    async fn expire_now(
+        db: &sqlx::PgPool,
+        registry: &crate::depot_expiry::RetentionRegistry,
+    ) -> u32 {
+        for _ in 0..10_000 {
+            match crate::depot_expiry::expire_committed_fences_once(db, registry, 100)
+                .await
+                .expect("expiry pass")
+            {
+                crate::depot_expiry::ExpiryPass::Ran { expired } => return expired,
+                crate::depot_expiry::ExpiryPass::LockBusy => tokio::task::yield_now().await,
+            }
+        }
+        panic!("the expiry pass lock stayed busy across 10k attempts — find the holder");
+    }
+
     /// Insert one `runs` row the candidate query can join — status and
     /// `updated_at` (MILLIS, `age_secs` ago), optionally pinned, `created_at`
     /// defaulting to `updated_at` (post-epoch unless backdated separately).
@@ -5619,9 +5640,7 @@ mod tests {
         let bucket_before = h.cold.list_objects("packs/").await.expect("list packs").len();
         assert!(bucket_before > 0, "the drains left pack bytes in the bucket");
 
-        let expired = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
-            .await
-            .expect("expiry pass");
+        let expired = expire_now(db, &expiry_ttls()).await;
         assert_eq!(expired, 1, "exactly the one eligible fence expires");
 
         assert_eq!(
@@ -5698,9 +5717,7 @@ mod tests {
             .await
             .expect("order the candidates");
 
-        let pass1 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
-            .await
-            .expect("pass 1");
+        let pass1 = expire_now(db, &expiry_ttls()).await;
         assert_eq!(pass1, 1, "pass 1 expires only the borrower B");
         let (packs_a, _, records_a, _) = expiry_rows_of(db, &fa).await;
         assert!(
@@ -5713,9 +5730,7 @@ mod tests {
             "B (unborrowed) expired, its outbound edges deleted with it"
         );
 
-        let pass2 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
-            .await
-            .expect("pass 2");
+        let pass2 = expire_now(db, &expiry_ttls()).await;
         assert_eq!(pass2, 1, "pass 2 collects the transitively-freed owner");
         assert_eq!(expiry_rows_of(db, &fa).await, (0, 0, 0, 0), "A is gone");
     }
@@ -5758,9 +5773,7 @@ mod tests {
             .await
             .expect("make the holder pre-epoch");
 
-        let pass1 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
-            .await
-            .expect("pass 1");
+        let pass1 = expire_now(db, &expiry_ttls()).await;
         assert_eq!(
             pass1, 1,
             "the post-epoch victim expires with the floor still up"
@@ -5778,9 +5791,7 @@ mod tests {
             .execute(db)
             .await
             .expect("unpin the holder");
-        let pass2 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
-            .await
-            .expect("pass 2");
+        let pass2 = expire_now(db, &expiry_ttls()).await;
         assert_eq!(pass2, 1, "the floor drained; the pre-epoch victim expires");
         assert_eq!(expiry_rows_of(db, &f_pre).await, (0, 0, 0, 0));
     }
@@ -5820,9 +5831,7 @@ mod tests {
             .await
             .expect("make the holder pre-epoch");
 
-        let pass1 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
-            .await
-            .expect("pass 1");
+        let pass1 = expire_now(db, &expiry_ttls()).await;
         assert_eq!(pass1, 0, "the recordless arm never runs while the floor holds");
         let (packs, members) = pack_rows_of(db, &f).await;
         assert!(packs > 0 && members > 0, "the recordless fence survives");
@@ -5836,9 +5845,7 @@ mod tests {
         .await
         .expect("terminate and age the holder");
 
-        let pass2 = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
-            .await
-            .expect("pass 2");
+        let pass2 = expire_now(db, &expiry_ttls()).await;
         assert_eq!(pass2, 1, "the floor drained; the recordless debris goes");
         assert_eq!(pack_rows_of(db, &f).await, (0, 0), "packs and members gone");
     }
@@ -5862,9 +5869,7 @@ mod tests {
             f.clone(),
             "UPDATE runs SET status = 'running' WHERE id = 'rrf'".to_string(),
         ));
-        let expired = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
-            .await
-            .expect("pass under the flip");
+        let expired = expire_now(db, &expiry_ttls()).await;
         *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN.lock().unwrap() = None;
         assert_eq!(
             expired, 0,
@@ -5875,9 +5880,7 @@ mod tests {
 
         // The skip rolled the (injected) flip back with the transaction, so
         // the same fence is still nominable — and without the hook it goes.
-        let expired = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
-            .await
-            .expect("pass without the flip");
+        let expired = expire_now(db, &expiry_ttls()).await;
         assert_eq!(expired, 1);
         assert_eq!(expiry_rows_of(db, &f).await, (0, 0, 0, 0));
     }
@@ -5911,9 +5914,7 @@ mod tests {
              END $$"
                 .to_string(),
         ));
-        let expired = crate::depot_expiry::expire_committed_fences_once(db, &expiry_ttls(), 100)
-            .await
-            .expect("a 40P01 aborts the pass, it does not fail it");
+        let expired = expire_now(db, &expiry_ttls()).await;
         *crate::depot_expiry::TEST_INJECT_IN_VICTIM_TXN.lock().unwrap() = None;
         assert_eq!(expired, 0, "the pass aborted before deleting anything");
         for fence in [&f1, &f2] {
@@ -5987,9 +5988,16 @@ mod tests {
         .expect("persist the borrower's record");
         record_tx.commit().await.expect("commit the record txn");
 
-        // …and the unblocked pass sees the edge and skips the victim.
-        let expired = pass.await.expect("join").expect("the pass completes");
-        assert_eq!(expired, 0, "the borrower re-check must skip the victim");
+        // …and the unblocked pass sees the edge and skips the victim. The
+        // assertion demands `Ran` — a LockBusy here would mean the pass never
+        // took the lock at all, which is exactly what this test must not
+        // silently accept.
+        let outcome = pass.await.expect("join").expect("the pass completes");
+        assert_eq!(
+            outcome,
+            crate::depot_expiry::ExpiryPass::Ran { expired: 0 },
+            "the pass must RUN and the borrower re-check must skip the victim"
+        );
         let (packs, _, records, _) = expiry_rows_of(db, &fa).await;
         assert!(packs > 0 && records > 0, "the victim survives intact");
     }
@@ -6056,9 +6064,7 @@ mod tests {
         set_run_profile(db, "pc", "no-such-profile").await;
 
         let expired =
-            crate::depot_expiry::expire_committed_fences_once(db, &expiry_profiles(), 100)
-                .await
-                .expect("expiry pass");
+            expire_now(db, &expiry_profiles()).await;
         assert_eq!(expired, 1, "only the short-profile run is past ITS TTL");
         assert_eq!(expiry_rows_of(db, &fa).await, (0, 0, 0, 0));
         for (fence, why) in [(&fb, "default profile"), (&fc, "unknown → default")] {
@@ -6109,9 +6115,7 @@ mod tests {
         set_run_profile(db, "ka", "short").await;
 
         let expired =
-            crate::depot_expiry::expire_committed_fences_once(db, &expiry_profiles(), 100)
-                .await
-                .expect("expiry pass");
+            expire_now(db, &expiry_profiles()).await;
         assert_eq!(expired, 0, "the borrower's record pins the short-TTL owner");
         for (fence, who) in [(&fa, "owner"), (&fb, "borrower")] {
             let (packs, _, records, _) = expiry_rows_of(db, fence).await;

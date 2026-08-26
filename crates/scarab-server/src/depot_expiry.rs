@@ -257,9 +257,9 @@ pub fn spawn_expiry(
     tokio::spawn(async move {
         loop {
             match expire_committed_fences_once(&db, &registry, EXPIRY_BATCH).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(
-                    fences = n,
+                Ok(ExpiryPass::LockBusy) | Ok(ExpiryPass::Ran { expired: 0 }) => {}
+                Ok(ExpiryPass::Ran { expired }) => tracing::info!(
+                    fences = expired,
                     "depot expiry: expired committed fences — pointers deleted, bytes \
                      left for the rowless reclaimer (git-bug 6499fb1)"
                 ),
@@ -287,7 +287,7 @@ pub async fn expire_committed_fences_once(
     db: &PgPool,
     registry: &RetentionRegistry,
     batch: u32,
-) -> Result<u32, sqlx::Error> {
+) -> Result<ExpiryPass, sqlx::Error> {
     // The advisory lock lives on ONE dedicated pooled connection — session
     // scoped, so the connection is held for the pass; if the explicit unlock
     // fails the connection is closed rather than returned to the pool still
@@ -299,10 +299,10 @@ pub async fn expire_committed_fences_once(
         .await?;
     if !locked {
         tracing::debug!(
-            "depot expiry: another replica (or the Depot reclaimer) holds the pass \
-             lock — not a skip, the work is happening elsewhere"
+            "depot expiry: another session holds the pass lock (a replica's pass, or \
+             the Depot reclaimer) — not a skip, the work is happening elsewhere"
         );
-        return Ok(0);
+        return Ok(ExpiryPass::LockBusy);
     }
 
     let result = expire_pass(db, registry, batch).await;
@@ -322,7 +322,22 @@ pub async fn expire_committed_fences_once(
             let _ = sqlx::Connection::close(conn.detach()).await;
         }
     }
-    result
+    result.map(|expired| ExpiryPass::Ran { expired })
+}
+
+/// What one call to [`expire_committed_fences_once`] did. `LockBusy` is a
+/// DISTINCT outcome, never folded into "ran and found nothing": the two mean
+/// different things to an operator (work happening elsewhere vs nothing
+/// eligible) and to a test (retry vs a real verdict).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiryPass {
+    /// The pass held the lock and ran. `expired` counts the fences whose
+    /// victim transactions committed — including a pass a 40P01 aborted
+    /// early, which counts what committed before the abort.
+    Ran { expired: u32 },
+    /// Another session held [`PACK_RECLAIM_ADVISORY_LOCK`]; nothing was
+    /// examined and nothing was deleted.
+    LockBusy,
 }
 
 /// The pass body, under the advisory lock: the floor, then the recorded arm,
