@@ -200,6 +200,15 @@ profile; it never defines the values. No byte cost enters authored YAML, so the 
 holds. [0061](0061-workspace-data-path.md)'s manual **pin** ("keep this Run's workspaces") remains the
 per-Run escape hatch for investigations.
 
+> **Implementation note (2026-08-26, git-bug 6499fb1 + 82c5775):** `RetentionProfile` shipped
+> **TTL-only** — name, `default`, and the four per-class TTLs (each falling back to the flat
+> `SCARAB_RETENTION_*` env knobs); the warm space budget, Cache-eligible directories and
+> drop-and-re-derive thresholds are deliberately **not parsed** until something consumes them (an
+> inert knob is a silent lie), so the bundle grows with its consumers rather than ahead of them. The
+> committed-pack expiry pass this ADR's retention grain feeds now **exists**
+> (`crates/scarab-server/src/depot_expiry.rs`): it resolves the pipeline-named profile out of
+> `runs.ir` against the *current* operator registry at sweep time, and the pin wins across classes.
+
 ## Alternatives considered
 
 - **Flip the default: a fresh Workspace per Step, explicit outputs only, with a finite exclusion list

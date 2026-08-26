@@ -49,6 +49,8 @@
 //! | `SCARAB_RETENTION_LOG_DAYS` | env | terminal runs' log TTL in days (ADR-0050); default 30 — metadata is retained regardless |
 //! | `SCARAB_RETENTION_ARTIFACT_DAYS` | env | terminal runs' artifact TTL in days (ADR-0052); default 90 |
 //! | `SCARAB_RETENTION_WORKSPACE_DAYS` | env | terminal runs' workspace-CAS reachability TTL in days (ADR-0050 mark-sweep); default 14 — non-terminal runs always reachable |
+//! | `SCARAB_RETENTION_PACK_DAYS` | env | terminal runs' Depot pack TTL in days (git-bug 6499fb1, ADR-0065/0067); default = the workspace TTL, and must be ≥ it (packs back Workspace Snapshots) |
+//! | `SCARAB_RETENTION_CONFIG_FILE` | env | path to the operator retention config (ADR-0065 s2): the named RetentionProfile registry, TTL-only (YAML/JSON, gitops-managed); a bad path/parse/validation is a boot failure |
 //! | `SCARAB_OAUTH_OWNERS` | env | comma-separated entries granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer`. An entry matches the Principal subject (`sub`/`login`/`id`) **or** a provider-VERIFIED `email` claim (`email_verified`) — unverified/absent verification never grants `Owner` |
 //! | `SCARAB_CONNECTIONS` | env | the declarative `connections:` block inline (YAML/JSON, ADR-0060 part D): config-owned forge connections, provisioned at boot and read-only in the UI. Wins over `_FILE` |
 //! | `SCARAB_CONNECTIONS_FILE` | env | path to a file holding the same `connections:` block (the GitOps shape: a ConfigMap mount). A bad path/parse/validation is a boot failure |
@@ -429,6 +431,18 @@ pub struct Config {
     /// (ADR-0050 mark-sweep; default 14). Non-terminal runs are always
     /// reachable regardless of age.
     pub retention_workspace_days: u32,
+    /// How long a terminal run's Depot PACKS are kept, in days (git-bug
+    /// 6499fb1, ADR-0065/0067). Default = `retention_workspace_days`, and
+    /// validated `>=` it: packs back Workspace Snapshots, so a shorter pack
+    /// TTL would unback durable materialization while roots are still
+    /// reachable.
+    pub retention_pack_days: u32,
+    /// Path to the operator **retention config** file (ADR-0065 s2): the named
+    /// RetentionProfile registry (TTL-only), YAML/JSON, gitops-managed — the
+    /// `placement_config_file` shape exactly. `None` = no profiles; every run
+    /// ages under the flat `SCARAB_RETENTION_*` TTLs. Read at boot; a bad
+    /// path/parse/validation is a boot failure (ADR-0048).
+    pub retention_config_file: Option<String>,
     /// In-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2);
     /// default [`scarab_storage_s3::DEFAULT_CAS_CONCURRENCY`].
     ///
@@ -552,6 +566,14 @@ pub enum ConfigError {
          of days (terminal runs' log TTL, ADR-0050)."
     )]
     InvalidRetention,
+
+    #[error(
+        "SCARAB_RETENTION_PACK_DAYS is set but invalid — want an integer number of days \
+         >= the workspace TTL ({0}d, SCARAB_RETENTION_WORKSPACE_DAYS). Packs back \
+         Workspace Snapshots (ADR-0065/0067): a shorter pack TTL would unback durable \
+         materialization while roots are still reachable."
+    )]
+    InvalidPackRetention(u32),
 
     #[error(
         "SCARAB_STEP_TIMEOUT_SECS is set but invalid — want a positive integer number \
@@ -797,6 +819,18 @@ impl Config {
                 .unwrap_or_else(|| "ghcr.io/thulasi-ram/scarab-results-sidecar:edge".into()),
         });
 
+        // Hoisted: the pack-retention default and floor below need the value.
+        let retention_workspace_days = match env("SCARAB_RETENTION_WORKSPACE_DAYS")
+            .filter(|v| !v.is_empty())
+        {
+            Some(v) => v
+                .parse::<u32>()
+                .ok()
+                .filter(|d| *d > 0)
+                .ok_or(ConfigError::InvalidRetention)?,
+            None => 14,
+        };
+
         Ok(Config {
             role: cli.role,
             addr: cli.addr.clone(),
@@ -842,16 +876,19 @@ impl Config {
                     .ok_or(ConfigError::InvalidRetention)?,
                 None => 90,
             },
-            retention_workspace_days: match env("SCARAB_RETENTION_WORKSPACE_DAYS")
-                .filter(|v| !v.is_empty())
+            retention_workspace_days,
+            retention_pack_days: match env("SCARAB_RETENTION_PACK_DAYS").filter(|v| !v.is_empty())
             {
                 Some(v) => v
                     .parse::<u32>()
                     .ok()
-                    .filter(|d| *d > 0)
-                    .ok_or(ConfigError::InvalidRetention)?,
-                None => 14,
+                    .filter(|d| *d >= retention_workspace_days)
+                    .ok_or(ConfigError::InvalidPackRetention(retention_workspace_days))?,
+                // Packs back workspace snapshots: the workspace TTL is the
+                // correct floor and the default.
+                None => retention_workspace_days,
             },
+            retention_config_file: env("SCARAB_RETENTION_CONFIG_FILE").filter(|v| !v.is_empty()),
             cas_concurrency,
             connections,
         })

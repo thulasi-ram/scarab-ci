@@ -108,6 +108,52 @@ pub fn cas_gc_depot_probe_failed() -> u64 {
     CAS_GC_DEPOT_PROBE_FAILED.load(Ordering::Relaxed)
 }
 
+/// Committed fences expired by the depot expiry pass (git-bug 6499fb1) —
+/// each one is a fence whose four row families were deleted in one victim
+/// transaction (the bytes go to the Depot's rowless reclaimer).
+static DEPOT_EXPIRED_FENCES: AtomicU64 = AtomicU64::new(0);
+
+/// Expiry passes that stopped early — a Postgres error, or a deadlock
+/// (40P01) in a victim transaction. Fail-closed either way: nothing further
+/// was deleted, the next cadence retries.
+static DEPOT_EXPIRY_PASS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the LAST expiry pass found the pre-epoch reachability floor held
+/// (1) — some pre-epoch run still non-terminal / within the workspace TTL /
+/// pinned, so pre-epoch committed content stayed untouchable — or drained
+/// (0). Gauge-like, set per pass; time heals it to 0 and it stays there.
+static DEPOT_EXPIRY_FLOOR_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Count one expired committed fence.
+pub fn record_depot_fence_expired() {
+    DEPOT_EXPIRED_FENCES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count one aborted/skipped expiry pass.
+pub fn record_depot_expiry_pass_skipped() {
+    DEPOT_EXPIRY_PASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record whether the last expiry pass held the pre-epoch floor.
+pub fn set_depot_expiry_floor_held(held: bool) {
+    DEPOT_EXPIRY_FLOOR_HELD.store(held as u64, Ordering::Relaxed);
+}
+
+/// Committed fences expired since process start.
+pub fn depot_expired_fences() -> u64 {
+    DEPOT_EXPIRED_FENCES.load(Ordering::Relaxed)
+}
+
+/// Expiry passes aborted/skipped since process start.
+pub fn depot_expiry_pass_skipped() -> u64 {
+    DEPOT_EXPIRY_PASS_SKIPPED.load(Ordering::Relaxed)
+}
+
+/// 1 if the last expiry pass found the pre-epoch floor held, else 0.
+pub fn depot_expiry_floor_held() -> u64 {
+    DEPOT_EXPIRY_FLOOR_HELD.load(Ordering::Relaxed)
+}
+
 /// Append the counters to a Prometheus text exposition body.
 pub(crate) fn render(out: &mut String) {
     out.push_str(&format!(
@@ -139,6 +185,21 @@ scarab_cas_gc_depot_probe_failed {}
         cas_gc_cold_residue_suppressed(),
         cas_gc_leader(),
         cas_gc_depot_probe_failed()
+    ));
+    out.push_str(&format!(
+        "# HELP scarab_depot_expired_fences_total Committed fences expired by the retention pass (pointers deleted; bytes left rowless for the Depot reclaimer).
+# TYPE scarab_depot_expired_fences_total counter
+scarab_depot_expired_fences_total {}
+# HELP scarab_depot_expiry_pass_skipped_total Expiry passes aborted early (Postgres error or a 40P01 deadlock in a victim transaction); nothing further deleted, the next cadence retries.
+# TYPE scarab_depot_expiry_pass_skipped_total counter
+scarab_depot_expiry_pass_skipped_total {}
+# HELP scarab_depot_expiry_floor_held Whether the last expiry pass found the pre-epoch reachability floor held (1 = pre-epoch committed content untouchable while some pre-epoch run is still reachable).
+# TYPE scarab_depot_expiry_floor_held gauge
+scarab_depot_expiry_floor_held {}
+",
+        depot_expired_fences(),
+        depot_expiry_pass_skipped(),
+        depot_expiry_floor_held()
     ));
     // The control plane's own view of the ADR-0061 tiering. The workspace
     // *service* exports the same counters from its own `/metrics`, and both are
