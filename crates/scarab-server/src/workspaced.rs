@@ -5827,6 +5827,46 @@ mod tests {
         ));
     }
 
+    /// The completeness rule at the unit grain (review item on F3): an entry
+    /// seeded by a PARTIAL piggyback — a token claiming roots [A, B] whose
+    /// `/flat`s covered only A — must answer Miss (fall to the walk) for a
+    /// blob it lacks, never Deny: absence from a partial entry proves
+    /// nothing. Kills the mutation flipping the completeness check's `all`
+    /// to `any` (one seen root would then vouch for the whole claim and
+    /// wrongly deny B's blobs); the same probe under a claim the entry DOES
+    /// cover pins the deny side, so the check cannot drift in either
+    /// direction.
+    #[test]
+    fn a_partial_piggyback_entry_misses_it_never_denies() {
+        let list = BlobAllowlist::new(BlobAuthzMode::Enforce);
+        let key = [9u8; 32];
+        let root_a = "a".repeat(64);
+        let root_b = "b".repeat(64);
+        let claimed = vec![root_a.clone(), root_b.clone()];
+        let in_entry = [1u8; 32];
+        let absent = [2u8; 32];
+
+        // The piggyback seeded root A only.
+        list.grant(key, i64::MAX / 2, std::slice::from_ref(&root_a), vec![in_entry]);
+
+        assert!(
+            matches!(list.lookup(&key, &in_entry, &claimed, 0), BlobAllowVerdict::Allowed),
+            "membership answers regardless of completeness"
+        );
+        assert!(
+            matches!(list.lookup(&key, &absent, &claimed, 0), BlobAllowVerdict::Miss),
+            "an entry covering only [A] of a claim [A, B] must MISS an absent \
+             blob — it could live under B, and only a complete walk may deny (F3)"
+        );
+        assert!(
+            matches!(
+                list.lookup(&key, &absent, std::slice::from_ref(&root_a), 0),
+                BlobAllowVerdict::DeniedComplete
+            ),
+            "…while the same entry IS complete for a claim of [A] alone, and denies"
+        );
+    }
+
     // --- the warm space bound (git-bug cba7165) ------------------------------
 
     /// Rewind every file under `dir` by `secs_back` — the fixture for "this
