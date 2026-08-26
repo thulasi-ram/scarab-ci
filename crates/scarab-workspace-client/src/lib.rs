@@ -63,9 +63,128 @@ use serde::{Deserialize, Serialize};
 /// wants a measurement on a real cluster, which nothing here has done.
 const CONCURRENCY: usize = 16;
 
+/// Default cap on ingest-upload bytes in memory at once: 256 MiB.
+///
+/// Without it the upload leg's peak was `CONCURRENCY × largest blob` —
+/// unbounded by anything but the workspace's own content, inside a container
+/// that (since ticket 16a7768) carries a memory limit. Whole-blob reads are
+/// kept (see [`read_blob_source`] for why streaming was rejected); the budget
+/// bounds their SUM instead: each transfer charges `min(len, budget)` against
+/// a byte semaphore before reading, so aggregate in-flight bytes never exceed
+/// the budget, and a single over-budget blob simply runs alone.
+pub const DEFAULT_TRANSFER_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// Env override for [`DEFAULT_TRANSFER_BYTE_BUDGET`], read by `scarab-wsfetch`
+/// (never by this library — ambient env reads in a lib can neither fail a
+/// boot nor be reported; the control plane sets its own via
+/// [`WorkspaceClient::with_transfer_byte_budget`]). The executor stamps it onto
+/// the egress container, derived from the helper's memory limit, so ONE knob
+/// (`workspace.helperMemoryMib`) moves both.
+pub const TRANSFER_BYTE_BUDGET_ENV: &str = "SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES";
+
+/// The step's RESOLVED timeout in seconds, stamped by the executor onto both
+/// wsfetch helper containers (fetch init + egress) and read by `scarab-wsfetch`
+/// to size its Depot-outage retry window (ticket e140121):
+/// `clamp(timeout/10, 5s, 60s)` — proportional cost, per ADR-0066's "a Depot
+/// outage delays boundary operations, never fails them".
+///
+/// Deliberately NOT named `SCARAB_STEP_TIMEOUT_SECS`: that name is already a
+/// **server boot knob** (the operator's global DEFAULT step deadline,
+/// `scarab-server` config) with a different meaning — this one is the
+/// per-step resolved number (`spec.timeout` or that default), the same value
+/// the executor writes into `activeDeadlineSeconds`. One meaning per env var.
+///
+/// Absent (image/CP skew: an old executor driving a new image) the binary
+/// assumes 300s → a 30s window — patient enough to ride out a Depot rollout,
+/// small next to any real deadline.
+pub const STEP_TIMEOUT_ENV: &str = "SCARAB_WORKSPACE_STEP_TIMEOUT_SECS";
+
+/// `scarab-wsfetch fetch` exit codes — the wire contract the executor's
+/// classification maps from (ticket e140121). Defined here (not in the
+/// binary) so the executor and the binary read the SAME constants: the
+/// executor already links this crate, while the binary must not link the
+/// executor.
+///
+/// | exit | meaning | executor class |
+/// |---|---|---|
+/// | 0 | workspace provisioned | — |
+/// | 1 | transient, retry window exhausted (unreachable Depot, 5xx/429/408,
+///       idle timeout, local I/O, torn read) | `Infra { never_started: true }` |
+/// | 2 | an input snapshot is GONE — a live Depot answered 404, meaning warm,
+///       the pack index and the cold archive all miss it (`NotFound` ONLY;
+///       a cold-tier outage is a 5xx → exit 1) | `MissingInputs` |
+/// | 3 | the Depot refused the workspace token (401/403) — retrying with the
+///       same token cannot heal; a fresh attempt mints a fresh one | `Infra
+///       { never_started: true }` + auth cause |
+/// | 4 | this invocation can never work: required env absent, an address
+///       shape the binary cannot parse, an unknown subcommand, a permanent
+///       4xx the service will answer identically forever — env/image skew,
+///       operator-fixable | `Config` |
+///
+/// Anything ELSE (137, signals) is not this table's verdict and stays
+/// `Infra { never_started: true }` in the executor's pinned default arm.
+pub const EXIT_FETCH_TRANSIENT: i32 = 1;
+/// See [`EXIT_FETCH_TRANSIENT`]. NotFound-only — the permanent-content exit.
+pub const EXIT_FETCH_MISSING_INPUTS: i32 = 2;
+/// See [`EXIT_FETCH_TRANSIENT`]. 401/403 from the Depot.
+pub const EXIT_FETCH_DENIED: i32 = 3;
+/// See [`EXIT_FETCH_TRANSIENT`]. Env/skew permanents (previously exit 2).
+pub const EXIT_FETCH_CONFIG: i32 = 4;
+
 /// Hashes per `POST /v1/cas/have`. The service caps the batch; the client chunks
 /// to stay under it.
 const HAVE_CHUNK: usize = 5_000;
+
+/// HTTP liveness bounds for a [`WorkspaceClient`] (ticket e140121).
+///
+/// `reqwest::Client::new()` carried NO timeouts, so a Depot that accepted the
+/// TCP connection and then hung (a restart mid-handshake, a wedged replica)
+/// stalled the caller until something *else* killed it — for a fetch init
+/// container, `activeDeadlineSeconds`, i.e. the whole step budget.
+///
+/// - `connect` bounds dialing.
+/// - `read_idle` bounds the gap between received bytes (`reqwest`'s
+///   `read_timeout`). Deliberately an **idle** cap, not a total one: blob
+///   GET/PUT bodies are unbounded in size, so progress = liveness — a hung
+///   Depot surfaces in `read_idle` on a stalled GET, while a large transfer
+///   that keeps moving is never cut off. Honest residual: a slow-TRICKLE
+///   Depot (bytes still flowing) can still eat the step budget inside one
+///   attempt — bounded by `activeDeadlineSeconds` and billed to the step,
+///   consistent with "Init waiting bills the step budget" (ADR-0066).
+///   Upload stalls are NOT covered by `read_idle` (nothing is being read);
+///   PUT legs carry a size-derived per-request total timeout instead — see
+///   [`put_timeout`].
+///
+/// The default is the **in-Pod** posture (patience is cheap inside a Pod; the
+/// retry window bounds it). The control plane wants to fail FAST — its
+/// `TieredCas` warm reads fall through to cold on `Backend`, so a snappy
+/// failure IS the feature there — and passes tighter values via
+/// [`WorkspaceClient::with_minted_token_tuned`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpTuning {
+    /// TCP/TLS connect bound. Default 5s.
+    pub connect: std::time::Duration,
+    /// Max gap between received body bytes. Default 30s.
+    pub read_idle: std::time::Duration,
+}
+
+impl Default for HttpTuning {
+    fn default() -> Self {
+        Self {
+            connect: std::time::Duration::from_secs(5),
+            read_idle: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
+/// The per-request TOTAL timeout for a PUT of `size_bytes` (ticket e140121
+/// F4): `max(60s, size / 1 MiB/s)`. `read_timeout` cannot bound a stalled
+/// upload — while the body is being SENT nothing is read — so every PUT leg
+/// gets a total bound generous enough that only a genuinely wedged transfer
+/// (under ~1 MiB/s sustained, with a 60s floor for small blobs) trips it.
+pub fn put_timeout(size_bytes: u64) -> std::time::Duration {
+    std::time::Duration::from_secs((size_bytes / (1024 * 1024)).max(60))
+}
 
 /// The durability-label header on CAS PUTs (ADR-0067 part 6). Duplicated from
 /// `scarab_server::workspaced` as a literal for the same reason as the token
@@ -168,6 +287,9 @@ pub struct WorkspaceClient {
     /// parents via [`MemoCas`]) ride the Depot's fenced absent-header default,
     /// which is `durable` — the correct promise for them.
     cas_cache_only: bool,
+    /// Cap on ingest-upload bytes held in memory at once — see
+    /// [`TRANSFER_BYTE_BUDGET_ENV`]. Default [`DEFAULT_TRANSFER_BYTE_BUDGET`].
+    transfer_byte_budget: u64,
 }
 
 #[derive(Serialize)]
@@ -200,9 +322,19 @@ struct MissingReport {
 }
 
 impl WorkspaceClient {
-    /// A client for `base` (e.g. `http://scarab-workspace`) presenting `token`.
+    /// A client for `base` (e.g. `http://scarab-workspace`) presenting `token`,
+    /// with the default (in-Pod) [`HttpTuning`].
     pub fn new(base: impl Into<String>, token: impl Into<String>) -> Self {
-        Self::with_source(base, TokenSource::Fixed(token.into()))
+        Self::with_http(base, token, HttpTuning::default())
+    }
+
+    /// [`Self::new`] with explicit [`HttpTuning`] (ticket e140121).
+    pub fn with_http(
+        base: impl Into<String>,
+        token: impl Into<String>,
+        tuning: HttpTuning,
+    ) -> Self {
+        Self::with_source(base, TokenSource::Fixed(token.into()), tuning)
     }
 
     /// A client that **mints a fresh token per request**.
@@ -219,16 +351,48 @@ impl WorkspaceClient {
         base: impl Into<String>,
         mint: impl Fn() -> String + Send + Sync + 'static,
     ) -> Self {
-        Self::with_source(base, TokenSource::Minted(Arc::new(mint)))
+        Self::with_source(
+            base,
+            TokenSource::Minted(Arc::new(mint)),
+            HttpTuning::default(),
+        )
     }
 
-    fn with_source(base: impl Into<String>, token: TokenSource) -> Self {
+    /// [`Self::with_minted_token`] with explicit [`HttpTuning`] (ticket
+    /// e140121) — the control plane's constructor, where failing FAST is the
+    /// feature: its `TieredCas` warm reads fall through to cold on `Backend`,
+    /// so a tight connect/read-idle turns a Depot outage into a cold-tier
+    /// read instead of a stall.
+    pub fn with_minted_token_tuned(
+        base: impl Into<String>,
+        mint: impl Fn() -> String + Send + Sync + 'static,
+        tuning: HttpTuning,
+    ) -> Self {
+        Self::with_source(base, TokenSource::Minted(Arc::new(mint)), tuning)
+    }
+
+    fn with_source(base: impl Into<String>, token: TokenSource, tuning: HttpTuning) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(tuning.connect)
+                .read_timeout(tuning.read_idle)
+                .build()
+                // Same failure surface as the `reqwest::Client::new()` this
+                // replaces (it panics on the identical builder error).
+                .expect("reqwest client"),
             base: base.into().trim_end_matches('/').to_string(),
             token,
             cas_cache_only: false,
+            transfer_byte_budget: DEFAULT_TRANSFER_BYTE_BUDGET,
         }
+    }
+
+    /// Cap ingest-upload bytes held in memory at once (default
+    /// [`DEFAULT_TRANSFER_BYTE_BUDGET`]). Zero is treated as 1 — a zero budget
+    /// could admit nothing and would deadlock the first transfer.
+    pub fn with_transfer_byte_budget(mut self, bytes: u64) -> Self {
+        self.transfer_byte_budget = bytes.max(1);
+        self
     }
 
     /// A twin of this client whose [`Cas`] PUTs (`put_blob`/`put_tree`) carry
@@ -246,6 +410,7 @@ impl WorkspaceClient {
             base: self.base.clone(),
             token: self.token.clone(),
             cas_cache_only: true,
+            transfer_byte_budget: self.transfer_byte_budget,
         }
     }
 
@@ -289,7 +454,24 @@ impl WorkspaceClient {
         if status == reqwest::StatusCode::NOT_FOUND {
             return StorageError::NotFound;
         }
-        StorageError::Backend(format!("workspace service {status}: {body}"))
+        // 401/403 are their own class (ticket e140121): retrying with the
+        // same token cannot heal a denial, so callers must be able to stop
+        // waiting without string-sniffing a `Backend` message (401 and 503
+        // used to be indistinguishable here).
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            return StorageError::Denied(format!("workspace service {status}: {body}"));
+        }
+        // Everything else keeps its status on the error (e140121 review fix):
+        // retry policy needs to split 5xx/429/408 (server weather, worth
+        // waiting out) from the other 4xx (a request the service will refuse
+        // identically forever — skew or a bug, never weather). `Backend`
+        // stays the transport-only error: no HTTP answer at all.
+        StorageError::Status {
+            status: status.as_u16(),
+            body,
+        }
     }
 
     /// Which of these the service does not have — durable-set answers plus
@@ -379,6 +561,11 @@ impl WorkspaceClient {
     ) -> Result<(), StorageError> {
         let mut req = self
             .request(reqwest::Method::PUT, &format!("/v1/cas/{kind}/{hash}"))
+            // A stalled upload is invisible to `read_timeout` (nothing is
+            // being read while the body sends), so every PUT carries a
+            // size-derived TOTAL bound (ticket e140121 F4). GETs keep
+            // connect + read-idle only — their liveness is the read.
+            .timeout(put_timeout(data.len() as u64))
             .body(data);
         if let Some(label) = label {
             req = req.header(DURABILITY_HEADER, label.as_str());
@@ -406,7 +593,7 @@ impl WorkspaceClient {
     /// plane, so the exit code is only a hint.
     pub async fn post_drain_record(&self, rec: &DrainRecord) -> Result<(), StorageError> {
         match self.post_drain_record_classified(rec).await? {
-            DrainPostOutcome::Posted => Ok(()),
+            DrainPostOutcome::Posted | DrainPostOutcome::AlreadyPosted => Ok(()),
             DrainPostOutcome::StateIncomplete(detail) => Err(StorageError::Backend(format!(
                 "workspace service 422 ({DRAIN_STATE_INCOMPLETE_CODE}): {detail}"
             ))),
@@ -435,6 +622,21 @@ impl WorkspaceClient {
         let status = resp.status();
         if status.is_success() {
             return Ok(DrainPostOutcome::Posted);
+        }
+        // 409 = a success record already stands under this fence — and the
+        // fence key includes `{run, step, attempt}`, so it can only be THIS
+        // attempt's own record: a POST whose 2xx response was lost (a Depot
+        // restart mid-response, a dropped connection) retries into 409. The
+        // record is deposited, which is the entire job — so this is success
+        // for exit-code honesty (ticket e140121 F5: classification is
+        // record-first on the same poll, so this saves no re-drive; it stops
+        // the helper reporting failure for a drain that succeeded). The
+        // fenced token cannot GET the record back (`require_browse`), so
+        // compare-and-confirm is not available in-Pod; 409-as-success is the
+        // correct affordance. The write-once property is untouched — the
+        // Depot still refused the overwrite.
+        if status == reqwest::StatusCode::CONFLICT {
+            return Ok(DrainPostOutcome::AlreadyPosted);
         }
         if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             let body = resp.text().await.unwrap_or_default();
@@ -616,8 +818,24 @@ impl WorkspaceClient {
         let blob_hits = (blob_hashes.len() - uploads.len()) as u64;
         let blobs_uploaded = uploads.len() as u64;
         let plan = &plan;
+        // Bytes in flight are BOUNDED, not just transfer count (ticket 16a7768
+        // item 1): `CONCURRENCY` alone left the peak at 16 × largest blob.
+        // Each transfer charges `min(len, budget)` against this semaphore
+        // BEFORE reading and holds it through the PUT; a blob bigger than the
+        // whole budget clamps to all of it, so it runs alone rather than
+        // deadlocking (its memory is then bounded by its own size — the
+        // disclosed residual on `read_blob_source`). Budget ≤ u32::MAX because
+        // `acquire_many` takes a u32; 4 GiB of in-flight uploads is beyond any
+        // sane setting anyway.
+        let budget = self.transfer_byte_budget.clamp(1, u64::from(u32::MAX));
+        let gate = tokio::sync::Semaphore::new(budget as usize);
+        let gate = &gate;
         let results: Vec<Result<u64, StorageError>> = futures::stream::iter(uploads)
             .map(|(hash, source)| async move {
+                let charge = source.len().min(budget) as u32;
+                let _permit = gate.acquire_many(charge).await.map_err(|_| {
+                    StorageError::Backend("upload byte-budget semaphore closed".into())
+                })?;
                 let data = read_blob_source(&source).await?;
                 let len = data.len() as u64;
                 self.put_bytes("blobs", &hash, data, plan.label_of(&hash))
@@ -775,6 +993,11 @@ pub const DRAIN_STATE_INCOMPLETE_CODE: &str = "drain_state_incomplete";
 pub enum DrainPostOutcome {
     /// 2xx — the record is deposited; the drain is done.
     Posted,
+    /// 409 — a success record ALREADY stands under this fence, and the fence
+    /// key includes the attempt, so it is this attempt's own (a retried POST
+    /// whose first 2xx was lost). Success, kept distinct from
+    /// [`Posted`](Self::Posted) only so the caller can log what happened.
+    AlreadyPosted,
     /// The durable-presence gate's machine-readable 422: not everything the
     /// record publishes is in the shared pack index YET. Retryable in-process
     /// — every retry sees a strictly larger index — and bounded by the
@@ -1068,11 +1291,24 @@ impl Cas for WorkspaceClient {
         // inside a `buffer_unordered` would park the runtime's worker threads,
         // and at 50 000 files that turns "concurrent" back into "sequential with
         // extra steps" — the exact property this is here to provide.
+        // Downloads whole-buffer each blob, so bytes in flight are bounded by
+        // the transfer byte budget exactly as the ingest leg's uploads are
+        // (ticket 16a7768 item 1): each entry charges `min(size, budget)` —
+        // the manifest carries sizes — before its GET and holds the charge
+        // through the write. Without this the peak was 16 × largest blob,
+        // inside a fetch container that now carries a memory limit.
+        let budget = self.transfer_byte_budget.clamp(1, u64::from(u32::MAX));
+        let gate = tokio::sync::Semaphore::new(budget as usize);
+        let gate = &gate;
         let results: Vec<Result<(), StorageError>> =
             futures::stream::iter(manifest.entries.iter().cloned())
                 .map(|entry| {
                     let root = root.clone();
                     async move {
+                        let charge = entry.size.min(budget) as u32;
+                        let _permit = gate.acquire_many(charge).await.map_err(|_| {
+                            StorageError::Backend("transfer byte-budget semaphore closed".into())
+                        })?;
                         let data = self.get_blob(&entry.blob).await?;
                         tokio::task::spawn_blocking(move || write_entry(&root, &entry, &data))
                             .await
@@ -1334,16 +1570,38 @@ fn apply_metadata(
 /// Where a blob's bytes come from during `ingest`.
 #[derive(Clone)]
 enum BlobSource {
-    File(std::path::PathBuf),
+    File {
+        path: std::path::PathBuf,
+        /// Size from the scan's `lstat` — what the upload byte budget charges
+        /// BEFORE reading, so the read itself can never overshoot the budget.
+        len: u64,
+    },
     /// A symlink's target path, already read.
     Link(Vec<u8>),
 }
 
+impl BlobSource {
+    fn len(&self) -> u64 {
+        match self {
+            BlobSource::File { len, .. } => *len,
+            BlobSource::Link(bytes) => bytes.len() as u64,
+        }
+    }
+}
+
 /// `tokio::fs`, not `std::fs`: this runs inside a `buffer_unordered`, and a
 /// blocking read there would serialise the very uploads it is feeding.
+///
+/// Whole-file, on purpose (ticket 16a7768 item 1): a streamed `PUT` body would
+/// drop the Content-Length (chunked encoding — a wire change the Depot and
+/// anything fronting it would have to be re-proven against) for a peak the
+/// byte budget in [`ingest_report_inner`] already bounds. The residual is a
+/// SINGLE file larger than the budget: it is read whole (its acquire is
+/// clamped), so the helper's memory limit must exceed the largest single
+/// output file — disclosed on the `workspace.helperMemoryMib` knob.
 async fn read_blob_source(source: &BlobSource) -> Result<Vec<u8>, StorageError> {
     match source {
-        BlobSource::File(path) => tokio::fs::read(path).await.map_err(io_err),
+        BlobSource::File { path, .. } => tokio::fs::read(path).await.map_err(io_err),
         BlobSource::Link(bytes) => Ok(bytes.clone()),
     }
 }
@@ -1659,12 +1917,70 @@ fn scan_one(
                 TreeTarget::Tree(TreeHash(sub)),
                 TreeTarget::Tree(TreeHash(sub_identity)),
             )
+        } else if !file_type.is_file() {
+            // A FIFO/device/socket left in the workspace (ticket 16a7768 item
+            // 2): `read` on a FIFO with no writer blocks FOREVER, nothing in
+            // the drive path times the drain exec out, and the control plane's
+            // escalation clock anchors on the first *returned* failure — so a
+            // hang here would present as a step-budget timeout with no cause
+            // named. Refuse loudly instead, naming the path: a workspace
+            // snapshot can only hold regular files, directories and symlinks
+            // anyway (there is no tree-entry encoding for anything else), so
+            // this is the honest answer, not a limitation of the walk.
+            // `Unsupported`, not `Backend` (e140121 review fix): the drain's
+            // whole-leg retry treats `Backend` as weather, and a FIFO in the
+            // workspace re-refuses identically on every re-scan — retrying it
+            // would grind the whole window before the same honest refusal.
+            return Err(StorageError::Unsupported(format!(
+                "refusing to snapshot {} at {:?}: a Workspace Snapshot holds only \
+                 regular files, directories and symlinks — reading a FIFO/device/\
+                 socket can block the drain forever (remove it or create it \
+                 somewhere outside /workspace)",
+                non_regular_kind(&file_type),
+                item.path(),
+            )));
         } else {
-            let data = std::fs::read(item.path()).map_err(io_err)?;
-            let hash = hash_hex(&data);
-            blobs
-                .entry(hash.clone())
-                .or_insert(BlobSource::File(item.path()));
+            // Stream-hash, never `fs::read` (ticket 16a7768 item 1): the scan
+            // used to hold each whole file while hashing it, sizing the
+            // helper's peak by the largest file in the workspace for no
+            // reason — the address needs one pass over the bytes, not the
+            // bytes in memory.
+            //
+            // The lstat guard above does NOT make this open safe — the path
+            // can be swapped between the lstat and the open (TOCTOU; e140121
+            // review fix). What the flags guarantee: `O_NOFOLLOW` refuses a
+            // symlink swapped in (ELOOP, an error, never a read outside the
+            // workspace), and `O_NONBLOCK` makes opening a writer-less FIFO
+            // return instead of blocking forever (on a regular file it is a
+            // no-op for reads). The fstat below then re-checks the object we
+            // actually OPENED, so a FIFO/device swapped in surfaces as the
+            // same loud refusal, not a hang or a mis-snapshot. Remaining
+            // race, disclosed: the workspace is a live mutable directory, so
+            // content can still change between this hash and the later
+            // upload read — the drain has always accepted that (the PUT is
+            // re-hashed server-side against its address).
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(item.path())
+                .map_err(io_err)?;
+            let opened = file.metadata().map_err(io_err)?;
+            if !opened.file_type().is_file() {
+                return Err(StorageError::Unsupported(format!(
+                    "refusing to snapshot {:?}: the path changed type mid-scan and is no \
+                     longer a regular file — a Workspace Snapshot holds only regular \
+                     files, directories and symlinks",
+                    item.path(),
+                )));
+            }
+            let hash = scarab_storage::sha256_hex_reader(&mut file).map_err(io_err)?;
+            blobs.entry(hash.clone()).or_insert(BlobSource::File {
+                path: item.path(),
+                // The OPENED file's size, not the earlier lstat's: this is
+                // what the byte budget charges for the bytes just hashed.
+                len: opened.len(),
+            });
             *files += 1;
             (
                 TreeTarget::Blob(BlobHash(hash.clone())),
@@ -1690,6 +2006,24 @@ fn scan_one(
     let (hash, bytes) = canonical_tree(entries)?;
     trees.push((hash.0.clone(), bytes));
     Ok((hash.0, identity.0))
+}
+
+/// Name a non-regular file type for the scan's refusal message. `lstat` already
+/// separated symlinks and directories out, so what reaches this is the zoo
+/// `read` can hang on or misrepresent.
+fn non_regular_kind(t: &std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if t.is_fifo() {
+        "a FIFO"
+    } else if t.is_socket() {
+        "a socket"
+    } else if t.is_block_device() {
+        "a block device"
+    } else if t.is_char_device() {
+        "a character device"
+    } else {
+        "a non-regular file"
+    }
 }
 
 /// A file's mtime as unix-ms. Pre-epoch timestamps come back negative rather
@@ -1720,6 +2054,46 @@ mod tests {
         let (h2, bytes2) = canonical_tree(vec![b, a]).unwrap();
         assert_eq!(h1, h2);
         assert_eq!(bytes1, bytes2);
+    }
+
+    /// A non-regular file in the workspace must FAIL the scan with an error
+    /// naming the path — never hang (`read` on a writer-less FIFO blocks
+    /// forever and nothing times the drain exec out) and never be silently
+    /// skipped (a skipped file would publish a narrower snapshot as the
+    /// Attempt's authoritative evidence). A unix socket is the stand-in here
+    /// because `std` can create one without a libc dance; the branch under
+    /// test is the same for FIFOs and device nodes.
+    #[test]
+    fn scan_refuses_a_non_regular_file_naming_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("ok.txt"), b"fine").expect("write");
+        let sock_path = dir.path().join("weird.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path).expect("bind socket");
+
+        let msg = match scan_dir(dir.path()) {
+            Ok(_) => panic!("a socket must refuse the scan"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("weird.sock"),
+            "the error must name the offending path, got: {msg}"
+        );
+        assert!(
+            msg.contains("socket"),
+            "the error must name the file type, got: {msg}"
+        );
+    }
+
+    /// Symlinks are recorded as symlinks (never followed, never refused) —
+    /// pinned next to the non-regular refusal so the two branches cannot be
+    /// conflated: a link to ANYWHERE is scannable, a FIFO is not.
+    #[test]
+    fn scan_records_a_symlink_without_following_or_refusing_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink("/nowhere/in/particular", dir.path().join("link"))
+            .expect("symlink");
+        let scan = scan_dir(dir.path()).expect("a dangling symlink scans fine");
+        assert_eq!(scan.files, 1);
     }
 
     #[test]

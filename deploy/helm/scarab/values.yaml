@@ -306,6 +306,29 @@ workspace:
   # after it. While the eager feed is live, `eager_fetch_total` on the
   # server is climbing.
   fetcherImage: ghcr.io/thulasi-ram/scarab-wsfetch:edge
+  # Resources for BOTH wsfetch helper containers in every workspace Step Pod
+  # (the fetcher init container and the egress hold/drain sidecar), applied
+  # requests==limits (ticket 16a7768). Without them the helper was invisible
+  # to the scheduler and unbounded — the drain hashes and uploads the whole
+  # workspace in-Pod, and a node-pressure OOM-kill classifies Transient and
+  # loops with nothing naming why.
+  #
+  # helperMemoryMib ALSO derives the helper's transfer byte budget (half the
+  # limit — SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES): the cap on blob bytes the
+  # fetch/drain hold in memory at once. One knob, both bounds, no drift.
+  # Residual, disclosed: the helper whole-reads each file, so a SINGLE
+  # workspace file approaching this limit needs it raised.
+  #
+  # OPT-IN (e140121 review): "" = NO k8s limit and no derived budget — the
+  # pre-16a7768 Pod shape, byte for byte. The wsfetch binary's own 256 MiB
+  # transfer budget still bounds fetch/drain memory (without a kill attached),
+  # so unconfigured deployments are bounded but never OOM-killed by a default
+  # a large single artifact could exceed. 0 = explicitly unset (same effect).
+  helperMemoryMib: ""
+  # Millicpu for the same two containers, requests==limits. "" = unset (the
+  # default: a CPU limit throttles the drain's hashing, and the drain clock is
+  # already the liveness bound). 0 = explicitly unset.
+  helperCpuMillis: ""
   # Warm space bound in PLAIN BYTES (git-bug cba7165) — over it the service's
   # LRU sweep evicts back to 80% of the bound: committed-durable content first
   # (free — the packs serve it straight back), cache-only content second (a
