@@ -7827,6 +7827,8 @@ mod tests {
                 data_dir: warm.path().to_string_lossy().into_owned(),
                 fetcher_image: "ghcr.io/example/wsfetch:test".into(),
                 warm_budget_bytes: None,
+                helper_cpu_millis: None,
+                helper_memory_mib: None,
             }),
             github_webhook_secret: None,
             forgejo_webhook_secret: None,
