@@ -32,7 +32,7 @@
 //! | `SCARAB_WORKSPACE_WARM_BUDGET_BYTES` | env | warm-tier space bound (git-bug cba7165): over it the Depot's LRU sweep evicts. Unset = 90% of the warm volume's `statvfs` capacity — right on a dedicated PVC, **effectively unbounded on a shared disk** (a dev machine), which is why `deploy/local-proc` sets one explicitly. Only meaningful under `--role workspace` |
 //! | `SCARAB_WSFETCH_IMAGE` | env | the workspace **helper** image every workspace Step Pod carries (ADR-0061): the fetch init container (s3-feed) AND the egress hold/drain sidecar (`scarab-wsfetch hold` / the in-Pod `drain` the control plane execs); default `ghcr.io/thulasi-ram/scarab-wsfetch:edge`. ADR-0062 stage 2 replaces only the **eager-fetch** role; the egress role survives it — the old "dies with the node driver" note (git-bug 0628369) applied to the fetch role alone and is closed as superseded |
 //! | `SCARAB_WSFETCH_CPU_MILLIS` | env | requests==limits CPU (millicpu) for BOTH wsfetch helper containers (ticket 16a7768). Default unset — a CPU limit throttles the drain's hashing. `0` = explicitly unset |
-//! | `SCARAB_WSFETCH_MEMORY_MIB` | env | requests==limits memory (MiB) for both wsfetch helper containers; default 512. Also derives the helper's transfer byte budget (half the limit, `SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES` on the containers) so the limit and the in-flight cap move on one knob. The helper whole-reads each file: a single workspace file approaching the limit needs it raised. `0` opts out of the limit AND the derived budget |
+//! | `SCARAB_WSFETCH_MEMORY_MIB` | env | requests==limits memory (MiB) for both wsfetch helper containers; **default unset — opt-in** (a defaulted limit could OOM-loop a workspace holding one file above it). When set it also derives the helper's transfer byte budget (half the limit, `SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES` on the containers) so the limit and the in-flight cap move on one knob; unset, the wsfetch binary's own 256 MiB budget still bounds transfer memory. The helper whole-reads each file: a single workspace file approaching a configured limit needs it raised. `0` = explicitly unset |
 //! | `SCARAB_GITHUB_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/github` |
 //! | `SCARAB_FORGEJO_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/forgejo` (ADR-0046 — each forge endpoint binds its own secret) |
 //! | `SCARAB_GATE_TOKEN_SECRET` | env | enables external-gate release tokens (ADR-0034) |
@@ -259,12 +259,17 @@ pub struct WorkspaceServiceConfig {
     /// the liveness bound.
     pub helper_cpu_millis: Option<u32>,
     /// Requests==limits memory (MiB) for both wsfetch helper containers.
-    /// Default 512. Also derives the helper's transfer byte budget (HALF the
-    /// limit — `SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES`), so the k8s limit
-    /// and the client's in-flight byte cap move on one knob. Residual,
-    /// disclosed: the helper whole-reads each file, so a single workspace
-    /// file approaching the limit needs it raised. `None` (= env `0`) opts
-    /// out of both the limit and the derived budget's coupling.
+    /// **Default unset — the limit is OPT-IN** (e140121 review fix: a
+    /// defaulted-on 512Mi limit was a behavior change that could OOM-loop a
+    /// workspace holding a single >512Mi file; a kill mechanism must be the
+    /// operator's explicit choice). When set it also derives the helper's
+    /// transfer byte budget (HALF the limit —
+    /// `SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES`), so the k8s limit and the
+    /// client's in-flight byte cap move on one knob. Unset, the client's own
+    /// 256 MiB default budget still bounds transfer memory — it just has no
+    /// kill attached. Residual, disclosed: the helper whole-reads each file,
+    /// so a single workspace file approaching a configured limit needs it
+    /// raised. `None` (= env unset or `0`) = no limit, no derived budget.
     pub helper_memory_mib: Option<u32>,
 }
 
@@ -949,14 +954,16 @@ impl Config {
                     None => None,
                 },
                 // Helper container resources (ticket 16a7768 item 1),
-                // requests==limits on both wsfetch containers. Memory
-                // defaults to 512Mi and derives the transfer byte budget;
-                // `0` opts an axis out explicitly.
+                // requests==limits on both wsfetch containers. BOTH axes are
+                // opt-in (e140121 review fix): an unconfigured deployment
+                // keeps the pre-ticket Pod shape byte for byte — no limits,
+                // no derived budget env; the wsfetch binary's own 256 MiB
+                // transfer budget still bounds memory, without a kill.
                 helper_cpu_millis: helper_axis(env("SCARAB_WSFETCH_CPU_MILLIS"), None)
                     .map_err(|raw| {
                         ConfigError::InvalidWsfetchResource("SCARAB_WSFETCH_CPU_MILLIS", raw)
                     })?,
-                helper_memory_mib: helper_axis(env("SCARAB_WSFETCH_MEMORY_MIB"), Some(512))
+                helper_memory_mib: helper_axis(env("SCARAB_WSFETCH_MEMORY_MIB"), None)
                     .map_err(|raw| {
                         ConfigError::InvalidWsfetchResource("SCARAB_WSFETCH_MEMORY_MIB", raw)
                     })?,
@@ -1618,6 +1625,49 @@ mod tests {
         let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(&[])).unwrap();
         assert!(cfg.github_app_pem.is_none());
         assert!(cfg.github_app_pem_file.is_none());
+    }
+
+    /// The wsfetch helper k8s limits are OPT-IN (e140121 review fix on ticket
+    /// 16a7768): an unconfigured deployment gets NO requests/limits and no
+    /// derived budget env — the pre-ticket Pod shape byte for byte — because
+    /// a defaulted-on 512Mi limit could OOM-loop any workspace holding one
+    /// file above it. Memory bounding without a kill stays: the wsfetch
+    /// binary's own 256 MiB transfer budget is client-side and unconditional.
+    /// Setting the env opts in; `0` explicitly opts out; garbage refuses.
+    #[test]
+    fn wsfetch_helper_limits_are_opt_in_not_defaulted() {
+        let ws = |extra: &'static [(&'static str, &'static str)]| {
+            let mut base = vec![("SCARAB_WORKSPACE_TOKEN_SECRET", "s3cret")];
+            base.extend_from_slice(extra);
+            let leaked: &'static [(&'static str, &'static str)] = Box::leak(base.into_boxed_slice());
+            Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(leaked))
+                .unwrap()
+                .workspace
+                .unwrap()
+        };
+        let unset = ws(&[]);
+        assert_eq!(unset.helper_memory_mib, None, "memory limit is opt-in");
+        assert_eq!(unset.helper_cpu_millis, None, "cpu limit is opt-in");
+
+        let set = ws(&[
+            ("SCARAB_WSFETCH_MEMORY_MIB", "512"),
+            ("SCARAB_WSFETCH_CPU_MILLIS", "0"),
+        ]);
+        assert_eq!(set.helper_memory_mib, Some(512), "the operator opted in");
+        assert_eq!(set.helper_cpu_millis, None, "0 = explicitly unset");
+
+        let err = Config::resolve_from(
+            &cli(Some("postgres://l/scarab")),
+            dev_env(&[
+                ("SCARAB_WORKSPACE_TOKEN_SECRET", "s3cret"),
+                ("SCARAB_WSFETCH_MEMORY_MIB", "lots"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("SCARAB_WSFETCH_MEMORY_MIB"),
+            "{err}"
+        );
     }
 
     #[test]
