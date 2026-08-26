@@ -2142,6 +2142,13 @@ impl<'a> Scheduler<'a> {
                             .put_artifacts(&run, &step, &attempt, true, &artifacts, now)
                             .await?;
                     }
+                    // Keyed-cache saves (ADR-0065 s1): upsert the key→root
+                    // mapping, best-effort BOTH ways — a read or upsert
+                    // failure never fails the step (the drain already treats
+                    // cache-only bytes as unpromised). PR-context runs never
+                    // write (dbe05e5 amendment #1).
+                    self.record_cache_saves(&run, &step, &attempt, &handle)
+                        .await;
                     self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
@@ -2215,6 +2222,51 @@ impl<'a> Scheduler<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Settle-time cache recording (ADR-0065 s1): upsert each reported save
+    /// into the `cache_entries` mapping. **Best-effort both ways** — nothing
+    /// here may fail the step: a save is an optimisation hint, and the drain
+    /// already treats cache-only bytes as unpromised.
+    ///
+    /// Write scope (dbe05e5 amendment #1): DENIED for any pull-request
+    /// context, fork or not — a PR head must not poison the mapping other
+    /// runs restore from, while push/tag/manual writes add no capability
+    /// (push rights already imply pipeline-edit rights). An error answering
+    /// the PR question fails CLOSED for the write. Reads stay open to every
+    /// context, forks included.
+    async fn record_cache_saves(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        handle: &ExecHandle,
+    ) {
+        let saves = match self.executor.cache_saves(handle).await {
+            Ok(Some(saves)) => saves,
+            _ => return,
+        };
+        if saves.key.is_empty() || saves.roots.is_empty() {
+            return;
+        }
+        match self.db.run_pr_context(run).await {
+            Ok(false) => {}
+            // PR context, or unanswerable: no write. Fail-closed is safe —
+            // the only cost is a cold cache.
+            _ => return,
+        }
+        let project = match self.db.run_project(run).await {
+            Ok(Some(p)) if !p.is_empty() => p,
+            _ => return,
+        };
+        let now = self.clock.now().await;
+        for (dir, root) in &saves.roots {
+            // Per-row best-effort: one failed upsert must not lose the rest.
+            let _ = self
+                .db
+                .cache_record(&project, &saves.key, dir, root, run, step, attempt, now)
+                .await;
+        }
     }
 
     /// Launch-time cache enrichment (ADR-0065 s1): fold the cache key from

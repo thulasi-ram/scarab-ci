@@ -501,6 +501,14 @@ pub trait Db: Send + Sync {
         key: &str,
     ) -> Result<Vec<(String, String)>, DbError>;
 
+    /// Was this run triggered in a **pull-request context** (any PR, fork or
+    /// not — from the ADR-0057 origin facts)? Gates cache-entry WRITES
+    /// (dbe05e5 amendment #1): push rights already imply pipeline-edit
+    /// rights, so branch-push writes add no capability, but a PR head — even
+    /// a same-repo one — must not poison the mapping other runs restore from.
+    /// Reads stay allowed for every context, forks included.
+    async fn run_pr_context(&self, run: &RunId) -> Result<bool, DbError>;
+
     /// How many runs are in-flight (started, not terminal). With `project`,
     /// scoped to that project (fairness cap); without, the global count
     /// (backpressure).
@@ -930,6 +938,24 @@ pub trait Executor: Send + Sync {
     /// every uploaded artifact of the executor it wraps (98ea804).
     async fn artifacts(&self, _handle: &ExecHandle) -> Result<Vec<crate::ArtifactMeta>, ExecError> {
         Ok(Vec::new())
+    }
+
+    /// The **cache saves** a finished execution reported (ADR-0065 s1): the
+    /// launch-resolved cache key plus each declared-and-present cache dir's
+    /// subtree root, as verified by the Depot against the fence's own write
+    /// ledger. The scheduler upserts these into the `cache_entries` mapping
+    /// best-effort on success. Default `None` — a backend with no cache
+    /// support (the local executor: parity explicitly deferred) saves
+    /// nothing, harmlessly.
+    ///
+    /// A **decorator** MUST forward this: the `None` default silently drops
+    /// every save of the executor it wraps (the same evidence-drop shape as
+    /// [`artifacts`](Self::artifacts), 98ea804).
+    async fn cache_saves(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<crate::CacheSaves>, ExecError> {
+        Ok(None)
     }
 
     /// Open a best-effort **live tail** of the unit's stdout/stderr for `step`,

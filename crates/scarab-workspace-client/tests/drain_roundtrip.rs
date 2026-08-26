@@ -332,7 +332,7 @@ async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
     let before = h.tree_puts.load(Ordering::SeqCst);
     let report = h
         .fence_client()
-        .drain_ingest_report(path, &[])
+        .drain_ingest_report(path, &[], &[])
         .await
         .expect("drain ingest");
     assert_eq!(
@@ -367,6 +367,7 @@ async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
             have_hits: report.have_hits,
             ingest_ms: 1,
             prune_ms: 0,
+            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -376,7 +377,7 @@ async fn a_drain_re_puts_every_closure_tree_even_when_warm_already_has_them() {
     // are durable now, so `/have`'s durable answer skips every upload.
     let report2 = h
         .fence_client_for("run-1", "build", "a2")
-        .drain_ingest_report(path, &[])
+        .drain_ingest_report(path, &[], &[])
         .await
         .expect("second drain ingest");
     assert_eq!(report2.blobs_uploaded, 0, "durable blobs must dedup");
@@ -402,7 +403,7 @@ async fn a_drain_record_round_trips_ingest_prune_record_get() {
     // appended only on PUT), memo-fed prune+identity, record LAST.
     let helper = h.fence_client();
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &[])
         .await
         .expect("ingest with the fence token");
     let root: TreeHash = report.snapshot.root.clone();
@@ -424,6 +425,7 @@ async fn a_drain_record_round_trips_ingest_prune_record_get() {
         have_hits: report.have_hits,
         ingest_ms: 12,
         prune_ms: 3,
+        cache_roots: Default::default(),
         error: None,
     };
     helper
@@ -468,7 +470,7 @@ async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
 
     let helper = h.fence_client_for("run-1", "fmt/check", "a1");
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &[])
         .await
         .expect("ingest with the slash-stepped fence token");
     let rec = DrainRecord {
@@ -482,6 +484,7 @@ async fn a_drain_record_for_a_step_id_containing_a_slash_round_trips() {
         have_hits: report.have_hits,
         ingest_ms: 1,
         prune_ms: 0,
+        cache_roots: Default::default(),
         error: None,
     };
     helper
@@ -528,7 +531,7 @@ async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
     build_workspace(ws.path());
     let helper = a.fence_client();
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &[])
         .await
         .expect("drain ingest against replica A");
     let root = report.snapshot.root.0.clone();
@@ -543,6 +546,7 @@ async fn a_drain_recorded_through_one_replica_is_readable_through_another() {
         have_hits: report.have_hits,
         ingest_ms: 5,
         prune_ms: 1,
+        cache_roots: Default::default(),
         error: None,
     };
     helper
@@ -668,7 +672,7 @@ async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_addres
     // The drain exactly as `scarab-wsfetch drain` composes it.
     let helper = a.fence_client();
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared, &[])
         .await
         .expect("drain ingest with labels");
     let memo = MemoCas::new(&helper, report.trees);
@@ -690,6 +694,7 @@ async fn a_pruned_drain_packs_its_closure_and_a_cold_replica_serves_every_addres
             have_hits: report.have_hits,
             ingest_ms: 7,
             prune_ms: 2,
+            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -810,7 +815,7 @@ async fn have_answers_the_durable_index_identically_across_replicas() {
 
     let helper = a.fence_client();
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared, &[])
         .await
         .expect("drain ingest with labels");
     let memo = MemoCas::new(&helper, report.trees);
@@ -829,6 +834,7 @@ async fn have_answers_the_durable_index_identically_across_replicas() {
             have_hits: report.have_hits,
             ingest_ms: 1,
             prune_ms: 0,
+            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -917,7 +923,7 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
 
     let helper = h.fence_client_for("run-9", "pack-order", "a1");
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &[])
         .await
         .expect("drain ingest, everything durable");
 
@@ -1025,6 +1031,7 @@ async fn pack_bytes_land_strictly_before_any_index_row() {
             have_hits: report.have_hits,
             ingest_ms: 3,
             prune_ms: 0,
+            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -1213,7 +1220,7 @@ async fn a_scattered_drain_commits_through_one_replica() {
     // `scarab-wsfetch drain` composes it.
     let helper = a.fence_client_for("run-sc", "build", "a1");
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared, &[])
         .await
         .expect("drain ingest through replica A");
     assert!(
@@ -1237,6 +1244,7 @@ async fn a_scattered_drain_commits_through_one_replica() {
             have_hits: report.have_hits,
             ingest_ms: 4,
             prune_ms: 1,
+            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -1319,7 +1327,7 @@ async fn a_drain_whose_puts_all_landed_elsewhere_commits_through_a_cold_replica(
     // The whole drain's bytes go through replica B.
     let helper_b = b.fence_client_for("run-tree", "build", "a1");
     let report = helper_b
-        .drain_ingest_report(ws.path().to_str().unwrap(), &[])
+        .drain_ingest_report(ws.path().to_str().unwrap(), &[], &[])
         .await
         .expect("drain ingest through replica B");
     let root = report.snapshot.root.0.clone();
@@ -1351,6 +1359,7 @@ async fn a_drain_whose_puts_all_landed_elsewhere_commits_through_a_cold_replica(
             have_hits: report.have_hits,
             ingest_ms: 2,
             prune_ms: 0,
+            cache_roots: Default::default(),
             error: None,
         })
         .await
@@ -1475,7 +1484,7 @@ async fn a_mid_flight_scattered_drain_survives_both_reclaim_passes() {
     // The drain completes through replica A, deduping against B's staging.
     let helper = a.fence_client_for("run-rec", "build", "a1");
     let report = helper
-        .drain_ingest_report(ws.path().to_str().unwrap(), &declared)
+        .drain_ingest_report(ws.path().to_str().unwrap(), &declared, &[])
         .await
         .expect("drain ingest through replica A");
     let memo = MemoCas::new(&helper, report.trees);
@@ -1494,6 +1503,7 @@ async fn a_mid_flight_scattered_drain_survives_both_reclaim_passes() {
             have_hits: report.have_hits,
             ingest_ms: 4,
             prune_ms: 1,
+            cache_roots: Default::default(),
             error: None,
         })
         .await

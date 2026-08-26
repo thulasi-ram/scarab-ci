@@ -96,8 +96,8 @@ use std::os::unix::fs::PermissionsExt;
 
 use scarab_storage::{PruneError, StorageError, TreeHash};
 use scarab_workspace_client::{
-    DrainErrorKind, DrainErrorRecord, DrainPostOutcome, DrainRecord, IngestReport, MemoCas,
-    WorkspaceClient,
+    exclude_paths, DrainErrorKind, DrainErrorRecord, DrainPostOutcome, DrainRecord, IngestReport,
+    MemoCas, WorkspaceClient,
 };
 
 /// The env var naming the tmpfs file holding the workspace token. Must agree
@@ -498,6 +498,7 @@ fn env_or(key: &str, default: &str) -> String {
 fn drain_main(args: &[String]) -> i32 {
     let mut workspace = env_or(TARGET_ENV, DEFAULT_TARGET);
     let mut outputs: Vec<String> = Vec::new();
+    let mut cache_dirs: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -512,6 +513,13 @@ fn drain_main(args: &[String]) -> i32 {
                 Some(v) => outputs.push(v.clone()),
                 None => {
                     eprintln!("scarab-wsfetch: drain: --outputs needs a value");
+                    return EXIT_DRAIN_TRANSIENT;
+                }
+            },
+            "--cache-dirs" => match it.next() {
+                Some(v) => cache_dirs.push(v.clone()),
+                None => {
+                    eprintln!("scarab-wsfetch: drain: --cache-dirs needs a value");
                     return EXIT_DRAIN_TRANSIENT;
                 }
             },
@@ -557,10 +565,15 @@ fn drain_main(args: &[String]) -> i32 {
             return EXIT_DRAIN_TRANSIENT;
         }
     };
-    runtime.block_on(run_drain(&client, &workspace, &outputs))
+    runtime.block_on(run_drain(&client, &workspace, &outputs, &cache_dirs))
 }
 
-async fn run_drain(client: &WorkspaceClient, workspace: &str, outputs: &[String]) -> i32 {
+async fn run_drain(
+    client: &WorkspaceClient,
+    workspace: &str,
+    outputs: &[String],
+    cache_dirs: &[String],
+) -> i32 {
     let t_ingest = std::time::Instant::now();
     // EACCES/EPERM anywhere in the walk surfaces HERE as a hard error — the
     // scan propagates every read_dir/read/metadata failure, it never skips a
@@ -570,7 +583,7 @@ async fn run_drain(client: &WorkspaceClient, workspace: &str, outputs: &[String]
     // The DRAIN variant: trees are PUT unconditionally so every tree of the
     // closure enters this fence's write ledger (only a PUT appends it), or
     // the record POST below would 422 on any incremental workspace.
-    let report = match client.drain_ingest_report(workspace, outputs).await {
+    let report = match client.drain_ingest_report(workspace, outputs, cache_dirs).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("scarab-wsfetch: drain: ingest {workspace}: {e}");
@@ -586,12 +599,14 @@ async fn run_drain(client: &WorkspaceClient, workspace: &str, outputs: &[String]
         blobs_uploaded,
         bytes_uploaded,
         have_hits,
+        cache_roots,
     } = report;
     println!(
         "scarab-wsfetch: drain — ingested {workspace}: root={} files={files} \
          blobs_uploaded={blobs_uploaded} bytes_uploaded={bytes_uploaded} \
-         have_hits={have_hits} ingest_ms={ingest_ms}",
-        snapshot.root.0
+         have_hits={have_hits} ingest_ms={ingest_ms} cache_saved={}",
+        snapshot.root.0,
+        cache_roots.len()
     );
 
     // Prune + identity IN-PROCESS: tree read-backs come from the scan's own
@@ -601,7 +616,34 @@ async fn run_drain(client: &WorkspaceClient, workspace: &str, outputs: &[String]
     // posted record names.
     let memo = MemoCas::new(client, trees);
     let t_prune = std::time::Instant::now();
-    let (pruned_root, identity) = if outputs.is_empty() {
+    let (pruned_root, identity) = if outputs.is_empty() && !cache_dirs.is_empty() {
+        // No declared outputs, but cache dirs (ADR-0065 s1): the published
+        // root is the full snapshot with the cache dirs EXCLUDED — a cached
+        // dir flows via the cache, not via the workspace. The exclusion runs
+        // over the memo, so the minted parents are real writes: warm and this
+        // fence's write ledger hold everything the record names (that is
+        // what lets `pruned_root` validate).
+        let excluded = match exclude_paths(&memo, &snapshot.root, cache_dirs).await {
+            Ok(excluded) => excluded,
+            Err(e) => {
+                eprintln!("scarab-wsfetch: drain: cache exclusion: {e}");
+                return EXIT_DRAIN_TRANSIENT;
+            }
+        };
+        if excluded == snapshot.root {
+            // No declared dir was actually present — nothing was excluded.
+            (None, snapshot.identity.as_ref().map(|t| t.0.clone()))
+        } else {
+            let identity = match scarab_storage::content_identity(&memo, &excluded).await {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("scarab-wsfetch: drain: excluded identity: {e}");
+                    return EXIT_DRAIN_TRANSIENT;
+                }
+            };
+            (Some(excluded.0), Some(identity.0))
+        }
+    } else if outputs.is_empty() {
         // `ingest` folded the identity for free; nothing to walk.
         (None, snapshot.identity.as_ref().map(|t| t.0.clone()))
     } else {
@@ -628,6 +670,8 @@ async fn run_drain(client: &WorkspaceClient, workspace: &str, outputs: &[String]
                         have_hits,
                         ingest_ms,
                         prune_ms: t_prune.elapsed().as_millis() as u64,
+                        // An error record publishes nothing — no saves either.
+                        cache_roots: Default::default(),
                         error: Some(DrainErrorRecord {
                             kind: DrainErrorKind::OutputContract,
                             detail: detail.clone(),
@@ -670,6 +714,12 @@ async fn run_drain(client: &WorkspaceClient, workspace: &str, outputs: &[String]
         have_hits,
         ingest_ms,
         prune_ms,
+        // The saves (ADR-0065 s1): declared dir → its subtree root, present
+        // dirs only. Every one of these trees was PUT by this drain (the
+        // drain PUTs all scan trees unconditionally), so they are in this
+        // fence's write ledger by construction — the Depot 422s a record
+        // naming one that is not.
+        cache_roots,
         error: None,
     };
     // Retried in-process ONLY on the Depot's machine-readable

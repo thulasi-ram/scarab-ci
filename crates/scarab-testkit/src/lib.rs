@@ -805,6 +805,16 @@ impl Db for InMemoryDb {
             .and_then(|o| o.5.clone()))
     }
 
+    async fn run_pr_context(&self, run: &RunId) -> Result<bool, DbError> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap()
+            .run_origin
+            .get(run)
+            .is_some_and(|o| o.0 == "pull_request" || o.4.is_some()))
+    }
+
     async fn cache_record(
         &self,
         project: &str,
@@ -1761,6 +1771,9 @@ struct FakeExecState {
     /// the harvest the backend reports back once the blobs are in the object
     /// store, which the orchestrator must durably index.
     artifacts: HashMap<String, Vec<scarab_engine::ArtifactMeta>>,
+    /// Cache saves (ADR-0065 s1) each *step* reports on success, keyed by
+    /// step id — what `Executor::cache_saves` answers.
+    cache_saves: HashMap<String, scarab_engine::CacheSaves>,
     /// The most recent spec each handle was launched with — lets a test assert
     /// launch-time interpolation (ADR-0041) rewrote `${{ … }}` before launch.
     launched_specs: HashMap<String, StepSpec>,
@@ -1846,6 +1859,16 @@ impl FakeExecutor {
         st.outputs.insert(step.to_string(), identity.to_string());
         st.identities.insert(step.to_string(), identity.to_string());
         st.churning_roots.insert(step.to_string());
+    }
+
+    /// The cache saves `step` (by id) reports on success (ADR-0065 s1) — what
+    /// `Executor::cache_saves` answers for any of that step's attempts.
+    pub fn set_cache_saves(&self, step: &str, saves: scarab_engine::CacheSaves) {
+        self.inner
+            .lock()
+            .unwrap()
+            .cache_saves
+            .insert(step.to_string(), saves);
     }
 
     /// The content identity `step` reports, independently of its root. Use this
@@ -2052,6 +2075,16 @@ impl Executor for FakeExecutor {
             return Ok(None);
         };
         Ok(self.inner.lock().unwrap().identities.get(&step).cloned())
+    }
+
+    async fn cache_saves(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::CacheSaves>, ExecError> {
+        let Some((step, _)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        Ok(self.inner.lock().unwrap().cache_saves.get(&step).cloned())
     }
 
     async fn results(

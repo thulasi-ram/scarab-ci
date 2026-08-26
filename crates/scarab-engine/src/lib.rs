@@ -538,6 +538,18 @@ pub struct CacheConfig {
     pub restore: Vec<(String, String)>,
 }
 
+/// One settled Step's **cache saves** (ADR-0065 s1), read back from the
+/// backend by [`Executor::cache_saves`]: the key the launch resolved and each
+/// declared-and-present cache dir's drained subtree root. The scheduler turns
+/// these into best-effort `cache_entries` upserts — a failed upsert logs and
+/// never fails the step.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSaves {
+    pub key: String,
+    /// dir → subtree root, present dirs only.
+    pub roots: std::collections::BTreeMap<String, String>,
+}
+
 /// The launch context of a `kind: build` step (ADR-0018): what to build
 /// (workspace-relative context/dockerfile) and the image tag to build and
 /// optionally push.

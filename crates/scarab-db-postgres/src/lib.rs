@@ -990,6 +990,21 @@ impl Db for PostgresDb {
         Ok(())
     }
 
+    async fn run_pr_context(&self, run: &RunId) -> Result<bool, DbError> {
+        let row = sqlx::query(
+            "SELECT origin_trigger_kind, origin_pr_number FROM runs WHERE id = $1",
+        )
+        .bind(&run.0)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(row.is_some_and(|r| {
+            r.get::<Option<String>, _>("origin_trigger_kind")
+                .is_some_and(|k| k == "pull_request")
+                || r.get::<Option<i64>, _>("origin_pr_number").is_some()
+        }))
+    }
+
     async fn cache_lookup(
         &self,
         project: &str,

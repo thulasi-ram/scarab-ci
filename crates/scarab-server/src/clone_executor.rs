@@ -219,6 +219,16 @@ impl Executor for CloneEnrichingExecutor {
         self.inner.artifacts(handle).await
     }
 
+    async fn cache_saves(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::CacheSaves>, ExecError> {
+        // Same forward-or-drop hazard as `artifacts` (ADR-0065 s1): the trait
+        // default answers `None`, which would silently drop every cache save
+        // of the wrapped executor.
+        self.inner.cache_saves(handle).await
+    }
+
     async fn log_stream(&self, step: &StepRun) -> Result<Option<Box<dyn LogChunks>>, ExecError> {
         self.inner.log_stream(step).await
     }

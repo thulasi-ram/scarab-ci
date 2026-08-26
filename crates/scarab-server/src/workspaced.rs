@@ -3140,6 +3140,15 @@ pub struct DrainRecord {
     pub have_hits: u64,
     pub ingest_ms: u64,
     pub prune_ms: u64,
+    /// Keyed-cache saves (ADR-0065 s1): declared cache dir → its subtree
+    /// root. Additive, serde-defaulted (the 212bb13 wire rule) — an older
+    /// helper posts none. Every named root must be in the posting fence's
+    /// OWN write ledger or the whole drain is refused 422 (dbe05e5 amendment
+    /// #3): a root the fence never PUT is a forged mapping (cache poisoning
+    /// with a foreign hash) or a serious client bug, and integrity is never
+    /// best-effort.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cache_roots: std::collections::BTreeMap<String, String>,
     /// Absent = success. A success record is write-once (`409` on a second
     /// POST); an error record may be overwritten by any later POST.
     #[serde(default)]
@@ -3471,6 +3480,29 @@ async fn post_drain(
                     "pruned_root {pruned} is not in this fence's write ledger"
                 )));
             }
+        }
+        // Cache saves (ADR-0065 s1, dbe05e5 amendment #3): every reported
+        // cache root must be in this fence's OWN write ledger — the drain
+        // PUTs all scan trees unconditionally, so a legitimate client
+        // satisfies this by construction. A root that is NOT ledgered is a
+        // forged mapping attempt (poisoning a key with a foreign tree the
+        // client merely learned the hash of) or a serious client bug; both
+        // fail the WHOLE drain loudly. Integrity is never best-effort —
+        // availability is. Normalized into the record like the roots above,
+        // so the persisted record and the CP's upsert see bare hex.
+        {
+            let mut normalized = std::collections::BTreeMap::new();
+            for (dir, root) in std::mem::take(&mut record.cache_roots) {
+                let root = valid_address(&root)?;
+                if !ledger.contains(&root) {
+                    return Ok(refusal(format!(
+                        "cache root {root} (dir `{dir}`) is not in this fence's \
+                         write ledger"
+                    )));
+                }
+                normalized.insert(dir, root);
+            }
+            record.cache_roots = normalized;
         }
         let effective = record.pruned_root.as_deref().unwrap_or(&record.root);
         match validate_drain_closure(&state, &ledger, effective, &fence_key(&fence)).await? {
