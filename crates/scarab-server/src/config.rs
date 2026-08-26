@@ -36,7 +36,8 @@
 //! | `SCARAB_OIDC_ISSUER` | env | enables the OIDC issuer (keyless federation, ADR-0015) |
 //! | `SCARAB_OIDC_SIGNING_KEY_FILE` | env | PKCS#8 RSA PEM the issuer signs with — **required** when the issuer is enabled (persistent across restarts/replicas) |
 //! | `SCARAB_OIDC_AUDIENCE` | env | `aud` of minted per-run tokens (ADR-0015); default `scarab` |
-//! | `SCARAB_MASTER_KEY` | env | base64 32-byte KEK for envelope encryption (ADR-0014) — **required** unless `SCARAB_DEV_INSECURE=1` |
+//! | `SCARAB_MASTER_KEYS` | env | comma-separated base64 32-byte KEKs for envelope encryption; **first = active writer**, the rest decrypt-only (rotation, git-bug f37463a). Authoritative when set |
+//! | `SCARAB_MASTER_KEY` | env | legacy single KEK ≡ a one-key list (ADR-0014) — one of the two is **required** unless `SCARAB_DEV_INSECURE=1`. When both are set the list wins; a legacy key that is not a list member refuses to boot |
 //! | `SCARAB_DEV_INSECURE` | env | `1`/`true`: downgrade the **security** hard-fails (KEK, auth) to loud boot warnings — dev only, never relaxes the Postgres requirement |
 //! | `SCARAB_STEP_TIMEOUT_SECS` | env | global default step deadline (ADR-0047); default 3600 (1h), per-step overridable via `timeout:` |
 //! | `SCARAB_PUBLIC_URL` | env | Scarab's public base URL — the run deep-link every forge status carries (ADR-0046); default `http://localhost:8080` (dev) |
@@ -383,10 +384,15 @@ pub struct Config {
     pub forgejo_webhook_secret: Option<Vec<u8>>,
     pub gate_token_secret: Option<Vec<u8>>,
     pub oidc: Option<OidcConfig>,
-    /// The envelope-encryption KEK (`SCARAB_MASTER_KEY`). `None` only under
-    /// `SCARAB_DEV_INSECURE=1` — the composition root generates a loud
-    /// ephemeral key.
-    pub master_key: Option<[u8; 32]>,
+    /// The envelope-encryption KEKs (`SCARAB_MASTER_KEYS`, first = active
+    /// writer, rest decrypt-only; legacy `SCARAB_MASTER_KEY` ≡ a one-key
+    /// list). `None` only under `SCARAB_DEV_INSECURE=1` — the composition
+    /// root generates a loud ephemeral key.
+    pub master_keys: Option<Vec<[u8; 32]>>,
+    /// Non-fatal master-key configuration notes (e.g. a redundant legacy
+    /// `SCARAB_MASTER_KEY` naming a non-active list member), surfaced via
+    /// [`Config::boot_warnings`]. Fingerprints only, never key material.
+    pub master_key_warnings: Vec<String>,
     /// `SCARAB_DEV_INSECURE=1`: the one loud escape hatch, for *security*
     /// hard-fails only (ADR-0048). Never the silent default.
     pub dev_insecure: bool,
@@ -491,7 +497,7 @@ pub struct OAuthConfig {
 
 /// A configuration the process must refuse to start under, with a message
 /// telling the operator exactly what to fix.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigError {
     #[error(
         "SCARAB_DATABASE_URL is not set. Postgres is mandatory for every serving role \
@@ -518,6 +524,29 @@ pub enum ConfigError {
          not an opt-out, so this fails even under SCARAB_DEV_INSECURE=1."
     )]
     InvalidMasterKey,
+
+    #[error(
+        "SCARAB_MASTER_KEYS is set but a member is invalid — want a comma-separated list \
+         of base64 32-byte keys (`head -c 32 /dev/urandom | base64`), first = the active \
+         writer, the rest decrypt-only. A malformed list is a misconfiguration, not an \
+         opt-out, so this fails even under SCARAB_DEV_INSECURE=1."
+    )]
+    InvalidMasterKeys,
+
+    #[error(
+        "SCARAB_MASTER_KEYS contains the same key twice (fingerprint {0}) — a decrypt-only \
+         member must be a different key from the active writer; listing the active key \
+         again would fake an in-progress rotation."
+    )]
+    DuplicateMasterKey(String),
+
+    #[error(
+        "SCARAB_MASTER_KEY (fingerprint {legacy}) is set but is NOT a member of \
+         SCARAB_MASTER_KEYS (configured: [{configured}]) — that is a genuinely ambiguous \
+         key posture. The list is authoritative: add the legacy key to it (decrypt-only \
+         position) or drop SCARAB_MASTER_KEY."
+    )]
+    ConflictingMasterKeys { legacy: String, configured: String },
 
     #[error(
         "SCARAB_S3_BUCKET is set but SCARAB_S3_ACCESS_KEY / SCARAB_S3_SECRET_KEY are \
@@ -635,24 +664,71 @@ impl Config {
             Some("1") | Some("true") | Some("TRUE") | Some("True")
         );
 
-        // KEK: a *missing* key is downgradable to a loud ephemeral (dev); a
+        // KEKs (git-bug f37463a): `SCARAB_MASTER_KEYS` is the rotation-aware
+        // list (first = active writer, rest decrypt-only) and is AUTHORITATIVE
+        // when set; legacy `SCARAB_MASTER_KEY` alone is a one-key list. A
+        // *missing* key is downgradable to a loud ephemeral (dev); a
         // *malformed* key is a misconfiguration and always refuses.
-        let master_key = match env("SCARAB_MASTER_KEY").filter(|v| !v.is_empty()) {
-            Some(b64) => {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(b64.trim())
-                    .map_err(|_| ConfigError::InvalidMasterKey)?;
-                let key: [u8; 32] = bytes
-                    .try_into()
-                    .map_err(|_| ConfigError::InvalidMasterKey)?;
-                Some(key)
+        let decode_master = |b64: &str, err: ConfigError| -> Result<[u8; 32], ConfigError> {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .map_err(|_| err.clone())?;
+            bytes.try_into().map_err(|_| err)
+        };
+        let mut master_key_warnings = Vec::new();
+        let list_var = env("SCARAB_MASTER_KEYS").filter(|v| !v.trim().is_empty());
+        let legacy_var = env("SCARAB_MASTER_KEY").filter(|v| !v.is_empty());
+        let master_keys = match list_var {
+            Some(list) => {
+                let mut keys: Vec<[u8; 32]> = Vec::new();
+                let mut fps: Vec<String> = Vec::new();
+                for member in list.split(',') {
+                    let member = member.trim();
+                    if member.is_empty() {
+                        return Err(ConfigError::InvalidMasterKeys);
+                    }
+                    let key = decode_master(member, ConfigError::InvalidMasterKeys)?;
+                    let fp = scarab_secrets_postgres::fingerprint(&key);
+                    if fps.contains(&fp) {
+                        return Err(ConfigError::DuplicateMasterKey(fp));
+                    }
+                    keys.push(key);
+                    fps.push(fp);
+                }
+                // Legacy var alongside the list: the LIST is authoritative.
+                // A legacy key that is a member is redundant (warn when it is
+                // not the active writer — the operator may believe it still
+                // writes); a non-member is true ambiguity and refuses.
+                if let Some(b64) = legacy_var {
+                    let legacy = decode_master(&b64, ConfigError::InvalidMasterKey)?;
+                    let legacy_fp = scarab_secrets_postgres::fingerprint(&legacy);
+                    match fps.iter().position(|f| *f == legacy_fp) {
+                        Some(0) => {}
+                        Some(_) => master_key_warnings.push(format!(
+                            "⚠ SCARAB_MASTER_KEY (fingerprint {legacy_fp}) names a NON-active \
+                             member of SCARAB_MASTER_KEYS — the list is authoritative and its \
+                             first key ({}) is the writer; drop SCARAB_MASTER_KEY",
+                            fps[0],
+                        )),
+                        None => {
+                            return Err(ConfigError::ConflictingMasterKeys {
+                                legacy: legacy_fp,
+                                configured: fps.join(", "),
+                            })
+                        }
+                    }
+                }
+                Some(keys)
             }
-            None if dev_insecure => None,
-            // Same carve-out, same reason: the workspace service decrypts
-            // nothing. It never constructs a `SecretProvider`, so a KEK there
-            // would be a key nothing uses.
-            None if !cli.role.needs_durable_core() => None,
-            None => return Err(ConfigError::MissingMasterKey),
+            None => match legacy_var {
+                Some(b64) => Some(vec![decode_master(&b64, ConfigError::InvalidMasterKey)?]),
+                None if dev_insecure => None,
+                // Same carve-out, same reason: the workspace service decrypts
+                // nothing. It never constructs a `SecretProvider`, so a KEK
+                // there would be a key nothing uses.
+                None if !cli.role.needs_durable_core() => None,
+                None => return Err(ConfigError::MissingMasterKey),
+            },
         };
 
         let store = match env("SCARAB_S3_BUCKET") {
@@ -844,7 +920,8 @@ impl Config {
             forgejo_webhook_secret: env("SCARAB_FORGEJO_WEBHOOK_SECRET").map(String::into_bytes),
             gate_token_secret: env("SCARAB_GATE_TOKEN_SECRET").map(String::into_bytes),
             oidc,
-            master_key,
+            master_keys,
+            master_key_warnings,
             dev_insecure,
             step_timeout_secs,
             public_url: env("SCARAB_PUBLIC_URL")
@@ -897,14 +974,14 @@ impl Config {
     /// The loud boot warnings the dev escape hatch trades hard-fails for
     /// (ADR-0048): insecure is opt-in and screaming, never silent.
     pub fn boot_warnings(&self) -> Vec<String> {
-        let mut warnings = Vec::new();
+        let mut warnings = self.master_key_warnings.clone();
         if self.dev_insecure {
             warnings.push(
                 "⚠ AUTH DISABLED — no authenticator; ALL callers are treated as Owner \
                  (SCARAB_DEV_INSECURE=1, dev only)"
                     .to_string(),
             );
-            if self.master_key.is_none() {
+            if self.master_keys.is_none() {
                 warnings.push(
                     "⚠ EPHEMERAL SECRET KEY — SCARAB_MASTER_KEY unset; secrets written this \
                      boot CANNOT be decrypted after a restart (SCARAB_DEV_INSECURE=1, dev only)"
@@ -979,10 +1056,17 @@ impl Config {
             ),
             format!(
                 "secrets store: enabled (envelope encryption, ADR-0014; KEK {})",
-                if self.master_key.is_some() {
-                    "persistent"
-                } else {
-                    "EPHEMERAL"
+                match &self.master_keys {
+                    Some(keys) => {
+                        let fps: Vec<String> =
+                            keys.iter().map(scarab_secrets_postgres::fingerprint).collect();
+                        format!(
+                            "active={} decrypt-only=[{}] (rotation, f37463a)",
+                            fps[0],
+                            fps[1..].join(", "),
+                        )
+                    }
+                    None => "EPHEMERAL".to_string(),
                 },
             ),
             format!(
@@ -1342,7 +1426,7 @@ mod tests {
         let config = Config::resolve_from(&cli, ws_env)
             .expect("the data-plane role needs Postgres but no KEK");
         assert_eq!(config.database_url, "postgres://scarab:pw@db/scarab");
-        assert!(config.master_key.is_none());
+        assert!(config.master_keys.is_none());
         assert_eq!(
             config.workspace.as_ref().map(|w| w.token_secret.clone()),
             Some(b"ws-secret".to_vec())
@@ -1415,7 +1499,7 @@ mod tests {
     #[test]
     fn missing_master_key_boots_ephemeral_under_dev_insecure_with_loud_warnings() {
         let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(&[])).unwrap();
-        assert!(cfg.master_key.is_none());
+        assert!(cfg.master_keys.is_none());
         let warnings = cfg.boot_warnings().join("\n");
         assert!(warnings.contains("AUTH DISABLED"), "{warnings}");
         assert!(warnings.contains("EPHEMERAL SECRET KEY"), "{warnings}");
@@ -1475,6 +1559,132 @@ mod tests {
         };
         let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
         assert_eq!(err, ConfigError::InvalidMasterKey);
+    }
+
+    // --- master-key rotation config (git-bug f37463a) -----------------------
+
+    fn b64_key(byte: u8) -> String {
+        base64::engine::general_purpose::STANDARD.encode([byte; 32])
+    }
+
+    fn fp(byte: u8) -> String {
+        scarab_secrets_postgres::fingerprint(&[byte; 32])
+    }
+
+    /// Env: dev-insecure on, plus computed (owned) master-key vars.
+    fn key_env(pairs: Vec<(&'static str, String)>) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| {
+            if k == "SCARAB_DEV_INSECURE" {
+                return Some("1".to_string());
+            }
+            pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.clone())
+        }
+    }
+
+    #[test]
+    fn master_keys_list_parses_with_the_first_member_active() {
+        let env = key_env(vec![(
+            "SCARAB_MASTER_KEYS",
+            format!("{}, {}", b64_key(2), b64_key(1)),
+        )]);
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
+        assert_eq!(cfg.master_keys, Some(vec![[2u8; 32], [1u8; 32]]));
+        assert!(cfg.master_key_warnings.is_empty());
+        // The startup report names both fingerprints, active first.
+        let report = cfg.startup_report().join("\n");
+        assert!(
+            report.contains(&format!("active={} decrypt-only=[{}]", fp(2), fp(1))),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn master_keys_rejects_malformed_or_empty_members_even_under_dev_insecure() {
+        for list in ["not-base64!!", &format!("{},", b64_key(1)), ",", " , "] {
+            let env = key_env(vec![("SCARAB_MASTER_KEYS", list.to_string())]);
+            let got = Config::resolve_from(&cli(Some("postgres://l/scarab")), env);
+            // A fully-empty value is "unset" (dev boots ephemeral); a list
+            // with a malformed/empty MEMBER refuses.
+            if list.trim().is_empty() {
+                continue;
+            }
+            assert_eq!(got.unwrap_err(), ConfigError::InvalidMasterKeys, "list={list:?}");
+        }
+    }
+
+    /// The active key listed again as a "decrypt-only" member is a duplicate:
+    /// refused by fingerprint, so a fake in-progress rotation cannot boot.
+    #[test]
+    fn master_keys_rejects_duplicate_members_including_the_active_key_relisted() {
+        let env = key_env(vec![(
+            "SCARAB_MASTER_KEYS",
+            format!("{},{},{}", b64_key(1), b64_key(2), b64_key(1)),
+        )]);
+        let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
+        assert_eq!(err, ConfigError::DuplicateMasterKey(fp(1)));
+        let msg = err.to_string();
+        assert!(msg.contains(&fp(1)), "{msg}");
+        assert!(!msg.contains(&b64_key(1)), "no key material in errors: {msg}");
+    }
+
+    /// Both vars, legacy names a NON-active member: the list is authoritative,
+    /// boot proceeds with the list's first key as the writer, and the operator
+    /// is told to drop the legacy var.
+    #[test]
+    fn legacy_var_naming_a_nonactive_member_boots_with_a_warning() {
+        let env = key_env(vec![
+            ("SCARAB_MASTER_KEYS", format!("{},{}", b64_key(2), b64_key(1))),
+            ("SCARAB_MASTER_KEY", b64_key(1)),
+        ]);
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
+        assert_eq!(cfg.master_keys, Some(vec![[2u8; 32], [1u8; 32]]));
+        let warnings = cfg.boot_warnings().join("\n");
+        assert!(warnings.contains("drop SCARAB_MASTER_KEY"), "{warnings}");
+        assert!(warnings.contains(&fp(1)), "{warnings}");
+        assert!(warnings.contains(&fp(2)), "names the actual writer: {warnings}");
+    }
+
+    /// Both vars, legacy names the ACTIVE member: harmless redundancy, no warn.
+    #[test]
+    fn legacy_var_naming_the_active_member_is_silent() {
+        let env = key_env(vec![
+            ("SCARAB_MASTER_KEYS", format!("{},{}", b64_key(2), b64_key(1))),
+            ("SCARAB_MASTER_KEY", b64_key(2)),
+        ]);
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
+        assert_eq!(cfg.master_keys, Some(vec![[2u8; 32], [1u8; 32]]));
+        assert!(cfg.master_key_warnings.is_empty());
+    }
+
+    /// Both vars, legacy key NOT a list member: true ambiguity — hard refusal
+    /// naming BOTH fingerprints (and never key material).
+    #[test]
+    fn legacy_var_outside_the_list_refuses_naming_both_fingerprints() {
+        let env = key_env(vec![
+            ("SCARAB_MASTER_KEYS", format!("{},{}", b64_key(2), b64_key(1))),
+            ("SCARAB_MASTER_KEY", b64_key(3)),
+        ]);
+        let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::ConflictingMasterKeys {
+                legacy: fp(3),
+                configured: format!("{}, {}", fp(2), fp(1)),
+            }
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&fp(3)) && msg.contains(&fp(2)) && msg.contains(&fp(1)), "{msg}");
+        assert!(!msg.contains(&b64_key(3)), "no key material in errors: {msg}");
+    }
+
+    /// The single legacy var still works: it is a one-key list.
+    #[test]
+    fn legacy_single_var_is_a_one_key_list() {
+        let env = key_env(vec![("SCARAB_MASTER_KEY", b64_key(7))]);
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), env).unwrap();
+        assert_eq!(cfg.master_keys, Some(vec![[7u8; 32]]));
+        let report = cfg.startup_report().join("\n");
+        assert!(report.contains(&format!("active={} decrypt-only=[]", fp(7))), "{report}");
     }
 
     #[test]

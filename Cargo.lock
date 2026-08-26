@@ -2796,6 +2796,7 @@ dependencies = [
  "async-trait",
  "rand 0.8.7",
  "scarab-secrets",
+ "sha2",
  "sqlx",
  "tokio",
  "tracing",
