@@ -1262,6 +1262,29 @@ async fn an_expired_input_widens_a_rerun_back_to_clone_instead_of_failing() {
             && e.produced_by == StepId("build".into())),
         "the diagnostic names which step's snapshot went missing, not just that one did"
     );
+    // The per-step WHY (git-bug 4afaa3e), on the REAL widened fixture: both
+    // ancestors are Regenerate roots (each dragged in by its own consumer),
+    // the target closes the list, and the order is executable.
+    let reasons: Vec<(&str, scarab_engine::PlanReason, Option<&str>)> = plan
+        .steps
+        .iter()
+        .map(|s| {
+            (
+                s.step.0.as_str(),
+                s.reason,
+                s.because_of.as_ref().map(|b| b.0.as_str()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            ("clone", scarab_engine::PlanReason::Regenerate, Some("build")),
+            ("build", scarab_engine::PlanReason::Regenerate, Some("test")),
+            ("test", scarab_engine::PlanReason::Target, None),
+        ],
+        "execution-ordered, each regenerate root attributed to the consumer that needs it"
+    );
 
     // Without the oracle the answer is the pre-0061 one: target + descendants
     // only. The contrast is the point — widening comes from proven absence, never
@@ -1287,7 +1310,11 @@ async fn an_expired_input_widens_a_rerun_back_to_clone_instead_of_failing() {
     )
     .await
     .unwrap();
-    assert_eq!(done.widened, plan.widened, "the executed scope is the previewed scope");
+    // Field-for-field, INCLUDING the per-step reasons: the preview and the
+    // execution are one function (`plan_rerun_over`), and this pins that no one
+    // forks the path (design 4afaa3e §5 — there must never be a second
+    // estimator to drift).
+    assert_eq!(done, plan, "the executed plan IS the previewed plan");
     for name in ["clone", "build", "test"] {
         let step = StepId(name.into());
         let s = db
