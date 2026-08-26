@@ -218,19 +218,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.workspace.as_ref().map(|ws| {
             use scarab_executor_k8s::workspace_token;
             let secret = ws.token_secret.clone();
-            Arc::new(scarab_workspace_client::WorkspaceClient::with_minted_token(
-                ws.url.clone(),
-                move || {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    workspace_token::mint(
-                        &secret,
-                        &workspace_token::browse_claims(now + BROWSE_TOKEN_TTL_SECS),
-                    )
-                },
-            ))
+            Arc::new(
+                scarab_workspace_client::WorkspaceClient::with_minted_token_tuned(
+                    ws.url.clone(),
+                    move || {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        workspace_token::mint(
+                            &secret,
+                            &workspace_token::browse_claims(now + BROWSE_TOKEN_TTL_SECS),
+                        )
+                    },
+                    // Fail FAST (ticket e140121): this client's warm reads sit
+                    // under a TieredCas that falls through to the cold tier on
+                    // `Backend`, so during a Depot outage a tight bound turns
+                    // every warm leg into a quick cold read instead of a
+                    // stalled request the whole control plane queues behind.
+                    // The in-Pod helpers keep the patient lib defaults.
+                    scarab_workspace_client::HttpTuning {
+                        connect: std::time::Duration::from_secs(2),
+                        read_idle: std::time::Duration::from_secs(10),
+                    },
+                ),
+            )
         });
 
     // The workspace `Cas` this process hands to Browse, the GC mark walk, the

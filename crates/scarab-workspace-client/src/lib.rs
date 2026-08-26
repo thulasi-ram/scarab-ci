@@ -82,9 +82,108 @@ pub const DEFAULT_TRANSFER_BYTE_BUDGET: u64 = 256 * 1024 * 1024;
 /// (`workspace.helperMemoryMib`) moves both.
 pub const TRANSFER_BYTE_BUDGET_ENV: &str = "SCARAB_WORKSPACE_TRANSFER_BUDGET_BYTES";
 
+/// The step's RESOLVED timeout in seconds, stamped by the executor onto both
+/// wsfetch helper containers (fetch init + egress) and read by `scarab-wsfetch`
+/// to size its Depot-outage retry window (ticket e140121):
+/// `clamp(timeout/10, 5s, 60s)` — proportional cost, per ADR-0066's "a Depot
+/// outage delays boundary operations, never fails them".
+///
+/// Deliberately NOT named `SCARAB_STEP_TIMEOUT_SECS`: that name is already a
+/// **server boot knob** (the operator's global DEFAULT step deadline,
+/// `scarab-server` config) with a different meaning — this one is the
+/// per-step resolved number (`spec.timeout` or that default), the same value
+/// the executor writes into `activeDeadlineSeconds`. One meaning per env var.
+///
+/// Absent (image/CP skew: an old executor driving a new image) the binary
+/// assumes 300s → a 30s window — patient enough to ride out a Depot rollout,
+/// small next to any real deadline.
+pub const STEP_TIMEOUT_ENV: &str = "SCARAB_WORKSPACE_STEP_TIMEOUT_SECS";
+
+/// `scarab-wsfetch fetch` exit codes — the wire contract the executor's
+/// classification maps from (ticket e140121). Defined here (not in the
+/// binary) so the executor and the binary read the SAME constants: the
+/// executor already links this crate, while the binary must not link the
+/// executor.
+///
+/// | exit | meaning | executor class |
+/// |---|---|---|
+/// | 0 | workspace provisioned | — |
+/// | 1 | transient, retry window exhausted (unreachable Depot, 5xx, idle
+///       timeout, local I/O, torn read) | `Infra { never_started: true }` |
+/// | 2 | an input snapshot is GONE — a live Depot answered 404, meaning warm,
+///       the pack index and the cold archive all miss it (`NotFound` ONLY;
+///       a cold-tier outage is a 5xx → exit 1) | `MissingInputs` |
+/// | 3 | the Depot refused the workspace token (401/403) — retrying with the
+///       same token cannot heal; a fresh attempt mints a fresh one | `Infra
+///       { never_started: true }` + auth cause |
+/// | 4 | this invocation can never work: required env absent, an address
+///       shape the binary cannot parse, an unknown subcommand — env/image
+///       skew, operator-fixable | `Config` |
+///
+/// Anything ELSE (137, signals) is not this table's verdict and stays
+/// `Infra { never_started: true }` in the executor's pinned default arm.
+pub const EXIT_FETCH_TRANSIENT: i32 = 1;
+/// See [`EXIT_FETCH_TRANSIENT`]. NotFound-only — the permanent-content exit.
+pub const EXIT_FETCH_MISSING_INPUTS: i32 = 2;
+/// See [`EXIT_FETCH_TRANSIENT`]. 401/403 from the Depot.
+pub const EXIT_FETCH_DENIED: i32 = 3;
+/// See [`EXIT_FETCH_TRANSIENT`]. Env/skew permanents (previously exit 2).
+pub const EXIT_FETCH_CONFIG: i32 = 4;
+
 /// Hashes per `POST /v1/cas/have`. The service caps the batch; the client chunks
 /// to stay under it.
 const HAVE_CHUNK: usize = 5_000;
+
+/// HTTP liveness bounds for a [`WorkspaceClient`] (ticket e140121).
+///
+/// `reqwest::Client::new()` carried NO timeouts, so a Depot that accepted the
+/// TCP connection and then hung (a restart mid-handshake, a wedged replica)
+/// stalled the caller until something *else* killed it — for a fetch init
+/// container, `activeDeadlineSeconds`, i.e. the whole step budget.
+///
+/// - `connect` bounds dialing.
+/// - `read_idle` bounds the gap between received bytes (`reqwest`'s
+///   `read_timeout`). Deliberately an **idle** cap, not a total one: blob
+///   GET/PUT bodies are unbounded in size, so progress = liveness — a hung
+///   Depot surfaces in `read_idle` on a stalled GET, while a large transfer
+///   that keeps moving is never cut off. Honest residual: a slow-TRICKLE
+///   Depot (bytes still flowing) can still eat the step budget inside one
+///   attempt — bounded by `activeDeadlineSeconds` and billed to the step,
+///   consistent with "Init waiting bills the step budget" (ADR-0066).
+///   Upload stalls are NOT covered by `read_idle` (nothing is being read);
+///   PUT legs carry a size-derived per-request total timeout instead — see
+///   [`put_timeout`].
+///
+/// The default is the **in-Pod** posture (patience is cheap inside a Pod; the
+/// retry window bounds it). The control plane wants to fail FAST — its
+/// `TieredCas` warm reads fall through to cold on `Backend`, so a snappy
+/// failure IS the feature there — and passes tighter values via
+/// [`WorkspaceClient::with_minted_token_tuned`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpTuning {
+    /// TCP/TLS connect bound. Default 5s.
+    pub connect: std::time::Duration,
+    /// Max gap between received body bytes. Default 30s.
+    pub read_idle: std::time::Duration,
+}
+
+impl Default for HttpTuning {
+    fn default() -> Self {
+        Self {
+            connect: std::time::Duration::from_secs(5),
+            read_idle: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
+/// The per-request TOTAL timeout for a PUT of `size_bytes` (ticket e140121
+/// F4): `max(60s, size / 1 MiB/s)`. `read_timeout` cannot bound a stalled
+/// upload — while the body is being SENT nothing is read — so every PUT leg
+/// gets a total bound generous enough that only a genuinely wedged transfer
+/// (under ~1 MiB/s sustained, with a 60s floor for small blobs) trips it.
+pub fn put_timeout(size_bytes: u64) -> std::time::Duration {
+    std::time::Duration::from_secs((size_bytes / (1024 * 1024)).max(60))
+}
 
 /// The durability-label header on CAS PUTs (ADR-0067 part 6). Duplicated from
 /// `scarab_server::workspaced` as a literal for the same reason as the token
@@ -222,9 +321,19 @@ struct MissingReport {
 }
 
 impl WorkspaceClient {
-    /// A client for `base` (e.g. `http://scarab-workspace`) presenting `token`.
+    /// A client for `base` (e.g. `http://scarab-workspace`) presenting `token`,
+    /// with the default (in-Pod) [`HttpTuning`].
     pub fn new(base: impl Into<String>, token: impl Into<String>) -> Self {
-        Self::with_source(base, TokenSource::Fixed(token.into()))
+        Self::with_http(base, token, HttpTuning::default())
+    }
+
+    /// [`Self::new`] with explicit [`HttpTuning`] (ticket e140121).
+    pub fn with_http(
+        base: impl Into<String>,
+        token: impl Into<String>,
+        tuning: HttpTuning,
+    ) -> Self {
+        Self::with_source(base, TokenSource::Fixed(token.into()), tuning)
     }
 
     /// A client that **mints a fresh token per request**.
@@ -241,12 +350,35 @@ impl WorkspaceClient {
         base: impl Into<String>,
         mint: impl Fn() -> String + Send + Sync + 'static,
     ) -> Self {
-        Self::with_source(base, TokenSource::Minted(Arc::new(mint)))
+        Self::with_source(
+            base,
+            TokenSource::Minted(Arc::new(mint)),
+            HttpTuning::default(),
+        )
     }
 
-    fn with_source(base: impl Into<String>, token: TokenSource) -> Self {
+    /// [`Self::with_minted_token`] with explicit [`HttpTuning`] (ticket
+    /// e140121) — the control plane's constructor, where failing FAST is the
+    /// feature: its `TieredCas` warm reads fall through to cold on `Backend`,
+    /// so a tight connect/read-idle turns a Depot outage into a cold-tier
+    /// read instead of a stall.
+    pub fn with_minted_token_tuned(
+        base: impl Into<String>,
+        mint: impl Fn() -> String + Send + Sync + 'static,
+        tuning: HttpTuning,
+    ) -> Self {
+        Self::with_source(base, TokenSource::Minted(Arc::new(mint)), tuning)
+    }
+
+    fn with_source(base: impl Into<String>, token: TokenSource, tuning: HttpTuning) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(tuning.connect)
+                .read_timeout(tuning.read_idle)
+                .build()
+                // Same failure surface as the `reqwest::Client::new()` this
+                // replaces (it panics on the identical builder error).
+                .expect("reqwest client"),
             base: base.into().trim_end_matches('/').to_string(),
             token,
             cas_cache_only: false,
@@ -320,6 +452,15 @@ impl WorkspaceClient {
         let body = resp.text().await.unwrap_or_default();
         if status == reqwest::StatusCode::NOT_FOUND {
             return StorageError::NotFound;
+        }
+        // 401/403 are their own class (ticket e140121): retrying with the
+        // same token cannot heal a denial, so callers must be able to stop
+        // waiting without string-sniffing a `Backend` message (401 and 503
+        // used to be indistinguishable here).
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            return StorageError::Denied(format!("workspace service {status}: {body}"));
         }
         StorageError::Backend(format!("workspace service {status}: {body}"))
     }
@@ -411,6 +552,11 @@ impl WorkspaceClient {
     ) -> Result<(), StorageError> {
         let mut req = self
             .request(reqwest::Method::PUT, &format!("/v1/cas/{kind}/{hash}"))
+            // A stalled upload is invisible to `read_timeout` (nothing is
+            // being read while the body sends), so every PUT carries a
+            // size-derived TOTAL bound (ticket e140121 F4). GETs keep
+            // connect + read-idle only — their liveness is the read.
+            .timeout(put_timeout(data.len() as u64))
             .body(data);
         if let Some(label) = label {
             req = req.header(DURABILITY_HEADER, label.as_str());
@@ -438,7 +584,7 @@ impl WorkspaceClient {
     /// plane, so the exit code is only a hint.
     pub async fn post_drain_record(&self, rec: &DrainRecord) -> Result<(), StorageError> {
         match self.post_drain_record_classified(rec).await? {
-            DrainPostOutcome::Posted => Ok(()),
+            DrainPostOutcome::Posted | DrainPostOutcome::AlreadyPosted => Ok(()),
             DrainPostOutcome::StateIncomplete(detail) => Err(StorageError::Backend(format!(
                 "workspace service 422 ({DRAIN_STATE_INCOMPLETE_CODE}): {detail}"
             ))),
@@ -467,6 +613,21 @@ impl WorkspaceClient {
         let status = resp.status();
         if status.is_success() {
             return Ok(DrainPostOutcome::Posted);
+        }
+        // 409 = a success record already stands under this fence — and the
+        // fence key includes `{run, step, attempt}`, so it can only be THIS
+        // attempt's own record: a POST whose 2xx response was lost (a Depot
+        // restart mid-response, a dropped connection) retries into 409. The
+        // record is deposited, which is the entire job — so this is success
+        // for exit-code honesty (ticket e140121 F5: classification is
+        // record-first on the same poll, so this saves no re-drive; it stops
+        // the helper reporting failure for a drain that succeeded). The
+        // fenced token cannot GET the record back (`require_browse`), so
+        // compare-and-confirm is not available in-Pod; 409-as-success is the
+        // correct affordance. The write-once property is untouched — the
+        // Depot still refused the overwrite.
+        if status == reqwest::StatusCode::CONFLICT {
+            return Ok(DrainPostOutcome::AlreadyPosted);
         }
         if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             let body = resp.text().await.unwrap_or_default();
@@ -823,6 +984,11 @@ pub const DRAIN_STATE_INCOMPLETE_CODE: &str = "drain_state_incomplete";
 pub enum DrainPostOutcome {
     /// 2xx — the record is deposited; the drain is done.
     Posted,
+    /// 409 — a success record ALREADY stands under this fence, and the fence
+    /// key includes the attempt, so it is this attempt's own (a retried POST
+    /// whose first 2xx was lost). Success, kept distinct from
+    /// [`Posted`](Self::Posted) only so the caller can log what happened.
+    AlreadyPosted,
     /// The durable-presence gate's machine-readable 422: not everything the
     /// record publishes is in the shared pack index YET. Retryable in-process
     /// — every retry sees a strictly larger index — and bounded by the

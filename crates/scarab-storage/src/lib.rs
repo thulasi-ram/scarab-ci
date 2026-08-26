@@ -435,6 +435,14 @@ pub enum StorageError {
     HashMismatch,
     #[error("unknown hash algorithm: {0}")]
     UnknownAlgorithm(String),
+    /// The store refused the caller's credential (HTTP 401/403). Split out of
+    /// [`Backend`](Self::Backend) (ticket e140121) because the two demand
+    /// opposite retry policies: a 5xx/transport failure may heal on its own
+    /// and is worth waiting out, while retrying with the SAME token cannot
+    /// heal a denial — the caller must fail out to whatever re-mints its
+    /// credential (a fresh attempt's fence token, for the in-Pod helpers).
+    #[error("access denied: {0}")]
+    Denied(String),
     #[error("storage backend error: {0}")]
     Backend(String),
 }
