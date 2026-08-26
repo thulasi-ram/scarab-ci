@@ -231,8 +231,16 @@ pub struct RerunPlan {
     pub starts_from: Vec<StepId>,
     /// The same set as `invalidated`, **execution-ordered** (topological over
     /// `needs` restricted to the set, ties broken by step id) and carrying each
-    /// member's WHY (git-bug 4afaa3e). Re-derivable from the fields above plus
-    /// the DAG, so the recorded event payload stays the compact form.
+    /// member's WHY (git-bug 4afaa3e).
+    ///
+    /// This list exists only in the plan itself (the GET preview and the POST
+    /// 202 body); the recorded `RunRerunRequested`/`StepRetryRequested` events
+    /// deliberately carry the compact `invalidated`+`widened` form and NOT the
+    /// reasons. They are *mostly* re-derivable from that form plus the DAG —
+    /// but not entirely: a `Regenerate` root's `because_of` (the consumer whose
+    /// expired input dragged it in) comes from the oracle probes at plan time
+    /// and cannot be reconstructed from the event later. Enriching the event
+    /// payload is an open owner decision, not an accident of this field.
     pub steps: Vec<PlannedStep>,
 }
 
