@@ -1135,20 +1135,34 @@ pub fn cache_key(project: &str, resolved: &[(String, String)]) -> String {
 
 /// A deterministic signature of the workspace a step will consume: the output
 /// snapshots of the dependencies it consumes (its explicit `inputs:` subset, or
-/// all `needs` — resolved identically to [`workspace_inputs`]), in sorted order.
-/// Two runs of a step with the same upstream outputs produce the same signature —
-/// the basis for restart skip-if-unchanged (ADR-0027). A consumed need that has
-/// produced no output contributes an empty slot, so "an upstream that gained/lost
-/// an output" also changes the signature. Because the subset is resolved the same
-/// way as the materialized workspace, the signature covers *exactly* the inputs
-/// the step consumes: a change in a need it does not consume does not force a
-/// re-run (ADR-0007).
+/// all `needs` — resolved identically to [`workspace_inputs`]), in **declared
+/// order**. Two runs of a step with the same upstream outputs *in the same
+/// order* produce the same signature — the basis for restart skip-if-unchanged
+/// (ADR-0027). A consumed need that has produced no output contributes an empty
+/// slot, so "an upstream that gained/lost an output" also changes the signature.
+/// Because the subset is resolved the same way as the materialized workspace,
+/// the signature covers *exactly* the inputs the step consumes: a change in a
+/// need it does not consume does not force a re-run (ADR-0007).
+///
+/// **Order-sensitive on purpose** (ticket 2e1a458; `v2:`). The value this
+/// stands for — the fan-in-merged workspace — IS order-dependent: the last
+/// root in declared order wins a collision (ADR-0007 amendment 2026-08-26),
+/// so reordering `needs:`/`inputs:` can change the step's bytes and must
+/// change what "unchanged" means. v1 sorted the parts; that was unreachable
+/// as a bug only because the comparison scope was one run's pinned IR — a
+/// property of the caller, not of this function, and a landmine for any
+/// future cross-IR comparison. The `v2:` prefix makes the format bump
+/// deliberate: on upgrade every stored v1 signature compares unequal (one
+/// conservative re-run, uniformly), rather than v1-equals-v2 exactly for
+/// runs whose needs happened to be alphabetical. The column is opaque TEXT
+/// compared for equality, so no migration; a wrong skip is impossible in
+/// either direction.
 pub fn input_signature(
     needs: &[StepId],
     inputs: Option<&[StepId]>,
     output_of: &std::collections::HashMap<StepId, String>,
 ) -> String {
-    let mut parts: Vec<String> = consumed(needs, inputs)
+    let parts: Vec<String> = consumed(needs, inputs)
         .iter()
         .map(|n| {
             format!(
@@ -1158,8 +1172,7 @@ pub fn input_signature(
             )
         })
         .collect();
-    parts.sort();
-    parts.join(";")
+    format!("v2:{}", parts.join(";"))
 }
 
 /// The set of steps invalidated by restarting `target`: `target` itself plus
@@ -1543,16 +1556,36 @@ mod tests {
         );
     }
 
+    /// FLIPPED from `input_signature_is_stable_and_order_independent`
+    /// (ticket 2e1a458): the signature stands for the fan-in-merged
+    /// workspace, and that value is order-dependent (last declared root wins
+    /// a collision, ADR-0007) — so reordering the declaration MUST change
+    /// the signature. Same order stays stable (that is what skip-if-
+    /// unchanged compares), and the `v2:` prefix pins the deliberate format
+    /// bump (uniform invalidation on upgrade — never coincidental
+    /// v1-equals-v2 for alphabetical needs).
     #[test]
-    fn input_signature_is_stable_and_order_independent() {
+    fn input_signature_is_order_sensitive_and_stable() {
         let outputs = HashMap::from([
             (StepId("a".into()), "hash-a".to_string()),
             (StepId("b".into()), "hash-b".to_string()),
         ]);
-        // Order of `needs` does not change the signature (it is sorted).
         let ab = input_signature(&[StepId("a".into()), StepId("b".into())], None, &outputs);
         let ba = input_signature(&[StepId("b".into()), StepId("a".into())], None, &outputs);
-        assert_eq!(ab, ba);
+        assert_ne!(
+            ab, ba,
+            "order determines the merged bytes, so it is part of what \
+             'unchanged' means"
+        );
+        // Same order ⇒ stable: the signature is a pure function of the
+        // declared order and the outputs.
+        assert_eq!(
+            ab,
+            input_signature(&[StepId("a".into()), StepId("b".into())], None, &outputs)
+        );
+        // The deliberate format bump: v1 (sorted, unprefixed) can never
+        // equal v2 by coincidence.
+        assert!(ab.starts_with("v2:"), "{ab}");
 
         // A changed upstream output changes the signature (→ cascade on rerun).
         let changed = HashMap::from([
