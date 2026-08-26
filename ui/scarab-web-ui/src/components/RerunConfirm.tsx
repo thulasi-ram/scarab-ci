@@ -28,8 +28,12 @@ import { type RerunPlan } from "../snapshot-retention";
 export default function RerunConfirm(props: {
   kind: ConfirmKind;
   target: string;
-  /** The previewed plan, or null when the preview fetch failed/never landed. */
+  /** The previewed plan FOR this target (the caller must never hand another
+   * step's plan in), or null when the preview failed or is still loading. */
   plan: RerunPlan | null;
+  /** True while the preview is still in flight — renders a loading line
+   * instead of claiming the preview is unavailable. */
+  loading?: boolean;
   /** Viewport-fixed anchor (the trigger button's rect bottom edge). */
   anchor: { top: number; left: number };
   busy: boolean;
@@ -72,7 +76,14 @@ export default function RerunConfirm(props: {
         style={{ top: `${props.anchor.top}px`, left: `${left()}px` }}
       >
         <p class="rc-headline">{confirmHeadline(props.kind, props.target)}</p>
-        <Show when={props.plan} fallback={<p class="rc-unavailable">Scope preview unavailable.</p>}>
+        <Show
+          when={props.plan}
+          fallback={
+            <p class="rc-unavailable">
+              {props.loading ? "Resolving the scope…" : "Scope preview unavailable."}
+            </p>
+          }
+        >
           {(p) => (
             <>
               <Show when={confirmWarning(p())}>

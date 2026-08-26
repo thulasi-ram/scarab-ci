@@ -122,6 +122,10 @@ export default function RunDetail() {
   // workspace snapshots widen the rerun upstream, resolved before the click so
   // the button can say which it is (ADR-0027 — smart never means mysterious).
   const [plan, setPlan] = createSignal<RerunPlan | null>(null);
+  // Distinguishes "preview still loading" from "preview FAILED" for the confirm
+  // popover: the first renders a loading line, the second an honest
+  // "unavailable" — both still allow confirm (disclosure, never prevention).
+  const [planFailed, setPlanFailed] = createSignal(false);
   // The workspace-snapshot pin, mirrored locally so the toggle is optimistic
   // about nothing: it re-renders from what the pin endpoint actually returned.
   const [pinState, setPinState] = createSignal<RetentionInfo | null>(null);
@@ -414,8 +418,13 @@ export default function RunDetail() {
   // oracle shortcut on the server.
   createEffect(() => {
     const step = sel();
+    // Clear UNCONDITIONALLY: on an ordinary selection change the previous
+    // step's plan must not linger until the new fetch lands, or the confirm
+    // popover renders A's cascade under B's headline (and the divergence
+    // toast compares against the wrong preview).
+    setPlan(null);
+    setPlanFailed(false);
     if (!step || isServiceSel() || timeTraveling()) {
-      setPlan(null);
       return;
     }
     const forRun = id();
@@ -425,8 +434,11 @@ export default function RunDetail() {
         if (sel() === step && id() === forRun) setPlan(p);
       })
       // A failed preview must NOT relabel or block the rerun: unknown is not
-      // "expired". Fall back to the plain label.
-      .catch(() => setPlan(null));
+      // "expired". Fall back to the plain label (and tell the popover the
+      // preview FAILED, as opposed to still loading).
+      .catch(() => {
+        if (sel() === step && id() === forRun) setPlanFailed(true);
+      });
   });
 
   // The retention promise: the server's value, overlaid by whatever the pin
@@ -479,6 +491,13 @@ export default function RunDetail() {
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
     setConfirming({ kind, step, top: r.bottom + 6, left: r.left });
   }
+  // The plan FOR this step, or null. A plan whose target is another step is a
+  // stale leftover mid-fetch — it must never render under this step's headline
+  // or be compared against this step's executed plan.
+  const planFor = (step: string): RerunPlan | null => {
+    const p = plan();
+    return p && p.target === step ? p : null;
+  };
   // A moved selection or version switch invalidates what the popover named.
   createEffect(() => {
     void sel();
@@ -487,7 +506,7 @@ export default function RunDetail() {
   });
 
   async function onRerun(step: string) {
-    const previewed = plan();
+    const previewed = planFor(step);
     setRerunning(step);
     try {
       const executed = await rerunStep(id(), step);
@@ -504,7 +523,7 @@ export default function RunDetail() {
   // Retry (ADR-0056 amendment): another Attempt in the CURRENT Take, no fork.
   // Failed steps only (the button is gated so; the server also 409s otherwise).
   async function onRetry(step: string) {
-    const previewed = plan();
+    const previewed = planFor(step);
     setRetrying(step);
     try {
       const executed = await retryStep(id(), step);
@@ -806,7 +825,8 @@ export default function RunDetail() {
                 <RerunConfirm
                   kind={c.kind}
                   target={c.step}
-                  plan={plan()}
+                  plan={planFor(c.step)}
+                  loading={!planFor(c.step) && !planFailed()}
                   anchor={{ top: c.top, left: c.left }}
                   busy={rerunning() !== null || retrying() !== null}
                   onCancel={() => setConfirming(null)}
