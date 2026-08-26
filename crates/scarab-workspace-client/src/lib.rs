@@ -1944,13 +1944,42 @@ fn scan_one(
             // used to hold each whole file while hashing it, sizing the
             // helper's peak by the largest file in the workspace for no
             // reason — the address needs one pass over the bytes, not the
-            // bytes in memory. The `is_file` guard above is what makes this
-            // `open` safe: opening a writer-less FIFO would block forever.
-            let mut file = std::fs::File::open(item.path()).map_err(io_err)?;
+            // bytes in memory.
+            //
+            // The lstat guard above does NOT make this open safe — the path
+            // can be swapped between the lstat and the open (TOCTOU; e140121
+            // review fix). What the flags guarantee: `O_NOFOLLOW` refuses a
+            // symlink swapped in (ELOOP, an error, never a read outside the
+            // workspace), and `O_NONBLOCK` makes opening a writer-less FIFO
+            // return instead of blocking forever (on a regular file it is a
+            // no-op for reads). The fstat below then re-checks the object we
+            // actually OPENED, so a FIFO/device swapped in surfaces as the
+            // same loud refusal, not a hang or a mis-snapshot. Remaining
+            // race, disclosed: the workspace is a live mutable directory, so
+            // content can still change between this hash and the later
+            // upload read — the drain has always accepted that (the PUT is
+            // re-hashed server-side against its address).
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(item.path())
+                .map_err(io_err)?;
+            let opened = file.metadata().map_err(io_err)?;
+            if !opened.file_type().is_file() {
+                return Err(StorageError::Unsupported(format!(
+                    "refusing to snapshot {:?}: the path changed type mid-scan and is no \
+                     longer a regular file — a Workspace Snapshot holds only regular \
+                     files, directories and symlinks",
+                    item.path(),
+                )));
+            }
             let hash = scarab_storage::sha256_hex_reader(&mut file).map_err(io_err)?;
             blobs.entry(hash.clone()).or_insert(BlobSource::File {
                 path: item.path(),
-                len: meta.len(),
+                // The OPENED file's size, not the earlier lstat's: this is
+                // what the byte budget charges for the bytes just hashed.
+                len: opened.len(),
             });
             *files += 1;
             (
