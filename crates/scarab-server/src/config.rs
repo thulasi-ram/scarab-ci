@@ -29,6 +29,7 @@
 //! | `SCARAB_WORKSPACE_TOKEN_SECRET` | env | enables the workspace service + the token Step Pods present to it (ADR-0061). **Required** under `--role workspace`; deliberately a DIFFERENT secret from `SCARAB_RESULTS_TOKEN_SECRET` |
 //! | `SCARAB_WORKSPACE_URL` | env | base URL of the workspace service; default `http://scarab-workspace` |
 //! | `SCARAB_WORKSPACE_DATA_DIR` | env | the workspace service's **warm tier** directory (its persistent volume); default `./.scarab/workspace-cas`. Only read under `--role workspace` |
+//! | `SCARAB_WORKSPACE_WARM_BUDGET_BYTES` | env | warm-tier space bound (git-bug cba7165): over it the Depot's LRU sweep evicts. Unset = 90% of the warm volume's `statvfs` capacity — right on a dedicated PVC, **effectively unbounded on a shared disk** (a dev machine), which is why `deploy/local-proc` sets one explicitly. Only meaningful under `--role workspace` |
 //! | `SCARAB_WSFETCH_IMAGE` | env | the workspace **helper** image every workspace Step Pod carries (ADR-0061): the fetch init container (s3-feed) AND the egress hold/drain sidecar (`scarab-wsfetch hold` / the in-Pod `drain` the control plane execs); default `ghcr.io/thulasi-ram/scarab-wsfetch:edge`. ADR-0062 stage 2 replaces only the **eager-fetch** role; the egress role survives it — the old "dies with the node driver" note (git-bug 0628369) applied to the fetch role alone and is closed as superseded |
 //! | `SCARAB_GITHUB_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/github` |
 //! | `SCARAB_FORGEJO_WEBHOOK_SECRET` | env | HMAC secret for `/webhooks/forgejo` (ADR-0046 — each forge endpoint binds its own secret) |
@@ -242,6 +243,12 @@ pub struct WorkspaceServiceConfig {
     /// the CSI/FUSE node driver replaces it — at which point this knob, the image
     /// and `WorkspaceFetch` all disappear together (git-bug 0628369).
     pub fetcher_image: String,
+    /// Warm-tier space bound in bytes (git-bug cba7165): over it the Depot's
+    /// LRU sweep evicts back to its low-water mark. `None` = 90% of the warm
+    /// volume's `statvfs` capacity, resolved at boot — the right default on a
+    /// dedicated PVC and **effectively unbounded on a shared disk**, so dev
+    /// modes set an explicit value. Only meaningful for `--role workspace`.
+    pub warm_budget_bytes: Option<u64>,
 }
 
 /// OIDC issuer settings (selected by `SCARAB_OIDC_ISSUER`). The signing key is
@@ -607,6 +614,14 @@ pub enum ConfigError {
          authenticators, not an open data plane."
     )]
     MissingWorkspaceTokenSecret,
+
+    #[error(
+        "SCARAB_WORKSPACE_WARM_BUDGET_BYTES is set but is not a byte count: {0:?}. \
+         Give plain bytes (e.g. 17179869184 for 16 GiB), or unset it to accept the \
+         default — 90% of the warm volume's capacity (statvfs). A knob that governs \
+         eviction must not be guessed at (ADR-0048)."
+    )]
+    InvalidWorkspaceWarmBudget(String),
 }
 
 impl Config {
@@ -804,6 +819,14 @@ impl Config {
                     .unwrap_or_else(|| {
                         scarab_executor_k8s::DEFAULT_WSFETCH_IMAGE.to_string()
                     }),
+                warm_budget_bytes: match env("SCARAB_WORKSPACE_WARM_BUDGET_BYTES")
+                    .filter(|v| !v.is_empty())
+                {
+                    Some(raw) => Some(raw.trim().parse::<u64>().map_err(|_| {
+                        ConfigError::InvalidWorkspaceWarmBudget(raw.clone())
+                    })?),
+                    None => None,
+                },
             }),
             None if matches!(cli.role, Role::Workspace) => {
                 return Err(ConfigError::MissingWorkspaceTokenSecret)

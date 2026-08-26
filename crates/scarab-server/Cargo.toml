@@ -79,6 +79,12 @@ scarab-testkit = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 xattr = { workspace = true }
 
+# git-bug cba7165: `statvfs` behind the warm budget's 90%-of-volume default.
+# Direct like scarab-workspace-client's, and unix-gated to match the one
+# `fs_capacity_bytes` impl that calls it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 regex-lite = { workspace = true }
 tower = { workspace = true, features = ["util"] }

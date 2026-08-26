@@ -98,6 +98,12 @@ spec:
               value: "0.0.0.0:8080"
             - name: SCARAB_WORKSPACE_DATA_DIR
               value: {{ .Values.workspace.dataDir | quote }}
+            {{- with .Values.workspace.warmBudgetBytes }}
+            # Warm space bound (git-bug cba7165). Unset renders nothing and the
+            # service defaults to 90% of the PVC's statvfs capacity.
+            - name: SCARAB_WORKSPACE_WARM_BUDGET_BYTES
+              value: {{ . | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8080

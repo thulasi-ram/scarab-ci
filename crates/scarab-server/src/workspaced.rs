@@ -160,6 +160,18 @@ static PACK_RECLAIM_ORPHAN_OBJECTS: AtomicU64 = AtomicU64::new(0);
 static PACK_RECLAIM_ORPHAN_BYTES: AtomicU64 = AtomicU64::new(0);
 static PACK_RECLAIM_PASS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Warm-eviction evidence (git-bug cba7165), exposed on `/metrics`.
+/// Process-wide like the reclaim counters: one sweep loop per replica.
+/// The budget gauge holds the bound in force — the explicit env override or
+/// the statvfs-90% default — and `u64::MAX` means "effectively unbounded"
+/// (statvfs itself failed; the pass then only ever gauges).
+static WARM_BUDGET_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
+static WARM_EVICTED_BYTES_DURABLE: AtomicU64 = AtomicU64::new(0);
+static WARM_EVICTED_BYTES_CACHE: AtomicU64 = AtomicU64::new(0);
+static WARM_EVICTED_OBJECTS_DURABLE: AtomicU64 = AtomicU64::new(0);
+static WARM_EVICTED_OBJECTS_CACHE: AtomicU64 = AtomicU64::new(0);
+static WARM_EVICT_PASS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
 /// How often the warm-tier size gauge is recomputed. Read on `/metrics` from an
 /// atomic rather than measured per scrape: a warm tier is tens of thousands of
 /// files, and walking it on every Prometheus scrape would make the observability
@@ -179,6 +191,15 @@ const WARM_SIZE_REFRESH_SECS: u64 = 60;
 /// per file per hour, not one per read. Backfill composes with this for free:
 /// it rewrites the file, and a refetch IS a use.
 const WARM_TOUCH_GRAIN_SECS: u64 = 3600;
+
+/// The eviction floor (git-bug cba7165): the sweep never unlinks a warm file
+/// whose mtime is younger than this, whatever the pressure. One hour is
+/// ≥ 12× the control plane's 5-minute drain clock, so everything an
+/// in-flight drain PUT-seals-records sits safely inside it — without going
+/// to [`FENCE_RESIDUE_TTL_SECS`] (~24h), which would starve eviction on a
+/// volume hot enough to fill in a day. Under the floor, warm `put` ENOSPC
+/// stays the loud failure it already is (`warm_full_total`).
+const WARM_EVICT_MIN_AGE_SECS: u64 = 3600;
 
 /// How often the residue sweep runs — expired fence rows
 /// ([`sweep_fence_residue`]) and abandoned pack sessions.
@@ -405,6 +426,7 @@ pub async fn run(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         ws.token_secret.clone(),
         db,
         Some(PACK_IDLE_LINGER),
+        ws.warm_budget_bytes,
     )?;
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     tracing::info!(
@@ -509,7 +531,8 @@ pub fn router_with_pack_linger(
     db: sqlx::PgPool,
     pack_linger: Option<std::time::Duration>,
 ) -> Result<Router, StorageError> {
-    router_and_state(warm_dir, cold, token_secret, db, pack_linger).map(|(router, _)| router)
+    router_and_state(warm_dir, cold, token_secret, db, pack_linger, None)
+        .map(|(router, _)| router)
 }
 
 /// [`router_with_pack_linger`], also handing back the state — for [`run`],
@@ -522,20 +545,31 @@ fn router_and_state(
     token_secret: Vec<u8>,
     db: sqlx::PgPool,
     pack_linger: Option<std::time::Duration>,
+    warm_budget_bytes: Option<u64>,
 ) -> Result<(Router, WorkspaceState), StorageError> {
     let warm_dir = warm_dir.as_ref().to_path_buf();
     let state = open_state(&warm_dir, cold, token_secret, db)?;
 
-    // The warm-tier size gauge (ADR-0061): LRU eviction is deferred, so this
-    // number climbing towards the volume size IS the operator's only warning
-    // that the deferral is about to bite.
+    // The warm-tier size gauge + LRU sweep (git-bug cba7165; ADR-0066 §4 in
+    // its post-0067 form). One walk per cadence answers the gauge AND, over
+    // the budget, evicts to the low-water mark — committed-durable content
+    // first (free: the packs serve it back), cache-only second (licensed
+    // loss). `None` = the statvfs-90% default ([`resolve_warm_budget`]).
     {
-        let gauge = state.warm_used_bytes.clone();
+        let state = state.clone();
+        let budget = resolve_warm_budget(&warm_dir, warm_budget_bytes);
+        WARM_BUDGET_BYTES.store(budget, Ordering::Relaxed);
         tokio::spawn(async move {
             loop {
-                let dir = warm_dir.clone();
-                if let Ok(bytes) = tokio::task::spawn_blocking(move || dir_size(&dir)).await {
-                    gauge.store(bytes, Ordering::Relaxed);
+                if let Some(used) = warm_evict_once(
+                    &state.warm_dir,
+                    &state.db,
+                    budget,
+                    std::time::Duration::from_secs(WARM_EVICT_MIN_AGE_SECS),
+                )
+                .await
+                {
+                    state.warm_used_bytes.store(used, Ordering::Relaxed);
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(WARM_SIZE_REFRESH_SECS)).await;
             }
@@ -637,6 +671,11 @@ fn open_state(
     // adapter is needed for this — `S3Storage::local` is already a local
     // filesystem store behind the same two ports.
     let warm_store = Arc::new(S3Storage::local(warm_dir)?);
+
+    // One-shot: reap the dead Snapshot Farm root an upgraded volume may still
+    // carry (cba7165 A4). Here rather than in the loops, because this is the
+    // one constructor — the binary and the tests boot the same way.
+    reap_farm_residue(warm_dir);
 
     let warm_cas: Arc<dyn Cas> = warm_store.clone();
     let cold_cas: Arc<dyn Cas> = cold.clone();
@@ -3851,9 +3890,12 @@ async fn readyz(State(state): State<WorkspaceState>) -> Response {
 
 /// `GET /metrics` — Prometheus text exposition.
 ///
-/// `scarab_workspace_warm_used_bytes` is the number that matters most in this
-/// slice: real LRU eviction is deferred, so this gauge approaching the volume
-/// size is the only advance warning an operator gets.
+/// `scarab_workspace_warm_used_bytes` against
+/// `scarab_workspace_warm_budget_bytes` is the pressure signal: the sweep
+/// (git-bug cba7165) holds used under budget by evicting to the low-water
+/// mark, and the evicted counters say what the bound is costing —
+/// `class="durable"` evictions are free (re-fetchable from packs),
+/// `class="cache_only"` evictions are real cache misses to come.
 async fn metrics(State(state): State<WorkspaceState>) -> Response {
     use scarab_storage::tiered;
     let body = format!(
@@ -3890,6 +3932,20 @@ scarab_workspace_pack_reclaim_orphan_bytes_total {}
 # HELP scarab_workspace_pack_reclaim_pass_skipped_total Reclaim passes skipped or aborted on an error (fail-closed: nothing was deleted).
 # TYPE scarab_workspace_pack_reclaim_pass_skipped_total counter
 scarab_workspace_pack_reclaim_pass_skipped_total {}
+# HELP scarab_workspace_warm_budget_bytes The warm space bound in force (SCARAB_WORKSPACE_WARM_BUDGET_BYTES, or 90% of the volume's statvfs capacity).
+# TYPE scarab_workspace_warm_budget_bytes gauge
+scarab_workspace_warm_budget_bytes {}
+# HELP scarab_workspace_warm_evicted_bytes_total Bytes the warm LRU sweep evicted (git-bug cba7165).
+# TYPE scarab_workspace_warm_evicted_bytes_total counter
+scarab_workspace_warm_evicted_bytes_total{{class=\"durable\"}} {}
+scarab_workspace_warm_evicted_bytes_total{{class=\"cache_only\"}} {}
+# HELP scarab_workspace_warm_evicted_objects_total Objects the warm LRU sweep evicted.
+# TYPE scarab_workspace_warm_evicted_objects_total counter
+scarab_workspace_warm_evicted_objects_total{{class=\"durable\"}} {}
+scarab_workspace_warm_evicted_objects_total{{class=\"cache_only\"}} {}
+# HELP scarab_workspace_warm_evict_pass_skipped_total Sweep passes that degraded to pure LRU (classification failed) or could not run at all.
+# TYPE scarab_workspace_warm_evict_pass_skipped_total counter
+scarab_workspace_warm_evict_pass_skipped_total {}
 ",
         state.warm_used_bytes.load(Ordering::Relaxed),
         tiered::cold_fallback_total(),
@@ -3902,6 +3958,12 @@ scarab_workspace_pack_reclaim_pass_skipped_total {}
         PACK_RECLAIM_ORPHAN_OBJECTS.load(Ordering::Relaxed),
         PACK_RECLAIM_ORPHAN_BYTES.load(Ordering::Relaxed),
         PACK_RECLAIM_PASS_SKIPPED.load(Ordering::Relaxed),
+        WARM_BUDGET_BYTES.load(Ordering::Relaxed),
+        WARM_EVICTED_BYTES_DURABLE.load(Ordering::Relaxed),
+        WARM_EVICTED_BYTES_CACHE.load(Ordering::Relaxed),
+        WARM_EVICTED_OBJECTS_DURABLE.load(Ordering::Relaxed),
+        WARM_EVICTED_OBJECTS_CACHE.load(Ordering::Relaxed),
+        WARM_EVICT_PASS_SKIPPED.load(Ordering::Relaxed),
     );
     let mut resp = body.into_response();
     resp.headers_mut().insert(
@@ -3942,6 +4004,323 @@ fn dir_size(dir: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+// ---------------------------------------------------------------------------
+// The warm space bound (git-bug cba7165; ADR-0066 §4 in its post-0067 form)
+// ---------------------------------------------------------------------------
+
+/// One evictable warm object, as the sweep's walk saw it.
+struct WarmObject {
+    kind: PackMemberKind,
+    hex: String,
+    path: std::path::PathBuf,
+    mtime: std::time::SystemTime,
+}
+
+/// Is `name` a warm CAS object's filename — 64 lowercase hex, exactly?
+///
+/// The sweep unlinks NOTHING else (cba7165 A3): the local backend's staging
+/// temp names are `<dest>#<n>` (excluded by charset and length), the `readyz/`
+/// probe lives outside `blobs/`/`trees/` entirely, and any stray garbage is
+/// left for an operator rather than guessed at.
+fn is_warm_object_name(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// One walk, two answers (blocking; called from `spawn_blocking`): the total
+/// bytes under the warm root — the gauge, same semantics as [`dir_size`],
+/// symlink note included — and every eviction candidate: 64-hex regular files
+/// **directly** under `blobs/` and `trees/`, with the `(len, mtime)` the
+/// eviction ordering needs.
+fn warm_scan(dir: &std::path::Path) -> (u64, Vec<WarmObject>) {
+    let blobs = dir.join("blobs");
+    let trees = dir.join("trees");
+    let mut total = 0u64;
+    let mut objects = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        // Only DIRECT children of the two content dirs are candidates; a
+        // subdirectory planted inside them is walked for the gauge and never
+        // eligible.
+        let kind = if next == blobs {
+            Some(PackMemberKind::Blob)
+        } else if next == trees {
+            Some(PackMemberKind::Tree)
+        } else {
+            None
+        };
+        let Ok(read) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for item in read.flatten() {
+            // `lstat`, exactly as in `dir_size` — never traverse a link.
+            let Ok(meta) = item.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(item.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+                if let (Some(kind), Some(name)) = (kind, item.file_name().to_str()) {
+                    if is_warm_object_name(name) {
+                        if let Ok(mtime) = meta.modified() {
+                            objects.push(WarmObject {
+                                kind,
+                                hex: name.to_string(),
+                                path: item.path(),
+                                // len deliberately NOT carried: the unlink
+                                // phase re-lstats (A2) and subtracts the
+                                // fresh answer.
+                                mtime,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (total, objects)
+}
+
+/// The filesystem capacity under `path`, via `statvfs` — the source of the
+/// budget's 90% default. On the chart's dedicated PVC this IS the operator's
+/// `persistence.size`, with no Helm quantity math to get wrong.
+#[cfg(unix)]
+fn fs_capacity_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut vfs) } != 0 {
+        return None;
+    }
+    // `as u64`: the libc field types differ per platform (c_ulong on Linux,
+    // c_uint blocks on darwin) and every one of them widens losslessly.
+    #[allow(clippy::unnecessary_cast)]
+    Some((vfs.f_frsize as u64).saturating_mul(vfs.f_blocks as u64))
+}
+
+#[cfg(not(unix))]
+fn fs_capacity_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+/// The warm budget in force: the explicit override, or 90% of the warm
+/// mount's capacity (cba7165 OQ1 — an implicit bound protects availability
+/// out of the box; refusing to boot would break every existing deploy on
+/// upgrade, and the only implicit "loss" is cache warmth, which
+/// miss-never-wrong licenses).
+///
+/// The default is only meaningful on a volume DEDICATED to the warm tier: 90%
+/// of a shared dev disk bounds nothing anyone meant, which is why
+/// `deploy/local-proc` sets an explicit `SCARAB_WORKSPACE_WARM_BUDGET_BYTES`.
+fn resolve_warm_budget(warm_dir: &std::path::Path, explicit: Option<u64>) -> u64 {
+    if let Some(bytes) = explicit {
+        return bytes;
+    }
+    match fs_capacity_bytes(warm_dir) {
+        Some(capacity) => capacity / 10 * 9,
+        None => {
+            tracing::warn!(
+                warm_dir = %warm_dir.display(),
+                "warm budget: statvfs failed and SCARAB_WORKSPACE_WARM_BUDGET_BYTES is unset — \
+                 the warm tier runs UNBOUNDED (gauge-only, the pre-cba7165 behaviour)"
+            );
+            u64::MAX
+        }
+    }
+}
+
+/// One pass of the warm sweep: gauge the volume and, over the budget, evict
+/// down to the low-water mark (80% of budget — evict-ahead, so the write hot
+/// path never pays for space). Returns the used-bytes answer for the gauge;
+/// `None` only when the pass could not even measure.
+///
+/// **Why evicting is safe (the keystone):** durable bytes are recoverable
+/// from the moment their drain COMMITS — the writer-buffer window before the
+/// commit is backstopped by the record gate's 422 — and staged-sealed packs
+/// serve reads even uncommitted; every content route falls through a warm
+/// miss to a ranged pack read (which re-backfills warm) and then to the loose
+/// cold object. A warm evict can therefore never lose the only copy of
+/// durable content. Cache-only content IS lost — by contract: it deduplicates
+/// on `missing_warm` precisely so an evicted copy becomes an honest miss.
+///
+/// Within candidates the order is class A — committed-durable-backed — oldest
+/// first (free to evict, re-fetchable), then class B — everything else,
+/// cache-only and not-yet-committed alike — oldest first (the Cache's tenancy
+/// is protected by ordering, not exemption). Nothing younger than `min_age`
+/// ([`WARM_EVICT_MIN_AGE_SECS`] in production) is ever touched, and each
+/// victim is re-`lstat`ed immediately before its unlink (cba7165 A2: warm
+/// PUTs are stage-then-rename, so the path re-check is airtight; the residual
+/// microsecond window can only lose a recoverable warm copy).
+///
+/// Public for the acceptance tests (`crates/scarab-workspace-client/tests/`),
+/// which construct evict-vs-read races by running exactly the pass the sweep
+/// loop runs — same discipline as [`router`] itself.
+pub async fn warm_evict_once(
+    warm_dir: &std::path::Path,
+    db: &sqlx::PgPool,
+    budget_bytes: u64,
+    min_age: std::time::Duration,
+) -> Option<u64> {
+    let dir = warm_dir.to_path_buf();
+    let Ok((total, objects)) = tokio::task::spawn_blocking(move || warm_scan(&dir)).await else {
+        WARM_EVICT_PASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    if total <= budget_bytes {
+        return Some(total);
+    }
+    let low_water = budget_bytes - budget_bytes / 5;
+
+    // The min-age floor: everything younger is invisible to this pass.
+    let now = std::time::SystemTime::now();
+    let candidates: Vec<WarmObject> = objects
+        .into_iter()
+        .filter(|o| {
+            now.duration_since(o.mtime)
+                .map(|age| age >= min_age)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    // Class query: which candidates the committed pack index backs — the
+    // reusable `/have` shape ([`durable_present_of`]) with no caller fence,
+    // so staged-but-uncommitted rows do NOT count (their fence may still
+    // need the warm copy for its retry window; they age into class A when
+    // the record commits).
+    let mut durable: HashSet<(&'static str, String)> = HashSet::new();
+    let mut degraded = false;
+    'classify: for kind in [PackMemberKind::Blob, PackMemberKind::Tree] {
+        let hexes: Vec<&str> = candidates
+            .iter()
+            .filter(|o| o.kind == kind)
+            .map(|o| o.hex.as_str())
+            .collect();
+        for chunk in hexes.chunks(HAVE_MAX_HASHES) {
+            match durable_present_of(db, kind, chunk.iter().copied(), None).await {
+                Ok(set) => durable.extend(set.into_iter().map(|hex| (kind.as_str(), hex))),
+                Err(e) => {
+                    // Degrade to pure LRU over the floored set — never to
+                    // skip. Classification only ORDERS (A before B); safety
+                    // is the floor + the fall-through reads + the keystone
+                    // above, so a wrong class costs a cache miss or a 422
+                    // re-upload, never durable loss. Degrading to skip would
+                    // be strictly worse: the volume fills and every PUT
+                    // ENOSPCs.
+                    tracing::warn!(
+                        error = ?e,
+                        "warm evict: pack-index classification failed — degrading this pass \
+                         to pure LRU (oldest first, floor still enforced)"
+                    );
+                    WARM_EVICT_PASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    degraded = true;
+                    break 'classify;
+                }
+            }
+        }
+    }
+
+    let mut victims: Vec<(bool, WarmObject)> = candidates
+        .into_iter()
+        .map(|o| {
+            let is_durable =
+                !degraded && durable.contains(&(o.kind.as_str(), o.hex.clone()));
+            (is_durable, o)
+        })
+        .collect();
+    // Class A first, oldest first within a class. Degraded: every candidate
+    // classed `false`, so this IS the pure-LRU order.
+    victims.sort_by_key(|(is_durable, o)| (!*is_durable, o.mtime));
+
+    let unlink = tokio::task::spawn_blocking(move || {
+        let mut used = total;
+        for (is_durable, o) in victims {
+            if used <= low_water {
+                break;
+            }
+            // A2: re-lstat the PATH immediately before the unlink — skip
+            // whatever vanished, changed shape, or was re-warmed (a touch or
+            // a backfill moves the mtime) since the scan.
+            let Ok(meta) = std::fs::symlink_metadata(&o.path) else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(mtime) = meta.modified() else { continue };
+            match std::time::SystemTime::now().duration_since(mtime) {
+                Ok(age) if age >= min_age => {}
+                _ => continue,
+            }
+            let len = meta.len();
+            if std::fs::remove_file(&o.path).is_ok() {
+                used = used.saturating_sub(len);
+                let (bytes, count) = if is_durable {
+                    (&WARM_EVICTED_BYTES_DURABLE, &WARM_EVICTED_OBJECTS_DURABLE)
+                } else {
+                    (&WARM_EVICTED_BYTES_CACHE, &WARM_EVICTED_OBJECTS_CACHE)
+                };
+                bytes.fetch_add(len, Ordering::Relaxed);
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        used
+    });
+    match unlink.await {
+        Ok(used) => {
+            tracing::info!(
+                over_budget_bytes = total.saturating_sub(budget_bytes),
+                freed_bytes = total.saturating_sub(used),
+                used_bytes = used,
+                budget_bytes,
+                degraded,
+                "warm evict: pass complete"
+            );
+            Some(used)
+        }
+        Err(_) => {
+            WARM_EVICT_PASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+/// One-shot boot reap of `<warm_dir>/farms` (cba7165 A4): the Snapshot Farm
+/// root of the deleted ADR-0062 machinery (git-bug 0ec3b39). Nothing writes
+/// it any more, so on an upgraded volume it is pure dead weight the sweep
+/// must not have to walk around forever. `lstat` first — a missing entry is
+/// silence, a symlink is warn-and-skip (never traversed, never followed).
+fn reap_farm_residue(warm_dir: &std::path::Path) {
+    let farms = warm_dir.join("farms");
+    let meta = match std::fs::symlink_metadata(&farms) {
+        Ok(meta) => meta,
+        Err(_) => return,
+    };
+    if meta.file_type().is_symlink() {
+        tracing::warn!(
+            path = %farms.display(),
+            "warm boot reap: `farms` is a SYMLINK — refusing to traverse or remove it"
+        );
+        return;
+    }
+    let reclaimed = if meta.is_dir() {
+        dir_size(&farms)
+    } else {
+        meta.len()
+    };
+    let removed = if meta.is_dir() {
+        std::fs::remove_dir_all(&farms)
+    } else {
+        std::fs::remove_file(&farms)
+    };
+    match removed {
+        Ok(()) => tracing::info!(
+            reclaimed_bytes = reclaimed,
+            "warm boot reap: removed the dead Snapshot Farm root (git-bug 0ec3b39)"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "warm boot reap: could not remove <warm_dir>/farms — left in place \
+             (it still counts toward the size gauge)"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -4218,6 +4597,258 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    // --- the warm space bound (git-bug cba7165) ------------------------------
+
+    /// Rewind every file under `dir` by `secs_back` — the fixture for "this
+    /// content has sat unused past the floor".
+    fn age_warm_files(dir: &std::path::Path, secs_back: i64) {
+        let then = filetime::FileTime::from_unix_time(
+            filetime::FileTime::now().unix_seconds() - secs_back,
+            0,
+        );
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(next) = stack.pop() {
+            let Ok(read) = std::fs::read_dir(&next) else {
+                continue;
+            };
+            for item in read.flatten() {
+                let Ok(meta) = item.metadata() else { continue };
+                if meta.is_dir() {
+                    stack.push(item.path());
+                } else {
+                    let _ = filetime::set_file_mtime(item.path(), then);
+                }
+            }
+        }
+    }
+
+    /// The sweep's ordering and its stop condition: over budget, the
+    /// committed-durable class is evicted first — it is the free class, the
+    /// packs serve it straight back — and the pass stops at the low-water
+    /// mark, before it ever reaches the cache-only class.
+    ///
+    /// Mutations killed: invert the class order (cache-only would vanish while
+    /// a re-fetchable megabyte sat warm) or evict to the budget instead of the
+    /// low-water mark (`used <= low` fails).
+    #[tokio::test]
+    async fn the_sweep_evicts_committed_durable_first_and_stops_at_low_water() {
+        let Some(h) = DepotHarness::start().await else { return };
+
+        // A committed-durable megabyte: fenced PUTs, then the drain record
+        // that seals and commits the fence's pack.
+        let fence = h.step_token("run-ev", "build", "a1");
+        let big = vec![7u8; 1_048_576];
+        let big_hash = hash_hex(&big);
+        let (tree_hash, tree_bytes) = scarab_storage::canonical_tree(vec![TreeEntry::new(
+            "big.bin",
+            TreeTarget::Blob(BlobHash(big_hash.clone())),
+        )])
+        .expect("canonical tree");
+        let (status, body) = h
+            .put_raw_as(&fence, &format!("/v1/cas/blobs/{big_hash}"), big)
+            .await;
+        assert!(status.is_success(), "seed big blob: {body}");
+        let (status, body) = h
+            .put_raw_as(&fence, &format!("/v1/cas/trees/{}", tree_hash.0), tree_bytes)
+            .await;
+        assert!(status.is_success(), "seed tree: {body}");
+        let (status, body) = h
+            .call_as(
+                &fence,
+                "POST",
+                "/v1/drains",
+                Some(drain_record_body(&tree_hash.0)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "commit the pack: {body}");
+
+        // A cache-only blob (fenceless absent-header PUT): the class the
+        // ordering protects.
+        let scratch = b"cache-only scratch the sweep must spare".to_vec();
+        let scratch_hash = hash_hex(&scratch);
+        let (status, body) = h
+            .put_raw(&format!("/v1/cas/blobs/{scratch_hash}"), scratch)
+            .await;
+        assert!(status.is_success(), "seed scratch: {body}");
+
+        // Everything has sat unused for two hours — past the 1h floor.
+        age_warm_files(&h.state.warm_dir, 7200);
+
+        let total = dir_size(&h.state.warm_dir);
+        let budget = total - 1; // over budget by one byte
+        let low = budget - budget / 5;
+        let used = warm_evict_once(
+            &h.state.warm_dir,
+            &h.state.db,
+            budget,
+            std::time::Duration::from_secs(WARM_EVICT_MIN_AGE_SECS),
+        )
+        .await
+        .expect("the pass must run");
+
+        assert!(
+            used <= low,
+            "evict-ahead: the pass must reach the low-water mark ({used} > {low})"
+        );
+        assert!(
+            !warm_blob_path(&h.state, &big_hash).exists(),
+            "the committed-durable megabyte is the free eviction and must go first"
+        );
+        assert!(
+            warm_blob_path(&h.state, &scratch_hash).exists(),
+            "cache-only content must survive while durable candidates cover the pressure"
+        );
+
+        // And the keystone holds: the evicted blob is still served — from its
+        // pack, which re-backfills warm on the way past.
+        let (status, _) = h
+            .call("GET", &format!("/v1/cas/blobs/{big_hash}"), None)
+            .await;
+        assert!(status.is_success(), "an evicted durable blob must re-serve");
+        assert!(
+            warm_blob_path(&h.state, &big_hash).exists(),
+            "…and the pack read re-backfills warm"
+        );
+    }
+
+    /// The three refusals: the min-age floor spares fresh content whatever the
+    /// pressure, the 64-hex filter spares everything that is not a CAS object
+    /// (staging temp names, stray garbage), and the `readyz/` probe key —
+    /// outside `blobs/`/`trees/` — is never a candidate at all.
+    #[tokio::test]
+    async fn the_floor_the_hex_filter_and_the_probe_survive_a_zero_budget() {
+        let Some(h) = DepotHarness::start().await else { return };
+
+        let scratch = b"fresh scratch under the floor".to_vec();
+        let scratch_hash = hash_hex(&scratch);
+        let (status, body) = h
+            .put_raw(&format!("/v1/cas/blobs/{scratch_hash}"), scratch)
+            .await;
+        assert!(status.is_success(), "seed scratch: {body}");
+
+        // The probe key and two pieces of non-CAS garbage, all ancient.
+        h.state
+            .warm
+            .put("readyz/probe", b"ready".to_vec())
+            .await
+            .expect("probe");
+        let staging = h.state.warm_dir.join("blobs").join(format!("{}#3", "a".repeat(64)));
+        let stray = h.state.warm_dir.join("trees").join("not-a-hash.tmp");
+        std::fs::write(&staging, b"half-renamed staging file").unwrap();
+        std::fs::write(&stray, b"operator debris").unwrap();
+        let probe = h.state.warm_dir.join("readyz").join("probe");
+        for path in [&staging, &stray, &probe] {
+            filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(1_000_000_000, 0))
+                .unwrap();
+        }
+
+        // Budget zero, floor in force: the fresh blob is untouchable and
+        // nothing else under pressure is a legal victim.
+        let floor = std::time::Duration::from_secs(WARM_EVICT_MIN_AGE_SECS);
+        warm_evict_once(&h.state.warm_dir, &h.state.db, 0, floor)
+            .await
+            .expect("pass 1");
+        assert!(
+            warm_blob_path(&h.state, &scratch_hash).exists(),
+            "the floor must spare content younger than WARM_EVICT_MIN_AGE_SECS"
+        );
+
+        // Aged past the floor, the blob IS evicted — and the garbage and the
+        // probe still are not.
+        age_warm_files(&h.state.warm_dir, 7200);
+        warm_evict_once(&h.state.warm_dir, &h.state.db, 0, floor)
+            .await
+            .expect("pass 2");
+        assert!(
+            !warm_blob_path(&h.state, &scratch_hash).exists(),
+            "past the floor, a cache-only blob under a zero budget is evicted"
+        );
+        assert!(staging.exists(), "a staging temp name fails the 64-hex filter");
+        assert!(stray.exists(), "stray garbage fails the 64-hex filter");
+        assert!(probe.exists(), "readyz/ is outside both content prefixes");
+    }
+
+    /// A pack-index outage degrades classification to pure LRU — it must not
+    /// degrade to *skip*: the volume would fill and every PUT would ENOSPC.
+    /// The counter is the operator's evidence the ordering was blind.
+    #[tokio::test]
+    async fn a_classify_failure_degrades_to_pure_lru_not_to_skip() {
+        let Some(h) = DepotHarness::start().await else { return };
+
+        let scratch = b"evict me even blind".to_vec();
+        let scratch_hash = hash_hex(&scratch);
+        let (status, body) = h
+            .put_raw(&format!("/v1/cas/blobs/{scratch_hash}"), scratch)
+            .await;
+        assert!(status.is_success(), "seed scratch: {body}");
+        age_warm_files(&h.state.warm_dir, 7200);
+
+        // Kill the pool the classify query runs on.
+        h.state.db.close().await;
+
+        let skipped_before = WARM_EVICT_PASS_SKIPPED.load(Ordering::Relaxed);
+        warm_evict_once(
+            &h.state.warm_dir,
+            &h.state.db,
+            0,
+            std::time::Duration::from_secs(WARM_EVICT_MIN_AGE_SECS),
+        )
+        .await
+        .expect("a degraded pass still runs");
+        assert!(
+            !warm_blob_path(&h.state, &scratch_hash).exists(),
+            "degrade means evict blind (oldest first), never skip"
+        );
+        assert!(
+            WARM_EVICT_PASS_SKIPPED.load(Ordering::Relaxed) > skipped_before,
+            "the degraded pass must leave evidence on the counter"
+        );
+    }
+
+    /// The boot reap (cba7165 A4): a dead `farms/` root from the deleted
+    /// ADR-0062 machinery is removed at boot; a symlink in its place is never
+    /// traversed or removed. No database needed — the reap runs in
+    /// `open_state`, before anything dials Postgres.
+    #[tokio::test]
+    async fn boot_reaps_a_dead_farm_root_and_refuses_a_symlinked_one() {
+        let lazy_pool = || {
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://scarab:scarab@127.0.0.1:1/never_dialed")
+                .expect("lazy pool")
+        };
+
+        // A real farms directory: reaped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warm = dir.path().join("warm");
+        std::fs::create_dir_all(warm.join("farms/snap-1")).unwrap();
+        std::fs::write(warm.join("farms/snap-1/file"), b"dead overlay lower").unwrap();
+        let cold = Arc::new(S3Storage::local(dir.path().join("cold")).expect("cold"));
+        open_state(&warm, cold.clone(), b"s".to_vec(), lazy_pool()).expect("open");
+        assert!(
+            !warm.join("farms").exists(),
+            "the dead Snapshot Farm root must be reaped at boot"
+        );
+
+        // A symlinked farms: warn-and-skip, target untouched.
+        let dir2 = tempfile::tempdir().expect("tempdir");
+        let warm2 = dir2.path().join("warm");
+        std::fs::create_dir_all(&warm2).unwrap();
+        let target = dir2.path().join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("precious"), b"not ours to delete").unwrap();
+        std::os::unix::fs::symlink(&target, warm2.join("farms")).unwrap();
+        let cold2 = Arc::new(S3Storage::local(dir2.path().join("cold")).expect("cold"));
+        open_state(&warm2, cold2, b"s".to_vec(), lazy_pool()).expect("open");
+        assert!(
+            warm2.join("farms").symlink_metadata().is_ok(),
+            "a symlink named farms is skipped, not removed"
+        );
+        assert!(
+            target.join("precious").exists(),
+            "and its target is never traversed"
+        );
     }
 
     /// "Not there" and "the volume could not answer" must not be one answer.
@@ -6990,6 +7621,7 @@ mod tests {
                 url: "http://127.0.0.1:0".into(),
                 data_dir: warm.path().to_string_lossy().into_owned(),
                 fetcher_image: "ghcr.io/example/wsfetch:test".into(),
+                warm_budget_bytes: None,
             }),
             github_webhook_secret: None,
             forgejo_webhook_secret: None,

@@ -298,6 +298,14 @@ workspace:
   # after it. While the eager feed is live, `eager_fetch_total` on the
   # server is climbing.
   fetcherImage: ghcr.io/thulasi-ram/scarab-wsfetch:edge
+  # Warm space bound in PLAIN BYTES (git-bug cba7165) — over it the service's
+  # LRU sweep evicts back to 80% of the bound: committed-durable content first
+  # (free — the packs serve it straight back), cache-only content second (a
+  # licensed cache miss). "" = the default: 90% of the warm volume's statvfs
+  # capacity, i.e. 90% of persistence.size, since the PVC is dedicated. Set it
+  # only to hold the sweep BELOW the volume (e.g. to leave headroom for
+  # filesystem overhead on a small PVC).
+  warmBudgetBytes: ""
   persistence:
     # The warm tier is bounded by SPACE (cold is bounded by time). LRU eviction
     # is NOT implemented yet, so until it is, watch the

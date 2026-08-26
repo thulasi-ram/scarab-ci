@@ -144,6 +144,12 @@ ws_port="${SCARAB_WORKSPACE_PORT:-8081}"
 export SCARAB_WORKSPACE_TOKEN_SECRET="${SCARAB_WORKSPACE_TOKEN_SECRET:-dev-workspace-token-secret}"
 export SCARAB_WORKSPACE_DATA_DIR="${SCARAB_WORKSPACE_DATA_DIR:-$root/.scarab/workspace-cas}"
 mkdir -p "$SCARAB_WORKSPACE_DATA_DIR"
+# Warm space bound (git-bug cba7165), EXPLICIT here on purpose: the service's
+# statvfs-90% default is sized for a dedicated PVC, and 90% of a shared dev
+# disk is effectively unbounded — the sweep would never run and the dev warm
+# dir would grow forever. 2 GiB is plenty for a demo run and small enough to
+# actually see eviction happen.
+export SCARAB_WORKSPACE_WARM_BUDGET_BYTES="${SCARAB_WORKSPACE_WARM_BUDGET_BYTES:-2147483648}"
 
 # Candidate hosts, best-first. `host.docker.internal` is Docker Desktop's and
 # colima's name for the host and is what works on darwin; the IPv4 gateway of the
