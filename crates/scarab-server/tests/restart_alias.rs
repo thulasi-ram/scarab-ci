@@ -140,6 +140,16 @@ async fn restart_behaves_identically_to_rerun() {
         "the alias must answer exactly like /rerun"
     );
 
+    // The alias inherits the 202 body too (git-bug 4afaa3e): the executed plan,
+    // per-step reasons included — identical pipelines, identical bodies.
+    let rerun_body = body_json(rerun).await;
+    let restart_body = body_json(restart).await;
+    assert_eq!(
+        restart_body, rerun_body,
+        "the alias returns the same executed-plan body as /rerun"
+    );
+    assert_eq!(rerun_body["steps"][0]["reason"], "target");
+
     // Identical durable outcome: same re-armed step, same reopened run, same
     // RunRerunRequested Take-fork event (target + invalidation set + actor).
     let via_rerun = fork_evidence(&db, &a).await;

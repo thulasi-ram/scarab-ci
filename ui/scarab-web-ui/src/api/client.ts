@@ -599,21 +599,28 @@ export async function fetchEvents(id: string): Promise<RunEvent[]> {
   return out;
 }
 
-/** Rerun a step and its transitive descendants (`POST …/steps/{step}/rerun`). */
-export async function rerunStep(id: string, step: string): Promise<void> {
-  const { error } = await api.POST("/v1/runs/{id}/steps/{step}/rerun", {
+/** Rerun a step and its transitive descendants (`POST …/steps/{step}/rerun`).
+ * The 202 body is the EXECUTED plan (git-bug 4afaa3e) — what actually re-armed,
+ * so a widening between preview and confirm can be disclosed after the fact.
+ * `null` if the server answered without a readable plan body (older server, or
+ * the mock's catch-all) — the caller treats that as "nothing to compare". */
+export async function rerunStep(id: string, step: string): Promise<RerunPlan | null> {
+  const { data, error } = await api.POST("/v1/runs/{id}/steps/{step}/rerun", {
     params: { path: { id, step } },
   });
   if (error) throw new Error(`failed to rerun ${step}`);
+  return data && Array.isArray(data.invalidated) ? data : null;
 }
 
 /** Retry a FAILED step (ADR-0056 amendment) — another attempt in the CURRENT
- * Take, no fork. 409 if the step is not failed (rerun it instead). */
-export async function retryStep(id: string, step: string): Promise<void> {
-  const { error } = await api.POST("/v1/runs/{id}/steps/{step}/retry", {
+ * Take, no fork. 409 if the step is not failed (rerun it instead). Returns the
+ * EXECUTED plan like `rerunStep`. */
+export async function retryStep(id: string, step: string): Promise<RerunPlan | null> {
+  const { data, error } = await api.POST("/v1/runs/{id}/steps/{step}/retry", {
     params: { path: { id, step } },
   });
   if (error) throw new Error(`failed to retry ${step}`);
+  return data && Array.isArray(data.invalidated) ? data : null;
 }
 
 /** Preview a rerun (`GET …/steps/{step}/rerun-plan`, ADR-0061 s5): what it would

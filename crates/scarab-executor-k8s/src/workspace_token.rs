@@ -45,8 +45,9 @@
 //! # What the service enforces
 //!
 //! See [`WorkspaceClaims`] and the service's own module docs. In one line:
-//! tree reads are checked against the token's `roots`; **blob reads are
-//! fence-*authenticated*, not fence-*authorized*.*
+//! tree reads are checked against the token's `roots`; blob reads are checked
+//! against the **blob closure** of those roots (ticket 52ef3aa — rollout-gated
+//! by `SCARAB_DEPOT_BLOB_AUTHZ`).
 
 use base64::Engine;
 

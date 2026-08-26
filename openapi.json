@@ -1829,7 +1829,14 @@
         ],
         "responses": {
           "202": {
-            "description": "rerun accepted"
+            "description": "rerun accepted — the body is the EXECUTED plan",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RerunPlanResponse"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such run or step"
@@ -2007,7 +2014,14 @@
         ],
         "responses": {
           "202": {
-            "description": "retry accepted"
+            "description": "retry accepted — the body is the EXECUTED plan",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RerunPlanResponse"
+                }
+              }
+            }
           },
           "404": {
             "description": "no such run or step"
@@ -3023,6 +3037,46 @@
           }
         }
       },
+      "PlanReasonDto": {
+        "type": "string",
+        "description": "Why a step is in a rerun plan (git-bug 4afaa3e).",
+        "enum": [
+          "target",
+          "cascade",
+          "regenerate",
+          "regenerate_cascade"
+        ]
+      },
+      "PlannedStepDto": {
+        "type": "object",
+        "description": "One member of a rerun plan, with its WHY (git-bug 4afaa3e).",
+        "required": [
+          "step",
+          "reason",
+          "is_gate"
+        ],
+        "properties": {
+          "because_of": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The in-set step this one is here because of: the cascade parent\n(minimum in-set need by id, deterministic) or, for `regenerate`, the\nconsumer whose expired input dragged it in. Absent only on the target."
+          },
+          "is_gate": {
+            "type": "boolean",
+            "description": "A gate (ADR-0008): the rerun pauses for approval here — the plan never\nclaims a gate will run."
+          },
+          "reason": {
+            "$ref": "#/components/schemas/PlanReasonDto",
+            "description": "Why it is in the set."
+          },
+          "step": {
+            "type": "string",
+            "description": "The step that re-runs (a gate re-arms and pauses instead of running)."
+          }
+        }
+      },
       "ProjectDto": {
         "type": "object",
         "description": "One registered project (governed repo, ADR-0046) in the repos list.",
@@ -3145,7 +3199,8 @@
           "invalidated",
           "widened",
           "starts_from",
-          "expired_inputs"
+          "expired_inputs",
+          "steps"
         ],
         "properties": {
           "expired_inputs": {
@@ -3168,6 +3223,13 @@
               "type": "string"
             },
             "description": "The steps the rerun effectively **starts from** (no dependency inside the\nset). `[target]` on an ordinary rerun; on a widened one this is the phrase\nthe affordance says out loud — \"this re-runs from *clone*\"."
+          },
+          "steps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PlannedStepDto"
+            },
+            "description": "The same set as `invalidated`, **execution-ordered** and carrying each\nmember's WHY (git-bug 4afaa3e) — computed by the engine, identically for\nthis preview and for the plan a POST rerun/retry executes and returns."
           },
           "target": {
             "type": "string",
