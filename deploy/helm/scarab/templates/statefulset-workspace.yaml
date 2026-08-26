@@ -104,6 +104,13 @@ spec:
             - name: SCARAB_WORKSPACE_WARM_BUDGET_BYTES
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.workspace.blobAuthz }}
+            # Blob-read authorization mode (ticket 52ef3aa). Unset renders
+            # nothing and the service defaults to `log` (compute the
+            # roots-closure allowlist, count would-denies, never refuse).
+            - name: SCARAB_DEPOT_BLOB_AUTHZ
+              value: {{ . | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8080
