@@ -103,8 +103,9 @@ use std::os::unix::fs::PermissionsExt;
 
 use scarab_storage::{PruneError, StorageError, TreeHash};
 use scarab_workspace_client::{
-    exclude_paths, DrainErrorKind, DrainErrorRecord, DrainPostOutcome, DrainRecord, IngestReport,
-    MemoCas, WorkspaceClient, EXIT_FETCH_CONFIG, EXIT_FETCH_DENIED, EXIT_FETCH_MISSING_INPUTS,
+    exclude_paths, fold_manifests, termination_summary, DrainErrorKind, DrainErrorRecord,
+    DrainPostOutcome, DrainRecord, FanInReport, IngestReport, MemoCas, WorkspaceClient,
+    EXIT_FETCH_CONFIG, EXIT_FETCH_DENIED, EXIT_FETCH_INPUT_CONFLICT, EXIT_FETCH_MISSING_INPUTS,
     EXIT_FETCH_TRANSIENT, STEP_TIMEOUT_ENV,
 };
 
@@ -128,6 +129,20 @@ const CACHE_ROOTS_ENV: &str = "SCARAB_CACHE_ROOTS";
 /// Where to build the Workspace. Overridable only so the binary is testable.
 const TARGET_ENV: &str = "SCARAB_WORKSPACE_TARGET";
 const DEFAULT_TARGET: &str = "/workspace";
+
+/// Where the bounded fan-in summary (and an exit-5 conflict cause) is written
+/// for the kubelet to capture as the container's `terminated.message` (ticket
+/// 2e1a458). `/dev/termination-log` is the k8s default `terminationMessagePath`
+/// — no Pod-spec change needed; captured on success and failure alike.
+/// Overridable only so the binary-grain e2e can read the file back.
+const TERMINATION_LOG_ENV: &str = "SCARAB_TERMINATION_LOG";
+const DEFAULT_TERMINATION_LOG: &str = "/dev/termination-log";
+
+/// Cap on per-collision stderr lines. The termination summary is bounded
+/// separately (and harder — the kubelet caps the message); the Pod log is
+/// where the full picture lives, but even it should not scroll a pathological
+/// merge into megabytes.
+const COLLISION_LOG_CAP: usize = 50;
 
 /// Default egress-done marker for `hold`. Must agree with
 /// `scarab_executor_k8s`'s `egress_done_marker()` —
@@ -175,6 +190,16 @@ fn main() {
                 Err(FetchError::Transient(msg)) => {
                     eprintln!("scarab-wsfetch: {msg}");
                     EXIT_FETCH_TRANSIENT
+                }
+                Err(FetchError::InputConflict(msg)) => {
+                    eprintln!("scarab-wsfetch: INPUT CONFLICT: {msg}");
+                    // The cause rides the termination log (ticket 2e1a458):
+                    // the executor reads `terminated.message` and surfaces the
+                    // path + both roots on the Config verdict, so the author
+                    // never has to find the init container's log to learn WHAT
+                    // conflicted.
+                    write_termination_log(&format!("workspace input conflict: {msg}"));
+                    EXIT_FETCH_INPUT_CONFLICT
                 }
             };
             std::process::exit(code);
@@ -252,6 +277,13 @@ enum FetchError {
     /// Anything else: unreachable service, 5xx, local I/O — exit
     /// [`EXIT_FETCH_TRANSIENT`] (after the retry window, where applicable).
     Transient(String),
+    /// A fan-in **type conflict** (ticket 2e1a458): two input snapshots carry
+    /// the same path as incompatible kinds (directory vs file/symlink).
+    /// Detected by the manifest pre-pass BEFORE any write; permanent and
+    /// author-fixable — exit [`EXIT_FETCH_INPUT_CONFLICT`], with the cause
+    /// (path + both roots) also written to the termination log so the
+    /// executor's verdict can name it.
+    InputConflict(String),
 }
 
 impl From<std::io::Error> for FetchError {
@@ -513,6 +545,40 @@ async fn fetch(
     // retry budget. Only transient failures (see `retry_verdict`) retry;
     // NotFound/Denied/skew exit immediately.
     let mut win = LegWindow::new(retry_window(step_timeout_secs()));
+
+    // Fan-in pre-pass (ticket 2e1a458), only when two or more roots can merge:
+    // fetch every root's manifest FIRST, fold them (dirs included), classify.
+    // A type conflict refuses the whole fetch BEFORE any write; file/symlink
+    // collisions proceed last-wins (ADR-0007) — loudly, on three rungs (stderr
+    // per path, the bounded termination summary, and the control-plane event
+    // built from it). The N up-front `/flat` calls are transfers inside this
+    // same leg: their transients retry inside the ONE shared window above,
+    // and the manifests are handed to `materialize_flat` below so no root
+    // pays a second `/flat`.
+    let manifests = if roots.len() >= 2 {
+        let mut manifests = Vec::with_capacity(roots.len());
+        for root in roots {
+            manifests.push(flat_with_retry(&client, root, &mut win).await?);
+        }
+        let report = fold_manifests(&manifests)
+            .map_err(|conflict| FetchError::InputConflict(conflict.to_string()))?;
+        report_collisions(&report, roots);
+        // Written NOW — before any write, and therefore before exit 0 — so the
+        // summary stands even when a LATER leg failure ends this fetch: a
+        // collision explains failures too. (The kubelet captures the file as
+        // the container's `terminated.message` on success and failure alike.)
+        match serde_json::to_string(&termination_summary(&report)) {
+            Ok(json) => write_termination_log(&json),
+            Err(e) => eprintln!(
+                "scarab-wsfetch: could not serialise the collision summary: {e} \
+                 (diagnostic only — the fetch proceeds)"
+            ),
+        }
+        Some(manifests)
+    } else {
+        None
+    };
+
     for (i, root) in roots.iter().enumerate() {
         let started = std::time::Instant::now();
         let mut pause = std::time::Duration::from_secs(1);
@@ -523,14 +589,18 @@ async fn fetch(
             // Whole-ROOT retry: `materialize` is a merge-in-order overlay, so
             // re-running a root over its own partial restore overwrites
             // correctly (idempotent). Re-downloading the root's blobs is the
-            // accepted cost — per-blob resume is future perf work.
-            let err = match scarab_storage::Cas::materialize(
-                &client,
-                &TreeHash(root.clone()),
-                target,
-            )
-            .await
-            {
+            // accepted cost — per-blob resume is future perf work. With the
+            // pre-pass done, the root's own manifest is already in hand
+            // (immutable — it IS the content address), so the retry
+            // re-applies it rather than re-asking `/flat`.
+            let attempt = match &manifests {
+                Some(m) => client.materialize_flat(&m[i], target).await,
+                None => {
+                    scarab_storage::Cas::materialize(&client, &TreeHash(root.clone()), target)
+                        .await
+                }
+            };
+            let err = match attempt {
                 Ok(()) => break,
                 Err(e) => e,
             };
@@ -636,6 +706,112 @@ async fn restore_cache(client: &WorkspaceClient, target: &str, dir: &str, root: 
             let _ = std::fs::remove_dir_all(&at);
             println!("scarab-wsfetch: cache restore miss dir={dir} root={root}: {e}");
         }
+    }
+}
+
+/// Fetch one root's `FlatManifest` for the fan-in pre-pass, retrying
+/// transients inside the SAME shared leg window the materialize loop uses
+/// (one window bounds the whole leg — the pre-pass is part of the leg, not a
+/// second budget). Verdict arms mirror the materialize loop's exactly: a 404
+/// here IS the missing-input verdict (the manifest is the root).
+async fn flat_with_retry(
+    client: &WorkspaceClient,
+    root: &str,
+    win: &mut LegWindow,
+) -> Result<scarab_storage::content::FlatManifest, FetchError> {
+    let mut pause = std::time::Duration::from_secs(1);
+    loop {
+        let err = match client.flat(&TreeHash(root.to_string())).await {
+            Ok(m) => return Ok(m),
+            Err(e) => e,
+        };
+        match retry_verdict(&err) {
+            RetryVerdict::Retry => {
+                let Some(sleep) = win.next_delay(std::time::Instant::now(), pause) else {
+                    return Err(FetchError::Transient(format!(
+                        "flat manifest {root}: {err} — still failing after the {}s retry \
+                         window (a Depot outage longer than this delays the attempt into \
+                         a bounded re-launch)",
+                        win.window.as_secs()
+                    )));
+                };
+                eprintln!(
+                    "scarab-wsfetch: flat manifest {root}: {err} — transient, retrying \
+                     in {} ms (window {}s)",
+                    sleep.as_millis(),
+                    win.window.as_secs()
+                );
+                tokio::time::sleep(sleep).await;
+                pause = next_pause(pause);
+            }
+            RetryVerdict::MissingInputs => {
+                return Err(FetchError::MissingInputs(format!(
+                    "input snapshot {root} is not in the workspace service, its pack \
+                     index or its cold archive — this Step can never be provisioned \
+                     from the identical spec (evicted, or the store was wiped); \
+                     Rerun/Retry regenerates it"
+                )))
+            }
+            RetryVerdict::Denied => {
+                return Err(FetchError::Denied(format!(
+                    "flat manifest {root}: {err} — retrying with the same workspace \
+                     token cannot heal a denial; a fresh attempt mints a fresh one"
+                )))
+            }
+            RetryVerdict::Config => {
+                return Err(FetchError::Config(format!("flat manifest {root}: {err}")))
+            }
+        }
+    }
+}
+
+/// One stderr line per collision (rung 1 of the diagnostic — always there,
+/// even if the Pod dies before the termination message is read), capped at
+/// [`COLLISION_LOG_CAP`] with the remainder counted. wsfetch knows only
+/// hashes and declared indices; step NAMES are resolved control-plane-side,
+/// where the `WorkspaceInputCollisions` event maps indices back through the
+/// same consumption filter that built this root list.
+fn report_collisions(report: &FanInReport, roots: &[String]) {
+    let short = |i: usize| {
+        roots
+            .get(i)
+            .map(|r| &r[..r.len().min(8)])
+            .unwrap_or("????????")
+    };
+    for c in report.collisions.iter().take(COLLISION_LOG_CAP) {
+        eprintln!(
+            "scarab-wsfetch: COLLISION {} — root[{}] {}… loses to root[{}] {}… \
+             (last root wins, ADR-0007)",
+            c.path,
+            c.loser,
+            short(c.loser),
+            c.winner,
+            short(c.winner)
+        );
+    }
+    if report.collisions.len() > COLLISION_LOG_CAP {
+        eprintln!(
+            "scarab-wsfetch: … and {} more collisions",
+            report.collisions.len() - COLLISION_LOG_CAP
+        );
+    }
+}
+
+/// Write `contents` to the termination log (see [`TERMINATION_LOG_ENV`]),
+/// best-effort BY CONTRACT: the message is a diagnostic channel, and failing
+/// a fetch that materialised correctly because `/dev/termination-log` was not
+/// writable would invert the feature's own rule (detection failure never
+/// fails a fetch that would otherwise succeed). If a kubelet denies the write
+/// (the container runs as uid 65532), the named contingency is
+/// `terminationMessagePolicy: FallbackToLogsOnError` — the env-gated cluster
+/// test asserts the write actually lands on a real kubelet.
+fn write_termination_log(contents: &str) {
+    let path = env_or(TERMINATION_LOG_ENV, DEFAULT_TERMINATION_LOG);
+    if let Err(e) = std::fs::write(&path, contents) {
+        eprintln!(
+            "scarab-wsfetch: could not write the termination message to {path}: {e} \
+             (diagnostic only — the fetch verdict is unchanged)"
+        );
     }
 }
 
