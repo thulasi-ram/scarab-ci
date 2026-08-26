@@ -186,9 +186,12 @@ async fn post_start_classes_fail_immediately_without_the_assertion() {
         // the run; a verdict-less post-start infra failure dead-letters it.
         let expected = match class {
             FailureClass::Infra { .. } => RunStatus::DeadLettered,
-            // Config is never-started (not iterated here), but fails fast to a
-            // developer verdict like Step/Timeout.
-            FailureClass::Step | FailureClass::Timeout | FailureClass::Config => RunStatus::Failed,
+            // Config/MissingInputs are never-started (not iterated here), but
+            // fail fast to a developer verdict like Step/Timeout.
+            FailureClass::Step
+            | FailureClass::Timeout
+            | FailureClass::Config
+            | FailureClass::MissingInputs => RunStatus::Failed,
         };
         assert_eq!(
             db.run_status(&run_id()).await.unwrap(),
@@ -224,6 +227,39 @@ async fn configured_retry_covers_post_start_failures_and_consumes_budget() {
     assert_eq!(a.len(), 3);
     assert_eq!(a[0].failure, Some(FailureKind::Step));
     assert_eq!(a[1].failure, Some(FailureKind::Timeout));
+}
+
+/// Ticket e140121: an input snapshot gone from every tier (`MissingInputs`)
+/// gets exactly ONE attempt — even against an author `retry:` budget, because
+/// re-launching the identical spec cannot re-create evicted content — and the
+/// run settles `Failed` (a developer-actionable verdict: Rerun/Retry widens to
+/// the producing steps), never `DeadLettered` (the operator fixed nothing).
+///
+/// Mutations killed: mapping the class into `Infra { never_started: true }`
+/// (the old behaviour — 3 futile pods, then a DeadLettered run), and letting
+/// `retry:` cover it (2 more futile pods).
+#[tokio::test]
+async fn missing_inputs_fails_fast_to_a_failed_run_never_dead_lettered() {
+    let (db, clock, exec) = (
+        InMemoryDb::new(),
+        FakeClock::new(1_000),
+        FakeExecutor::new(),
+    );
+    seed(&db, Some(2)).await; // an author budget that must NOT apply
+    exec.script_outcome(failed(FailureClass::MissingInputs));
+
+    for _ in 0..3 {
+        tick(&db, &clock, &exec).await;
+    }
+
+    assert_eq!(
+        db.run_status(&run_id()).await.unwrap(),
+        Some(RunStatus::Failed),
+        "a developer verdict — the recovery (Rerun widening) is the author's move"
+    );
+    let a = attempts(&db).await;
+    assert_eq!(a.len(), 1, "one attempt: retrying cannot re-create content");
+    assert_eq!(a[0].failure, Some(FailureKind::MissingInputs));
 }
 
 #[tokio::test]

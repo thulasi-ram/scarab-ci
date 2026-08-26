@@ -2360,7 +2360,7 @@
               "string",
               "null"
             ],
-            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`\n| `config`."
+            "description": "Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`\n| `config` | `missing-inputs` (an input snapshot gone from every tier —\nRerun/Retry regenerates it; ticket e140121)."
           },
           "failure_detail": {
             "type": [

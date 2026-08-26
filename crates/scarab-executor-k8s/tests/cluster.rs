@@ -329,6 +329,7 @@ fn workspace_fixture() -> Option<WorkspaceFixture> {
             url: pod_url,
             token_secret: secret.into_bytes(),
             fetcher_image: image,
+            helper_resources: scarab_pipeline::Resources::default(),
         },
     })
 }
