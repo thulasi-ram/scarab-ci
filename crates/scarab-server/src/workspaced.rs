@@ -7424,10 +7424,12 @@ mod tests {
     ///
     /// Mutations killed: drop the prefilter's NOT EXISTS and `expired` is 0
     /// here (the window is all blockers, each nominated then declined
-    /// in-txn); weaken its liveness join (edge alone, without the borrower's
-    /// living drain record) and a dead-borrower fence hides from nomination
-    /// forever — the transitive free in
-    /// `a_borrowed_victim_survives_until_its_borrower_expires` breaks.
+    /// in-txn). The OTHER direction — weakening the liveness join to
+    /// edge-alone, stricter than the in-txn authority — is killed by
+    /// `a_dangling_edge_without_a_borrower_record_does_not_hide_the_owner`,
+    /// not here: fence expiry deletes the expiring borrower's outbound edges
+    /// in the same transaction, so every edge THIS test leaves behind has a
+    /// living record anyway.
     #[tokio::test]
     async fn a_window_of_borrowed_blockers_cannot_starve_a_victim_behind_them() {
         let Some(h) = DepotHarness::start().await else { return };
@@ -7582,6 +7584,44 @@ mod tests {
         // the same fence is still nominable — and without the hook it goes.
         let expired = expire_now(db, &expiry_ttls()).await;
         assert_eq!(expired, 1);
+        assert_eq!(expiry_rows_of(db, &f).await, (0, 0, 0, 0));
+    }
+
+    /// A DANGLING borrow edge — one whose borrower fence has NO drain record
+    /// (the migration-0048 `run`-column insurance case: the record went away
+    /// without the borrower fence expiring — rebuilds, manual sweeps) — pins
+    /// NOTHING, at nomination exactly as in the victim transaction. The
+    /// prefilter's liveness is the same edge-JOIN-record shape as the in-txn
+    /// authority; edge-alone would be STRICTER than the authority and would
+    /// hide this owner from nomination forever, unnominated and uncounted.
+    ///
+    /// Mutations killed: weaken the prefilter's liveness join to edge-alone
+    /// (drop the JOIN on the borrower's living drain record) and `expired`
+    /// is 0 here — the one direction none of the live-borrower tests can see.
+    #[tokio::test]
+    async fn a_dangling_edge_without_a_borrower_record_does_not_hide_the_owner() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        let f = expiry_drain(&h, "dang", "dangling-edge").await;
+        seed_run(db, "dang", "succeeded", 3600, false).await;
+        // The bare edge: no drain record exists for its borrower fence.
+        sqlx::query(
+            "INSERT INTO depot_fence_borrows (borrower_fence, owner_fence, run, created_at) \
+             VALUES ('dang-borrower-fence', $1, 'dang-brw', $2)",
+        )
+        .bind(&f)
+        .bind(now_secs())
+        .execute(db)
+        .await
+        .expect("seed the dangling edge");
+
+        let expired = expire_now(db, &expiry_ttls()).await;
+        assert_eq!(
+            expired, 1,
+            "a borrow edge whose borrower record is gone pins nothing — the \
+             owner must be nominated and expire in ONE pass"
+        );
         assert_eq!(expiry_rows_of(db, &f).await, (0, 0, 0, 0));
     }
 
