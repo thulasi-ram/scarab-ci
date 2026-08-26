@@ -314,6 +314,46 @@ fn next_pause(pause: std::time::Duration) -> std::time::Duration {
     std::cmp::min(pause * 2, std::time::Duration::from_secs(10))
 }
 
+/// One leg's transient-retry window, **armed at the first transient failure**
+/// — never at leg start (review fix on e140121). Arming at leg start made
+/// successful transfer time consume the retry budget: a fetch whose downloads
+/// alone take longer than the window would reach its first outage with the
+/// window already spent and get ZERO retries — the feature inert exactly for
+/// the expensive legs that need it most. Arming on failure keeps the
+/// guarantee that matters (at most ONE window of outage-waiting per leg,
+/// shared across roots/retries — never N × window) while transfer time stays
+/// the step budget's business, not the window's.
+struct LegWindow {
+    window: std::time::Duration,
+    /// The deadline, set by the first transient failure.
+    armed: Option<std::time::Instant>,
+}
+
+impl LegWindow {
+    fn new(window: std::time::Duration) -> Self {
+        Self {
+            window,
+            armed: None,
+        }
+    }
+
+    /// Called on a transient failure observed at `now`: arms the deadline on
+    /// the first call, then answers how long to sleep before the next try —
+    /// `pause`, capped to what remains of the window — or `None` once the
+    /// window is exhausted.
+    fn next_delay(
+        &mut self,
+        now: std::time::Instant,
+        pause: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        let deadline = *self.armed.get_or_insert(now + self.window);
+        if now >= deadline {
+            return None;
+        }
+        Some(pause.min(deadline - now))
+    }
+}
+
 /// Parse `SCARAB_SNAPSHOT_ROOTS` into the merge order to materialise in.
 ///
 /// A named function rather than an inline chain in [`run`] specifically so a test
@@ -447,10 +487,11 @@ async fn fetch(
     let client = apply_transfer_budget(client).map_err(FetchError::Transient)?;
     // ONE window for the whole fetch leg (ticket e140121): every root's
     // retries share this deadline, so the worst-case delay is proportional to
-    // the step's own budget, not to its input count. Only transient failures
-    // (see `retry_verdict`) retry; NotFound/Denied/skew exit immediately.
-    let window = retry_window(step_timeout_secs());
-    let leg_deadline = std::time::Instant::now() + window;
+    // the step's own budget, not to its input count. Armed at the FIRST
+    // transient failure (see [`LegWindow`]) so transfer time never eats the
+    // retry budget. Only transient failures (see `retry_verdict`) retry;
+    // NotFound/Denied/skew exit immediately.
+    let mut win = LegWindow::new(retry_window(step_timeout_secs()));
     for (i, root) in roots.iter().enumerate() {
         let started = std::time::Instant::now();
         let mut pause = std::time::Duration::from_secs(1);
@@ -474,21 +515,19 @@ async fn fetch(
             };
             match retry_verdict(&err) {
                 RetryVerdict::Retry => {
-                    let now = std::time::Instant::now();
-                    if now >= leg_deadline {
+                    let Some(sleep) = win.next_delay(std::time::Instant::now(), pause) else {
                         return Err(FetchError::Transient(format!(
                             "materialize {root}: {err} — still failing after the \
                              {}s retry window (a Depot outage longer than this \
                              delays the attempt into a bounded re-launch)",
-                            window.as_secs()
+                            win.window.as_secs()
                         )));
-                    }
-                    let sleep = pause.min(leg_deadline - now);
+                    };
                     eprintln!(
                         "scarab-wsfetch: materialize {root}: {err} — transient, \
                          retrying in {} ms (window {}s)",
                         sleep.as_millis(),
-                        window.as_secs()
+                        win.window.as_secs()
                     );
                     tokio::time::sleep(sleep).await;
                     pause = next_pause(pause);
@@ -757,28 +796,34 @@ async fn run_drain(
     // restart lost re-upload while surviving packs dedup, a PUT of identical
     // bytes is an idempotent overwrite, and the write-ledger append upserts
     // (`ON CONFLICT DO UPDATE` on `depot_fence_writes`).
-    let window = retry_window(step_timeout_secs());
-    let leg_deadline = std::time::Instant::now() + window;
+    // Armed at the first transient failure, like the fetch leg's — hashing
+    // and uploading the workspace can alone outlast the window, and a window
+    // armed at leg start would leave such a drain ZERO retries.
+    let mut win = LegWindow::new(retry_window(step_timeout_secs()));
     let mut ingest_pause = std::time::Duration::from_secs(1);
     let report = loop {
         let err = match client.drain_ingest_report(workspace, outputs, cache_dirs).await {
             Ok(r) => break r,
             Err(e) => e,
         };
-        let now = std::time::Instant::now();
-        if retry_verdict(&err) != RetryVerdict::Retry || now >= leg_deadline {
-            // Non-transient (denied/skew) or window exhausted: exit 10 either
-            // way — classification is record-first on the control plane, and
-            // its bounded outer re-drive stays the correctness path.
+        if retry_verdict(&err) != RetryVerdict::Retry {
+            // Non-transient (denied / a permanent 4xx / an unscannable
+            // workspace): exit 10 immediately — classification is
+            // record-first on the control plane, and its bounded outer
+            // re-drive stays the correctness path.
             eprintln!("scarab-wsfetch: drain: ingest {workspace}: {err}");
             return EXIT_DRAIN_TRANSIENT;
         }
-        let sleep = ingest_pause.min(leg_deadline - now);
+        let Some(sleep) = win.next_delay(std::time::Instant::now(), ingest_pause) else {
+            // Window exhausted: same exit, the outer re-drive takes over.
+            eprintln!("scarab-wsfetch: drain: ingest {workspace}: {err}");
+            return EXIT_DRAIN_TRANSIENT;
+        };
         eprintln!(
             "scarab-wsfetch: drain: ingest {workspace}: {err} — transient, retrying \
              the whole leg in {} ms (window {}s)",
             sleep.as_millis(),
-            window.as_secs()
+            win.window.as_secs()
         );
         tokio::time::sleep(sleep).await;
         ingest_pause = next_pause(ingest_pause);
@@ -1072,6 +1117,44 @@ mod tests {
         assert_eq!(next_pause(Duration::from_secs(4)), Duration::from_secs(8));
         assert_eq!(next_pause(Duration::from_secs(8)), Duration::from_secs(10));
         assert_eq!(next_pause(Duration::from_secs(10)), Duration::from_secs(10));
+    }
+
+    /// The window arms at the FIRST transient failure, never at leg start
+    /// (review fix): a leg whose successful transfers alone outlast the whole
+    /// window still gets its full retry budget when the outage finally hits.
+    /// Mutation killed: reverting to `deadline = leg_start + window`, which
+    /// made the feature inert for exactly the expensive fetches that need it.
+    #[test]
+    fn the_window_arms_at_the_first_failure_not_at_leg_start() {
+        use std::time::{Duration, Instant};
+        let mut win = LegWindow::new(Duration::from_secs(5));
+        let leg_start = Instant::now();
+        // Transfers ran 100s — 20x the window — before the first failure…
+        let first_failure = leg_start + Duration::from_secs(100);
+        // …and the first transient still gets its full pause: the window is
+        // only NOW being armed.
+        assert_eq!(
+            win.next_delay(first_failure, Duration::from_secs(1)),
+            Some(Duration::from_secs(1)),
+            "transfer time must not consume the retry budget"
+        );
+        // Inside the armed window the sleep is capped to what remains…
+        assert_eq!(
+            win.next_delay(first_failure + Duration::from_secs(4), Duration::from_secs(10)),
+            Some(Duration::from_secs(1)),
+            "the sleep never overshoots the armed deadline"
+        );
+        // …and once the armed deadline passes, the window is exhausted. Still
+        // ONE window per leg: arming happened exactly once.
+        assert_eq!(
+            win.next_delay(first_failure + Duration::from_secs(5), Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            win.next_delay(first_failure + Duration::from_secs(60), Duration::from_secs(1)),
+            None,
+            "a later failure must not re-arm a second window"
+        );
     }
 
     /// The b04697f contract, at the grain the fetcher owns it: after the pass a
