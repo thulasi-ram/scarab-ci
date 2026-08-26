@@ -56,6 +56,7 @@ import {
   retentionNote,
   widenedNote,
 } from "../snapshot-retention";
+import { planDivergence, type ConfirmKind } from "../rerun-confirm";
 import { relTime, absTime, duration } from "../fmt";
 import { forgeCommitUrl, forgePrUrl } from "../forge";
 import StatusBadge from "../components/StatusBadge";
@@ -68,6 +69,7 @@ import ServicePane from "../components/ServicePane";
 import { type FilmstripTry } from "../components/AttemptsDropdown";
 import DebugShell from "../components/DebugShell";
 import TriggerCell from "../components/TriggerCell";
+import RerunConfirm from "../components/RerunConfirm";
 
 const POLL_MS = 1200;
 
@@ -402,18 +404,17 @@ export default function RunDetail() {
     setSelAttempt(null);
   });
 
-  // Fetch the rerun PREVIEW for the selected step (ADR-0061 s5). Lazy and
-  // per-selection rather than folded into the run resource: the preview asks the
-  // object store whether each input snapshot is still there, which is far too
-  // expensive to put on a 1.2s poll. Restricted to a TERMINAL run because a run
-  // that has not settled is never GC-eligible (ADR-0050), so its snapshots cannot
-  // have expired and there is nothing to widen — one fewer request on a live
-  // run's hot path, for a case that cannot arise.
+  // Fetch the rerun PREVIEW for the selected step (ADR-0061 s5 + git-bug
+  // 4afaa3e). Lazy and per-selection rather than folded into the run resource:
+  // the preview asks the object store whether each input snapshot is still
+  // there, which is far too expensive to put on a 1.2s poll. Fetched for LIVE
+  // runs too (4afaa3e G4/amendment F2): the cascade exists there as well, the
+  // confirm popover has to name it, and "a live run cannot have expired
+  // snapshots" is falsified by reopened runs — so no status gate here and no
+  // oracle shortcut on the server.
   createEffect(() => {
     const step = sel();
-    const r = run();
-    const settled = r ? isTerminal(r.status) : false;
-    if (!step || isServiceSel() || !settled || timeTraveling()) {
+    if (!step || isServiceSel() || timeTraveling()) {
       setPlan(null);
       return;
     }
@@ -451,10 +452,47 @@ export default function RunDetail() {
     setPinState(null);
   });
 
+  // The TOCTOU toast (git-bug 4afaa3e): the POST returns the EXECUTED plan;
+  // when it is wider than the preview the user confirmed (a snapshot expired
+  // between preview and click), disclose it after the fact — the one window
+  // the confirm popover cannot close.
+  const [toast, setToast] = createSignal<string | null>(null);
+  let toastTimer: ReturnType<typeof setTimeout> | undefined;
+  function showToast(msg: string) {
+    setToast(msg);
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => setToast(null), 10_000);
+  }
+  onCleanup(() => {
+    if (toastTimer) clearTimeout(toastTimer);
+  });
+
+  // The confirm popover (git-bug 4afaa3e): the first click on Rerun/Retry opens
+  // it; the POST fires only from its confirm button.
+  const [confirming, setConfirming] = createSignal<{
+    kind: ConfirmKind;
+    step: string;
+    top: number;
+    left: number;
+  } | null>(null);
+  function openConfirm(kind: ConfirmKind, step: string, e: MouseEvent) {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setConfirming({ kind, step, top: r.bottom + 6, left: r.left });
+  }
+  // A moved selection or version switch invalidates what the popover named.
+  createEffect(() => {
+    void sel();
+    void viewTake();
+    setConfirming(null);
+  });
+
   async function onRerun(step: string) {
+    const previewed = plan();
     setRerunning(step);
     try {
-      await rerunStep(id(), step);
+      const executed = await rerunStep(id(), step);
+      const note = planDivergence(previewed, executed, "rerun");
+      if (note) showToast(note);
       setLive(true);
       await refresh();
       if (!poll && live()) poll = setInterval(() => void refresh(), POLL_MS);
@@ -466,9 +504,12 @@ export default function RunDetail() {
   // Retry (ADR-0056 amendment): another Attempt in the CURRENT Take, no fork.
   // Failed steps only (the button is gated so; the server also 409s otherwise).
   async function onRetry(step: string) {
+    const previewed = plan();
     setRetrying(step);
     try {
-      await retryStep(id(), step);
+      const executed = await retryStep(id(), step);
+      const note = planDivergence(previewed, executed, "retry");
+      if (note) showToast(note);
       setLive(true);
       await refresh();
       if (!poll && live()) poll = setInterval(() => void refresh(), POLL_MS);
@@ -648,7 +689,7 @@ export default function RunDetail() {
               <Show when={selectedStatus() === "failed" && !timeTraveling()}>
                 <button
                   class="btn btn-ghost btn-sm"
-                  onClick={() => sel() && onRetry(sel()!)}
+                  onClick={(e) => sel() && openConfirm("retry", sel()!, e)}
                   disabled={retrying() !== null || rerunning() !== null || !!prereqBlocker(sel())}
                   title={
                     prereqBlocker(sel())
@@ -668,7 +709,7 @@ export default function RunDetail() {
               <button
                 class="btn btn-ghost btn-sm"
                 classList={{ widened: isWidened(plan()) }}
-                onClick={() => sel() && !isServiceSel() && onRerun(sel()!)}
+                onClick={(e) => sel() && !isServiceSel() && openConfirm("rerun", sel()!, e)}
                 disabled={
                   rerunning() !== null ||
                   retrying() !== null ||
@@ -686,7 +727,7 @@ export default function RunDetail() {
                         ? "a shared service isn't a step — select a step to rerun"
                         : prereqBlocker(sel())
                           ? `blocked — prerequisite ${prereqBlocker(sel())} failed; rerun that first`
-                          : rerunTitle(plan(), sel()!, retention()?.retention_days)
+                          : rerunTitle(plan(), sel()!)
                 }
               >
                 <Icon icon="rotate-ccw" size={13} />{" "}
@@ -757,6 +798,38 @@ export default function RunDetail() {
                 )}
               </Show>
             </div>
+            {/* The confirm popover (git-bug 4afaa3e): the whole cascade, named
+                before the POST fires. Portalled; anchored under whichever button
+                opened it. */}
+            <Show when={confirming()} keyed>
+              {(c) => (
+                <RerunConfirm
+                  kind={c.kind}
+                  target={c.step}
+                  plan={plan()}
+                  anchor={{ top: c.top, left: c.left }}
+                  busy={rerunning() !== null || retrying() !== null}
+                  onCancel={() => setConfirming(null)}
+                  onConfirm={() => {
+                    setConfirming(null);
+                    if (c.kind === "retry") void onRetry(c.step);
+                    else void onRerun(c.step);
+                  }}
+                />
+              )}
+            </Show>
+            {/* The TOCTOU disclosure: the executed plan diverged from the one
+                the popover previewed (a snapshot expired mid-confirm). */}
+            <Show when={toast()}>
+              {(t) => (
+                <div class="rd-toast" role="status">
+                  <Icon icon="alert-triangle" size={13} /> {t()}
+                  <button class="rd-toast-x" onClick={() => setToast(null)} title="dismiss">
+                    ✕
+                  </button>
+                </div>
+              )}
+            </Show>
             {/* The widened scope, stated WITHOUT a hover: a rerun that quietly
                 grew is still a surprise, even if the tooltip would have explained
                 it (ADR-0027 — smart never means mysterious). */}

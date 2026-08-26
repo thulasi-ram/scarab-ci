@@ -30,6 +30,16 @@ export type RetentionInfo = {
   pinned_at?: number | null;
 };
 
+/** One plan member with its WHY (`RerunPlanResponse.steps[]`, git-bug 4afaa3e). */
+export type PlannedStepInfo = {
+  step: string;
+  reason: "target" | "cascade" | "regenerate" | "regenerate_cascade";
+  /** The in-set step this one is here because of; absent only on the target. */
+  because_of?: string | null;
+  /** A gate: the rerun pauses for approval here — it never "runs". */
+  is_gate: boolean;
+};
+
 /** A rerun preview (`GET …/steps/{step}/rerun-plan`). */
 export type RerunPlan = {
   target: string;
@@ -39,6 +49,9 @@ export type RerunPlan = {
   /** Where the rerun effectively starts. */
   starts_from: string[];
   expired_inputs?: { consumer: string; produced_by: string; root: string }[];
+  /** Execution-ordered members with reasons (optional: mock fixtures may
+   * predate it; the confirm copy degrades gracefully without it). */
+  steps?: PlannedStepInfo[];
 };
 
 /** Join ids the way prose does: `a`, `a and b`, `a, b and c`. */
@@ -63,19 +76,16 @@ export function rerunLabel(plan: RerunPlan | null | undefined): string {
 }
 
 /** The rerun button's TITLE: the full scope, so the widening is legible before
- * the click. `days` is the run's retention window, for the "why". */
-export function rerunTitle(
-  plan: RerunPlan | null | undefined,
-  step: string,
-  days?: number,
-): string {
+ * the click. Retention is named GENERICALLY (git-bug 4afaa3e amendment F9):
+ * the flat configured day count is NOT the number that expired a profiled
+ * run's packs, and a wrong number is worse than none. */
+export function rerunTitle(plan: RerunPlan | null | undefined, step: string): string {
   if (!isWidened(plan)) {
     return `rerun ${step} and everything downstream — forks a new version`;
   }
   const p = plan!;
-  const window = days ? ` past the ${days}-day retention window` : "";
   return (
-    `${step}'s input workspace snapshots are gone${window}, so rerunning ${step} alone ` +
+    `${step}'s input workspace snapshots are past retention, so rerunning ${step} alone ` +
     `is impossible. This re-runs ${nameList(p.starts_from)} first to regenerate them, ` +
     `then ${nameList(p.widened.filter((s) => !p.starts_from.includes(s)).concat(step))} — ` +
     `${p.invalidated.length} steps in a new version. Nothing is lost; it just costs the ` +

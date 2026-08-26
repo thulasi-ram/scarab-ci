@@ -559,6 +559,7 @@ function route(pathname: string, search: string): Response | null {
       widened: [],
       starts_from: [target],
       expired_inputs: [],
+      steps: [{ step: target, reason: "target", is_gate: false }],
     });
   }
   if (/\/steps\/[^/]+\/results$/.test(p)) return json(testResults);
