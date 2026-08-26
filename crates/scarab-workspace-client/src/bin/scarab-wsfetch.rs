@@ -502,7 +502,10 @@ async fn fetch(
 ) -> Result<(), FetchError> {
     let client = WorkspaceClient::from_token_file(base, token_file)
         .map_err(|e| FetchError::Transient(format!("workspace token: {e}")))?;
-    let client = apply_transfer_budget(client).map_err(FetchError::Transient)?;
+    // Config, not Transient (review fix): a garbled budget env is stamped by
+    // the EXECUTOR — image/executor skew — and re-launching re-stamps the
+    // identical garbage, so the infra retry budget cannot heal it.
+    let client = apply_transfer_budget(client).map_err(FetchError::Config)?;
     // ONE window for the whole fetch leg (ticket e140121): every root's
     // retries share this deadline, so the worst-case delay is proportional to
     // the step's own budget, not to its input count. Armed at the FIRST
