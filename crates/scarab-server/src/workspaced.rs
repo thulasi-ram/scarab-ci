@@ -6456,7 +6456,11 @@ mod tests {
         registry: &crate::depot_expiry::RetentionRegistry,
     ) -> u32 {
         for _ in 0..10_000 {
-            match crate::depot_expiry::expire_committed_fences_once(db, registry, 100)
+            match crate::depot_expiry::expire_committed_fences_once(
+                db,
+                registry,
+                crate::depot_expiry::EXPIRY_BATCH,
+            )
                 .await
                 .expect("expiry pass")
             {
@@ -6893,7 +6897,12 @@ mod tests {
         let pass = {
             let db = db.clone();
             tokio::spawn(async move {
-                crate::depot_expiry::expire_committed_fences_once(&db, &expiry_ttls(), 100).await
+                crate::depot_expiry::expire_committed_fences_once(
+                    &db,
+                    &expiry_ttls(),
+                    crate::depot_expiry::EXPIRY_BATCH,
+                )
+                .await
             })
         };
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -7067,7 +7076,7 @@ mod tests {
     ///
     /// Mutations killed: revert to the loose-bound-plus-code-skip shape and
     /// `expired` is 0 here; drop the CASE (bind one flat cutoff as the
-    /// verdict) and the 120 blockers expire too.
+    /// verdict) and the blockers expire too.
     #[tokio::test]
     async fn a_window_of_long_ttl_blockers_cannot_starve_a_victim_behind_them() {
         let Some(h) = DepotHarness::start().await else { return };
@@ -7086,11 +7095,14 @@ mod tests {
                 .await
                 .expect("the victim's posted_at");
 
-        // 120 blockers, records posted BEFORE the victim's so they own the
-        // whole `ORDER BY posted_at LIMIT 100` window: terminal `keep` (30d)
-        // runs 2 days old — past the victim's cutoff, inside their own TTL.
-        // Rows only: blockers exist to crowd nomination, they need no packs.
-        for i in 0..120i64 {
+        // A full window of blockers plus slack — DERIVED from the real batch
+        // constant, so a retune retunes this test with it — records posted
+        // BEFORE the victim's so they own the whole `ORDER BY posted_at
+        // LIMIT <batch>` window: terminal `keep` (30d) runs 2 days old —
+        // past the victim's cutoff, inside their own TTL. Rows only:
+        // blockers exist to crowd nomination, they need no packs.
+        let blocker_count = i64::from(crate::depot_expiry::EXPIRY_BATCH) + 20;
+        for i in 0..blocker_count {
             let run = format!("starve-b{i}");
             seed_run(db, &run, "succeeded", two_days, false).await;
             set_run_profile(db, &run, "keep").await;
@@ -7122,7 +7134,10 @@ mod tests {
         .fetch_one(db)
         .await
         .expect("count blocker records");
-        assert_eq!(blockers, 120, "every blocker survives, within its own TTL");
+        assert_eq!(
+            blockers, blocker_count,
+            "every blocker survives, within its own TTL"
+        );
     }
 
     /// Seed and SEAL one fence's pack, so its rows are STAGED

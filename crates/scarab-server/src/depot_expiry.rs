@@ -68,7 +68,9 @@ use crate::workspaced::PACK_RECLAIM_ADVISORY_LOCK;
 
 /// Victim fences processed per arm per pass — bounds one pass's work; the
 /// loop catches up. Same figure as the retention sweeper's `SWEEP_BATCH`.
-const EXPIRY_BATCH: u32 = 100;
+/// `pub(crate)` so the starvation test seeds its blocker population FROM
+/// this figure — a retune must retune the test with it.
+pub(crate) const EXPIRY_BATCH: u32 = 100;
 
 /// The DB spellings of the terminal run states, as one SQL `IN` list. The
 /// same literal set every retention query in `scarab-db-postgres` uses
@@ -208,9 +210,11 @@ impl RetentionRegistry {
     }
 
     /// Every profile's (name, resolved pack TTL) pair — the nomination
-    /// query's CASE arms, rebuilt from the CURRENT registry at every pass
-    /// start (which is what keeps an ADR-0065 s2 operator retune
-    /// retroactive). The registry is small; the CASE is bounded by it.
+    /// query's CASE arms, rebuilt at every pass start so each pass is
+    /// self-contained. The registry itself is boot-loaded: an ADR-0065 s2
+    /// operator retune lands on the next reboot, and from there applies to
+    /// every run, old ones included. The registry is small; the CASE is
+    /// bounded by it.
     fn profile_pack_ttls(&self) -> Vec<(&str, i64)> {
         self.profiles
             .iter()
@@ -341,6 +345,25 @@ pub enum ExpiryPass {
     LockBusy,
 }
 
+/// One pass's declined-candidate accumulator, recorded into
+/// [`crate::metrics::record_depot_expiry_candidates_skipped`] on DROP — so
+/// EVERY exit from the pass records it: the normal return, the 40P01 aborts,
+/// and the hard-error `?`/`return Err` paths alike. A decline that happened
+/// is evidence regardless of how the pass ended.
+struct SkippedCandidates(u32);
+
+impl SkippedCandidates {
+    fn bump(&mut self) {
+        self.0 += 1;
+    }
+}
+
+impl Drop for SkippedCandidates {
+    fn drop(&mut self) {
+        crate::metrics::record_depot_expiry_candidates_skipped(self.0);
+    }
+}
+
 /// The pass body, under the advisory lock: the floor, then the recorded arm,
 /// then (floor permitting) the recordless arm.
 async fn expire_pass(
@@ -379,10 +402,10 @@ async fn expire_pass(
     let mut expired = 0u32;
     // Nominated candidates the pass declined without expiring (the victim
     // transaction's re-read said no: a live borrower, a rerun flip, a
-    // vanished record). Recorded per pass so a starved window — skips
+    // vanished record). Counted per pass so a starved window — skips
     // climbing while `expired` stays flat — is VISIBLE, never silent
-    // (git-bug a543fef).
-    let mut skipped = 0u32;
+    // (git-bug a543fef). The drop-guard records on every exit path.
+    let mut skipped = SkippedCandidates(0);
 
     // --- The recorded arm: success records whose run is terminal, past ITS
     // OWN profile's pack TTL and unpinned. The per-run cutoff is resolved
@@ -444,10 +467,9 @@ async fn expire_pass(
     for fence in candidates {
         match expire_one_fence(db, &fence, Victim::Recorded { now_secs }, registry).await {
             Ok(true) => expired += 1,
-            Ok(false) => skipped += 1,
+            Ok(false) => skipped.bump(),
             Err(e) if is_deadlock(&e) => {
                 crate::metrics::record_depot_expiry_pass_skipped();
-                crate::metrics::record_depot_expiry_candidates_skipped(skipped);
                 tracing::warn!(
                     fence_key = %fence,
                     "depot expiry: deadlock (40P01) in a victim transaction — pass \
@@ -482,10 +504,9 @@ async fn expire_pass(
         for fence in recordless {
             match expire_one_fence(db, &fence, Victim::Recordless { epoch }, registry).await {
                 Ok(true) => expired += 1,
-                Ok(false) => skipped += 1,
+                Ok(false) => skipped.bump(),
                 Err(e) if is_deadlock(&e) => {
                     crate::metrics::record_depot_expiry_pass_skipped();
-                    crate::metrics::record_depot_expiry_candidates_skipped(skipped);
                     tracing::warn!(
                         fence_key = %fence,
                         "depot expiry: deadlock (40P01) in a victim transaction — pass \
@@ -498,7 +519,7 @@ async fn expire_pass(
         }
     }
 
-    crate::metrics::record_depot_expiry_candidates_skipped(skipped);
+    // `skipped` drops here (as on every earlier return), recording the count.
     Ok(expired)
 }
 

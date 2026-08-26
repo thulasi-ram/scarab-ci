@@ -4,4 +4,10 @@
 -- each probe was a full `runs` scan. Pre-epoch runs are a fixed, shrinking
 -- set: with the index the probe is a narrow range scan that only narrows
 -- further as the floor drains.
+--
+-- Plain CREATE INDEX holds a SHARE lock on `runs` for the build (reads fine,
+-- writes blocked) — fine at current scale; switch to CREATE INDEX
+-- CONCURRENTLY (which needs the `-- no-transaction` directive at the top of
+-- the file) if `runs` ever grows enough for the build to block writes
+-- noticeably.
 CREATE INDEX runs_created_at_idx ON runs (created_at);
