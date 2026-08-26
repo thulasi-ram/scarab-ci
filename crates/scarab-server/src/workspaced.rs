@@ -6640,8 +6640,16 @@ mod tests {
             .await
             .expect("order the candidates");
 
+        let skipped_before = crate::metrics::depot_expiry_skipped_candidates();
         let pass1 = expire_now(db, &expiry_ttls()).await;
         assert_eq!(pass1, 1, "pass 1 expires only the borrower B");
+        // The borrow-gated decline is VISIBLE (git-bug a543fef): A was
+        // nominated and skipped, so the counter moved. `>=` because the
+        // counter is process-global and the suite runs in parallel.
+        assert!(
+            crate::metrics::depot_expiry_skipped_candidates() >= skipped_before + 1,
+            "a nominated-but-borrowed victim must count as a skipped candidate"
+        );
         let (packs_a, _, records_a, _) = expiry_rows_of(db, &fa).await;
         assert!(
             packs_a > 0 && records_a > 0,
@@ -7044,6 +7052,77 @@ mod tests {
             let (packs, _, records, _) = expiry_rows_of(db, fence).await;
             assert!(packs > 0 && records > 0, "the {who} must survive");
         }
+    }
+
+    /// The nomination window cannot be STARVED by long-TTL blockers (git-bug
+    /// a543fef): a full window's worth (`EXPIRY_BATCH` + 20) of OLDER
+    /// `keep`-profile runs — terminal, past the loose flat bound the pre-fix
+    /// query nominated under, but well within their own 30d TTL — sits first
+    /// in `posted_at` order, and ONE genuinely-expired `short`-profile victim
+    /// sits behind all of them. The pre-fix shape (nominate under the loosest
+    /// cutoff `ORDER BY posted_at LIMIT 100`, skip in code) re-fetched exactly
+    /// the blockers every pass, forever, and the victim was never nominated;
+    /// with the per-profile cutoff resolved into the SQL the blockers are
+    /// never nominated at all and the victim expires in ONE pass.
+    ///
+    /// Mutations killed: revert to the loose-bound-plus-code-skip shape and
+    /// `expired` is 0 here; drop the CASE (bind one flat cutoff as the
+    /// verdict) and the 120 blockers expire too.
+    #[tokio::test]
+    async fn a_window_of_long_ttl_blockers_cannot_starve_a_victim_behind_them() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let db = &h.state.db;
+
+        // The victim: a real drained fence on the 1d `short` profile, 2 days
+        // terminal — genuinely expired under ITS OWN TTL.
+        let victim = expiry_drain(&h, "starve-v", "starved-victim").await;
+        let two_days = 2 * 24 * 3600;
+        seed_run(db, "starve-v", "succeeded", two_days, false).await;
+        set_run_profile(db, "starve-v", "short").await;
+        let victim_posted: i64 =
+            sqlx::query_scalar("SELECT posted_at FROM depot_drain_records WHERE fence_key = $1")
+                .bind(&victim)
+                .fetch_one(db)
+                .await
+                .expect("the victim's posted_at");
+
+        // 120 blockers, records posted BEFORE the victim's so they own the
+        // whole `ORDER BY posted_at LIMIT 100` window: terminal `keep` (30d)
+        // runs 2 days old — past the victim's cutoff, inside their own TTL.
+        // Rows only: blockers exist to crowd nomination, they need no packs.
+        for i in 0..120i64 {
+            let run = format!("starve-b{i}");
+            seed_run(db, &run, "succeeded", two_days, false).await;
+            set_run_profile(db, &run, "keep").await;
+            sqlx::query(
+                "INSERT INTO depot_drain_records \
+                     (fence_key, run, step, attempt, version, posted_at, record) \
+                 VALUES ($1, $2, 'build', 'a1', 1, $3, '{}'::jsonb)",
+            )
+            .bind(format!("starve-blocker-fence-{i}"))
+            .bind(&run)
+            .bind(victim_posted - 10_000 + i)
+            .execute(db)
+            .await
+            .expect("seed a blocker record");
+        }
+
+        let expired = expire_now(db, &expiry_profiles()).await;
+        assert_eq!(
+            expired, 1,
+            "the victim behind a full window of long-TTL blockers must expire \
+             in ONE pass — 0 here is the starved window, >1 means a blocker \
+             expired inside its own profile's TTL"
+        );
+        assert_eq!(expiry_rows_of(db, &victim).await, (0, 0, 0, 0));
+        let blockers: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM depot_drain_records \
+             WHERE fence_key LIKE 'starve-blocker-fence-%'",
+        )
+        .fetch_one(db)
+        .await
+        .expect("count blocker records");
+        assert_eq!(blockers, 120, "every blocker survives, within its own TTL");
     }
 
     /// Seed and SEAL one fence's pack, so its rows are STAGED
