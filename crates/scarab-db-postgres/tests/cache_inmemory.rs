@@ -292,6 +292,106 @@ async fn every_unresolvable_key_disables_the_cache_and_never_fails_the_step() {
     }
 }
 
+/// Tenancy isolation (dbe05e5 mandatory test), at the mapping grain: project
+/// B never resolves project A's rows — even asking with the very same key
+/// string. Belt: the lookup is project-scoped. Braces: the key itself is
+/// project-salted (see the key test below), so B cannot even NAME A's key
+/// from identical lockfiles.
+#[tokio::test]
+async fn project_b_never_resolves_project_as_cache_rows() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-1".into());
+    let step = StepId("build".into());
+    let attempt = scarab_engine::AttemptId("a1".into());
+    db.cache_record(
+        "acme/web",
+        "key-1",
+        "node_modules",
+        "tree-a",
+        &run,
+        &step,
+        &attempt,
+        Timestamp(1),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        db.cache_lookup("acme/web", "key-1").await.unwrap(),
+        vec![("node_modules".to_string(), "tree-a".to_string())]
+    );
+    assert!(
+        db.cache_lookup("evil/web", "key-1").await.unwrap().is_empty(),
+        "another project must not resolve the row, same key string or not"
+    );
+}
+
+/// PR-context write denial (dbe05e5 amendment #1, mandatory test): a step
+/// that succeeds WITH cache saves records nothing when the run originates
+/// from a pull request (fork or not), while the identical push-context run
+/// records the mapping. Reads are untouched (the restore hints still mint —
+/// covered by the launch tests above, which never consult the origin).
+#[tokio::test]
+async fn a_pr_context_run_never_writes_cache_entries_and_a_push_run_does() {
+    for (name, origin_kind, pr_number, expect_rows) in [
+        ("push context", "push", None, true),
+        ("PR context", "pull_request", Some(7), false),
+        // A PR-numbered origin under any kind is still a PR context.
+        ("stamped PR number", "push", Some(9), false),
+    ] {
+        let db = InMemoryDb::new();
+        let (run, build) = seed(
+            &db,
+            caching(&["node_modules"], &["package-lock.json"]),
+            Some("acme/web"),
+        )
+        .await;
+        db.set_run_origin(&run, origin_kind, None, None, None, pr_number, None)
+            .await
+            .unwrap();
+
+        let oracle = FakeOracle::with(&[("root-clone", "package-lock.json", "blob-lock")]);
+        let exec = FakeExecutor::new();
+        exec.set_output("clone", "root-clone");
+        exec.set_cache_saves(
+            "build",
+            scarab_engine::CacheSaves {
+                key: cache_key(
+                    "acme/web",
+                    &[("package-lock.json".to_string(), "blob-lock".to_string())],
+                ),
+                roots: std::collections::BTreeMap::from([(
+                    "node_modules".to_string(),
+                    "tree-saved".to_string(),
+                )]),
+            },
+        );
+        for _ in 0..2 {
+            exec.script_outcome(ExecState::Succeeded);
+        }
+        drive(&db, &run, &exec, &oracle).await;
+
+        let _ = &build;
+        let key = cache_key(
+            "acme/web",
+            &[("package-lock.json".to_string(), "blob-lock".to_string())],
+        );
+        let rows = db.cache_lookup("acme/web", &key).await.unwrap();
+        if expect_rows {
+            assert_eq!(
+                rows,
+                vec![("node_modules".to_string(), "tree-saved".to_string())],
+                "{name}: the save must be recorded"
+            );
+        } else {
+            assert!(
+                rows.is_empty(),
+                "{name}: a PR context must never write the mapping"
+            );
+        }
+    }
+}
+
 /// The key is project-salted AND the lookup is project-scoped: the same key
 /// files resolve to different keys for different projects, so tenant B can
 /// never see tenant A's rows even by recording identical lockfiles.
