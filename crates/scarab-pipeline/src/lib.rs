@@ -2972,24 +2972,35 @@ mod tests {
         )
         .iter()
         .any(|d| d.contains("overlap")));
-        // outputs ∩ cache.dirs (amendment #4), both directions + glob.
-        for outputs in ["[node_modules]", "[node_modules/pkg]", "[\"*\"]"] {
+        // outputs ∩ cache.dirs (amendment #4), both directions + glob:
+        // equality, an output INSIDE a cache dir, an output that is a PREFIX
+        // of a cache dir, and a glob that covers it.
+        for (outputs, dirs) in [
+            ("[node_modules]", "[node_modules]"),
+            ("[node_modules/pkg]", "[node_modules]"),
+            ("[dist]", "[dist/cache]"),
+            ("[\"*\"]", "[node_modules]"),
+        ] {
             assert!(
                 errors(&format!(
                     r#"steps: [{{ id: b, image: n, outputs: {outputs},
-                       cache: {{ dirs: [node_modules], key: [l] }} }}]"#
+                       cache: {{ dirs: {dirs}, key: [l] }} }}]"#
                 ))
                 .iter()
                 .any(|d| d.contains("overlaps cache dir")),
-                "outputs {outputs} must conflict with the cache dir"
+                "outputs {outputs} must conflict with cache dirs {dirs}"
             );
         }
-        // Disjoint outputs stay fine.
-        assert!(errors(
+        // Disjoint outputs COEXIST with a cache dir — the amendment rejects
+        // overlap, never coexistence. (`compile`, not `errors`: the helper
+        // panics on a pipeline that compiles, which is the point here.)
+        let ok = compile(
             r#"steps: [{ id: b, image: n, outputs: [dist],
-               cache: { dirs: [node_modules], key: [l] } }]"#
-        )
-        .is_empty());
+               cache: { dirs: [node_modules], key: [l] } }]"#,
+        );
+        let b = ok.steps.iter().find(|s| s.id == "b").unwrap();
+        assert_eq!(b.outputs.as_deref(), Some(["dist".to_string()].as_slice()));
+        assert!(b.cache.is_some(), "the disjoint cache survives compile");
         // Key files are workspace-relative.
         assert!(errors(
             r#"steps: [{ id: b, image: n, cache: { dirs: [d], key: ["../x"] } }]"#
