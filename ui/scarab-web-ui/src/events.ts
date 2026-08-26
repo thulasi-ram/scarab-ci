@@ -37,9 +37,28 @@ export function describeEvent(e: RunEvent): string {
       return `Workspace snapshots pinned${v.by ? ` by ${s(v.by)}` : ""} — kept past the retention window`;
     case "RunSnapshotsUnpinned":
       return `Workspace snapshots unpinned${v.by ? ` by ${s(v.by)}` : ""} — back to the retention window`;
+    // Fan-in collisions (ticket 2e1a458): the merge overwrote paths — ADR-0007
+    // last-wins semantics made loud, not an error. `count` is authoritative;
+    // `sample` is a bounded excerpt (≤8 on k8s), so name the first paths only.
+    case "WorkspaceInputCollisions":
+      return `${s(v.step)} — ${collisionSummary(v)}`;
     default:
       return tag;
   }
+}
+
+/** The human line for a WorkspaceInputCollisions payload, step omitted:
+ * count + the first sampled paths (the full list lives in the fetch
+ * container's own log — the event is the rail's summary, not the ledger). */
+function collisionSummary(v: Record<string, unknown>): string {
+  const count = Number(v.count ?? 0);
+  const sample = Array.isArray(v.sample) ? (v.sample as Array<Record<string, unknown>>) : [];
+  const firsts = sample
+    .slice(0, 2)
+    .map((c) => String(c?.path ?? ""))
+    .filter(Boolean);
+  const paths = firsts.length ? `: ${firsts.join(", ")}${count > firsts.length ? ", …" : ""}` : "";
+  return `${count} workspace input collision${count === 1 ? "" : "s"} — last input wins${paths}`;
 }
 
 /** Split an event into its optional step id and a human message with the step
@@ -65,6 +84,8 @@ export function eventParts(e: RunEvent): { step: string | null; text: string } {
       return { step, text: `skipped (${s(v.reason)})` };
     case "AttemptReadopted":
       return { step, text: "re-adopted after control-plane restart" };
+    case "WorkspaceInputCollisions":
+      return { step, text: collisionSummary(v) };
     default:
       return { step, text: describeEvent(e) };
   }
@@ -74,7 +95,7 @@ export function eventParts(e: RunEvent): { step: string | null; text: string } {
  * covers a failed attempt (the retry story) and a run/step that ended failed.
  * `take` is a human rerun — the Take boundary (ADR-0056); `recover` is a
  * control-plane crash re-adoption — durability made visible. */
-export type EventCat = "info" | "ok" | "run" | "err" | "gate" | "take" | "recover";
+export type EventCat = "info" | "ok" | "run" | "err" | "gate" | "take" | "recover" | "warning";
 
 export function eventCategory(e: RunEvent): EventCat {
   const k = e.kind;
@@ -105,6 +126,12 @@ export function eventCategory(e: RunEvent): EventCat {
       return "run";
     case "AttemptReadopted":
       return "recover";
+    // Fan-in collisions are semantics working as documented — but semantics
+    // an author may not have intended, so they warrant a WARNING mark, never
+    // the invisible `info` fall-through (the ticket's not-silent bar) and
+    // never `err` (nothing failed).
+    case "WorkspaceInputCollisions":
+      return "warning";
     // Everything else — including the ADR-0061 s5 snapshot pin/unpin — is `info`.
     // Those two used to have their own arms returning `info`, which was dead code
     // AND untestable: no input could tell the arm from this fall-through, so the
@@ -125,4 +152,5 @@ export const EVENT_GLYPH: Record<EventCat, string> = {
   gate: "◷",
   take: "◈",
   recover: "⟲",
+  warning: "△",
 };

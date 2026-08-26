@@ -105,3 +105,57 @@ describe("describeEvent / eventParts", () => {
     expect(EVENT_GLYPH[pin]).not.toBe(EVENT_GLYPH[take]);
   });
 });
+
+describe("WorkspaceInputCollisions (ticket 2e1a458)", () => {
+  const collisions = (count: number, sample: Array<{ path: string; winner: string; loser: string }>) =>
+    ev(1, { WorkspaceInputCollisions: { step: "e", attempt: "a1", count, sample } });
+
+  it("is a WARNING — its own visible mark, never the info fall-through, never err", () => {
+    const cat = eventCategory(collisions(1, [{ path: "shared.txt", winner: "c", loser: "b" }]));
+    expect(cat).toBe("warning");
+    // The not-silent bar: the mark must be distinct from the fall-through's,
+    // or an unhandled tag would render identically and the arm would be
+    // unfalsifiable (same trap the pin/unpin test documents).
+    expect(EVENT_GLYPH[cat]).toBeTruthy();
+    expect(EVENT_GLYPH[cat]).not.toBe(EVENT_GLYPH["info"]);
+    // And it is NOT an error: nothing failed — last-wins is ADR-0007
+    // semantics, the event only makes it loud.
+    expect(cat).not.toBe("err");
+  });
+
+  it("renders the count and the first sampled paths, step split into the chip", () => {
+    const parts = eventParts(
+      collisions(3, [
+        { path: "dist/app.js", winner: "c", loser: "b" },
+        { path: "dist/app.css", winner: "c", loser: "b" },
+        { path: "dist/index.html", winner: "c", loser: "b" },
+      ]),
+    );
+    expect(parts.step).toBe("e");
+    expect(parts.text).toBe(
+      "3 workspace input collisions — last input wins: dist/app.js, dist/app.css, …",
+    );
+  });
+
+  it("singular count, and a count that outruns its truncated sample stays authoritative", () => {
+    expect(eventParts(collisions(1, [{ path: "shared.txt", winner: "c", loser: "b" }])).text).toBe(
+      "1 workspace input collision — last input wins: shared.txt",
+    );
+    // The k8s transport caps the sample at 8; the count is the truth.
+    const parts = eventParts(collisions(40, [{ path: "a.txt", winner: "c", loser: "b" }]));
+    expect(parts.text).toContain("40 workspace input collisions");
+    expect(parts.text).toContain("a.txt, …");
+  });
+
+  it("an empty sample (fully truncated transport) still reads", () => {
+    const parts = eventParts(collisions(12, []));
+    expect(parts.step).toBe("e");
+    expect(parts.text).toBe("12 workspace input collisions — last input wins");
+  });
+
+  it("the whole-line form names the step", () => {
+    expect(describeEvent(collisions(1, [{ path: "shared.txt", winner: "c", loser: "b" }]))).toBe(
+      "e — 1 workspace input collision — last input wins: shared.txt",
+    );
+  });
+});

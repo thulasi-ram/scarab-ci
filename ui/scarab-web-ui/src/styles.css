@@ -2997,3 +2997,6 @@ h1, .crumb-head, .run-title {
    control-plane re-adoption (the durability wedge, visible). */
 .tl-glyph.take { border-color: var(--copper); color: var(--copper); }
 .tl-glyph.recover { border-color: var(--emerald); color: var(--emerald); }
+/* Fan-in collision warning (2e1a458): louder than info's copper-on-border-copper,
+   quieter than err — copper on both, like a gate, but with the △ glyph. */
+.tl-glyph.warning { border-color: var(--copper); color: var(--copper); }
