@@ -954,6 +954,62 @@ impl Db for PostgresDb {
         Ok(row.and_then(|r| r.get::<Option<String>, _>("origin_pr_base")))
     }
 
+    async fn cache_record(
+        &self,
+        project: &str,
+        key: &str,
+        dir: &str,
+        tree_root: &str,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        now: Timestamp,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO cache_entries
+                 (project, key, dir, tree_root, saved_at, run_id, step_id, attempt)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (project, key, dir) DO UPDATE SET
+                 tree_root = EXCLUDED.tree_root,
+                 saved_at = EXCLUDED.saved_at,
+                 run_id = EXCLUDED.run_id,
+                 step_id = EXCLUDED.step_id,
+                 attempt = EXCLUDED.attempt",
+        )
+        .bind(project)
+        .bind(key)
+        .bind(dir)
+        .bind(tree_root)
+        .bind(now.0)
+        .bind(&run.0)
+        .bind(&step.0)
+        .bind(&attempt.0)
+        .execute(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn cache_lookup(
+        &self,
+        project: &str,
+        key: &str,
+    ) -> Result<Vec<(String, String)>, DbError> {
+        let rows = sqlx::query(
+            "SELECT dir, tree_root FROM cache_entries
+             WHERE project = $1 AND key = $2 ORDER BY dir",
+        )
+        .bind(project)
+        .bind(key)
+        .fetch_all(self.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("dir"), r.get::<String, _>("tree_root")))
+            .collect())
+    }
+
     async fn set_run_pipeline(&self, run: &RunId, pipeline: &str) -> Result<(), DbError> {
         sqlx::query("UPDATE runs SET pipeline = $2 WHERE id = $1")
             .bind(&run.0)

@@ -122,11 +122,7 @@ pub struct PlacementConfig {
 
 impl PlacementConfig {
     fn profile(&self, name: &str) -> Option<&scarab_pipeline::PlacementProfile> {
-        // The shared named-registry lookup (ADR-0065 consequence): two
-        // operator profile types exist now, so the machinery lives in
-        // scarab-pipeline instead of being copy-pasted per kind. Same
-        // behavior as the local `find` it replaces.
-        scarab_pipeline::profile_named(&self.profiles, name)
+        self.profiles.iter().find(|p| p.name == name)
     }
 }
 
@@ -4723,6 +4719,7 @@ mod tests {
             timeout_seconds: None,
             workspace_inputs: vec![],
             workspace_outputs: vec![],
+            cache: None,
             clone: None,
             build: None,
             artifacts: vec![],
@@ -4939,6 +4936,7 @@ mod tests {
             timeout_seconds: None,
             workspace_inputs: vec![],
             workspace_outputs: vec![],
+            cache: None,
             clone: None,
             build: None,
             artifacts: vec![],

@@ -74,13 +74,6 @@ pub struct PipelineIr {
     /// cancelled). Absent for ordinary CI pipelines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
-    /// The operator [`RetentionProfile`] this pipeline's runs age under
-    /// (ADR-0065 s2) — a NAME only, resolved against the operator registry at
-    /// sweep time (so an operator retune applies retroactively, which is the
-    /// point). Absent = the registry's `default` profile, else the flat env
-    /// TTLs. Rides into `runs.ir` untouched; the author never defines values.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retention_profile: Option<String>,
     /// The reuse **interface** of a Library pipeline (ADR-0038): the parameter
     /// names it requires and the output names it exposes to an `invoke:` caller.
     /// Only meaningful when this pipeline is invoked (it is authoring metadata for
@@ -381,6 +374,14 @@ pub struct StepSpec {
     /// (ADR-0029); authored + validated here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<String>>,
+    /// Keyed directory Cache (ADR-0065 s1): workspace-relative directories
+    /// restored at Step start and saved at Step end, keyed by the blob hashes
+    /// of declared key files (typically a lockfile). Best-effort and
+    /// warm-only: a miss is slower and never wrong, and a cache dir never
+    /// flows downstream via the workspace (it is pruned from the published
+    /// root and rides the cache instead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheSpec>,
     /// Per-step execution deadline in **seconds** (ADR-0047). Absent = the
     /// global default (1h). Enforced primarily by the backend (kubelet
     /// `activeDeadlineSeconds` / the local kill-timer — it survives
@@ -640,6 +641,29 @@ pub struct CloneSpec {
     pub r#ref: Option<String>,
 }
 
+/// A step's keyed directory Cache declaration (ADR-0065 s1):
+/// `cache: { dirs: [node_modules], key: [package-lock.json] }`.
+///
+/// `dirs` are the workspace-relative directories to restore/save; `key` names
+/// the files whose **blob hashes** (from the input snapshots' tree entries —
+/// no content reads) key the cache, scoped by project. Both lists are
+/// required and validated by [`validate`]: workspace-relative, no `..`, no
+/// `.git*`, no `=`/`,` in dir names (they ride a `dir=root,…` env), no mutual
+/// prefix-overlap among dirs, and no overlap with the step's `outputs:` (a
+/// cached dir is scratch — publishing it too would be a self-contradictory
+/// label plan). `CARGO_HOME=/workspace/.cargo` is the documented pattern for
+/// tool caches that default to `$HOME`; dirs outside the workspace are
+/// deliberately unsupported in v1.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSpec {
+    /// Workspace-relative directories to cache.
+    #[serde(default)]
+    pub dirs: Vec<String>,
+    /// Workspace-relative files whose blob hashes form the cache key.
+    #[serde(default)]
+    pub key: Vec<String>,
+}
+
 /// Configuration of a `build` step (ADR-0018): what to build and where to
 /// push. Registry credentials are NEVER authored here — they are a scoped
 /// `REGISTRY_AUTH` secret (ADR-0037) or derived from the forge connection.
@@ -790,110 +814,6 @@ pub struct PlacementProfile {
     pub k8s: Option<serde_json::Value>,
 }
 
-/// A **RetentionProfile** (ADR-0065 s2, git-bug 82c5775): an operator-owned,
-/// cluster-scoped named bundle of per-class retention TTLs. The exact
-/// [`PlacementProfile`] pattern: it lives in Scarab operator config
-/// (`SCARAB_RETENTION_CONFIG_FILE`), **not** in a pipeline; a Pipeline may
-/// *name* one via the top-level `retention_profile:` key but never defines
-/// values — where the substrate is expensive, the system pays, not the author
-/// (ADR-0061's governing principle).
-///
-/// **TTL-only** (2026-08-26 narrowing of ADR-0065's bundle): the warm space
-/// budget, Cache-eligible directories and drop-and-re-derive thresholds are
-/// deliberately NOT parsed — nothing consumes them yet, and an inert knob is
-/// a silent lie. Each TTL is optional: an absent field falls back to the
-/// operator's flat env default for that class (`SCARAB_RETENTION_*_DAYS`).
-/// `pack_ttl_days` and `workspace_ttl_days` drive committed-fence expiry and
-/// its reachability floor today; `log_ttl_days`/`artifact_ttl_days` are the
-/// same classes the retention sweeper prunes, adopted there in a follow-up.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RetentionProfile {
-    /// The name a pipeline references in `retention_profile:`.
-    pub name: String,
-    /// Marks the profile applied when a run names none. At most one per registry.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub default: bool,
-    /// How long a terminal run's Depot packs are kept, in days.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pack_ttl_days: Option<u32>,
-    /// How long a terminal run's logs are kept, in days.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub log_ttl_days: Option<u32>,
-    /// How long a terminal run's artifacts are kept, in days.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_ttl_days: Option<u32>,
-    /// How long a terminal run's workspace CAS stays reachable, in days.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_ttl_days: Option<u32>,
-}
-
-/// What every operator profile registry entry answers — the shared machinery
-/// ADR-0065 called for once a second profile type existed: lookup by name,
-/// the at-most-one `default`, and registry validation live HERE rather than
-/// being copy-pasted per profile kind.
-pub trait NamedProfile {
-    /// The name a pipeline/step references.
-    fn profile_name(&self) -> &str;
-    /// Whether this entry is the registry's default.
-    fn is_default(&self) -> bool;
-}
-
-impl NamedProfile for PlacementProfile {
-    fn profile_name(&self) -> &str {
-        &self.name
-    }
-    fn is_default(&self) -> bool {
-        self.default
-    }
-}
-
-impl NamedProfile for RetentionProfile {
-    fn profile_name(&self) -> &str {
-        &self.name
-    }
-    fn is_default(&self) -> bool {
-        self.default
-    }
-}
-
-/// Look one profile up by name.
-pub fn profile_named<'a, P: NamedProfile>(registry: &'a [P], name: &str) -> Option<&'a P> {
-    registry.iter().find(|p| p.profile_name() == name)
-}
-
-/// The registry's `default`-flagged profile, if any.
-pub fn default_profile<P: NamedProfile>(registry: &[P]) -> Option<&P> {
-    registry.iter().find(|p| p.is_default())
-}
-
-/// Validate an operator profile registry: non-empty, unique names and at most
-/// one `default`. `kind` names the registry in the message (a boot-failure
-/// message must say WHICH gitops file to fix).
-pub fn validate_profile_registry<P: NamedProfile>(registry: &[P], kind: &str) -> Result<(), String> {
-    let mut names = BTreeSet::new();
-    let mut defaults = 0usize;
-    for p in registry {
-        if p.profile_name().trim().is_empty() {
-            return Err(format!("{kind} registry contains an empty profile name"));
-        }
-        if !names.insert(p.profile_name()) {
-            return Err(format!(
-                "{kind} registry names `{}` more than once",
-                p.profile_name()
-            ));
-        }
-        if p.is_default() {
-            defaults += 1;
-        }
-    }
-    if defaults > 1 {
-        return Err(format!(
-            "{kind} registry marks {defaults} profiles as `default` — at most one"
-        ));
-    }
-    Ok(())
-}
-
 /// Requested compute resources for a step (ADR-0055). Exact `cpu`/`memory`, not
 /// named `size` tiers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1014,7 +934,6 @@ pub fn compile_yaml_with_libs(
         triggers: authored.triggers,
         concurrency: authored.concurrency,
         environment: authored.environment,
-        retention_profile: authored.retention_profile,
         interface: authored.interface,
         budget: authored.budget,
         // Pipeline-level shared services (ADR-0058) are not DAG nodes and are not
@@ -1771,23 +1690,113 @@ pub fn lint(ir: &PipelineIr) -> Vec<String> {
     warnings
 }
 
+/// Validate one step's [`CacheSpec`] (ADR-0065 s1). All diagnostics are
+/// author-fixable submit-time errors; nothing here is enforced at runtime
+/// except the fetcher's source-wins backstop (which this validation exists to
+/// make unreachable).
+fn validate_cache(
+    step_id: &str,
+    cache: &CacheSpec,
+    outputs: Option<&[String]>,
+    diagnostics: &mut Vec<String>,
+) {
+    if cache.dirs.is_empty() {
+        diagnostics.push(format!(
+            "step `{step_id}`: `cache.dirs` must list at least one directory"
+        ));
+    }
+    if cache.key.is_empty() {
+        diagnostics.push(format!(
+            "step `{step_id}`: `cache.key` must list at least one key file \
+             (typically a lockfile) — a keyless cache would never invalidate"
+        ));
+    }
+    for dir in &cache.dirs {
+        let d = dir.trim_end_matches('/');
+        // `=` and `,` are the separators of the `SCARAB_CACHE_ROOTS`
+        // `dir=root,dir=root` env the fetcher parses; a dir name carrying
+        // either would be unparseable on the other side.
+        if d.contains('=') || d.contains(',') {
+            diagnostics.push(format!(
+                "step `{step_id}`: cache dir `{dir}` must not contain `=` or `,`"
+            ));
+            continue;
+        }
+        if d.is_empty() || dir.starts_with('/') {
+            diagnostics.push(format!(
+                "step `{step_id}`: cache dir `{dir}` must be workspace-relative \
+                 (no leading `/`, non-empty)"
+            ));
+            continue;
+        }
+        // `.` would make the whole workspace a cache dir (clobbering the
+        // clone, which lands at the workspace root); `..` escapes it; `.git*`
+        // components would clobber source control state on restore.
+        if d.split('/').any(|c| {
+            c.is_empty() || c == "." || c == ".." || c.starts_with(".git")
+        }) {
+            diagnostics.push(format!(
+                "step `{step_id}`: cache dir `{dir}` must not contain empty, \
+                 `.`, `..`, or `.git*` path components"
+            ));
+        }
+    }
+    // Mutual prefix-overlap among cache dirs: restoring `a` and `a/b`
+    // double-writes the same tree region in an order nothing defines.
+    for (i, a) in cache.dirs.iter().enumerate() {
+        for b in cache.dirs.iter().skip(i + 1) {
+            if paths_overlap(a, b) {
+                diagnostics.push(format!(
+                    "step `{step_id}`: cache dirs `{a}` and `{b}` overlap — \
+                     one contains the other"
+                ));
+            }
+        }
+    }
+    // outputs ∩ cache.dirs (binding amendment #4): a path that is both
+    // published downstream and cache-labelled scratch is a self-contradictory
+    // label plan; refuse it at submit rather than resolving it silently.
+    if let Some(outputs) = outputs {
+        for out in outputs {
+            for dir in &cache.dirs {
+                if paths_overlap(out, dir) {
+                    diagnostics.push(format!(
+                        "step `{step_id}`: output `{out}` overlaps cache dir \
+                         `{dir}` — a cached directory is scratch and cannot \
+                         also be published (drop it from `outputs:` or from \
+                         `cache.dirs`)"
+                    ));
+                }
+            }
+        }
+    }
+    for path in &cache.key {
+        if path.is_empty() || path.starts_with('/') || path.split('/').any(|c| c == "..") {
+            diagnostics.push(format!(
+                "step `{step_id}`: cache key file `{path}` must be \
+                 workspace-relative (no leading `/`, no `..`)"
+            ));
+        }
+    }
+}
+
+/// Do two workspace-relative paths name overlapping tree regions? True when
+/// one's components are a prefix of the other's, where a component containing
+/// `*` (outputs may be globs) conservatively matches anything.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let ac: Vec<&str> = a.trim_end_matches('/').split('/').collect();
+    let bc: Vec<&str> = b.trim_end_matches('/').split('/').collect();
+    ac.iter()
+        .zip(bc.iter())
+        .all(|(x, y)| x == y || x.contains('*') || y.contains('*'))
+}
+
 pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
     let mut diagnostics = Vec::new();
 
     // Run budget (ADR-0047): opt-in, active-time-only; zero is nonsense.
     if ir.budget == Some(0) {
         diagnostics.push("`budget` must be greater than zero seconds".to_string());
-    }
-
-    // Retention (ADR-0065 s2): a profile is named, never defined, and an
-    // empty name would silently resolve as "no profile" downstream.
-    if ir
-        .retention_profile
-        .as_deref()
-        .is_some_and(|p| p.trim().is_empty())
-    {
-        diagnostics
-            .push("`retention_profile` must be a non-empty operator profile name".to_string());
     }
 
     // Unique ids.
@@ -2074,6 +2083,15 @@ pub fn validate(ir: &PipelineIr) -> Result<(), Vec<String>> {
                     ));
                 }
             }
+        }
+        // Keyed directory Cache (ADR-0065 s1): dirs and key files must be
+        // workspace-relative and well-formed, dirs must not clobber each
+        // other (mutual prefix-overlap) or the source (`.git*`, `.`), must
+        // not carry `=`/`,` (they ride a `dir=root,…` env var), and must not
+        // overlap the step's `outputs:` (a cached dir is scratch by
+        // definition — also publishing it is a self-contradictory label plan).
+        if let Some(cache) = &step.cache {
+            validate_cache(&step.id, cache, step.outputs.as_deref(), &mut diagnostics);
         }
         // Submit-time CEL: `when:` guards and every `${{ … }}` interpolation
         // must parse now, not fail mid-run (ADR-0009).
@@ -2411,56 +2429,6 @@ mod tests {
     fn empty_placement_profile_name_is_rejected() {
         let errs = errors(r#"steps: [{ id: a, image: busybox, placement_profiles: ["", "x"] }]"#);
         assert!(errs.iter().any(|e| e.contains("empty profile name")));
-    }
-
-    /// ADR-0065 s2: the pipeline-level `retention_profile:` NAME rides into
-    /// the IR untouched (that is how it reaches `runs.ir` for sweep-time
-    /// resolution), is omitted from the serialized IR when absent, and an
-    /// empty name is rejected (it would silently resolve as "no profile").
-    #[test]
-    fn retention_profile_rides_into_the_ir_and_an_empty_name_is_rejected() {
-        let ir = compile(
-            r#"
-            retention_profile: keep-longer
-            steps: [{ id: a, image: busybox }]
-            "#,
-        );
-        assert_eq!(ir.retention_profile.as_deref(), Some("keep-longer"));
-        let json = serde_json::to_string(&ir).unwrap();
-        assert!(
-            json.contains(r#""retention_profile":"keep-longer""#),
-            "the name must survive into the stored IR: {json}"
-        );
-        let bare = compile("steps: [{ id: a, image: busybox }]");
-        assert!(
-            !serde_json::to_string(&bare).unwrap().contains("retention_profile"),
-            "absent means absent — no null key in every stored IR"
-        );
-        let errs = errors("retention_profile: \"\"\nsteps: [{ id: a, image: busybox }]");
-        assert!(errs.iter().any(|e| e.contains("retention_profile")));
-    }
-
-    /// The shared named-registry machinery (ADR-0065 consequence): one
-    /// helper serves both operator profile kinds — lookup, the default flag,
-    /// and registry validation (empty/duplicate names, two defaults).
-    #[test]
-    fn the_shared_profile_registry_helper_serves_both_profile_kinds() {
-        let placement = vec![
-            PlacementProfile { name: "arm64".into(), default: false, k8s: None },
-            PlacementProfile { name: "big".into(), default: true, k8s: None },
-        ];
-        assert_eq!(profile_named(&placement, "arm64").map(|p| &*p.name), Some("arm64"));
-        assert!(profile_named(&placement, "nope").is_none());
-        assert_eq!(default_profile(&placement).map(|p| &*p.name), Some("big"));
-        assert!(validate_profile_registry(&placement, "placement").is_ok());
-
-        let retention = vec![
-            RetentionProfile { name: "keep".into(), default: true, ..Default::default() },
-            RetentionProfile { name: "keep".into(), default: true, ..Default::default() },
-        ];
-        let err = validate_profile_registry(&retention, "retention")
-            .expect_err("duplicate names must be refused");
-        assert!(err.contains("retention"), "the message names the registry: {err}");
     }
 
     #[test]
@@ -2951,6 +2919,83 @@ mod tests {
         assert!(errors(r#"steps: [{ id: b, image: rust, outputs: [] }]"#)
             .iter()
             .any(|d| d.contains("at least one path")));
+    }
+
+    /// ADR-0065 s1: a well-formed `cache:` compiles through; the malformed
+    /// shapes are submit-time diagnostics, never runtime surprises.
+    #[test]
+    fn cache_compiles_and_its_validation_rejects_the_dangerous_shapes() {
+        let ir = compile(
+            r#"steps: [{ id: b, image: node, cache: { dirs: [node_modules, .cargo],
+               key: [package-lock.json] } }]"#,
+        );
+        let b = ir.steps.iter().find(|s| s.id == "b").unwrap();
+        let cache = b.cache.as_ref().expect("cache compiled through");
+        assert_eq!(cache.dirs, vec!["node_modules", ".cargo"]);
+        assert_eq!(cache.key, vec!["package-lock.json"]);
+
+        // Empty dirs / empty key.
+        assert!(
+            errors(r#"steps: [{ id: b, image: n, cache: { dirs: [], key: [l] } }]"#)
+                .iter()
+                .any(|d| d.contains("at least one directory"))
+        );
+        assert!(
+            errors(r#"steps: [{ id: b, image: n, cache: { dirs: [d], key: [] } }]"#)
+                .iter()
+                .any(|d| d.contains("at least one key file"))
+        );
+        // Dir-clobber shapes (amendment #2): `.`, `..`, `.git*`, absolute.
+        for bad in [".", "a/..", ".git", ".github/x", "/abs"] {
+            assert!(
+                !errors(&format!(
+                    r#"steps: [{{ id: b, image: n, cache: {{ dirs: ["{bad}"], key: [l] }} }}]"#
+                ))
+                .is_empty(),
+                "cache dir {bad:?} must be rejected"
+            );
+        }
+        // `=`/`,` would break the `dir=root,…` env the fetcher parses.
+        for bad in ["a=b", "a,b"] {
+            assert!(
+                errors(&format!(
+                    r#"steps: [{{ id: b, image: n, cache: {{ dirs: ["{bad}"], key: [l] }} }}]"#
+                ))
+                .iter()
+                .any(|d| d.contains("`=` or `,`")),
+                "cache dir {bad:?} must be rejected"
+            );
+        }
+        // Mutual prefix-overlap among dirs.
+        assert!(errors(
+            r#"steps: [{ id: b, image: n, cache: { dirs: [a, a/b], key: [l] } }]"#
+        )
+        .iter()
+        .any(|d| d.contains("overlap")));
+        // outputs ∩ cache.dirs (amendment #4), both directions + glob.
+        for outputs in ["[node_modules]", "[node_modules/pkg]", "[\"*\"]"] {
+            assert!(
+                errors(&format!(
+                    r#"steps: [{{ id: b, image: n, outputs: {outputs},
+                       cache: {{ dirs: [node_modules], key: [l] }} }}]"#
+                ))
+                .iter()
+                .any(|d| d.contains("overlaps cache dir")),
+                "outputs {outputs} must conflict with the cache dir"
+            );
+        }
+        // Disjoint outputs stay fine.
+        assert!(errors(
+            r#"steps: [{ id: b, image: n, outputs: [dist],
+               cache: { dirs: [node_modules], key: [l] } }]"#
+        )
+        .is_empty());
+        // Key files are workspace-relative.
+        assert!(errors(
+            r#"steps: [{ id: b, image: n, cache: { dirs: [d], key: ["../x"] } }]"#
+        )
+        .iter()
+        .any(|d| d.contains("workspace-relative")));
     }
 
     #[test]

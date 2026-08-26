@@ -157,6 +157,46 @@ impl scarab_engine::WorkspaceSnapshots for CasSnapshots {
             }
         }
     }
+
+    /// The blob hash of `path` inside the snapshot at `root` (ADR-0065 s1):
+    /// a component-by-component tree walk — the hash is IN the tree entries,
+    /// so no blob content is ever read. `Ok(None)` only on definitive absence
+    /// (`NotFound` anywhere on the walk, a missing entry, or a non-blob at the
+    /// leaf); any other storage error is `Err`, which the engine treats as
+    /// "cannot key — disable", never as absence.
+    async fn file_blob_hash(&self, root: &str, path: &str) -> Result<Option<String>, String> {
+        let mut tree = scarab_storage::TreeHash(root.to_string());
+        let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let Some((leaf, dirs)) = components.split_last() else {
+            return Ok(None);
+        };
+        for dir in dirs {
+            let entries = match self.0.tree_entries(&tree).await {
+                Ok(entries) => entries,
+                Err(scarab_storage::StorageError::NotFound) => return Ok(None),
+                Err(e) => return Err(e.to_string()),
+            };
+            match entries.into_iter().find(|e| e.name == *dir) {
+                Some(scarab_storage::TreeEntry {
+                    target: scarab_storage::TreeTarget::Tree(sub),
+                    ..
+                }) => tree = sub,
+                // Absent, or a file where a directory was expected.
+                _ => return Ok(None),
+            }
+        }
+        let entries = match self.0.tree_entries(&tree).await {
+            Ok(entries) => entries,
+            Err(scarab_storage::StorageError::NotFound) => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        };
+        Ok(entries.into_iter().find(|e| e.name == *leaf).and_then(|e| {
+            match e.target {
+                scarab_storage::TreeTarget::Blob(b) => Some(b.0),
+                scarab_storage::TreeTarget::Tree(_) => None,
+            }
+        }))
+    }
 }
 
 /// The workspace-CAS GC configuration (ADR-0050).

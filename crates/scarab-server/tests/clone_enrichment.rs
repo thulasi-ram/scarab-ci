@@ -43,6 +43,7 @@ fn clone_spec(read_only: bool) -> StepSpec {
         timeout_seconds: None,
         workspace_inputs: vec![],
         workspace_outputs: vec![],
+        cache: None,
         clone: Some(CloneConfig {
             owner: "acme".into(),
             name: "web".into(),
@@ -180,6 +181,7 @@ fn build_spec(image: &str) -> StepSpec {
         timeout_seconds: None,
         workspace_inputs: vec![],
         workspace_outputs: vec![],
+        cache: None,
         clone: None,
         build: Some(BuildConfig {
             context: ".".into(),

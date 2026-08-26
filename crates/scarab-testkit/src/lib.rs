@@ -194,6 +194,10 @@ struct InMemoryState {
             Option<String>,
         ),
     >,
+    /// Keyed-cache mapping rows (ADR-0065 s1; mirrors `cache_entries`):
+    /// `(project, key, dir) → (tree_root, saved_at, run, step, attempt)`.
+    #[allow(clippy::type_complexity)]
+    cache_entries: HashMap<(String, String, String), (String, Timestamp, RunId, StepId, AttemptId)>,
     /// Per-run pipeline name (mirrors the `pipeline` run column).
     run_pipeline: HashMap<RunId, String>,
     /// Per-run Headline / trigger title (mirrors the `trigger_title` column).
@@ -799,6 +803,46 @@ impl Db for InMemoryDb {
             .run_origin
             .get(run)
             .and_then(|o| o.5.clone()))
+    }
+
+    async fn cache_record(
+        &self,
+        project: &str,
+        key: &str,
+        dir: &str,
+        tree_root: &str,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        now: Timestamp,
+    ) -> Result<(), DbError> {
+        self.state.lock().unwrap().cache_entries.insert(
+            (project.to_string(), key.to_string(), dir.to_string()),
+            (
+                tree_root.to_string(),
+                now,
+                run.clone(),
+                step.clone(),
+                attempt.clone(),
+            ),
+        );
+        Ok(())
+    }
+
+    async fn cache_lookup(
+        &self,
+        project: &str,
+        key: &str,
+    ) -> Result<Vec<(String, String)>, DbError> {
+        let st = self.state.lock().unwrap();
+        let mut rows: Vec<(String, String)> = st
+            .cache_entries
+            .iter()
+            .filter(|((p, k, _), _)| p == project && k == key)
+            .map(|((_, _, dir), (root, ..))| (dir.clone(), root.clone()))
+            .collect();
+        rows.sort();
+        Ok(rows)
     }
 
     async fn set_run_pipeline(&self, run: &RunId, pipeline: &str) -> Result<(), DbError> {

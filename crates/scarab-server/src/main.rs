@@ -340,48 +340,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.retention_log_days,
             config.retention_workspace_days,
         );
-
-        // Committed-fence expiry (git-bug 6499fb1, ADR-0065/0067): the
-        // control plane selects AND executes — pointers only; the Depot's
-        // rowless reclaimer collects the bytes a cadence later. On its own
-        // small pool (a composition-root concern: `PgDb`'s pool stays
-        // private, and the pass holds one connection for the reclaimer's
-        // advisory lock plus one per victim transaction), on the sweeper's
-        // cadence; cross-replica and cross-pass serialization is the
-        // advisory lock itself, so no lease is needed.
-        let expiry_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy(&database_url)
-            .map_err(|e| format!("depot expiry pool: {e}"))?;
-        // The per-run TTL source (ADR-0065 s2): the operator RetentionProfile
-        // registry over the flat env fallbacks. A bad path/parse/validation
-        // is a boot failure (ADR-0048), mirroring the placement config.
-        let flat_ttls = scarab_server::depot_expiry::ExpiryTtls {
-            pack_ttl_secs: (config.retention_pack_days as i64) * 24 * 60 * 60,
-            workspace_ttl_secs: (config.retention_workspace_days as i64) * 24 * 60 * 60,
-        };
-        let retention_registry = match &config.retention_config_file {
-            Some(path) => {
-                let raw = std::fs::read_to_string(path)
-                    .map_err(|e| format!("cannot read SCARAB_RETENTION_CONFIG_FILE {path}: {e}"))?;
-                let file: scarab_server::depot_expiry::RetentionConfigFile =
-                    serde_yaml::from_str(&raw)
-                        .map_err(|e| format!("invalid retention config {path}: {e}"))?;
-                scarab_server::depot_expiry::RetentionRegistry::new(file.profiles, flat_ttls)
-                    .map_err(|e| format!("invalid retention config {path}: {e}"))?
-            }
-            None => scarab_server::depot_expiry::RetentionRegistry::flat(flat_ttls),
-        };
-        scarab_server::depot_expiry::spawn_expiry(
-            expiry_pool,
-            retention_registry,
-            Duration::from_secs(300),
-        );
-        tracing::info!(
-            "depot committed-fence expiry on (packs {}d default, per-run RetentionProfile \
-             honoured; pin wins, borrow edges gate, pre-epoch floor — git-bug 6499fb1)",
-            config.retention_pack_days,
-        );
     }
 
     // The OIDC issuer (ADR-0015), built BEFORE the driver so the launch path
@@ -641,6 +599,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 db.clone(),
                 clock.clone(),
                 executor,
+                // Cache-key resolution at launch (ADR-0065 s1): the same CAS
+                // the rerun-widening oracle reads.
+                Some(Arc::new(scarab_server::retention::CasSnapshots(
+                    workspace_cas.clone(),
+                ))),
                 Some(forge.clone()),
                 // Feed the log pipeline from the executor's live tail (ADR-0013).
                 Some(logs.clone()),
