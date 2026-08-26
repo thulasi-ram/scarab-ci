@@ -3383,6 +3383,19 @@ enum ClosureVerdict {
     Missing(String),
 }
 
+/// How many reads the closure validation keeps in flight at once — the
+/// per-level tree reads and the warm blob probes in
+/// [`validate_drain_closure`] (ticket `1d4b3ce`). 16 matches the drain
+/// client's own upload `CONCURRENCY`: validating a snapshot never works the
+/// Depot harder than uploading it did.
+const VALIDATE_CLOSURE_CONCURRENCY: usize = 16;
+
+/// Blobs per blocking stat task in [`validate_drain_closure`]'s warm probe:
+/// large enough that the `spawn_blocking` hop is noise against its chunk,
+/// small enough that a 20k-blob snapshot still spreads across the whole
+/// [`VALIDATE_CLOSURE_CONCURRENCY`] bound.
+const VALIDATE_STAT_CHUNK: usize = 1024;
+
 /// Validate a success record's closure against **the fence's ledger, warm OR
 /// the pack index**. The tree walk used to be warm-only, on a rationale the
 /// PG-backed ledger voided (a cold-only tree read as "a tree this fence
@@ -3396,79 +3409,152 @@ enum ClosureVerdict {
 /// already-durable blob is legitimately never re-uploaded to this replica's
 /// warm. Bounded like [`reachable_set_of`]: BFS with a visited set, hashes only
 /// in memory.
+///
+/// This sits on the drain's critical path and used to be strictly serial —
+/// one awaited tree read at a time, then one `stat` per blob over the whole
+/// snapshot (~520 ms at 20k files; ticket `1d4b3ce`). Two changes, neither of
+/// which can move the verdict:
+///
+/// * **trees**: the BFS proceeds level by level, each level's reads
+///   [`VALIDATE_CLOSURE_CONCURRENCY`]-bounded and consumed in level order,
+///   so the ledger refusal and the first-missing-tree refusal stay
+///   deterministic per level;
+/// * **blobs**: the probe order is INVERTED — ONE batched
+///   [`durable_present_of`] query over the whole blob set first (a large
+///   drain's filled body packs are already staged rows by record time, so
+///   the index usually vouches for most of the set), then bounded-concurrent
+///   warm probes only for what the index lacks. A blob passes iff warm OR
+///   durable — the same predicate in either order. The one behavioral delta
+///   is deliberate: a durable blob's warm `stat` no longer runs, so a sick
+///   warm volume cannot 500 a closure the index already vouches for. Index
+///   errors stay errors (`durable_present_of` is a 500, never a miss), so
+///   an index outage still cannot read as "absent".
 async fn validate_drain_closure(
     state: &WorkspaceState,
     ledger: &HashSet<String>,
     effective_root: &str,
     caller_fence_key: &str,
 ) -> Result<ClosureVerdict, WsError> {
+    use futures::StreamExt;
+
     let mut visited: HashSet<String> = HashSet::new();
-    let mut queue: Vec<String> = vec![effective_root.to_string()];
+    let mut frontier: Vec<String> = vec![effective_root.to_string()];
     let mut blobs: HashSet<String> = HashSet::new();
-    while let Some(tree) = queue.pop() {
-        if !visited.insert(tree.clone()) {
-            continue;
+    while !frontier.is_empty() {
+        // The ledger check is an in-memory set lookup: run it over the whole
+        // level before paying for any read, and dedupe against `visited` so a
+        // tree shared by two parents is read once.
+        let mut level: Vec<String> = Vec::new();
+        for tree in frontier.drain(..) {
+            if !visited.insert(tree.clone()) {
+                continue;
+            }
+            if !ledger.contains(&tree) {
+                return Ok(ClosureVerdict::Missing(format!(
+                    "tree {tree} is not in this fence's write ledger"
+                )));
+            }
+            level.push(tree);
         }
-        if !ledger.contains(&tree) {
-            return Ok(ClosureVerdict::Missing(format!(
-                "tree {tree} is not in this fence's write ledger"
-            )));
-        }
-        let bytes = match state.warm.get(&format!("trees/{tree}")).await {
-            Ok(bytes) => bytes,
-            Err(StorageError::NotFound) => {
-                match tree_bytes_via_pack_then_loose(state, &tree).await {
-                    Ok(bytes) => bytes,
-                    Err(WsError::NotFound) => {
-                        return Ok(ClosureVerdict::Missing(format!(
-                            "tree {tree} is neither in the warm tier nor readable \
-                             from the pack index"
-                        )))
+        // `buffered`, not `buffer_unordered`: results land in level order, so
+        // the refusal below names the same tree run over run. Owned `String`
+        // items, deliberately — an async block borrowing the iterator's
+        // `&String` trips rustc's "implementation of `FnOnce` is not general
+        // enough" when the router future's auto traits are checked.
+        let reads: Vec<Result<Option<Vec<u8>>, WsError>> =
+            futures::stream::iter(level.clone().into_iter().map(|tree| async move {
+                match state.warm.get(&format!("trees/{tree}")).await {
+                    Ok(bytes) => Ok(Some(bytes)),
+                    Err(StorageError::NotFound) => {
+                        match tree_bytes_via_pack_then_loose(state, &tree).await {
+                            Ok(bytes) => Ok(Some(bytes)),
+                            Err(WsError::NotFound) => Ok(None),
+                            Err(e) => Err(e),
+                        }
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => Err(WsError::Backend(e.to_string())),
                 }
-            }
-            Err(e) => return Err(WsError::Backend(e.to_string())),
-        };
-        let entries: Vec<TreeEntry> = serde_json::from_slice(&bytes).map_err(|e| {
-            WsError::Backend(format!("tree {tree} does not parse: {e}"))
-        })?;
-        for entry in entries {
-            match entry.target {
-                TreeTarget::Blob(blob) => {
-                    blobs.insert(blob.0);
+            }))
+            .buffered(VALIDATE_CLOSURE_CONCURRENCY)
+            .collect()
+            .await;
+        for (tree, read) in level.iter().zip(reads) {
+            let Some(bytes) = read? else {
+                return Ok(ClosureVerdict::Missing(format!(
+                    "tree {tree} is neither in the warm tier nor readable \
+                     from the pack index"
+                )));
+            };
+            let entries: Vec<TreeEntry> = serde_json::from_slice(&bytes).map_err(|e| {
+                WsError::Backend(format!("tree {tree} does not parse: {e}"))
+            })?;
+            for entry in entries {
+                match entry.target {
+                    TreeTarget::Blob(blob) => {
+                        blobs.insert(blob.0);
+                    }
+                    TreeTarget::Tree(sub) => frontier.push(sub.0),
                 }
-                TreeTarget::Tree(sub) => queue.push(sub.0),
             }
         }
     }
-    // Blobs: warm first, then the durable pack index. The fallback exists
-    // because the drain's durable dedup keys on the index (ADR-0067 part 4):
-    // a blob some earlier fence already packed is skipped by the client and
-    // may legitimately be absent from THIS replica's warm — refusing it would
-    // 422 every retried drain forever, since the retry re-asks `/have` and
-    // re-skips the same upload. Durable presence is the stronger fact anyway;
-    // reads range into the pack and backfill warm.
-    let mut warm_missing: Vec<String> = Vec::new();
-    for blob in &blobs {
-        if !warm_has(&warm_blob_path(state, blob)).await? {
-            warm_missing.push(blob.clone());
-        }
-    }
-    if !warm_missing.is_empty() {
-        let durable = durable_present_of(
-            &state.db,
-            PackMemberKind::Blob,
-            warm_missing.iter().map(String::as_str),
-            Some(caller_fence_key),
-        )
-        .await?;
-        if let Some(blob) = warm_missing.iter().find(|b| !durable.contains(*b)) {
+    // Blobs: the durable pack index first, warm only for the remainder (see
+    // the doc comment). The index leg exists because the drain's durable
+    // dedup keys on the index (ADR-0067 part 4): a blob some earlier fence
+    // already packed is skipped by the client and may legitimately be absent
+    // from THIS replica's warm — refusing it would 422 every retried drain
+    // forever, since the retry re-asks `/have` and re-skips the same upload.
+    // Durable presence is the stronger fact anyway; reads range into the
+    // pack and backfill warm.
+    let durable = durable_present_of(
+        &state.db,
+        PackMemberKind::Blob,
+        blobs.iter().map(String::as_str),
+        Some(caller_fence_key),
+    )
+    .await?;
+    let index_missing: Vec<(String, std::path::PathBuf)> = blobs
+        .iter()
+        .filter(|blob| !durable.contains(*blob))
+        .map(|blob| (blob.clone(), warm_blob_path(state, blob)))
+        .collect();
+    // Chunked `spawn_blocking`, not one `tokio::fs::metadata` per blob: a
+    // stat is a few microseconds of syscall under ~15µs of per-op executor
+    // hop, so at snapshot scale the hops WERE the cost (measured: ~20k probes
+    // dominated the serial 525 ms, and stayed ~290 ms probed individually at
+    // concurrency 16). Same answer semantics as [`warm_has`], per path: found
+    // is present, `NotFound` is absent, anything else is the volume failing —
+    // a 500, never a miss.
+    let mut probes = futures::stream::iter(
+        index_missing
+            .chunks(VALIDATE_STAT_CHUNK)
+            .map(<[(String, std::path::PathBuf)]>::to_vec)
+            .map(|chunk| {
+                tokio::task::spawn_blocking(move || -> Result<Option<String>, WsError> {
+                    for (blob, path) in chunk {
+                        match std::fs::metadata(&path) {
+                            Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                                return Ok(Some(blob))
+                            }
+                            Err(e) => return Err(warm_volume_error("stat", &path, e)),
+                        }
+                    }
+                    Ok(None)
+                })
+            }),
+    )
+    .buffer_unordered(VALIDATE_CLOSURE_CONCURRENCY);
+    while let Some(joined) = probes.next().await {
+        let missing = joined
+            .map_err(|e| WsError::Backend(format!("a closure stat task died: {e}")))??;
+        if let Some(blob) = missing {
             return Ok(ClosureVerdict::Missing(format!(
                 "blob {blob} is neither in the warm tier nor durable in the pack index"
             )));
         }
     }
+    drop(probes);
     Ok(ClosureVerdict::Complete {
         trees: visited,
         blobs,
