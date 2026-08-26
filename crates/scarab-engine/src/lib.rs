@@ -24,8 +24,9 @@ pub use ports::{Clock, Db, Executor, LogChunks, SnapshotRetention, WorkspaceSnap
 pub use scheduler::{
     cancel_run_request, pin_run_snapshots, plan_rerun, record_gate_approval, release_gate,
     rerun_step, rerun_step_widened, retry_step, retry_step_widened, unpin_run_snapshots,
-    ExpiredInput, RerunError, RerunPlan, Scheduler, SchedulerError, SupersedeTeardown,
-    SupersededAttempt, Supervision, TickHealth, CANCEL_RUN, LAUNCH_STEP, MAX_DELIVERY_ATTEMPTS,
+    ExpiredInput, PlanReason, PlannedStep, RerunError, RerunPlan, Scheduler, SchedulerError,
+    SupersedeTeardown, SupersededAttempt, Supervision, TickHealth, CANCEL_RUN, LAUNCH_STEP,
+    MAX_DELIVERY_ATTEMPTS,
     RUN_STATUS_CHANGED, SUPERSEDE_TEARDOWN,
 };
 
