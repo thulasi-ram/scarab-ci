@@ -1258,7 +1258,8 @@ export interface components {
             failed: boolean;
             /**
              * @description Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`
-             *     | `config`.
+             *     | `config` | `missing-inputs` (an input snapshot gone from every tier —
+             *     Rerun/Retry regenerates it; ticket e140121).
              */
             failure?: string | null;
             /**
