@@ -4123,8 +4123,9 @@ fn service_security_context(run_as_user: Option<u32>, run_as_root: bool) -> Secu
 /// The gid a non-root service pins (ADR-0058) — `Some` only when the service
 /// pins a non-root uid and is not the root escape hatch. How it is delivered is
 /// the builder's call, per topology: a **standalone** shared-service Pod (no
-/// workspace, no other tenants) sets it as the Pod `fsGroup` so any
-/// fsGroup-supporting volume is group-writable; a **step Pod** puts it in
+/// workspace, no other tenants) keeps it as the Pod `fsGroup`, so any future
+/// fsGroup-supporting volume would land group-writable — today that Pod mounts
+/// none, so the setting is inert; a **step Pod** puts it in
 /// `supplementalGroups` only, because there the `fsGroup` is the workspace's
 /// contract (`WORKSPACE_GID`) and a sidecar mounts no volumes of its own
 /// (git-bug 908f534).
@@ -4248,10 +4249,12 @@ pub fn build_service_pod(
             // A standalone backing service is long-lived within the run; keep it
             // up on crash (teardown, not exit, ends it).
             restart_policy: Some("Always".to_string()),
-            // Non-root default (ADR-0058): a pinned uid gets a matching Pod-level
-            // fsGroup so the service's `emptyDir` data volume is group-writable
-            // (the standard k8s pattern that lets the stock postgres image write
-            // PGDATA). None when root or no uid pinned.
+            // Non-root default (ADR-0058): a pinned uid keeps a matching
+            // Pod-level fsGroup so any future fsGroup-supporting volume would
+            // land group-writable. Today this Pod mounts no volumes at all —
+            // the service's scratch (e.g. postgres PGDATA) is its image's own
+            // writable layer, which fsGroup never touches — so the setting is
+            // inert (git-bug 908f534). None when root or no uid pinned.
             security_context: service_pinned_gid(svc).map(|g| {
                 k8s_openapi::api::core::v1::PodSecurityContext {
                     fs_group: Some(g),
