@@ -21,6 +21,16 @@ struct CapturingExec {
 }
 #[async_trait]
 impl Executor for CapturingExec {
+    async fn workspace_provisioning(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        // No fan-in sensor here; the method is REQUIRED (not defaulted) so
+        // this "none" is a visible decision, not a decorator-shaped evidence
+        // drop (56220d7).
+        Ok(None)
+    }
+
     async fn launch(&self, _step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
         *self.last_env.lock().unwrap() = Some(spec.env.clone());
         Ok(ExecHandle("h".into()))
@@ -210,6 +220,16 @@ struct SpecCapturingExec {
 }
 #[async_trait]
 impl Executor for SpecCapturingExec {
+    async fn workspace_provisioning(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        // No fan-in sensor here; the method is REQUIRED (not defaulted) so
+        // this "none" is a visible decision, not a decorator-shaped evidence
+        // drop (56220d7).
+        Ok(None)
+    }
+
     async fn launch(&self, _step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
         *self.last.lock().unwrap() = Some(spec.clone());
         Ok(ExecHandle("h".into()))

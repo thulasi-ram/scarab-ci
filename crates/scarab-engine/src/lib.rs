@@ -562,6 +562,35 @@ pub struct CacheSaves {
     pub roots: std::collections::BTreeMap<String, String>,
 }
 
+/// What the backend observed while **provisioning** a Step's input workspace
+/// (ticket 2e1a458), read back at settle by
+/// [`Executor::workspace_provisioning`](ports::Executor::workspace_provisioning).
+/// On k8s this is the fetch init container's bounded termination summary; a
+/// backend with no fan-in sensor answers `None`, harmlessly. Indices are into
+/// the DECLARED input-root order — the same order `workspace_inputs` built —
+/// and the scheduler maps them back to step ids through
+/// [`workspace_input_steps`], never a parallel derivation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvisioningReport {
+    /// TOTAL fan-in collision count — authoritative even when `sample` was
+    /// truncated to fit the transport's byte budget.
+    pub collisions: u64,
+    /// A bounded sample of the colliding paths (≤8 on the k8s transport).
+    pub sample: Vec<ProvisioningCollision>,
+}
+
+/// One sampled fan-in collision, as the backend reported it: a path two input
+/// roots both carried with differing content; the last root in declared order
+/// won (ADR-0007).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvisioningCollision {
+    pub path: String,
+    /// Index (into the declared input-root order) of the winning root.
+    pub winner: usize,
+    /// Index of the root whose entry was overwritten.
+    pub loser: usize,
+}
+
 /// The launch context of a `kind: build` step (ADR-0018): what to build
 /// (workspace-relative context/dockerfile) and the image tag to build and
 /// optionally push.
@@ -935,8 +964,38 @@ pub enum EventPayload {
     RunSnapshotsUnpinned {
         by: Option<String>,
     },
+    /// The fan-in merge of this step's input workspaces overwrote paths
+    /// (ticket 2e1a458): two (or more) consumed inputs carried the same path
+    /// with differing content, and the LAST input in declared order won
+    /// (ADR-0007 — semantics, not an accident; this event only makes it
+    /// loud). Appended at settle, on success and on step-classed failure
+    /// alike (a collision explains failures too). `count` is authoritative;
+    /// `sample` is bounded by the backend transport (≤8 paths on k8s — the
+    /// full list lives in the fetch container's own log).
+    ///
+    /// **Forward-only**: like `MissingInputs`, a control plane rolled BACK
+    /// past this variant hard-fails deserializing a run that carries it.
+    WorkspaceInputCollisions {
+        step: StepId,
+        attempt: AttemptId,
+        count: u64,
+        sample: Vec<WorkspaceCollision>,
+    },
     /// Escape hatch for forward-compatible payloads not yet modelled.
     Raw(serde_json::Value),
+}
+
+/// One sampled fan-in collision with its indices resolved to step ids —
+/// resolved by the scheduler through [`workspace_input_steps`] (the one
+/// consumption function, ADR-0007), so the event names producers, not
+/// positions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceCollision {
+    pub path: String,
+    /// The consumed input whose bytes won (last in declared order).
+    pub winner: StepId,
+    /// The consumed input whose bytes were overwritten.
+    pub loser: StepId,
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,9 +1077,34 @@ pub fn workspace_inputs(
     inputs: Option<&[StepId]>,
     output_of: &std::collections::HashMap<StepId, String>,
 ) -> Vec<String> {
+    workspace_input_steps(needs, inputs, output_of)
+        .iter()
+        .map(|n| {
+            output_of
+                .get(n)
+                .cloned()
+                .expect("workspace_input_steps filters on output presence")
+        })
+        .collect()
+}
+
+/// The steps behind [`workspace_inputs`], same filter, same order: the
+/// consumed dependencies (via [`consumed`]) that produced an output. This IS
+/// the index space of the fetcher's `SCARAB_SNAPSHOT_ROOTS` — a consumed need
+/// with no output contributes no root, so index ≠ needs-index — and the
+/// mapping from a `ProvisioningReport`'s root indices back to step ids MUST
+/// go through this one function (`workspace_inputs` itself is derived from
+/// it), never a parallel derivation (ADR-0007's one-function rule on
+/// `consumed`).
+pub fn workspace_input_steps(
+    needs: &[StepId],
+    inputs: Option<&[StepId]>,
+    output_of: &std::collections::HashMap<StepId, String>,
+) -> Vec<StepId> {
     consumed(needs, inputs)
         .iter()
-        .filter_map(|n| output_of.get(n).cloned())
+        .filter(|n| output_of.contains_key(*n))
+        .cloned()
         .collect()
 }
 
@@ -1426,6 +1510,36 @@ mod tests {
             workspace_inputs(&needs, Some(&inputs), &outputs),
             vec!["hash-c", "hash-a"],
             "c then a in declared order; b skipped (no output)"
+        );
+    }
+
+    /// `workspace_input_steps` IS the index space of the fetcher's root list
+    /// (ticket 2e1a458): consumed needs that produced an output, in declared
+    /// order — so root index ≠ needs index whenever a need produced nothing.
+    /// The collision event's index→StepId mapping goes through this one
+    /// function; this pins the filter it must reproduce.
+    #[test]
+    fn workspace_input_steps_is_the_root_index_space() {
+        // `a` produced nothing: the root list is [b, c], so index 0 is B —
+        // NOT a. Mapping through the needs list instead of through this
+        // function would misattribute every collision.
+        let outputs = HashMap::from([
+            (StepId("b".into()), "hash-b".to_string()),
+            (StepId("c".into()), "hash-c".to_string()),
+        ]);
+        let needs = vec![StepId("a".into()), StepId("b".into()), StepId("c".into())];
+        assert_eq!(
+            workspace_input_steps(&needs, None, &outputs),
+            vec![StepId("b".into()), StepId("c".into())]
+        );
+        // And `workspace_inputs` is DERIVED from it (one function, ADR-0007):
+        // same filter, same order, hashes instead of ids.
+        assert_eq!(workspace_inputs(&needs, None, &outputs), vec!["hash-b", "hash-c"]);
+        // Explicit `inputs:` resolves through the same filter.
+        let inputs = vec![StepId("c".into()), StepId("a".into())];
+        assert_eq!(
+            workspace_input_steps(&needs, Some(&inputs), &outputs),
+            vec![StepId("c".into())]
         );
     }
 

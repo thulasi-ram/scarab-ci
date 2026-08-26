@@ -2355,3 +2355,128 @@ async fn rerun_supersede_tears_down_the_in_flight_descendant_pod() {
         "the superseded descendant's Pod was torn down, not orphaned"
     );
 }
+
+/// Ticket 2e1a458, the one leg only a real kubelet can prove: the fetch init
+/// container — running as uid 65532 under the restricted baseline — can
+/// actually WRITE `/dev/termination-log`, and the kubelet captures it as the
+/// container's `terminated.message`, which is the entire transport of the
+/// fan-in collision evidence. Two producers collide on `shared.txt`; the
+/// consumer must materialise the LAST declared root's bytes (ADR-0007), and
+/// `Executor::workspace_provisioning` must hand back the parsed summary.
+///
+/// If this fails with a missing/empty message on a kubelet that denies the
+/// write, the named contingency is `terminationMessagePolicy:
+/// FallbackToLogsOnError` on the fetch container — wire it there, don't
+/// weaken this assertion. Env-gated like every case here, and the fixture
+/// PANICS when opted in with missing prereqs (the live-tier silent-skip
+/// rule).
+#[tokio::test]
+#[ignore = "requires a dev kubernetes cluster; opt in with SCARAB_TEST_KUBE=1"]
+async fn fanin_collision_summary_survives_the_termination_log_as_uid_65532() {
+    let Some(ns) = opted_in() else { return };
+    let Some(ws) = workspace_fixture() else { return };
+
+    let client = kube::Client::try_default().await.expect("kube client");
+    let exec = K8sExecutor::with_client(ns, client)
+        .with_workspace_cas(ws.cas.clone())
+        .with_workspace_depot(ws.depot.clone())
+        .with_workspace_service(ws.fetch.clone());
+
+    let run_id = unique_run("run-fanin");
+    let step_run = |id: &str| StepRun {
+        run: RunId(run_id.clone()),
+        step: StepId(id.into()),
+        status: StepStatus::Running,
+        attempts: vec![Attempt {
+            id: AttemptId("a1".into()),
+            started_at: Timestamp(0),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        }],
+        needs: vec![],
+        gate_kind: None,
+    };
+    let spec = |cmd: &str, inputs: Vec<String>| StepSpec {
+        image: "busybox:latest".into(),
+        command: vec!["sh".into(), "-c".into(), cmd.into()],
+        env: vec![],
+        secrets: vec![],
+        run_as_root: true, // busybox runs as root; fsGroup covers the emptyDir
+        add_capabilities: vec![],
+        privileged: false,
+        timeout_seconds: Some(120),
+        workspace_inputs: inputs,
+        workspace_outputs: vec![],
+        cache: None,
+        clone: None,
+        build: None,
+        artifacts: vec![],
+        placement_profiles: vec![],
+        resources: Default::default(),
+        k8s_overlay: None,
+        oidc_token: None,
+        services: Vec::new(),
+        uses: Vec::new(),
+        matrix_values: Default::default(),
+    };
+    async fn settle(exec: &K8sExecutor, h: &ExecHandle) -> ExecState {
+        poll_to_terminal(exec, h, 90)
+            .await
+            .expect("pod did not settle")
+    }
+
+    // Producers B then C, both writing shared.txt with different bytes.
+    let b = step_run("b");
+    let hb = exec
+        .launch(&b, &spec("echo b-bytes > /workspace/shared.txt", vec![]))
+        .await
+        .expect("launch B");
+    assert_eq!(settle(&exec, &hb).await, ExecState::Succeeded, "B succeeds");
+    let root_b = exec.output(&hb).await.expect("output").expect("B snapshot");
+
+    let c = step_run("c");
+    let hc = exec
+        .launch(&c, &spec("echo c-bytes > /workspace/shared.txt", vec![]))
+        .await
+        .expect("launch C");
+    assert_eq!(settle(&exec, &hc).await, ExecState::Succeeded, "C succeeds");
+    let root_c = exec.output(&hc).await.expect("output").expect("C snapshot");
+
+    // Consumer D declares [B, C]: C's bytes must win, and the collision must
+    // ride the termination message back out.
+    let d = step_run("d");
+    let hd = exec
+        .launch(
+            &d,
+            &spec(
+                "grep -q c-bytes /workspace/shared.txt",
+                vec![root_b.clone(), root_c.clone()],
+            ),
+        )
+        .await
+        .expect("launch D");
+    assert_eq!(
+        settle(&exec, &hd).await,
+        ExecState::Succeeded,
+        "D read the LAST declared root's bytes (ADR-0007 last-wins)"
+    );
+
+    let report = exec
+        .workspace_provisioning(&hd)
+        .await
+        .expect("workspace_provisioning read")
+        .expect(
+            "the fetch container's termination summary must be present: the uid-65532 \
+             write to /dev/termination-log failed or the kubelet did not capture it \
+             (contingency: terminationMessagePolicy: FallbackToLogsOnError)",
+        );
+    assert_eq!(report.collisions, 1, "one colliding path");
+    assert_eq!(report.sample.len(), 1);
+    assert_eq!(report.sample[0].path, "shared.txt");
+    assert_eq!(
+        (report.sample[0].winner, report.sample[0].loser),
+        (1, 0),
+        "declared indices: root 1 (C) wins over root 0 (B)"
+    );
+}

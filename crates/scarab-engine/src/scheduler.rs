@@ -2155,6 +2155,12 @@ impl<'a> Scheduler<'a> {
                     // write (dbe05e5 amendment #1).
                     self.record_cache_saves(&run, &step, &attempt, &handle)
                         .await;
+                    // Fan-in collision evidence (ticket 2e1a458): if the
+                    // backend's fetcher reported that this step's merged
+                    // inputs overwrote paths, append the event now — the
+                    // overwrite is ADR-0007 semantics, this makes it loud.
+                    self.record_workspace_collisions(&run, &step, &attempt, &handle)
+                        .await;
                     self.finalize_step(&run, &step, &attempt, StepStatus::Succeeded, None, None)
                         .await?;
                     self.db.mark_dispatched(msg.id).await?;
@@ -2170,6 +2176,17 @@ impl<'a> Scheduler<'a> {
                         self.db
                             .put_artifacts(&run, &step, &attempt, false, &artifacts, now)
                             .await?;
+                    }
+                    // Fan-in collision evidence (ticket 2e1a458) on
+                    // STEP-classed failures too: `Step` asserts the author's
+                    // command ran, so the fetch succeeded and its summary
+                    // exists — and a collision can be exactly why the step
+                    // failed. Infra/timeout classes are skipped: the Pod
+                    // evidence may be gone, and a pre-start failure has no
+                    // summary to read.
+                    if matches!(class, FailureClass::Step) {
+                        self.record_workspace_collisions(&run, &step, &attempt, &handle)
+                            .await;
                     }
                     // The adapter classified the failure (ADR-0047); the engine
                     // consumes the class verbatim and applies retry policy.
@@ -2274,6 +2291,78 @@ impl<'a> Scheduler<'a> {
                 .cache_record(&project, &saves.key, dir, root, run, step, attempt, now)
                 .await;
         }
+    }
+
+    /// Fan-in collision evidence (ticket 2e1a458), read at settle: the
+    /// backend's [`crate::ProvisioningReport`] (on k8s, the fetch init
+    /// container's bounded termination summary) carries declared-order root
+    /// indices; this resolves them back to step ids through
+    /// [`crate::workspace_input_steps`] — THE one consumption function
+    /// (consumed needs that produced an output, in order; ADR-0007's
+    /// one-function rule) — and appends
+    /// [`EventPayload::WorkspaceInputCollisions`].
+    ///
+    /// Best-effort THROUGHOUT, mirroring `record_cache_saves`: every failure
+    /// path is a silent return, because collision evidence must never fail a
+    /// settle that would otherwise succeed (the Pod-log rung still exists).
+    /// A sample whose index no longer resolves is dropped; `count` stays
+    /// authoritative either way.
+    async fn record_workspace_collisions(
+        &self,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        handle: &ExecHandle,
+    ) {
+        let report = match self.executor.workspace_provisioning(handle).await {
+            Ok(Some(r)) if r.collisions > 0 => r,
+            _ => return,
+        };
+        let Ok(all) = self.db.steps_of_run(run).await else {
+            return;
+        };
+        let Some(me) = all.iter().find(|s| s.step == *step) else {
+            return;
+        };
+        let Ok(explicit_inputs) = self.db.step_inputs(run, step).await else {
+            return;
+        };
+        let mut output_of = HashMap::new();
+        for s in &all {
+            match self.db.step_output(run, &s.step).await {
+                Ok(Some(o)) => {
+                    output_of.insert(s.step.clone(), o);
+                }
+                Ok(None) => {}
+                Err(_) => return,
+            }
+        }
+        let ordered =
+            crate::workspace_input_steps(&me.needs, explicit_inputs.as_deref(), &output_of);
+        let sample: Vec<crate::WorkspaceCollision> = report
+            .sample
+            .iter()
+            .filter_map(|c| {
+                Some(crate::WorkspaceCollision {
+                    path: c.path.clone(),
+                    winner: ordered.get(c.winner)?.clone(),
+                    loser: ordered.get(c.loser)?.clone(),
+                })
+            })
+            .collect();
+        let now = self.clock.now().await;
+        let _ = self
+            .append(
+                run,
+                EventPayload::WorkspaceInputCollisions {
+                    step: step.clone(),
+                    attempt: attempt.clone(),
+                    count: report.collisions,
+                    sample,
+                },
+                now,
+            )
+            .await;
     }
 
     /// Launch-time cache enrichment (ADR-0065 s1): fold the cache key from

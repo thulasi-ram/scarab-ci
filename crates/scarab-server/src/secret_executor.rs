@@ -123,6 +123,16 @@ impl SecretInjectingExecutor {
 
 #[async_trait]
 impl Executor for SecretInjectingExecutor {
+    async fn workspace_provisioning(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        // Forward — same forward-or-drop hazard as `artifacts` (98ea804) and
+        // `output_identity` (56220d7). This method is REQUIRED on the trait
+        // precisely so this line cannot be forgotten by a future decorator.
+        self.inner.workspace_provisioning(handle).await
+    }
+
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
         // Per-attempt OIDC token (ADR-0015): minted fresh on every launch,
         // in memory only — the k8s executor delivers it via a tmpfs file.

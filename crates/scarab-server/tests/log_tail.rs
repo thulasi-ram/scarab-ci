@@ -142,6 +142,16 @@ impl GatedExec {
 
 #[async_trait]
 impl Executor for GatedExec {
+    async fn workspace_provisioning(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        // No fan-in sensor here; the method is REQUIRED (not defaulted) so
+        // this "none" is a visible decision, not a decorator-shaped evidence
+        // drop (56220d7).
+        Ok(None)
+    }
+
     async fn launch(&self, step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
         Ok(ExecHandle(step.step.0.clone()))
     }

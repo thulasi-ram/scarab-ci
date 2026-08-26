@@ -969,6 +969,29 @@ pub trait Executor: Send + Sync {
         Ok(None)
     }
 
+    /// What the backend observed while **provisioning** the unit's input
+    /// workspace (ticket 2e1a458): the fan-in collision summary the fetcher
+    /// left behind — on k8s, the fetch init container's bounded
+    /// `terminated.message`. `Ok(None)` = this backend has no fan-in sensor
+    /// (the local executor), the Pod is already gone (best-effort by
+    /// contract), or the message was absent/malformed (an old wsfetch image;
+    /// the reader warns and moves on). The scheduler turns a `Some` with
+    /// `collisions > 0` into an `EventPayload::WorkspaceInputCollisions` at
+    /// settle.
+    ///
+    /// **Deliberately REQUIRED — no default.** Every other evidence method
+    /// here defaults, and that convention has now silently dropped evidence
+    /// through decorators twice (`artifacts`, 98ea804; `output_identity`,
+    /// 56220d7: a defaulted trait method on a decorator answers the default,
+    /// not the wrapped executor, and nothing fails). A required method makes
+    /// the compiler enforce what the comment on `artifacts` merely requests:
+    /// every impl — decorators above all — must decide, visibly, whether to
+    /// forward.
+    async fn workspace_provisioning(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<crate::ProvisioningReport>, ExecError>;
+
     /// Open a best-effort **live tail** of the unit's stdout/stderr for `step`,
     /// keyed by its fence (ADR-0013). The control plane drains the returned
     /// [`LogChunks`] into the log pipeline while the step runs. `Ok(None)` means

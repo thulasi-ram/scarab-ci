@@ -1774,6 +1774,10 @@ struct FakeExecState {
     /// Cache saves (ADR-0065 s1) each *step* reports on success, keyed by
     /// step id — what `Executor::cache_saves` answers.
     cache_saves: HashMap<String, scarab_engine::CacheSaves>,
+    /// step id — what `Executor::workspace_provisioning` answers (ticket
+    /// 2e1a458): the scripted fan-in collision report a backend would read
+    /// back from its fetcher at settle.
+    provisioning: HashMap<String, scarab_engine::ProvisioningReport>,
     /// The most recent spec each handle was launched with — lets a test assert
     /// launch-time interpolation (ADR-0041) rewrote `${{ … }}` before launch.
     launched_specs: HashMap<String, StepSpec>,
@@ -1869,6 +1873,17 @@ impl FakeExecutor {
             .unwrap()
             .cache_saves
             .insert(step.to_string(), saves);
+    }
+
+    /// Script the [`scarab_engine::ProvisioningReport`] that `step` (by id)
+    /// reports at settle (ticket 2e1a458) — what a k8s backend would parse
+    /// from the fetch init container's termination summary.
+    pub fn set_provisioning(&self, step: &str, report: scarab_engine::ProvisioningReport) {
+        self.inner
+            .lock()
+            .unwrap()
+            .provisioning
+            .insert(step.to_string(), report);
     }
 
     /// The content identity `step` reports, independently of its root. Use this
@@ -2085,6 +2100,16 @@ impl Executor for FakeExecutor {
             return Ok(None);
         };
         Ok(self.inner.lock().unwrap().cache_saves.get(&step).cloned())
+    }
+
+    async fn workspace_provisioning(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        let Some((step, _)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        Ok(self.inner.lock().unwrap().provisioning.get(&step).cloned())
     }
 
     async fn results(

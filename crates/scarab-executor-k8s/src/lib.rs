@@ -2433,6 +2433,61 @@ impl Executor for K8sExecutor {
         }))
     }
 
+    /// The fan-in collision summary the fetch init container left in its
+    /// termination message (ticket 2e1a458), parsed back into the engine's
+    /// [`scarab_engine::ProvisioningReport`]. Best-effort BY CONTRACT: Pod
+    /// gone ⇒ `None`; message absent (a single-root fetch writes none, and so
+    /// do old wsfetch images) ⇒ `None`; malformed where a summary was
+    /// expected (kubelet truncation, garbage) ⇒ `None` + a warn — collision
+    /// evidence must never fail a settle that would otherwise succeed.
+    async fn workspace_provisioning(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        if self.workspace_cas.is_none() {
+            return Ok(None);
+        }
+        let pods = self.pods()?;
+        let pod = pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        let Some(pod) = pod else { return Ok(None) };
+        let Some(t) = workspace_fetch_terminated(&pod) else {
+            return Ok(None);
+        };
+        let Some(message) = t.message.as_deref().filter(|m| !m.trim().is_empty()) else {
+            return Ok(None);
+        };
+        match scarab_workspace_client::parse_termination_summary(message) {
+            Some(summary) => Ok(Some(scarab_engine::ProvisioningReport {
+                collisions: summary.collisions,
+                sample: summary
+                    .sample
+                    .into_iter()
+                    .map(|s| scarab_engine::ProvisioningCollision {
+                        path: s.p,
+                        winner: s.w,
+                        loser: s.l,
+                    })
+                    .collect(),
+            })),
+            None => {
+                // An exit-5 cause is deliberately plain text (not a summary),
+                // and an old image writes nothing — only a SUCCEEDED fetch
+                // whose message does not parse is worth a warn.
+                if t.exit_code == 0 {
+                    tracing::warn!(
+                        pod = %handle.0,
+                        "unparseable workspace fetch termination summary — \
+                         fan-in collision evidence dropped for this attempt"
+                    );
+                }
+                Ok(None)
+            }
+        }
+    }
+
     /// The artifacts the step published (ADR-0052), from the Pod annotation
     /// the harvest recorded (durable with the Pod across restarts).
     async fn artifacts(
@@ -4604,9 +4659,10 @@ pub fn pod_state(pod: &Pod) -> ExecState {
             // on a node (or a moment) that can reach the service — while a
             // permanently-missing snapshot is `MissingInputs` (one attempt,
             // run Failed, Rerun/Retry named) and env/skew is `Config`.
-            if let Some(fetch_exit) = workspace_fetch_failed(pod) {
+            if let Some((fetch_exit, fetch_message)) = workspace_fetch_failed(pod) {
                 if exit_code.is_none() {
-                    let (class, cause) = classify_fetch_exit(fetch_exit);
+                    let (class, cause) =
+                        classify_fetch_exit(fetch_exit, fetch_message.as_deref());
                     return ExecState::Failed {
                         exit_code: None,
                         class,
@@ -4655,8 +4711,8 @@ pub fn pod_state(pod: &Pod) -> ExecState {
             // Also checked while Pending: an init container that exited non-zero
             // under `restartPolicy: Never` is never retried by the kubelet, so
             // there is nothing to wait for even before the phase flips to Failed.
-            if let Some(fetch_exit) = workspace_fetch_failed(pod) {
-                let (class, cause) = classify_fetch_exit(fetch_exit);
+            if let Some((fetch_exit, fetch_message)) = workspace_fetch_failed(pod) {
+                let (class, cause) = classify_fetch_exit(fetch_exit, fetch_message.as_deref());
                 ExecState::Failed {
                     exit_code: None,
                     class,
@@ -4780,7 +4836,7 @@ fn step_container_started(pod: &Pod) -> bool {
 /// [`scarab_workspace_client::EXIT_FETCH_TRANSIENT`] and siblings. Runs only
 /// after [`workspace_fetch_failed`] said the FETCHER failed, so `exit` is that
 /// container's own code, never the step's.
-fn classify_fetch_exit(exit: i32) -> (FailureClass, String) {
+fn classify_fetch_exit(exit: i32, message: Option<&str>) -> (FailureClass, String) {
     match exit {
         // NotFound-only: a LIVE Depot answered 404, so warm, the pack index
         // and the cold archive all miss the snapshot (a cold-tier outage is a
@@ -4831,6 +4887,33 @@ fn classify_fetch_exit(exit: i32) -> (FailureClass, String) {
              Fix the deployment (matching wsfetch image + workspace env), then retry"
                 .to_string(),
         ),
+        // Fan-in type conflict (ticket 2e1a458): two input snapshots carry
+        // the same path as incompatible kinds (directory vs file/symlink —
+        // either direction, the symlink case being a closed traversal
+        // hazard). Refused by the fetcher BEFORE any write; permanent and
+        // author-fixable, so Config — re-launching the identical spec
+        // re-refuses identically. The cause carries the fetcher's own
+        // termination message, which names the path and both roots.
+        //
+        // Rollout: aligned with the recorded image-first rule — old wsfetch
+        // images never emit 5, and an old control plane reading a new
+        // image's 5 lands in the pinned default arm below (bounded infra
+        // retry, tolerable).
+        code if code == scarab_workspace_client::EXIT_FETCH_INPUT_CONFLICT => (
+            FailureClass::Config,
+            match message.map(str::trim).filter(|m| !m.is_empty()) {
+                Some(cause) => format!(
+                    "the step's input workspaces cannot merge (fetch exit 5): {cause}. \
+                     Fix the producers (rename one side), or declare `inputs:` to \
+                     consume only one of them"
+                ),
+                None => "the step's input workspaces cannot merge (fetch exit 5): two \
+                         inputs carry the same path as incompatible kinds (directory vs \
+                         file/symlink). The fetch container's log names the path; fix \
+                         the producers, or declare `inputs:` to consume only one of them"
+                    .to_string(),
+            },
+        ),
         // PINNED default (binding amendment 1): exit 1 (transient after the
         // in-Pod retry window) and EVERY unlisted code — 137 (OOM/SIGKILL),
         // signal deaths, codes a newer image might add — stay
@@ -4851,7 +4934,14 @@ fn classify_fetch_exit(exit: i32) -> (FailureClass, String) {
     }
 }
 
-fn workspace_fetch_failed(pod: &Pod) -> Option<i32> {
+/// The workspace fetch init container's terminated state (current or
+/// `last_state`, so a snapshot taken after the Pod moved on still yields the
+/// verdict), whatever its exit code. The single source for both readers: the
+/// failure classifier ([`workspace_fetch_failed`]) and the settle-time
+/// collision evidence (`Executor::workspace_provisioning`, ticket 2e1a458).
+fn workspace_fetch_terminated(
+    pod: &Pod,
+) -> Option<&k8s_openapi::api::core::v1::ContainerStateTerminated> {
     pod.status
         .as_ref()?
         .init_container_statuses
@@ -4864,8 +4954,15 @@ fn workspace_fetch_failed(pod: &Pod) -> Option<i32> {
                 .and_then(|s| s.terminated.as_ref())
                 .or_else(|| c.last_state.as_ref().and_then(|s| s.terminated.as_ref()))
         })
-        .map(|t| t.exit_code)
-        .filter(|code| *code != 0)
+}
+
+/// A FAILED fetch: the exit code plus the container's termination message
+/// (the fetcher writes its exit-5 cause there — path + both roots — so the
+/// verdict can name what conflicted without a log excavation).
+fn workspace_fetch_failed(pod: &Pod) -> Option<(i32, Option<String>)> {
+    workspace_fetch_terminated(pod)
+        .filter(|t| t.exit_code != 0)
+        .map(|t| (t.exit_code, t.message.clone()))
 }
 
 /// The step container's terminated `reason` (e.g. `OOMKilled`), current or last.
@@ -7923,27 +8020,42 @@ mod tests {
             never_started: true,
         };
         // 1: transient after the in-Pod window.
-        assert_eq!(classify_fetch_exit(wc::EXIT_FETCH_TRANSIENT).0, infra);
+        assert_eq!(classify_fetch_exit(wc::EXIT_FETCH_TRANSIENT, None).0, infra);
         // 2: gone from every tier.
-        let (class, cause) = classify_fetch_exit(wc::EXIT_FETCH_MISSING_INPUTS);
+        let (class, cause) = classify_fetch_exit(wc::EXIT_FETCH_MISSING_INPUTS, None);
         assert_eq!(class, FailureClass::MissingInputs);
         assert!(cause.contains("Rerun/Retry"), "{cause}");
         // 3: denied — infra (a fresh attempt mints a fresh token), cause
         // names the token's exp story so persistent skew is diagnosable.
-        let (class, cause) = classify_fetch_exit(wc::EXIT_FETCH_DENIED);
+        let (class, cause) = classify_fetch_exit(wc::EXIT_FETCH_DENIED, None);
         assert_eq!(class, infra);
         assert!(
             cause.contains("token") && cause.contains("24h"),
             "the auth cause must name the credential and its exp: {cause}"
         );
         // 4: env/skew permanents — Config, fail fast.
-        let (class, cause) = classify_fetch_exit(wc::EXIT_FETCH_CONFIG);
+        let (class, cause) = classify_fetch_exit(wc::EXIT_FETCH_CONFIG, None);
         assert_eq!(class, FailureClass::Config);
         assert!(cause.contains("skew"), "{cause}");
+        // 5 (ticket 2e1a458): a fan-in type conflict — Config, fail fast,
+        // and the cause carries the fetcher's own termination message (path
+        // + both roots) when it is there.
+        let (class, cause) = classify_fetch_exit(
+            wc::EXIT_FETCH_INPUT_CONFLICT,
+            Some("workspace input conflict: type conflict at \"dist\": root[0] … root[1] …"),
+        );
+        assert_eq!(class, FailureClass::Config);
+        assert!(
+            cause.contains("dist") && cause.contains("root[0]") && cause.contains("root[1]"),
+            "the exit-5 cause must carry the message naming path + both roots: {cause}"
+        );
+        let (class, cause) = classify_fetch_exit(wc::EXIT_FETCH_INPUT_CONFLICT, None);
+        assert_eq!(class, FailureClass::Config, "exit 5 is Config even without a message");
+        assert!(cause.contains("inputs:"), "{cause}");
         // PINNED default: 137 (OOM/SIGKILL of the fetcher) and unknown codes
         // stay never-started infra.
-        for code in [137, 5, 42, 255] {
-            assert_eq!(classify_fetch_exit(code).0, infra, "exit {code}");
+        for code in [137, 42, 255] {
+            assert_eq!(classify_fetch_exit(code, None).0, infra, "exit {code}");
         }
     }
 

@@ -127,6 +127,16 @@ fn state_of(status: std::process::ExitStatus) -> ExecState {
 
 #[async_trait]
 impl Executor for LocalExecutor {
+    async fn workspace_provisioning(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        // The local backend has no fan-in sensor: it has no workspace CAS leg
+        // at all (parity explicitly deferred), so there is nothing to report.
+        // REQUIRED method, so this None is a decision the compiler saw.
+        Ok(None)
+    }
+
     async fn launch(&self, step: &StepRun, spec: &StepSpec) -> Result<ExecHandle, ExecError> {
         let handle = Self::handle_for(step);
 
