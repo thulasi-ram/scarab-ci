@@ -5730,7 +5730,13 @@ mod tests {
             );
             return;
         }
-        let Some(h) = DepotHarness::start().await else { return };
+        // Opted in, so the live-tier rule applies: a missing prerequisite
+        // must PANIC — a silent return here would pass green having
+        // measured nothing.
+        let h = DepotHarness::start().await.expect(
+            "SCARAB_TEST_DRAIN_TIMING=1 requires SCARAB_TEST_DATABASE_URL — \
+             the timing harness must not pass green without measuring",
+        );
         let warm = h.tmp.path().join("warm");
         std::fs::create_dir_all(warm.join("blobs")).expect("mkdir blobs");
         std::fs::create_dir_all(warm.join("trees")).expect("mkdir trees");
