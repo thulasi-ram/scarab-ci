@@ -7263,6 +7263,55 @@ mod tests {
         }
     }
 
+    /// Ticket e140121: the step's RESOLVED timeout — the exact number
+    /// `activeDeadlineSeconds` gets — rides BOTH wsfetch containers as
+    /// `SCARAB_WORKSPACE_STEP_TIMEOUT_SECS`, sizing their in-Pod retry
+    /// windows as a fraction of the deadline they run under. Mutation
+    /// killed: stamping the operator default while the spec declares its
+    /// own `timeout:` (the window would stop tracking the step's budget),
+    /// or stamping only one container (the drain's window would fall back
+    /// to the 300s skew default silently).
+    #[test]
+    fn the_resolved_step_timeout_rides_both_wsfetch_containers() {
+        let step = step_with_attempt("run-1", "build", "a1");
+        let fetch = sample_fetch();
+        let mut spec = busybox();
+        spec.workspace_inputs = vec!["root-a".into()];
+        spec.timeout_seconds = Some(120);
+        let pod = build_pod(
+            "scarab-x",
+            "ns",
+            &step,
+            &spec,
+            None,
+            DEFAULT_STEP_TIMEOUT_SECS,
+            true,
+            DEFAULT_CLONE_IMAGE,
+            Some(&fetch),
+        );
+        let ps = pod.spec.as_ref().unwrap();
+        assert_eq!(ps.active_deadline_seconds, Some(120));
+        let inits = ps.init_containers.as_ref().unwrap();
+        for name in [WORKSPACE_INIT_CONTAINER, WORKSPACE_EGRESS_CONTAINER] {
+            let c = inits
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let v = c
+                .env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|e| e.name == scarab_workspace_client::STEP_TIMEOUT_ENV)
+                .unwrap_or_else(|| panic!("{name} must carry the step timeout"));
+            assert_eq!(
+                v.value.as_deref(),
+                Some("120"),
+                "{name}: the SAME resolved number activeDeadlineSeconds gets"
+            );
+        }
+    }
+
     /// With no helper resources configured, the Pod keeps the pre-16a7768
     /// shape byte for byte: no resources on the helpers and no budget env —
     /// the wsfetch binary's own default budget carries the in-flight cap.
