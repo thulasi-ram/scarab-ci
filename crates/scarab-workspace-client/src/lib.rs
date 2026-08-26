@@ -1659,6 +1659,24 @@ fn scan_one(
                 TreeTarget::Tree(TreeHash(sub)),
                 TreeTarget::Tree(TreeHash(sub_identity)),
             )
+        } else if !file_type.is_file() {
+            // A FIFO/device/socket left in the workspace (ticket 16a7768 item
+            // 2): `read` on a FIFO with no writer blocks FOREVER, nothing in
+            // the drive path times the drain exec out, and the control plane's
+            // escalation clock anchors on the first *returned* failure — so a
+            // hang here would present as a step-budget timeout with no cause
+            // named. Refuse loudly instead, naming the path: a workspace
+            // snapshot can only hold regular files, directories and symlinks
+            // anyway (there is no tree-entry encoding for anything else), so
+            // this is the honest answer, not a limitation of the walk.
+            return Err(StorageError::Backend(format!(
+                "refusing to snapshot {} at {:?}: a Workspace Snapshot holds only \
+                 regular files, directories and symlinks — reading a FIFO/device/\
+                 socket can block the drain forever (remove it or create it \
+                 somewhere outside /workspace)",
+                non_regular_kind(&file_type),
+                item.path(),
+            )));
         } else {
             let data = std::fs::read(item.path()).map_err(io_err)?;
             let hash = hash_hex(&data);
@@ -1692,6 +1710,24 @@ fn scan_one(
     Ok((hash.0, identity.0))
 }
 
+/// Name a non-regular file type for the scan's refusal message. `lstat` already
+/// separated symlinks and directories out, so what reaches this is the zoo
+/// `read` can hang on or misrepresent.
+fn non_regular_kind(t: &std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if t.is_fifo() {
+        "a FIFO"
+    } else if t.is_socket() {
+        "a socket"
+    } else if t.is_block_device() {
+        "a block device"
+    } else if t.is_char_device() {
+        "a character device"
+    } else {
+        "a non-regular file"
+    }
+}
+
 /// A file's mtime as unix-ms. Pre-epoch timestamps come back negative rather
 /// than being dropped.
 fn mtime_ms(meta: &std::fs::Metadata) -> Option<i64> {
@@ -1720,6 +1756,44 @@ mod tests {
         let (h2, bytes2) = canonical_tree(vec![b, a]).unwrap();
         assert_eq!(h1, h2);
         assert_eq!(bytes1, bytes2);
+    }
+
+    /// A non-regular file in the workspace must FAIL the scan with an error
+    /// naming the path — never hang (`read` on a writer-less FIFO blocks
+    /// forever and nothing times the drain exec out) and never be silently
+    /// skipped (a skipped file would publish a narrower snapshot as the
+    /// Attempt's authoritative evidence). A unix socket is the stand-in here
+    /// because `std` can create one without a libc dance; the branch under
+    /// test is the same for FIFOs and device nodes.
+    #[test]
+    fn scan_refuses_a_non_regular_file_naming_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("ok.txt"), b"fine").expect("write");
+        let sock_path = dir.path().join("weird.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock_path).expect("bind socket");
+
+        let err = scan_dir(dir.path()).expect_err("a socket must refuse the scan");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("weird.sock"),
+            "the error must name the offending path, got: {msg}"
+        );
+        assert!(
+            msg.contains("socket"),
+            "the error must name the file type, got: {msg}"
+        );
+    }
+
+    /// Symlinks are recorded as symlinks (never followed, never refused) —
+    /// pinned next to the non-regular refusal so the two branches cannot be
+    /// conflated: a link to ANYWHERE is scannable, a FIFO is not.
+    #[test]
+    fn scan_records_a_symlink_without_following_or_refusing_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink("/nowhere/in/particular", dir.path().join("link"))
+            .expect("symlink");
+        let scan = scan_dir(dir.path()).expect("a dangling symlink scans fine");
+        assert_eq!(scan.files, 1);
     }
 
     #[test]
