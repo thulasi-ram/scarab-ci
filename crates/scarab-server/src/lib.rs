@@ -1198,6 +1198,10 @@ async fn create_run(
             timeout_seconds: step.timeout,
             workspace_inputs: vec![],
             workspace_outputs: step.outputs.clone().unwrap_or_default(),
+            // No cache on the inline `POST /v1/runs` escape hatch: such runs
+            // are untenanted (no `runs.project`), and the cache mapping is
+            // project-namespaced — the scheduler would disable it anyway.
+            cache: None,
             clone: None,
             build: None,
             artifacts: vec![],
@@ -4128,6 +4132,18 @@ fn admit_step_grants(
 /// `permit_k8s_overlay` is set, else the run is rejected **fail-closed**. An
 /// inline API run (no Environment) therefore never gets one. Returns the overlay
 /// to persist (or `None`).
+/// Translate an authored `cache:` (ADR-0065 s1) into the launch spec's
+/// [`scarab_engine::CacheConfig`]. Only the authored halves cross here —
+/// `key`/`restore` are launch-time enrichment the scheduler owns.
+fn cache_config(step: &scarab_pipeline::StepSpec) -> Option<scarab_engine::CacheConfig> {
+    step.cache.as_ref().map(|c| scarab_engine::CacheConfig {
+        dirs: c.dirs.clone(),
+        key_files: c.key.clone(),
+        key: None,
+        restore: Vec::new(),
+    })
+}
+
 fn admit_k8s_overlay(
     protection: Option<&scarab_project::ProtectionRules>,
     overlay: Option<&serde_json::Value>,
@@ -4354,6 +4370,9 @@ async fn persist_run_from_ir(
                 // unless declared, but it is the author's call, and silently
                 // ignoring the field here would be the one thing we won't do.
                 workspace_outputs: step.outputs.clone().unwrap_or_default(),
+                // Carried for uniformity; caching a clone step's checkout is
+                // legal but unusual (the clone itself is already CAS-deduped).
+                cache: cache_config(step),
                 clone: Some(scarab_engine::CloneConfig {
                     owner: repo.owner.clone(),
                     name: repo.name.clone(),
@@ -4437,6 +4456,10 @@ async fn persist_run_from_ir(
                 // post-step snapshot to exactly these workspace-relative paths.
                 // Empty = publish the whole workspace (the implicit default).
                 workspace_outputs: step.outputs.clone().unwrap_or_default(),
+                // Keyed directory Cache (ADR-0065 s1): the authored dirs/key
+                // files persist with the spec; the scheduler resolves the key
+                // and restore hints at launch.
+                cache: cache_config(step),
                 clone: None,
                 build,
                 artifacts: step.artifacts.clone(),

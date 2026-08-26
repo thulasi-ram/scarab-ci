@@ -67,6 +67,19 @@ pub struct SnapshotRetention {
 pub trait WorkspaceSnapshots: Send + Sync {
     /// Is the Workspace Snapshot rooted at `root` still materialisable?
     async fn snapshot_present(&self, root: &str) -> bool;
+
+    /// The **blob hash** of the file at workspace-relative `path` inside the
+    /// snapshot rooted at `root` (ADR-0065 s1: the cache key needs the hash,
+    /// never the content — it is already in the tree entries). `Ok(None)` =
+    /// the path is definitively absent from this snapshot (a directory, or
+    /// not there at all); `Err` = the store could not answer (transient), and
+    /// the caller must NOT treat that as absence — the cache-key resolution
+    /// disables the cache for the attempt instead of mis-keying it.
+    ///
+    /// Deliberately a required method: a decorator that inherited a defaulted
+    /// body would silently answer "absent" for an adapter that knows better
+    /// (the defaulted-trait-method evidence-drop trap).
+    async fn file_blob_hash(&self, root: &str, path: &str) -> Result<Option<String>, String>;
 }
 
 /// Opaque handle to a launched unit of execution (a pod, a local process…).
@@ -458,6 +471,43 @@ pub trait Db: Send + Sync {
 
     /// The run's Headline, if stamped.
     async fn run_trigger_title(&self, run: &RunId) -> Result<Option<String>, DbError>;
+
+    /// Record one keyed-cache save (ADR-0065 s1): upsert the `(project, key,
+    /// dir) → tree_root` mapping, refreshing `saved_at` and the provenance on
+    /// conflict. **Advisory only**: under replica-local warm + eviction a row
+    /// means "a drain recently saved this tree warm somewhere" — a hint, never
+    /// a promise. Callers treat failures as best-effort (log, never fail the
+    /// step).
+    #[allow(clippy::too_many_arguments)]
+    async fn cache_record(
+        &self,
+        project: &str,
+        key: &str,
+        dir: &str,
+        tree_root: &str,
+        run: &RunId,
+        step: &StepId,
+        attempt: &AttemptId,
+        now: Timestamp,
+    ) -> Result<(), DbError>;
+
+    /// The `(dir, tree_root)` rows recorded for `(project, key)`, if any —
+    /// the launch-time restore hints. Scoped by project: two tenants can
+    /// never resolve each other's rows (the key itself is also project-salted,
+    /// belt and braces).
+    async fn cache_lookup(
+        &self,
+        project: &str,
+        key: &str,
+    ) -> Result<Vec<(String, String)>, DbError>;
+
+    /// Was this run triggered in a **pull-request context** (any PR, fork or
+    /// not — from the ADR-0057 origin facts)? Gates cache-entry WRITES
+    /// (dbe05e5 amendment #1): push rights already imply pipeline-edit
+    /// rights, so branch-push writes add no capability, but a PR head — even
+    /// a same-repo one — must not poison the mapping other runs restore from.
+    /// Reads stay allowed for every context, forks included.
+    async fn run_pr_context(&self, run: &RunId) -> Result<bool, DbError>;
 
     /// How many runs are in-flight (started, not terminal). With `project`,
     /// scoped to that project (fairness cap); without, the global count
@@ -888,6 +938,24 @@ pub trait Executor: Send + Sync {
     /// every uploaded artifact of the executor it wraps (98ea804).
     async fn artifacts(&self, _handle: &ExecHandle) -> Result<Vec<crate::ArtifactMeta>, ExecError> {
         Ok(Vec::new())
+    }
+
+    /// The **cache saves** a finished execution reported (ADR-0065 s1): the
+    /// launch-resolved cache key plus each declared-and-present cache dir's
+    /// subtree root, as verified by the Depot against the fence's own write
+    /// ledger. The scheduler upserts these into the `cache_entries` mapping
+    /// best-effort on success. Default `None` — a backend with no cache
+    /// support (the local executor: parity explicitly deferred) saves
+    /// nothing, harmlessly.
+    ///
+    /// A **decorator** MUST forward this: the `None` default silently drops
+    /// every save of the executor it wraps (the same evidence-drop shape as
+    /// [`artifacts`](Self::artifacts), 98ea804).
+    async fn cache_saves(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<crate::CacheSaves>, ExecError> {
+        Ok(None)
     }
 
     /// Open a best-effort **live tail** of the unit's stdout/stderr for `step`,

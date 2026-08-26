@@ -440,6 +440,14 @@ pub struct StepSpec {
     /// (fail-closed — never a silently narrower publish).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workspace_outputs: Vec<String>,
+    /// Keyed directory Cache (ADR-0065 s1), when the step declared `cache:`.
+    /// `dirs`/`key_files` are authored (persisted with the spec); `key` and
+    /// `restore` are resolved by the scheduler at LAUNCH (like
+    /// [`workspace_inputs`](Self::workspace_inputs)) and ride the in-memory
+    /// launch copy. Best-effort end to end: an unresolvable key disables the
+    /// cache for the attempt, never fails it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheConfig>,
     /// Set when this is a **clone** step (ADR-0045): the engine runs the
     /// canonical scarab-clone image with this context instead of an authored
     /// image/command.
@@ -497,6 +505,49 @@ pub struct StepSpec {
     /// (absent in older stored specs → empty).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub matrix_values: std::collections::BTreeMap<String, String>,
+}
+
+/// The launch context of a step's keyed directory Cache (ADR-0065 s1).
+///
+/// `dirs`/`key_files` come from the authored `cache:` (already validated by
+/// `scarab-pipeline`) and persist with the stored spec. `key` and `restore`
+/// are launch-time enrichment: the scheduler resolves each key file to its
+/// blob hash through the merged input roots (last-overlay-wins, the same
+/// resolution the workspace materialisation uses), folds [`cache_key`], and
+/// looks the key up in `cache_entries` — the restore pairs are `(dir, tree
+/// root)` hints the executor turns into token claims + the fetcher's
+/// `SCARAB_CACHE_ROOTS`. A hint, never a promise: a root evicted from warm
+/// 404s at fetch time and degrades to a tolerated miss.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// Workspace-relative directories to cache (authored).
+    #[serde(default)]
+    pub dirs: Vec<String>,
+    /// Workspace-relative files whose blob hashes key the cache (authored).
+    #[serde(default)]
+    pub key_files: Vec<String>,
+    /// The resolved cache key — launch-time only. `None` until resolved, or
+    /// when resolution was impossible (no project, a key file absent from the
+    /// inputs, no snapshot oracle): the cache is then disabled for the
+    /// attempt (no restore claims, no save recording), never an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Launch-resolved `(dir, tree root)` restore hints, in authored dir
+    /// order. Empty = nothing to restore (a cold key, or the cache disabled).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restore: Vec<(String, String)>,
+}
+
+/// One settled Step's **cache saves** (ADR-0065 s1), read back from the
+/// backend by [`Executor::cache_saves`]: the key the launch resolved and each
+/// declared-and-present cache dir's drained subtree root. The scheduler turns
+/// these into best-effort `cache_entries` upserts — a failed upsert logs and
+/// never fails the step.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheSaves {
+    pub key: String,
+    /// dir → subtree root, present dirs only.
+    pub roots: std::collections::BTreeMap<String, String>,
 }
 
 /// The launch context of a `kind: build` step (ADR-0018): what to build
@@ -959,6 +1010,31 @@ pub fn workspace_inputs(
         .iter()
         .filter_map(|n| output_of.get(n).cloned())
         .collect()
+}
+
+/// Fold the **cache key** (ADR-0065 s1): sha256 over the project and the
+/// sorted `(key-file path, blob hash)` pairs, length-prefixed so no crafted
+/// path/hash pair can collide with another encoding. The blob hashes come
+/// from the input snapshots' tree entries (no content reads) — resolved by
+/// the caller through the merged input roots, last-overlay-wins. Deterministic
+/// by construction, so launch and settle agree on the key without persisting
+/// it: the same inputs always fold the same key.
+pub fn cache_key(project: &str, resolved: &[(String, String)]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut pairs: Vec<&(String, String)> = resolved.iter().collect();
+    pairs.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}:{}\n", project.len(), project));
+    for (path, blob) in pairs {
+        hasher.update(format!("{}:{}\n{}:{}\n", path.len(), path, blob.len(), blob));
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
 }
 
 /// A deterministic signature of the workspace a step will consume: the output

@@ -509,7 +509,7 @@ impl WorkspaceClient {
     /// the walk is a hard error from `scan_dir`, never a silent skip — the
     /// scan's `read_dir`/`read`/`metadata` failures all propagate.
     pub async fn ingest_report(&self, path: &str) -> Result<IngestReport, StorageError> {
-        self.ingest_report_inner(path, None).await
+        self.ingest_report_inner(path, None, &[]).await
     }
 
     /// [`ingest_report`](Self::ingest_report) for the **drain**: every scan
@@ -533,29 +533,62 @@ impl WorkspaceClient {
     /// `cache-only`. Empty = the whole closure publishes, all durable. The
     /// prune-minted parent trees themselves are PUT later by the caller's
     /// real prune walk (over [`MemoCas`]) and ride the durable default.
+    ///
+    /// `cache_dirs` are the Step's declared cache directories (ADR-0065 s1):
+    /// each present dir's subtree root is surfaced in
+    /// [`IngestReport::cache_roots`] (the scan computed every subtree hash
+    /// bottom-up anyway), and a cache dir is **scratch even when `outputs:`
+    /// is empty** — the labels are then the closure of the root with the
+    /// cache dirs excluded, so evictable content never consumes pack rows. A
+    /// cached dir flows via the cache, not via the workspace; pipeline
+    /// validation refuses outputs ∩ cache overlap, so the declared-outputs
+    /// prune already excludes them and needs no second pass.
     pub async fn drain_ingest_report(
         &self,
         path: &str,
         outputs: &[String],
+        cache_dirs: &[String],
     ) -> Result<IngestReport, StorageError> {
-        self.ingest_report_inner(path, Some(outputs)).await
+        self.ingest_report_inner(path, Some(outputs), cache_dirs).await
     }
 
     /// `drain`: `None` = the feed-path ingest (tree `/have` dedup, no labels);
     /// `Some(outputs)` = the drain (unconditional tree PUTs, durability labels
-    /// from the local prune of `outputs`).
+    /// from the local prune of `outputs`, cache dirs excluded — see
+    /// [`drain_ingest_report`](Self::drain_ingest_report)).
     async fn ingest_report_inner(
         &self,
         path: &str,
         drain: Option<&[String]>,
+        cache_dirs: &[String],
     ) -> Result<IngestReport, StorageError> {
         let scan = scan_dir(std::path::Path::new(path))?;
         let dedup_trees = drain.is_none();
         let plan = match drain {
             None => LabelPlan::Unlabelled,
-            Some(outputs) if outputs.is_empty() => LabelPlan::AllDurable,
+            Some(outputs) if outputs.is_empty() && cache_dirs.is_empty() => LabelPlan::AllDurable,
+            // No declared outputs but cache dirs: durable = the closure of
+            // the root with the cache dirs EXCLUDED (ADR-0065 s1) — same
+            // local walk, zero HTTP; the exclusion-minted parents are PUT
+            // later by the caller's real exclusion walk over [`MemoCas`].
+            Some(outputs) if outputs.is_empty() => {
+                cache_excluded_label_plan(&scan, cache_dirs).await?
+            }
             Some(outputs) => durable_label_plan(&scan, outputs).await?,
         };
+        // Each declared cache dir's subtree root, read straight off the scan
+        // (ADR-0065 s1). Only PRESENT dirs report — a dir the step never
+        // created simply saves nothing.
+        let mut cache_roots: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        if drain.is_some() && !cache_dirs.is_empty() {
+            let memo = ScanTreeCas::new(&scan);
+            for dir in cache_dirs {
+                if let Some(sub) = subtree_root_of(&memo, &scan.root, dir)? {
+                    cache_roots.insert(dir.clone(), sub);
+                }
+            }
+        }
 
         // One question for every blob, then upload only the misses — keyed on
         // the answer that matches each blob's PROMISE (ADR-0067 part 4):
@@ -640,6 +673,7 @@ impl WorkspaceClient {
             blobs_uploaded,
             bytes_uploaded,
             have_hits: blob_hits + tree_hits,
+            cache_roots,
         })
     }
 
@@ -717,6 +751,15 @@ pub struct DrainRecord {
     pub have_hits: u64,
     pub ingest_ms: u64,
     pub prune_ms: u64,
+    /// Keyed-cache saves (ADR-0065 s1): declared cache dir → its subtree
+    /// root, for the dirs the step actually produced. **Additive, serde-
+    /// defaulted** (the 212bb13 wire rule: the pinned shape evolves
+    /// additively) — an older helper simply reports none. The Depot verifies
+    /// every named root against this fence's own write ledger before
+    /// accepting the record (a forged root 422s the whole drain); the
+    /// control plane then upserts the key→root mapping best-effort.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub cache_roots: std::collections::BTreeMap<String, String>,
     pub error: Option<DrainErrorRecord>,
 }
 
@@ -788,6 +831,10 @@ pub struct IngestReport {
     /// only for [`drain_ingest_report`](WorkspaceClient::drain_ingest_report)
     /// (which never asks the tree question — see its doc).
     pub have_hits: u64,
+    /// Declared cache dir → its subtree root, for the dirs present in the
+    /// scan (ADR-0065 s1). Empty outside the drain, and for steps that
+    /// declared no cache.
+    pub cache_roots: std::collections::BTreeMap<String, String>,
 }
 
 /// A [`Cas`] over a [`WorkspaceClient`] that serves `tree_entries` from an
@@ -1340,22 +1387,142 @@ async fn durable_label_plan(scan: &Scan, outputs: &[String]) -> Result<LabelPlan
     };
     // The pruned closure, over the memo — which now also holds the
     // prune-minted parents its `put_tree` recorded.
-    let mut durable = std::collections::HashSet::new();
-    let mut queue = vec![pruned.0];
+    Ok(LabelPlan::Pruned(closure_of(&memo, pruned.0)?))
+}
+
+/// The drain's durable set when `outputs:` is empty but the step declared
+/// cache dirs (ADR-0065 s1): the closure of the root with the cache dirs
+/// **excluded** — everything publishes except the caches, which are
+/// cache-only scratch riding the cache mapping instead of the workspace.
+/// Deterministic over the same trees as the caller's later real exclusion
+/// (one [`exclude_paths`], one input), so the labels and the published
+/// closure cannot disagree.
+async fn cache_excluded_label_plan(
+    scan: &Scan,
+    cache_dirs: &[String],
+) -> Result<LabelPlan, StorageError> {
+    let memo = ScanTreeCas::new(scan);
+    let root = TreeHash(scan.root.clone());
+    let excluded = exclude_paths(&memo, &root, cache_dirs).await?;
+    Ok(LabelPlan::Pruned(closure_of(&memo, excluded.0)?))
+}
+
+/// Every tree and blob hash reachable from `root`, over the scan memo (which
+/// also holds any prune/exclusion-minted parents its `put_tree` recorded).
+fn closure_of(
+    memo: &ScanTreeCas,
+    root: String,
+) -> Result<std::collections::HashSet<String>, StorageError> {
+    let mut closure = std::collections::HashSet::new();
+    let mut queue = vec![root];
     while let Some(tree) = queue.pop() {
-        if !durable.insert(tree.clone()) {
+        if !closure.insert(tree.clone()) {
             continue;
         }
         for entry in memo.entries_of(&tree)? {
             match entry.target {
                 TreeTarget::Blob(blob) => {
-                    durable.insert(blob.0);
+                    closure.insert(blob.0);
                 }
                 TreeTarget::Tree(sub) => queue.push(sub.0),
             }
         }
     }
-    Ok(LabelPlan::Pruned(durable))
+    Ok(closure)
+}
+
+/// The subtree root at workspace-relative `dir` inside the scanned snapshot,
+/// if the step produced it as a directory (ADR-0065 s1). `Ok(None)` when the
+/// path is absent or names a file — such a dir simply saves nothing.
+fn subtree_root_of(
+    memo: &ScanTreeCas,
+    root: &str,
+    dir: &str,
+) -> Result<Option<String>, StorageError> {
+    let mut tree = root.to_string();
+    for comp in dir.trim_end_matches('/').split('/').filter(|c| !c.is_empty()) {
+        let entries = memo.entries_of(&tree)?;
+        match entries.into_iter().find(|e| e.name == comp) {
+            Some(TreeEntry {
+                target: TreeTarget::Tree(sub),
+                ..
+            }) => tree = sub.0,
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(tree))
+}
+
+/// Rebuild `root` with the entries at `paths` **removed**, minting the
+/// narrower parent chain through `cas.put_tree` (ADR-0065 s1: a cache dir is
+/// pruned from the published root even when `outputs:` is empty). A path that
+/// is absent — or whose intermediate components are not directories — excludes
+/// nothing. Returns the (possibly unchanged) root.
+///
+/// Like the prune, run this over [`MemoCas`] when the minted parents must
+/// really exist: its `put_tree` writes through to the Depot, so the excluded
+/// root and its new interior trees land in warm AND in the fence's write
+/// ledger — which is what lets the posted `pruned_root` validate.
+pub async fn exclude_paths(
+    cas: &dyn Cas,
+    root: &TreeHash,
+    paths: &[String],
+) -> Result<TreeHash, StorageError> {
+    let mut current = root.clone();
+    for path in paths {
+        current = exclude_one(cas, &current, path).await?;
+    }
+    Ok(current)
+}
+
+async fn exclude_one(cas: &dyn Cas, root: &TreeHash, path: &str) -> Result<TreeHash, StorageError> {
+    let comps: Vec<&str> = path
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .collect();
+    if comps.is_empty() {
+        return Ok(root.clone());
+    }
+    // Descend, remembering each parent's entries and which entry we followed,
+    // then rebuild bottom-up with the leaf entry dropped.
+    let mut chain: Vec<(Vec<TreeEntry>, usize)> = Vec::new();
+    let mut tree = root.clone();
+    for (depth, comp) in comps.iter().enumerate() {
+        let entries = cas.tree_entries(&tree).await?;
+        let Some(idx) = entries.iter().position(|e| e.name == *comp) else {
+            return Ok(root.clone());
+        };
+        if depth == comps.len() - 1 {
+            let mut trimmed = entries;
+            trimmed.remove(idx);
+            let mut child = cas.put_tree(trimmed).await?;
+            for (mut parent, pidx) in chain.into_iter().rev() {
+                match &mut parent[pidx].target {
+                    TreeTarget::Tree(t) => *t = child,
+                    // Unreachable: we only pushed tree-targeted entries.
+                    TreeTarget::Blob(_) => {
+                        return Err(StorageError::Backend(
+                            "exclusion chain crossed a blob entry".to_string(),
+                        ))
+                    }
+                }
+                child = cas.put_tree(parent).await?;
+            }
+            return Ok(child);
+        }
+        match &entries[idx].target {
+            TreeTarget::Tree(sub) => {
+                let next = sub.clone();
+                chain.push((entries, idx));
+                tree = next;
+            }
+            // An intermediate component is a file: the declared dir cannot
+            // exist beneath it — nothing to exclude.
+            TreeTarget::Blob(_) => return Ok(root.clone()),
+        }
+    }
+    Ok(root.clone())
 }
 
 /// A [`Cas`] over the scan's own canonical tree bytes, entirely in memory —
@@ -1582,6 +1749,10 @@ mod tests {
             have_hits: 7,
             ingest_ms: 41,
             prune_ms: 5,
+            cache_roots: std::collections::BTreeMap::from([(
+                "node_modules".to_string(),
+                "cc".to_string(),
+            )]),
             error: Some(DrainErrorRecord {
                 kind: DrainErrorKind::OutputContract,
                 detail: "declared output path not produced by the step: dist".into(),
@@ -1605,9 +1776,27 @@ mod tests {
         }
         assert_eq!(v["error"]["kind"], "OutputContract");
         assert_eq!(v["identity"], serde_json::Value::Null);
+        assert_eq!(v["cache_roots"]["node_modules"], "cc");
         // And the round trip back — the CP reads what the helper wrote.
         let back: DrainRecord = serde_json::from_value(v).unwrap();
         assert_eq!(back, rec);
+        // The 212bb13 wire rule: the shape evolves ADDITIVELY. A record from
+        // an older helper — no `cache_roots` — must still parse, defaulting
+        // to empty; and an empty map serialises to nothing (skip), keeping
+        // old readers agnostic.
+        let mut old = serde_json::to_value(&rec).unwrap();
+        old.as_object_mut().unwrap().remove("cache_roots");
+        let back: DrainRecord = serde_json::from_value(old).unwrap();
+        assert!(back.cache_roots.is_empty(), "serde default on absence");
+        let empty = DrainRecord {
+            cache_roots: Default::default(),
+            ..rec
+        };
+        let v = serde_json::to_value(&empty).unwrap();
+        assert!(
+            v.get("cache_roots").is_none(),
+            "an empty map is skipped on the wire"
+        );
     }
 
     /// A manifest is not a trust boundary: the service could be buggy or hostile

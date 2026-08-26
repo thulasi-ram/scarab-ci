@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use scarab_engine::{
     Clock, Db, Executor, Scheduler, SchedulerError, ServiceStatus, StepStatus, Supervision,
-    TickHealth,
+    TickHealth, WorkspaceSnapshots,
 };
 use scarab_forge::ForgePort;
 
@@ -28,6 +28,7 @@ pub async fn tick_once(
     db: &Arc<dyn Db>,
     clock: &Arc<dyn Clock>,
     executor: &Arc<dyn Executor>,
+    snapshots: Option<&Arc<dyn WorkspaceSnapshots>>,
     forge: Option<&Arc<dyn ForgePort>>,
     tailer: Option<&LogTailer>,
     owner: &str,
@@ -49,6 +50,9 @@ pub async fn tick_once(
     // does not log; the driver, which owns tracing, surfaces them without
     // aborting the tick.
     let isolated = Scheduler::new(&**db, &**clock, &**executor, owner)
+        // Cache-key resolution at launch (ADR-0065 s1) rides the same oracle
+        // the rerun-widening legs use; `None` = the cache is silently off.
+        .with_snapshots(snapshots.map(|s| &**s as &dyn WorkspaceSnapshots))
         .with_outbox_visibility_ms(visibility_ms)
         .with_default_step_timeout_ms(step_timeout_ms)
         .with_supervision(supervision.clone())
@@ -158,6 +162,7 @@ pub fn spawn_driver(
     db: Arc<dyn Db>,
     clock: Arc<dyn Clock>,
     executor: Arc<dyn Executor>,
+    snapshots: Option<Arc<dyn WorkspaceSnapshots>>,
     forge: Option<Arc<dyn ForgePort>>,
     logs: Option<Arc<crate::LogService>>,
     owner: String,
@@ -180,6 +185,7 @@ pub fn spawn_driver(
                 &db,
                 &clock,
                 &executor,
+                snapshots.as_ref(),
                 forge.as_ref(),
                 tailer.as_ref(),
                 &owner,

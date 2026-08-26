@@ -49,6 +49,7 @@ async fn crash_mid_run_resumes_and_runs_step_exactly_once() {
         timeout_seconds: None,
         workspace_inputs: vec![],
         workspace_outputs: vec![],
+        cache: None,
         clone: None,
         build: None,
         artifacts: vec![],
