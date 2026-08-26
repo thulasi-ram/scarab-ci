@@ -2180,7 +2180,6 @@ impl<'a> Scheduler<'a> {
                         FailureClass::Step => FailureKind::Step,
                         FailureClass::Timeout => FailureKind::Timeout,
                         FailureClass::Config => FailureKind::Config,
-                        FailureClass::MissingInputs => FailureKind::MissingInputs,
                     };
                     self.settle_failed_attempt(&run, &step, &attempt, kind, cause)
                         .await?;
@@ -2933,12 +2932,8 @@ impl<'a> Scheduler<'a> {
             } => configured.unwrap_or(0).max(NEVER_STARTED_AUTO_ATTEMPTS),
             // A permanent config/admission rejection can never succeed on a
             // re-run of the identical spec — fail fast on the first attempt,
-            // ignoring any author `retry:` (ADR-0047). Same for inputs gone
-            // from every tier (ticket e140121): re-launching the identical
-            // spec cannot re-create evicted content; the recovery is a
-            // Rerun/Retry, whose planner widens to the producing steps
-            // (ADR-0061 s5) — burning 3 attempts first was the bug.
-            FailureKind::Config | FailureKind::MissingInputs => 1,
+            // ignoring any author `retry:` (ADR-0047).
+            FailureKind::Config => 1,
             _ => configured.unwrap_or(1),
         };
 

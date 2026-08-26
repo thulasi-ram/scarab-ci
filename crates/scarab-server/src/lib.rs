@@ -981,8 +981,7 @@ pub struct AttemptDto {
     /// (a `superseded`/`cancelled` attempt is `failed:false` but NOT green).
     pub failed: bool,
     /// Coarse failure kind when `failed`: `infra` | `step` | `timeout` | `lost`
-    /// | `config` | `missing-inputs` (an input snapshot gone from every tier —
-    /// Rerun/Retry regenerates it; ticket e140121).
+    /// | `config`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
     /// The executor's human-readable cause for a failed attempt (ticket
@@ -1008,7 +1007,6 @@ fn attempt_dto(a: &scarab_engine::Attempt) -> AttemptDto {
             scarab_engine::FailureKind::Timeout => "timeout",
             scarab_engine::FailureKind::Lost => "lost",
             scarab_engine::FailureKind::Config => "config",
-            scarab_engine::FailureKind::MissingInputs => "missing-inputs",
         }
         .to_string()
     });

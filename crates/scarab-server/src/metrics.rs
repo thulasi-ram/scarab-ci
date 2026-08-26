@@ -118,6 +118,14 @@ static DEPOT_EXPIRED_FENCES: AtomicU64 = AtomicU64::new(0);
 /// was deleted, the next cadence retries.
 static DEPOT_EXPIRY_PASS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Expiry candidates a pass NOMINATED but declined without expiring — the
+/// victim transaction's re-read said no (a live borrower, a rerun flip, a
+/// record gone since nomination). Steady growth here while
+/// `scarab_depot_expired_fences_total` stays flat is the starved-window
+/// signal (git-bug a543fef): the batch window full of undeletable
+/// candidates, genuinely-expired victims queued invisibly behind it.
+static DEPOT_EXPIRY_SKIPPED_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+
 /// Whether the LAST expiry pass found the pre-epoch reachability floor held
 /// (1) — some pre-epoch run still non-terminal / within the workspace TTL /
 /// pinned, so pre-epoch committed content stayed untouchable — or drained
@@ -134,6 +142,11 @@ pub fn record_depot_expiry_pass_skipped() {
     DEPOT_EXPIRY_PASS_SKIPPED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Count one pass's nominated-but-declined expiry candidates.
+pub fn record_depot_expiry_candidates_skipped(n: u32) {
+    DEPOT_EXPIRY_SKIPPED_CANDIDATES.fetch_add(u64::from(n), Ordering::Relaxed);
+}
+
 /// Record whether the last expiry pass held the pre-epoch floor.
 pub fn set_depot_expiry_floor_held(held: bool) {
     DEPOT_EXPIRY_FLOOR_HELD.store(held as u64, Ordering::Relaxed);
@@ -147,6 +160,11 @@ pub fn depot_expired_fences() -> u64 {
 /// Expiry passes aborted/skipped since process start.
 pub fn depot_expiry_pass_skipped() -> u64 {
     DEPOT_EXPIRY_PASS_SKIPPED.load(Ordering::Relaxed)
+}
+
+/// Nominated-but-declined expiry candidates since process start.
+pub fn depot_expiry_skipped_candidates() -> u64 {
+    DEPOT_EXPIRY_SKIPPED_CANDIDATES.load(Ordering::Relaxed)
 }
 
 /// 1 if the last expiry pass found the pre-epoch floor held, else 0.
@@ -210,12 +228,16 @@ scarab_depot_expired_fences_total {}
 # HELP scarab_depot_expiry_pass_skipped_total Expiry passes aborted early (Postgres error or a 40P01 deadlock in a victim transaction); nothing further deleted, the next cadence retries.
 # TYPE scarab_depot_expiry_pass_skipped_total counter
 scarab_depot_expiry_pass_skipped_total {}
+# HELP scarab_depot_expiry_skipped_candidates_total Expiry candidates nominated but declined by the victim transaction (live borrower, rerun flip, record gone); climbing while expired_fences stays flat means the nomination window is full of undeletable candidates.
+# TYPE scarab_depot_expiry_skipped_candidates_total counter
+scarab_depot_expiry_skipped_candidates_total {}
 # HELP scarab_depot_expiry_floor_held Whether the last expiry pass found the pre-epoch reachability floor held (1 = pre-epoch committed content untouchable while some pre-epoch run is still reachable).
 # TYPE scarab_depot_expiry_floor_held gauge
 scarab_depot_expiry_floor_held {}
 ",
         depot_expired_fences(),
         depot_expiry_pass_skipped(),
+        depot_expiry_skipped_candidates(),
         depot_expiry_floor_held()
     ));
     out.push_str(&format!(

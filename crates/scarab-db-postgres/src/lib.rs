@@ -2578,10 +2578,6 @@ fn failure_str(f: FailureKind) -> &'static str {
         FailureKind::Timeout => "timeout",
         FailureKind::Lost => "lost",
         FailureKind::Config => "config",
-        // Forward-only (ticket e140121): rows carrying this string are
-        // unreadable to a binary from before the variant — deliberate, no
-        // unknown-variant fallback (see `FailureKind::MissingInputs`).
-        FailureKind::MissingInputs => "missing-inputs",
     }
 }
 
@@ -2597,7 +2593,6 @@ fn failure_from_str(s: &str) -> Result<FailureKind, DbError> {
         "timeout" => Ok(FailureKind::Timeout),
         "lost" => Ok(FailureKind::Lost),
         "config" => Ok(FailureKind::Config),
-        "missing-inputs" => Ok(FailureKind::MissingInputs),
         other => Err(DbError::Other(format!("unknown failure kind {other:?}"))),
     }
 }
