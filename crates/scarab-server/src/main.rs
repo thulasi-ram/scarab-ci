@@ -296,8 +296,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         key
     });
     let secrets: Arc<dyn scarab_secrets::SecretProvider> = {
-        let s = scarab_secrets_postgres::PostgresSecrets::connect(&database_url, master_key)
-            .await?;
+        let s = scarab_secrets_postgres::PostgresSecrets::connect(
+            &database_url,
+            scarab_secrets_postgres::MasterKeySet::single(master_key),
+        )
+        .await?;
         s.migrate().await?;
         Arc::new(s)
     };
