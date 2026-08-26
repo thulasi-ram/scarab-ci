@@ -137,7 +137,7 @@ async fn drain_and_record(
     ws: &std::path::Path,
 ) -> scarab_workspace_client::IngestReport {
     let report = client
-        .drain_ingest_report(ws.to_str().unwrap(), &[], &[])
+        .drain_ingest_report(ws.to_str().unwrap(), &[])
         .await
         .expect("drain ingest");
     client
@@ -152,7 +152,6 @@ async fn drain_and_record(
             have_hits: report.have_hits,
             ingest_ms: 1,
             prune_ms: 0,
-            cache_roots: Default::default(),
             error: None,
         })
         .await

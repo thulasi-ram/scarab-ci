@@ -5624,6 +5624,188 @@ mod tests {
         tree_hash.0.clone()
     }
 
+    /// Timing harness for ticket `1d4b3ce` — NOT a correctness gate, and
+    /// deliberately env-gated (`SCARAB_TEST_DRAIN_TIMING=1`) so the regular
+    /// suite never pays for a ~20k-file fixture. It measures exactly the
+    /// phase the ticket names: [`validate_drain_closure`] over a snapshot of
+    /// 20 × 10 × 100 = 20,000 blobs under 221 nested trees, everything in
+    /// warm (the fresh-drain shape: the drain PUT every blob to this
+    /// replica's warm; only earlier fences' dedup hits sit in the pack
+    /// index). Seeded directly onto the warm volume + an in-memory ledger
+    /// set — the same state the PUT routes leave behind — because posting a
+    /// real 20k-file drain through the router would time the uploads, not
+    /// the validation.
+    #[tokio::test]
+    async fn timing_validate_drain_closure_over_a_20k_file_snapshot() {
+        if std::env::var("SCARAB_TEST_DRAIN_TIMING").as_deref() != Ok("1") {
+            eprintln!(
+                "SKIPPED (timing harness, ticket 1d4b3ce): set \
+                 SCARAB_TEST_DRAIN_TIMING=1 to run"
+            );
+            return;
+        }
+        let Some(h) = DepotHarness::start().await else { return };
+        let warm = h.tmp.path().join("warm");
+        std::fs::create_dir_all(warm.join("blobs")).expect("mkdir blobs");
+        std::fs::create_dir_all(warm.join("trees")).expect("mkdir trees");
+
+        let mut ledger: HashSet<String> = HashSet::new();
+        let mut files = 0usize;
+        let mut seed_tree = |entries: Vec<TreeEntry>| -> TreeHash {
+            let (hash, bytes) =
+                scarab_storage::canonical_tree(entries).expect("canonical tree");
+            std::fs::write(warm.join("trees").join(&hash.0), &bytes).expect("write tree");
+            ledger.insert(hash.0.clone());
+            hash
+        };
+        let mut dirs: Vec<TreeEntry> = Vec::new();
+        for d in 0..20 {
+            let mut subs: Vec<TreeEntry> = Vec::new();
+            for s in 0..10 {
+                let mut leaves: Vec<TreeEntry> = Vec::new();
+                for f in 0..100 {
+                    let content = format!("blob {d}/{s}/{f}");
+                    let hash = hash_hex(content.as_bytes());
+                    std::fs::write(warm.join("blobs").join(&hash), content.as_bytes())
+                        .expect("write blob");
+                    leaves.push(TreeEntry::new(
+                        format!("f{f:03}.txt"),
+                        TreeTarget::Blob(BlobHash(hash)),
+                    ));
+                    files += 1;
+                }
+                let sub = seed_tree(leaves);
+                subs.push(TreeEntry::new(format!("s{s:02}"), TreeTarget::Tree(sub)));
+            }
+            let dir = seed_tree(subs);
+            dirs.push(TreeEntry::new(format!("d{d:02}"), TreeTarget::Tree(dir)));
+        }
+        let root = seed_tree(dirs);
+        let trees_seeded = ledger.len();
+        let caller = scarab_workspace_client::drain_fence_key("r-timing", "build", "a1");
+
+        for round in 0..5 {
+            let started = std::time::Instant::now();
+            let verdict = validate_drain_closure(&h.state, &ledger, &root.0, &caller)
+                .await
+                .expect("validation must not error");
+            let elapsed = started.elapsed();
+            let ClosureVerdict::Complete { trees, blobs } = verdict else {
+                panic!("the seeded closure is complete by construction");
+            };
+            assert_eq!(blobs.len(), files, "every seeded blob is in the closure");
+            assert_eq!(trees.len(), trees_seeded, "every seeded tree is walked");
+            eprintln!(
+                "1d4b3ce validate_drain_closure round {round}: {files} files, \
+                 {trees_seeded} trees -> {:.1} ms",
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    /// Ticket `1d4b3ce`: the closure validation's ANSWER must not move when
+    /// its probe order does. One closure whose blobs are split across the
+    /// three presence classes — warm-only (on this replica's disk, no index
+    /// row), durable-only (a committed pack row, nothing in warm: the dedup
+    /// shape ADR-0067 part 4 makes legitimate), and absent everywhere — must
+    /// validate Complete without the absent blob and Missing (naming the
+    /// absent blob) with it, whichever of warm and the index is consulted
+    /// first.
+    ///
+    /// Mutations killed: drop the durable fallback and the durable-only blob
+    /// 422s every retried drain forever; drop the warm probe and the
+    /// warm-only blob (this drain's own fresh upload, not yet sealed) is
+    /// refused; answer the missing blob present from either leg and a drain
+    /// record commits over durable evidence that does not exist.
+    #[tokio::test]
+    async fn closure_validation_verdict_is_identical_across_warm_durable_and_missing_blobs() {
+        let Some(h) = DepotHarness::start().await else { return };
+        let warm = h.tmp.path().join("warm");
+        std::fs::create_dir_all(warm.join("blobs")).expect("mkdir blobs");
+        std::fs::create_dir_all(warm.join("trees")).expect("mkdir trees");
+
+        // Warm-only: bytes on the volume, no pack row anywhere.
+        let warm_only = hash_hex(b"warm-only blob");
+        std::fs::write(warm.join("blobs").join(&warm_only), b"warm-only blob")
+            .expect("write warm blob");
+
+        // Durable-only: a COMMITTED foreign pack's member row, nothing in warm.
+        let durable_only = hash_hex(b"durable-only blob");
+        sqlx::query(
+            "INSERT INTO depot_packs (pack_key, fence_key, kind, created_at, bytes, committed) \
+             VALUES ('pk-1d4b3ce', 'some-foreign-fence', 'body', 0, 17, TRUE)",
+        )
+        .execute(&h.state.db)
+        .await
+        .expect("insert pack row");
+        sqlx::query(
+            "INSERT INTO depot_pack_members (address, kind, pack_key, byte_offset, byte_len) \
+             VALUES ($1, 'blob', 'pk-1d4b3ce', 0, 17)",
+        )
+        .bind(tagged_address(HashAlgo::Sha256, &durable_only))
+        .execute(&h.state.db)
+        .await
+        .expect("insert member row");
+
+        // Missing: a real hash with no bytes and no row.
+        let missing = hash_hex(b"missing blob");
+
+        let mut ledger: HashSet<String> = HashSet::new();
+        let mut seed_tree = |entries: Vec<TreeEntry>| -> TreeHash {
+            let (hash, bytes) =
+                scarab_storage::canonical_tree(entries).expect("canonical tree");
+            std::fs::write(warm.join("trees").join(&hash.0), &bytes).expect("write tree");
+            ledger.insert(hash.0.clone());
+            hash
+        };
+        let complete_root = seed_tree(vec![
+            TreeEntry::new("warm.txt", TreeTarget::Blob(BlobHash(warm_only.clone()))),
+            TreeEntry::new(
+                "durable.txt",
+                TreeTarget::Blob(BlobHash(durable_only.clone())),
+            ),
+        ]);
+        let broken_root = seed_tree(vec![
+            TreeEntry::new("warm.txt", TreeTarget::Blob(BlobHash(warm_only.clone()))),
+            TreeEntry::new(
+                "durable.txt",
+                TreeTarget::Blob(BlobHash(durable_only.clone())),
+            ),
+            TreeEntry::new("gone.txt", TreeTarget::Blob(BlobHash(missing.clone()))),
+        ]);
+        let caller = scarab_workspace_client::drain_fence_key("r-verdict", "build", "a1");
+
+        match validate_drain_closure(&h.state, &ledger, &complete_root.0, &caller)
+            .await
+            .expect("validation must not error")
+        {
+            ClosureVerdict::Complete { trees, blobs } => {
+                assert_eq!(
+                    blobs,
+                    HashSet::from([warm_only.clone(), durable_only.clone()]),
+                    "the closure's blob set is exactly the two present blobs"
+                );
+                assert!(trees.contains(&complete_root.0));
+            }
+            ClosureVerdict::Missing(detail) => {
+                panic!("warm-only + durable-only must validate Complete: {detail}")
+            }
+        }
+
+        match validate_drain_closure(&h.state, &ledger, &broken_root.0, &caller)
+            .await
+            .expect("validation must not error")
+        {
+            ClosureVerdict::Missing(detail) => assert!(
+                detail.contains(&missing),
+                "the refusal must name the absent blob: {detail}"
+            ),
+            ClosureVerdict::Complete { .. } => {
+                panic!("a closure with an absent blob must be Missing")
+            }
+        }
+    }
+
     /// A success record is write-once; an error record is not.
     ///
     /// Mutations killed: drop the 409 arm in `post_drain` and the second
@@ -6456,11 +6638,7 @@ mod tests {
         registry: &crate::depot_expiry::RetentionRegistry,
     ) -> u32 {
         for _ in 0..10_000 {
-            match crate::depot_expiry::expire_committed_fences_once(
-                db,
-                registry,
-                crate::depot_expiry::EXPIRY_BATCH,
-            )
+            match crate::depot_expiry::expire_committed_fences_once(db, registry, 100)
                 .await
                 .expect("expiry pass")
             {
@@ -6644,16 +6822,8 @@ mod tests {
             .await
             .expect("order the candidates");
 
-        let skipped_before = crate::metrics::depot_expiry_skipped_candidates();
         let pass1 = expire_now(db, &expiry_ttls()).await;
         assert_eq!(pass1, 1, "pass 1 expires only the borrower B");
-        // The borrow-gated decline is VISIBLE (git-bug a543fef): A was
-        // nominated and skipped, so the counter moved. `>=` because the
-        // counter is process-global and the suite runs in parallel.
-        assert!(
-            crate::metrics::depot_expiry_skipped_candidates() >= skipped_before + 1,
-            "a nominated-but-borrowed victim must count as a skipped candidate"
-        );
         let (packs_a, _, records_a, _) = expiry_rows_of(db, &fa).await;
         assert!(
             packs_a > 0 && records_a > 0,
@@ -6897,12 +7067,7 @@ mod tests {
         let pass = {
             let db = db.clone();
             tokio::spawn(async move {
-                crate::depot_expiry::expire_committed_fences_once(
-                    &db,
-                    &expiry_ttls(),
-                    crate::depot_expiry::EXPIRY_BATCH,
-                )
-                .await
+                crate::depot_expiry::expire_committed_fences_once(&db, &expiry_ttls(), 100).await
             })
         };
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -7061,83 +7226,6 @@ mod tests {
             let (packs, _, records, _) = expiry_rows_of(db, fence).await;
             assert!(packs > 0 && records > 0, "the {who} must survive");
         }
-    }
-
-    /// The nomination window cannot be STARVED by long-TTL blockers (git-bug
-    /// a543fef): a full window's worth (`EXPIRY_BATCH` + 20) of OLDER
-    /// `keep`-profile runs — terminal, past the loose flat bound the pre-fix
-    /// query nominated under, but well within their own 30d TTL — sits first
-    /// in `posted_at` order, and ONE genuinely-expired `short`-profile victim
-    /// sits behind all of them. The pre-fix shape (nominate under the loosest
-    /// cutoff `ORDER BY posted_at LIMIT 100`, skip in code) re-fetched exactly
-    /// the blockers every pass, forever, and the victim was never nominated;
-    /// with the per-profile cutoff resolved into the SQL the blockers are
-    /// never nominated at all and the victim expires in ONE pass.
-    ///
-    /// Mutations killed: revert to the loose-bound-plus-code-skip shape and
-    /// `expired` is 0 here; drop the CASE (bind one flat cutoff as the
-    /// verdict) and the blockers expire too.
-    #[tokio::test]
-    async fn a_window_of_long_ttl_blockers_cannot_starve_a_victim_behind_them() {
-        let Some(h) = DepotHarness::start().await else { return };
-        let db = &h.state.db;
-
-        // The victim: a real drained fence on the 1d `short` profile, 2 days
-        // terminal — genuinely expired under ITS OWN TTL.
-        let victim = expiry_drain(&h, "starve-v", "starved-victim").await;
-        let two_days = 2 * 24 * 3600;
-        seed_run(db, "starve-v", "succeeded", two_days, false).await;
-        set_run_profile(db, "starve-v", "short").await;
-        let victim_posted: i64 =
-            sqlx::query_scalar("SELECT posted_at FROM depot_drain_records WHERE fence_key = $1")
-                .bind(&victim)
-                .fetch_one(db)
-                .await
-                .expect("the victim's posted_at");
-
-        // A full window of blockers plus slack — DERIVED from the real batch
-        // constant, so a retune retunes this test with it — records posted
-        // BEFORE the victim's so they own the whole `ORDER BY posted_at
-        // LIMIT <batch>` window: terminal `keep` (30d) runs 2 days old —
-        // past the victim's cutoff, inside their own TTL. Rows only:
-        // blockers exist to crowd nomination, they need no packs.
-        let blocker_count = i64::from(crate::depot_expiry::EXPIRY_BATCH) + 20;
-        for i in 0..blocker_count {
-            let run = format!("starve-b{i}");
-            seed_run(db, &run, "succeeded", two_days, false).await;
-            set_run_profile(db, &run, "keep").await;
-            sqlx::query(
-                "INSERT INTO depot_drain_records \
-                     (fence_key, run, step, attempt, version, posted_at, record) \
-                 VALUES ($1, $2, 'build', 'a1', 1, $3, '{}'::jsonb)",
-            )
-            .bind(format!("starve-blocker-fence-{i}"))
-            .bind(&run)
-            .bind(victim_posted - 10_000 + i)
-            .execute(db)
-            .await
-            .expect("seed a blocker record");
-        }
-
-        let expired = expire_now(db, &expiry_profiles()).await;
-        assert_eq!(
-            expired, 1,
-            "the victim behind a full window of long-TTL blockers must expire \
-             in ONE pass — 0 here is the starved window, >1 means a blocker \
-             expired inside its own profile's TTL"
-        );
-        assert_eq!(expiry_rows_of(db, &victim).await, (0, 0, 0, 0));
-        let blockers: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM depot_drain_records \
-             WHERE fence_key LIKE 'starve-blocker-fence-%'",
-        )
-        .fetch_one(db)
-        .await
-        .expect("count blocker records");
-        assert_eq!(
-            blockers, blocker_count,
-            "every blocker survives, within its own TTL"
-        );
     }
 
     /// Seed and SEAL one fence's pack, so its rows are STAGED
@@ -7827,8 +7915,6 @@ mod tests {
                 data_dir: warm.path().to_string_lossy().into_owned(),
                 fetcher_image: "ghcr.io/example/wsfetch:test".into(),
                 warm_budget_bytes: None,
-                helper_cpu_millis: None,
-                helper_memory_mib: None,
             }),
             github_webhook_secret: None,
             forgejo_webhook_secret: None,

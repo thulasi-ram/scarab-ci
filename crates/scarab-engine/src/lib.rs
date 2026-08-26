@@ -209,18 +209,6 @@ pub enum FailureKind {
     /// auto-retried; settles the run as `Failed` (developer signal), not
     /// `DeadLettered`.
     Config,
-    /// The step's input Workspace Snapshot is gone from every tier — see
-    /// [`FailureClass::MissingInputs`](crate::ports::FailureClass::MissingInputs)
-    /// (ticket e140121). One attempt (retrying the identical spec cannot
-    /// re-create evicted content), run `Failed` not `DeadLettered`, and the
-    /// cause points at the recovery that exists: Rerun/Retry, whose planner
-    /// widens to the producing steps (ADR-0061 s5).
-    ///
-    /// **Forward-only**: this variant rides attempt rows and `AttemptFinished`
-    /// events; a binary from before it cannot replay an event log that
-    /// carries it. Deliberate — no unknown-variant fallback (a fallback would
-    /// silently reclassify, which is worse than a loud refusal).
-    MissingInputs,
 }
 
 // ---------------------------------------------------------------------------
@@ -1289,15 +1277,11 @@ impl StepRun {
         let from = StepStatus::Running;
         let to = match failure {
             None => StepStatus::Succeeded,
-            // A verdict (Step/Timeout) or a permanent rejection (Config, or
-            // inputs gone from every tier — MissingInputs, ticket e140121)
+            // A verdict (Step/Timeout) or a permanent config rejection (Config)
             // fails the step outright — never auto-retried.
-            Some(
-                FailureKind::Step
-                | FailureKind::Timeout
-                | FailureKind::Config
-                | FailureKind::MissingInputs,
-            ) => StepStatus::Failed,
+            Some(FailureKind::Step | FailureKind::Timeout | FailureKind::Config) => {
+                StepStatus::Failed
+            }
             Some(FailureKind::Infra {
                 never_started: true,
             }) => {
