@@ -1996,6 +1996,13 @@ async fn put_blob(
     // write here would restore the old cost silently, because nothing would
     // fail.
     let already = warm_has(&warm_blob_path(&state, &hash)).await?;
+    // A warm ENOSPC here fails the PUT loudly — durable label or not — even
+    // though the LRU sweep (git-bug cba7165) now bounds the volume: the sweep
+    // evicts ahead on its own cadence, and a fill rate that outruns it keeps
+    // the contract it always had (`warm_full_total` counts it, the client
+    // retries). Letting a DURABLE put skip the warm seed and survive on its
+    // pack alone would be honest post-ADR-0067, but it is a contract change —
+    // a separate ticket (cba7165 OQ2), not a side effect of eviction.
     state
         .warm
         .put(&format!("blobs/{hash}"), body.to_vec())

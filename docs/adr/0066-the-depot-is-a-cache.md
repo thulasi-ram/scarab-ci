@@ -279,6 +279,18 @@ Attempt is stamped `warm-only`), so pins protect only **in-flight** work rather 
    `ENOSPC` there means **the snapshot is nowhere**. A loud refusal at the boundary is the honest
    outcome; a silent partial write is not.
 
+> **Status (2026-08-26, git-bug cba7165): built, in its post-[0067](0067-the-pack-is-the-record.md)
+> form — and the deferral in (2) is resolved.** With every durable byte bucket-backed and warm-only
+> no longer a deployment mode, (1)'s reachability walk is not needed for *safety* (and is
+> Depot-unknowable anyway: the mark walk is control-plane-side), and (3)'s case no longer exists.
+> What ships is (2) generalised: a budget (`SCARAB_WORKSPACE_WARM_BUDGET_BYTES`, default
+> statvfs-90% of the dedicated volume) with high/low watermarks, evicting committed-durable
+> content first and cache-only content second, oldest first within each class, over a 1h min-age
+> floor. The access index this step was deferred on turned out to cost one `utimensat` per object
+> per hour — a coarse touch-on-read that refreshes mtime once per grain — not a new storage
+> decision. Reachability survives only as the class ordering's cheap Depot-side proxy: committed
+> presence in `depot_pack_members`.
+
 **The budget is a size watermark, not a TTL.** Space is what the operator actually controls, it is
 what is already instrumented (the warm-size gauge walks the volume), and it is the only bound that
 degrades predictably. A TTL bounds nothing when the fill rate changes.

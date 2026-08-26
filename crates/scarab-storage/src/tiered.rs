@@ -162,9 +162,11 @@ static COLD_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static WARM_READ_FAILED: AtomicU64 = AtomicU64::new(0);
 /// Warm writes that failed specifically because the volume is **full**. Broken
 /// out from [`WARM_WRITE_FAILED`] because it is the one warm failure with an
-/// obvious operator action (grow the volume / lower the retention window), and
-/// because ADR-0061 defers real LRU eviction to a later slice — until that
-/// lands, this counter climbing *is* the eviction policy's absence.
+/// obvious operator action (grow the volume, or lower the warm budget's
+/// low-water headroom). The Depot's LRU sweep (git-bug cba7165,
+/// `scarab-server`'s `workspaced.rs`) evicts ahead of this, so a climbing
+/// counter now means the sweep cannot keep up with the fill rate — or the
+/// budget is set above what the volume actually holds.
 static WARM_FULL: AtomicU64 = AtomicU64::new(0);
 
 /// Writes that reached cold but not warm, since process start.
@@ -514,14 +516,15 @@ impl ObjectStore for TieredObjectStore {
 /// Space accounting for the warm tier (ADR-0061 retention: warm is bounded by
 /// **space**, cold by **time**).
 ///
-/// **This trait has no implementation yet, on purpose.** It is declared here
-/// because the shape is settled and the workspace service's `/metrics` already
-/// reports used bytes, but real LRU eviction needs something nothing in this
-/// repo has: an **access index**. `ObjectStore::list_objects` reports
-/// `modified_ms`, i.e. least-recently-**written**, and for immutable
-/// content-addressed blobs that is the wrong key — a blob written a year ago and
-/// read hourly would evict first. [`touch`](WarmTier::touch) is the missing
-/// half, and building it is a separate slice with its own storage decision.
+/// **This trait has no implementation, on purpose — and eviction shipped
+/// without one** (git-bug cba7165). The access index it was waiting on turned
+/// out not to need a storage-crate abstraction: the Depot bumps a warm file's
+/// mtime on a hit (coarsely, once per grain), which makes `mtime`
+/// least-recently-**used** rather than least-recently-written, and its sweep
+/// lives beside the routes that own the warm directory
+/// (`scarab-server`'s `workspaced.rs`) rather than behind this port. The trait
+/// stays as the record of the shape considered, in case a second warm-tier
+/// implementation ever needs a shared seam.
 ///
 /// Only the warm tier ever implements this. Cold is bounded by time
 /// (ADR-0050's retention TTL + mark-sweep) and never by space.

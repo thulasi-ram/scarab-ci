@@ -307,9 +307,12 @@ workspace:
   # filesystem overhead on a small PVC).
   warmBudgetBytes: ""
   persistence:
-    # The warm tier is bounded by SPACE (cold is bounded by time). LRU eviction
-    # is NOT implemented yet, so until it is, watch the
-    # `scarab_workspace_warm_used_bytes` gauge: this number is the whole budget.
+    # The warm tier is bounded by SPACE (cold is bounded by time). The service
+    # enforces the bound itself (git-bug cba7165): its LRU sweep holds usage
+    # under warmBudgetBytes — by default 90% of this volume — so sizing this
+    # PVC is sizing the CACHE, not a leak's runway. Pressure is visible as
+    # scarab_workspace_warm_used_bytes vs scarab_workspace_warm_budget_bytes,
+    # and what the bound costs as warm_evicted_bytes_total{class="cache_only"}.
     size: 20Gi
     # This volume is the warm CAS — the Depot's local cache tier in front of
     # the cold object store (ADR-0066: the Depot is a cache). Its whole point

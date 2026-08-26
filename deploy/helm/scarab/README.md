@@ -263,7 +263,8 @@ which is exactly the cost the warm tier exists to remove.
 | `scarab.connections` | `[]` | declarative, config-owned forge connections (above) |
 | `workspace.enabled` | `true` | the ADR-0061 workspace service; renders only when a workspace token secret exists (above) |
 | `workspace.dataDir` | `/var/lib/scarab/cas` | where the warm tier's PVC is mounted (`SCARAB_WORKSPACE_DATA_DIR`) |
-| `workspace.persistence.size` / `.storageClass` | `20Gi` / cluster default | the warm tier's volume — bounded by SPACE, with no eviction policy yet; prefer local disk (above) |
+| `workspace.persistence.size` / `.storageClass` | `20Gi` / cluster default | the warm tier's volume — bounded by SPACE via the LRU sweep (git-bug cba7165); prefer local disk (above) |
+| `workspace.warmBudgetBytes` | `""` = 90% of the volume | warm space bound in plain bytes (`SCARAB_WORKSPACE_WARM_BUDGET_BYTES`); the sweep evicts to 80% of it, committed-durable content first |
 | `workspace.replicaCount` | `1` | one per failure domain; `>1` is **unverified** |
 | `secrets.workspaceTokenSecret` | — | HMAC secret for the workspace token; MUST differ from `resultsTokenSecret` (above) |
 | `scarab.workspaceUrl` | — | override the in-cluster workspace Service URL (split installs) |
