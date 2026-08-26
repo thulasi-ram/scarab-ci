@@ -448,11 +448,43 @@ fn parse_cache_roots(raw: &str) -> Vec<(String, String)> {
 /// unreachable, which is exactly why the runtime refuses to clobber);
 /// `Err` = the question could not be answered (a file where a directory was
 /// expected, permissions) — the caller skips, loudly, restoring nothing.
+/// Is the cache dir free for a restore?
+///
+/// `lstat` first, deliberately: `read_dir` FOLLOWS a symlink, so a source input
+/// shipping a symlink at a declared cache dir would answer "empty" for whatever
+/// the link points at and the restore would then write THROUGH it — the same
+/// traversal family the fan-in fold refuses for input roots (git-bug 2e1a458).
+/// A path that exists and is not a real directory is refused here, which the
+/// caller renders as a loud skip (cache restore is best-effort by contract).
 fn dir_absent_or_empty(path: &std::path::Path) -> Result<bool, std::io::Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if !md.is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "a source input already put a {} here — refusing to restore through it",
+                    describe_file_kind(&md.file_type())
+                ),
+            ))
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e),
+    }
     match std::fs::read_dir(path) {
         Ok(mut entries) => Ok(entries.next().is_none()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(e) => Err(e),
+    }
+}
+
+fn describe_file_kind(ft: &std::fs::FileType) -> &'static str {
+    if ft.is_symlink() {
+        "symlink"
+    } else if ft.is_file() {
+        "file"
+    } else {
+        "non-directory"
     }
 }
 
@@ -1479,6 +1511,37 @@ mod tests {
         let file = tmp.path().join("file");
         std::fs::write(&file, b"a file, not a dir").expect("file");
         assert!(dir_absent_or_empty(&file).is_err());
+    }
+
+    /// The traversal the fan-in fold refuses for input roots, on the cache leg
+    /// (git-bug 2e1a458 review): a source input shipping a SYMLINK where a
+    /// declared cache dir goes must be refused, not followed. `read_dir` alone
+    /// answers "empty" for the link's target — and `restore_cache` would then
+    /// write through it, outside the workspace when the target is absolute.
+    #[test]
+    fn a_symlink_where_a_cache_dir_goes_is_refused_not_followed() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("mkdir");
+        let link = tmp.path().join("node_modules");
+        std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
+
+        // The link points at a genuinely empty dir, so the pre-fix `read_dir`
+        // would have said "free — restore here" and followed it.
+        assert!(std::fs::read_dir(&link).expect("read_dir").next().is_none());
+
+        let err = dir_absent_or_empty(&link).expect_err("a symlink must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("symlink"),
+            "the skip has to name what it found: {err}"
+        );
+
+        // A real directory at the same path still restores — the guard refuses
+        // the kind, not the path.
+        std::fs::remove_file(&link).expect("unlink");
+        std::fs::create_dir(&link).expect("mkdir");
+        assert!(dir_absent_or_empty(&link).expect("a real empty dir is free"));
     }
 
     /// The backstop end to end (dbe05e5 amendment #2): a cache restore into a

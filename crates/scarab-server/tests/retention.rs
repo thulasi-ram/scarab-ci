@@ -1148,7 +1148,7 @@ async fn seed_chain(db: &PostgresDb, cas: &Arc<dyn Cas>, run: &RunId) -> Vec<Str
         prev = Some(step);
     }
     // The signatures admission stored. `clone` consumes nothing, so its signature
-    // is the empty string — the exact case that makes a naive widening useless,
+    // is the bare `v2:` prefix — the exact case that makes a naive widening useless,
     // because "unchanged" would then skip the step that has to regenerate.
     let mut output_of = std::collections::HashMap::new();
     for name in chain {
