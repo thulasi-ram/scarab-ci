@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1787758402,"nonce":"qFIuVsL7NYzE2DKvUDsUQYGamOI=","message":"PARKED 2026-08-26 (owner call): the concurrent fan-out benchmark and the per-node-cache/Dragonfly gate wait until Depot HA sizing is actually on the table.","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":5,"timestamp":1787758420,"nonce":"g+EdTbad3Mfbn3scAf2/mWf53T8=","added":["parked"],"removed":null}]}
