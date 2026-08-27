@@ -162,45 +162,49 @@ Secret Access Key** pair, never the "token value" shown beside them.
   installation") — user login goes through the OAuth App. Permissions and
   subscribed events are listed above. Install it on `thulasi-ram/scarab-ci`.
 
-## Blocked on — GitHub Actions billing (only you can fix this)
+## Blocked on — GHCR package ownership after the repo was recreated
 
-The `image` workflow's most recent run (`33104586966`, `main`, 2026-08-27)
-**failed in 12 seconds with all 8 build jobs refused before they started**:
+`thulasi-ram/scarab-ci` was **created 2026-08-27T18:38:21Z**, and the old name
+does not redirect (404), so this was a recreate rather than a rename — a new
+repository **ID** behind the same name. The four GHCR packages predate it
+(`scarab-server:edge` was built 2026-08-26 by the previous repo) and are
+user-scoped, so this repo is not on their Actions-access list.
+
+Every build job now runs and fails identically at the push:
 
 ```
-The job was not started because recent account payments have failed or your
-spending limit needs to be increased. Please check the 'Billing & plans'
-section in your settings
+#11 ERROR: failed to push ghcr.io/thulasi-ram/scarab-results-sidecar:
+    denied: permission_denied: write_package
 ```
 
-Not a workflow bug — nothing to fix in `image.yml`. Until billing is settled, no
-new images publish, and pushing to `main` just re-fails.
+Note "Log in to GHCR" **succeeds** in every job — this is authorization on the
+package, not authentication, and not the workflow: `image.yml` already declares
+`packages: write` at job level (lines 54-56, 132-134), which overrides the
+repo's read-only `default_workflow_permissions`.
 
-What that leaves, measured rather than assumed:
+The same orphaning explains the wsfetch anomaly: all four packages belong to the
+old repo; three are public and pull fine, `scarab-wsfetch` is private, so the
+node gets `401 Unauthorized` on the anonymous token and every workspace Step Pod
+would sit in `ImagePullBackOff`. `deploy.sh` preflights it, so the deploy
+refuses instead of half-succeeding.
 
-| Image | `:edge` state |
-|---|---|
-| `scarab-server` | **fine** — amd64 + arm64, built 2026-08-26, and a role probe against the published image prints `[converged, api, scheduler, executor, webhook, workspace]`, so it is post-ADR-0061 |
-| `scarab-clone` | anonymous pull OK |
-| `scarab-results-sidecar` | anonymous pull OK |
-| `scarab-wsfetch` | **BLOCKING** — the node cannot pull it: `failed to fetch anonymous token: 401 Unauthorized`, Pod sits in `ImagePullBackOff` |
+**Fix, per package** at
+`github.com/users/thulasi-ram/packages/container/<name>/settings`:
+Manage Actions access -> Add repository -> `scarab-ci` -> **Write**. For
+`scarab-wsfetch` also set visibility to **Public**. Then
+`gh run rerun <id> --failed`. Needs a token with `admin:packages`, so it is a UI
+action.
 
-**`scarab-wsfetch:edge` is the one thing standing between here and a deploy.** It
-is needed twice in every workspace Step Pod (the `s3-feed` fetcher init
-container and the `s3-drain` egress helper), and `deploy.sh` preflights it, so
-the deploy refuses rather than half-succeeding.
+Deleting the four packages and letting the workflow recreate them (auto-linked
+to this repo) also works and is less fiddly, but throws away the only currently
+working images — `scarab-server:edge` is the fallback if a rebuild hits
+something unrelated. Prefer granting access.
 
-Two possible causes, and they have very different fixes. **A `gh` token without
-`read:packages` cannot tell them apart** (both answer 403), so check
-`github.com/thulasi-ram?tab=packages` by eye:
-
-1. **The package exists but is private.** New GHCR packages default to private
-   while the other three were made public at some point. Fix is 30 seconds and
-   needs no build: package -> Package settings -> Change visibility -> Public.
-   Given the other three images published fine from the same workflow, this is
-   the more likely story.
-2. **It was never published.** Then it genuinely needs an `image.yml` run, which
-   needs billing fixed first.
+**Earlier and now resolved:** run `33104586966` (18:39:40Z, one minute after the
+repo was created) failed in 12s with all 8 jobs refused before starting —
+"recent account payments have failed or your spending limit needs to be
+increased". Jobs start and build now, so billing is no longer the blocker. Two
+separate problems in sequence; do not confuse the two if this recurs.
 
 ## Fixed in this session
 
