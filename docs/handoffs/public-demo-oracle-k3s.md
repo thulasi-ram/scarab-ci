@@ -6,8 +6,10 @@ every step Pod, reached through a Cloudflare Tunnel, with Cloudflare R2 as the
 object store. The deployment mode lives in `deploy/demo-oracle/` (new; see its
 README, which is the operator guide).
 
-Not merged, not deployed yet — **one blocking bug** stands between the current
-state and a first deploy. See "Blocked on" below.
+**Live as of 2026-08-27**: `https://demo-scarab.ahiravan.dev` serves the UI,
+`/readyz` is 200 (Postgres and R2 both reachable), and `/v1/auth/login` 302s to
+GitHub with PKCE `S256`. Merged to `main`. What is NOT yet proven is listed in
+"Do next" — no human has completed a login, and no run has been triggered.
 
 ## Why this shape (decisions, so they are not relitigated)
 
@@ -162,49 +164,34 @@ Secret Access Key** pair, never the "token value" shown beside them.
   installation") — user login goes through the OAuth App. Permissions and
   subscribed events are listed above. Install it on `thulasi-ram/scarab-ci`.
 
-## Blocked on — GHCR package ownership after the repo was recreated
+## The image blockers (both resolved, in sequence — do not confuse them)
 
-`thulasi-ram/scarab-ci` was **created 2026-08-27T18:38:21Z**, and the old name
-does not redirect (404), so this was a recreate rather than a rename — a new
-repository **ID** behind the same name. The four GHCR packages predate it
-(`scarab-server:edge` was built 2026-08-26 by the previous repo) and are
-user-scoped, so this repo is not on their Actions-access list.
+Two different failures wore the same hat, an hour apart:
 
-Every build job now runs and fails identically at the push:
+1. **Billing.** Run `33104586966` (18:39:40Z, one minute after the repo was
+   created) failed in 12s with all 8 build jobs refused before starting:
+   "recent account payments have failed or your spending limit needs to be
+   increased". Note that jobs later starting is NOT evidence this cleared — the
+   repo is public, so Actions minutes are free regardless.
+2. **GHCR package ownership.** `thulasi-ram/scarab-ci` was **created**
+   2026-08-27T18:38:21Z and the old name 404s, so it was recreated, not renamed
+   — a new repository **ID** behind the same name, while the four GHCR packages
+   were created by its predecessor and are user-scoped. Every build then ran and
+   failed at the push with `denied: permission_denied: write_package`. "Log in
+   to GHCR" **succeeded** in every job: authorization on the package, not
+   authentication, and not the workflow's token (`image.yml` already declares
+   `packages: write` at job level, lines 54-56 and 132-134, which overrides the
+   repository default — flipping that default to read-write changed nothing, as
+   a re-run confirmed).
 
-```
-#11 ERROR: failed to push ghcr.io/thulasi-ram/scarab-results-sidecar:
-    denied: permission_denied: write_package
-```
+   Fixed by granting the repo Write on each package (Manage Actions access) and
+   flipping `scarab-wsfetch` to Public. All four `:edge` tags now carry
+   amd64+arm64 manifests, `scarab-wsfetch:edge` pulls on the node, and its
+   binary answers `fetch`/`hold`/`drain` — so it is the post-ADR-0061 image with
+   the s3-drain helper, not the skew `local-helm`'s README warns about.
 
-Note "Log in to GHCR" **succeeds** in every job — this is authorization on the
-package, not authentication, and not the workflow: `image.yml` already declares
-`packages: write` at job level (lines 54-56, 132-134), which overrides the
-repo's read-only `default_workflow_permissions`.
-
-The same orphaning explains the wsfetch anomaly: all four packages belong to the
-old repo; three are public and pull fine, `scarab-wsfetch` is private, so the
-node gets `401 Unauthorized` on the anonymous token and every workspace Step Pod
-would sit in `ImagePullBackOff`. `deploy.sh` preflights it, so the deploy
-refuses instead of half-succeeding.
-
-**Fix, per package** at
-`github.com/users/thulasi-ram/packages/container/<name>/settings`:
-Manage Actions access -> Add repository -> `scarab-ci` -> **Write**. For
-`scarab-wsfetch` also set visibility to **Public**. Then
-`gh run rerun <id> --failed`. Needs a token with `admin:packages`, so it is a UI
-action.
-
-Deleting the four packages and letting the workflow recreate them (auto-linked
-to this repo) also works and is less fiddly, but throws away the only currently
-working images — `scarab-server:edge` is the fallback if a rebuild hits
-something unrelated. Prefer granting access.
-
-**Earlier and now resolved:** run `33104586966` (18:39:40Z, one minute after the
-repo was created) failed in 12s with all 8 jobs refused before starting —
-"recent account payments have failed or your spending limit needs to be
-increased". Jobs start and build now, so billing is no longer the blocker. Two
-separate problems in sequence; do not confuse the two if this recurs.
+If images ever stop publishing again, check which of these two it is before
+touching anything.
 
 ## Fixed in this session
 
@@ -218,32 +205,50 @@ separate problems in sequence; do not confuse the two if this recurs.
   the file by hand never reproduced it. Unit-tested against inline comments,
   base64 padding, a `#` inside a value, tab-preceded comments, and URLs.
 
+- **The chart never gave the workspace StatefulSet the OAuth client secret**
+  (`8b4469d`). The four `SCARAB_OAUTH_*` knobs reach that Pod through the shared
+  ConfigMap in `envFrom`, but the secret is a by-reference Secret only
+  `deployment.yaml` projected — so the Pod saw four of five, and ADR-0049's
+  all-five-or-none rule plus ADR-0048 validating config *before* the role is
+  dispatched meant it refused to boot, despite the workspace role having no
+  login surface at all (no Postgres, no RBAC, no sessions; callers present a
+  workspace token). A **chart** bug, not a demo-oracle one: it is unreachable
+  from `deploy/local-helm` because that runs `SCARAB_DEV_INSECURE=true`, so
+  `demo-oracle` was the first deployment mode able to hit it.
+
+- **StatefulSet update deadlock** (`bb5310a`). Fixing the chart changed nothing
+  on its own: a RollingUpdate will not replace a Pod that never became Ready, so
+  the StatefulSet carried the new revision while `scarab-workspace-0` kept
+  running the old one and kept failing for a reason already fixed — with
+  `rollout status` burning its full timeout and naming none of it. `deploy.sh`
+  now compares the Pod's `controller-revision-hash` against the StatefulSet's
+  `updateRevision` and deletes the Pod only when they differ AND it is not
+  ready. Deleted by hand at the time, it was Ready in 13 seconds.
+
 ## Do next (in order)
 
-1. **Settle the GitHub Actions billing**, then confirm `scarab-wsfetch:edge` is
-   pullable anonymously:
-   ```
-   kubectl run wsprobe --restart=Never --image=ghcr.io/thulasi-ram/scarab-wsfetch:edge --command -- /bin/true
-   ```
-   If the package merely needed its visibility flipped, this passes without any
-   rebuild at all.
-2. **Re-run the deploy** on the box: `bash deploy/demo-oracle/deploy.sh`. The
-   loader bug that stopped the first attempt is fixed; the image preflight is
-   the next gate it has to clear.
-3. **Prove a real login** — the only unvalidated credential. Sign in at
-   `https://demo-scarab.ahiravan.dev`, confirm you land as Owner
-   (`SCARAB_OAUTH_OWNERS=thulasi-ram`) and that a second account lands as Viewer
-   and **cannot** dispatch.
-4. **Prove a real GitHub-delivered run**: push to the repo, watch the webhook
-   land, the run go green, and a commit status post back with a resolvable
-   `{publicUrl}/runs/{id}` deep link.
+Everything below is unproven, not broken — the stack is up and serving.
+
+1. **Complete a browser login.** The OAuth client secret is the one credential
+   that cannot be validated any other way. Confirm you land as **Owner**
+   (`SCARAB_OAUTH_OWNERS=thulasi-ram`), and ideally that a second GitHub account
+   lands as **Viewer** and cannot dispatch — that is the entire containment
+   story for a public demo.
+2. **Register the App installation.** On a fresh install the connection is
+   registered by an `installation` webhook delivery: install the App on the demo
+   repo, or hit "Recreate all" on its Advanced webhook page. There is no
+   `reseed.sh` here (unlike local-helm) because the box is publicly reachable
+   and real deliveries arrive on their own.
+3. **Prove a real run end to end**: push, watch the webhook land, the run go
+   green, and a commit status post back with a resolvable
+   `{publicUrl}/runs/{id}` deep link. Step Pods land in the **`scarab-steps`**
+   namespace, not `scarab` — `kubectl get pods -n scarab-steps`.
+4. **Enable the keepalive** (`.github/workflows/demo-keepalive.yml`) only once
+   (3) works — it drives runs through the same webhook path.
 5. **Measure what a run actually costs** on 2 cores before deciding anything
    about resizing (see "Sizing" below).
 6. Install `just` on the box if the recipe is wanted; today only
    `bash deploy/demo-oracle/deploy.sh` works there.
-7. Re-clone the repo on the box now that the mode is committed — it is currently
-   running off an `scp`'d working tree, which is fine but is not what the next
-   person will reproduce.
 
 ## Sizing — deliberately left at 2 OCPU / 12 GB
 
@@ -299,10 +304,13 @@ budget alert is the real safety net.
   is the front door; consider digest-pinning.
 - Retention TTLs are aggressive for a demo box: logs 7d, artifacts 7d, workspace
   3d, packs 3d, via `SCARAB_RETENTION_*` in `scarab.extraEnv`.
-- **Nothing in `deploy/demo-oracle/` has completed a successful deploy.** The
-  README carries an explicit `> **Unverified:**` note. R2 end-to-end through
-  `object_store` 0.14, and whether two cores carry the pipeline, are both
-  untested.
+- The deploy now completes and the stack serves, but **`deploy/demo-oracle/`
+  README still carries its original `> **Unverified:**` note** — reword it to
+  what is actually still unproven rather than deleting it: R2 end-to-end through
+  `object_store` 0.14 under real drain/fetch load (the credential path is
+  proven; the Depot's multipart write path is not), whether two Ampere cores
+  carry the pipeline, and the separate `scarab-steps` namespace, which no other
+  mode in this repo uses.
 
 ## Fixes already folded back into `bootstrap.sh`
 
