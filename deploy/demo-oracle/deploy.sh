@@ -457,6 +457,41 @@ kubectl rollout status -n "$NS" deploy/scarab --timeout=300s
 # plane never came up is the "reports success but structurally cannot work"
 # shape this repo keeps finding.
 echo "==> workspace service (ADR-0061)"
+
+# Break the StatefulSet update deadlock BEFORE waiting on the rollout.
+#
+# A StatefulSet's RollingUpdate will not replace a Pod that has never become
+# Ready. So if a template change fixes the very thing that was crash-looping,
+# the controller still refuses to act: the StatefulSet carries the NEW revision,
+# `scarab-workspace-0` keeps running the OLD one, and it keeps failing for a
+# reason you already fixed. `rollout status` then burns its whole timeout and
+# reports nothing about why — the cause is three layers down in a Pod log.
+#
+# Observed for real (2026-08-27): the chart was not projecting
+# SCARAB_OAUTH_CLIENT_SECRET into this Pod, so it refused to boot on a partial
+# OAuth provider. Fixing the chart changed nothing until the Pod was deleted by
+# hand, after which it was Ready in 13 seconds.
+#
+# The check is exact rather than heuristic: compare the Pod's
+# controller-revision-hash to the StatefulSet's updateRevision. Delete ONLY when
+# they differ AND the Pod is not ready — i.e. it is provably running superseded
+# spec and is not healthy, so nothing is lost by restarting it. A Pod that is
+# merely slow to start is left alone.
+_sts_rev=$(kubectl get sts scarab-workspace -n "$NS" \
+  -o jsonpath='{.status.updateRevision}' 2>/dev/null || true)
+_pod_rev=$(kubectl get pod scarab-workspace-0 -n "$NS" \
+  -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
+_pod_ready=$(kubectl get pod scarab-workspace-0 -n "$NS" \
+  -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+if [ -n "$_pod_rev" ] && [ -n "$_sts_rev" ] && \
+   [ "$_pod_rev" != "$_sts_rev" ] && [ "$_pod_ready" != "true" ]; then
+  echo "    scarab-workspace-0 is stuck on a superseded revision and is not"
+  echo "    ready ($_pod_rev, want $_sts_rev) — deleting it so the StatefulSet"
+  echo "    can recreate it from the current spec."
+  kubectl delete pod scarab-workspace-0 -n "$NS" --wait=false
+fi
+unset _sts_rev _pod_rev _pod_ready
+
 kubectl rollout status -n "$NS" statefulset/scarab-workspace --timeout=300s
 
 # cloudflared LAST, deliberately: it is the front door, and there is no point
