@@ -1,0 +1,109 @@
+# The demo's entire ingress story: `cloudflared` dials OUT to Cloudflare and
+# proxies requests back to the scarab ClusterIP Service.
+#
+# WHAT THIS REPLACES — all of it, on purpose:
+#   * no ingress controller (bootstrap.sh installs k3s with traefik disabled),
+#   * no Ingress object (values.yaml keeps ingress.enabled false),
+#   * no cert-manager — Cloudflare terminates TLS at its edge,
+#   * no LoadBalancer, no NodePort, no public listener on the box at all.
+# The tunnel is EGRESS-only. The OCI security list can stay SSH-only, and the
+# box has no inbound attack surface to speak of. If you ever find yourself
+# opening port 443 to make the demo reachable, something here is misconfigured
+# — that is not the fallback, it is the sign.
+#
+# WHERE THE ROUTING LIVES. This is a token-authenticated (remotely-managed)
+# tunnel, so the hostname -> origin mapping is NOT in this file and cannot be:
+# it is configured in the Cloudflare Zero Trust dashboard, on the tunnel's
+# Public Hostname tab —
+#
+#     demo-scarab.<your-domain>   ->   http://scarab.scarab.svc.cluster.local:80
+#
+# and that URL must match the chart's Service (release `scarab`, namespace
+# `scarab`, service.port 80). A mismatch fails as a Cloudflare 502 with a
+# healthy-looking cluster behind it, which is a bad hour.
+#
+# SCARAB_PUBLIC_URL in .env must be `https://demo-scarab.<your-domain>` — the
+# same hostname. It is what every forge commit status deep-links to and, more
+# importantly, it is the base of the OAuth callback
+# (`{public_url}/v1/auth/callback`) that must be registered on the GitHub OAuth
+# app. Wrong there and login fails with a provider-side redirect_uri error that
+# never reaches Scarab's logs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scarab-cloudflared
+  labels: { app: scarab-cloudflared }
+spec:
+  # One replica. Cloudflare's own guidance is two for zero-downtime upgrades,
+  # and that is right on a real cluster; here there is one node, so a second
+  # replica would buy nothing but a second copy of the same failure domain.
+  replicas: 1
+  selector:
+    matchLabels: { app: scarab-cloudflared }
+  template:
+    metadata:
+      labels: { app: scarab-cloudflared }
+    spec:
+      # cloudflared holds long-lived connections to the edge; give it time to
+      # drain them rather than cutting live requests on every roll.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: cloudflared
+          # ⚠ Pin this before you care about the demo. `latest` is used here to
+          # match the house precedent (deploy/local-helm/minio.yaml) and because
+          # cloudflared's images are multi-arch (arm64 runs on Ampere), but this
+          # container is the demo's front door: a bad `latest` takes the whole
+          # site down with no local change to blame. `cloudflare/cloudflared:2025.x.y`.
+          image: cloudflare/cloudflared:latest
+          args:
+            - tunnel
+            # The container is immutable and rolled by k8s; an in-place
+            # self-update would replace the binary under a running Pod and
+            # confuse every "which version is this" question afterwards.
+            - --no-autoupdate
+            # Serves /ready and /metrics. /ready is what the readiness probe
+            # below reads, and it means something specific and useful: at least
+            # one connection to the Cloudflare edge is registered. A Pod that is
+            # Running but has no edge connection serves nothing.
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+          env:
+            # Token mode: the token encodes the tunnel id and its credentials,
+            # so there is no config file and no credentials volume. deploy.sh
+            # creates this Secret from CLOUDFLARE_TUNNEL_TOKEN in .env.
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: scarab-cloudflared
+                  key: token
+          ports:
+            - { name: metrics, containerPort: 2000 }
+          livenessProbe:
+            httpGet: { path: /ready, port: metrics }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: metrics }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # ~0.05G of the box's budget — it is a proxy, not a workload.
+          resources:
+            requests: { cpu: 20m, memory: 48Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # readOnlyRootFilesystem with nowhere to write is how a proxy dies
+            # at 3am over a temp file. cloudflared in token mode writes no
+            # state, but /tmp costs nothing to provide.
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}

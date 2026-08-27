@@ -1,0 +1,195 @@
+# Chart values for the PUBLIC demo: one Oracle Cloud "Always Free" A1 instance
+# (arm64, 2 OCPU / 12 GB) running k3s, the Scarab control plane, the workspace
+# service, and every step Pod.
+#
+# This file holds the NON-SECRET, mode-defining half of the configuration —
+# sizing, retention, the OAuth provider's endpoints. `deploy.sh` renders a
+# SECOND values file from deploy/demo-oracle/.env (secrets + per-install ids +
+# the image source) and passes both to helm, later-wins:
+#
+#     helm upgrade --install scarab deploy/helm/scarab \
+#       -f deploy/demo-oracle/values.yaml -f <transient>
+#
+# So: anything here is reviewable in git; nothing here is a secret. Every key
+# below exists in deploy/helm/scarab/values.yaml — the server fails CLOSED on
+# unknown config (ADR-0048), and an invented chart key is worse than that: it
+# is silently dropped by helm and nothing is set at all.
+
+image:
+  # repository/tag come from deploy.sh (the image SOURCE is a per-invocation
+  # choice, exactly as in local-helm). pullPolicy is a mode fact, not a run
+  # choice: this box builds nothing, so every image is always pulled.
+  pullPolicy: Always
+
+# One replica. Not a scaling limit — the chart says >1 is safe (Postgres is the
+# coordination bus and launch is idempotent, ADR-0021) — but there are two
+# cores here, and a second control-plane replica buys nothing while costing a
+# core the step Pods want.
+replicaCount: 1
+
+scarab:
+  role: converged
+  executor: k8s
+
+  # Step Pods land in their OWN namespace, not the release namespace.
+  #
+  # The reason is the LimitRange in steps.yaml. A LimitRange applies to every
+  # Pod in its namespace, and the default it injects is a CPU *limit* — which
+  # the chart deliberately does NOT set on the workspace service, because a CPU
+  # limit throttles the drain's hashing (see workspace.helperCpuMillis in
+  # deploy/helm/scarab/values.yaml). Separating the namespaces is what lets
+  # step Pods be capped without capping the control plane along with them.
+  #
+  # The chart supports this properly: the executor Role/RoleBinding render into
+  # this namespace (templates/rbac.yaml), and the workspace + results URLs the
+  # server hands a step Pod are fully-qualified Service DNS names, so a step in
+  # another namespace still reaches them.
+  #
+  # ⚠ Unverified in this repo: no other deployment mode uses a non-default exec
+  # namespace. If step Pods misbehave in a way that smells cross-namespace, set
+  # this back to "" (release namespace) and drop the LimitRange with it — the
+  # two are one decision.
+  namespace: scarab-steps
+
+  # Global step deadline (ADR-0047). 30 min, not the chart's 1h: on two shared
+  # Ampere cores a step that has not finished in half an hour is either wedged
+  # or is a workload this box should not be advertising. Per-step `timeout:`
+  # still overrides.
+  stepTimeoutSecs: "1800"
+
+  # In-flight object-store round-trips per workspace-CAS leg (ADR-0061 s2).
+  # RAISED from the default 32 because the cold store is Cloudflare R2 — a
+  # remote bucket several tens of ms away, where the legs are latency-bound and
+  # 32 is explicitly a FLOOR (see the chart's own comment). The counter-pressure
+  # is memory: peak is roughly `casConcurrency × largest blob`, and a blob is
+  # buffered whole. 96 × a few MiB is comfortable inside the server's 512Mi.
+  # Raise it further only alongside the memory limit.
+  casConcurrency: "96"
+
+  # --- login (ADR-0049) ---------------------------------------------------
+  # REAL authentication. `devInsecure` below is false and must stay false: this
+  # box is on the public internet, and dev-insecure makes every caller — every
+  # anonymous caller — a synthetic Owner with permission to dispatch runs and
+  # read secrets. The chart refuses to render devInsecure and oauth together,
+  # which is the guard, not the policy.
+  #
+  # GitHub's OAuth endpoints, verbatim. A partial set refuses the boot
+  # (ConfigError), and the chart refuses the render before that.
+  # clientId and owners come from .env via deploy.sh; the client SECRET never
+  # passes through helm values at all — deploy.sh puts it in a Secret and the
+  # chart wires it in by reference (secrets.oauthClientSecret).
+  oauth:
+    authorizeUrl: "https://github.com/login/oauth/authorize"
+    tokenUrl: "https://github.com/login/oauth/access_token"
+    userinfoUrl: "https://api.github.com/user"
+    # `read:user` is enough to identify the visitor. Deliberately NOT `repo` or
+    # `read:org`: a public demo asking for repository access is a demo nobody
+    # signs into.
+    scopes: "read:user"
+    # Plain OAuth2, not OIDC: GitHub returns no id_token, so the Principal comes
+    # from userinfoUrl. Leaving scarab.oauth.issuer unset is what selects that
+    # mode — setting it would make the server expect an id_token that never
+    # arrives.
+  devInsecure: false
+
+  # S3 region for R2. Cloudflare R2 has exactly one region token and it is the
+  # literal string "auto"; the bucket + endpoint + keys come from .env.
+  s3:
+    region: "auto"
+
+  extraEnv:
+    RUST_LOG: "info,scarab=info"
+
+    # --- retention (ADR-0050/0052/0065) ---------------------------------
+    # These are SCARAB_* env vars, not chart keys — the chart has no stanza for
+    # them, so extraEnv (rendered verbatim into the ConfigMap) is the supported
+    # path. Names checked against crates/scarab-server/src/config.rs; an
+    # invented one fails the boot (ADR-0048), it does not warn.
+    #
+    # Aggressive on purpose. This is a demo box with a 200 GB boot volume and a
+    # bucket someone pays for; nobody is going to want a run's logs from three
+    # weeks ago, and the default 30/90/14/14 would quietly fill both.
+    SCARAB_RETENTION_LOG_DAYS: "7"        # default 30 — run METADATA is kept regardless
+    SCARAB_RETENTION_ARTIFACT_DAYS: "7"   # default 90
+    SCARAB_RETENTION_WORKSPACE_DAYS: "3"  # default 14 — non-terminal runs stay reachable
+    # Packs back Workspace Snapshots, so this MUST be >= the workspace TTL or
+    # the boot refuses. Equal is the tightest legal setting.
+    SCARAB_RETENTION_PACK_DAYS: "3"
+
+# --- the workspace service (ADR-0061) --------------------------------------
+workspace:
+  enabled: true
+  replicaCount: 1
+  persistence:
+    # 8Gi, down from the chart's 20Gi. This PVC is a CACHE, not a leak's
+    # runway: the service's own LRU sweep holds usage under 90% of the volume
+    # by default, so shrinking it costs cache hits (blobs get re-fetched from
+    # R2) and never correctness. Watch scarab_workspace_warm_used_bytes against
+    # scarab_workspace_warm_budget_bytes; if warm_evicted_bytes_total
+    # {class="cache_only"} climbs steadily, this is too small for the demo's
+    # working set.
+    size: 8Gi
+    # Named, not "" (the cluster default), for the same reason postgres.yaml
+    # names it: on k3s this IS the default, so the two are identical today —
+    # but if local-storage were ever disabled, an unset class binds nothing and
+    # the PVC sits Pending with no message naming the cause, which surfaces as
+    # a StatefulSet that never becomes Ready and a deploy that times out on it.
+    #
+    # local-path is a directory on the boot volume, which is exactly right: the
+    # warm tier exists to remove a network round trip, so it must be local disk
+    # (an NFS-backed class would put one right back under every blob).
+    storageClass: "local-path"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  # Requests==limits on BOTH wsfetch helper containers in every step Pod
+  # (ticket 16a7768). Opt-in in the chart, taken here: on a two-core box the
+  # scheduler must be able to see the fetch/drain helper, or it overcommits the
+  # node and the OOM-killer picks the victim.
+  #
+  # ⚠ The trade this buys: half of this number is also the helper's transfer
+  # byte budget, and the helper WHOLE-READS each file. A single workspace file
+  # approaching 256 MiB needs this raised — the failure is an OOM-kill of the
+  # drain, which classifies Transient and retries into the same wall. The demo
+  # pipeline's largest artifact is a few KiB, so 512 is generous; a demo that
+  # grows a big artifact must revisit it.
+  helperMemoryMib: "512"
+  # Left unset ON PURPOSE (the chart default). A CPU limit throttles the
+  # drain's hashing, and the drain clock is already the liveness bound — a
+  # throttled drain is a run that times out for a reason nothing names.
+  helperCpuMillis: ""
+
+# The control plane's own budget. Roughly: k3s+system ~0.8G, this 0.5G,
+# workspace 0.25-1G, Postgres ~0.3G, cloudflared ~0.05G — leaving ~8G of the
+# 12G for step Pods (steps.yaml caps what any one of them may take).
+# No CPU limit, matching the chart: on two cores a limit here would throttle the
+# scheduler loop under exactly the load that needs it.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+
+# NO Ingress, and this is not an omission.
+#
+# Ingress is off because there is no ingress controller (bootstrap.sh disables
+# traefik), no cert-manager, no LoadBalancer, and no public inbound port on this
+# box at all. Reachability comes from cloudflared.yaml: a Deployment that dials
+# OUT to Cloudflare and proxies back to the ClusterIP Service below. Cloudflare
+# terminates TLS. Turning this on would render an Ingress object no controller
+# ever reconciles — a resource that exists, reports nothing, and does nothing.
+ingress:
+  enabled: false
+
+service:
+  type: ClusterIP
+  port: 80
+
+# Off: no Prometheus Operator on this box, so the CRD does not exist and the
+# render would fail. /metrics is still served — port-forward it if you want it.
+serviceMonitor:
+  enabled: false

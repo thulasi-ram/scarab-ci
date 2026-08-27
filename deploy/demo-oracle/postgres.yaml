@@ -1,0 +1,200 @@
+# In-cluster Postgres for the public demo, plus a nightly dump to R2.
+#
+# WHY IN-CLUSTER, when the whole point of R2 is keeping state off a box Oracle
+# can reclaim: because the free managed options do not fit this shape. Neon's
+# free tier bills 100 compute-hours/month and a Scarab server holds a
+# connection pool open permanently — an always-connected server exhausts a
+# month's allowance in about four days, and then the demo is down. So Postgres
+# lives here on local-path, and the mitigation is the CronJob at the bottom: the
+# BUCKET is the durable copy, and losing the instance costs a restore, not the
+# data.
+#
+# This is a DEMO posture, not a production one. Production uses managed
+# Postgres (see deploy/helm/scarab/README.md).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: scarab-postgres
+spec:
+  accessModes: ["ReadWriteOnce"]
+  # Explicit rather than "the default": if bootstrap.sh's k3s were ever
+  # installed with `--disable local-storage`, an unset class binds nothing and
+  # the PVC sits Pending with no message naming the cause. Named, it is obvious.
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scarab-postgres
+  labels: { app: scarab-postgres }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }        # single RWO volume — never two pods at once
+  selector:
+    matchLabels: { app: scarab-postgres }
+  template:
+    metadata:
+      labels: { app: scarab-postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine   # official image is multi-arch (runs on arm64)
+          env:
+            - { name: POSTGRES_USER, value: scarab }
+            # Dev-grade credential, deliberately: this Postgres has no Service
+            # outside the cluster, no NodePort, and nothing on this box listens
+            # publicly (the tunnel is egress-only). The credential that
+            # actually guards the demo is the GitHub OAuth login.
+            - { name: POSTGRES_PASSWORD, value: scarab }
+            - { name: POSTGRES_DB, value: scarab }
+            # Subdir so the volume's lost+found doesn't collide with initdb.
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          # ~0.3G of the box's budget. No CPU limit: this is the coordination
+          # bus for the whole engine, and throttling it under load throttles
+          # every run at once.
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "scarab", "-d", "scarab"] }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: scarab-postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scarab-postgres
+  labels: { app: scarab-postgres }
+spec:
+  selector: { app: scarab-postgres }
+  ports:
+    - { name: postgres, port: 5432, targetPort: 5432 }
+---
+# The nightly dump to R2 — the thing that makes "Oracle reclaimed the instance"
+# a restore instead of a total loss.
+#
+# Credentials come from the `scarab-backup` Secret, which deploy.sh creates from
+# deploy/demo-oracle/.env. Deliberately its OWN Secret rather than reusing the
+# chart's: this job is not part of the release, and reaching into a chart-owned
+# Secret's key names couples a backup to chart internals that may be renamed.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scarab-postgres-backup
+  labels: { app: scarab-postgres }
+spec:
+  # 03:17 UTC. Off the hour on purpose — every free-tier scheduler on earth
+  # fires at :00, and R2 is a shared service.
+  schedule: "17 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  # A missed window (box asleep, k3s restarting) still runs when it can, rather
+  # than being skipped silently for the night.
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          volumes:
+            - name: dump
+              emptyDir: {}
+          # pg_dump and the uploader are DIFFERENT images, so this is an
+          # initContainer + a container sharing an emptyDir rather than one
+          # container with a pipe: `postgres:16-alpine` has no S3 client and
+          # installing one at 03:17 every night is a network dependency in the
+          # backup path.
+          initContainers:
+            - name: dump
+              # MUST match the server's major version — pg_dump refuses to dump
+              # a newer server than itself. Bump both together.
+              image: postgres:16-alpine
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef: { name: scarab-backup, key: PGPASSWORD }
+              # Custom format (-Fc) with compression, written straight to a
+              # file: no shell pipeline, so no pipefail subtlety in busybox ash
+              # deciding whether a failed pg_dump still "succeeds". Restore with
+              # `pg_restore`.
+              command:
+                - pg_dump
+                - "-h"
+                - scarab-postgres
+                - "-U"
+                - scarab
+                - "-d"
+                - scarab
+                - "-Fc"
+                - "-Z"
+                - "9"
+                - "-f"
+                - /dump/scarab.dump
+              resources:
+                requests: { cpu: 100m, memory: 128Mi }
+                limits: { memory: 512Mi }
+              volumeMounts:
+                - { name: dump, mountPath: /dump }
+          containers:
+            - name: upload
+              # Official AWS CLI v2 image; multi-arch, so it runs on Ampere.
+              image: amazon/aws-cli:latest
+              env:
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef: { name: scarab-backup, key: S3_ACCESS_KEY }
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef: { name: scarab-backup, key: S3_SECRET_KEY }
+                - name: S3_ENDPOINT
+                  valueFrom:
+                    secretKeyRef: { name: scarab-backup, key: S3_ENDPOINT }
+                - name: S3_BUCKET
+                  valueFrom:
+                    secretKeyRef: { name: scarab-backup, key: S3_BUCKET }
+                # R2's single region token is the literal string "auto".
+                - { name: AWS_DEFAULT_REGION, value: "auto" }
+                # ⚠ R2 + recent aws-cli v2: the CLI began sending a CRC32
+                # full-object checksum on every upload, which R2 rejects
+                # (`Header 'x-amz-checksum-crc32' with value '...' not
+                # implemented`). These two switches put checksums back to
+                # when-required and are the documented workaround. Without
+                # them the upload fails every night with an error that reads
+                # like a credential problem and is not.
+                - { name: AWS_REQUEST_CHECKSUM_CALCULATION, value: "when_required" }
+                - { name: AWS_RESPONSE_CHECKSUM_VALIDATION, value: "when_required" }
+              # The image's ENTRYPOINT is `aws`, so a shell has to be asked for
+              # explicitly.
+              command: ["/bin/sh", "-euc"]
+              args:
+                # SEVEN ROTATING SLOTS, keyed by ISO day-of-week (1..7). This is
+                # the retention policy, and it needs no bucket lifecycle rule
+                # and no prune job that could delete the wrong thing: the eighth
+                # night overwrites the first. A week of recovery points is the
+                # right depth for a demo — the DB holds run history, and run
+                # CONTENT already expires in 3-7 days (see the
+                # SCARAB_RETENTION_* values in values.yaml).
+                - |
+                  key="pg/scarab-$(date -u +%u).dump"
+                  echo "==> uploading /dump/scarab.dump -> s3://$S3_BUCKET/$key"
+                  aws s3 cp /dump/scarab.dump "s3://$S3_BUCKET/$key" \
+                    --endpoint-url "$S3_ENDPOINT" --only-show-errors
+                  echo "==> ok"
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { memory: 256Mi }
+              volumeMounts:
+                - { name: dump, mountPath: /dump, readOnly: true }

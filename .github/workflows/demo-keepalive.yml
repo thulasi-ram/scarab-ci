@@ -1,0 +1,116 @@
+# Keep the public demo (deploy/demo-oracle) alive and busy.
+#
+# TWO problems, one workflow:
+#
+# 1. NOTHING SCHEDULES `cron:` TRIGGERS. The DSL parses `on: { cron: … }` and
+#    `scarab_forge::Event::Cron` exists as a type — but nothing in the engine
+#    ever constructs one. Verified: outside `scarab-forge`'s own unit tests,
+#    `Event::Cron` appears only in `match` arms. There is no scheduler, so a
+#    pipeline that declares a cron trigger simply never runs. Until one exists,
+#    a recurring Scarab run has to be poked from outside, and this is the poke.
+#
+# 2. ORACLE RECLAIMS IDLE ALWAYS FREE INSTANCES. The published rule is a
+#    conjunction over a 7-day window, 95th percentile: CPU AND network AND
+#    memory all under the threshold. Sources disagree on the number (10% vs
+#    20%); the cadence below clears either, so it is not worth pinning down. An idle k3s box fails CPU and network
+#    comfortably; memory on 12 GB is the only one likely to save it on its own,
+#    and "probably fine" is not a plan for the box the demo lives on. Six real
+#    runs a day move all three.
+#
+# ---------------------------------------------------------------------------
+# TODO — this SHOULD dispatch, and today it structurally cannot.
+#
+# The natural shape is `POST /v1/repos/{org}/{repo}/dispatch`, which authorizes
+# as a Write. There is no machine credential that can make that call:
+#
+#   * Requests authenticate with `Authorization: Bearer <session-id>` (or the
+#     `scarab_session` cookie) — `session_id()` in crates/scarab-server/src/lib.rs.
+#     A session id is the ONLY bearer credential the server knows.
+#   * Sessions are minted in exactly one place: `POST /v1/auth/login`, which
+#     takes an OAuth AUTHORIZATION CODE and exchanges it at the provider
+#     (`OAuthAuthenticator::exchange`). An authorization code is single-use and
+#     is only obtainable by a browser completing a redirect.
+#   * A minted session lives 24h (`SESSION_TTL_MS`).
+#   * There is no PAT, no service account, no API-token endpoint, and no
+#     client-credentials grant. `openapi.json` declares no securitySchemes at
+#     all.
+#
+# So a scheduled runner has nothing to present, and a human-pasted session would
+# expire five times between two runs of a 4-hourly cron. Closing this is a
+# server feature — issued API tokens (a `Principal`-bearing credential minted by
+# an Owner, with a verb and an expiry), not a deploy or workflow trick. When
+# that lands, replace the job below with a real dispatch and delete this block.
+#
+# What the job below does instead is NOT a workaround for the auth gap — it is a
+# different, fully-supported mechanism that happens to be a BETTER demo: a real
+# push to the repo, delivered by the real GitHub App webhook, producing a run
+# that exercises the same path a contributor's push does. Nothing is forged and
+# no signature is synthesized.
+# ---------------------------------------------------------------------------
+name: demo-keepalive
+
+on:
+  schedule:
+    # Every 4 hours, off the hour — GitHub's scheduler is heavily contended at
+    # :00 and delays cron jobs by up to ~15 minutes there.
+    - cron: "23 */4 * * *"
+  workflow_dispatch:
+
+# One at a time, and never cancel a running one: the point is that the run
+# actually happens, not that the newest one wins.
+concurrency:
+  group: demo-keepalive
+  cancel-in-progress: false
+
+jobs:
+  poke:
+    runs-on: ubuntu-latest
+    permissions:
+      # The only permission needed: push one empty commit.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          # A shallow clone is enough — the commit is empty and the branch is
+          # rebuilt from main's tip every time.
+          fetch-depth: 1
+
+      - name: Push an empty commit to the keepalive branch
+        run: |
+          set -euxo pipefail
+          git config user.name  "scarab-demo-keepalive"
+          git config user.email "demo-keepalive@users.noreply.github.com"
+          # -B, then force-push: the branch is always exactly `main` plus one
+          # empty commit, so this never accumulates history and never touches
+          # main. Deleting the branch is a safe way to stop it.
+          git checkout -B demo-keepalive
+          git commit --allow-empty -m "chore(demo): keepalive $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push --force origin demo-keepalive
+
+      - name: What should happen next
+        run: |
+          cat <<'EOF'
+          The push above is delivered to https://demo-scarab.<domain>/webhooks/github
+          by the GitHub App, and Scarab compiles .scarab/ci.yaml at that commit
+          (it declares `on: push: {}` with no branch filter) into a Run.
+
+          NOTE — a push made with GITHUB_TOKEN does NOT trigger GitHub *Actions*
+          workflows. That restriction is Actions-specific and exists to prevent
+          recursive workflow runs; GitHub *App* webhook deliveries are unaffected,
+          which is the whole reason this shape works.
+
+          If nothing runs, in order of likelihood:
+            1. the App is not subscribed to the Push event (Permissions & events
+               -> Subscribe to events). Installation events still arrive, so the
+               repo looks registered and healthy while nothing ever triggers;
+            2. the demo box is down — check the tunnel, then the Pods;
+            3. the App's webhook secret and SCARAB_GITHUB_WEBHOOK_SECRET drifted;
+               deliveries then 401 and GitHub's Recent Deliveries tab shows it.
+          EOF
+
+# ⚠ GitHub disables scheduled workflows in a repository with no commit activity
+# for 60 days, and emails the owner rather than failing loudly. This workflow
+# pushes to a branch every 4 hours, which is itself repository activity — so it
+# keeps its own schedule alive. Do not "clean up" the branch push into something
+# that writes nothing.

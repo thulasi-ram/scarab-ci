@@ -1,0 +1,81 @@
+# The namespace step Pods land in, and the only thing that bounds what a step
+# may take on a two-core box.
+#
+# WHY A SEPARATE NAMESPACE. A LimitRange applies to every Pod in its namespace —
+# there is no way to scope one to "just the step Pods". Applied to the release
+# namespace it would also hit the workspace StatefulSet, and the default it
+# injects is exactly the thing the chart warns against there: a CPU limit
+# throttles the drain's hashing, and the drain clock is already the liveness
+# bound (see workspace.helperCpuMillis in deploy/helm/scarab/values.yaml). Two
+# namespaces is what lets step Pods be capped without capping the data plane
+# along with them. `scarab.namespace` in values.yaml points the executor here,
+# and the chart renders the executor's Role/RoleBinding into this namespace
+# (templates/rbac.yaml), so the two files are one decision — change both or
+# neither.
+#
+# WHY NOT A PlacementProfile. ADR-0055 gives the operator a proper
+# `default_resources` knob, and it is the RIGHT home for this. It is not
+# reachable from here: it is file-only (SCARAB_PLACEMENT_CONFIG_FILE — there is
+# no inline env form) and the chart has no value that mounts an arbitrary file,
+# so wiring it would mean a chart change. A LimitRange is the k8s-native
+# equivalent, needs no chart change, and is enforced by the API server rather
+# than by us. If the chart grows a placement-config mount, move this there:
+# `default_resources` is per-step and legible in `scarab-server`'s own config,
+# where a LimitRange is invisible to Scarab entirely.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scarab-steps
+  labels:
+    app.kubernetes.io/part-of: scarab
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: scarab-steps
+  namespace: scarab-steps
+spec:
+  limits:
+    - type: Container
+      # What a container that declares nothing gets. Every container in a step
+      # Pod is covered — the step itself, the clone init container, the wsfetch
+      # fetch init container, the results sidecar, the wsfetch hold sidecar.
+      defaultRequest:
+        # A REQUEST, so the scheduler can see the Pod and refuse to pack more
+        # onto two cores than fit. Deliberately not a matching `default` cpu
+        # LIMIT: a cpu limit throttles the wsfetch drain's hashing, which is
+        # the same hazard the separate namespace exists to avoid — and the
+        # step's own wall-clock deadline (scarab.stepTimeoutSecs) is the real
+        # bound on a runaway step.
+        #
+        # ⚠ k8s subtlety, and it bites the other way from what you would
+        # guess: `max` does NOT become a default limit. The LimitRanger
+        # admission plugin seeds limits from `default` only — but it then
+        # ENFORCES `max`, and its check rejects a container that declares no
+        # limit at all for a resource `max` covers ("maximum cpu usage per
+        # Container is X. No limit is specified."). So adding `max.cpu` here
+        # without a matching `default.cpu` would refuse every step Pod, and
+        # adding both would reintroduce exactly the CPU limit this namespace
+        # exists to avoid. There is no cpu entry under `max` below, on purpose.
+        cpu: 250m
+        memory: 512Mi
+      default:
+        # A memory LIMIT is wanted: a step that runs away on memory should be
+        # OOM-killed as itself (Attempt fails, legibly) rather than pushing the
+        # node into pressure and letting the kernel pick a victim — which on
+        # this box could be Postgres.
+        memory: 2Gi
+      max:
+        # The ceiling a pipeline may ask for explicitly (`resources:` on a
+        # step). ~8G of the 12G is what is left after k3s+system (~0.8G),
+        # scarab-server (0.5G), the workspace service (up to 1G), Postgres
+        # (~0.3G) and cloudflared (~0.05G); 4Gi lets one heavy step run
+        # alongside a second normal one and no more. A Pod over this is
+        # REJECTED at admission by the API server, which the executor surfaces
+        # as a failed launch — loud, not silent.
+        memory: 4Gi
+# Deliberately NO ResourceQuota. A quota would bound the namespace in
+# aggregate, which sounds strictly better and is not: when a quota is exhausted
+# the API server REJECTS Pod creation, and a demo whose runs start failing
+# admission mid-burst looks broken rather than busy. The LimitRange above makes
+# the scheduler queue step Pods instead — slow is a fine demo, refused is not.

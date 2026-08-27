@@ -149,6 +149,37 @@ local-helm-ui port="8080":
       sleep 1
     done
 
+# The PUBLIC demo (deploy/demo-oracle): one Oracle Cloud "Always Free" A1
+# instance — arm64, 2 OCPU / 12 GB — running k3s, the control plane, the
+# workspace service and every step Pod, reached through a Cloudflare Tunnel.
+#
+# Run this ON THE BOX, after `sudo bash deploy/demo-oracle/bootstrap.sh` and
+# after filling in deploy/demo-oracle/.env. It refuses unless the kube context
+# matches KUBE_CONTEXT (k3s writes `default`) — the same "never target the wrong
+# cluster" guard `just local-helm` has for colima.
+#
+#   just demo-oracle             # deploy the latest published ghcr `edge`
+#   just demo-oracle sha-<sha>   # deploy a specific published SHA
+#
+# There is deliberately NO `local` variant, unlike `just local-helm local`. Two
+# Ampere cores will not compile this workspace in a time anyone will wait for,
+# and doing it on the demo box would starve the running demo of both cores while
+# it happened. image.yml builds arm64 on native runners, so every published tag
+# already carries an arm64 manifest — pull, never build.
+
+# Deploy the public demo stack on the Oracle box (published images only).
+demo-oracle ref="edge":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    owner=ghcr.io/thulasi-ram
+    echo "==> deploying published images @ {{ref}} (ghcr, pullPolicy Always)"
+    IMAGE_REPOSITORY="$owner/scarab-server" \
+    IMAGE_PULL_POLICY=Always \
+    SCARAB_CLONE_IMAGE="$owner/scarab-clone:{{ref}}" \
+    SCARAB_SIDECAR_IMAGE="$owner/scarab-results-sidecar:{{ref}}" \
+    SCARAB_WSFETCH_IMAGE="$owner/scarab-wsfetch:{{ref}}" \
+      bash deploy/demo-oracle/deploy.sh {{ref}}
+
 # Run scarab-server in the FOREGROUND against the dev stack (Ctrl-C to stop).
 # Useful when iterating; `just up` runs it in the background instead. Needs the
 # stack up first (`just up`). Env comes from the one dev env file, not inline.

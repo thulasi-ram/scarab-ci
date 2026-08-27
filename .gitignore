@@ -47,6 +47,13 @@
 # disk rather than regenerated per deploy so tokens the control plane already
 # minted keep verifying; it is a secret, so it is never committed.
 /deploy/local-helm/.workspace-token-secret
+# The same secret in the public-demo mode (deploy/demo-oracle/deploy.sh
+# generates it once, for the same reason: the control plane mints workspace
+# tokens with it and the service verifies them, so rotating it per deploy would
+# invalidate every in-flight Step's credential mid-run). Its `.env` needs no
+# entry here — the `.env` rule above already covers it, exactly as it covers
+# local-helm's.
+/deploy/demo-oracle/.workspace-token-secret
 # Proc-mode workspace service (ADR-0061): its pidfile and its log. Its warm tier
 # lands under /.scarab/, which lines 12-15 above already ignore while keeping the
 # committed pipeline configs tracked — do NOT add a bare `/.scarab/` here, it
