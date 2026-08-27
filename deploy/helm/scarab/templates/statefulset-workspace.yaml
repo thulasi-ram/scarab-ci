@@ -111,6 +111,33 @@ spec:
             - name: SCARAB_DEPOT_BLOB_AUTHZ
               value: {{ . | quote }}
             {{- end }}
+            {{- if .Values.secrets.oauthClientSecret.name }}
+            # The OAuth client secret, exactly as deployment.yaml wires it — and
+            # yes, this Pod needs it even though the workspace role has no login
+            # surface at all (no Postgres, no RBAC, no session store; callers
+            # present a workspace token).
+            #
+            # ADR-0048's fail-closed validation runs on the CONFIG, before the
+            # role is dispatched, and ADR-0049 makes an OAuth provider all-five-
+            # or-none. The four SCARAB_OAUTH_* knobs arrive here through the
+            # shared ConfigMap in `envFrom` above, while the secret is a
+            # by-reference Secret that only deployment.yaml used to project — so
+            # this Pod saw four of five and refused to boot:
+            #
+            #   refusing to start: OAuth login is partially configured
+            #   (ADR-0049) — missing: SCARAB_OAUTH_CLIENT_SECRET
+            #
+            # CrashLoopBackOff, and because readiness gates the deploy, the
+            # install fails at `rollout status` with the cause three layers
+            # down in a Pod log. Only reachable with real OAuth configured,
+            # which is why deploy/local-helm (SCARAB_DEV_INSECURE=true) never
+            # hit it and deploy/demo-oracle did, on its first deploy.
+            - name: SCARAB_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.oauthClientSecret.name | quote }}
+                  key: {{ .Values.secrets.oauthClientSecret.key | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: 8080
