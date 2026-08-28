@@ -3051,3 +3051,48 @@ h1, .crumb-head, .run-title {
 /* Fan-in collision warning (2e1a458): louder than info's copper-on-border-copper,
    quieter than err — copper on both, like a gate, but with the △ glyph. */
 .tl-glyph.warning { border-color: var(--copper); color: var(--copper); }
+
+/* --- Sign-in screen (ADR-0049) -------------------------------------------
+   Replaces the whole shell when there is no session, so it centres in the
+   viewport rather than sitting under a top bar that would need a principal it
+   does not have. */
+.login {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.login-card {
+  width: min(100%, 380px);
+  background: var(--emerald-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 40px 32px 32px;
+  text-align: center;
+}
+.login-emblem { display: block; margin: 0 auto 18px; }
+.login-title {
+  font-size: 22px;
+  letter-spacing: 0.01em;
+  margin: 0 0 6px;
+  color: var(--soft-white);
+}
+.login-sub {
+  margin: 0 0 26px;
+  color: var(--sage);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+/* Anchor styled as the primary button: this must be a real navigation to a
+   server route, so it cannot be a <button> with a click handler. */
+.login-btn {
+  display: inline-flex;
+  width: 100%;
+  justify-content: center;
+  text-decoration: none;
+}
+.login-note {
+  margin: 16px 0 0;
+  color: var(--muted-sage);
+  font-size: 12px;
+}

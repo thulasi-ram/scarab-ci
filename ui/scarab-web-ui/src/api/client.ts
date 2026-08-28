@@ -1,6 +1,7 @@
 // The dogfooded API client — typed end-to-end against the generated OpenAPI
 // schema (ADR-0012, 0028). The UI eats the same API as every other client.
 import createClient from "openapi-fetch";
+import { createSignal } from "solid-js";
 import type { paths, components } from "./schema";
 import type { ParamSpec } from "../params";
 
@@ -26,6 +27,32 @@ export type RetentionInfo = components["schemas"]["SnapshotRetentionDto"];
 export type RerunPlan = components["schemas"]["RerunPlanResponse"];
 
 export const api = createClient<paths>({ baseUrl: "/" });
+
+/**
+ * Is there no usable session? (ADR-0049)
+ *
+ * Set by the 401 middleware below and read by the app shell, which swaps the
+ * whole UI for the sign-in screen. It lives here rather than in `session.ts`
+ * because the *client* is what learns the answer — every call goes through this
+ * middleware, so a session that expires mid-visit surfaces on the next request
+ * instead of leaving the page throwing "failed to load" at the user.
+ */
+const [unauthenticated, setUnauthenticated] = createSignal(false);
+export { unauthenticated };
+
+// A 401 means "no session", and until this existed the UI had no answer for it:
+// `GET /v1/me` failed, the identity menu rendered blank, every page threw its
+// own "failed to load …", and there was no way to sign in from anywhere in the
+// app. Only reachable with real auth configured, so dev-insecure deployments
+// (every local loop) never saw it.
+api.use({
+  onResponse({ response }) {
+    if (response.status === 401) {
+      setUnauthenticated(true);
+    }
+    return response;
+  },
+});
 
 // CSRF double-submit (ADR-0049): the session rides as an HttpOnly cookie; the
 // server pairs it with a script-READABLE `scarab_csrf` cookie whose value we
@@ -106,6 +133,11 @@ export async function getMe(): Promise<Me> {
 /** End the session (`POST /v1/auth/logout`), then send the user to login. */
 export async function logout(): Promise<void> {
   await api.POST("/v1/auth/logout");
+  // The doc comment above promised this for a while and the code did not do it:
+  // the POST cleared the cookie server-side and the user was left looking at a
+  // shell still rendering their name. Flip the shell over deliberately rather
+  // than waiting for the next request to 401.
+  setUnauthenticated(true);
 }
 
 /** List a run's artifacts of record (`GET /v1/runs/{id}/artifacts`, ADR-0052). */

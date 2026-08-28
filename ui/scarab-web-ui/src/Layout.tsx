@@ -5,6 +5,8 @@
 import { Show, type ParentProps } from "solid-js";
 import { A } from "@solidjs/router";
 import Icon from "./components/Icon";
+import Login from "./Login";
+import { unauthenticated } from "./api/client";
 import UserMenu from "./components/UserMenu";
 import CommandPalette from "./components/CommandPalette";
 import { setPaletteOpen } from "./palette";
@@ -13,7 +15,16 @@ import { theme, toggleTheme } from "./theme";
 import emblemGold from "./assets/brand/scarab-emblem-dark.svg";
 
 export default function Layout(props: ParentProps) {
+  // No session => the sign-in screen INSTEAD of the shell, for every route at
+  // once. Rendering the chrome around a login form would be a lie: the search
+  // palette, the settings entry and the identity menu all need a principal, and
+  // every one of them would sit there failing quietly.
+  //
+  // <Show>, not an early `return` — a Solid component body runs ONCE, so a bare
+  // `if (unauthenticated())` reads the signal outside any reactive scope and
+  // the shell would never flip when a session expires mid-visit.
   return (
+    <Show when={!unauthenticated()} fallback={<Login />}>
     <div class="app">
       <nav class="topbar">
         <A href="/" class="brand" end>
@@ -56,5 +67,6 @@ export default function Layout(props: ParentProps) {
       <CommandPalette />
       {props.children}
     </div>
+    </Show>
   );
 }
