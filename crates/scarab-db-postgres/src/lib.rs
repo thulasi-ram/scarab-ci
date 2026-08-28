@@ -2834,3 +2834,131 @@ impl scarab_identity::RbacStore for PostgresDb {
             .collect())
     }
 }
+
+// ---------------------------------------------------------------------------
+// ApiTokenStore (ADR-0049 amendment): issued API tokens in Postgres. The row
+// holds the SHA-256 of the plaintext and never the plaintext; project=''
+// encodes an org-scoped token, exactly as it does for a binding.
+// ---------------------------------------------------------------------------
+
+fn api_token_from_row(r: &sqlx::postgres::PgRow) -> Option<scarab_identity::ApiToken> {
+    let project = r.get::<String, _>("scope_project");
+    let org = r.get::<String, _>("scope_org");
+    let scope = if project.is_empty() {
+        scarab_identity::Scope::Org(org)
+    } else {
+        scarab_identity::Scope::Project { org, name: project }
+    };
+    Some(scarab_identity::ApiToken {
+        id: r.get::<String, _>("id"),
+        name: r.get::<String, _>("name"),
+        owner_subject: r.get::<String, _>("owner_subject"),
+        scope,
+        // An unreadable role fails CLOSED: the row is dropped rather than
+        // defaulted, so a future role this binary does not know cannot be
+        // silently downgraded into one it does.
+        role: role_from_str(&r.get::<String, _>("role"))?,
+        expires_at: r.get::<i64, _>("expires_at"),
+        created_by: r.get::<String, _>("created_by"),
+        created_at: r.get::<i64, _>("created_at"),
+        last_used_at: r.get::<Option<i64>, _>("last_used_at"),
+        revoked_at: r.get::<Option<i64>, _>("revoked_at"),
+    })
+}
+
+const API_TOKEN_COLS: &str = "id, name, owner_subject, scope_org, scope_project, role, \
+                              expires_at, created_by, created_at, last_used_at, revoked_at";
+
+#[async_trait]
+impl scarab_identity::ApiTokenStore for PostgresDb {
+    async fn put(
+        &self,
+        token: &scarab_identity::ApiToken,
+        hash: &str,
+    ) -> Result<(), scarab_identity::IdentityError> {
+        let (org, project) = scope_cols(&token.scope);
+        // No upsert: a token id is minted fresh and a hash is unique by
+        // construction, so a conflict here means a CSPRNG collision or a bug —
+        // either way the right answer is to fail, not to overwrite a live
+        // credential's row with a different one.
+        sqlx::query(
+            "INSERT INTO api_tokens
+                 (id, token_hash, name, owner_subject, scope_org, scope_project,
+                  role, expires_at, created_by, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(&token.id)
+        .bind(hash)
+        .bind(&token.name)
+        .bind(&token.owner_subject)
+        .bind(org)
+        .bind(project)
+        .bind(role_str(token.role))
+        .bind(token.expires_at)
+        .bind(&token.created_by)
+        .bind(token.created_at)
+        .execute(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(())
+    }
+
+    async fn by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<scarab_identity::ApiToken>, scarab_identity::IdentityError> {
+        let row = sqlx::query(&format!(
+            "SELECT {API_TOKEN_COLS} FROM api_tokens WHERE token_hash = $1"
+        ))
+        .bind(hash)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(row.as_ref().and_then(api_token_from_row))
+    }
+
+    async fn list(
+        &self,
+        org: &str,
+    ) -> Result<Vec<scarab_identity::ApiToken>, scarab_identity::IdentityError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {API_TOKEN_COLS} FROM api_tokens WHERE scope_org = $1 \
+             ORDER BY created_at DESC, id"
+        ))
+        .bind(org)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(rows.iter().filter_map(api_token_from_row).collect())
+    }
+
+    async fn revoke(&self, id: &str, now_ms: i64) -> Result<bool, scarab_identity::IdentityError> {
+        // `revoked_at IS NULL` makes this idempotent AND honest: a second
+        // revoke reports false rather than moving the stamp, so the record of
+        // when the credential actually died is never rewritten.
+        let done = sqlx::query(
+            "UPDATE api_tokens SET revoked_at = $2 WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id)
+        .bind(now_ms)
+        .execute(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn touch(&self, id: &str, now_ms: i64) -> Result<(), scarab_identity::IdentityError> {
+        // Monotonic: two in-flight requests cannot make last_used_at go
+        // backwards, which would misreport a token as staler than it is.
+        sqlx::query(
+            "UPDATE api_tokens SET last_used_at = $2
+             WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < $2)",
+        )
+        .bind(id)
+        .bind(now_ms)
+        .execute(self.pool())
+        .await
+        .map_err(identity_err)?;
+        Ok(())
+    }
+}

@@ -21,7 +21,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use futures::stream::{self, BoxStream, Stream, StreamExt};
 use futures::SinkExt;
@@ -125,6 +125,11 @@ pub struct AppState {
     /// every request is allowed); when `Some`, run endpoints require a valid
     /// session with a sufficient role.
     pub sessions: Option<Arc<dyn scarab_identity::SessionStore>>,
+    /// Issued API tokens (ADR-0049 amendment) — the credential a machine can
+    /// hold. `None` leaves `/v1/orgs/{org}/tokens` disabled and makes any
+    /// `scarab_pat_…` bearer a 401: an unwired store must refuse tokens, never
+    /// fall through to treating one as a session id.
+    pub api_tokens: Option<Arc<dyn scarab_identity::ApiTokenStore>>,
     /// Environments + deployment history store. `None` disables the environment
     /// endpoints.
     pub environments: Option<Arc<dyn scarab_project::EnvironmentStore>>,
@@ -220,6 +225,7 @@ impl AppState {
             forge_adapters: None,
             auth: None,
             sessions: None,
+            api_tokens: None,
             environments: None,
             secret_coverage: None,
             oidc: None,
@@ -344,6 +350,15 @@ impl AppState {
     ) -> Self {
         self.auth = Some(auth);
         self.sessions = Some(sessions);
+        self
+    }
+
+    /// Enable issued API tokens (ADR-0049 amendment): the mint/list/revoke
+    /// endpoints, and `scarab_pat_…` as a bearer credential. Separate from
+    /// [`with_auth`](AppState::with_auth) because a deployment may want browser
+    /// login without ever issuing a machine credential.
+    pub fn with_api_tokens(mut self, tokens: Arc<dyn scarab_identity::ApiTokenStore>) -> Self {
+        self.api_tokens = Some(tokens);
         self
     }
 
@@ -1632,16 +1647,14 @@ async fn list_runs(
     Query(q): Query<ListRunsQuery>,
 ) -> Result<Json<RunListResponse>, ApiError> {
     // Tenancy scoping (ADR-0049): authenticate, then filter the list to what
-    // the caller may see — global roles see everything; scoped principals see
-    // the runs of orgs/projects their bindings grant Read on. Untenanted runs
-    // (inline dev submissions) are visible to global roles only.
-    let principal = authenticate(&st, &headers, Action::Read).await?;
+    // the caller may see — global roles see everything; scoped callers see the
+    // runs of orgs/projects their bindings grant Read on, and an issued API
+    // token sees only those its own scope also covers. Untenanted runs (inline
+    // dev submissions) are visible to global roles only.
+    let caller = authenticate(&st, &headers, Action::Read).await?;
     let limit = q.limit.unwrap_or(DEFAULT_RUNS_LIMIT).min(MAX_RUNS_LIMIT);
     let mut runs = st.db.list_runs(limit).await?;
-    if !principal.can(Action::Read) {
-        let Some(rbac) = st.rbac.as_ref() else {
-            return Err(ApiError::Forbidden);
-        };
+    if !caller.may_globally(Action::Read) {
         // Resolve each distinct tenant once, never per run.
         let mut allowed: std::collections::HashMap<(String, String), bool> =
             std::collections::HashMap::new();
@@ -1657,11 +1670,7 @@ async fn list_runs(
                         org: tenant.0.clone(),
                         name: tenant.1.clone(),
                     };
-                    let ok = rbac
-                        .role_of(&principal.subject, &scope)
-                        .await
-                        .map_err(|_| ApiError::Forbidden)?
-                        .is_some_and(|role| role.allows(Action::Read));
+                    let ok = caller.may(&st, Action::Read, &scope).await?;
                     allowed.insert(tenant.clone(), ok);
                     ok
                 }
@@ -2639,13 +2648,21 @@ pub struct MeResponse {
     )
 )]
 async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeResponse>, ApiError> {
-    let principal = authenticate(&st, &headers, Action::Read).await?;
-    let admin_orgs = administrable_orgs(&st, &principal).await?;
-    let can_administer = principal.can(Action::Administer) || !admin_orgs.is_empty();
+    let caller = authenticate(&st, &headers, Action::Read).await?;
+    let admin_orgs = administrable_orgs(&st, &caller).await?;
+    let can_administer = caller.may_globally(Action::Administer) || !admin_orgs.is_empty();
+    // `roles` stays the caller's GLOBAL roles, which for a token caller is the
+    // owner's C1 bootstrap and nothing else — so an API token never reports an
+    // administrable org it could not actually act on.
     Ok(Json(MeResponse {
-        subject: principal.subject,
-        display_name: principal.display_name,
-        roles: principal.roles.iter().map(|r| format!("{r:?}")).collect(),
+        subject: caller.principal.subject,
+        display_name: caller.principal.display_name,
+        roles: caller
+            .principal
+            .roles
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect(),
         can_administer,
         admin_orgs,
     }))
@@ -2657,10 +2674,7 @@ async fn me(State(st): State<AppState>, headers: HeaderMap) -> Result<Json<MeRes
 /// table (ADR-0046) — so the candidate set is exactly the orgs of the registry's
 /// bindings. A globally-`Administer` role takes all of them; anyone else needs an
 /// `Admin`+ binding on that specific `Scope::Org`.
-async fn administrable_orgs(
-    st: &AppState,
-    principal: &Principal,
-) -> Result<Vec<String>, ApiError> {
+async fn administrable_orgs(st: &AppState, caller: &Caller) -> Result<Vec<String>, ApiError> {
     let Some(connections) = st.connections.as_ref() else {
         return Ok(Vec::new()); // no registry wired (dev): no orgs exist yet
     };
@@ -2684,20 +2698,13 @@ async fn administrable_orgs(
             }
         }
     }
-    if principal.can(Action::Administer) {
+    if caller.may_globally(Action::Administer) {
         return Ok(orgs.into_iter().collect());
     }
-    let Some(rbac) = st.rbac.as_ref() else {
-        return Ok(Vec::new());
-    };
     let mut allowed = Vec::new();
     for org in orgs {
         let scope = scarab_identity::Scope::Org(org.clone());
-        let role = rbac
-            .role_of(&principal.subject, &scope)
-            .await
-            .map_err(|_| ApiError::Forbidden)?;
-        if role.is_some_and(|r| r.allows(Action::Administer)) {
+        if caller.may(st, Action::Administer, &scope).await? {
             allowed.push(org);
         }
     }
@@ -2742,7 +2749,7 @@ async fn list_projects(
     State(st): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ProjectDto>>, ApiError> {
-    let principal = authenticate(&st, &headers, Action::Read).await?;
+    let caller = authenticate(&st, &headers, Action::Read).await?;
     let Some(connections) = st.connections.as_ref() else {
         return Ok(Json(Vec::new())); // no registry wired (dev): empty, honest
     };
@@ -2764,21 +2771,14 @@ async fn list_projects(
             else {
                 continue;
             };
-            // Tenancy (ADR-0049): scoped principals see only their projects.
-            if !principal.can(Action::Read) {
+            // Tenancy (ADR-0049): scoped callers see only their projects, and
+            // an issued API token only those its own scope covers.
+            if !caller.may_globally(Action::Read) {
                 let scope = scarab_identity::Scope::Project {
                     org: resolved.org.clone(),
                     name: resolved.project.clone(),
                 };
-                let allowed = match st.rbac.as_ref() {
-                    Some(rbac) => rbac
-                        .role_of(&principal.subject, &scope)
-                        .await
-                        .map_err(|_| ApiError::Forbidden)?
-                        .is_some_and(|r| r.allows(Action::Read)),
-                    None => false,
-                };
-                if !allowed {
+                if !caller.may(&st, Action::Read, &scope).await? {
                     continue;
                 }
             }
@@ -5348,24 +5348,442 @@ async fn import_bindings(
     Ok(Json(imported))
 }
 
-/// Authenticate the request: resolve the session (Bearer or cookie), enforce
+// ---------------------------------------------------------------------------
+// Issued API tokens (ADR-0049 amendment): the credential a machine can hold.
+//
+// Every client surface for one already existed — `scarab-cli` takes `--token` /
+// `SCARAB_TOKEN` and sends a Bearer header, and `authenticate` already exempts
+// Bearer from CSRF because such a caller presents its credential explicitly.
+// What was missing was a credential that is not a 24h browser session id.
+// ---------------------------------------------------------------------------
+
+/// `POST /v1/orgs/{org}/tokens` body. Every field is required on purpose: a
+/// credential with no verb and no expiry is the shape this repo already learned
+/// not to mint twice.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MintTokenRequest {
+    /// Human label — what makes the token revocable in practice. "demo
+    /// keepalive", "amy's laptop".
+    pub name: String,
+    /// Project within the org to scope the token to. Absent = the whole org,
+    /// inheriting down to its projects exactly as an org binding does.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// The **ceiling**: `viewer` | `member` | `admin` | `owner`. Never more than
+    /// the minter holds in this scope, and capped again at each request by what
+    /// the owner holds *then*.
+    pub role: String,
+    /// Lifetime in days, `1..=365`. No default and no "never".
+    pub expires_in_days: u32,
+}
+
+/// The mint response — the **only** place the plaintext ever appears.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MintedTokenDto {
+    /// The credential. Returned once, here. Scarab keeps only its SHA-256, so
+    /// this exact string cannot be recovered from the database, from a backup,
+    /// or by any later API call: a lost token is re-minted, never re-read.
+    pub token: String,
+    /// The token's record, for immediate display in the list it just joined.
+    pub record: ApiTokenDto,
+}
+
+/// One issued token, as the API describes it — record only, never the secret.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiTokenDto {
+    pub id: String,
+    pub name: String,
+    /// The principal whose live authority bounds this token.
+    pub owner_subject: String,
+    pub org: String,
+    /// `None` for an org-scoped token.
+    pub project: Option<String>,
+    /// The granted ceiling, not the effective role — what the token can do
+    /// depends on what its owner holds at the moment of each request.
+    pub role: String,
+    pub created_by: String,
+    /// Unix-ms.
+    pub created_at: i64,
+    /// Unix-ms.
+    pub expires_at: i64,
+    /// Unix-ms of the last request that presented it, written back at most once
+    /// a minute. `None` means it has never been used.
+    pub last_used_at: Option<i64>,
+    /// Unix-ms revocation, or `None` while it is live.
+    pub revoked_at: Option<i64>,
+}
+
+impl From<scarab_identity::ApiToken> for ApiTokenDto {
+    fn from(t: scarab_identity::ApiToken) -> Self {
+        let (org, project) = match &t.scope {
+            scarab_identity::Scope::Org(org) => (org.clone(), None),
+            scarab_identity::Scope::Project { org, name } => (org.clone(), Some(name.clone())),
+        };
+        Self {
+            id: t.id,
+            name: t.name,
+            owner_subject: t.owner_subject,
+            org,
+            project,
+            role: role_name(t.role).to_string(),
+            created_by: t.created_by,
+            created_at: t.created_at,
+            expires_at: t.expires_at,
+            last_used_at: t.last_used_at,
+            revoked_at: t.revoked_at,
+        }
+    }
+}
+
+const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+
+/// Mint an API token scoped to this org (or one of its projects). Administer on
+/// the scope the token targets. The plaintext is returned **once**, here.
+#[utoipa::path(
+    post,
+    path = "/v1/orgs/{org}/tokens",
+    params(("org" = String, Path, description = "org the token is scoped to")),
+    summary = "Mint an API token - the plaintext is returned ONCE (ADR-0049)",
+    responses(
+        (status = 201, body = MintedTokenDto),
+        (status = 400, description = "bad role, name, or lifetime, or the role exceeds the minter's"),
+        (status = 403, description = "not an admin of the target scope, or the caller is itself a token"),
+        (status = 404, description = "API tokens not configured")
+    )
+)]
+async fn mint_api_token(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    Json(req): Json<MintTokenRequest>,
+) -> Result<Response, ApiError> {
+    let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?.clone();
+    let scope = match req.project.as_deref().filter(|p| !p.is_empty()) {
+        Some(project) => scarab_identity::Scope::Project {
+            org: org.clone(),
+            name: project.to_string(),
+        },
+        None => scarab_identity::Scope::Org(org.clone()),
+    };
+
+    let caller = authenticate(&st, &headers, Action::Administer).await?;
+    // A token may not mint tokens. Without this, "every token expires" is a
+    // story rather than a property: a token holding Administer could mint its
+    // own successor forever, and the expiry that makes this credential safe to
+    // hand to a machine would bound nothing at all. Issuance stays an act a
+    // human performs.
+    if caller.grant.is_some() {
+        return Err(ApiError::Forbidden);
+    }
+    if !caller.may_globally(Action::Administer)
+        && !caller.may(&st, Action::Administer, &scope).await?
+    {
+        return Err(ApiError::Forbidden);
+    }
+
+    let name = req.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::BadRequest("token `name` must not be empty".into()));
+    }
+    if req.expires_in_days == 0 || req.expires_in_days > scarab_identity::MAX_API_TOKEN_DAYS {
+        return Err(ApiError::BadRequest(format!(
+            "`expires_in_days` must be 1..={} — a token with no expiry is the one shape this credential must never take",
+            scarab_identity::MAX_API_TOKEN_DAYS
+        )));
+    }
+    let role = parse_role(&req.role)?;
+
+    // Least privilege, enforced at mint: the grant may not exceed what the
+    // minter holds in this scope. The easy implementation — clone the minter's
+    // principal into the row, exactly as `sessions` denormalises it — is
+    // precisely the one that yields permanent Owner credentials nobody can
+    // scope down afterwards.
+    //
+    // Bounded by what the TOKEN will be able to re-derive per request — see
+    // `token_owner_roles` — not by what the minter's session happens to carry.
+    // The two differ, and using the session's view here would mint credentials
+    // that pass this check and then hold nothing at all: a minter whose only
+    // authority is a login-time snapshot is told so HERE, with the fix in the
+    // message, instead of walking away with a dead token.
+    let owner_view = Principal {
+        subject: caller.principal.subject.clone(),
+        display_name: None,
+        roles: token_owner_roles(&st, &caller.principal.subject),
+    };
+    match live_role_in(&st, &owner_view, &scope).await? {
+        Some(held) if held >= role => {}
+        Some(held) => {
+            return Err(ApiError::BadRequest(format!(
+                "cannot mint a `{}` token: you hold `{}` in this scope, and a token may not exceed its minter",
+                role_name(role),
+                role_name(held)
+            )))
+        }
+        None => {
+            return Err(ApiError::BadRequest(
+                "cannot mint a token here: you hold no role binding in this scope — grant yourself one on the org or project first (PUT /v1/orgs/{org}/bindings)".into(),
+            ))
+        }
+    }
+
+    let now = st.clock.now().await.0;
+    // The random half of minting lives HERE, at the composition root: a CSPRNG
+    // is I/O, so `scarab-identity` — which owns the hash and the authority math
+    // — cannot mint a token it is able to verify (ADR-0031).
+    let plaintext = format!(
+        "{}{}",
+        scarab_identity::API_TOKEN_PREFIX,
+        random_token_secret()
+    );
+    let token = scarab_identity::ApiToken {
+        id: Uuid::new_v4().to_string(),
+        name: name.to_string(),
+        owner_subject: caller.principal.subject.clone(),
+        scope,
+        role,
+        expires_at: now + i64::from(req.expires_in_days) * MS_PER_DAY,
+        created_by: caller.principal.subject.clone(),
+        created_at: now,
+        last_used_at: None,
+        revoked_at: None,
+    };
+    store
+        .put(&token, &scarab_identity::api_token_hash(&plaintext))
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(MintedTokenDto {
+            token: plaintext,
+            record: ApiTokenDto::from(token),
+        }),
+    )
+        .into_response())
+}
+
+/// 32 bytes of CSPRNG, base64url without padding — a high-entropy bearer
+/// secret, not a password, which is why the store hashes it with a plain digest
+/// rather than stretching it.
+fn random_token_secret() -> String {
+    use base64::Engine as _;
+    use rand::RngCore as _;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// List the tokens issued within this org, org- and project-scoped alike.
+/// Administer on the Org. Records only — there is no plaintext to return.
+#[utoipa::path(
+    get,
+    path = "/v1/orgs/{org}/tokens",
+    params(("org" = String, Path, description = "org")),
+    summary = "List the API tokens issued in an org (ADR-0049)",
+    responses(
+        (status = 200, body = [ApiTokenDto]),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "API tokens not configured")
+    )
+)]
+async fn list_api_tokens(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+) -> Result<Json<Vec<ApiTokenDto>>, ApiError> {
+    let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?;
+    let scope = scarab_identity::Scope::Org(org.clone());
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    let tokens = store
+        .list(&org)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(tokens.into_iter().map(ApiTokenDto::from).collect()))
+}
+
+/// Revoke an issued token — permanent, and effective on the very next request
+/// that presents it. Administer on the Org.
+#[utoipa::path(
+    delete,
+    path = "/v1/orgs/{org}/tokens/{id}",
+    params(
+        ("org" = String, Path, description = "org"),
+        ("id" = String, Path, description = "token id - NOT the token itself")
+    ),
+    summary = "Revoke an issued API token (ADR-0049)",
+    responses(
+        (status = 204, description = "revoked"),
+        (status = 403, description = "not an org admin"),
+        (status = 404, description = "no such live token in this org")
+    )
+)]
+async fn revoke_api_token(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((org, id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let store = st.api_tokens.as_ref().ok_or(ApiError::NotFound)?;
+    let scope = scarab_identity::Scope::Org(org.clone());
+    authorize_scoped(&st, &headers, Action::Administer, Some(&scope)).await?;
+    // Scoped by org BEFORE revoking: `id` alone is a global handle, and an
+    // admin of one org must not be able to reach into another's by guessing.
+    let tokens = store
+        .list(&org)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if !tokens.iter().any(|t| t.id == id) {
+        return Err(ApiError::NotFound);
+    }
+    let now = st.clock.now().await.0;
+    match store
+        .revoke(&id, now)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+    {
+        true => Ok(StatusCode::NO_CONTENT),
+        // Already revoked. Reported rather than smoothed over, so the stamp of
+        // when the credential actually died is never quietly rewritten.
+        false => Err(ApiError::NotFound),
+    }
+}
+
+/// How coarsely a token's `last_used_at` is written back. Observability, not
+/// accounting: the question it answers is "is anyone still using this?", and one
+/// write per token per minute answers it without putting an UPDATE on the hot
+/// path of every request a busy CI robot makes.
+const API_TOKEN_TOUCH_INTERVAL_MS: i64 = 60_000;
+
+/// The authenticated caller of a request: who they are, plus — when the
+/// credential was an issued API token — the narrowing that token carries.
+///
+/// This type exists because a token is **not** a principal. Building one and
+/// handing it onward as a bare [`Principal`] would silently give the token
+/// everything its owner has: every scoped decision in this file would resolve
+/// the OWNER's bindings and never learn the caller was restricted to one repo.
+/// Keeping the grant attached, and asking [`Caller::role_in`] rather than
+/// `rbac.role_of` directly, is what makes the restriction real instead of
+/// decorative.
+#[derive(Debug, Clone)]
+struct Caller {
+    principal: Principal,
+    /// `Some` when an issued API token authenticated this request.
+    grant: Option<scarab_identity::ApiToken>,
+}
+
+impl Caller {
+    /// A caller with no token narrowing — a session, or the dev-insecure
+    /// synthetic Owner.
+    fn session(principal: Principal) -> Self {
+        Self {
+            principal,
+            grant: None,
+        }
+    }
+
+    /// May this caller act on an **untenanted** resource — one belonging to no
+    /// Org or Project (an inline dev run, the catch-all default)?
+    ///
+    /// Never, for a token. A token's authority is a scope it covers, and an
+    /// untenanted resource sits in no scope to be covered; answering anything
+    /// else here would be a hole straight through the scoping the rest of this
+    /// type enforces.
+    fn may_globally(&self, action: Action) -> bool {
+        self.grant.is_none() && self.principal.can(action)
+    }
+
+    /// The role this caller effectively holds in `scope`, token ceiling applied.
+    async fn role_in(
+        &self,
+        st: &AppState,
+        scope: &scarab_identity::Scope,
+    ) -> Result<Option<scarab_identity::Role>, ApiError> {
+        let live = live_role_in(st, &self.principal, scope).await?;
+        match &self.grant {
+            None => Ok(live),
+            Some(token) if token.covers(scope) => Ok(token.effective_role(live)),
+            Some(_) => Ok(None),
+        }
+    }
+
+    /// May this caller perform `action` in `scope`?
+    async fn may(
+        &self,
+        st: &AppState,
+        action: Action,
+        scope: &scarab_identity::Scope,
+    ) -> Result<bool, ApiError> {
+        Ok(self
+            .role_in(st, scope)
+            .await?
+            .is_some_and(|role| role.allows(action)))
+    }
+}
+
+/// The role `principal` holds in `scope` **right now**, across the two live
+/// sources ADR-0049 recognises: the C1 global bootstrap carried on the
+/// principal, and the C2 native bindings in the store. The higher wins, exactly
+/// as [`authorize_scoped`] has always treated them.
+///
+/// "Right now" is the load-bearing word for tokens. This is re-read on every
+/// request rather than frozen into the token row at mint, which is why a
+/// demotion reaches a token the instant it lands.
+async fn live_role_in(
+    st: &AppState,
+    principal: &Principal,
+    scope: &scarab_identity::Scope,
+) -> Result<Option<scarab_identity::Role>, ApiError> {
+    let global = principal.roles.iter().copied().max();
+    let bound = match st.rbac.as_ref() {
+        Some(rbac) => rbac
+            .role_of(&principal.subject, scope)
+            .await
+            .map_err(|_| ApiError::Forbidden)?,
+        None => None,
+    };
+    Ok(global.into_iter().chain(bound).max())
+}
+
+/// The global roles an issued token can re-derive for `subject` on **every**
+/// request: the C1 bootstrap owners list, and nothing else.
+///
+/// Deliberately not `Principal::roles` off a session. Those are a login-time
+/// snapshot — including the blanket `Viewer` login hands every human — and a
+/// token capped by them would be capped by authority nothing can re-check
+/// later, which is the frozen-authority trap this design exists to avoid. The
+/// mint endpoint bounds a grant with exactly this view too, so what a minter is
+/// allowed to issue and what the token will actually do cannot drift.
+fn token_owner_roles(st: &AppState, subject: &str) -> Vec<scarab_identity::Role> {
+    st.oauth_login
+        .as_ref()
+        .and_then(|o| o.bootstrap_owner_role(subject))
+        .into_iter()
+        .collect()
+}
+
+/// Authenticate the request: resolve the credential (Bearer or cookie), enforce
 /// expiry + the CSRF double-submit on cookie mutations, and return the
-/// principal — **no role decision** (that's [`authorize`]/[`authorize_scoped`]).
-/// With no session store configured, authn is **disabled** (dev/test) and
-/// every caller is a synthetic Owner (the loud SCARAB_DEV_INSECURE posture).
+/// [`Caller`] — **no role decision** (that's [`authorize`]/[`authorize_scoped`]).
+/// With no session store configured, authn is **disabled** (dev/test) and every
+/// caller is a synthetic Owner (the loud SCARAB_DEV_INSECURE posture).
 async fn authenticate(
     st: &AppState,
     headers: &HeaderMap,
     action: Action,
-) -> Result<Principal, ApiError> {
+) -> Result<Caller, ApiError> {
     let Some(sessions) = st.sessions.as_ref() else {
-        return Ok(Principal {
+        return Ok(Caller::session(Principal {
             subject: "anonymous".into(),
             display_name: None,
             roles: vec![scarab_identity::Role::Owner],
-        });
+        }));
     };
     let (sid, via) = session_id(headers).ok_or(ApiError::Unauthorized)?;
+    // Route on the prefix rather than probing both stores (ADR-0049
+    // amendment): a mistyped token must fail as a token, with no chance of
+    // being taken for a session id.
+    if sid.starts_with(scarab_identity::API_TOKEN_PREFIX) {
+        return authenticate_api_token(st, &sid, via).await;
+    }
     let session = sessions
         .get(&sid)
         .await
@@ -5384,7 +5802,57 @@ async fn authenticate(
             return Err(ApiError::Forbidden);
         }
     }
-    Ok(session.principal)
+    Ok(Caller::session(session.principal))
+}
+
+/// Authenticate a `scarab_pat_…` bearer (ADR-0049 amendment): hash it, load the
+/// row, check it is live, and build the [`Caller`] that its owner's identity
+/// plus its own grant describe.
+///
+/// Every failure answers the same 401 on the wire — unknown, expired and
+/// revoked are indistinguishable neighbours to a caller holding a bad string,
+/// and telling them apart would turn this into an oracle for which tokens exist.
+async fn authenticate_api_token(
+    st: &AppState,
+    plaintext: &str,
+    via: AuthVia,
+) -> Result<Caller, ApiError> {
+    // A token is a Bearer credential, full stop. Honouring one from the cookie
+    // jar would put it back on the ambient path CSRF exists to defend — and the
+    // Bearer branch above is exempt from CSRF *precisely because* a Bearer
+    // caller presents its credential deliberately.
+    if via != AuthVia::Bearer {
+        return Err(ApiError::Unauthorized);
+    }
+    let Some(store) = st.api_tokens.as_ref() else {
+        return Err(ApiError::Unauthorized);
+    };
+    let token = store
+        .by_hash(&scarab_identity::api_token_hash(plaintext))
+        .await
+        .map_err(|_| ApiError::Unauthorized)?
+        .ok_or(ApiError::Unauthorized)?;
+    let now = st.clock.now().await.0;
+    if !token.is_live(now) {
+        return Err(ApiError::Unauthorized);
+    }
+    // Observability, coarse and best-effort: a failure to record the use must
+    // never fail the request that was being observed.
+    if token
+        .last_used_at
+        .is_none_or(|prev| now - prev >= API_TOKEN_TOUCH_INTERVAL_MS)
+    {
+        let _ = store.touch(&token.id, now).await;
+    }
+    let roles = token_owner_roles(st, &token.owner_subject);
+    Ok(Caller {
+        principal: Principal {
+            subject: token.owner_subject.clone(),
+            display_name: Some(format!("API token \u{201c}{}\u{201d}", token.name)),
+            roles,
+        },
+        grant: Some(token),
+    })
 }
 
 /// Authorize `action` with **global** (flat) roles only — for resources that
@@ -5408,17 +5876,13 @@ async fn authorize_scoped(
     action: Action,
     scope: Option<&scarab_identity::Scope>,
 ) -> Result<Principal, ApiError> {
-    let principal = authenticate(st, headers, action).await?;
-    if principal.can(action) {
-        return Ok(principal);
+    let caller = authenticate(st, headers, action).await?;
+    if caller.may_globally(action) {
+        return Ok(caller.principal);
     }
-    if let (Some(rbac), Some(scope)) = (st.rbac.as_ref(), scope) {
-        let role = rbac
-            .role_of(&principal.subject, scope)
-            .await
-            .map_err(|_| ApiError::Forbidden)?;
-        if role.is_some_and(|r| r.allows(action)) {
-            return Ok(principal);
+    if let Some(scope) = scope {
+        if caller.may(st, action, scope).await? {
+            return Ok(caller.principal);
         }
     }
     Err(ApiError::Forbidden)
@@ -6345,8 +6809,9 @@ pub const FORGE_CREDENTIALS_ORG: &str = "_forge";
 /// connection necessarily needs the global role — the same asymmetry `/v1/me`
 /// already reports via `can_administer` + an empty `admin_orgs`.
 async fn authorize_org_administer(st: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let principal = authenticate(st, headers, Action::Administer).await?;
-    if !principal.can(Action::Administer) && administrable_orgs(st, &principal).await?.is_empty() {
+    let caller = authenticate(st, headers, Action::Administer).await?;
+    if !caller.may_globally(Action::Administer) && administrable_orgs(st, &caller).await?.is_empty()
+    {
         return Err(ApiError::Forbidden);
     }
     Ok(())
@@ -7648,8 +8113,8 @@ const TAG_GROUPS: &[(&str, &str)] = &[
     ),
     (
         "Auth & Identity",
-        "Login/session, the current principal, OIDC discovery and JWKS, and \
-         RBAC role bindings.",
+        "Login/session, issued API tokens, the current principal, OIDC \
+         discovery and JWKS, and RBAC role bindings.",
     ),
     (
         "System",
@@ -7672,6 +8137,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         || path.starts_with("/v1/auth/")
         || path == "/v1/me"
         || path.contains("bindings")
+        || path.contains("/tokens")
     {
         "Auth & Identity"
     } else if matches!(path, "/healthz" | "/readyz" | "/metrics") {
@@ -7742,10 +8208,86 @@ impl utoipa::Modify for TagGroups {
     }
 }
 
+/// Is this path reachable **without** a Scarab credential?
+///
+/// Liveness/readiness/metrics are probes; the auth endpoints are how a caller
+/// gets a credential in the first place; a webhook is called by the forge and
+/// authenticates itself by signature, not by anything of ours. Everything else
+/// needs one, and [`SecuritySchemes`] says so per operation rather than only
+/// once at the top — a generated client reads the operation.
+fn is_public_path(path: &str) -> bool {
+    path.starts_with("/webhooks/")
+        || path.starts_with("/.well-known/")
+        || path.starts_with("/v1/auth/")
+        || matches!(path, "/healthz" | "/readyz" | "/metrics" | "/openapi.json")
+}
+
+/// Declares HOW to authenticate to this API — which `openapi.json` did not say
+/// at all before issued API tokens existed, because there was nothing to say:
+/// the only credential was a browser session id.
+struct SecuritySchemes;
+
+impl utoipa::Modify for SecuritySchemes {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::security::{
+            ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme,
+        };
+        let components = openapi.components.get_or_insert_with(Default::default);
+        components.add_security_scheme(
+            "apiToken",
+            SecurityScheme::Http(
+                HttpBuilder::new()
+                    .scheme(HttpAuthScheme::Bearer)
+                    .bearer_format("scarab_pat")
+                    .description(Some(
+                        "An issued API token: `Authorization: Bearer scarab_pat_…`. \
+                         Mint one at `POST /v1/orgs/{org}/tokens`; it is scoped to one \
+                         Org or Project, carries a role ceiling, and expires. This is \
+                         what `scarab --token` / `SCARAB_TOKEN` sends.",
+                    ))
+                    .build(),
+            ),
+        );
+        components.add_security_scheme(
+            "sessionCookie",
+            SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
+                "scarab_session",
+                "A browser login session (ADR-0049). Set by the OAuth flow, and — \
+                 unlike a Bearer token — it rides ambiently, so every mutation must \
+                 also double-submit the `scarab_csrf` cookie as `x-csrf-token`.",
+            ))),
+        );
+
+        let required = vec![
+            utoipa::openapi::security::SecurityRequirement::new::<&str, [&str; 0], &str>(
+                "apiToken",
+                [],
+            ),
+            utoipa::openapi::security::SecurityRequirement::new::<&str, [&str; 0], &str>(
+                "sessionCookie",
+                [],
+            ),
+        ];
+        for (path, item) in &mut openapi.paths.paths {
+            // An EMPTY list is not the same as saying nothing: it declares the
+            // operation as deliberately unauthenticated, so a reader can tell a
+            // public endpoint from one whose security someone forgot.
+            let security = if is_public_path(path) {
+                Vec::new()
+            } else {
+                required.clone()
+            };
+            for op in path_item_operations(item) {
+                op.security = Some(security.clone());
+            }
+        }
+    }
+}
+
 /// The generated OpenAPI document. The pipeline request schema is the IR subset.
 #[derive(OpenApi)]
 #[openapi(
-    modifiers(&TagGroups),
+    modifiers(&TagGroups, &SecuritySchemes),
     paths(
         healthz,
         readyz,
@@ -7757,6 +8299,9 @@ impl utoipa::Modify for TagGroups {
         oauth_callback,
         logout,
         me,
+        mint_api_token,
+        list_api_tokens,
+        revoke_api_token,
         list_bindings,
         put_binding,
         delete_binding,
@@ -7860,7 +8405,10 @@ impl utoipa::Modify for TagGroups {
         ConnectionPreflightDto,
         CapabilityRequirementDto,
         GrantedPermissionDto,
-        MeResponse
+        MeResponse,
+        MintTokenRequest,
+        MintedTokenDto,
+        ApiTokenDto
     ))
 )]
 pub struct ApiDoc;
@@ -7898,6 +8446,11 @@ fn router_inner(state: AppState) -> Router {
             "/v1/orgs/{org}/bindings",
             get(list_bindings).put(put_binding).delete(delete_binding),
         )
+        .route(
+            "/v1/orgs/{org}/tokens",
+            get(list_api_tokens).post(mint_api_token),
+        )
+        .route("/v1/orgs/{org}/tokens/{id}", delete(revoke_api_token))
         .route(
             "/v1/repos/{org}/{repo}/bindings/import",
             post(import_bindings),

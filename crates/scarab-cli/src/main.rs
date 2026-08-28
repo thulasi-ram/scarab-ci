@@ -88,8 +88,10 @@ struct RunArgs {
     /// Base URL of the Scarab server.
     #[arg(long, env = "SCARAB_SERVER", default_value = "http://localhost:8080")]
     server: String,
-    /// Bearer token for authentication. When unset, no `Authorization` header is
-    /// sent (a dev server with no session store treats callers as Owner).
+    /// Bearer token for authentication: an issued API token (`scarab_pat_…`),
+    /// minted at `POST /v1/orgs/{org}/tokens`. A browser session id also works.
+    /// When unset, no `Authorization` header is sent (a dev server with no
+    /// session store treats callers as Owner).
     #[arg(long, env = "SCARAB_TOKEN")]
     token: Option<String>,
 }

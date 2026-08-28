@@ -24,7 +24,8 @@
           "404": {
             "description": "issuer disabled"
           }
-        }
+        },
+        "security": []
       }
     },
     "/.well-known/openid-configuration": {
@@ -41,7 +42,8 @@
           "404": {
             "description": "issuer disabled"
           }
-        }
+        },
+        "security": []
       }
     },
     "/healthz": {
@@ -55,7 +57,8 @@
           "200": {
             "description": "alive"
           }
-        }
+        },
+        "security": []
       }
     },
     "/metrics": {
@@ -69,7 +72,8 @@
           "200": {
             "description": "Prometheus text exposition"
           }
-        }
+        },
+        "security": []
       }
     },
     "/readyz": {
@@ -86,7 +90,8 @@
           "503": {
             "description": "a dependency is unreachable"
           }
-        }
+        },
+        "security": []
       }
     },
     "/v1/auth/callback": {
@@ -103,7 +108,8 @@
           "401": {
             "description": "state mismatch or bad code"
           }
-        }
+        },
+        "security": []
       }
     },
     "/v1/auth/login": {
@@ -120,7 +126,8 @@
           "404": {
             "description": "OAuth not configured"
           }
-        }
+        },
+        "security": []
       },
       "post": {
         "tags": [
@@ -145,7 +152,8 @@
           "404": {
             "description": "login not configured"
           }
-        }
+        },
+        "security": []
       }
     },
     "/v1/auth/logout": {
@@ -159,7 +167,8 @@
           "204": {
             "description": "session revoked; cookies expired"
           }
-        }
+        },
+        "security": []
       }
     },
     "/v1/connections": {
@@ -190,7 +199,15 @@
           "404": {
             "description": "no connection registry wired"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -232,7 +249,15 @@
           "409": {
             "description": "a connection to that forge and base URL already exists"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/connections/{id}": {
@@ -276,7 +301,15 @@
           "409": {
             "description": "the connection still has bound repos (Projects)"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/connections/{id}/available-repos": {
@@ -321,7 +354,15 @@
           "501": {
             "description": "this forge adapter cannot enumerate repos"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/connections/{id}/preflight": {
@@ -360,7 +401,15 @@
           "404": {
             "description": "no such connection, or no registry wired"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/connections/{id}/repos": {
@@ -415,7 +464,15 @@
           "409": {
             "description": "the repo is already bound to a different connection"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/connections/{id}/repos/{owner}/{name}": {
@@ -465,7 +522,15 @@
           "404": {
             "description": "no such connection, or the repo is not bound to it"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/connections/{id}/repos/{owner}/{name}/webhook": {
@@ -525,7 +590,15 @@
           "404": {
             "description": "no such connection, or the repo is not bound to it"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/connections/{id}/resync": {
@@ -567,7 +640,15 @@
           "501": {
             "description": "this forge adapter cannot enumerate repos"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/me": {
@@ -591,7 +672,15 @@
           "401": {
             "description": "not authenticated"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/orgs/{org}/bindings": {
@@ -618,7 +707,15 @@
           "403": {
             "description": "not an org admin"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       },
       "put": {
         "tags": [
@@ -630,7 +727,15 @@
           "204": {
             "description": "granted"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -642,7 +747,159 @@
           "204": {
             "description": "revoked"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/tokens": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "List the API tokens issued in an org (ADR-0049)",
+        "operationId": "list_api_tokens",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ApiTokenDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "API tokens not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Mint an API token - the plaintext is returned ONCE (ADR-0049)",
+        "operationId": "mint_api_token",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org the token is scoped to",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MintedTokenDto"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "bad role, name, or lifetime, or the role exceeds the minter's"
+          },
+          "403": {
+            "description": "not an admin of the target scope, or the caller is itself a token"
+          },
+          "404": {
+            "description": "API tokens not configured"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/v1/orgs/{org}/tokens/{id}": {
+      "delete": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Revoke an issued API token (ADR-0049)",
+        "operationId": "revoke_api_token",
+        "parameters": [
+          {
+            "name": "org",
+            "in": "path",
+            "description": "org",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "description": "token id - NOT the token itself",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "revoked"
+          },
+          "403": {
+            "description": "not an org admin"
+          },
+          "404": {
+            "description": "no such live token in this org"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos": {
@@ -666,7 +923,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos/{org}/{repo}/bindings/import": {
@@ -690,7 +955,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos/{org}/{repo}/dispatch": {
@@ -741,7 +1014,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos/{org}/{repo}/environments": {
@@ -755,7 +1036,15 @@
           "200": {
             "description": "the environments"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos/{org}/{repo}/environments/{name}": {
@@ -772,7 +1061,15 @@
           "404": {
             "description": "unknown"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       },
       "put": {
         "tags": [
@@ -784,7 +1081,15 @@
           "200": {
             "description": "stored"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -796,7 +1101,15 @@
           "204": {
             "description": "deleted"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos/{org}/{repo}/environments/{name}/deployments": {
@@ -810,7 +1123,15 @@
           "200": {
             "description": "most recent first"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos/{org}/{repo}/pipelines": {
@@ -860,7 +1181,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos/{org}/{repo}/pipelines/{name}/interface": {
@@ -925,7 +1254,15 @@
           "404": {
             "description": "no pipeline by that name at the ref"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos/{org}/{repo}/refs": {
@@ -975,7 +1312,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos/{org}/{repo}/runs": {
@@ -1027,7 +1372,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos/{org}/{repo}/secrets/matrix": {
@@ -1049,7 +1402,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/repos/{org}/{repo}/secrets/matrix/silenced": {
@@ -1076,7 +1437,15 @@
           "404": {
             "description": "coverage annotations not configured"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -1111,7 +1480,15 @@
           "404": {
             "description": "coverage annotations not configured"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs": {
@@ -1145,7 +1522,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -1174,7 +1559,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}": {
@@ -1209,7 +1602,15 @@
           "404": {
             "description": "no such run"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/artifacts": {
@@ -1247,7 +1648,15 @@
           "404": {
             "description": "no such run"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/artifacts/{name}": {
@@ -1300,7 +1709,15 @@
           "404": {
             "description": "no such artifact"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/cancel": {
@@ -1331,7 +1748,15 @@
           "409": {
             "description": "run already terminal"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/events": {
@@ -1356,7 +1781,15 @@
           "200": {
             "description": "SSE stream of the run's event log"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/gates/{step}/approve": {
@@ -1393,7 +1826,15 @@
           "404": {
             "description": "no such run or gate"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/gates/{step}/release": {
@@ -1433,7 +1874,15 @@
           "404": {
             "description": "no such external gate, or token release disabled"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/logs": {
@@ -1458,7 +1907,15 @@
           "200": {
             "description": "SSE stream of step log output"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/services": {
@@ -1496,7 +1953,15 @@
           "404": {
             "description": "no such run"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/services/{service}/logs": {
@@ -1543,7 +2008,15 @@
           "404": {
             "description": "no such run or service"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/snapshots-pin": {
@@ -1579,7 +2052,15 @@
           "404": {
             "description": "no such run"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -1612,7 +2093,15 @@
           "404": {
             "description": "no such run"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/steps/{step}/attach": {
@@ -1652,7 +2141,15 @@
           "404": {
             "description": "no such run/step, or attach disabled"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/steps/{step}/consumed": {
@@ -1704,7 +2201,15 @@
           "404": {
             "description": "no such run or no attempt"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/steps/{step}/debug-pod": {
@@ -1741,7 +2246,15 @@
           "404": {
             "description": "no such run/step, no step spec, or debug-pod disabled"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/steps/{step}/logs": {
@@ -1797,7 +2310,15 @@
           "404": {
             "description": "no such run or step"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/steps/{step}/rerun": {
@@ -1844,7 +2365,15 @@
           "409": {
             "description": "target's dependencies have not succeeded"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/steps/{step}/rerun-plan": {
@@ -1888,7 +2417,15 @@
           "404": {
             "description": "no such run or step"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/steps/{step}/results": {
@@ -1943,7 +2480,15 @@
           "404": {
             "description": "no such run"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -1982,7 +2527,15 @@
           "404": {
             "description": "no such step, or results ingest disabled"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/steps/{step}/retry": {
@@ -2029,7 +2582,15 @@
           "409": {
             "description": "step is not failed"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/steps/{step}/workspace": {
@@ -2091,7 +2652,15 @@
           "404": {
             "description": "no such run/path or browse disabled"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/runs/{id}/steps/{step}/workspace/file": {
@@ -2146,7 +2715,15 @@
           "404": {
             "description": "no such file or browse disabled"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/v1/secrets": {
@@ -2199,7 +2776,15 @@
           "404": {
             "description": "secrets not configured"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       },
       "post": {
         "tags": [
@@ -2224,7 +2809,15 @@
           "404": {
             "description": "secrets not configured"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       },
       "delete": {
         "tags": [
@@ -2277,7 +2870,15 @@
           "404": {
             "description": "secrets not configured"
           }
-        }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
       }
     },
     "/webhooks/forgejo": {
@@ -2294,7 +2895,8 @@
           "401": {
             "description": "bad signature"
           }
-        }
+        },
+        "security": []
       }
     },
     "/webhooks/github": {
@@ -2311,12 +2913,82 @@
           "401": {
             "description": "bad signature"
           }
-        }
+        },
+        "security": []
       }
     }
   },
   "components": {
     "schemas": {
+      "ApiTokenDto": {
+        "type": "object",
+        "description": "One issued token, as the API describes it — record only, never the secret.",
+        "required": [
+          "id",
+          "name",
+          "owner_subject",
+          "org",
+          "role",
+          "created_by",
+          "created_at",
+          "expires_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "created_by": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix-ms."
+          },
+          "id": {
+            "type": "string"
+          },
+          "last_used_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms of the last request that presented it, written back at most once\na minute. `None` means it has never been used."
+          },
+          "name": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "owner_subject": {
+            "type": "string",
+            "description": "The principal whose live authority bounds this token."
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`None` for an org-scoped token."
+          },
+          "revoked_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix-ms revocation, or `None` while it is live."
+          },
+          "role": {
+            "type": "string",
+            "description": "The granted ceiling, not the effective role — what the token can do\ndepends on what its owner holds at the moment of each request."
+          }
+        }
+      },
       "ArtifactDto": {
         "type": "object",
         "description": "One artifact **version** in a run's list (ADR-0052, immutable per attempt\nby ADR-0056). `step`/`attempt` are the publishing provenance (empty\nstrings on pre-ADR-0056 rows); `succeeded` is that attempt's verdict;\n`of_record` marks the version the bare name-addressed download resolves\nto — the latest successful version of that name.",
@@ -2947,6 +3619,56 @@
           "subject": {
             "type": "string",
             "description": "Stable, forge-agnostic identity subject."
+          }
+        }
+      },
+      "MintTokenRequest": {
+        "type": "object",
+        "description": "`POST /v1/orgs/{org}/tokens` body. Every field is required on purpose: a\ncredential with no verb and no expiry is the shape this repo already learned\nnot to mint twice.",
+        "required": [
+          "name",
+          "role",
+          "expires_in_days"
+        ],
+        "properties": {
+          "expires_in_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Lifetime in days, `1..=365`. No default and no \"never\".",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Human label — what makes the token revocable in practice. \"demo\nkeepalive\", \"amy's laptop\"."
+          },
+          "project": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Project within the org to scope the token to. Absent = the whole org,\ninheriting down to its projects exactly as an org binding does."
+          },
+          "role": {
+            "type": "string",
+            "description": "The **ceiling**: `viewer` | `member` | `admin` | `owner`. Never more than\nthe minter holds in this scope, and capped again at each request by what\nthe owner holds *then*."
+          }
+        }
+      },
+      "MintedTokenDto": {
+        "type": "object",
+        "description": "The mint response — the **only** place the plaintext ever appears.",
+        "required": [
+          "token",
+          "record"
+        ],
+        "properties": {
+          "record": {
+            "$ref": "#/components/schemas/ApiTokenDto",
+            "description": "The token's record, for immediate display in the list it just joined."
+          },
+          "token": {
+            "type": "string",
+            "description": "The credential. Returned once, here. Scarab keeps only its SHA-256, so\nthis exact string cannot be recovered from the database, from a backup,\nor by any later API call: a lost token is re-minted, never re-read."
           }
         }
       },
@@ -3881,6 +4603,20 @@
           }
         }
       }
+    },
+    "securitySchemes": {
+      "apiToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "scarab_pat",
+        "description": "An issued API token: `Authorization: Bearer scarab_pat_…`. Mint one at `POST /v1/orgs/{org}/tokens`; it is scoped to one Org or Project, carries a role ceiling, and expires. This is what `scarab --token` / `SCARAB_TOKEN` sends."
+      },
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "scarab_session",
+        "description": "A browser login session (ADR-0049). Set by the OAuth flow, and — unlike a Bearer token — it rides ambiently, so every mutation must also double-submit the `scarab_csrf` cookie as `x-csrf-token`."
+      }
     }
   },
   "tags": [
@@ -3910,7 +4646,7 @@
     },
     {
       "name": "Auth & Identity",
-      "description": "Login/session, the current principal, OIDC discovery and JWKS, and RBAC role bindings."
+      "description": "Login/session, issued API tokens, the current principal, OIDC discovery and JWKS, and RBAC role bindings."
     },
     {
       "name": "System",

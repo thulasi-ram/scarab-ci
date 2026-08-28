@@ -421,6 +421,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the API tokens issued in an org (ADR-0049) */
+        get: operations["list_api_tokens"];
+        put?: never;
+        /** Mint an API token - the plaintext is returned ONCE (ADR-0049) */
+        post: operations["mint_api_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/orgs/{org}/tokens/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Revoke an issued API token (ADR-0049) */
+        delete: operations["revoke_api_token"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/repos": {
         parameters: {
             query?: never;
@@ -1226,6 +1261,43 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description One issued token, as the API describes it — record only, never the secret. */
+        ApiTokenDto: {
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            created_at: number;
+            created_by: string;
+            /**
+             * Format: int64
+             * @description Unix-ms.
+             */
+            expires_at: number;
+            id: string;
+            /**
+             * Format: int64
+             * @description Unix-ms of the last request that presented it, written back at most once
+             *     a minute. `None` means it has never been used.
+             */
+            last_used_at?: number | null;
+            name: string;
+            org: string;
+            /** @description The principal whose live authority bounds this token. */
+            owner_subject: string;
+            /** @description `None` for an org-scoped token. */
+            project?: string | null;
+            /**
+             * Format: int64
+             * @description Unix-ms revocation, or `None` while it is live.
+             */
+            revoked_at?: number | null;
+            /**
+             * @description The granted ceiling, not the effective role — what the token can do
+             *     depends on what its owner holds at the moment of each request.
+             */
+            role: string;
+        };
         /**
          * @description One artifact **version** in a run's list (ADR-0052, immutable per attempt
          *     by ADR-0056). `step`/`attempt` are the publishing provenance (empty
@@ -1658,6 +1730,45 @@ export interface components {
             roles: string[];
             /** @description Stable, forge-agnostic identity subject. */
             subject: string;
+        };
+        /**
+         * @description `POST /v1/orgs/{org}/tokens` body. Every field is required on purpose: a
+         *     credential with no verb and no expiry is the shape this repo already learned
+         *     not to mint twice.
+         */
+        MintTokenRequest: {
+            /**
+             * Format: int32
+             * @description Lifetime in days, `1..=365`. No default and no "never".
+             */
+            expires_in_days: number;
+            /**
+             * @description Human label — what makes the token revocable in practice. "demo
+             *     keepalive", "amy's laptop".
+             */
+            name: string;
+            /**
+             * @description Project within the org to scope the token to. Absent = the whole org,
+             *     inheriting down to its projects exactly as an org binding does.
+             */
+            project?: string | null;
+            /**
+             * @description The **ceiling**: `viewer` | `member` | `admin` | `owner`. Never more than
+             *     the minter holds in this scope, and capped again at each request by what
+             *     the owner holds *then*.
+             */
+            role: string;
+        };
+        /** @description The mint response — the **only** place the plaintext ever appears. */
+        MintedTokenDto: {
+            /** @description The token's record, for immediate display in the list it just joined. */
+            record: components["schemas"]["ApiTokenDto"];
+            /**
+             * @description The credential. Returned once, here. Scarab keeps only its SHA-256, so
+             *     this exact string cannot be recovered from the database, from a backup,
+             *     or by any later API call: a lost token is re-minted, never re-read.
+             */
+            token: string;
         };
         /**
          * @description `GET /v1/repos/{org}/{repo}/pipelines?ref=` body: the manually-dispatchable
@@ -2951,6 +3062,122 @@ export interface operations {
         responses: {
             /** @description revoked */
             204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_api_tokens: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiTokenDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description API tokens not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    mint_api_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org the token is scoped to */
+                org: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MintedTokenDto"];
+                };
+            };
+            /** @description bad role, name, or lifetime, or the role exceeds the minter's */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an admin of the target scope, or the caller is itself a token */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description API tokens not configured */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    revoke_api_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description org */
+                org: string;
+                /** @description token id - NOT the token itself */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description not an org admin */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description no such live token in this org */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

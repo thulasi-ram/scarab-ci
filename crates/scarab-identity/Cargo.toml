@@ -6,6 +6,13 @@ license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+# ADR-0031's I/O-free-library carve-out. An issued API token's identity IS the
+# SHA-256 of its plaintext (`api_token_hash`) — a pure function of the
+# credential, exactly as a snapshot's address is a pure function of its bytes.
+# The *random* half of minting is NOT here: a CSPRNG is I/O, so it stays at the
+# composition root (`scarab-server`), which is why this crate can never mint a
+# token it can verify.
+sha2 = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }

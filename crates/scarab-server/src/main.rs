@@ -826,8 +826,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_oauth_login(login)
             // Scoped RBAC (ADR-0049 C2): per-request role-in-Org/Project from
             // the native bindings in Postgres.
-            .with_rbac(pg.clone());
-        tracing::info!("authn: OAuth/OIDC login + PG sessions + scoped RBAC wired (ADR-0049)");
+            .with_rbac(pg.clone())
+            // Issued API tokens (ADR-0049 amendment): the credential a machine
+            // can hold. Gated on the SAME OAuth config as sessions, because a
+            // token is a narrowing of a human's authority — with no login there
+            // is no minter for it to be bounded by.
+            .with_api_tokens(pg.clone());
+        tracing::info!(
+            "authn: OAuth/OIDC login + PG sessions + scoped RBAC + issued API tokens wired (ADR-0049)"
+        );
     }
     // OIDC issuer for keyless federation (ADR-0014): serve JWKS + discovery so a
     // cloud provider can verify Scarab-minted tokens. The signing key is loaded

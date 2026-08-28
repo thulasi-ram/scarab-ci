@@ -296,6 +296,31 @@ impl OAuthAuthenticator {
         })
     }
 
+    /// The C1 global bootstrap role `subject` holds **right now**, decided by
+    /// subject match against the configured owners (ADR-0049 amendment).
+    ///
+    /// Deliberately narrower than [`principal_from`](Self::principal_from)'s
+    /// login-time decision, in two ways that can only ever return *less*
+    /// authority. It cannot honour an owner entry that matched a VERIFIED
+    /// EMAIL, because that email is a claim the provider asserts during login
+    /// and nothing persists it afterwards. And it never returns the blanket
+    /// `Viewer` login hands every human: a machine credential has no business
+    /// inheriting a read of the whole install.
+    ///
+    /// Used to resolve an API token owner's live global role on each request —
+    /// and, by the mint endpoint, to bound the grant. Sharing one function
+    /// across both keeps "what you were allowed to mint" and "what the token
+    /// will actually do" the same answer: an email-matched owner is told at
+    /// mint that they need a binding, rather than being handed a token that
+    /// silently holds nothing.
+    pub fn bootstrap_owner_role(&self, subject: &str) -> Option<Role> {
+        self.cfg
+            .owners
+            .iter()
+            .any(|o| o == subject)
+            .then_some(Role::Owner)
+    }
+
     /// An owner entry matches the stored subject **or** a VERIFIED email
     /// (ADR-0049 amendment): with a real OIDC issuer `sub` is an opaque
     /// per-client id, so subject-only bootstrap means pasting UUIDs before

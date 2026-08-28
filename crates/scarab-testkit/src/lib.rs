@@ -2857,6 +2857,72 @@ impl SessionStore for InMemorySessions {
     }
 }
 
+/// An in-memory [`scarab_identity::ApiTokenStore`] with the same semantics as
+/// the Postgres adapter: keyed on the hash of the plaintext (never the
+/// plaintext), revocation idempotent-but-honest, and `touch` monotonic.
+#[derive(Default)]
+pub struct InMemoryApiTokens {
+    /// hash → record. The hash is the key here for the same reason it is the
+    /// unique index there: lookup by digest is the whole verification step.
+    tokens: Mutex<HashMap<String, scarab_identity::ApiToken>>,
+}
+
+impl InMemoryApiTokens {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl scarab_identity::ApiTokenStore for InMemoryApiTokens {
+    async fn put(&self, token: &scarab_identity::ApiToken, hash: &str) -> Result<(), IdentityError> {
+        self.tokens
+            .lock()
+            .unwrap()
+            .insert(hash.to_string(), token.clone());
+        Ok(())
+    }
+
+    async fn by_hash(&self, hash: &str) -> Result<Option<scarab_identity::ApiToken>, IdentityError> {
+        Ok(self.tokens.lock().unwrap().get(hash).cloned())
+    }
+
+    async fn list(&self, org: &str) -> Result<Vec<scarab_identity::ApiToken>, IdentityError> {
+        let mut out: Vec<scarab_identity::ApiToken> = self
+            .tokens
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|t| t.scope.org() == org)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
+    async fn revoke(&self, id: &str, now_ms: i64) -> Result<bool, IdentityError> {
+        let mut rows = self.tokens.lock().unwrap();
+        let Some(t) = rows.values_mut().find(|t| t.id == id) else {
+            return Ok(false);
+        };
+        if t.revoked_at.is_some() {
+            return Ok(false);
+        }
+        t.revoked_at = Some(now_ms);
+        Ok(true)
+    }
+
+    async fn touch(&self, id: &str, now_ms: i64) -> Result<(), IdentityError> {
+        let mut rows = self.tokens.lock().unwrap();
+        if let Some(t) = rows.values_mut().find(|t| t.id == id) {
+            if t.last_used_at.is_none_or(|prev| prev < now_ms) {
+                t.last_used_at = Some(now_ms);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// An in-memory [`scarab_identity::RbacStore`] with the same origin semantics
 /// as the Postgres adapter: native rows are authoritative (imports never
 /// clobber them), a native revoke is a tombstone imports cannot resurrect,
