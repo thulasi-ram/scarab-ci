@@ -170,6 +170,14 @@ jobs:
       #
       # ⚠ Goes away with the node driver (git-bug 0628369), together with
       # docker/wsfetch/ and the executor's WorkspaceFetch.
+      # The GHA layer cache below is a BuildKit cache EXPORT, which the default
+      # `docker` driver cannot do — without this step the build fails with
+      # "Cache export is not supported for the docker driver" before any test
+      # runs. setup-buildx-action creates a `docker-container` builder, which
+      # supports both the export and the `load: true` this step needs. image.yml
+      # already does the same before its builds.
+      - uses: docker/setup-buildx-action@v3
+
       - name: Build the workspace fetcher image from the tree
         uses: docker/build-push-action@v6
         with:
