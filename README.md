@@ -18,9 +18,10 @@ Written in Rust.
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-137a52?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-137a52?style=flat-square&logo=rust&logoColor=white)](#building)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-137a52?style=flat-square&logo=kubernetes&logoColor=white)](docs/adr/0005-tenancy-and-k8s-only.md)
+[![Live demo](https://img.shields.io/badge/live%20demo-demo--scarab.ahiravan.dev-137a52?style=flat-square)](https://demo-scarab.ahiravan.dev/)
 [![Status: proven core](https://img.shields.io/badge/status-proven%20core%20%C2%B7%20edges%20wiring-b8860b?style=flat-square)](#status-honest)
 
-[Context](CONTEXT.md) · [ADRs](docs/adr/) · [Positioning](docs/positioning.md) · [Run it locally](#local-dev-cluster-free)
+[Live demo](https://demo-scarab.ahiravan.dev/) · [Context](CONTEXT.md) · [ADRs](docs/adr/) · [Positioning](docs/positioning.md) · [Run it locally](#local-dev-cluster-free)
 
 </div>
 
@@ -84,6 +85,18 @@ So: the hard core (the durable state machine) is real and tested; the claims sco
 live forge* and *a live cluster* are not yet demonstrated. Implementation proceeds in
 tracer-bullet vertical slices. See [docs/positioning.md](docs/positioning.md) for what we do
 and don't claim, and why.
+
+## Live demo
+
+**[demo-scarab.ahiravan.dev](https://demo-scarab.ahiravan.dev/)** runs the real thing: the
+control plane, the workspace service, and every step Pod on a single Oracle Always Free ARM
+box under k3s, reached through a Cloudflare Tunnel, with Cloudflare R2 as the object store —
+$0/month. The deployment mode is [`deploy/demo-oracle/`](deploy/demo-oracle/), and its README
+is the operator guide.
+
+Sign in with GitHub. Visitors land as **Viewer**, which carries no Write, so no visitor can
+dispatch a run; there is no anonymous read path in the server. It is a demo box on reclaimable
+free-tier capacity, not an SLA.
 
 ## Documentation
 
