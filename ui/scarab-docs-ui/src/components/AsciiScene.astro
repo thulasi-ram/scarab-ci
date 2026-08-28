@@ -29,6 +29,16 @@ const entry = Object.entries(scenes).find(([p]) => p.endsWith(`/${name}.json`));
 if (!entry) throw new Error(`AsciiScene: unknown scene "${name}" (run npm run bake in ui/brand/ascii)`);
 const scene = entry[1];
 const [em0, au0, fe0] = scene.frames[0];
+// Widest occupied column across every frame. The baked grid is padded to a
+// uniform `cols` so a family of scenes can share one canvas — ponder-kingofhill
+// puts a `place: "right"` bubble in columns 76..95, which the other ponder
+// scenes leave empty. Sizing the box to `cols` would centre the BOX while the
+// art sits left of centre. Measured here at build time; a bubble that reaches
+// further widens the box in the player.
+let boxCols = 0;
+for (const frame of scene.frames)
+  for (const layer of frame)
+    for (const ln of layer.split('\n')) boxCols = Math.max(boxCols, ln.trimEnd().length);
 const hasBubble = !!(scene.bubble && line);
 const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
 ---
@@ -45,7 +55,7 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
     // JetBrains Mono's advance is exactly 0.6em and line-height is set to 0.6em
     // too, so cells are SQUARE — width AND height use the same 0.6 factor.
     `--ascii-fs:${fontSize}px;` +
-    `width:${scene.cols * fontSize * 0.6}px;` +
+    `width:${boxCols * fontSize * 0.6}px;` +
     `height:${scene.rows * fontSize * 0.6}px`
   }
   role={label ? "img" : undefined}
@@ -129,6 +139,10 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
         const cell = parseFloat(node.style.getPropertyValue("--ascii-fs")) * 0.6;
         (pres[3] as HTMLElement).style.left = `${bub.col * cell}px`;
         (pres[3] as HTMLElement).style.top = `${bub.row * cell}px`;
+        // A right-placed bubble can run past the art, up to the last column.
+        const right = bub.col + Math.max(...bub.text.split("\n").map((l) => l.length));
+        const needed = Math.min(cols, right) * cell;
+        if (needed > parseFloat(node.style.width)) node.style.width = `${needed}px`;
       }
       const bubbleAt = (f: number) =>
         bub && f >= bubble!.from && f < bubble!.to ? bub.text : "";

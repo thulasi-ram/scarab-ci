@@ -65,6 +65,25 @@ function composeBubble(line: string, b: Bubble, cols: number, rows: number) {
   return { text: grid.map((r) => r.join("").replace(/\s+$/, "")).join("\n"), col: c0, row: r0 };
 }
 
+// Widest occupied column across every frame. The baked grid is padded to a
+// uniform `cols` so a family of scenes can share one canvas — ponder-kingofhill
+// puts a `place: "right"` bubble in columns 76..95, which the other ponder
+// scenes leave empty. Sizing the box to `cols` therefore centres the BOX while
+// the art sits left of centre. Measured once per baked scene and cached: the
+// frames are frozen, so the answer never changes.
+const contentColsCache = new WeakMap<Baked, number>();
+function contentCols(scene: Baked): number {
+  let w = contentColsCache.get(scene);
+  if (w === undefined) {
+    w = 0;
+    for (const frame of scene.frames)
+      for (const layer of frame)
+        for (const ln of layer.split("\n")) w = Math.max(w, ln.trimEnd().length);
+    contentColsCache.set(scene, w);
+  }
+  return w;
+}
+
 export default function AsciiScene(props: {
   scene: Baked;
   /** px per cell column; glyph advance is ~0.602 × this */
@@ -85,6 +104,12 @@ export default function AsciiScene(props: {
   const bub = bubble && props.line ? composeBubble(props.line, bubble, cols, rows) : null;
   const bubbleAt = (f: number) =>
     bub && f >= bubble!.from && f < bubble!.to ? bub.text : "";
+  // A right-placed bubble is real content and can run to the last column, so
+  // it widens the box; `cols` stays the ceiling.
+  const bubRight = bub
+    ? bub.col + Math.max(...bub.text.split("\n").map((l) => l.length))
+    : 0;
+  const boxCols = Math.min(cols, Math.max(contentCols(props.scene), bubRight));
 
   onMount(() => {
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
@@ -104,7 +129,8 @@ export default function AsciiScene(props: {
   });
 
   // Explicit box: layers are absolutely positioned, and the trimmed text lines
-  // must not size the scene (a layer can be much narrower than the grid).
+  // must not size the scene (a layer can be much narrower than the grid). The
+  // width is the OCCUPIED grid, not the declared one — see contentCols.
   // JetBrains Mono's advance is exactly 0.6em and the CSS sets line-height to
   // 0.6em too, so cells are SQUARE — width AND height use the same 0.6 factor.
   return (
@@ -112,8 +138,8 @@ export default function AsciiScene(props: {
       class={`ascii-scene ${props.class ?? ""}`}
       style={{
         "--ascii-fs": `${props.fontSize ?? 8}px`,
-        width: `${props.scene.cols * (props.fontSize ?? 8) * 0.6}px`,
-        height: `${props.scene.rows * (props.fontSize ?? 8) * 0.6}px`,
+        width: `${boxCols * cell}px`,
+        height: `${props.scene.rows * cell}px`,
       }}
       role={props.label ? "img" : undefined}
       aria-label={props.label}
