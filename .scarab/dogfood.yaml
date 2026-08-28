@@ -26,10 +26,28 @@
 name: Dogfood — kitchen-sink pipeline
 
 # --- on: triggers (ADR-0009/0010) -------------------------------------------
-# push (filtered to main via a CEL `when:`), pull_request, and manual dispatch.
+# pull_request and manual dispatch. NO `push:` — deliberately.
+#
+# This pipeline is sized for a build farm, not for the public demo box
+# (deploy/demo-oracle: one Oracle Always Free A1, 2 OCPU / 12 GB, which also
+# runs the control plane, the workspace service and Postgres). It wants a
+# 3-leg matrix — each leg a step Pod plus a Redis sidecar — and a BuildKit
+# step asking for an explicit 1000m. A step Pod's effective request there is
+# ~750m (the step container plus the results-egress and workspace-egress
+# sidecars), so roughly TWO step Pods fit on the whole node.
+#
+# With `push:` on, every commit to main started another dogfood run. Being a
+# deploy (`environment:` below) it opts OUT of newest-wins supersede, so the
+# runs never superseded one another; each one started its own Run-scoped
+# Postgres service, the node's CPU saturated, step Pods went unschedulable, and
+# `.scarab/ci.yaml` — the small pipeline this demo actually exists to show —
+# dead-lettered with `checkout: Infra { never_started: true }` because its Pod
+# could not be scheduled either.
+#
+# Dispatch it by hand when you want the full tour; do not let every commit
+# start one. (`pull_request:` is left on, and carries the same cost — drop it
+# too if PRs to this repo ever become frequent.)
 on:
-  push:
-    when: "event.branch == 'main'"
   pull_request: {}
   manual: {}
 
