@@ -250,6 +250,11 @@ code,
   font-size: var(--ascii-fs, 8px);
   /* square cell = 0.6em advance x 0.6em line-height (no squash; bake aspect 1.0) */
   line-height: calc(var(--ascii-fs, 8px) * 0.6);
+  /* The baked layers are trimmed of trailing spaces, so every row is a
+     different length. An inherited `text-align: center` (e.g. .empty-scene)
+     then centres each row independently and shears the scene apart. The grid
+     is absolute: always align from the start edge. */
+  text-align: left;
   user-select: none;
 }
 .ascii-scene .ascii-em { color: var(--emerald); }
@@ -257,8 +262,15 @@ code,
 .ascii-scene .ascii-fe { color: var(--muted-sage); }
 /* Runtime speech bubble (ponder-* stages): crisp foreground text over the
    dotted art, deliberately off-language from the dot-matrix — reads as a
-   terminal caption. */
-.ascii-scene .ascii-bubble { color: var(--soft-white); }
+   terminal caption. Unlike the art layers it is real TEXT, so it does NOT take
+   the square cell: 1em glyphs in a 0.6em line box overlap into a smudge. It
+   keeps a 1em line box and is anchored at its own origin (the player sets
+   left/top) instead of being stretched over the grid. */
+.ascii-scene .ascii-bubble {
+  color: var(--soft-white);
+  inset: auto;
+  line-height: var(--ascii-fs, 8px);
+}
 
 /* Dashboard footer: the dung beetle walks its ball across the full viewport
    on a copper ground line. `.rolling` runs the motion (frames + travel); it is

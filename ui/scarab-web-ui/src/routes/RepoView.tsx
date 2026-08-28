@@ -280,7 +280,7 @@ export default function RepoView() {
                   <div class="empty-scene">
                     <AsciiScene
                       scene={ponderIdle}
-                      fontSize={5}
+                      fontSize={8}
                       label="Beetle pausing beside its ball"
                       line={"no runs yet.\npush something\nto get rolling."}
                     />
