@@ -298,7 +298,9 @@ budget alert is the real safety net.
   `securitySchemes` at all. No PAT, no service account, no client-credentials
   grant. **Closing this is a server feature** — issued API tokens, a
   `Principal`-bearing credential minted by an Owner with a verb and an expiry —
-  and it is worth an ADR.
+  and it is worth an ADR. **Designed out in
+  `docs/handoffs/issued-api-tokens.md`** — the client surface already exists
+  (`scarab-cli` takes `--token`/`SCARAB_TOKEN`), only the credential is missing.
 - **`cron:` triggers are inert.** The DSL parses them and `Event::Cron` exists,
   but nothing constructs one — outside its own unit tests it appears only in
   `match` arms. There is no scheduler.
