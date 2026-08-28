@@ -1,11 +1,17 @@
 # Handoff — issued API tokens (the missing machine credential)
 
-> **Status (2026-08-28): the server-side credential is BUILT** — commit
-> `feat(auth): issued API tokens`. Migration `0051_api_tokens`, prefix routing in
+> **Status (2026-08-28): the credential and its UI are BUILT.** Server side, in
+> `feat(auth): issued API tokens`: migration `0051_api_tokens`, prefix routing in
 > `authenticate()`, mint/list/revoke under `/v1/orgs/{org}/tokens`,
-> `securitySchemes` in `openapi.json`, and the tests below. **What is left: the
-> Settings UI section** (mint dialog with the one-time plaintext reveal, the list
-> with `last_used_at`, revoke) and a docs page under `usage/`.
+> `securitySchemes` in `openapi.json`, and the tests below. UI side, in
+> `feat(web-ui): mint, watch and revoke API tokens from Settings`: a Settings
+> panel with the list (scope, ceiling, `last_used_at`, expiry), revoke, and a mint
+> dialog whose one-time reveal will not close on Escape or a scrim click. That
+> commit also fixed a real gap this one left — mint's `#[utoipa::path]` declared
+> no `request_body`, so the generated client typed the mint body as `undefined`
+> and the call did not compile.
+>
+> **What is left: a docs page under `usage/`.**
 >
 > The open questions at the bottom were answered: authority is the carried
 > ceiling ∩ the owner's live bindings; tokens are person-owned, with a machine
