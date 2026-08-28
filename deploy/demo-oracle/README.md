@@ -5,25 +5,28 @@ on a single Oracle Cloud **Always Free** A1 instance — arm64, 2 OCPU, 12 GB RA
 Ubuntu 24.04, 200 GB boot volume. That one machine is the whole deployment:
 control plane, workspace service, Postgres, the tunnel, **and** every step Pod.
 
-> **Unverified:** nothing in this directory has been run against a real Oracle
-> instance. The chart renders with these values, every chart key and every
-> `SCARAB_*` env var here was checked against `deploy/helm/scarab/values.yaml`,
-> `deploy/helm/scarab/templates/` and `crates/scarab-server/src/config.rs`, the
-> scripts pass `bash -n`, and the manifests parse. None of that is the same as a
-> box that came up. The parts most likely to be wrong, in order:
+> **Status (2026-08-27): deployed and serving.** `https://demo-scarab.ahiravan.dev`
+> returns 200, `/readyz` is 200 (Postgres *and* R2 reachable), `/v1/auth/login`
+> 302s to the provider with PKCE `S256`, and the nightly `pg_dump` CronJob has
+> written a dump to R2 on its own. Three things this directory assumed were
+> wrong, and are fixed: see "What the first deploy found" below.
 >
-> 1. **the OCI iptables repair** — the exact rules Oracle's stock Ubuntu image
->    ships have not been read off a live instance, only the well-documented
->    `REJECT --reject-with icmp-host-prohibited` at the end of INPUT/FORWARD;
-> 2. **step Pods in their own namespace** (`scarab.namespace: scarab-steps`) —
->    the chart supports it by design and renders the executor RBAC there, but no
->    other deployment mode in this repo uses a non-default exec namespace;
-> 3. **R2 as the object store** — `object_store` 0.14 path-style against
->    `https://<account>.r2.cloudflarestorage.com` should be fine and the Depot's
->    uniform 8 MiB multipart parts satisfy R2's equal-part-size rule, but the
->    combination has not been exercised;
-> 4. **the two-core budget** — `cargo check` in a step Pod on two shared Ampere
->    cores is a guess, not a measurement.
+> Still **unproven**, in order of how likely they are to bite:
+>
+> 1. **R2 under real load.** The credential path is proven (list/put/get/delete
+>    from inside the cluster, plus the backup CronJob), but the Depot's
+>    multipart pack write path against R2 has not been exercised by an actual
+>    drain — that needs a run with a workspace.
+> 2. **The two-core budget.** `cargo check` in a step Pod on two shared Ampere
+>    cores is still a guess, not a measurement. Nothing has run yet.
+> 3. **Step Pods in their own namespace** (`scarab.namespace: scarab-steps`).
+>    The chart supports it and renders the executor RBAC there, but no other
+>    deployment mode in this repo uses a non-default exec namespace, and no step
+>    Pod has been launched here.
+>
+> The OCI iptables repair is no longer on this list: the live ruleset was read
+> off the instance and matches what `bootstrap.sh` targets, and pod networking
+> was smoke-tested (cluster DNS, service-CIDR routing, egress to ghcr.io).
 
 ## What runs where
 
@@ -103,6 +106,60 @@ the box is publicly reachable, so real GitHub deliveries arrive on their own.
 The App **PEM** is a different matter and is handled: `deploy.sh` puts
 `SCARAB_APP_PEM` into a k8s Secret the chart mounts, so the server holds the
 credential at boot and it survives a DB wipe or restore.
+
+## What the first deploy found
+
+Three defects, all fixed, recorded because each one is invisible until you run
+this mode specifically.
+
+**`kubectl` did not work as `ubuntu`.** `/usr/local/bin/kubectl` is a symlink to
+the k3s binary, and that wrapper prefers `/etc/rancher/k3s/k3s.yaml` over
+`$HOME/.kube/config` and does **not** fall back when it cannot read it — so a
+root-only kubeconfig broke kubectl for the very user `deploy.sh` runs as, even
+with a perfectly good copy in their home directory. `bootstrap.sh` now passes
+`--write-kubeconfig-group`. Rejected the one-character alternative
+(`--write-kubeconfig-mode 0644`): world-readable cluster-admin credentials on a
+public box.
+
+**Re-running `bootstrap.sh` poisoned `/etc/iptables/rules.v4`.**
+`netfilter-persistent save` snapshots the *live* ruleset, so running it once k3s
+was up baked 79 lines of kube-proxy / kube-router / flannel runtime chains into
+the file — including stale `kube-dns … has no endpoints -j REJECT` rules, which
+`netfilter-persistent` then restores **at boot, before k3s starts**. kube-proxy
+full-syncs and heals it, but a persisted DNS reject is precisely the failure
+class that section exists to prevent. The save is now skipped when k3s is
+already installed.
+
+**The chart did not give the workspace StatefulSet the OAuth client secret.**
+Fixed in the chart, not here (`deploy/helm/scarab/templates/statefulset-workspace.yaml`).
+The Pod saw four of five `SCARAB_OAUTH_*` values and refused to boot, since
+ADR-0049 makes a provider all-five-or-none and ADR-0048 validates config before
+the role is dispatched. Unreachable from `deploy/local-helm`, which runs
+`SCARAB_DEV_INSECURE=true`; this mode is the first with authentication actually
+on. Fixing it exposed a second problem now guarded in `deploy.sh`: a
+StatefulSet's RollingUpdate will not replace a Pod that never became Ready, so
+the corrected template changed nothing until the Pod was deleted by hand.
+
+### Fixes applied directly to the running box
+
+Every fix above is in `bootstrap.sh`, so a **fresh** box gets them from the
+script. The box that already exists was repaired **in place**, because bootstrap
+had already run on it. The two states are equivalent; they were reached by
+different routes, and that is worth knowing before you debug the live host.
+
+| What | On a fresh box | On the box that exists |
+|---|---|---|
+| kubeconfig group | `--write-kubeconfig-group` at install time | `--write-kubeconfig-group ubuntu` added to `ExecStart` in `/etc/systemd/system/k3s.service`, `daemon-reload`, `systemctl restart k3s` |
+| `rules.v4` | never saved after k3s is up | rewritten once: every `KUBE-*`/`FLANNEL-*`/`CNI-*`/`cali*` chain declaration, every rule in those chains, and every builtin rule jumping to one were stripped; validated with `iptables-restore --test` before install. What remains is the base ruleset — Oracle's 17-line `InstanceServices` chain, the SSH accept, both trailing REJECTs, and the eight pod/service ACCEPTs |
+| UDP buffers for QUIC | `/etc/sysctl.d/99-scarab-udp-buffers.conf` | same file, written by hand |
+
+Consequences to keep in mind:
+
+* `--write-kubeconfig-group` is an **install-time** flag baked into the systemd
+  unit. If you ever re-run `get.k3s.io` on this host, re-check `ExecStart` —
+  a reinstall can rewrite the unit and silently take the group back off.
+* Do **not** replay these by hand on a rebuilt box. Run `bootstrap.sh`; it does
+  all three, in the right order, before k3s exists.
 
 ## The operational facts that matter
 
@@ -218,6 +275,10 @@ So, if Oracle reclaims the instance:
   (a cache: it re-fills from R2, at the cost of cache misses);
 * **must be replayed** — `bootstrap.sh`, `.env` (keep it somewhere else!), and
   the App installation registration.
+
+**Verified working (2026-08-27):** the CronJob ran on its own and left
+`pg/scarab-5.dump` in the bucket, which exercises the day-of-week rotation and a
+second, independent R2 writer besides the control plane.
 
 Two values in `.env` are the ones you cannot lose: `SCARAB_MASTER_KEY` (change it
 and every stored secret becomes undecryptable) and, if you keep the DB,
