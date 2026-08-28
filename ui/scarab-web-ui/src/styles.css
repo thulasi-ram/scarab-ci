@@ -316,23 +316,6 @@ code,
   .modal-scrim, .modal, .usermenu-pop { transition-property: opacity; }
 }
 
-/* The traced emblem as a faint background mark (doodle placement rules). */
-.ascii-watermark {
-  position: absolute;
-  z-index: 0;
-  top: 52px;
-  right: 36px;
-  margin: 0;
-  font-family: var(--font-mono);
-  font-size: 7px;
-  line-height: calc(7px * 0.6); /* square cells: emblem-mark is baked unsquashed */
-  color: var(--copper);
-  opacity: 0.3;
-  transform: rotate(-6deg);
-  pointer-events: none;
-  user-select: none;
-}
-
 h1 {
   font-family: var(--font-display);
   /* The biform is WIDE — it carries presence through width, not height, so

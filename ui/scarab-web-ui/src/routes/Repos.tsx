@@ -19,7 +19,6 @@ import Icon from "../components/Icon";
 import RunBars from "../components/RunBars";
 import AsciiScene from "../components/AsciiScene";
 import dungroller from "../../../brand/ascii/generated/dungroller-bare.json";
-import emblemMark from "../../../brand/ascii/generated/emblem-mark.txt?raw";
 
 const runHref = (r: RunSummary) => `/${r.org ?? "api"}/${r.project ?? "unknown"}/runs/${r.id}`;
 const tenant = (r: RunSummary) => (r.org && r.project ? `${r.org}/${r.project}` : null);
@@ -101,8 +100,6 @@ export default function Repos() {
   return (
     <>
       <section class="page">
-        <pre class="ascii-watermark" aria-hidden="true">{emblemMark}</pre>
-
         <div class="page-head">
           <h1>Dashboard</h1>
         </div>
