@@ -5443,6 +5443,7 @@ const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
     post,
     path = "/v1/orgs/{org}/tokens",
     params(("org" = String, Path, description = "org the token is scoped to")),
+    request_body = MintTokenRequest,
     summary = "Mint an API token - the plaintext is returned ONCE (ADR-0049)",
     responses(
         (status = 201, body = MintedTokenDto),

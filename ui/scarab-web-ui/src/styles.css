@@ -3080,3 +3080,105 @@ h1, .crumb-head, .run-title {
   color: var(--muted-sage);
   font-size: 12px;
 }
+
+/* ════════════════════════════════════════════════════════════════════════
+   Issued API tokens (ADR-0049) — Settings › API tokens
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* One block per token, same rhythm as .conn: an identity line with its action,
+   then a fact line. A dead token stays legible rather than being hidden — the
+   graveyard is how you tell that a credential you were worried about is
+   genuinely gone — but it recedes. */
+.tok-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+.tok {
+  border: 1px solid var(--border-soft);
+  border-radius: 5px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 7px;
+}
+.tok-dead { opacity: 0.6; }
+.tok-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.tok-name { color: var(--soft-white); font-size: 13.5px; }
+.tok-scope { font-size: 12px; color: var(--muted-sage); }
+/* The ceiling, edged not filled (§edges) — copper, because it is a grant and
+   not a status. Reads "up to admin" in the markup; the box is only the frame. */
+.tok-role {
+  font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--copper); border: 1px solid var(--border-copper); border-radius: 4px;
+  padding: 1px 6px; white-space: nowrap;
+}
+.tok-state {
+  font-family: var(--font-mono); font-size: 9.5px;
+  text-transform: uppercase; letter-spacing: 0.7px;
+  border: 1px dotted currentColor; border-radius: 3px; padding: 1px 5px;
+}
+.tok-revoked { color: var(--danger); }
+.tok-expired { color: var(--muted-sage); }
+.tok-revoke { margin-left: auto; }
+.tok-count { font-family: var(--font-mono); color: var(--sage); }
+.tok-facts {
+  display: flex; gap: 18px; flex-wrap: wrap;
+  font-size: 12px; align-items: center; color: var(--muted-sage);
+}
+.tok-facts > span { display: inline-flex; align-items: center; gap: 5px; }
+/* Inside the two-week renewal window: a warning an operator can still act on,
+   which is the only reason to colour it at all. */
+.tok-soon { color: var(--copper); }
+
+/* ---- mint dialog ---- */
+/* The default .modal clips its overflow, which is fine for a two-field dialog
+   and hides the primary button on a four-field one. Column layout with a
+   bounded height: the body scrolls, the footer never leaves. */
+.modal-tall {
+  display: flex;
+  flex-direction: column;
+  max-height: min(74vh, 720px);
+}
+.modal-tall .modal-body { overflow-y: auto; min-height: 0; }
+.modal-foot {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 14px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--pine-deep);
+}
+.modal-foot .modal-actions { margin-top: 0; }
+/* Fields go full width here: the form asks four questions, and a row of default
+   -width inputs reads as a settings row rather than as a sequence. */
+.token-form .form-r { display: flex; flex-direction: column; }
+.token-form .input, .token-form select.input { width: 100%; }
+.token-form select.input { cursor: pointer; }
+.fieldnote {
+  margin: 5px 0 0;
+  font-size: 11.5px; line-height: 1.45; color: var(--muted-sage);
+}
+.tok-life { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tok-days { width: 88px; }
+.tok-life-unit { font-size: 12px; color: var(--muted-sage); margin-right: 4px; }
+.tok-preset-on { border-color: var(--emerald); color: var(--emerald); }
+
+/* ---- the one-time reveal ---- */
+/* Deliberately loud. This is the only moment the plaintext exists outside the
+   holder's hands, and a quiet panel is one people close without reading. */
+.tok-warn {
+  display: flex; gap: 9px; align-items: flex-start; margin: 0;
+  font-size: 12.5px; line-height: 1.5; color: var(--copper);
+  border: 1px dashed var(--border-copper); border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+.tok-warn svg { flex: none; margin-top: 2px; }
+/* The secret itself: selectable, wrapping, never truncated with an ellipsis —
+   a copy button can fail (no clipboard permission, an insecure origin), and
+   when it does, hand-selecting the string has to actually work. */
+.tok-secret {
+  display: block;
+  background: var(--terminal);
+  border: 1px solid var(--terminal-line);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  color: var(--terminal-ink);
+  font-size: 12.5px;
+  line-height: 1.5;
+  word-break: break-all;
+  user-select: all;
+}

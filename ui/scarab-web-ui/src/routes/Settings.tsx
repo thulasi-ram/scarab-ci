@@ -10,14 +10,18 @@
 // rather than a wall of failed fetches. Layout hides the nav entry too — belt
 // and braces, not a security boundary.
 //
-// Two sections today: **Connections** (which forges Scarab is wired to, and what
-// they cover) and **Org Secrets** (the top of the `env → repo → org` inheritance
-// chain, until now settable only by raw HTTP). Connections comes first: without
-// one there are no Projects, so nothing else here has anything to act on.
+// Three sections today: **Connections** (which forges Scarab is wired to, and
+// what they cover), **API tokens** (ADR-0049 — the credential a machine can
+// hold, minted here and nowhere else) and **Org Secrets** (the top of the
+// `env → repo → org` inheritance chain, until now settable only by raw HTTP).
+// Connections comes first: without one there are no Projects, so nothing else
+// here has anything to act on. Tokens sit above secrets because they are the
+// only thing on this page that hands out authority rather than data.
 import { createResource, Show } from "solid-js";
 import { getMe } from "../api/client";
 import ScopedSecrets from "../components/ScopedSecrets";
 import Connections from "../components/Connections";
+import ApiTokens from "../components/ApiTokens";
 import Icon from "../components/Icon";
 
 export default function Settings() {
@@ -56,12 +60,12 @@ export default function Settings() {
             when={org()}
             fallback={
               <div class="panel">
-                <div class="panel-h"><span>Org secrets</span></div>
+                <div class="panel-h"><span>API tokens &amp; org secrets</span></div>
                 <div class="secrets-body">
                   <p class="empty">
                     No organization yet. An org comes into being with its first connected
-                    repository — connect a forge and bind a repo, then org-wide secrets
-                    live here.
+                    repository — connect a forge and bind a repo, then org-wide secrets and
+                    API tokens live here.
                   </p>
                 </div>
               </div>
@@ -69,6 +73,10 @@ export default function Settings() {
           >
             {(o) => (
               <>
+                {/* Org-scoped: a token narrowed to one Project is still issued
+                    against the org that contains it, so this needs the same
+                    `admin_orgs[0]` the secrets below do. */}
+                <ApiTokens org={o()} />
                 <ScopedSecrets
                   scope={{ org: o() }}
                   title={`Org secrets · ${o()}`}

@@ -488,6 +488,68 @@ const secretMatrix = {
   ],
 };
 
+// ── /v1/orgs/{org}/tokens (ADR-0049) ──────────────────────────────────────
+// Four records covering every state the panel renders differently: a live token
+// in daily use, one narrowed to a single project, one inside the two-week
+// expiry warning, and a revoked one (the graveyard row that proves a killed
+// credential stays visible). No plaintext anywhere — the mint 201 below is the
+// only place one exists, and it is obviously fake.
+const day = 86_400_000;
+const apiTokens = [
+  {
+    id: "9f2c1d84-0f2b-4f3a-9a11-2b7c5d0e4a10",
+    name: "release-bot",
+    owner_subject: "a.kim",
+    org: "acme",
+    project: null,
+    role: "member",
+    created_by: "a.kim",
+    created_at: ago(40 * day),
+    expires_at: now + 50 * day,
+    last_used_at: ago(4 * min),
+    revoked_at: null,
+  },
+  {
+    id: "3b7a9c02-6d41-4b8e-8c22-71f0ab993c55",
+    name: "orders-api deploy gate",
+    owner_subject: "j.lee",
+    org: "acme",
+    project: "orders-api",
+    role: "admin",
+    created_by: "a.kim",
+    created_at: ago(9 * day),
+    expires_at: now + 81 * day,
+    last_used_at: ago(3 * 60 * min),
+    revoked_at: null,
+  },
+  {
+    id: "c41e7f60-2a88-4f19-b0d3-5e6a7c1b2d34",
+    name: "status poller",
+    owner_subject: "a.kim",
+    org: "acme",
+    project: null,
+    role: "viewer",
+    created_by: "a.kim",
+    created_at: ago(84 * day),
+    expires_at: now + 6 * day,
+    last_used_at: ago(52 * min),
+    revoked_at: null,
+  },
+  {
+    id: "7d5b0e13-9c44-4a27-8e61-0f3d2c8a55b7",
+    name: "amy's laptop",
+    owner_subject: "a.kim",
+    org: "acme",
+    project: null,
+    role: "member",
+    created_by: "a.kim",
+    created_at: ago(120 * day),
+    expires_at: now + 20 * day,
+    last_used_at: ago(30 * day),
+    revoked_at: ago(11 * day),
+  },
+];
+
 // ── router ────────────────────────────────────────────────────────────────
 function json(body: unknown, init?: ResponseInit) {
   return new Response(JSON.stringify(body), {
@@ -497,7 +559,10 @@ function json(body: unknown, init?: ResponseInit) {
   });
 }
 
-function route(pathname: string, search: string): Response | null {
+// `method` matters for exactly one surface so far — minting a token POSTs to
+// the same path the list GETs — so it is threaded through rather than having
+// the token route guess from the body.
+function route(pathname: string, search: string, method: string): Response | null {
   const p = pathname;
   if (p === "/v1/me") return json(me);
   if (p === "/v1/repos") return json(projects);
@@ -519,6 +584,30 @@ function route(pathname: string, search: string): Response | null {
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/secrets\/matrix$/.test(p)) return json(secretMatrix);
   // /v1/repos/{org}/{repo}/refs  (ref picker — not on the shot screens)
   if (/^\/v1\/repos\/[^/]+\/[^/]+\/refs$/.test(p)) return json({ refs: [] });
+
+  // /v1/orgs/{org}/tokens — list, and a mint that returns an obviously-fake
+  // plaintext so the one-time reveal can be exercised (and screenshotted)
+  // without a server. Nothing is persisted: the list is the fixture above.
+  if (/^\/v1\/orgs\/[^/]+\/tokens$/.test(p)) {
+    if (method === "POST") {
+      return json(
+        {
+          token: "scarab_pat_EXAMPLE0NOTAREALTOKEN0000000000000000000000",
+          record: {
+            ...apiTokens[0],
+            id: "0000ffff-0000-4fff-8fff-000000000000",
+            name: "new token",
+            created_at: now,
+            expires_at: now + 90 * day,
+            last_used_at: null,
+          },
+        },
+        { status: 201 },
+      );
+    }
+    return json(apiTokens);
+  }
+  if (/^\/v1\/orgs\/[^/]+\/tokens\/[^/]+$/.test(p)) return json({}, { status: 204 });
 
   if (p === "/v1/connections") return json(connections);
   if (/^\/v1\/connections\/[^/]+\/available-repos$/.test(p)) return json(availableRepos);
@@ -588,6 +677,16 @@ function urlOf(input: RequestInfo | URL): string {
   return (input as Request).url;
 }
 
+/** The verb, from wherever the caller put it: `openapi-fetch` passes a built
+ * `Request`, hand-rolled calls pass `init.method`, a bare URL means GET. */
+function methodOf(input: RequestInfo | URL, init?: RequestInit): string {
+  if (init?.method) return init.method.toUpperCase();
+  if (typeof input !== "string" && !(input instanceof URL)) {
+    return (input as Request).method.toUpperCase();
+  }
+  return "GET";
+}
+
 export function installMock() {
   // Optional theme pin via `?theme=dark|light` — deterministic for capture.
   // Without it, the app's normal stored/toggle theme applies.
@@ -612,7 +711,7 @@ export function installMock() {
     } catch {
       /* fall through to real fetch */
     }
-    const res = pathname ? route(pathname, search) : null;
+    const res = pathname ? route(pathname, search, methodOf(input, init)) : null;
     if (res) return Promise.resolve(res);
     return realFetch(input as RequestInfo, init);
   }) as typeof window.fetch;

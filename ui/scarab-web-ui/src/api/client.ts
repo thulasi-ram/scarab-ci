@@ -150,6 +150,81 @@ export async function logout(): Promise<void> {
   setUnauthenticated(true);
 }
 
+// --- Issued API tokens (ADR-0049) — the credential a machine can hold. ---
+//
+// The plaintext exists in exactly ONE response, the mint 201, and nowhere else.
+// Scarab stores only its SHA-256, so a token that is not copied out of the
+// dialog that reveals it is re-minted, never re-read: there is deliberately no
+// call here that can fetch an existing token's secret, because the server has
+// nothing to answer with.
+//
+// A record's `role` is the granted CEILING, not the effective role — what the
+// token may actually do is that ceiling ∩ what its owner holds at the moment of
+// each request, so display it as "up to" and never as a promise.
+
+/** One issued token's record — never the secret. */
+export type ApiToken = components["schemas"]["ApiTokenDto"];
+/** The mint response: the plaintext, once, plus the record it just created. */
+export type MintedToken = components["schemas"]["MintedTokenDto"];
+/** The mint body — name, ceiling role and lifetime are all required. */
+export type MintTokenRequest = components["schemas"]["MintTokenRequest"];
+
+/**
+ * The tokens issued in an org (`GET /v1/orgs/{org}/tokens`), org- and
+ * project-scoped alike.
+ *
+ * Returns `null` when the deployment has no token store — every token endpoint
+ * answers 404 before it authorizes anything, so that is "this server cannot
+ * issue tokens", not "you have none" and not a failure. The caller renders the
+ * difference; collapsing the three would tell an admin their tokens vanished.
+ */
+export async function listApiTokens(org: string): Promise<ApiToken[] | null> {
+  const { data, error, response } = await api.GET("/v1/orgs/{org}/tokens", {
+    params: { path: { org } },
+  });
+  if (response.status === 404) return null;
+  if (error || !data) {
+    throw new Error(errorText(error) || "failed to load API tokens");
+  }
+  return data;
+}
+
+/**
+ * Mint a token (`POST /v1/orgs/{org}/tokens`). The 201 body carries the
+ * plaintext — the only time it exists outside the caller's hands.
+ *
+ * The 400s are worth surfacing verbatim rather than flattening to "invalid":
+ * the server explains *which* ceiling was exceeded and what the minter actually
+ * holds, which is the whole answer to "why can I not mint this".
+ */
+export async function mintApiToken(
+  org: string,
+  body: MintTokenRequest,
+): Promise<MintedToken> {
+  const { data, error, response } = await api.POST("/v1/orgs/{org}/tokens", {
+    params: { path: { org } },
+    body,
+  });
+  if (error || !data) {
+    throw new Error(errorText(error) || `could not mint the token (${response.status})`);
+  }
+  return data;
+}
+
+/**
+ * Revoke a token (`DELETE /v1/orgs/{org}/tokens/{id}`) — permanent, and
+ * effective on the very next request that presents it. `id` is the record's id,
+ * never the credential.
+ */
+export async function revokeApiToken(org: string, id: string): Promise<void> {
+  const { error, response } = await api.DELETE("/v1/orgs/{org}/tokens/{id}", {
+    params: { path: { org, id } },
+  });
+  if (error) {
+    throw new Error(errorText(error) || `could not revoke the token (${response.status})`);
+  }
+}
+
 /** List a run's artifacts of record (`GET /v1/runs/{id}/artifacts`, ADR-0052). */
 export async function listArtifacts(id: string): Promise<Artifact[]> {
   const { data, error } = await api.GET("/v1/runs/{id}/artifacts", {
