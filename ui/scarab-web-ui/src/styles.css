@@ -298,10 +298,10 @@ code,
     transform: translateX(min(72vw, 900px)) !important;
   }
   /* Keep color/border feedback, drop the press-scale movement. */
-  .btn:not(:disabled):active, .theme-toggle:active, .search-chip:active,
+  .btn:not(:disabled):active, .search-chip:active,
   .brand:active, .repo-card:active { transform: none; }
   /* Overlays + icon: keep the opacity fade, drop the scale/rotate movement. */
-  .modal-scrim, .modal, .usermenu-pop, .tt-icon { transition-property: opacity; }
+  .modal-scrim, .modal, .usermenu-pop { transition-property: opacity; }
 }
 
 /* The traced emblem as a faint background mark (doodle placement rules). */
@@ -378,7 +378,7 @@ h2 {
    ring on the interactive controls — kept instant, not eased: a laggy focus
    ring reads as sluggish. Mouse clicks don't trigger it (:focus-visible). */
 .btn:focus-visible, .tab:focus-visible, .brand:focus-visible,
-.search-chip:focus-visible, .theme-toggle:focus-visible, .avatar:focus-visible,
+.search-chip:focus-visible, .topbar-link:focus-visible, .avatar:focus-visible,
 .repo-card:focus-visible, .repo-row:focus-visible, .fpill:focus-visible,
 .um-item:focus-visible, .crumb:focus-visible,
 input:focus-visible, textarea:focus-visible, select:focus-visible {
@@ -1358,41 +1358,10 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .search-chip:hover { border-color: var(--emerald); color: var(--sage); }
 .search-chip:active { transform: scale(0.97); }
-.theme-toggle {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 30px; height: 30px; border-radius: 7px; cursor: pointer;
-  background: var(--emerald-surface); border: 1px solid var(--border);
-  color: var(--muted-sage);
-  transition: color 0.12s var(--ease-out), border-color 0.12s var(--ease-out),
-    transform 0.12s var(--ease-out);
-}
-.theme-toggle:hover { color: var(--copper); border-color: var(--copper); }
-.theme-toggle:active { transform: scale(0.94); }
-/* Topbar icon LINK (the org-settings gear, ADR-0060) — same affordance as the
-   theme toggle so the cluster reads as one control group. `active` marks the
-   current route, not the press state, so it stays lit while you're in there. */
-.topbar-icon {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 30px; height: 30px; border-radius: 7px;
-  background: var(--emerald-surface); border: 1px solid var(--border);
-  color: var(--muted-sage);
-  transition: color 0.12s var(--ease-out), border-color 0.12s var(--ease-out),
-    transform 0.12s var(--ease-out);
-}
-.topbar-icon:hover { color: var(--copper); border-color: var(--copper); }
-.topbar-icon:active { transform: scale(0.94); }
-.topbar-icon.active { color: var(--emerald); border-color: var(--emerald); }
-/* Both icons are stacked; the theme crossfades + rotates between them rather
-   than hard-swapping. The toggle is infrequent, so a little delight is earned. */
-.theme-toggle { position: relative; }
-.tt-icon {
-  position: absolute; top: 50%; left: 50%;
-  transition: opacity 0.16s var(--ease-out), transform 0.22s var(--ease-out);
-}
-.tt-sun  { opacity: 0; transform: translate(-50%, -50%) rotate(-90deg) scale(0.5); }
-.tt-moon { opacity: 1; transform: translate(-50%, -50%) rotate(0) scale(1); }
-[data-theme="dark"] .tt-sun  { opacity: 1; transform: translate(-50%, -50%) rotate(0) scale(1); }
-[data-theme="dark"] .tt-moon { opacity: 0; transform: translate(-50%, -50%) rotate(90deg) scale(0.5); }
+/* The top bar's icon-button cluster (theme toggle + org-settings gear) lived
+   here. Both moved into the user menu — per-account controls belong with the
+   account — so their rules and the sun/moon crossfade went with them. Docs and
+   API took the space, as `.topbar-link` text links below. */
 .avatar {
   width: 26px; height: 26px; border-radius: 50%;
   background: var(--pine);
@@ -2112,9 +2081,13 @@ h1, .crumb-head, .run-title {
 .avatar:hover { border-color: var(--emerald); }
 .avatar-init {
   font-family: var(--font-ui); font-size: 11px; font-weight: 600;
-  color: var(--soft-white); letter-spacing: 0.3px;
+  /* --on-pine, NOT --soft-white. The avatar circle is `--pine` in BOTH themes
+     (#14241b light, #17392a dark), but --soft-white FLIPS meaning between them:
+     near-black ink on light, pale on dark. So light mode drew black initials on
+     a near-black circle. --on-pine exists for exactly this — text on the pine
+     fill, light in both themes — and needs no per-theme override. */
+  color: var(--on-pine); letter-spacing: 0.3px;
 }
-[data-theme="dark"] .avatar-init { color: #eaf3ee; }
 .usermenu-pop {
   position: absolute; top: 38px; right: 0; z-index: 60; width: 232px;
   background: var(--emerald-elevated); border: 1px solid var(--border);
@@ -2141,6 +2114,22 @@ h1, .crumb-head, .run-title {
   font-family: var(--font-ui); font-size: 12.5px; color: var(--sage);
 }
 .um-item:hover { background: color-mix(in srgb, var(--emerald) 8%, transparent); color: var(--soft-white); }
+/* Rows carry an icon now, and one of them is an <A> rather than a <button>. */
+.um-item { display: flex; align-items: center; gap: 8px; }
+.um-link { text-decoration: none; }
+.um-icon-slot { display: inline-block; width: 14px; flex: none; }
+
+/* Top-bar text links (Docs, API). Quieter than the search chip beside them:
+   destinations you occasionally want, not the primary action. */
+.topbar-link {
+  font-family: var(--font-ui); font-size: 12.5px; color: var(--sage);
+  text-decoration: none; padding: 5px 8px; border-radius: 7px;
+  white-space: nowrap;
+}
+.topbar-link:hover {
+  color: var(--soft-white);
+  background: color-mix(in srgb, var(--emerald) 8%, transparent);
+}
 
 /* Search chip: show a label + a keycap, and open the palette on click. */
 .search-chip-label { color: var(--muted-sage); }
