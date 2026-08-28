@@ -1,5 +1,21 @@
 # Handoff — issued API tokens (the missing machine credential)
 
+> **Status (2026-08-28): the server-side credential is BUILT** — commit
+> `feat(auth): issued API tokens`. Migration `0051_api_tokens`, prefix routing in
+> `authenticate()`, mint/list/revoke under `/v1/orgs/{org}/tokens`,
+> `securitySchemes` in `openapi.json`, and the tests below. **What is left: the
+> Settings UI section** (mint dialog with the one-time plaintext reveal, the list
+> with `last_used_at`, revoke) and a docs page under `usage/`.
+>
+> The open questions at the bottom were answered: authority is the carried
+> ceiling ∩ the owner's live bindings; tokens are person-owned, with a machine
+> `Principal` kind left as a seam; this rides as an ADR-0049 amendment. Two
+> things the design below did not anticipate, both recorded in the commit body:
+> a token may not mint tokens (else the mandatory expiry bounds nothing), and
+> mint must bound the grant with the same view the token re-derives per request
+> (bounding by the minter's *session* roles mints credentials that pass the check
+> and then hold nothing).
+
 Scarab has no credential a machine can hold. Every client surface for one
 already exists; the credential itself does not. This is the design work and the
 decisions worth making deliberately before writing code.
