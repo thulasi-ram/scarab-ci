@@ -153,7 +153,7 @@ jobs:
       - name: Per-crate summary + ratchet against baseline
         # The script also appends its table to $GITHUB_STEP_SUMMARY itself.
         run: python3 scripts/coverage_ratchet.py lcov.info docs/audits/coverage-baseline.toml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lcov
           path: lcov.info
