@@ -244,7 +244,9 @@ code,
 }
 .ascii-scene pre {
   position: absolute;
-  inset: 0;
+  /* The layers paint in GRID coordinates; the box is the occupied sub-rect of
+     that grid, so they are shifted by its origin (set by the player). */
+  inset: var(--ascii-dy, 0) 0 0 var(--ascii-dx, 0);
   margin: 0;
   font-family: var(--font-mono);
   font-size: var(--ascii-fs, 8px);
@@ -1869,8 +1871,25 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 
 /* State-moment beetle: an idle/failed pose stands in for an empty list. */
 .empty-scene {
-  display: flex; flex-direction: column; align-items: center; gap: 6px;
-  padding: 28px 0 8px; text-align: center;
+  display: flex; flex-direction: column; align-items: stretch; gap: 14px;
+  padding: 34px 0 8px; text-align: center;
+}
+/* The beetle needs ground for the same reason the dashboard footer's does: it
+   is drawn standing on something, and without a horizon it floats. Same
+   language as `.dash-footer` — one dashed copper rule, the scene's feet
+   landing on it (the baked crop leaves ~1 row of slack, so the box overhangs
+   by 4px exactly as the footer's `roller` does). */
+.empty-land {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  padding-bottom: 4px;
+}
+.empty-land::after {
+  content: "";
+  position: absolute;
+  left: 0; right: 0; bottom: 4px;
+  border-top: 1px dashed var(--border-copper);
 }
 .empty-scene .ascii-scene { margin: 0 auto; }
 .allclear .ac-title { font-family: "Space Grotesk", var(--font-ui); font-size: 15px; font-weight: 600; color: var(--soft-white); }

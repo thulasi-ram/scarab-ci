@@ -65,23 +65,42 @@ function composeBubble(line: string, b: Bubble, cols: number, rows: number) {
   return { text: grid.map((r) => r.join("").replace(/\s+$/, "")).join("\n"), col: c0, row: r0 };
 }
 
-// Widest occupied column across every frame. The baked grid is padded to a
-// uniform `cols` so a family of scenes can share one canvas — ponder-kingofhill
-// puts a `place: "right"` bubble in columns 76..95, which the other ponder
-// scenes leave empty. Sizing the box to `cols` therefore centres the BOX while
-// the art sits left of centre. Measured once per baked scene and cached: the
-// frames are frozen, so the answer never changes.
-const contentColsCache = new WeakMap<Baked, number>();
-function contentCols(scene: Baked): number {
-  let w = contentColsCache.get(scene);
-  if (w === undefined) {
-    w = 0;
+// The occupied BOX across every frame: first/last column and row that any
+// layer ever paints. The baked grid is padded to a uniform cols x rows so a
+// family of scenes can share one canvas — ponder-kingofhill puts a
+// `place: "right"` bubble in columns 76..95 that the other ponder scenes leave
+// empty, and every scene reserves head-room its art never enters
+// (ponder-ponder starts at row 6, dungroller at row 4 and column 13). Sizing
+// the box to the DECLARED grid therefore pads the scene with dead space —
+// which centres the box while the art sits off-centre inside it, and in a
+// stacked layout pushes whatever follows down by rows of nothing.
+//
+// Measured once per baked scene and cached: the frames are frozen, so the
+// answer never changes.
+type Box = { c0: number; c1: number; r0: number; r1: number };
+const contentBoxCache = new WeakMap<Baked, Box>();
+function contentBox(scene: Baked): Box {
+  let b = contentBoxCache.get(scene);
+  if (b === undefined) {
+    let c0 = Infinity, c1 = -1, r0 = Infinity, r1 = -1;
     for (const frame of scene.frames)
       for (const layer of frame)
-        for (const ln of layer.split("\n")) w = Math.max(w, ln.trimEnd().length);
-    contentColsCache.set(scene, w);
+        layer.split("\n").forEach((ln, r) => {
+          const end = ln.trimEnd().length;
+          if (!end) return;
+          const start = ln.length - ln.trimStart().length;
+          if (r < r0) r0 = r;
+          if (r > r1) r1 = r;
+          if (start < c0) c0 = start;
+          if (end - 1 > c1) c1 = end - 1;
+        });
+    // An empty scene would leave the sentinels: fall back to the declared grid.
+    b = c1 < 0
+      ? { c0: 0, c1: scene.cols - 1, r0: 0, r1: scene.rows - 1 }
+      : { c0, c1, r0, r1 };
+    contentBoxCache.set(scene, b);
   }
-  return w;
+  return b;
 }
 
 export default function AsciiScene(props: {
@@ -104,12 +123,22 @@ export default function AsciiScene(props: {
   const bub = bubble && props.line ? composeBubble(props.line, bubble, cols, rows) : null;
   const bubbleAt = (f: number) =>
     bub && f >= bubble!.from && f < bubble!.to ? bub.text : "";
-  // A right-placed bubble is real content and can run to the last column, so
-  // it widens the box; `cols` stays the ceiling.
-  const bubRight = bub
-    ? bub.col + Math.max(...bub.text.split("\n").map((l) => l.length))
-    : 0;
-  const boxCols = Math.min(cols, Math.max(contentCols(props.scene), bubRight));
+  // The bubble is real content: it can sit outside the art's own box (a
+  // `place: "right"` bubble runs past its right edge, an "above" one starts
+  // above its top row), so the box is the union of the two. The declared grid
+  // stays the ceiling.
+  const art = contentBox(props.scene);
+  const bubLines = bub ? bub.text.split("\n") : [];
+  const box = {
+    c0: bub ? Math.min(art.c0, bub.col) : art.c0,
+    c1: bub
+      ? Math.min(cols - 1, Math.max(art.c1, bub.col + Math.max(...bubLines.map((l) => l.length)) - 1))
+      : art.c1,
+    r0: bub ? Math.min(art.r0, bub.row) : art.r0,
+    r1: bub ? Math.min(rows - 1, Math.max(art.r1, bub.row + bubLines.length - 1)) : art.r1,
+  };
+  const boxCols = box.c1 - box.c0 + 1;
+  const boxRows = box.r1 - box.r0 + 1;
 
   onMount(() => {
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
@@ -129,8 +158,10 @@ export default function AsciiScene(props: {
   });
 
   // Explicit box: layers are absolutely positioned, and the trimmed text lines
-  // must not size the scene (a layer can be much narrower than the grid). The
-  // width is the OCCUPIED grid, not the declared one — see contentCols.
+  // must not size the scene (a layer can be much narrower than the grid). Both
+  // axes are the OCCUPIED grid, not the declared one — see contentBox. The
+  // layers still paint in grid coordinates, so they are shifted up/left by the
+  // box origin (`--ascii-dx/dy`) to bring the art flush into it.
   // JetBrains Mono's advance is exactly 0.6em and the CSS sets line-height to
   // 0.6em too, so cells are SQUARE — width AND height use the same 0.6 factor.
   return (
@@ -138,8 +169,10 @@ export default function AsciiScene(props: {
       class={`ascii-scene ${props.class ?? ""}`}
       style={{
         "--ascii-fs": `${props.fontSize ?? 8}px`,
+        "--ascii-dx": `${-box.c0 * cell}px`,
+        "--ascii-dy": `${-box.r0 * cell}px`,
         width: `${boxCols * cell}px`,
-        height: `${props.scene.rows * cell}px`,
+        height: `${boxRows * cell}px`,
       }}
       role={props.label ? "img" : undefined}
       aria-label={props.label}
@@ -152,7 +185,10 @@ export default function AsciiScene(props: {
         <pre
           class="ascii-bubble"
           ref={(el) => (pres[3] = el)}
-          style={{ left: `${bub.col * cell}px`, top: `${bub.row * cell}px` }}
+          style={{
+            left: `${(bub.col - box.c0) * cell}px`,
+            top: `${(bub.row - box.r0) * cell}px`,
+          }}
         />
       )}
     </div>

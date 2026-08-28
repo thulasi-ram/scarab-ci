@@ -278,12 +278,13 @@ export default function RepoView() {
               fallback={
                 (rows() ?? []).length === 0 ? (
                   <div class="empty-scene">
-                    <AsciiScene
-                      scene={ponderIdle}
-                      fontSize={8}
-                      label="Beetle pausing beside its ball"
-                      line={"no runs yet.\npush something\nto get rolling."}
-                    />
+                    <div class="empty-land">
+                      <AsciiScene
+                        scene={ponderIdle}
+                        fontSize={6}
+                        label="Beetle pausing beside its ball"
+                      />
+                    </div>
                     <p class="empty">This repo hasn't run yet.</p>
                   </div>
                 ) : (
