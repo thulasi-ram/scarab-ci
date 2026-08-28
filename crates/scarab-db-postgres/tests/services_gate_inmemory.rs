@@ -3,8 +3,8 @@
 //! fakes (no Postgres, no cluster), proving the engine behavior end to end.
 
 use scarab_engine::{
-    rerun_step, Db, RunId, RunStatus, Scheduler, ServiceStatus, StepId, StepSpec, StepStatus,
-    Timestamp,
+    cancel_run_request, rerun_step, Attempt, AttemptId, AttemptOutcome, Db, RunId, RunStatus,
+    Scheduler, ServiceStatus, StepId, StepSpec, StepStatus, Timestamp,
 };
 use scarab_testkit::{FakeClock, FakeExecutor, InMemoryDb};
 use serde_json::json;
@@ -349,4 +349,143 @@ async fn run_terminal_tears_down_services() {
         ServiceStatus::TornDown
     );
     assert_eq!(exec.torn_down_services(), vec![handle.0]);
+}
+
+/// Seed a run that is mid-flight with one live step Pod and one `ready` shared
+/// service — the shape an operator cancels from the UI.
+async fn seed_running_run_with_service(db: &InMemoryDb, run_name: &str) -> (RunId, String) {
+    let run = RunId(run_name.into());
+    db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run,
+        &ir_with_db_service(json!([{ "id": "test", "image": "busybox", "uses": ["db"] }])),
+    )
+    .await
+    .unwrap();
+    let step = StepId("test".into());
+    db.create_step_run(&run, &step, Some(&spec(&["db"])), &[], Timestamp(0))
+        .await
+        .unwrap();
+    let attempt = AttemptId("a1".into());
+    db.record_attempt(
+        &run,
+        &step,
+        &Attempt {
+            id: attempt.clone(),
+            started_at: Timestamp(0),
+            failure: None,
+            failure_detail: None,
+            outcome: AttemptOutcome::Running,
+        },
+    )
+    .await
+    .unwrap();
+    db.set_attempt_handle(&run, &step, &attempt, "pod/test-1")
+        .await
+        .unwrap();
+    db.record_step_transition(&run, &step, StepStatus::Pending, StepStatus::Running)
+        .await
+        .unwrap();
+    db.seed_run(&run, RunStatus::Running);
+
+    db.create_run_service(&run, 1, "db", Timestamp(0))
+        .await
+        .unwrap();
+    let handle = FakeExecutor::service_handle(run_name, 1, "db");
+    db.set_run_service(&run, 1, "db", ServiceStatus::Ready, Some(&handle.0))
+        .await
+        .unwrap();
+    (run, handle.0)
+}
+
+/// An OPERATOR cancel must tear down the run's shared services, not just its
+/// step Pods. Regression: the cancel-teardown reconcile only walked
+/// `steps_of_run`, and services live in `run_services` — so every cancelled run
+/// left its services running forever. Nothing collected them later either: the
+/// terminal-teardown arm of `reconcile_services` only visits ACTIVE runs, and a
+/// cancelled run has already left that set. (`Scheduler::cancel_run` — the
+/// concurrency/supersede path — always tore them down, which is why only the
+/// operator path leaked.)
+#[tokio::test]
+async fn operator_cancel_tears_down_shared_services() {
+    let db = InMemoryDb::new();
+    let (run, svc_handle) = seed_running_run_with_service(&db, "run-cancel").await;
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_outbox_visibility_ms(0);
+
+    // The operator cancels: durable state settles now, teardown is the intent.
+    assert!(
+        cancel_run_request(&db, &clock, &run, Some("operator".into()))
+            .await
+            .unwrap()
+    );
+    assert_eq!(db.run_status(&run).await.unwrap(), Some(RunStatus::Cancelled));
+    assert!(
+        exec.torn_down_services().is_empty(),
+        "teardown is the driver's job, not inline in the request"
+    );
+
+    // The driver drains the intent: the step Pod AND the service go.
+    sched.reconcile_cancellations().await.unwrap();
+    assert_eq!(exec.cancelled_handles(), vec!["pod/test-1".to_string()]);
+    assert_eq!(
+        exec.torn_down_services(),
+        vec![svc_handle],
+        "the run-scoped service Pod was torn down"
+    );
+    assert_eq!(
+        service(&db.run_services(&run).await.unwrap(), 1, "db").status,
+        ServiceStatus::TornDown
+    );
+
+    // The message retired: a second drain is a no-op, and the already-torn-down
+    // row is never re-torn-down.
+    sched.reconcile_cancellations().await.unwrap();
+    assert_eq!(
+        exec.torn_down_services().len(),
+        1,
+        "a retired teardown is not redelivered, and a terminal row is skipped"
+    );
+}
+
+/// A service teardown that genuinely fails (a transient backend error) must NOT
+/// retire the cancel message nor mark the row `torn-down`: marking it optimistically
+/// would lose the Pod permanently — the same leak, just moved. The row stays
+/// non-terminal so the retried message re-attempts it.
+#[tokio::test]
+async fn failed_service_teardown_is_retried_not_recorded() {
+    let db = InMemoryDb::new();
+    let (run, svc_handle) = seed_running_run_with_service(&db, "run-cancel-retry").await;
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    exec.fail_service_teardowns(1); // the first teardown errors; the next succeeds
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_outbox_visibility_ms(0);
+
+    cancel_run_request(&db, &clock, &run, Some("operator".into()))
+        .await
+        .unwrap();
+
+    // First pass: teardown attempted and failed — the row is untouched.
+    sched.reconcile_cancellations().await.unwrap();
+    assert_eq!(exec.torn_down_services(), vec![svc_handle.clone()]);
+    assert_eq!(
+        service(&db.run_services(&run).await.unwrap(), 1, "db").status,
+        ServiceStatus::Ready,
+        "a failed teardown must not be recorded as torn down"
+    );
+
+    // Second pass: retried, succeeds, and now the row settles.
+    sched.reconcile_cancellations().await.unwrap();
+    assert_eq!(
+        exec.torn_down_services(),
+        vec![svc_handle.clone(), svc_handle],
+        "the teardown was retried"
+    );
+    assert_eq!(
+        service(&db.run_services(&run).await.unwrap(), 1, "db").status,
+        ServiceStatus::TornDown
+    );
 }

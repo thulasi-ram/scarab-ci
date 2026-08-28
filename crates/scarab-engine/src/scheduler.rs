@@ -1902,7 +1902,9 @@ impl<'a> Scheduler<'a> {
 
     /// Drain cancel-teardown intents (ADR-0054): for each cancelled run, delete
     /// every recorded in-flight execution (the executor's `cancel` — SIGTERM +
-    /// grace period). The message is retired only once every Pod reached the
+    /// grace period) **and** tear down the run's shared services (ADR-0058),
+    /// which are not steps and so are reached by neither the step loop nor any
+    /// later tick. The message is retired only once every Pod reached the
     /// desired end state; a genuinely failed cancel is retried rather than
     /// silently orphaning the Pod (see [`settle_teardown`](Self::settle_teardown)).
     pub async fn reconcile_cancellations(&self) -> Result<(), SchedulerError> {
@@ -1938,6 +1940,47 @@ impl<'a> Scheduler<'a> {
                             }
                         }
                     }
+                }
+                // Run-scoped shared services (ADR-0058) are NOT steps — they
+                // live in `run_services`, not `steps_of_run` — so the loop above
+                // never reaches them. Without this an operator cancel tore down
+                // every step Pod and left the run's services running forever:
+                // `reconcile_services`' terminal-teardown arm only visits runs in
+                // the ACTIVE set, and a cancelled run has already left it, so no
+                // later tick would collect them. The automated cancel paths
+                // (concurrency auto-cancel / supersede, via `cancel_run`) call
+                // `teardown_services` inline, which is why only this one leaked.
+                //
+                // Deliberately not that helper: it `?`s on an executor error,
+                // which would abort the message body and fall through to
+                // `abandon_poison_message`, bypassing `settle_teardown` — the
+                // accounting that retries a genuinely failed teardown. Folding
+                // the error into `outcome` keeps the promise in this function's
+                // doc comment. Steps first, then the services they depend on.
+                for svc in self.db.run_services(&msg.run).await? {
+                    if svc.status.is_terminal() {
+                        continue;
+                    }
+                    if let Some(h) = &svc.handle {
+                        if let Err(e) = self.executor.teardown_service(&ExecHandle(h.clone())).await
+                        {
+                            // Leave the row non-terminal so the retried message
+                            // re-attempts it. Marking `TornDown` optimistically
+                            // would lose the Pod permanently — the very bug this
+                            // closes, just moved.
+                            outcome = Err(e);
+                            continue;
+                        }
+                    }
+                    self.db
+                        .set_run_service(
+                            &msg.run,
+                            svc.take,
+                            &svc.name,
+                            crate::ServiceStatus::TornDown,
+                            None,
+                        )
+                        .await?;
                 }
                 self.settle_teardown(&msg, outcome).await
             }

@@ -1800,6 +1800,10 @@ struct FakeExecState {
     /// a Pod the backend can never reach (persistent failure → dead-letter); a
     /// small N models a transient API blip that clears on a later reconcile.
     cancel_failures: u32,
+    /// The same budget for `teardown_service` — the shared-service half of the
+    /// cancel teardown, which must retry rather than mark the row torn down over
+    /// a Pod that is still up.
+    service_teardown_failures: u32,
 }
 
 /// An [`Executor`] whose behaviour a test scripts: it can be told that a given
@@ -2010,6 +2014,12 @@ impl FakeExecutor {
         self.inner.lock().unwrap().cancel_failures = n;
     }
 
+    /// Make the next `n` `teardown_service` calls return `Err` before any
+    /// succeeds — the shared-service counterpart of [`fail_cancels`](Self::fail_cancels).
+    pub fn fail_service_teardowns(&self, n: u32) {
+        self.inner.lock().unwrap().service_teardown_failures = n;
+    }
+
     /// Handles of shared services launched via `launch_service`, in call order.
     pub fn launched_services(&self) -> Vec<String> {
         self.inner.lock().unwrap().services_launched.clone()
@@ -2176,11 +2186,18 @@ impl Executor for FakeExecutor {
     }
 
     async fn teardown_service(&self, handle: &ExecHandle) -> Result<(), ExecError> {
-        self.inner
-            .lock()
-            .unwrap()
-            .services_torn_down
-            .push(handle.0.clone());
+        // Record the attempt first (so `torn_down_services` counts retries too),
+        // then consume one scripted failure if any are budgeted — the same shape
+        // as `cancel`: a genuine `Err` is retryable, an already-gone unit is `Ok`.
+        let mut st = self.inner.lock().unwrap();
+        st.services_torn_down.push(handle.0.clone());
+        if st.service_teardown_failures > 0 {
+            st.service_teardown_failures = st.service_teardown_failures.saturating_sub(1);
+            return Err(ExecError::Other(format!(
+                "scripted teardown_service failure for {}",
+                handle.0
+            )));
+        }
         Ok(())
     }
 }
