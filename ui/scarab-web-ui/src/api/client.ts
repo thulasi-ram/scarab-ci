@@ -56,19 +56,29 @@ api.use({
 
 // CSRF double-submit (ADR-0049): the session rides as an HttpOnly cookie; the
 // server pairs it with a script-READABLE `scarab_csrf` cookie whose value we
-// echo in `x-csrf-token` on every mutation. A cross-site page can trigger the
-// cookie, but it can never read this token.
+// echo in `x-csrf-token`. A cross-site page can trigger the cookie, but it can
+// never read this token.
+//
+// On EVERY request, not just mutations. The server gates the check on the
+// authorized ACTION, not the HTTP method — `authenticate()` demands the token
+// whenever `action != Action::Read` on a cookie-authenticated request — and
+// several endpoints are GETs that authorize as `Administer`:
+// `GET /v1/secrets` and `GET /v1/connections` are the two the Settings page
+// needs. Sending the token only on mutations left that whole page 403ing with
+// nothing to explain it, while every Action::Read endpoint worked.
+//
+// Sending it on safe methods costs nothing and loses nothing: a cross-site page
+// still cannot set a custom header (it would need a CORS preflight the server
+// does not grant), so the double-submit property is unchanged.
 api.use({
   onRequest({ request }) {
-    if (request.method !== "GET" && request.method !== "HEAD") {
-      const csrf = document.cookie
-        .split(";")
-        .map((c) => c.trim())
-        .find((c) => c.startsWith("scarab_csrf="))
-        ?.slice("scarab_csrf=".length);
-      if (csrf) {
-        request.headers.set("x-csrf-token", csrf);
-      }
+    const csrf = document.cookie
+      .split(";")
+      .map((c) => c.trim())
+      .find((c) => c.startsWith("scarab_csrf="))
+      ?.slice("scarab_csrf=".length);
+    if (csrf) {
+      request.headers.set("x-csrf-token", csrf);
     }
     return request;
   },
