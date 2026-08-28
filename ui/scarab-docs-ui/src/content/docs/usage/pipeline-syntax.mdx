@@ -22,6 +22,18 @@ Compilation is **static**: the whole DAG (every matrix combination, every inline
 materialised and validated at submit time, so a cycle, a dangling `needs`, or an empty matrix
 dimension is rejected up front, never discovered mid-run.
 
+Keys are **strict** at every level of that schema. A key Scarab does not know — a misspelling,
+a field borrowed from another CI system, a knob from a newer version — is a compile error naming
+the key and the ones that were expected, not a line that is quietly ignored:
+
+```
+unknown field `cpu_milis`, expected `cpu_millis` or `memory_mib`
+```
+
+The alternative is worse than it looks: `resources: { cpu_milis: 500 }` would parse clean, report
+`ok`, and then run the step with no CPU request at all. A setting that is silently dropped is
+indistinguishable from one that was never written.
+
 A repo's CI lives in `.scarab/`. A triggered pipeline is a YAML file such as `.scarab/ci.yaml`;
 its file name is the default display name (`ci.yaml` reads as `ci`, overridable with a top-level
 `name:`). Reusable **library** pipelines live under `.scarab/lib/` and are pulled in with

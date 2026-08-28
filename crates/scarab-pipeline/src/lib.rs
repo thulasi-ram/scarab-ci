@@ -47,6 +47,7 @@ fn default_ir_version() -> u32 {
 // `serde_json::Value` (which is `PartialEq` but not `Eq`), so the whole IR is
 // only `PartialEq`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineIr {
     /// Schema version of the IR, for forward/backward compatibility.
     #[serde(default = "default_ir_version")]
@@ -113,6 +114,7 @@ pub struct PipelineIr {
 /// supplies (via `with:` for an invoke, or a launch `params` map); `outputs` are
 /// the names the pipeline exposes, each of which must be one of its step ids.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Interface {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<ParamSpec>,
@@ -182,6 +184,7 @@ impl<'de> Deserialize<'de> for ParamSpec {
     {
         /// The full map form; every field defaulted so a partial map fills in.
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct Full {
             name: String,
             #[serde(rename = "type", default)]
@@ -197,33 +200,48 @@ impl<'de> Deserialize<'de> for ParamSpec {
             #[serde(default)]
             description: Option<String>,
         }
-        /// A bare string (backward-compat) *or* the full map (ADR-0043).
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            Bare(String),
-            Full(Full),
+
+        /// Dispatched on the input's SHAPE rather than by `#[serde(untagged)]`,
+        /// which is what the bare-string/map choice actually is. Untagged tries
+        /// both arms and, on failure, reports only "data did not match any
+        /// variant" — swallowing the `deny_unknown_fields` message that names
+        /// the misspelled key, which is the whole point of denying. A string is
+        /// a string and a map is a map; there is nothing to guess.
+        struct FormVisitor;
+        impl<'de> serde::de::Visitor<'de> for FormVisitor {
+            type Value = ParamSpec;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a parameter name, or a parameter map with a `name`")
+            }
+            /// Backward-compat with ADR-0038's bare-name inputs.
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ParamSpec, E> {
+                Ok(ParamSpec {
+                    name: v.to_string(),
+                    r#type: ParamType::String,
+                    required: true,
+                    default: None,
+                    options: None,
+                    validate: None,
+                    description: None,
+                })
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<ParamSpec, A::Error> {
+                let f = Full::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+                Ok(ParamSpec {
+                    name: f.name,
+                    r#type: f.r#type,
+                    required: f.required,
+                    default: f.default,
+                    options: f.options,
+                    validate: f.validate,
+                    description: f.description,
+                })
+            }
         }
-        Ok(match Raw::deserialize(deserializer)? {
-            Raw::Bare(name) => ParamSpec {
-                name,
-                r#type: ParamType::String,
-                required: true,
-                default: None,
-                options: None,
-                validate: None,
-                description: None,
-            },
-            Raw::Full(f) => ParamSpec {
-                name: f.name,
-                r#type: f.r#type,
-                required: f.required,
-                default: f.default,
-                options: f.options,
-                validate: f.validate,
-                description: f.description,
-            },
-        })
+        deserializer.deserialize_any(FormVisitor)
     }
 }
 
@@ -237,6 +255,7 @@ fn default_true() -> bool {
 /// independent of the engine's `ConcurrencyPolicy` — the server maps `policy` via
 /// `ConcurrencyPolicy::from_wire` at the wiring boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Concurrency {
     pub group: String,
     /// `queue` (wait for the slot, the safe default) or `cancel-in-progress`
@@ -272,6 +291,7 @@ impl Triggers {
 /// A filter narrowing when a trigger kind fires: an optional CEL predicate over
 /// the event context (`when:`). Absent `when` means the kind always matches.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TriggerFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
@@ -283,6 +303,7 @@ pub struct TriggerFilter {
 /// `None` and each concrete instance instead carries its
 /// [`matrix_values`](StepSpec::matrix_values).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StepSpec {
     pub id: String,
     /// OCI image the step runs in. Empty (and defaulted) for a [`gate`](StepSpec::gate)
@@ -486,6 +507,7 @@ impl StepSpec {
 /// baseline (ADR-0039). This is the author's *request*; the Environment's
 /// whitelist decides what is actually admitted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StepSecurity {
     /// Run as uid 0 (opt out of the baseline `runAsNonRoot`). Self-service —
     /// root inside the caps-dropped, unprivileged, seccomp-confined sandbox does
@@ -523,6 +545,7 @@ fn is_false(b: &bool) -> bool {
 /// author-supplied and no more trusted than a step image — it runs under the
 /// ADR-0039 restricted baseline; the `run-as-root` self-service grant applies.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceSpec {
     /// The OCI image (e.g. `postgres:16`). Serde-defaulted so an absent image
     /// surfaces as a validation diagnostic, not a parse error (cf. `BuildSpec`).
@@ -569,6 +592,7 @@ pub struct ServiceSpec {
 /// (`ready: { exec: [pg_isready] }`) and `http` (`ready: { http: { port, path } }`)
 /// are also allowed. Exactly one form must be set (enforced by [`validate`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadyProbe {
     /// Ready when a TCP connection to this port succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -592,6 +616,7 @@ impl ReadyProbe {
 
 /// The `http` form of a [`ReadyProbe`] (ADR-0058).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpReady {
     /// Port to GET.
     pub port: u16,
@@ -613,7 +638,7 @@ fn default_http_path() -> String {
 /// the opt-in Pods only), born eagerly at Run start and torn down at Run/Take
 /// terminal — a fresh instance per Take, never shared across Takes. It is **not**
 /// a `needs`-able DAG node and is explicitly *unfenced* external state.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SharedServiceSpec {
     /// The service name — the opt-in key a Step names in `uses:` and the cluster
     /// DNS hostname (`<name>:<port>`). Must be non-empty, unique across the
@@ -625,10 +650,53 @@ pub struct SharedServiceSpec {
     pub spec: ServiceSpec,
 }
 
+/// Hand-written because `flatten` and `deny_unknown_fields` are mutually
+/// exclusive in serde, in a way that fails **open**: serde's flatten machinery
+/// forwards only the keys the flattened struct declares, so a stray key on a
+/// shared service never reaches [`ServiceSpec`]'s `deny_unknown_fields` and is
+/// silently dropped. That is the exact silent facade the attribute exists to
+/// stop, and this is the one level of the schema where the derive could not
+/// deliver it.
+///
+/// So `name` is lifted off first and the remainder handed to [`ServiceSpec`]
+/// itself, which keeps ONE authority for what a service may declare: a field
+/// added there is accepted here the same day, with no second list to drift
+/// (`a_shared_service_accepts_every_field_a_sidecar_service_declares` holds
+/// that).
+impl<'de> Deserialize<'de> for SharedServiceSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        let name = {
+            let map = value
+                .as_object_mut()
+                .ok_or_else(|| D::Error::custom("a shared service must be a map"))?;
+            match map.remove("name") {
+                // Absent stays a validation diagnostic ("service has no name"),
+                // not a parse error — the same choice `ServiceSpec` makes for a
+                // missing `image`.
+                None | Some(serde_json::Value::Null) => String::new(),
+                Some(serde_json::Value::String(s)) => s,
+                Some(other) => {
+                    return Err(D::Error::custom(format!(
+                        "shared service `name` must be a string, found `{other}`"
+                    )))
+                }
+            }
+        };
+        let spec = ServiceSpec::deserialize(value).map_err(D::Error::custom)?;
+        Ok(SharedServiceSpec { name, spec })
+    }
+}
+
 /// Configuration of a `clone` step (ADR-0045). Everything is optional —
 /// `clone: {}` is the common case; repo/ref/SHA/token come from the run's
 /// trigger context, never from the author.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CloneSpec {
     /// `1` (default — shallow, small CAS snapshots) or `full` (complete
     /// history + all refs, for history-dependent workloads). Any other value
@@ -662,6 +730,7 @@ pub struct CloneSpec {
 /// tool caches that default to `$HOME`; dirs outside the workspace are
 /// deliberately unsupported in v1.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CacheSpec {
     /// Workspace-relative directories to cache.
     #[serde(default)]
@@ -675,6 +744,7 @@ pub struct CacheSpec {
 /// push. Registry credentials are NEVER authored here — they are a scoped
 /// `REGISTRY_AUTH` secret (ADR-0037) or derived from the forge connection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildSpec {
     /// Workspace-relative build context directory (default `.`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -753,6 +823,7 @@ impl<'de> Deserialize<'de> for CloneDepth {
 /// the whole step at-least-once; enable only if the step is idempotent or
 /// fenced against a cooperating sink.*
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Retry {
     /// Which failures the author's assertion covers. `failure` (the default
     /// and only value today) selects every *post-start* class: post-start
@@ -785,6 +856,7 @@ pub struct Needs(pub Vec<String>);
 /// evaluated against the combination's own coordinate (each dimension bound as a
 /// variable), so expansion stays fully static.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Matrix {
     pub dimensions: BTreeMap<String, Vec<String>>,
     /// CEL predicates over the dimension variables; a combination is dropped if
@@ -808,6 +880,7 @@ pub struct When(pub String);
 /// It is *where a step lands* — not an `Environment` (deploy governance) and not
 /// a `Run` (a pipeline instance). One profile in the registry may be `default`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlacementProfile {
     /// The name a step references in `placement_profiles`.
     pub name: String,
@@ -838,6 +911,7 @@ pub struct PlacementProfile {
 /// its reachability floor today; `log_ttl_days`/`artifact_ttl_days` are the
 /// same classes the retention sweeper prunes, adopted there in a follow-up.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionProfile {
     /// The name a pipeline references in `retention_profile:`.
     pub name: String,
@@ -941,6 +1015,7 @@ pub const MAX_STEP_TIMEOUT_SECS: u32 = 23 * 60 * 60;
 /// Requested compute resources for a step (ADR-0055). Exact `cpu`/`memory`, not
 /// named `size` tiers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Resources {
     pub cpu_millis: Option<u32>,
     pub memory_mib: Option<u32>,
@@ -2480,6 +2555,12 @@ mod tests {
         match compile_yaml(yaml) {
             Err(PipelineError::Validation(d)) => d,
             other => panic!("expected validation error, got {other:?}"),
+        }
+    }
+    fn parse_error(yaml: &str) -> String {
+        match compile_yaml(yaml) {
+            Err(PipelineError::Parse(msg)) => msg,
+            other => panic!("expected a parse error, got {other:?}"),
         }
     }
 
@@ -4653,5 +4734,161 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The `steps[i].resources` typo that started this: `cpu_milis` for
+    /// `cpu_millis`. Before `deny_unknown_fields` this compiled clean and
+    /// `validate` reported "ok: 2 step(s)" — while the step silently requested
+    /// no CPU at all. A resource request dropped on the floor is worse than a
+    /// rejected one, because nothing ever says so.
+    #[test]
+    fn a_misspelled_key_is_a_parse_error_not_a_silent_no_op() {
+        let yaml = r#"
+            steps:
+              - id: build
+                image: rust:1
+                resources:
+                  cpu_milis: 500
+            "#;
+        let err = parse_error(yaml);
+        assert!(err.contains("cpu_milis"), "{err}");
+        assert!(err.contains("cpu_millis"), "names the key it meant: {err}");
+        // And the correct spelling still lands.
+        let ir = compile(&yaml.replace("cpu_milis", "cpu_millis"));
+        assert_eq!(ir.steps[0].resources.cpu_millis, Some(500));
+    }
+
+    /// One case per nesting level of the authored schema, because the attribute
+    /// is PER-STRUCT: a level that is missed fails open and silently, so the
+    /// coverage has to be enumerated rather than assumed.
+    #[test]
+    fn an_unknown_key_is_rejected_at_every_level_of_the_schema() {
+        let cases: &[(&str, &str)] = &[
+            ("top level", "stepz: []\nsteps: [{id: a, image: alpine}]\n"),
+            ("step", "steps: [{id: a, image: alpine, dependsOn: [b]}]\n"),
+            (
+                "interface input",
+                "interface: {inputs: [{name: v, requried: false}]}\nsteps: [{id: a, image: alpine}]\n",
+            ),
+            (
+                "concurrency",
+                "concurrency: {group: g, polciy: queue}\nsteps: [{id: a, image: alpine}]\n",
+            ),
+            (
+                "trigger filter",
+                "on: {push: {whn: \"true\"}}\nsteps: [{id: a, image: alpine}]\n",
+            ),
+            (
+                "retry",
+                "steps: [{id: a, image: alpine, retry: {max: 2, onn: failure}}]\n",
+            ),
+            ("clone", "steps: [{id: a, clone: {submodule: true}}]\n"),
+            (
+                "build",
+                "steps: [{id: a, build: {image: x, dockerfle: D}}]\n",
+            ),
+            (
+                "cache",
+                "steps: [{id: a, image: alpine, cache: {dirs: [t], keys: [f]}}]\n",
+            ),
+            (
+                "security",
+                "steps: [{id: a, image: alpine, security: {run_as_rot: true}}]\n",
+            ),
+            (
+                "matrix",
+                "steps: [{id: a, image: alpine, matrix: {dimensions: {os: [l]}, excludes: []}}]\n",
+            ),
+            (
+                "sidecar service",
+                "steps: [{id: a, image: alpine, services: [{image: postgres:16, portz: [5432]}]}]\n",
+            ),
+            (
+                "sidecar ready probe",
+                "steps: [{id: a, image: alpine, services: [{image: postgres:16, ready: {tcpp: 5432}}]}]\n",
+            ),
+            (
+                "http ready probe",
+                "steps: [{id: a, image: alpine, services: [{image: n, ready: {http: {port: 80, pth: /}}}]}]\n",
+            ),
+            // The shared service is the one level the derive could NOT cover:
+            // it flattens `ServiceSpec`, and serde's flatten forwards only the
+            // keys the flattened struct declares, so `deny_unknown_fields`
+            // never sees the stray one. Hence the hand-written `Deserialize`.
+            (
+                "shared service",
+                "services: [{name: db, image: postgres:16, portz: [5432]}]\nsteps: [{id: a, image: alpine}]\n",
+            ),
+        ];
+        for (level, yaml) in cases {
+            let err = parse_error(yaml);
+            assert!(
+                err.contains("unknown field"),
+                "{level}: expected an unknown-field parse error, got: {err}"
+            );
+        }
+    }
+
+    /// A shared service must accept exactly what a sidecar service accepts,
+    /// plus `name`. The hand-written `Deserialize` delegates to [`ServiceSpec`]
+    /// precisely so there is no second field list to drift, and this holds it:
+    /// every field a fully-populated `ServiceSpec` serializes must survive the
+    /// round-trip through the shared-service form.
+    #[test]
+    fn a_shared_service_accepts_every_field_a_sidecar_service_declares() {
+        // An exhaustive literal on purpose: adding a field to `ServiceSpec`
+        // breaks THIS line, which is the reminder to re-check the delegation.
+        let spec = ServiceSpec {
+            image: "postgres:16".to_string(),
+            command: vec!["docker-entrypoint.sh".to_string()],
+            args: vec!["postgres".to_string()],
+            env: BTreeMap::from([("POSTGRES_PASSWORD".to_string(), "test".to_string())]),
+            ports: vec![5432],
+            ready: Some(ReadyProbe {
+                tcp: Some(5432),
+                exec: Vec::new(),
+                http: None,
+            }),
+            run_as_user: Some(999),
+            run_as_root: false,
+        };
+        let shared = SharedServiceSpec {
+            name: "db".to_string(),
+            spec: spec.clone(),
+        };
+
+        let shared_keys: BTreeSet<String> = serde_json::to_value(&shared)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let mut expected: BTreeSet<String> = serde_json::to_value(&spec)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        expected.insert("name".to_string());
+        assert_eq!(shared_keys, expected);
+
+        let back: SharedServiceSpec =
+            serde_json::from_value(serde_json::to_value(&shared).unwrap()).unwrap();
+        assert_eq!(back, shared);
+    }
+
+    /// `name` is absent-tolerant (that becomes a `validate` diagnostic, matching
+    /// what `ServiceSpec` does with a missing `image`) but not type-tolerant.
+    #[test]
+    fn a_shared_service_name_must_be_a_string_when_present() {
+        let err = parse_error("services: [{name: 7, image: n}]\nsteps: [{id: a, image: alpine}]\n");
+        assert!(err.contains("`name` must be a string"), "{err}");
+        let errs = errors("services: [{image: n}]\nsteps: [{id: a, image: alpine}]\n");
+        assert!(
+            errs.iter().any(|e| e.contains("name")),
+            "expected a name diagnostic, got {errs:?}"
+        );
     }
 }
