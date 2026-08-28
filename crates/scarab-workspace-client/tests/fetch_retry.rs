@@ -281,12 +281,25 @@ async fn an_outage_longer_than_the_window_exits_transient_not_missing_inputs() {
 /// same token cannot heal a denial; a fresh attempt mints a fresh fence
 /// token, bounded by NEVER_STARTED_AUTO_ATTEMPTS upstream).
 ///
-/// Constructed honestly: two snapshot roots to materialise, a token whose
-/// roots claim names only the FIRST. Root A fully materialises (real
-/// successful transfers — the denial is provably mid-leg, not a first-request
+/// Constructed honestly: two snapshot roots to fetch, a token whose roots claim
+/// names only the FIRST. Root A's manifest is read successfully (a real,
+/// authorised transfer — so the denial is provably mid-leg, not a first-request
 /// refusal), then root B's read is refused by the live Depot. The client-side
-/// path is identical for the blob-authz enforce denial this ticket adds —
-/// both surface as `StorageError::Denied` mid-materialize.
+/// path is identical for the blob-authz enforce denial this ticket adds — both
+/// surface as `StorageError::Denied`.
+///
+/// **Where the denial lands, and why nothing is written.** With two or more
+/// roots the fan-in pre-pass (ticket 2e1a458) reads every root's `/flat`
+/// manifest BEFORE the materialise loop, so an unclaimed root is refused before
+/// the first byte hits the target. That is the stronger guarantee and the one
+/// asserted here: a denied fetch leaves the workspace untouched, rather than
+/// half-populated with whatever the claim did cover.
+///
+/// This test previously asserted the opposite — that root A had landed on disk
+/// first, as its evidence that the denial was not a first-request refusal. That
+/// evidence predates the pre-pass and has been failing since it landed. The
+/// same thing is proved here without depending on a partial write: the denial
+/// names root B, so the client got past root A.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mid_fetch_403_exits_denied_without_consuming_the_retry_window() {
     let Some(h) = Harness::start().await else { return };
@@ -333,11 +346,23 @@ async fn a_mid_fetch_403_exits_denied_without_consuming_the_retry_window() {
         Some(scarab_workspace_client::EXIT_FETCH_DENIED),
         "a denial exits 3 — never transient, never missing-inputs, stderr:\n{stderr}"
     );
-    // MID-fetch, provably: the granted root's content really landed first.
-    assert_eq!(
-        std::fs::read(target.path().join("granted.txt")).expect("root A materialised"),
-        b"reachable",
-        "the denial must have arrived after real successful transfers"
+    // MID-leg, provably: the denial names root B, so root A's manifest was
+    // read successfully first — this is not a first-request refusal.
+    assert!(
+        stderr.contains(&root_b) && !stderr.contains(&root_a),
+        "the denial must name the UNCLAIMED root (B={root_b}), proving the \
+         claimed one was served first, stderr:\n{stderr}"
+    );
+    // And it refused before writing anything: a denied fetch leaves the
+    // workspace untouched rather than half-populated (the fan-in pre-pass
+    // reads every manifest before the materialise loop).
+    let written: Vec<_> = std::fs::read_dir(target.path())
+        .expect("target dir")
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        written.is_empty(),
+        "a denial must refuse before any write, found: {written:?}"
     );
     // And the retry window (30s at timeout 300) was NOT consumed: a denial
     // is terminal for this token, so waiting could only delay the fresh
