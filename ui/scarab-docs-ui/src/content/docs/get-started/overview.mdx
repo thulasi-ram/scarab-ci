@@ -15,6 +15,12 @@ not care which.
 There are two ways to bring Scarab up. They are both legitimate; pick the one
 that fits what you're doing, not a "real" one versus a "toy" one.
 
+If you only want to see what Scarab looks like, there is a third option that
+installs nothing: the [live demo](https://demo-scarab.ahiravan.dev/). Sign
+in with GitHub and you land as **Viewer**, which carries no Write, so you can
+read a run but not dispatch one. To actually run a pipeline, pick one of the two
+paths below.
+
 ## Which path?
 
 Both run the same engine against a real cluster; they differ in how
@@ -22,6 +28,7 @@ Both run the same engine against a real cluster; they differ in how
 
 | If you want to… | Use | Where |
 |---|---|---|
+| Look at a running Scarab without installing anything | **Live demo** | [demo-scarab.ahiravan.dev](https://demo-scarab.ahiravan.dev/) |
 | Deploy Scarab inside the cluster the way it ships, on kind/colima or a live/production cluster | **Helm chart** | [Installation](/scarab-ci/get-started/deploy-helm/) |
 | Iterate on the server from source with a loop that rebuilds and reruns | **Proc-mode dev loop** | [Run locally](/scarab-ci/get-started/run-locally/) |
 | Reproduce the exact deployment inside the cluster on your laptop before shipping | **Helm chart on colima** (`just local-helm`) | [Installation](/scarab-ci/get-started/deploy-helm/) |

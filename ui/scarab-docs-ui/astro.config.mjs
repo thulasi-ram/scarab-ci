@@ -65,6 +65,13 @@ export default defineConfig({
             { label: 'Get Started', link: '/get-started/overview/' },
             { label: 'Usage', link: '/usage/pipeline-syntax/' },
             { label: 'References', link: '/reference/api/' },
+            // The public demo. Absolute URLs are passed through untouched by
+            // the theme (it only rewrites relative links), so no base here.
+            {
+              label: 'Demo',
+              link: 'https://demo-scarab.ahiravan.dev/',
+              attrs: { target: '_blank', rel: 'noopener' },
+            },
           ],
           footerText:
             'Scarab — a modern CI engine for Kubernetes: forge-native, on a durable core. Themed with [Lucode Starlight](https://github.com/lucas-labs/lucode-starlight-theme).',
