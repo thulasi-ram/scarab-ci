@@ -216,6 +216,19 @@ touching anything.
   from `deploy/local-helm` because that runs `SCARAB_DEV_INSECURE=true`, so
   `demo-oracle` was the first deployment mode able to hit it.
 
+- **The web UI had no sign-in screen** (`e52f550`). The server side of ADR-0049
+  was complete and working — `/v1/auth/login` 302s to the provider with PKCE
+  S256, sessions are Postgres-backed, `/v1/me` returns the principal — and the
+  UI could not reach any of it. A 401 threw "failed to load ..." from whichever
+  page you opened, the identity menu rendered blank, and there was no link to
+  sign in from anywhere in the app; a first-time visitor had no route into the
+  product at all. Invisible in every local loop, which runs
+  `SCARAB_DEV_INSECURE=true` where every caller is a synthetic Owner. Fixed with
+  a 401 middleware on the API client (so a session expiring mid-visit flips the
+  UI on the next request), `Layout` rendering `<Login />` in place of the shell
+  for every route at once, and `logout()` finally doing what its doc comment
+  always claimed.
+
 - **StatefulSet update deadlock** (`bb5310a`). Fixing the chart changed nothing
   on its own: a RollingUpdate will not replace a Pod that never became Ready, so
   the StatefulSet carried the new revision while `scarab-workspace-0` kept
@@ -229,6 +242,9 @@ touching anything.
 
 Everything below is unproven, not broken — the stack is up and serving.
 
+0. Verified since, unprompted: the **nightly Postgres backup CronJob works** —
+   `pg/scarab-5.dump` (45 KiB) landed in R2 on its own, exercising the
+   day-of-week rotation and a second independent R2 writer.
 1. **Complete a browser login.** The OAuth client secret is the one credential
    that cannot be validated any other way. Confirm you land as **Owner**
    (`SCARAB_OAUTH_OWNERS=thulasi-ram`), and ideally that a second GitHub account
