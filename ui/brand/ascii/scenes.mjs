@@ -144,6 +144,21 @@ export const BEETLE_VB_H = 59;       // with ground dots (treadmill variant)
 export const BEETLE_VB_H_BARE = 48;  // cropped at the feet (traveling variant)
 const GY = 72;              // ground line
 const BALL = { x: 63, r: 20 };
+
+// Limb style, shared by EVERY beetle (DUNG.md §1 + §6). One definition, because
+// the two scenes had drifted to 1.65 cells / #8fa89b here and 1.10 cells /
+// #6e7f76 in the Ponderer — where the legs all but vanished. Two things set a
+// limb's weight, and both live here:
+//
+//   • the stroke, in CELLS — `LEG.cells / s`, never a raw design-unit width,
+//     which means something different in every scene's design space;
+//   • the COLOUR, because the bake maps luminance to dot SIZE on the " .·•●"
+//     ramp. A lighter stroke crosses each ramp step at lower coverage, so it
+//     bakes to bigger dots. Darkening a limb thins it as surely as narrowing it.
+//
+// 1.65 cells is the dung-roller's historical 1.8 design units (its s = 88/96),
+// so adopting this constant leaves the roller's bake byte-identical.
+export const LEG = { color: "#8fa89b", cells: 1.65 };
 const LEG_CYCLES = 14;      // integer → seamless loop
 const DOTS = 29;            // ground dots; spacing chosen so one loop = one wrap
 
@@ -202,7 +217,7 @@ export function drawBeetle(x, u, cols, rows, opts = {}) {
   x.beginPath(); x.ellipse(-10.5, 2, 3.6, 3, 0, 0, 7); x.fill();
   x.restore();
 
-  x.strokeStyle = "#8fa89b"; x.lineWidth = 1.8;
+  x.strokeStyle = LEG.color; x.lineWidth = LEG.cells / s;
   const ph1 = Math.sin(leg), ph2 = Math.sin(leg + Math.PI);
   x.beginPath(); x.moveTo(23, 67 + bob); x.quadraticCurveTo(20, 70, 18 + ph1 * 2.4, GY); x.stroke();
   x.beginPath(); x.moveTo(27, 68 + bob); x.quadraticCurveTo(26, 70.5, 25 + ph2 * 2.4, GY); x.stroke();
@@ -256,12 +271,27 @@ export function ponderAnchor(pose) {
   return { x: q.bx - 7, y: q.by - 4, place: "above" };
 }
 
-function ponderBall(x, cx, cy, r, roll) {
-  // Solid rim. A dashed rim baked to these small dot grids reads as a *broken*
-  // ball; a clean continuous ring is what "beetle pausing beside its ball"
-  // wants. (The roll still reads through the ground scroll + rotating flecks.)
-  x.strokeStyle = "#d9b45e"; x.lineWidth = 2;
+function ponderBall(x, cx, cy, r, roll, s) {
+  // The ball follows DUNG.md — the spec every scene's ball shares. Two rules
+  // are load-bearing here:
+  //
+  // 1. The rim is measured in CELLS, not design units, exactly like the legs
+  //    below. This stage is a 74-unit space baked to 96 cells (s ≈ 1.30), so a
+  //    2-unit rim landed at 2.6 cells while the dungroller's 2.2-unit rim in
+  //    its 96-unit space baked to 88 cells is 2.0 — the Ponderer's ball was
+  //    drawn 28% heavier on a ball 16% smaller, and read as a thick doughnut
+  //    beside the roller's sleek ring.
+  // 2. The rim is DASHED and phase-locked to the roll, because a smooth circle
+  //    rotating is invisible. This reverses an earlier note here claiming a
+  //    dashed rim "reads as a *broken* ball" — true at the old 64 grid, false
+  //    at 96, where the dashes land at 2.89 cells (DUNG.md §3 carries the
+  //    ≥2.5-cell threshold and the comparison that settled it).
+  x.strokeStyle = "#d9b45e"; x.lineWidth = 2 / s;
+  const rimPeriod = (TAU * r) / 21;
+  x.setLineDash([rimPeriod * 0.62, rimPeriod * 0.38]);
+  x.lineDashOffset = -roll * r;
   x.beginPath(); x.arc(cx, cy, r, 0, 7); x.stroke();
+  x.setLineDash([]);
   // Sparse, uniform flecks — dung texture that rotates with the roll, kept few
   // and small so they read as texture rather than a swirl inside the ball.
   x.fillStyle = "#b3924a";
@@ -285,9 +315,11 @@ function ponderGround(x, gy, travel, r) {
 
 function ponderBeetle(x, bx, by, gy, tilt, grip, legPh, ballCx, ballTop, ballR, s, onBall) {
   const R = 6.6;
-  // Leg/arm stroke ~1.1 cells at ANY bake grid (s = cells per design unit), so
-  // finer bakes don't render legs as chunky multi-cell dot-clusters on the ball.
-  x.strokeStyle = "#6e7f76"; x.lineWidth = 1.1 / s;
+  // Limbs are the roller's, exactly — see LEG. The geometry below cannot be
+  // shared with it (this beetle translates, tilts, lets go of the ball and can
+  // climb onto it; the roller's legs are constants for a beetle that does none
+  // of those), but the STYLE is not geometry and had no business differing.
+  x.strokeStyle = LEG.color; x.lineWidth = LEG.cells / s;
   const ph1 = Math.sin(legPh), ph2 = Math.sin(legPh + Math.PI);
   if (onBall) {
     // legs tucked onto the ball crown instead of the ground
@@ -299,15 +331,37 @@ function ponderBeetle(x, bx, by, gy, tilt, grip, legPh, ballCx, ballTop, ballR, 
     x.beginPath(); x.moveTo(bx - 1, by + 3); x.quadraticCurveTo(bx - 1, by + 5.5, bx - 1 + ph2 * 2.2, gy); x.stroke();
     x.beginPath(); x.moveTo(bx + 3, by + 3); x.quadraticCurveTo(bx + 3.5, by + 5.5, bx + 3 + ph1 * 1.7, gy); x.stroke();
     // arms — reach to the ball's near SURFACE when gripping (never onto/over the
-    // gold ball), else fold to the chest. Target sits just outside the rim on
-    // the upper-left arc, so the hands touch the ball without overlapping it.
+    // gold ball), else fold to the chest. The hands must STOP at the rim's outer
+    // edge: the bake classifies each cell to exactly ONE layer, so a limb drawn
+    // over the rim does not overlay it, it REPLACES those cells with gray and
+    // punches a notch out of the gold ring (DUNG.md §4 says the same about a
+    // fleck touching the rim from the inside).
+    //
+    // So the clearance is derived, not guessed: half the rim plus half the limb,
+    // both of which are specified in cells, converted back to design units. A
+    // hand-tuned `ballR * 1.04` put the tip at 12.48 units with the rim spanning
+    // 11.23–12.77 — inside the band, which cost ~16 of the rim's 222 cells while
+    // the beetle pushed.
     const ax = bx + 5.5, ay = by - 1;
-    const ballCy = ballTop + ballR, ca = Math.PI * 1.11; // ~200°, upper-left rim
-    const tx = ballCx + ballR * 1.04 * Math.cos(ca), ty = ballCy + ballR * 1.04 * Math.sin(ca);
-    const gx1 = ax + (tx - ax) * grip - (1 - grip) * 1.5;
-    const gy1 = ay + (ty - ay) * grip + (1 - grip) * 3;
+    const clear = (2 / 2 + LEG.cells / 2) / s;
+    const ballCy = ballTop + ballR, reach = ballR + clear;
+    // Both hands land ON the clearance circle, at two angles on the upper-left
+    // arc — never one hand placed and the other nudged off it by a hand-tuned
+    // offset, which is how the lower arm ended up back inside the rim band.
+    const hand = (ang) => {
+      const hx = ballCx + reach * Math.cos(ang), hy = ballCy + reach * Math.sin(ang);
+      return [ax + (hx - ax) * grip - (1 - grip) * 1.5, ay + (hy - ay) * grip + (1 - grip) * 3];
+    };
+    // Angles chosen by measurement, not by eye: the shoulder sits at ~154° from
+    // the ball centre, so a hand placed high on the arc (the old ~200°) made the
+    // arm cross the rim band OBLIQUELY — running along the ring instead of into
+    // it, which is what maximises the cells it steals. Sweeping the pair over
+    // the arc, 0.95π/1.03π leaves 9 limb cells in the band against 74 at
+    // 1.11π/1.19π, and hands 65 more gold rim cells back.
+    const [gx1, gy1] = hand(Math.PI * 0.95);   // ~171°
+    const [gx2, gy2] = hand(Math.PI * 1.03);   // ~185°, the lower arm
     x.beginPath(); x.moveTo(ax, ay); x.quadraticCurveTo(ax + 1.5, ay - 2, gx1, gy1); x.stroke();
-    x.beginPath(); x.moveTo(bx + 4, by + 1); x.quadraticCurveTo(ax + 1, ay + 1, gx1 - 0.3, gy1 + 2.2); x.stroke();
+    x.beginPath(); x.moveTo(bx + 4, by + 1); x.quadraticCurveTo(ax + 1, ay + 1, gx2, gy2); x.stroke();
   }
   // body + head, rotated about (bx,by)
   x.save(); x.translate(bx, by); x.rotate(tilt);
@@ -317,7 +371,7 @@ function ponderBeetle(x, bx, by, gy, tilt, grip, legPh, ballCx, ballTop, ballR, 
   x.beginPath(); x.moveTo(-R * 0.4, -2.2); x.lineTo(R * 0.6, 0.4); x.stroke();
   x.fillStyle = "#1c8a64";
   x.beginPath(); x.ellipse(-R - 0.6, 1.3, 2.4, 2, 0, 0, 7); x.fill();
-  x.strokeStyle = "#6e7f76"; x.lineWidth = 0.8;
+  x.strokeStyle = LEG.color; x.lineWidth = 0.8;
   x.beginPath(); x.moveTo(-R - 1.4, 0.2); x.quadraticCurveTo(-R - 3.5, -1.6, -R - 4, -3.2); x.stroke();
   x.restore();
 }
@@ -347,7 +401,7 @@ export function drawPonderer(x, u, cols, rows, opts = {}) {
   const q = ponderPose(pose, a);
   const ballCx = ballX + q.ballDX;
   const ballCy = gy - r;
-  ponderBall(x, ballCx, ballCy, r, roll);
+  ponderBall(x, ballCx, ballCy, r, roll, s);
 
   const legPh = (u < R0 ? u : u < R1 ? R0 : u) * TAU * 13;
   ponderBeetle(x, q.bx, q.by, gy, q.tilt, q.grip, legPh, ballCx, ballCy - r, r, s, q.onBall);

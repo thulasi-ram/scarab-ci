@@ -43,6 +43,11 @@ The wing-spread scene (`drawScarab`) stays in `scenes.mjs` but is currently
 unbaked — the docs hero uses the square emblem SVG. Re-add its `bakeScene`
 line if a state moment wants it.
 
+**The dung ball** is the one object that recurs across scenes, so its rules —
+rim weight in cells, the single `roll` that drives rim/flecks/ground, the dash
+threshold, layer roles — live in `DUNG.md`. Read it before drawing a ball in a
+new scene.
+
 **Scene backdrops** (scenery behind the beetle — sun/moon/clouds) were explored
 and **parked** as overkill for v1; the design + a build recipe are preserved in
 `BACKDROPS.md`. The beetle fixes from that exploration (square cells, 96 grid,
