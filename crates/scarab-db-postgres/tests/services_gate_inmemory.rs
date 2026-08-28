@@ -489,3 +489,67 @@ async fn failed_service_teardown_is_retried_not_recorded() {
         ServiceStatus::TornDown
     );
 }
+
+/// The ADR-0059 tick bound is the THIRD way a run reaches a terminal state, and
+/// it was the only one that left the run's shared services running. It is also
+/// the worst place to leak: an orphaned service Pod holds its CPU request
+/// forever, and on a small node a few of them make every later step Pod
+/// Unschedulable — which the executor reports as `Infra { never_started }`,
+/// which dead-letters that run and leaks ITS services in turn. Observed on the
+/// public demo box: three orphaned Postgres services, node at 96% CPU
+/// requested, 18 Pending step Pods and every run red.
+#[tokio::test]
+async fn a_dead_lettered_run_tears_down_its_shared_services() {
+    let db = InMemoryDb::new();
+    let run = RunId("run-dl".into());
+    db.create_run(&run, 2, 1, Timestamp(0)).await.unwrap();
+    db.store_run_ir(
+        &run,
+        &ir_with_db_service(json!([{ "id": "test", "image": "busybox", "uses": ["db"] }])),
+    )
+    .await
+    .unwrap();
+    db.create_step_run(
+        &run,
+        &StepId("test".into()),
+        Some(&spec(&["db"])),
+        &[],
+        Timestamp(0),
+    )
+    .await
+    .unwrap();
+    db.seed_run(&run, RunStatus::Running);
+    db.create_run_service(&run, 1, "db", Timestamp(0))
+        .await
+        .unwrap();
+    let handle = FakeExecutor::service_handle("run-dl", 1, "db");
+    db.set_run_service(&run, 1, "db", ServiceStatus::Ready, Some(&handle.0))
+        .await
+        .unwrap();
+
+    let clock = FakeClock::new(1_000);
+    let exec = FakeExecutor::new();
+    // Drive the bound honestly rather than calling the private dead-letter: a
+    // readiness probe that always errors fails this run's per-run leg every
+    // tick, and a zero deadline means the very first failure trips the bound.
+    exec.fail_service_ready(&handle);
+    let sched = Scheduler::new(&db, &clock, &exec, "drv").with_tick_failure_deadline_ms(0);
+
+    sched.tick_all().await.expect("tick");
+
+    assert_eq!(
+        db.run_status(&run).await.unwrap(),
+        Some(RunStatus::DeadLettered),
+        "the tick bound dead-letters the run"
+    );
+    assert_eq!(
+        exec.torn_down_services(),
+        vec![handle.0.clone()],
+        "the dead-lettered run's service Pod was torn down — nothing visits \
+         this run again, so this was the last chance"
+    );
+    assert_eq!(
+        service(&db.run_services(&run).await.unwrap(), 1, "db").status,
+        ServiceStatus::TornDown
+    );
+}

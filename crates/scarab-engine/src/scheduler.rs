@@ -3263,12 +3263,34 @@ impl<'a> Scheduler<'a> {
                         .await?;
                 }
             }
+            // Shared services (ADR-0058) are NOT steps, so the loop above never
+            // reaches them — and this is the LAST moment anything will: the run
+            // is about to go terminal and leave the active set, after which no
+            // tick visits it again. Left behind, a service Pod runs forever
+            // holding its CPU request, and on a small node a few of them
+            // saturate it: every later step Pod is then Unschedulable, which the
+            // executor reports as `Infra { never_started }`, which dead-letters
+            // THAT run — leaking its services in turn. The leak is self-feeding,
+            // which is how a demo box wedged with three orphaned Postgres
+            // services and every run red.
+            //
+            // `settle_run` (the natural terminal) and `cancel_run` both tear
+            // down here; this bound was the third path and the only one that
+            // did not.
+            self.teardown_services(run).await?;
             Ok::<(), SchedulerError>(())
         }
         .await;
         if let Err(e) = cleanup {
+            // Best-effort ON PURPOSE (ADR-0059, as for the step rows above): a
+            // run dead-lettered *because its own reads keep failing* must still
+            // reach a terminal verdict, or the very fault being escaped blocks
+            // the escape. A failed teardown is recorded in the diagnostic — the
+            // operator signal that a Pod may be orphaned — never a reason to
+            // abandon the dead-letter.
             reason.push_str(&format!(
-                " (step cleanup also failed, step rows may be left non-terminal: {e})"
+                " (cleanup also failed, step rows may be left non-terminal and \
+                 shared-service Pods may be orphaned: {e})"
             ));
         }
         let now = self.clock.now().await;
