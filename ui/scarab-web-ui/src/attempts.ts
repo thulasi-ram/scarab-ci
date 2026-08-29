@@ -14,6 +14,11 @@ export type AttemptLike = {
   outcome: string;
   failed: boolean;
   failure?: string | null;
+  /** The executor's human-readable cause (`attempts.failure_detail`) — WHAT
+   * happened, where `failure` is only which retry policy applied (ADR-0068).
+   * This field existed on the API for months and no view read it, which is why
+   * a dead-lettered step showed "no output for this try" and nothing else. */
+  failure_detail?: string | null;
 };
 
 /** The attempts a step pane's tabs are scoped to. Take-windowed in EVERY view
@@ -70,6 +75,8 @@ export type FilmstripTry = {
   outcome: string;
   failed: boolean;
   failure?: string;
+  /** The executor's human-readable cause, when it reported one (ADR-0068). */
+  failureDetail?: string;
   /** Cut short by a rerun of an ancestor (started, never finished). */
   superseded: boolean;
   /** A success that a newer success replaced as of-record. */
@@ -99,6 +106,7 @@ export function stripTries(
     outcome: a.outcome,
     failed: a.failed,
     failure: a.failure ?? undefined,
+    failureDetail: a.failure_detail ?? undefined,
     superseded: c.superseded.has(a.id),
     shadowed: c.shadowed.has(a.id),
     readopted: c.readopted.has(a.id),

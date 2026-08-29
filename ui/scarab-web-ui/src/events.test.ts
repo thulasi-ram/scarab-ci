@@ -159,3 +159,59 @@ describe("WorkspaceInputCollisions (ticket 2e1a458)", () => {
     );
   });
 });
+
+// The infra-condition channel (ADR-0068). These events exist because a step
+// whose Pod never started has an empty log stream by construction, so the
+// activity rail is the only place its diagnosis can appear.
+describe("StepInfraCondition", () => {
+  const onset = (reason: string, message?: string) =>
+    ev(1, { StepInfraCondition: { step: "build", attempt: "a1", reason, message } });
+  const close = (reason: string, held_ms: number, observations: number) =>
+    ev(2, { StepInfraCondition: { step: "build", attempt: "a1", reason, held_ms, observations } });
+
+  it("an onset leads with the backend reason and its message", () => {
+    expect(describeEvent(onset("Unschedulable", "0/3 nodes are available: 3 Insufficient cpu"))).toBe(
+      "build — Unschedulable: 0/3 nodes are available: 3 Insufficient cpu",
+    );
+  });
+
+  it("a reason with no message still reads", () => {
+    expect(eventParts(onset("ContainerCreating")).text).toBe("ContainerCreating");
+  });
+
+  it("a close leads with how long it held, not how many polls saw it", () => {
+    // Duration is what an operator acts on; the observation count is an artifact
+    // of the backend's own backoff schedule.
+    expect(eventParts(close("ImagePullBackOff", 252_000, 8)).text).toBe(
+      "ImagePullBackOff cleared after 4m12s",
+    );
+  });
+
+  it("splits the step into a chip like other step-scoped events", () => {
+    expect(eventParts(onset("Unschedulable")).step).toBe("build");
+  });
+
+  it("warns while it holds and goes quiet once it has cleared", () => {
+    // A Pod that could not schedule for two minutes and then ran is a fact, not
+    // an alarm — and neither is `err`: nothing has failed yet.
+    expect(eventCategory(onset("Unschedulable"))).toBe("warning");
+    expect(eventCategory(close("Unschedulable", 120_000, 4))).toBe("info");
+  });
+});
+
+describe("RunDeadLettered", () => {
+  const dl = (reason: string) => ev(9, { RunDeadLettered: { reason } });
+
+  it("renders the reason instead of the bare tag", () => {
+    // This is the one place the diagnosis is durably written. It used to fall
+    // through to `default` and render as "RunDeadLettered", so the run that most
+    // needed explaining explained nothing.
+    expect(describeEvent(dl("step `build`: Unschedulable: 0/3 nodes are available"))).toBe(
+      "Run dead-lettered — step `build`: Unschedulable: 0/3 nodes are available",
+    );
+  });
+
+  it("is an error, not the quietest thing on the rail", () => {
+    expect(eventCategory(dl("whatever"))).toBe("err");
+  });
+});
