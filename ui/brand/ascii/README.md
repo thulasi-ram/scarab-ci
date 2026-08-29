@@ -10,6 +10,11 @@ output, ship no rendering code**. The UIs play plain text frames by swapping
 npm install && npm run bake     # deterministic; reruns don't churn
 ```
 
+The two beetles that carry the brand — the dung roller and the Ponderer — are
+**traced pixel art**, not parametric drawings. The sheet and the tracer live in
+`sprites/` (read its README first); `sprites.mjs` composes the poses and holds
+the cell-exact primitives every scene draws with.
+
 ## Scenes (`generated/`)
 
 | Asset | What | Used by |
@@ -21,6 +26,13 @@ npm install && npm run bake     # deterministic; reruns don't churn
 | `doodles/*.svg` | Lucide icons rasterized to a 24×24 **dot matrix** (dot-icons.mjs) | docs + web-ui background doodles |
 
 ### Bubble stages (`ponder-*`) — text is a prop, not pixels
+
+`ponder` is the **idle** state moment (RepoView's empty repo), where an arrival
+reads wrong, so unlike the other three it is settled for the whole loop: the
+beetle is already lying there, back against its ball, and the ball only rocks a
+short distance to and fro under an idle foot. Its ball is smaller than the
+stage's (r 8 vs 12) — at the stage radius no foreleg can reach the rim without
+becoming a horizontal plank. A Zzz rises off the horn.
 
 The Ponderer is one stage reused for four moods (the held pose differs); each
 loop rolls in, **stops** for the middle, then rolls on. The speech-bubble text
@@ -66,9 +78,28 @@ same-shape text layers split by brand role: **em**erald (wings), gold/**au**
 `<pre>` elements and colors them via CSS custom properties, so the art follows
 the theme with zero per-cell work at runtime.
 
+## Cell spacing: the dots stand apart
+
+A cell is **0.9em**, against JetBrains Mono's 0.6em advance — so a cell is
+bigger than the glyph box and the dots do not touch. A solid fill then reads as
+a dot matrix rather than a slab. Both axes take the same factor (letter-spacing
+on x, line-height on y) or the grid stops being square.
+
+The factor lives in three coupled places and they **must** move together:
+`--ascii-cell` in `scarab-web-ui/src/styles.css`, `ASCII_CELL` in that UI's
+`AsciiScene.tsx`, and `ASCII_CELL` in `scarab-docs-ui`'s `AsciiScene.astro`.
+The players size the scene's box from the constant and the box clips, so a
+mismatch crops the art. Call sites carry a smaller `fontSize` to keep the same
+physical footprint as the old flush spacing.
+
+Spacing is a RENDERING choice — it never touches the bake — but it changes what
+the art has to do, because the eye stops closing small gaps for us. That is why
+the ball's rim is drawn the way `DUNG.md` now describes.
+
 ## Why the animated scarab is parametric, not traced
 
-The traced emblem's dark layer (`../logo/scarab-emblem.svg`) is one
+(The *scarab* here is the wing-spread emblem, not the beetles — those are
+traced, see `sprites/`.) The traced emblem's dark layer (`../logo/scarab-emblem.svg`) is one
 winding-linked compound path — its background whites are *hole contours* — so
 it cannot be dismembered for wing articulation. `scenes.mjs` rebuilds the
 scarab parametrically at the emblem's measured proportions (ring r≈894 at

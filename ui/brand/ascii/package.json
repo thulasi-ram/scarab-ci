@@ -4,7 +4,7 @@
   "type": "module",
   "description": "Offline ASCII scene baker \u2014 renders the brand beetle scenes to committed text frames (see README.md)",
   "scripts": {
-    "bake": "node bake.mjs && node dot-icons.mjs"
+    "bake": "node trace-sprites.mjs && node bake.mjs && node dot-icons.mjs"
   },
   "devDependencies": {
     "@napi-rs/canvas": "^0.1.65",

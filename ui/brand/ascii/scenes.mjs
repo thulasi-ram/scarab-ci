@@ -15,11 +15,19 @@
 // cell as emerald / gold / gray by hue and the players color those layers with
 // CSS. Keep fills in these three hue families.
 
+import { BODIES, blit, limb, ball } from "./sprites.mjs";
+
 export const VB_W = 2196;
 export const VB_H = 1952;
-// Cells render SQUARE — the players set line-height to the 0.6em glyph advance,
-// so scene y is NOT squashed and the dot matrix is evenly spaced on both axes
-// (one language with the dot-matrix doodles). rows = cols * (VBh / VBw).
+// Cells render SQUARE — the players give a cell the SAME size on both axes, so
+// scene y is NOT squashed and the dot matrix is evenly spaced (one language
+// with the dot-matrix doodles). rows = cols * (VBh / VBw).
+//
+// A cell is no longer flush with the glyph: the players space them at 0.9em
+// against JetBrains Mono's 0.6em advance, so the dots stand apart and a solid
+// fill reads as a matrix rather than a slab. That spacing is a RENDERING
+// choice and does not touch the bake — but it does change what the art has to
+// do, because the eye stops closing small gaps for us. See DUNG.md.
 export const CELL_ASPECT = 1.0;
 
 const RING = { cx: 1089, cy: 950, r: 894, w: 42 };
@@ -159,7 +167,15 @@ const BALL = { x: 63, r: 20 };
 // 1.65 cells is the dung-roller's historical 1.8 design units (its s = 88/96),
 // so adopting this constant leaves the roller's bake byte-identical.
 export const LEG = { color: "#8fa89b", cells: 1.65 };
-const LEG_CYCLES = 14;      // integer → seamless loop
+const LEG_CYCLES = 9;       // integer → seamless loop; see drawBeetle
+/** Where the sprite sits, in CELLS on the 88-wide stage, and where its limbs
+ *  leave it. The art is authored at one source pixel per cell (sprites.mjs),
+ *  so these are cell coordinates, not design units. */
+const ROLLER = { col: 10, row: 19 };
+const ROLLER_LEGS = {
+  ground: [[[11, 18], 9], [[14, 16], 13], [[16, 13], 17]],   // [hip, foot col]
+  rim: [[[19, 4], [23, 2], 1], [[20, 9], [24, 8], 6]],       // [hip, knee, foot row]
+};
 const DOTS = 29;            // ground dots; spacing chosen so one loop = one wrap
 
 /** Dung beetle pushing its ball at phase u.
@@ -186,44 +202,42 @@ export function drawBeetle(x, u, cols, rows, opts = {}) {
     }
   }
 
-  // dung ball — outline + rotating flecks, resting on the ground.
-  // The rim is dashed and phase-locked to the roll (a smooth circle rotating
-  // is invisible); 21 segments divide the circumference exactly, so the loop
-  // stays seamless.
-  const by = GY - BALL.r;
-  const rimPeriod = (TAU * BALL.r) / 21;
-  x.strokeStyle = "#d9b45e"; x.lineWidth = 2.2;
-  x.setLineDash([rimPeriod * 0.62, rimPeriod * 0.38]);
-  x.lineDashOffset = -roll * BALL.r;
-  x.beginPath(); x.arc(BALL.x, by, BALL.r, 0, 7); x.stroke();
-  x.setLineDash([]);
-  x.fillStyle = "#b3924a";
-  for (let i = 0; i < 16; i++) {
-    const a = roll + i * 2.39996;            // golden-angle scatter
-    const rr = BALL.r * (0.15 + 0.75 * ((i * 0.61) % 1));
-    const fs = 1.4 + ((i * 7) % 3) * 0.8;
-    x.beginPath(); x.arc(BALL.x + Math.cos(a) * rr, by + Math.sin(a) * rr, fs, 0, 7); x.fill();
-  }
-
-  // beetle, head-down at the ground, hind legs up on the ball
-  // (dung beetles really do push walking backwards)
-  const leg = u * TAU * LEG_CYCLES;
-  const bob = Math.sin(leg) * 0.8;
-  x.save();
-  x.translate(30, 61 + bob); x.rotate(-0.62);
-  x.fillStyle = "#27b584";
-  x.beginPath(); x.ellipse(0, 0, 10.5, 6.5, 0, 0, 7); x.fill();
-  x.fillStyle = "#1c8a64";
-  x.beginPath(); x.ellipse(-10.5, 2, 3.6, 3, 0, 0, 7); x.fill();
+  // dung ball — DUNG.md. Cell-exact, so the rim is exactly one dot thick.
   x.restore();
+  ball(x, BALL.x * s, (GY - BALL.r - BEETLE_VB_Y0) * s, BALL.r * s, roll);
+  x.save();
+  x.setTransform(s, 0, 0, s * CELL_ASPECT, 0, -BEETLE_VB_Y0 * s * CELL_ASPECT);
 
-  x.strokeStyle = LEG.color; x.lineWidth = LEG.cells / s;
-  const ph1 = Math.sin(leg), ph2 = Math.sin(leg + Math.PI);
-  x.beginPath(); x.moveTo(23, 67 + bob); x.quadraticCurveTo(20, 70, 18 + ph1 * 2.4, GY); x.stroke();
-  x.beginPath(); x.moveTo(27, 68 + bob); x.quadraticCurveTo(26, 70.5, 25 + ph2 * 2.4, GY); x.stroke();
-  x.beginPath(); x.moveTo(32, 68 + bob); x.quadraticCurveTo(32.5, 70.5, 32 + ph1 * 1.8, GY); x.stroke();
-  x.beginPath(); x.moveTo(37, 57 + bob); x.quadraticCurveTo(43, 52.5, 46.5, 48 + ph2 * 1.2); x.stroke();
-  x.beginPath(); x.moveTo(38.5, 61 + bob); x.quadraticCurveTo(44.5, 58.5, 48.5, 56 + ph1 * 1.2); x.stroke();
+  // The beetle: the traced sprite, rotated 45° into the head-down push (dung
+  // beetles really do push walking backwards). Limbs FIRST, carapace over
+  // them — a leg braced on the ball leaves from underneath, and drawn after
+  // the fill it lays a gray band across the shell.
+  //
+  // The carapace itself HOLDS. It is hard-edged cells now, and bobbing it a
+  // whole cell fourteen times a loop reads as vibration rather than a gait, so
+  // the gait lives entirely in the feet. For the same reason LEG_CYCLES is 9,
+  // not the old oval's 14: 72/9 gives 8 frames per step where 14 gave 5, and
+  // cell-quantised feet have no antialiased in-betweens to carry a stride.
+  const leg = u * TAU * LEG_CYCLES;
+  const gyC = Math.round((GY - BEETLE_VB_Y0) * s);
+  const bcx = BALL.x * s, bcy = (GY - BALL.r - BEETLE_VB_Y0) * s, br = BALL.r * s;
+  // Hips sit on the THORAX underside, never on the horn: rotated 45° the
+  // horn's arch swings into the bottom-left corner of the sprite, which is
+  // exactly where a naive "under the front of the beetle" hip lands.
+  for (const [i, [hip, fx]] of ROLLER_LEGS.ground.entries()) {
+    const p = leg + i * 2.1;
+    const swing = Math.round(Math.sin(p) * 2);
+    const lift = Math.cos(p) > 0 ? 1 : 0;            // the foot clears the ground
+    limb(x, [[ROLLER.col + hip[0], ROLLER.row + hip[1]], [ROLLER.col + fx + swing, gyC - lift]], "flat");
+  }
+  for (const [i, [hip, knee, frow]] of ROLLER_LEGS.rim.entries()) {
+    const ph = Math.round(Math.sin(leg + Math.PI * i) * 1.6);
+    const fr = ROLLER.row + frow + ph, dy = fr - bcy;
+    const fx = Math.round(bcx - Math.sqrt(Math.max(0, br * br - dy * dy))) - 1;
+    limb(x, [[ROLLER.col + hip[0], ROLLER.row + hip[1]],
+             [ROLLER.col + knee[0], ROLLER.row + knee[1]], [fx, fr]], "grip");
+  }
+  blit(x, BODIES.roller, ROLLER.col, ROLLER.row);
   x.restore();
 }
 
@@ -238,6 +252,35 @@ export const PONDER = {
   W: 74, VBy0: 10, VBh: 33, gy: 40, r: 12, ballX: 48, bx: 28,
   R0: 0.30, R1: 0.78, // roll-in ends at R0; hold ends (roll-out begins) at R1
 };
+
+// "ponder" is the state-moment pose (RepoView's empty repo) and an arrival
+// reads wrong there, so unlike nap / kingofhill / faceplant it is NOT a hold
+// inside a roll-in/hold/roll-out journey. It is settled for the WHOLE loop: no
+// entrance, no exit, and the ball only rocks a short distance to and fro under
+// an idle foot.
+//
+// Its ball is SMALLER than the stage's (r 8 vs 12). At the stage radius no
+// foreleg can reach the rim without becoming a horizontal plank — the surface
+// at the beetle's own height is simply too far away — and a beetle merely
+// beside a boulder does not read as a beetle with its ball.
+const SETTLED = {
+  ballX: 48, ballR: 8, amp: 2,
+  col: 10, row: 26,                 // the sprite's cell origin on the 96 stage
+  hip: [37, 10], knee: [40, 9], footRow: 7,
+};
+// The Zzz. The sheet draws one over its sleeper, but in a script-thin stroke
+// finer than the native pixel grid — traced at pitch it survives as four
+// scattered cells, not as letters — so it is redrawn as pixel glyphs, three
+// sizes rising away from the horn. Each dissolves by WEIGHT rather than
+// presence (bright gold bakes to '●', #a8873f to '•', then out): popping a
+// whole glyph off in one frame reads as a flicker, stepping it down the ramp
+// reads as fading.
+const Z_GLYPH = {
+  3: ["###", ".#.", "###"],
+  4: ["####", "..#.", ".#..", "####"],
+  5: ["#####", "...#.", "..#..", ".#...", "#####"],
+};
+const ZZZ = [[24, 23, 3], [18, 19, 4], [11, 14, 5]];   // [col, row, size]
 export const PONDER_POSES = ["ponder", "nap", "kingofhill", "faceplant"];
 
 // Trapezoid settle: ease into the pose, hold it, ease back out over the hold.
@@ -266,41 +309,35 @@ function ponderPose(pose, a) {
 
 /** World-space point the bubble tail points at, + placement side. */
 export function ponderAnchor(pose) {
+  if (pose === "ponder") {
+    // Above the horn arch. Derived from SETTLED so it cannot go stale: a NaN
+    // here bakes to `"col": null`, which only surfaces as a web-ui type error.
+    return { x: (SETTLED.col + 20) / (96 / PONDER.W),
+             y: PONDER.VBy0 + (SETTLED.row - 6) / (96 / PONDER.W), place: "above" };
+  }
   const q = ponderPose(pose, 1);
   if (pose === "kingofhill") return { x: q.bx + 10, y: q.by + 1, place: "right" };
   return { x: q.bx - 7, y: q.by - 4, place: "above" };
 }
 
+/** The Ponderer's ball. One implementation for every scene — see sprites.mjs.
+ *
+ *  This replaces a STROKED, dashed rim. Two things it got wrong, both of which
+ *  only became visible once the players spaced the cells apart:
+ *   • a stroke cannot be thinned past ~3 rows at the circle's poles. The width
+ *     is perpendicular to the curve; it is the ANTIALIASING that spreads, and
+ *     every grazed cell still bakes to a dot. Narrowing dims them, it does not
+ *     remove them.
+ *   • a dash GAP is a hole. At the old flush spacing the eye closed it and the
+ *     ring read as a circle; spaced out, the same rim reads as loose arcs. The
+ *     rhythm is kept but drawn as WEIGHT (a dimmer dot) instead of absence.
+ *  `s` is no longer needed: cell-exact art does not scale with the stage. */
 function ponderBall(x, cx, cy, r, roll, s) {
-  // The ball follows DUNG.md — the spec every scene's ball shares. Two rules
-  // are load-bearing here:
-  //
-  // 1. The rim is measured in CELLS, not design units, exactly like the legs
-  //    below. This stage is a 74-unit space baked to 96 cells (s ≈ 1.30), so a
-  //    2-unit rim landed at 2.6 cells while the dungroller's 2.2-unit rim in
-  //    its 96-unit space baked to 88 cells is 2.0 — the Ponderer's ball was
-  //    drawn 28% heavier on a ball 16% smaller, and read as a thick doughnut
-  //    beside the roller's sleek ring.
-  // 2. The rim is DASHED and phase-locked to the roll, because a smooth circle
-  //    rotating is invisible. This reverses an earlier note here claiming a
-  //    dashed rim "reads as a *broken* ball" — true at the old 64 grid, false
-  //    at 96, where the dashes land at 2.89 cells (DUNG.md §3 carries the
-  //    ≥2.5-cell threshold and the comparison that settled it).
-  x.strokeStyle = "#d9b45e"; x.lineWidth = 2 / s;
-  const rimPeriod = (TAU * r) / 21;
-  x.setLineDash([rimPeriod * 0.62, rimPeriod * 0.38]);
-  x.lineDashOffset = -roll * r;
-  x.beginPath(); x.arc(cx, cy, r, 0, 7); x.stroke();
-  x.setLineDash([]);
-  // Sparse, uniform flecks — dung texture that rotates with the roll, kept few
-  // and small so they read as texture rather than a swirl inside the ball.
-  x.fillStyle = "#b3924a";
-  for (let i = 0; i < 9; i++) {
-    const a = roll + i * 2.39996;
-    const rr = r * (0.22 + 0.48 * ((i * 0.61) % 1));
-    const fs = r * 0.085;
-    x.beginPath(); x.arc(cx + Math.cos(a) * rr, cy + Math.sin(a) * rr, fs, 0, 7); x.fill();
-  }
+  x.restore();
+  ball(x, cx * s, (cy - PONDER.VBy0) * s, r * s, roll);
+  x.save();
+  x.setTransform(s, 0, 0, s * CELL_ASPECT, 0, -PONDER.VBy0 * s * CELL_ASPECT);
+  x.lineCap = "round"; x.lineJoin = "round";
 }
 
 function ponderGround(x, gy, travel, r) {
@@ -377,8 +414,56 @@ function ponderBeetle(x, bx, by, gy, tilt, grip, legPh, ballCx, ballTop, ballR, 
 }
 
 /** Ponderer stage at phase u. opts.pose ∈ PONDER_POSES. */
+/** "ponder": settled for the whole loop, the ball rocking under an idle foot. */
+function drawSettledPonder(x, u, cols, rows) {
+  const P = PONDER, S = SETTLED;
+  const s = cols / P.W;
+  x.clearRect(0, 0, cols, rows);
+  x.save();
+  x.setTransform(s, 0, 0, s * CELL_ASPECT, 0, -P.VBy0 * s * CELL_ASPECT);
+  // Ground pitch is the STAGE's, not this ball's: ponderGround derives its dot
+  // spacing from the radius it is given, so the settled ball's smaller radius
+  // would stop the ground short of the frame's right edge. Travel is 0 — the
+  // beetle isn't going anywhere.
+  ponderGround(x, P.gy, 0, P.r);
+
+  // TWO harmonics, not one. A pure sine rock is symmetric about its extremes,
+  // so u and 0.5-u put the ball in the same place with the same roll — and
+  // since roll drives the rim rhythm and the flecks too, half the loop was a
+  // byte-for-byte replay: 72 baked frames rendered 37 distinct ones and the
+  // scene read as half the animation the roller is. A second harmonic breaks
+  // the symmetry while still returning to rest, so it is still one idle nudge.
+  const cx = S.ballX + S.amp * (0.72 * Math.sin(u * TAU) + 0.28 * Math.sin(2 * u * TAU));
+  const cy = P.gy - S.ballR;
+  const roll = (cx - S.ballX) / S.ballR;   // phase tracks displacement, not a spin
+  ponderBall(x, cx, cy, S.ballR, roll, s);
+  x.restore();
+
+  // The braced hind leg, redrawn each frame so its foot stays ON the rocking
+  // rim: the whole animation is the ball moving under an idle foot. Limb
+  // first, carapace over it.
+  const bcx = cx * s, bcy = (cy - P.VBy0) * s, br = S.ballR * s;
+  const fr = S.row + S.footRow, dy = fr - bcy;
+  const foot = [Math.round(bcx - Math.sqrt(Math.max(0, br * br - dy * dy))) - 1, fr];
+  limb(x, [[S.col + S.hip[0], S.row + S.hip[1]], [S.col + S.knee[0], S.row + S.knee[1]], foot], "grip");
+  blit(x, BODIES.ponder, S.col, S.row);
+
+  x.save(); x.setTransform(1, 0, 0, 1, 0, 0);
+  ZZZ.forEach(([col, row, size], i) => {
+    const p = (u + i / 3) % 1;
+    if (p >= 0.82) return;
+    x.fillStyle = p < 0.58 ? "#d9b45e" : "#a8873f";
+    const rise = Math.round(p * 3);
+    Z_GLYPH[size].forEach((line, r) => [...line].forEach((ch, c) => {
+      if (ch === "#") x.fillRect(col + c, row + r - rise, 1, 1);
+    }));
+  });
+  x.restore();
+}
+
 export function drawPonderer(x, u, cols, rows, opts = {}) {
   const pose = opts.pose || "ponder";
+  if (pose === "ponder") return drawSettledPonder(x, u, cols, rows);
   const P = PONDER;
   const s = cols / P.W;
   x.clearRect(0, 0, cols, rows);

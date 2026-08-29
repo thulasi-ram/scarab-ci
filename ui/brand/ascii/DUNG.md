@@ -38,9 +38,51 @@ never.
 
 | feature | value | why |
 |---|---|---|
-| rim stroke | **2.0 cells** (`2 / s`) | one dot of ramp on each side of the true circle; 1 cell aliases into a dotted line, 3 closes the ring into a band |
-| leg / arm stroke | **1.65 cells** (`LEG.cells / s`) | see §7 — thinner vanishes |
+| rim | **1 row of dots**, rasterized cell by cell | see §1a — a stroke cannot get there |
+| leg / arm | **1 cell**, rasterized, ending in a 2-cell foot | see §1a |
 | ground dot | **1.3–1.7 cells** square | below 1 cell it flickers between frames as it crosses cell boundaries |
+
+## 1a. Don't STROKE anything that has to read at a set weight
+
+The rim and the limbs used to be strokes: 2.0 cells and 1.65 cells. Both are
+now rasterized cell by cell, and the reason is the medium, not taste.
+
+A stroke's width is perpendicular to the curve, but what you see is its
+ANTIALIASING, and that is sub-cell: every grazed cell still crosses the ramp
+and bakes to a dot. So a 2-cell rim comes out **three rows thick at the
+circle's poles** — where the curve runs nearly horizontal it grazes a whole
+band — and narrowing the stroke only dims those dots, it never removes them.
+The same thing made a 1.65-cell leg a three-dot band, heavier than the
+hard-celled carapace it hangs off.
+
+Rasterized instead, a rim is exactly one dot thick everywhere and a leg is
+exactly one dot wide. Two consequences:
+
+- **4-connect the ring.** Cells that touch only at a corner sit √2 apart, which
+  at the player's cell spacing reads as a hole. Fill the corner cell when a
+  step moves in both axes.
+- **Give every limb a foot** — two cells, flat on the ground or stacked to grip
+  the rim. The sheet does; without it a bare diagonal reads as a scratch.
+
+## 1b. Encode a pattern in dot SIZE, never in presence
+
+The rim keeps its rhythm — 21 dashes at 62% duty, phase-locked to the roll —
+but the "off" arcs are **dimmed** (`#a8873f`, which bakes to `•`) rather than
+omitted. On a dot matrix a gap is a HOLE. At the old flush cell spacing the eye
+closed it and a dashed ring still read as a circle; spaced apart, the identical
+rim reads as loose arcs and the ball stops being round.
+
+Everything tried in between is worth not re-trying: raising the duty cycle
+leaves the diagonals gappy (that is §1a, not the pattern); a notch, a bump and
+a travelling two-row arc all read as damage or as a machined part; and a fully
+smooth closed ring is invisible when it rotates, which is the trap the original
+dashed rim was avoiding in the first place. A lighter dot marches just as well
+as an absent one, and the circle never opens.
+
+**Flecks: 16, at three sizes.** Equal-sized flecks orbit as a pattern; varied
+ones read as a surface turning, because the eye tracks the big ones while the
+small ones fill between them. Cutting them to five equal blobs was tried and
+the ball went dead.
 
 ### Colour is the other half of weight
 
@@ -88,6 +130,12 @@ correct: the ball genuinely is not moving. Never animate the ball through a hold
 to "keep it alive".
 
 ## 3. The rim rotates, and it is dashed so you can see it
+
+> **Superseded in part by §1b.** The rhythm below is unchanged and still the
+> spec; what changed is that the dashes are now drawn as lighter dots rather
+> than as gaps. Read §1b first — everything here about phase, period and
+> seamlessness still holds.
+
 
 A smooth circle rotating is invisible. The rim is therefore **dashed and
 phase-locked to the roll** — the dashes walk around the circumference, and that

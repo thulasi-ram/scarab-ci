@@ -281,8 +281,8 @@ export default function RepoView() {
                     <div class="empty-land">
                       <AsciiScene
                         scene={ponderIdle}
-                        fontSize={6}
-                        label="Beetle pausing beside its ball"
+                        fontSize={4}
+                        label="Beetle dozing with its back against its dung ball"
                       />
                     </div>
                     <p class="empty">This repo hasn't run yet.</p>

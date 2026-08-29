@@ -250,8 +250,15 @@ code,
   margin: 0;
   font-family: var(--font-mono);
   font-size: var(--ascii-fs, 8px);
-  /* square cell = 0.6em advance x 0.6em line-height (no squash; bake aspect 1.0) */
-  line-height: calc(var(--ascii-fs, 8px) * 0.6);
+  /* SQUARE cell, and DELIBERATELY BIGGER than the glyph box. JetBrains Mono's
+     advance is 0.6em; the cell is 0.9em, so the dots stand apart and a solid
+     fill reads as a dot matrix rather than a slab. Both axes take the same
+     factor (letter-spacing on x, line-height on y) or the grid stops being
+     square. --ascii-cell is the single source of that factor and MUST stay in
+     step with AsciiScene's `cell` constant: the player sizes the box from it,
+     and .ascii-scene clips, so a mismatch crops the art. */
+  line-height: calc(var(--ascii-fs, 8px) * var(--ascii-cell, 0.9));
+  letter-spacing: calc(var(--ascii-fs, 8px) * (var(--ascii-cell, 0.9) - 0.6));
   /* The baked layers are trimmed of trailing spaces, so every row is a
      different length. An inherited `text-align: center` (e.g. .empty-scene)
      then centres each row independently and shears the scene apart. The grid
