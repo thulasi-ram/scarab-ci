@@ -103,9 +103,14 @@ function contentBox(scene: Baked): Box {
   return b;
 }
 
+/** Cell size in em. MUST match --ascii-cell in styles.css: this sizes the box
+ *  and .ascii-scene clips, so a mismatch crops the art (a layer can be a third
+ *  of the scene's width, which is exactly how far it crops). */
+const ASCII_CELL = 0.9;
+
 export default function AsciiScene(props: {
   scene: Baked;
-  /** px per cell column; glyph advance is ~0.602 × this */
+  /** px per glyph. A CELL is ASCII_CELL x this — bigger than the glyph box. */
   fontSize?: number;
   /** accessible name; omit → decorative (aria-hidden) */
   label?: string;
@@ -117,7 +122,7 @@ export default function AsciiScene(props: {
 }) {
   const pres: HTMLPreElement[] = [];
   const { frames, fps, bubble, cols, rows } = props.scene;
-  const cell = (props.fontSize ?? 8) * 0.6;
+  const cell = (props.fontSize ?? 8) * ASCII_CELL;
   // Composed once: neither the text nor its anchor changes per frame — only
   // whether the bubble is showing.
   const bub = bubble && props.line ? composeBubble(props.line, bubble, cols, rows) : null;
@@ -162,13 +167,16 @@ export default function AsciiScene(props: {
   // axes are the OCCUPIED grid, not the declared one — see contentBox. The
   // layers still paint in grid coordinates, so they are shifted up/left by the
   // box origin (`--ascii-dx/dy`) to bring the art flush into it.
-  // JetBrains Mono's advance is exactly 0.6em and the CSS sets line-height to
-  // 0.6em too, so cells are SQUARE — width AND height use the same 0.6 factor.
+  // Cells are SQUARE — width AND height use the same ASCII_CELL factor, which
+  // the CSS applies as letter-spacing (x) and line-height (y). It is larger
+  // than JetBrains Mono's 0.6em advance on purpose: the dots stand apart and a
+  // solid fill reads as a dot matrix rather than a slab.
   return (
     <div
       class={`ascii-scene ${props.class ?? ""}`}
       style={{
         "--ascii-fs": `${props.fontSize ?? 8}px`,
+        "--ascii-cell": `${ASCII_CELL}`,
         "--ascii-dx": `${-box.c0 * cell}px`,
         "--ascii-dy": `${-box.r0 * cell}px`,
         width: `${boxCols * cell}px`,

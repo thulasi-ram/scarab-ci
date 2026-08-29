@@ -98,6 +98,8 @@ const repoRuns: Record<string, ReturnType<typeof strip>> = {
   "orders-api": strip("oxooxooxooooo"),
   "inventory-svc": strip("oxoxooxxooxoo"), // ~50%
   "edge-gateway": strip("ooooooooxoooo"), // ~93%
+  // matches its last_run_at: null above — the empty-state repo (ponder scene)
+  "scarab-infra": { runs: [] },
 };
 // A gentler pass mix so the shown percentages land ~64/64/50/93 like the
 // original: recompute deterministically by fixed strings above (close enough).

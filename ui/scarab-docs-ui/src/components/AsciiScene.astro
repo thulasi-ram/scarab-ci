@@ -10,9 +10,15 @@
 // `slotSelector` supports the hero: Starlight's hero.image.html is a static
 // string, so the page puts an empty slot div there and this component moves
 // itself into it during parse (inline script — before first paint).
+/** Cell size in em — MUST match the line-height/letter-spacing below and the
+ *  web-ui's ASCII_CELL. Bigger than JetBrains Mono's 0.6em advance on purpose:
+ *  the dots stand apart and a solid fill reads as a dot matrix, not a slab.
+ *  This also sizes the box, and the scene clips, so a mismatch crops the art. */
+const ASCII_CELL = 0.9;
+
 interface Props {
   name: string;
-  fontSize?: number;      // px per cell column (glyph advance ≈ 0.602 × this)
+  fontSize?: number;      // px per glyph; a CELL is ASCII_CELL x this
   slotSelector?: string;
   label?: string;         // accessible name; omit → decorative (aria-hidden)
   class?: string;
@@ -55,8 +61,8 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
     // JetBrains Mono's advance is exactly 0.6em and line-height is set to 0.6em
     // too, so cells are SQUARE — width AND height use the same 0.6 factor.
     `--ascii-fs:${fontSize}px;` +
-    `width:${boxCols * fontSize * 0.6}px;` +
-    `height:${scene.rows * fontSize * 0.6}px`
+    `width:${boxCols * fontSize * ASCII_CELL}px;` +
+    `height:${scene.rows * fontSize * ASCII_CELL}px`
   }
   role={label ? "img" : undefined}
   aria-label={label}
@@ -182,7 +188,8 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
     font-family: 'JetBrains Mono', ui-monospace, monospace;
     font-size: var(--ascii-fs, 8px);
     /* square cell = 0.6em advance x 0.6em line-height (no squash; bake aspect 1.0) */
-    line-height: calc(var(--ascii-fs, 8px) * 0.6);
+    line-height: calc(var(--ascii-fs, 8px) * 0.9);
+    letter-spacing: calc(var(--ascii-fs, 8px) * 0.3);
     /* The baked layers are trimmed of trailing spaces, so every row is a
        different length. An inherited `text-align: center` would then centre
        each row independently and shear the scene apart. */

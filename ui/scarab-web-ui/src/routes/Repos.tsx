@@ -212,7 +212,7 @@ export default function Repos() {
 
       <footer class="dash-footer rolling" aria-hidden="true">
         <div class="roller">
-          <AsciiScene scene={dungroller} fontSize={5} playing={true} />
+          <AsciiScene scene={dungroller} fontSize={3.33} playing={true} />
         </div>
       </footer>
     </>
