@@ -33,7 +33,7 @@ use kube::api::{Api, AttachParams, DeleteParams, LogParams, Patch, PatchParams, 
 use std::sync::Arc;
 
 use scarab_engine::ports::{ExecHandle, ExecState, FailureClass, LogChunks};
-use scarab_engine::{ExecError, Executor, RunId, StepRun, StepSpec};
+use scarab_engine::{ExecError, Executor, InfraCondition, RunId, StepRun, StepSpec};
 use scarab_storage::Cas;
 
 /// The step container's name in every step Pod (see [`build_pod`]). The log tail
@@ -327,6 +327,41 @@ impl K8sExecutor {
     fn pods(&self) -> Result<Api<Pod>, ExecError> {
         let client = self.client.clone().ok_or(ExecError::Unavailable)?;
         Ok(Api::namespaced(client, &self.namespace))
+    }
+
+    /// The most recent `Warning` Event about `pod`, as a bounded message — the
+    /// text `kubectl describe pod` prints under Events, and the only place
+    /// `FailedScheduling` / `FailedMount` / `FailedCreatePodSandBox` detail
+    /// exists. The Pod object itself does not carry it.
+    ///
+    /// Read on the observer's cadence and only when the Pod's own status left
+    /// the message blank, so this is not a per-tick cost on healthy steps. The
+    /// caller treats every error here as "no message" — a missing RBAC grant
+    /// must degrade the diagnosis, never the run.
+    async fn pod_warning_event(&self, pod: &str) -> Result<Option<String>, ExecError> {
+        use k8s_openapi::api::core::v1::Event;
+        let client = self.client.clone().ok_or(ExecError::Unavailable)?;
+        let events: Api<Event> = Api::namespaced(client, &self.namespace);
+        // Events are namespaced and keyed to the object they describe; the field
+        // selector keeps this to the one Pod rather than listing the namespace.
+        let params = kube::api::ListParams::default()
+            .fields(&format!("involvedObject.name={pod}"))
+            .limit(64);
+        let list = events
+            .list(&params)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?;
+        // Newest wins: a Pod that failed to schedule and then failed to mount
+        // should report the mount, and the API does not guarantee list order.
+        let latest = list
+            .items
+            .into_iter()
+            .filter(|e| e.type_.as_deref() == Some("Warning"))
+            .filter(|e| e.message.as_deref().is_some_and(|m| !m.trim().is_empty()))
+            .max_by_key(|e| e.last_timestamp.as_ref().map(|t| t.0));
+        Ok(latest
+            .and_then(|e| e.message)
+            .map(|m| truncate_message(m.trim())))
     }
 
     /// Upsert the per-Pod Secret carrying the clone credential (ADR-0045
@@ -2440,6 +2475,53 @@ impl Executor for K8sExecutor {
     /// do old wsfetch images) ⇒ `None`; malformed where a summary was
     /// expected (kubelet truncation, garbage) ⇒ `None` + a warn — collision
     /// evidence must never fail a settle that would otherwise succeed.
+    async fn infra_condition(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<InfraCondition>, ExecError> {
+        let pods = self.pods()?;
+        let Some(pod) = pods
+            .get_opt(&handle.0)
+            .await
+            .map_err(|e| ExecError::Other(e.to_string()))?
+        else {
+            // A Pod that is gone is not a condition — the step either finished
+            // or was torn down, and `poll` owns that verdict.
+            return Ok(None);
+        };
+        let Some(condition) = pod_infra_condition(&pod) else {
+            return Ok(None);
+        };
+        // The Pod's own status often carries the reason but no message —
+        // `Unschedulable` with nothing after the colon, `ContainerCreating`
+        // forever. The sentence an operator needs is then only in the Event
+        // stream (`FailedScheduling` enumerating the nodes, `FailedMount`
+        // naming the volume), which is what `kubectl describe` reads and the
+        // Pod object does not carry.
+        //
+        // Strictly best-effort, and deliberately not fatal: the Role may not
+        // grant `list` on events, events are TTL'd out after an hour, and a
+        // condition with no message still beats no condition at all.
+        if condition.message.is_some() {
+            return Ok(Some(condition));
+        }
+        Ok(Some(match self.pod_warning_event(&handle.0).await {
+            Ok(Some(message)) => InfraCondition {
+                message: Some(message),
+                ..condition
+            },
+            Ok(None) => condition,
+            Err(e) => {
+                tracing::debug!(
+                    pod = %handle.0, error = %e,
+                    "could not read Pod events for the infra condition; \
+                     reporting the Pod-derived reason alone"
+                );
+                condition
+            }
+        }))
+    }
+
     async fn workspace_provisioning(
         &self,
         handle: &ExecHandle,
@@ -4689,10 +4771,11 @@ pub fn pod_state(pod: &Pod) -> ExecState {
             if reason.is_none() && (no_verdict || synthetic) {
                 return ExecState::Pending;
             }
+            let (class, cause) = classify_failed_pod(pod, exit_code);
             ExecState::Failed {
                 exit_code,
-                class: classify_failed_pod(pod, exit_code),
-                cause: None,
+                class,
+                cause,
             }
         }
         "Running" => ExecState::Running,
@@ -4718,19 +4801,19 @@ pub fn pod_state(pod: &Pod) -> ExecState {
                     class,
                     cause: Some(cause),
                 }
-            } else if let Some(class) = terminal_waiting_class(pod) {
+            } else if let Some((class, cause)) = terminal_waiting_class(pod) {
                 ExecState::Failed {
                     exit_code: None,
                     class,
-                    cause: None,
+                    cause: Some(cause),
                 }
-            } else if is_unschedulable(pod) {
+            } else if let Some(cause) = is_unschedulable(pod) {
                 ExecState::Failed {
                     exit_code: None,
                     class: FailureClass::Infra {
                         never_started: true,
                     },
-                    cause: None,
+                    cause: Some(cause),
                 }
             } else {
                 ExecState::Pending
@@ -4739,30 +4822,97 @@ pub fn pod_state(pod: &Pod) -> ExecState {
     }
 }
 
+/// The Pod's own account of why it is not running yet, or `None` when it has
+/// nothing noteworthy to say (ADR-0068).
+///
+/// Pure over a `Pod` on purpose: the same fixture-driven testability as
+/// [`pod_state`], and — more importantly — the observer must never be able to
+/// change a verdict. This reads status only.
+///
+/// Ordering is by how *actionable* the condition is, not by severity: a
+/// scheduler rejection explains everything downstream of it, so it wins over a
+/// container that is merely still waiting to be created.
+pub fn pod_infra_condition(pod: &Pod) -> Option<InfraCondition> {
+    // Never scheduled: nothing else about this Pod is meaningful yet.
+    if let Some(c) = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_ref())
+        .into_iter()
+        .flatten()
+        .find(|c| c.type_ == "PodScheduled" && c.status == "False")
+    {
+        return Some(InfraCondition::new(
+            c.reason.clone().unwrap_or_else(|| "NotScheduled".into()),
+            c.message.clone().map(|m| truncate_message(&m)),
+        ));
+    }
+    let status = pod.status.as_ref()?;
+    // A container the kubelet cannot get to Running. Reported whether or not it
+    // is terminal: a *benign* `ContainerCreating` that never ends is precisely
+    // the case with no terminal classifier at all, which today burns the full
+    // step timeout in silence. The observer's job is to make the waiting
+    // visible; deciding it is fatal remains `pod_state`'s.
+    for w in status
+        .init_container_statuses
+        .iter()
+        .flatten()
+        .chain(status.container_statuses.iter().flatten())
+        .filter_map(|c| c.state.as_ref()?.waiting.as_ref())
+    {
+        let Some(reason) = w.reason.as_deref() else {
+            continue;
+        };
+        return Some(InfraCondition::new(
+            reason,
+            w.message.clone().map(|m| truncate_message(&m)),
+        ));
+    }
+    None
+}
+
 /// Classify a `phase: Failed` Pod (ADR-0047).
 ///
 /// Order matters: the kubelet's own verdicts (deadline, eviction, OOM-kill)
 /// take precedence over the container exit code — an OOM-killed container also
 /// reports exit 137, but the *platform* killed it, not the step's own logic.
-fn classify_failed_pod(pod: &Pod, exit_code: Option<i32>) -> FailureClass {
+fn classify_failed_pod(pod: &Pod, exit_code: Option<i32>) -> (FailureClass, Option<String>) {
+    // The Pod's own `message` accompanies its `reason` (an eviction names the
+    // resource that ran out); the step container's terminated `message` carries
+    // the kubelet's account of the kill.
+    let pod_message = pod.status.as_ref().and_then(|s| s.message.as_deref());
     let pod_reason = pod.status.as_ref().and_then(|s| s.reason.as_deref());
     match pod_reason {
         // activeDeadlineSeconds elapsed — the kubelet killed the Pod.
-        Some("DeadlineExceeded") => return FailureClass::Timeout,
+        Some("DeadlineExceeded") => {
+            return (
+                FailureClass::Timeout,
+                Some(render_cause("DeadlineExceeded", pod_message)),
+            )
+        }
         // Evicted: infra reclaimed the Pod. Whether a side effect is possible
         // depends on whether the step's process had started.
         Some("Evicted") => {
-            return FailureClass::Infra {
-                never_started: !step_container_started(pod),
-            }
+            return (
+                FailureClass::Infra {
+                    never_started: !step_container_started(pod),
+                },
+                Some(render_cause("Evicted", pod_message)),
+            )
         }
         _ => {}
     }
     // The platform OOM-killed the started process: post-start infra.
     if step_terminated_reason(pod).as_deref() == Some("OOMKilled") {
-        return FailureClass::Infra {
-            never_started: false,
-        };
+        return (
+            FailureClass::Infra {
+                never_started: false,
+            },
+            Some(render_cause(
+                "OOMKilled",
+                Some("the step container exceeded its memory limit and was killed by the kernel"),
+            )),
+        );
     }
     // `reason: DeadlineExceeded` can propagate a beat AFTER the kubelet kills
     // the containers (observed on k3s: the first Failed observation carries
@@ -4770,16 +4920,29 @@ fn classify_failed_pod(pod: &Pod, exit_code: Option<i32>) -> FailureClass {
     // outlived its own spec'd deadline, the kill is a timeout — never the
     // step's verdict.
     if outlived_deadline(pod) {
-        return FailureClass::Timeout;
+        return (
+            FailureClass::Timeout,
+            Some(render_cause(
+                "DeadlineExceeded",
+                Some("the Pod outlived its activeDeadlineSeconds"),
+            )),
+        );
     }
     match exit_code {
-        // The step's own code produced a verdict.
-        Some(_) => FailureClass::Step,
+        // The step's own code produced a verdict — its own logs are the
+        // evidence, so there is no infra cause to add.
+        Some(_) => (FailureClass::Step, None),
         // Failed with no exit code: the container never produced a verdict —
         // infra, with side-effect possibility keyed on whether it started.
-        None => FailureClass::Infra {
-            never_started: !step_container_started(pod),
-        },
+        None => (
+            FailureClass::Infra {
+                never_started: !step_container_started(pod),
+            },
+            Some(render_cause(
+                "NoVerdict",
+                Some("the Pod failed without the step container reporting an exit code"),
+            )),
+        ),
     }
 }
 
@@ -4989,17 +5152,23 @@ fn step_container_status(pod: &Pod) -> Option<&k8s_openapi::api::core::v1::Conta
 /// (`PodScheduled=False`). The Pod would otherwise sit Pending indefinitely;
 /// ADR-0047 treats it as never-started infra churn to self-heal via bounded
 /// auto-retry.
-fn is_unschedulable(pod: &Pod) -> bool {
+fn is_unschedulable(pod: &Pod) -> Option<String> {
     pod.status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
         .into_iter()
         .flatten()
-        .any(|c| {
+        .find(|c| {
             c.type_ == "PodScheduled"
                 && c.status == "False"
                 && c.reason.as_deref() == Some("Unschedulable")
         })
+        // The condition's `message` is the whole diagnosis — "0/3 nodes are
+        // available: 3 Insufficient cpu" is the answer to the operator's actual
+        // question, and it is already in hand here. Dropping it (as this
+        // returned-bool predicate used to) is what left a demo box reporting
+        // `Infra { never_started: true }` and an empty log pane.
+        .map(|c| render_cause("Unschedulable", c.message.as_deref()))
 }
 
 /// Classify a container (step or native sidecar) stuck in a `waiting` state the
@@ -5017,33 +5186,73 @@ fn is_unschedulable(pod: &Pod) -> bool {
 ///   image simply exhausts that budget and dead-letters — an operator concern.
 ///
 /// A config reason is definitive and wins over a co-occurring pull reason.
-fn terminal_waiting_class(pod: &Pod) -> Option<FailureClass> {
-    const CONFIG: &[&str] = &[
-        "CreateContainerConfigError",
-        "CreateContainerError",
-        "RunContainerError",
-        "InvalidImageName",
-    ];
-    const IMAGE_PULL: &[&str] = &["ErrImagePull", "ImagePullBackOff"];
+fn terminal_waiting_class(pod: &Pod) -> Option<(FailureClass, String)> {
     let status = pod.status.as_ref()?;
-    let mut class = None;
-    for reason in status
+    let mut pull = None;
+    for w in status
         .container_statuses
         .iter()
         .flatten()
         .chain(status.init_container_statuses.iter().flatten())
-        .filter_map(|c| c.state.as_ref()?.waiting.as_ref()?.reason.as_deref())
+        .filter_map(|c| c.state.as_ref()?.waiting.as_ref())
     {
-        if CONFIG.contains(&reason) {
-            return Some(FailureClass::Config);
+        let Some(reason) = w.reason.as_deref() else {
+            continue;
+        };
+        if WAITING_CONFIG.contains(&reason) {
+            return Some((FailureClass::Config, render_cause(reason, w.message.as_deref())));
         }
-        if IMAGE_PULL.contains(&reason) {
-            class = Some(FailureClass::Infra {
-                never_started: true,
-            });
+        if WAITING_IMAGE_PULL.contains(&reason) {
+            pull = Some((
+                FailureClass::Infra {
+                    never_started: true,
+                },
+                render_cause(reason, w.message.as_deref()),
+            ));
         }
     }
-    class
+    pull
+}
+
+/// Container `waiting` reasons the kubelet can never recover from on its own.
+const WAITING_CONFIG: &[&str] = &[
+    "CreateContainerConfigError",
+    "CreateContainerError",
+    "RunContainerError",
+    "InvalidImageName",
+];
+const WAITING_IMAGE_PULL: &[&str] = &["ErrImagePull", "ImagePullBackOff"];
+
+/// Render a backend reason + optional message into the one human line that
+/// travels as `ExecState::Failed { cause }` and lands on `attempts.failure_detail`.
+///
+/// The message is where the *answer* lives — `Unschedulable` alone says nothing,
+/// `0/3 nodes are available: 3 Insufficient cpu` says everything — so it is kept
+/// whole rather than summarised, only bounded. Bounding matters: a scheduler
+/// message enumerating every node of a large cluster is unbounded in principle,
+/// and this string is persisted in Postgres and served on the API.
+fn render_cause(reason: &str, message: Option<&str>) -> String {
+    match message.map(str::trim).filter(|m| !m.is_empty()) {
+        Some(m) => format!("{reason}: {}", truncate_message(m)),
+        None => reason.to_string(),
+    }
+}
+
+/// Longest backend message kept verbatim. Generous enough for a real
+/// `FailedScheduling` verdict across a double-digit node count, short enough
+/// that a pathological one cannot bloat the event log or the attempt row.
+const MAX_MESSAGE_BYTES: usize = 1024;
+
+fn truncate_message(m: &str) -> String {
+    if m.len() <= MAX_MESSAGE_BYTES {
+        return m.to_string();
+    }
+    // Cut on a char boundary, never mid-codepoint.
+    let mut end = MAX_MESSAGE_BYTES;
+    while end > 0 && !m.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… (truncated)", &m[..end])
 }
 
 fn container_exit_code(pod: &Pod) -> Option<i32> {
@@ -6981,7 +7190,7 @@ mod tests {
             ExecState::Failed {
                 exit_code: Some(137),
                 class: FailureClass::Timeout,
-                cause: None,
+                cause: Some("DeadlineExceeded".into()),
             },
             "a wedged drain that outlives the step deadline is a Timeout, not a lost \
              snapshot — and never a Succeeded"
@@ -7043,7 +7252,7 @@ mod tests {
             ExecState::Failed {
                 exit_code: Some(137),
                 class: FailureClass::Timeout,
-                cause: None,
+                cause: Some("DeadlineExceeded".into()),
             },
             "a timeout must not be withheld as Running"
         );
@@ -8463,7 +8672,11 @@ mod tests {
             ContainerState, ContainerStateWaiting, ContainerStatus, PodStatus,
         };
 
-        let waiting = |reason: &str| Pod {
+        // The kubelet's `message` alongside the reason — the sentence that says
+        // WHICH image or WHICH setting, and the whole reason this fixture carries
+        // one: a reason without its message is a diagnosis an operator cannot act
+        // on (ADR-0068).
+        let waiting_with = |reason: &str, message: Option<&str>| Pod {
             status: Some(PodStatus {
                 // A stuck container keeps the Pod in Pending.
                 phase: Some("Pending".into()),
@@ -8472,6 +8685,7 @@ mod tests {
                     state: Some(ContainerState {
                         waiting: Some(ContainerStateWaiting {
                             reason: Some(reason.into()),
+                            message: message.map(Into::into),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -8482,6 +8696,7 @@ mod tests {
             }),
             ..Default::default()
         };
+        let waiting = |reason: &str| waiting_with(reason, None);
 
         // Un-recoverable container/image errors surface as a terminal failure so
         // the run does not hang forever (and the log tail stops retrying). The
@@ -8500,25 +8715,30 @@ mod tests {
                 ExecState::Failed {
                     exit_code: None,
                     class: FailureClass::Config,
-                    cause: None,
+                    cause: Some(reason.to_string()),
                 },
-                "{reason} is a permanent config rejection"
+                "{reason} is a permanent config rejection, and names itself"
             );
         }
 
         // Image-pull failures may be a transient registry/network blip: the main
         // process never ran, so never-started infra — safe to bounded-auto-retry.
         for reason in ["ErrImagePull", "ImagePullBackOff"] {
+            // The message names the image that could not be pulled. Without it
+            // the operator is told only that "infra" failed, which on a demo box
+            // is indistinguishable from a node being too small — the exact
+            // confusion ADR-0068 exists to end.
+            let message = "Back-off pulling image \"ghcr.io/acme/builder:v9\"";
             assert_eq!(
-                pod_state(&waiting(reason)),
+                pod_state(&waiting_with(reason, Some(message))),
                 ExecState::Failed {
                     exit_code: None,
                     class: FailureClass::Infra {
                         never_started: true
                     },
-                    cause: None,
+                    cause: Some(format!("{reason}: {message}")),
                 },
-                "{reason} is (possibly transient) never-started infra"
+                "{reason} is (possibly transient) never-started infra, and names the image"
             );
         }
 
@@ -8528,6 +8748,166 @@ mod tests {
     }
 
     /// One fixture per ADR-0047 classification rule.
+    /// The observer's read of a Pod (ADR-0068). Pure over a fixture, like
+    /// `pod_state` — the observer must never be able to change a verdict, and
+    /// keeping this a total function of the Pod is what makes that structural
+    /// rather than a promise.
+    mod infra_condition {
+        use super::*;
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateRunning, ContainerStateWaiting, ContainerStatus,
+            PodCondition, PodStatus,
+        };
+
+        fn pod(status: PodStatus) -> Pod {
+            Pod {
+                status: Some(status),
+                ..Default::default()
+            }
+        }
+
+        fn waiting(name: &str, reason: &str, message: Option<&str>) -> ContainerStatus {
+            ContainerStatus {
+                name: name.into(),
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some(reason.into()),
+                        message: message.map(Into::into),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        /// A running Pod has nothing to narrate. This is the common case and it
+        /// must stay silent, or the observer would append on every healthy step.
+        #[test]
+        fn a_running_pod_reports_no_condition() {
+            let p = pod(PodStatus {
+                phase: Some("Running".into()),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "step".into(),
+                    state: Some(ContainerState {
+                        running: Some(ContainerStateRunning { started_at: None }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            assert_eq!(pod_infra_condition(&p), None);
+        }
+
+        /// The scheduler's verdict carries its message — "0/3 nodes are
+        /// available: 3 Insufficient cpu" is the answer to the operator's actual
+        /// question, and the reason alone is not.
+        #[test]
+        fn an_unschedulable_pod_reports_the_scheduler_message() {
+            let p = pod(PodStatus {
+                phase: Some("Pending".into()),
+                conditions: Some(vec![PodCondition {
+                    type_: "PodScheduled".into(),
+                    status: "False".into(),
+                    reason: Some("Unschedulable".into()),
+                    message: Some("0/3 nodes are available: 3 Insufficient cpu.".into()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            });
+            let c = pod_infra_condition(&p).expect("a condition");
+            assert_eq!(c.reason, "Unschedulable");
+            assert_eq!(
+                c.message.as_deref(),
+                Some("0/3 nodes are available: 3 Insufficient cpu.")
+            );
+        }
+
+        /// A scheduler rejection explains everything downstream of it, so it
+        /// wins over a container that is merely still waiting to be created.
+        #[test]
+        fn the_scheduler_verdict_outranks_a_waiting_container() {
+            let p = pod(PodStatus {
+                phase: Some("Pending".into()),
+                conditions: Some(vec![PodCondition {
+                    type_: "PodScheduled".into(),
+                    status: "False".into(),
+                    reason: Some("Unschedulable".into()),
+                    message: Some("insufficient memory".into()),
+                    ..Default::default()
+                }]),
+                container_statuses: Some(vec![waiting("step", "ContainerCreating", None)]),
+                ..Default::default()
+            });
+            assert_eq!(pod_infra_condition(&p).unwrap().reason, "Unschedulable");
+        }
+
+        /// A BENIGN wait is reported too. `ContainerCreating` has no terminal
+        /// classifier at all, so a mount that never completes burns the full
+        /// step timeout in silence today — making the waiting visible is the
+        /// whole point. Deciding it is fatal remains `pod_state`'s job.
+        #[test]
+        fn a_benign_wait_is_still_narrated() {
+            let p = pod(PodStatus {
+                phase: Some("Pending".into()),
+                container_statuses: Some(vec![waiting("step", "ContainerCreating", None)]),
+                ..Default::default()
+            });
+            let c = pod_infra_condition(&p).expect("a benign wait is still a condition");
+            assert_eq!(c.reason, "ContainerCreating");
+            assert_eq!(c.message, None, "the kubelet often gives no message here");
+        }
+
+        /// An init container holds the Pod exactly as the step container does —
+        /// the workspace fetcher and the clone step both run there, so missing
+        /// them would blind the observer to a whole class of stall.
+        #[test]
+        fn an_init_container_wait_is_reported() {
+            let p = pod(PodStatus {
+                phase: Some("Pending".into()),
+                init_container_statuses: Some(vec![waiting(
+                    "scarab-workspace-fetch",
+                    "ImagePullBackOff",
+                    Some("Back-off pulling image \"ghcr.io/acme/wsfetch:v2\""),
+                )]),
+                ..Default::default()
+            });
+            let c = pod_infra_condition(&p).expect("a condition");
+            assert_eq!(c.reason, "ImagePullBackOff");
+            assert!(c.message.unwrap().contains("wsfetch:v2"));
+        }
+
+        /// A backend message is bounded before it is stored. A `FailedScheduling`
+        /// verdict enumerating every node of a large cluster is unbounded in
+        /// principle, and this string is persisted and served on the API.
+        #[test]
+        fn an_enormous_message_is_truncated() {
+            let huge = "x".repeat(MAX_MESSAGE_BYTES * 3);
+            let p = pod(PodStatus {
+                phase: Some("Pending".into()),
+                container_statuses: Some(vec![waiting("step", "ErrImagePull", Some(&huge))]),
+                ..Default::default()
+            });
+            let message = pod_infra_condition(&p).unwrap().message.unwrap();
+            assert!(
+                message.len() < MAX_MESSAGE_BYTES + 32,
+                "message was not bounded: {} bytes",
+                message.len()
+            );
+            assert!(message.ends_with("… (truncated)"));
+        }
+
+        /// Truncation cuts on a char boundary — a multi-byte codepoint spanning
+        /// the limit must not panic or produce invalid UTF-8.
+        #[test]
+        fn truncation_never_splits_a_codepoint() {
+            let m = "é".repeat(MAX_MESSAGE_BYTES);
+            let out = truncate_message(&m);
+            assert!(out.ends_with("… (truncated)"));
+            assert!(out.is_char_boundary(out.len()));
+        }
+    }
+
     mod failure_classification {
         use super::*;
         use k8s_openapi::api::core::v1::{
@@ -8652,6 +9032,7 @@ mod tests {
                         type_: "PodScheduled".into(),
                         status: "False".into(),
                         reason: Some("Unschedulable".into()),
+                        message: Some("0/3 nodes are available: 3 Insufficient cpu.".into()),
                         ..Default::default()
                     }]),
                     ..Default::default()
@@ -8665,7 +9046,11 @@ mod tests {
                     class: FailureClass::Infra {
                         never_started: true
                     },
-                    cause: None,
+                    // The scheduler's own message, carried through verbatim: it
+                    // is the answer to "why", and the class alone is not.
+                    cause: Some(
+                        "Unschedulable: 0/3 nodes are available: 3 Insufficient cpu.".into()
+                    ),
                 }
             );
         }
