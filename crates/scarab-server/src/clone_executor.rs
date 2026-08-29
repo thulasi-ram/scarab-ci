@@ -116,6 +116,17 @@ impl CloneEnrichingExecutor {
 
 #[async_trait]
 impl Executor for CloneEnrichingExecutor {
+    async fn infra_condition(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        // Forward — a decorator that answered `None` here would silently blind
+        // the observer to every condition of the executor it wraps, which is the
+        // evidence-drop shape of `artifacts` (98ea804) and `output_identity`
+        // (56220d7). REQUIRED on the trait so this line cannot be forgotten.
+        self.inner.infra_condition(handle).await
+    }
+
     async fn workspace_provisioning(
         &self,
         handle: &ExecHandle,

@@ -21,6 +21,13 @@ struct CapturingExec {
 }
 #[async_trait]
 impl Executor for CapturingExec {
+    async fn infra_condition(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+
     async fn workspace_provisioning(
         &self,
         _handle: &ExecHandle,
@@ -220,6 +227,13 @@ struct SpecCapturingExec {
 }
 #[async_trait]
 impl Executor for SpecCapturingExec {
+    async fn infra_condition(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+
     async fn workspace_provisioning(
         &self,
         _handle: &ExecHandle,
@@ -387,4 +401,105 @@ async fn no_issuer_or_no_deploy_context_means_no_token() {
     );
     exec.launch(&step("r-plain"), &plain_spec()).await.unwrap();
     assert_eq!(inner.last.lock().unwrap().clone().unwrap().oidc_token, None);
+}
+
+/// An inner executor that always has something to narrate — and puts a secret
+/// in it, so one test can prove both forwarding and scrubbing.
+struct ConditionExec;
+
+#[async_trait]
+impl Executor for ConditionExec {
+    async fn infra_condition(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(Some(scarab_engine::InfraCondition::new(
+            "ErrImagePull",
+            Some("pulling https://u:sup3r-s3cret@registry.test/acme:v1 failed".into()),
+        )))
+    }
+
+    async fn workspace_provisioning(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::ProvisioningReport>, ExecError> {
+        Ok(None)
+    }
+
+    async fn launch(&self, _step: &StepRun, _spec: &StepSpec) -> Result<ExecHandle, ExecError> {
+        Ok(ExecHandle("h".into()))
+    }
+    async fn poll(&self, _handle: &ExecHandle) -> Result<ExecState, ExecError> {
+        // A failed pod whose cause quotes the same credential.
+        Ok(ExecState::Failed {
+            exit_code: None,
+            class: scarab_engine::ports::FailureClass::Infra {
+                never_started: true,
+            },
+            cause: Some("ErrImagePull: https://u:sup3r-s3cret@registry.test/acme:v1".into()),
+        })
+    }
+    async fn cancel(&self, _handle: &ExecHandle) -> Result<(), ExecError> {
+        Ok(())
+    }
+}
+
+/// The decorator FORWARDS the infra condition rather than answering the trait
+/// default — the evidence-drop shape that has bitten this repo twice
+/// (`artifacts`, 98ea804; `output_identity`, 56220d7). A decorator that
+/// answered `None` here would silently blind the observer to every condition of
+/// the executor it wraps, and nothing would fail.
+///
+/// It also SCRUBS on the way through: this decorator is the only layer holding
+/// both the backend's diagnosis and the redactor, so it is the one place the
+/// scrub can happen at all.
+#[tokio::test]
+async fn the_decorator_forwards_and_scrubs_the_infra_condition() {
+    let db = Arc::new(InMemoryDb::new());
+    let logs = logs(db.clone());
+    logs.register_secret(b"sup3r-s3cret");
+    let exec = SecretInjectingExecutor::new(
+        Arc::new(ConditionExec),
+        db.clone() as Arc<dyn Db>,
+        Arc::new(FakeSecrets::new()) as Arc<dyn SecretProvider>,
+        logs,
+    );
+
+    let condition = exec
+        .infra_condition(&ExecHandle("h".into()))
+        .await
+        .unwrap()
+        .expect("the decorator must forward the wrapped executor's condition");
+    assert_eq!(condition.reason, "ErrImagePull");
+    let message = condition.message.expect("message forwarded");
+    assert!(
+        !message.contains("sup3r-s3cret"),
+        "the forwarded condition leaked the secret: {message}"
+    );
+    assert!(message.contains("registry.test/acme:v1"));
+}
+
+/// The same scrub on the failure cause `poll` reports — the value that reaches
+/// `attempts.failure_detail` and the API.
+#[tokio::test]
+async fn the_decorator_scrubs_the_failure_cause() {
+    let db = Arc::new(InMemoryDb::new());
+    let logs = logs(db.clone());
+    logs.register_secret(b"sup3r-s3cret");
+    let exec = SecretInjectingExecutor::new(
+        Arc::new(ConditionExec),
+        db.clone() as Arc<dyn Db>,
+        Arc::new(FakeSecrets::new()) as Arc<dyn SecretProvider>,
+        logs,
+    );
+
+    let ExecState::Failed { cause, .. } = exec.poll(&ExecHandle("h".into())).await.unwrap() else {
+        panic!("expected a failed state");
+    };
+    let cause = cause.expect("the cause must survive the decorator");
+    assert!(
+        !cause.contains("sup3r-s3cret"),
+        "the failure cause leaked the secret: {cause}"
+    );
+    assert!(cause.starts_with("ErrImagePull:"));
 }

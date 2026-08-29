@@ -2752,12 +2752,28 @@ impl<'a> Scheduler<'a> {
             .iter()
             .filter(|s| s.status == StepStatus::Failed)
             .filter_map(|s| {
-                let failure = s.attempts.last()?.failure?;
+                let last = s.attempts.last()?;
+                let failure = last.failure?;
                 matches!(failure, FailureKind::Infra { .. } | FailureKind::Lost).then(|| {
-                    format!(
-                        "step `{}`: {failure:?} — retries exhausted without a verdict",
-                        s.step.0
-                    )
+                    // Name WHAT happened, not just which policy applied. The
+                    // class alone renders as a Rust debug string — `Infra {
+                    // never_started: true }` — which tells an operator nothing
+                    // they can act on, and it was the entire dead-letter
+                    // diagnosis before ADR-0068. The executor's detail (the
+                    // Pod's own "0/3 nodes are available: 3 Insufficient cpu")
+                    // is already on the attempt; this reads it rather than
+                    // making the operator go find it.
+                    match last.failure_detail.as_deref() {
+                        Some(detail) => format!(
+                            "step `{}`: {detail} ({failure:?} — retries exhausted \
+                             without a verdict)",
+                            s.step.0
+                        ),
+                        None => format!(
+                            "step `{}`: {failure:?} — retries exhausted without a verdict",
+                            s.step.0
+                        ),
+                    }
                 })
             })
             .collect();

@@ -135,6 +135,21 @@ export default function StepPane(props: {
     notRun() ? null : ofRecordAttemptId(attemptsOf());
   const ofRecordIndex = (): number => ofRecordIndexOf(attemptsOf());
 
+  // Why the selected try produced no output (ADR-0068). A step whose Pod never
+  // started — unschedulable, image unpullable, volume unmountable — has an
+  // EMPTY log stream by construction: there was no process to print anything.
+  // The diagnosis is on the attempt (`failure_detail`, the executor's own read
+  // of the backend), and until now nothing rendered it, so the pane an operator
+  // opens first said "no output for this try" and stopped there.
+  const scopedFailure = (): { failure: string; detail?: string } | null => {
+    const a = scoped();
+    if (!a?.failed) return null;
+    return {
+      failure: a.failure ?? "failed",
+      detail: a.failure_detail ?? undefined,
+    };
+  };
+
   // Reset per-step view state when the DAG selection moves.
   createEffect(() => {
     void stepId();
@@ -439,10 +454,27 @@ export default function StepPane(props: {
                     <For
                       each={logRows()}
                       fallback={
-                        <div class="lgrow empty">
-                          <span class="lgln" />
-                          <span class="lgtx">no output for this try</span>
-                        </div>
+                        <Show
+                          when={scopedFailure()}
+                          fallback={
+                            <div class="lgrow empty">
+                              <span class="lgln" />
+                              <span class="lgtx">no output for this try</span>
+                            </div>
+                          }
+                        >
+                          {(f) => (
+                            <div class="lgrow empty lgwhy">
+                              <span class="lgln" />
+                              <span class="lgtx">
+                                no output — this try never produced any:{" "}
+                                <span class="lgwhy-reason">
+                                  {f().detail ?? f().failure}
+                                </span>
+                              </span>
+                            </div>
+                          )}
+                        </Show>
                       }
                     >
                       {(r) => (

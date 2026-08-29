@@ -58,6 +58,7 @@ pub mod connections_config;
 pub mod converged;
 pub mod depot_expiry;
 pub mod forge_router;
+pub mod infra_observer;
 pub mod log_tail;
 pub mod logs;
 pub mod metrics;
@@ -69,6 +70,7 @@ pub mod secret_executor;
 /// `/readyz`, and NO durable core — see the module docs.
 pub mod workspaced;
 
+pub use infra_observer::{live_fences, InfraObserver};
 pub use log_tail::{pump_log_stream, LogTailer};
 pub use logs::LogService;
 pub use secret_executor::SecretInjectingExecutor;

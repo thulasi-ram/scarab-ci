@@ -66,3 +66,36 @@ async fn injected_secret_is_redacted_from_stored_and_streamed_logs() {
     );
     assert!(stored.contains("TOKEN=***"));
 }
+
+/// A backend diagnostic is redacted too (ADR-0068).
+///
+/// This is the channel the log pipeline does NOT cover. A failure cause and an
+/// infra condition quote the backend verbatim — and a backend quotes registry
+/// URLs and auth-failure bodies — then land in Postgres
+/// (`attempts.failure_detail`, the event log) and are served on the API, none of
+/// which passes through `LogService::append`. Before the k8s messages started
+/// travelling in `cause`, nothing but a drain error ever did, so this was
+/// harmless; now it is the one uncensored path out of a step.
+#[tokio::test]
+async fn a_backend_diagnostic_is_redacted_like_a_log_chunk() {
+    let logs = LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        Arc::new(InMemoryDb::new()),
+    );
+    logs.register_secret(b"sup3r-s3cret");
+
+    // The shape a registry rejection actually takes: the credential is inside
+    // the message the kubelet reports.
+    let cause = "ErrImagePull: failed to pull \
+                 https://user:sup3r-s3cret@registry.example.com/acme/builder:v9";
+    let redacted = logs.redact_text(cause);
+
+    assert!(
+        !redacted.contains("sup3r-s3cret"),
+        "the diagnostic leaked the secret: {redacted}"
+    );
+    assert!(
+        redacted.contains("registry.example.com/acme/builder:v9"),
+        "redaction must keep the part that makes the diagnosis useful: {redacted}"
+    );
+}

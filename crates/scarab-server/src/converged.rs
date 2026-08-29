@@ -16,7 +16,7 @@ use scarab_engine::{
 };
 use scarab_forge::ForgePort;
 
-use crate::LogTailer;
+use crate::{InfraObserver, LogTailer};
 
 /// Run one converged cycle across all active runs: tick the scheduler, ensure a
 /// live log tail is running for every in-flight step (if a `tailer` is wired),
@@ -31,6 +31,7 @@ pub async fn tick_once(
     snapshots: Option<&Arc<dyn WorkspaceSnapshots>>,
     forge: Option<&Arc<dyn ForgePort>>,
     tailer: Option<&LogTailer>,
+    observer: Option<&InfraObserver>,
     owner: &str,
     visibility_ms: i64,
     step_timeout_ms: i64,
@@ -79,6 +80,14 @@ pub async fn tick_once(
             tracing::warn!(error = %e, "ensuring service log tails failed");
         }
     }
+    // Infra observation (ADR-0068): narrate why an in-flight step has no logs
+    // yet. Runs on its own 30s cadence inside the observer, so calling it every
+    // tick is cheap; best-effort, and it never influences a verdict.
+    if let Some(observer) = observer {
+        if let Err(e) = observe_infra(db, observer).await {
+            tracing::warn!(error = %e, "infra observation failed");
+        }
+    }
     if let Some(forge) = forge {
         // Status posting is best-effort within a tick; a failed post stays on the
         // outbox for the next cycle (at-least-once, idempotent).
@@ -115,6 +124,35 @@ async fn ensure_log_tails(db: &Arc<dyn Db>, tailer: &LogTailer) -> Result<(), Sc
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Observe the backend condition of every in-flight step across all active runs,
+/// then retire the fences that are no longer in flight (ADR-0068).
+///
+/// The retire pass is not bookkeeping — it is what emits the closing event for a
+/// step that ended *while* wedged, which is the usual way a wedged step ends: the
+/// retry budget or the timeout kills it rather than it recovering. Computing the
+/// live set from the same pass that observed keeps the two consistent within a
+/// tick.
+async fn observe_infra(db: &Arc<dyn Db>, observer: &InfraObserver) -> Result<(), SchedulerError> {
+    let mut live = Vec::new();
+    for run in db.active_runs().await? {
+        for step in db.steps_of_run(&run).await? {
+            if step.status == StepStatus::Running {
+                if let Err(e) = observer.observe(&step).await {
+                    tracing::warn!(
+                        run = %run.0, step = %step.step.0, error = %e,
+                        "observing infra condition failed; retried next cycle"
+                    );
+                }
+                live.push(step);
+            }
+        }
+    }
+    if let Err(e) = observer.retire(&crate::live_fences(&live)).await {
+        tracing::warn!(error = %e, "retiring infra observations failed");
     }
     Ok(())
 }
@@ -175,6 +213,10 @@ pub fn spawn_driver(
     // lease holder tails a step — deduping ingestion and spreading log I/O.
     let tailer = logs
         .map(|logs| LogTailer::new(executor.clone(), logs).with_lease(db.clone(), owner.clone()));
+    // Infra observation (ADR-0068) is unconditional: unlike the log tail it needs
+    // no object store, and the failures it exists to explain are exactly the ones
+    // that produce no logs to store.
+    let observer = InfraObserver::new(executor.clone(), db.clone(), clock.clone());
     // One Supervision per driver process (ADR-0056) — see `tick_once`.
     let supervision = Supervision::new();
     // Likewise one TickHealth per driver process (ADR-0059).
@@ -188,6 +230,7 @@ pub fn spawn_driver(
                 snapshots.as_ref(),
                 forge.as_ref(),
                 tailer.as_ref(),
+                Some(&observer),
                 &owner,
                 visibility_ms,
                 step_timeout_ms,

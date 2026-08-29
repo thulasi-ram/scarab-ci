@@ -1,6 +1,7 @@
 // Render a RunEvent (EventKind) into a short human line for the activity feed.
 // `kind` is either a bare string (unit variant) or a single-key tagged object.
 import type { RunEvent } from "./api/client";
+import { duration } from "./fmt";
 
 export function describeEvent(e: RunEvent): string {
   const k = e.kind;
@@ -42,6 +43,14 @@ export function describeEvent(e: RunEvent): string {
     // `sample` is a bounded excerpt (≤8 on k8s), so name the first paths only.
     case "WorkspaceInputCollisions":
       return `${s(v.step)} — ${collisionSummary(v)}`;
+    case "StepInfraCondition":
+      return `${s(v.step)} — ${infraSummary(v)}`;
+    // The dead-letter reason is the ONE place the diagnosis is durably written
+    // ("step `build`: Unschedulable: 0/3 nodes are available…"). It used to fall
+    // through to `default` and render as the bare tag, so the run that most
+    // needed explaining was the one that explained nothing.
+    case "RunDeadLettered":
+      return `Run dead-lettered — ${s(v.reason)}`;
     default:
       return tag;
   }
@@ -59,6 +68,21 @@ function collisionSummary(v: Record<string, unknown>): string {
     .filter(Boolean);
   const paths = firsts.length ? `: ${firsts.join(", ")}${count > firsts.length ? ", …" : ""}` : "";
   return `${count} workspace input collision${count === 1 ? "" : "s"} — last input wins${paths}`;
+}
+
+/** The human line for a StepInfraCondition payload, step omitted (ADR-0068).
+ *
+ * The onset and the close are the same variant distinguished by `held_ms`, and
+ * they read differently on purpose: the onset is a live warning, the close is a
+ * finished episode. Duration leads over the observation count because "stuck in
+ * ContainerCreating for 41m" is what an operator acts on — the count is an
+ * artifact of the backend's own backoff schedule. */
+function infraSummary(v: Record<string, unknown>): string {
+  const reason = String(v.reason ?? "");
+  const message = v.message ? `: ${String(v.message)}` : "";
+  const held = typeof v.held_ms === "number" ? v.held_ms : null;
+  if (held === null) return `${reason}${message}`;
+  return `${reason} cleared after ${duration(0, held)}${message}`;
 }
 
 /** Split an event into its optional step id and a human message with the step
@@ -86,6 +110,8 @@ export function eventParts(e: RunEvent): { step: string | null; text: string } {
       return { step, text: "re-adopted after control-plane restart" };
     case "WorkspaceInputCollisions":
       return { step, text: collisionSummary(v) };
+    case "StepInfraCondition":
+      return { step, text: infraSummary(v) };
     default:
       return { step, text: describeEvent(e) };
   }
@@ -132,6 +158,17 @@ export function eventCategory(e: RunEvent): EventCat {
     // never `err` (nothing failed).
     case "WorkspaceInputCollisions":
       return "warning";
+    // An infra condition is a WARNING while it holds and plain info once it has
+    // cleared: a Pod that could not schedule for two minutes and then ran is a
+    // fact, not an alarm. Neither is `err` — nothing has failed yet, and the
+    // failure (if it comes) has its own event.
+    case "StepInfraCondition":
+      return v.held_ms === undefined || v.held_ms === null ? "warning" : "info";
+    // The system could not obtain a verdict — the operator signal, and squarely
+    // an error. It previously fell through to `info`, rendering the most serious
+    // outcome a run has as the quietest thing on the rail.
+    case "RunDeadLettered":
+      return "err";
     // Everything else — including the ADR-0061 s5 snapshot pin/unpin — is `info`.
     // Those two used to have their own arms returning `info`, which was dead code
     // AND untestable: no input could tell the arm from this fall-through, so the

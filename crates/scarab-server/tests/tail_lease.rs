@@ -37,6 +37,13 @@ impl LogChunks for TwoChunks {
 
 #[async_trait]
 impl Executor for TwoChunkExec {
+    async fn infra_condition(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        Ok(None)
+    }
+
     async fn workspace_provisioning(
         &self,
         _handle: &ExecHandle,

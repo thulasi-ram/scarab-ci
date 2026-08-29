@@ -2429,6 +2429,13 @@ h1, .crumb-head, .run-title {
 .lgbody.nowrap .lgtx { white-space: pre; overflow-x: auto; }
 .lgrow .lgln { color: var(--terminal-line); text-align: right; padding-right: 14px; user-select: none; }
 .lgrow .lgtx { color: var(--terminal-ink); white-space: pre-wrap; word-break: break-word; }
+/* The empty-log explanation (ADR-0068): a step whose Pod never started has no
+   stdout to show, so this row carries the backend's own account of why instead
+   of the bare "no output". Muted frame, emphatic reason — it is an explanation,
+   not an error line. */
+.lgrow.lgwhy { padding-top: 10px; padding-bottom: 10px; }
+.lgrow.lgwhy .lgtx { color: var(--terminal-line); }
+.lgrow.lgwhy .lgwhy-reason { color: var(--danger); font-weight: 600; }
 .lgrow.err { background: color-mix(in srgb, var(--danger) 12%, transparent); }
 .lgrow.err .lgln { color: var(--danger); }
 .lgrow.err .lgtx { color: var(--danger); }
