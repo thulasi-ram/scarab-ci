@@ -190,7 +190,42 @@ impl Executor for SecretInjectingExecutor {
     }
 
     async fn poll(&self, handle: &ExecHandle) -> Result<ExecState, ExecError> {
-        self.inner.poll(handle).await
+        // Redact the failure cause on the way through. This decorator is the
+        // only layer that holds BOTH the executor's diagnosis and the redactor:
+        // the cause is minted in the backend adapter (which has no secrets) and
+        // consumed by the scheduler (which has no redactor), so this is the one
+        // seam where the scrub can happen at all. Without it the k8s messages
+        // now carried in `cause` (ADR-0068) would reach `attempts.failure_detail`
+        // and the API verbatim — the log pipeline's scrub does not cover them.
+        Ok(match self.inner.poll(handle).await? {
+            ExecState::Failed {
+                exit_code,
+                class,
+                cause: Some(cause),
+            } => ExecState::Failed {
+                exit_code,
+                class,
+                cause: Some(self.logs.redact_text(&cause)),
+            },
+            other => other,
+        })
+    }
+
+    async fn infra_condition(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        // Forward and scrub, for the same reason as `poll` above: an infra
+        // condition quotes the backend verbatim and is appended to the run's
+        // event log, which has no redactor of its own.
+        Ok(self
+            .inner
+            .infra_condition(handle)
+            .await?
+            .map(|c| scarab_engine::InfraCondition {
+                message: c.message.as_deref().map(|m| self.logs.redact_text(m)),
+                ..c
+            }))
     }
 
     async fn cancel(&self, handle: &ExecHandle) -> Result<(), ExecError> {

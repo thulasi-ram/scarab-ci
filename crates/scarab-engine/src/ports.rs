@@ -992,6 +992,31 @@ pub trait Executor: Send + Sync {
         handle: &ExecHandle,
     ) -> Result<Option<crate::ProvisioningReport>, ExecError>;
 
+    /// The backend's current **infra condition** for a launched unit, or
+    /// `Ok(None)` when it has nothing noteworthy to say — the unit is running,
+    /// or is merely early in a normal start (ADR-0068).
+    ///
+    /// This is the channel that answers "why is there no log yet". A Pod stuck
+    /// `Unschedulable` or in `ImagePullBackOff` produces no stdout to tail, so
+    /// [`log_stream`](Self::log_stream) is structurally empty for exactly the
+    /// failures an operator most needs to see. The observer polls this while a
+    /// step is in flight and appends to the run's activity log on *change*.
+    ///
+    /// Called on a cadence, so an implementation must be cheap and must never
+    /// mutate: it is a read of state the backend already keeps. It is also
+    /// strictly best-effort — an error here is logged and dropped, and must
+    /// never influence the verdict that [`poll`](Self::poll) reports.
+    ///
+    /// **Deliberately REQUIRED — no default**, for the reason spelled out on
+    /// [`workspace_provisioning`](Self::workspace_provisioning): a defaulted
+    /// evidence method silently answers the default through a decorator rather
+    /// than the executor it wraps, and nothing fails (`artifacts`, 98ea804;
+    /// `output_identity`, 56220d7). Every impl must visibly decide.
+    async fn infra_condition(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<crate::InfraCondition>, ExecError>;
+
     /// Open a best-effort **live tail** of the unit's stdout/stderr for `step`,
     /// keyed by its fence (ADR-0013). The control plane drains the returned
     /// [`LogChunks`] into the log pipeline while the step runs. `Ok(None)` means

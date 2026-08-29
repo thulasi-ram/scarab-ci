@@ -33,6 +33,19 @@ rules:
     resources: ["pods/status"]
     verbs: ["get"]
   - apiGroups: [""]
+    # Events: the infra observer reads a Pod's Warning events to explain why it
+    # is not running yet (ADR-0068) — `FailedScheduling`, `FailedMount`,
+    # `FailedCreatePodSandBox`. This is the text `kubectl describe pod` prints;
+    # the Pod object itself does not carry it, and a step Pod that never starts
+    # has no logs to tail instead. Read-only, and read only when a Pod's own
+    # status left the message blank.
+    #
+    # Withholding this grant DEGRADES the diagnosis (the observer reports the
+    # bare reason) but never fails a run — the executor treats every error here
+    # as "no message".
+    resources: ["events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
     # exec: the control plane streams workspaces in/out of the init/egress
     # helpers (ADR-0029/0045 CAS materialize/ingest).
     resources: ["pods/exec"]

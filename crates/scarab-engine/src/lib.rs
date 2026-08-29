@@ -563,6 +563,36 @@ pub struct CacheSaves {
     pub roots: std::collections::BTreeMap<String, String>,
 }
 
+/// A point-in-time **infra condition** of a launched unit: the backend-side
+/// narration that never reaches the step's own stdout, because it describes why
+/// that stdout does not exist yet (ADR-0068).
+///
+/// On Kubernetes this is the Pod's own account of itself — a container `waiting`
+/// reason, an `Unschedulable` scheduler verdict, a `FailedMount` Warning event —
+/// the text `kubectl describe pod` shows and that the log endpoint, by
+/// construction, cannot: a Pod that never started has no logs to tail.
+///
+/// A condition is **noteworthy or absent**. `reason` is the backend's stable
+/// machine token (`ImagePullBackOff`, `Unschedulable`, `ContainerCreating`) and
+/// is what change-detection keys on; `message` is the human sentence, which may
+/// be long and may quote registry URLs, so it is redacted before it is stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InfraCondition {
+    /// The backend's machine token for the condition.
+    pub reason: String,
+    /// The backend's human sentence, when it gave one.
+    pub message: Option<String>,
+}
+
+impl InfraCondition {
+    pub fn new(reason: impl Into<String>, message: Option<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            message,
+        }
+    }
+}
+
 /// What the backend observed while **provisioning** a Step's input workspace
 /// (ticket 2e1a458), read back at settle by
 /// [`Executor::workspace_provisioning`](ports::Executor::workspace_provisioning).
@@ -981,6 +1011,40 @@ pub enum EventPayload {
         attempt: AttemptId,
         count: u64,
         sample: Vec<WorkspaceCollision>,
+    },
+    /// The backend reported an **infra condition** holding a launched attempt
+    /// back — a Pod that cannot be scheduled, an image that will not pull, a
+    /// volume that never mounts (ADR-0068). This is the missing channel: the
+    /// step's own log stream is empty precisely *because* of this condition,
+    /// so the diagnosis has nowhere else to live.
+    ///
+    /// **Narrative, never authoritative.** Nothing in the engine folds this
+    /// variant — the retry budget, admission, and completion all ignore it, and
+    /// must keep ignoring it. It exists to be read by a human.
+    ///
+    /// **Emitted on change, not on observation.** The observer polls far more
+    /// often than it appends: one event when a condition first appears
+    /// (`held_ms`/`observations` are `None`), and one when it clears or the
+    /// attempt goes terminal (both `Some`). A condition that persists for forty
+    /// minutes therefore costs two rows, not eighty — which matters because the
+    /// run's event log is walked in full on every retry decision
+    /// (`settle_failed_attempt`), so a chatty diagnostic would tax exactly the
+    /// runs already in trouble.
+    StepInfraCondition {
+        step: StepId,
+        attempt: AttemptId,
+        /// The backend's machine token (`ImagePullBackOff`, `Unschedulable`, …).
+        reason: String,
+        /// The backend's human sentence, already redacted. `None` if it gave none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        /// How long the condition held. `None` marks the onset event; `Some`
+        /// marks the closing one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        held_ms: Option<i64>,
+        /// How many polls observed it, onset included. Paired with `held_ms`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observations: Option<u32>,
     },
     /// Escape hatch for forward-compatible payloads not yet modelled.
     Raw(serde_json::Value),

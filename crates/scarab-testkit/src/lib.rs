@@ -1778,6 +1778,10 @@ struct FakeExecState {
     /// 2e1a458): the scripted fan-in collision report a backend would read
     /// back from its fetcher at settle.
     provisioning: HashMap<String, scarab_engine::ProvisioningReport>,
+    /// The infra condition each *step* (by id) reports while in flight —
+    /// what `Executor::infra_condition` answers (ADR-0068). Absent = the step
+    /// is running normally and the backend has nothing to narrate.
+    infra_conditions: HashMap<String, scarab_engine::InfraCondition>,
     /// The most recent spec each handle was launched with — lets a test assert
     /// launch-time interpolation (ADR-0041) rewrote `${{ … }}` before launch.
     launched_specs: HashMap<String, StepSpec>,
@@ -1888,6 +1892,24 @@ impl FakeExecutor {
             .unwrap()
             .provisioning
             .insert(step.to_string(), report);
+    }
+
+    /// Script the [`scarab_engine::InfraCondition`] that `step` (by id) reports
+    /// while in flight (ADR-0068) — what a k8s backend would read off a Pod that
+    /// cannot schedule or cannot pull. Setting it again replaces it; that is how
+    /// a test drives a *change* of condition past the observer.
+    pub fn set_infra_condition(&self, step: &str, condition: scarab_engine::InfraCondition) {
+        self.inner
+            .lock()
+            .unwrap()
+            .infra_conditions
+            .insert(step.to_string(), condition);
+    }
+
+    /// Clear `step`'s scripted infra condition — the backend now has nothing to
+    /// narrate, which is how a wedged step becomes a healthy one.
+    pub fn clear_infra_condition(&self, step: &str) {
+        self.inner.lock().unwrap().infra_conditions.remove(step);
     }
 
     /// The content identity `step` reports, independently of its root. Use this
@@ -2110,6 +2132,22 @@ impl Executor for FakeExecutor {
             return Ok(None);
         };
         Ok(self.inner.lock().unwrap().cache_saves.get(&step).cloned())
+    }
+
+    async fn infra_condition(
+        &self,
+        handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        let Some((step, _)) = Self::step_and_attempt(handle) else {
+            return Ok(None);
+        };
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .infra_conditions
+            .get(&step)
+            .cloned())
     }
 
     async fn workspace_provisioning(

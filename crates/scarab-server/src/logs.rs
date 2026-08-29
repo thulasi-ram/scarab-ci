@@ -105,6 +105,21 @@ impl LogService {
         }
     }
 
+    /// Replace every registered secret value in a **text diagnostic** with
+    /// `***` — the same scrub [`append`](Self::append) applies to log bytes,
+    /// for the strings that never travel as log bytes.
+    ///
+    /// A failure cause or an infra condition quotes whatever the backend said,
+    /// and a backend quotes registry URLs and auth-failure bodies. Those land
+    /// in Postgres (`attempts.failure_detail`, the event log) and are served on
+    /// the API, neither of which passes through the log pipeline — so without
+    /// this they would be the one uncensored channel out of a step.
+    ///
+    /// Lossy by design on invalid UTF-8: a diagnostic is for reading.
+    pub fn redact_text(&self, text: &str) -> String {
+        String::from_utf8_lossy(&self.redact(text.as_bytes())).into_owned()
+    }
+
     /// Replace every registered secret value in `data` with `***`.
     fn redact(&self, data: &[u8]) -> Vec<u8> {
         let secrets = self.secrets.lock().unwrap();

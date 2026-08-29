@@ -127,6 +127,17 @@ fn state_of(status: std::process::ExitStatus) -> ExecState {
 
 #[async_trait]
 impl Executor for LocalExecutor {
+    async fn infra_condition(
+        &self,
+        _handle: &ExecHandle,
+    ) -> Result<Option<scarab_engine::InfraCondition>, ExecError> {
+        // The local backend runs the step as a child process: there is no
+        // scheduler to reject it, no image to pull, and no node to be too small
+        // — so it has no infra plane to narrate. REQUIRED method, so this None
+        // is a decision the compiler saw.
+        Ok(None)
+    }
+
     async fn workspace_provisioning(
         &self,
         _handle: &ExecHandle,
