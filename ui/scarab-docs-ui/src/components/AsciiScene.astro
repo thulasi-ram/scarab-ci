@@ -15,6 +15,11 @@
  *  the dots stand apart and a solid fill reads as a dot matrix, not a slab.
  *  This also sizes the box, and the scene clips, so a mismatch crops the art. */
 const ASCII_CELL = 0.9;
+/** Gray-layer glyph scale — MUST match ASCII_LEG in the web-ui and the
+ *  .ascii-fe rule below. Smaller glyph, same cell: the legs are the only cells
+ *  in that layer at the top of the dot ramp, and the ramp's top two steps
+ *  differ by 2.1x, so this is the only continuous control over their weight. */
+const ASCII_LEG = 0.85;
 
 interface Props {
   name: string;
@@ -60,7 +65,7 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
     // must not size the scene (a layer can be much narrower than the grid).
     // JetBrains Mono's advance is exactly 0.6em and line-height is set to 0.6em
     // too, so cells are SQUARE — width AND height use the same 0.6 factor.
-    `--ascii-fs:${fontSize}px;` +
+    `--ascii-fs:${fontSize}px;--ascii-leg:${ASCII_LEG};` +
     `width:${boxCols * fontSize * ASCII_CELL}px;` +
     `height:${scene.rows * fontSize * ASCII_CELL}px`
   }
@@ -200,7 +205,15 @@ const id = `ascii-${name}-${Math.random().toString(36).slice(2, 7)}`;
   /* brand-role layers; tokens themed in scarab.css */
   .ascii-scene .ascii-em { color: var(--ascii-emerald); }
   .ascii-scene .ascii-au { color: var(--ascii-gold); }
-  .ascii-scene .ascii-fe { color: var(--ascii-gray); }
+  /* Smaller glyph on the SAME grid — the shrink comes back out of
+     letter-spacing so the cell is unchanged and the layers stay registered;
+     translateX re-centres the glyph in its cell. See ASCII_LEG above. */
+  .ascii-scene .ascii-fe {
+    color: var(--ascii-gray);
+    font-size: calc(var(--ascii-fs, 8px) * var(--ascii-leg, 0.85));
+    letter-spacing: calc(var(--ascii-fs, 8px) * (0.9 - 0.6 * var(--ascii-leg, 0.85)));
+    transform: translateX(calc(var(--ascii-fs, 8px) * 0.3 * (1 - var(--ascii-leg, 0.85))));
+  }
   /* Runtime speech bubble (ponder-* stages): crisp foreground text, off-language
      from the dot-matrix on purpose — reads as a terminal caption. Unlike the art
      layers it is real TEXT, so it does NOT take the square cell: 1em glyphs in a

@@ -108,6 +108,13 @@ function contentBox(scene: Baked): Box {
  *  of the scene's width, which is exactly how far it crops). */
 const ASCII_CELL = 0.9;
 
+/** Gray-layer glyph scale. MUST match --ascii-leg in styles.css, which is where
+ *  the geometry lives. The legs are the only thing in that layer that reaches
+ *  the top of the dot ramp, and the ramp's top two steps differ by 2.1x — so
+ *  this is the only continuous control over how heavy a leg reads. It does NOT
+ *  change the cell: the CSS takes the shrink back out of letter-spacing. */
+const ASCII_LEG = 0.85;
+
 export default function AsciiScene(props: {
   scene: Baked;
   /** px per glyph. A CELL is ASCII_CELL x this — bigger than the glyph box. */
@@ -177,6 +184,7 @@ export default function AsciiScene(props: {
       style={{
         "--ascii-fs": `${props.fontSize ?? 8}px`,
         "--ascii-cell": `${ASCII_CELL}`,
+        "--ascii-leg": `${ASCII_LEG}`,
         "--ascii-dx": `${-box.c0 * cell}px`,
         "--ascii-dy": `${-box.r0 * cell}px`,
         width: `${boxCols * cell}px`,

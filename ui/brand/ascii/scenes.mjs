@@ -171,11 +171,29 @@ const LEG_CYCLES = 9;       // integer → seamless loop; see drawBeetle
 /** Where the sprite sits, in CELLS on the 88-wide stage, and where its limbs
  *  leave it. The art is authored at one source pixel per cell (sprites.mjs),
  *  so these are cell coordinates, not design units. */
-const ROLLER = { col: 10, row: 19 };
+const ROLLER = { col: 15, row: 19 };
+// Every hip sits ON the body's silhouette — the last cell of the carapace at
+// that column (ground legs) or at that row (rim legs). They are not free
+// numbers: the 45° anchors do not survive the 55° body, which is three rows
+// taller and a column narrower, and re-used verbatim they put the second rim
+// leg's hip PAST the right edge, so that leg starts in mid-air.
+//
+// The three ground legs hang from the FRONT half of the underside and the two
+// rim legs leave the RAISED BACK. That is the pose: at 55° the back is held up
+// by the ball, not by the ground, so there is nothing for a rear ground leg to
+// be doing.
 const ROLLER_LEGS = {
-  ground: [[[11, 18], 9], [[14, 16], 13], [[16, 13], 17]],   // [hip, foot col]
-  rim: [[[19, 4], [23, 2], 1], [[20, 9], [24, 8], 6]],       // [hip, knee, foot row]
+  ground: [[[7, 20], 5], [[10, 19], 9], [[13, 17], 14]],     // [hip, foot col]
+  rim: [[[19, 4], [23, 2], 1], [[19, 8], [23, 7], 5]],       // [hip, knee, foot row]
 };
+/** The carapace bob, in CELLS. Two terms, and it needs both: `amp` is the
+ *  old oval's 0.73 at the gait rate, a step-by-step lift, and `heave` is a
+ *  slower swell three times a loop — the shove behind the stride. The gait
+ *  term alone is a steady jog; the heave is what makes the beetle look like
+ *  it is working against the ball. Both are SUB-CELL: blit() resolves them
+ *  per cell (see the note there), which is the only reason they render at
+ *  all on hard-edged sprite art. */
+const ROLLER_BOB = { amp: 0.73, rate: 1, heave: 0.6, heaveCycles: 3 };
 const DOTS = 29;            // ground dots; spacing chosen so one loop = one wrap
 
 /** Dung beetle pushing its ball at phase u.
@@ -208,36 +226,42 @@ export function drawBeetle(x, u, cols, rows, opts = {}) {
   x.save();
   x.setTransform(s, 0, 0, s * CELL_ASPECT, 0, -BEETLE_VB_Y0 * s * CELL_ASPECT);
 
-  // The beetle: the traced sprite, rotated 45° into the head-down push (dung
+  // The beetle: the traced sprite, rotated 55° into the head-down push (dung
   // beetles really do push walking backwards). Limbs FIRST, carapace over
   // them — a leg braced on the ball leaves from underneath, and drawn after
   // the fill it lays a gray band across the shell.
   //
-  // The carapace itself HOLDS. It is hard-edged cells now, and bobbing it a
-  // whole cell fourteen times a loop reads as vibration rather than a gait, so
-  // the gait lives entirely in the feet. For the same reason LEG_CYCLES is 9,
-  // not the old oval's 14: 72/9 gives 8 frames per step where 14 gave 5, and
-  // cell-quantised feet have no antialiased in-betweens to carry a stride.
+  // The carapace BOBS, by a fraction of a cell — see blit(). The old oval
+  // rode on `sin(leg) * 0.8` design units, which at this scene's s is 0.73 of
+  // a cell, and because the oval was antialiased that sub-cell shift swelled
+  // and shrank every dot on its outline: the body read as soft and alive. The
+  // traced sprite is hard cells, so the same offset does nothing unless blit()
+  // resolves it per cell — and a WHOLE cell instead would be a jump, which at
+  // gait frequency is vibration, not a gait. LEG_CYCLES is 9, not the oval's
+  // 14: 72/9 gives 8 frames per step where 14 gave 5, and cell-quantised feet
+  // have no antialiased in-betweens to carry a stride.
   const leg = u * TAU * LEG_CYCLES;
+  const B = ROLLER_BOB;
+  const bob = Math.sin(leg * B.rate) * B.amp + Math.sin(u * TAU * B.heaveCycles) * B.heave;
   const gyC = Math.round((GY - BEETLE_VB_Y0) * s);
   const bcx = BALL.x * s, bcy = (GY - BALL.r - BEETLE_VB_Y0) * s, br = BALL.r * s;
-  // Hips sit on the THORAX underside, never on the horn: rotated 45° the
-  // horn's arch swings into the bottom-left corner of the sprite, which is
-  // exactly where a naive "under the front of the beetle" hip lands.
+  // Hips sit on the THORAX underside, never on the horn: rotated into this
+  // pose the horn's arch swings into the bottom-left corner of the sprite,
+  // which is exactly where a naive "under the front of the beetle" hip lands.
   for (const [i, [hip, fx]] of ROLLER_LEGS.ground.entries()) {
     const p = leg + i * 2.1;
     const swing = Math.round(Math.sin(p) * 2);
     const lift = Math.cos(p) > 0 ? 1 : 0;            // the foot clears the ground
-    limb(x, [[ROLLER.col + hip[0], ROLLER.row + hip[1]], [ROLLER.col + fx + swing, gyC - lift]], "flat");
+    limb(x, [[ROLLER.col + hip[0], ROLLER.row + hip[1] + bob], [ROLLER.col + fx + swing, gyC - lift]], "flat");
   }
   for (const [i, [hip, knee, frow]] of ROLLER_LEGS.rim.entries()) {
     const ph = Math.round(Math.sin(leg + Math.PI * i) * 1.6);
     const fr = ROLLER.row + frow + ph, dy = fr - bcy;
     const fx = Math.round(bcx - Math.sqrt(Math.max(0, br * br - dy * dy))) - 1;
-    limb(x, [[ROLLER.col + hip[0], ROLLER.row + hip[1]],
-             [ROLLER.col + knee[0], ROLLER.row + knee[1]], [fx, fr]], "grip");
+    limb(x, [[ROLLER.col + hip[0], ROLLER.row + hip[1] + bob],
+             [ROLLER.col + knee[0], ROLLER.row + knee[1] + bob], [fx, fr]], "grip");
   }
-  blit(x, BODIES.roller, ROLLER.col, ROLLER.row);
+  blit(x, BODIES.roller, ROLLER.col, ROLLER.row, bob);
   x.restore();
 }
 
@@ -421,11 +445,12 @@ function drawSettledPonder(x, u, cols, rows) {
   x.clearRect(0, 0, cols, rows);
   x.save();
   x.setTransform(s, 0, 0, s * CELL_ASPECT, 0, -P.VBy0 * s * CELL_ASPECT);
-  // Ground pitch is the STAGE's, not this ball's: ponderGround derives its dot
-  // spacing from the radius it is given, so the settled ball's smaller radius
-  // would stop the ground short of the frame's right edge. Travel is 0 — the
-  // beetle isn't going anywhere.
-  ponderGround(x, P.gy, 0, P.r);
+  // NO GROUND. The moving poses keep theirs — a beetle that travels needs a
+  // floor to travel over — but this one is the empty-repo state, where the
+  // scene sits under a heading and has to stay quiet. The ground also spanned
+  // the FULL stage width, so it alone set the scene's occupied box: dropping
+  // it lets the box close on the art and the whole thing stops reading as a
+  // banner with a rule under it.
 
   // TWO harmonics, not one. A pure sine rock is symmetric about its extremes,
   // so u and 0.5-u put the ball in the same place with the same roll — and
