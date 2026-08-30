@@ -156,7 +156,12 @@ scarab:
 # tier on a PV survives the roll.
 workspace:
   enabled: true
-  replicaCount: 1
+  # Overridable because the alternative is `kubectl scale`, and a manual scale
+  # takes ownership of .spec.replicas away from Helm — after which every
+  # subsequent deploy dies on a .spec.replicas conflict and the server image
+  # never rolls. Express the topology here instead:
+  #   WS_REPLICAS=2 just local-helm local
+  replicaCount: ${WS_REPLICAS:-1}
   persistence:
     size: "${WS_PV_SIZE}"
   # The ADR-0061 s3-feed fetcher. 'just local-helm local' builds it from the tree
@@ -320,13 +325,26 @@ kubectl rollout status -n "$NS" deploy/scarab-postgres --timeout=120s
 # real-S3 override (SCARAB_S3_ENDPOINT set to something else in .env) skips it.
 if [ "$S3_ENDPOINT" = "http://scarab-minio:9000" ]; then
   echo "==> in-cluster MinIO"
+  # A Job's spec.template is IMMUTABLE, so `apply` fails the moment the bucket
+  # job's script changes — and it changes whenever a comment in minio.yaml
+  # does. The failure is late and unhelpful ("field is immutable", printing the
+  # whole PodSpec), and it aborts the deploy BEFORE the helm upgrade, so the
+  # cluster silently keeps running the old server image while the build that
+  # just succeeded goes nowhere. The job is one-shot and idempotent
+  # (`mc mb --ignore-existing`), so recreate it every time.
+  kubectl delete job scarab-minio-mkbucket -n "$NS" --ignore-not-found
   kubectl apply -n "$NS" -f "$ROOT/deploy/local-helm/minio.yaml"
   kubectl rollout status -n "$NS" deploy/scarab-minio --timeout=120s
   kubectl wait -n "$NS" --for=condition=complete job/scarab-minio-mkbucket --timeout=90s
 fi
 
 echo "==> scarab-server + workspace service (image tag: $TAG)"
-helm upgrade --install scarab "$ROOT/deploy/helm/scarab" -n "$NS" -f "$VALUES"
+# --force-conflicts: Helm 4 applies server-side, so any field a human touched
+# with kubectl becomes a conflict that aborts the WHOLE upgrade — leaving the
+# old image running while the build that just succeeded goes nowhere. For a
+# release whose desired state is the values above, Helm is the authority. Set
+# WS_REPLICAS rather than scaling by hand.
+helm upgrade --install scarab "$ROOT/deploy/helm/scarab" -n "$NS" -f "$VALUES" --force-conflicts
 kubectl rollout status -n "$NS" deploy/scarab --timeout=180s
 # The workspace service is standard-path, so its readiness is a deploy gate, not a
 # footnote: a Ready StatefulSet means its PVC bound AND its /readyz passed (warm
