@@ -22,9 +22,18 @@ export const INK = {
   "#": "#4ecfa2",   // elytra
   "%": "#d9b45e",   // the shell's highlight slab — gold, see below
   o: "#d9b45e",     // pronotum, head, horn
-  "-": "#8fa89b",   // limbs
+  "-": "#9bb4a7",   // limbs — see below
 };
 const RIM = "#d9b45e", RIM_DIM = "#a8873f", FLECK = "#b3924a";
+
+// THE LIMB INK IS A THRESHOLD, NOT A SHADE. The bake maps luminance to dot
+// SIZE, and a colour must reach 0.6665 to land on the biggest dot on the ramp.
+// The old #8fa89b measured 0.6343 — just under it — so the legs baked one ramp
+// step below the body and the ball, and at the size the site actually renders
+// (a 3px cell) they were not there at all. #9bb4a7 is 0.6814: same cell count,
+// every one a size bigger, and still gray to classify(). Widening the limb was
+// the obvious fix and it is the wrong one; this costs nothing.
+
 
 // The shell is #4ecfa2, not the roller's old #27b584. Inside ONE layer the
 // only thing a colour can say is dot SIZE: #27b584 bakes to '•' while the gold
@@ -61,7 +70,10 @@ function ponderBody() {
 }
 
 // ── the ROLLER body ─────────────────────────────────────────────────────────
-// The standing pose rotated 45° into the head-down push.
+// The standing pose rotated 55° into the head-down push. 45° was the first
+// cut and reads as a beetle leaning; 55° stands it up into a shove — the
+// silhouette goes narrower and taller (22×18 cells to 21×20) and the raised
+// back and the ball start to read as one gesture.
 //
 // Rotating pixel art is normally wrong, and it is safe HERE because the final
 // medium is a dot matrix, not crisp pixels: what has to survive is the
@@ -76,7 +88,7 @@ function ponderBody() {
 // shear drags it four rows across itself and it stops being an arch. Rotation
 // moves it as one rigid piece.
 const RW = 36, RH = 26, PAD_T = 1;
-function rollerBody(deg = 45) {
+function rollerBody(deg = 55) {
   const src = SHEET.poses.idle;                      // the sheet faces LEFT: the push direction
   const seam = SHEET.parts.idle.seam, bodyRows = SHEET.parts.idle.legRow;
   const K = 12, sw = src[0].length, diag = Math.ceil(Math.hypot(sw, bodyRows)) + 2;
@@ -115,7 +127,7 @@ function rollerBody(deg = 45) {
     if (ch !== ".") out[r + PAD_T][c + PAD_L] = ch;
   }));
   // Re-cut the shell's highlight AFTER the rotation. The sheet draws it as a
-  // hard slab across the shell's upper front; turned 45° that slab lands as an
+  // hard slab across the shell's upper front; turned into this pose that slab lands as an
   // amorphous patch mid-shell and reads as damage. Drawn fresh along the
   // shell's top contour it becomes a shine down the beetle's raised back,
   // which is what this pose wants anyway.
@@ -130,13 +142,38 @@ export const BODIES = { ponder: ponderBody(), roller: rollerBody() };
 
 // ── cell-exact primitives ───────────────────────────────────────────────────
 /** Blit a body. The art is authored in CELLS, so it is drawn with the
- *  transform reset — never through a scene's design-unit transform. */
-export function blit(x, body, col, row) {
+ *  transform reset — never through a scene's design-unit transform.
+ *
+ *  `dy` shifts it by a FRACTION of a cell, which is how this art breathes.
+ *  The bake maps coverage to dot SIZE, so a sub-cell offset makes every cell
+ *  on the silhouette swell and shrink through the ramp while the interior
+ *  holds solid — the body reads as soft-edged and alive instead of as a
+ *  bitmap being translated. (A WHOLE-cell offset can't do this: it is a jump,
+ *  and at gait frequency it reads as vibration.)
+ *
+ *  Each output cell is RESOLVED, never blended: it takes its coverage from
+ *  the two source rows it straddles but its INK from whichever of them covers
+ *  it more. Blending is not an option here — laying the shell's gold
+ *  highlight over the emerald at 0.73 of a cell mixes to rgb(170,189,117),
+ *  which classify() reads as the gray LIMB layer, so the seam would come out
+ *  as a gray stripe across the shell at every peak of the bob. */
+export function blit(x, body, col, row, dy = 0) {
   x.save(); x.setTransform(1, 0, 0, 1, 0, 0);
-  body.forEach((line, r) => [...line].forEach((ch, c) => {
-    if (ch === "." || ch === " ") return;
-    x.fillStyle = INK[ch]; x.fillRect(col + c, row + r, 1, 1);
-  }));
+  const k = Math.floor(dy), f = dy - k;             // whole cells, then the fraction
+  const at = (r, c) => { const ch = body[r]?.[c]; return !ch || ch === "." || ch === " " ? null : ch; };
+  const h = body.length + (f > 0 ? 1 : 0);
+  for (let r = 0; r < h; r++) {
+    const wide = Math.max(body[r - k]?.length ?? 0, body[r - k - 1]?.length ?? 0);
+    for (let c = 0; c < wide; c++) {
+      const near = at(r - k, c), far = at(r - k - 1, c);   // weights 1-f and f
+      const a = (near ? 1 - f : 0) + (far ? f : 0);
+      if (a <= 0) continue;
+      x.globalAlpha = a;
+      x.fillStyle = INK[(near && (!far || f < 0.5)) ? near : far];
+      x.fillRect(col + c, row + r, 1, 1);
+    }
+  }
+  x.globalAlpha = 1;
   x.restore();
 }
 

@@ -268,7 +268,25 @@ code,
 }
 .ascii-scene .ascii-em { color: var(--emerald); }
 .ascii-scene .ascii-au { color: var(--copper); }
-.ascii-scene .ascii-fe { color: var(--muted-sage); }
+/* The gray layer draws at a SMALLER GLYPH on the SAME grid. The bake can only
+   pick a dot from a five-step ramp, and between the medium dot and the big one
+   the ink jumps 2.1x with nothing in between — so a leg that is visible at ship
+   size is necessarily as heavy as the body. Shrinking the glyph here is the
+   only continuous control over that, and it is a RENDERING choice: the bake is
+   untouched.
+   Pitch is preserved by taking the shrink out of letter-spacing, so the cell
+   stays exactly --ascii-cell wide and the layers stay registered. The glyph
+   then sits fractionally left of centre in its own cell; translateX puts it
+   back. (The matching vertical error is 0.04px at ship size — measured, and
+   identical across JetBrains Mono, SF Mono and Menlo — so it is ignored.)
+   --ascii-leg MUST stay in step with ASCII_LEG in AsciiScene.tsx / .astro. */
+.ascii-scene .ascii-fe {
+  color: var(--muted-sage);
+  font-size: calc(var(--ascii-fs, 8px) * var(--ascii-leg, 0.85));
+  letter-spacing: calc(
+    var(--ascii-fs, 8px) * (var(--ascii-cell, 0.9) - 0.6 * var(--ascii-leg, 0.85)));
+  transform: translateX(calc(var(--ascii-fs, 8px) * 0.3 * (1 - var(--ascii-leg, 0.85))));
+}
 /* Runtime speech bubble (ponder-* stages): crisp foreground text over the
    dotted art, deliberately off-language from the dot-matrix — reads as a
    terminal caption. Unlike the art layers it is real TEXT, so it does NOT take
@@ -1876,27 +1894,25 @@ input:focus-visible, textarea:focus-visible, select:focus-visible {
 }
 .allclear .ac-ico { color: var(--emerald); flex: none; }
 
-/* State-moment beetle: an idle/failed pose stands in for an empty list. */
+/* State-moment beetle: an idle/failed pose stands in for an empty list.
+   The caption sits DIRECTLY under the art — it reads as the beetle's own line,
+   not as a separate paragraph. That needs all three of the gaps killed: the
+   flex gap here, the land's padding, and the <p>'s default margin (flex items
+   do not collapse margins, so it stacked on top of the gap instead of merging
+   with it — 4 + 14 + 14 = 32px of air). */
 .empty-scene {
-  display: flex; flex-direction: column; align-items: stretch; gap: 14px;
+  display: flex; flex-direction: column; align-items: stretch; gap: 0;
   padding: 34px 0 8px; text-align: center;
 }
-/* The beetle needs ground for the same reason the dashboard footer's does: it
-   is drawn standing on something, and without a horizon it floats. Same
-   language as `.dash-footer` — one dashed copper rule, the scene's feet
-   landing on it (the baked crop leaves ~1 row of slack, so the box overhangs
-   by 4px exactly as the footer's `roller` does). */
+.empty-scene .empty { margin-top: 0; }
+/* No ground rule under the dozing beetle. There were TWO of them and they read
+   as one: a dashed border here, and a row of baked ground dots inside the scene
+   itself (both dropped — see scenes.mjs). The scene is the quiet state of a
+   repo that has never run; a full-width rule under it read as a banner. The
+   padding-bottom went with the rule it was making room for. */
 .empty-land {
-  position: relative;
   display: flex;
   justify-content: center;
-  padding-bottom: 4px;
-}
-.empty-land::after {
-  content: "";
-  position: absolute;
-  left: 0; right: 0; bottom: 4px;
-  border-top: 1px dashed var(--border-copper);
 }
 .empty-scene .ascii-scene { margin: 0 auto; }
 .allclear .ac-title { font-family: "Space Grotesk", var(--font-ui); font-size: 15px; font-weight: 600; color: var(--soft-white); }
