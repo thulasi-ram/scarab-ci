@@ -1,0 +1,111 @@
+# Path filters — ONE definition, consumed by every workflow that needs to know
+# what a push actually touched (`dorny/paths-filter`'s `filters:` accepts a path
+# to this file).
+#
+# WHY A SHARED FILE: `ci.yml` and `image.yml` both have to answer "did Rust
+# change?" and "did the UI change?". Two copies of that answer drift, and a
+# drifted filter is worse than no filter — it makes a real break invisible
+# instead of merely slow. `kind.yml` keeps its own inline `paths:` because it
+# filters at the WORKFLOW level (the whole workflow sits out), which is a
+# different mechanism with no job to read an output.
+#
+# THE RULE FOR EDITING THIS FILE: a filter must name every input the gated job
+# READS, not just the obvious one. If a job runs a script, the script is an
+# input. If it compares against a committed baseline, the baseline is an input.
+# Every filter therefore includes this file and its own workflow, so a change to
+# the gating logic itself always re-runs everything it gates.
+#
+# The tiering that makes a skipped job safe lives in
+# `.github/required-checks.txt` (`required-if-run`) — read its header before
+# adding a filter here, and move the affected line in the SAME commit.
+
+# The cargo surface: anything that can change what the workspace builds or what
+# its tests assert. `migrations/` is inside `crates/scarab-db-postgres/`, so
+# `crates/**` already covers the schema the PG-backed tests run against.
+# NOTE: `ui/**` is deliberately absent. Nothing in `crates/` reads the UI —
+# `docker/server/Dockerfile` builds it as a separate stage and copies `dist/`
+# into the image, so a stylesheet cannot change a cargo test result.
+cargo: &cargo
+  - "crates/**"
+  - "Cargo.toml"
+  - "Cargo.lock"
+  - "rust-toolchain.toml"
+
+# `cargo` plus the things that gate it. Split from `cargo` on purpose: the image
+# filters below want the SOURCE surface, and a `ci.yml` edit must not rebuild
+# four container images.
+rust: &rust
+  - *cargo
+  - ".github/workflows/ci.yml"
+  - ".github/path-filters.yml"
+
+# The npm UI workspace. `ui/brand` is in scope, not just the app: scarab-web-ui
+# imports the shared ASCII/emblem assets from its sibling via `../../brand/...`
+# (PR #18), so a brand edit is a UI change.
+ui_src: &ui_src
+  - "ui/**"
+
+ui: &ui
+  - *ui_src
+  - ".github/workflows/ci.yml"
+  - ".github/path-filters.yml"
+
+# `coverage` runs the Rust suite AND executes the ratchet against the committed
+# baseline. A baseline edit with no Rust change is exactly the case that must
+# re-run it — otherwise a lowered floor merges unvalidated.
+coverage:
+  - *rust
+  - "scripts/coverage_ratchet.py"
+  - "docs/audits/coverage-baseline.toml"
+
+# `openapi-drift` gates BOTH halves of the contract (ADR-0054): the committed
+# spec vs the Rust routes, and the generated TS client vs the spec. The second
+# half runs `npm run gen && npm run typecheck`, which makes this job the ONLY
+# TypeScript typecheck in CI — so `ui` belongs here, and dropping it would let a
+# type error merge on a UI-only PR. Do not "simplify" this to Rust-only.
+contracts:
+  - *rust
+  - *ui
+  - "openapi.json"
+
+# ---------------------------------------------------------------------------
+# Per-image filters for `image.yml`. Each image's filter is the set of paths
+# its OWN build context reads — which is why a stylesheet edit rebuilds
+# `scarab-server` and nothing else.
+# ---------------------------------------------------------------------------
+
+# The converged binary + the embedded UI: the Dockerfile is a cargo stage over
+# the workspace, an npm stage over `ui/`, and a `COPY openapi.json` the client
+# generator reads.
+image_server:
+  - *cargo
+  - *ui_src
+  - "openapi.json"
+  - "docker/server/Dockerfile"
+  - ".dockerignore"
+  - ".github/workflows/image.yml"
+  - ".github/path-filters.yml"
+
+# Build context is `docker/clone/` itself — a self-contained image (ADR-0045),
+# no workspace crates.
+image_clone:
+  - "docker/clone/**"
+  - ".github/workflows/image.yml"
+  - ".github/path-filters.yml"
+
+# Build context is `docker/sidecar/` itself (ADR-0042).
+image_results_sidecar:
+  - "docker/sidecar/**"
+  - ".github/workflows/image.yml"
+  - ".github/path-filters.yml"
+
+# Context is the repo ROOT: the fetcher is a bin target of
+# `crates/scarab-workspace-client` (deliberately, so it shares the one
+# `Cas::materialize` that carries the fidelity rules), so it takes the whole
+# cargo surface — but not the UI.
+image_wsfetch:
+  - *cargo
+  - "docker/wsfetch/**"
+  - ".dockerignore"
+  - ".github/workflows/image.yml"
+  - ".github/path-filters.yml"
