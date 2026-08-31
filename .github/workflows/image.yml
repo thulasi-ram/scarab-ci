@@ -23,19 +23,13 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  # NO workflow-level `paths:` on purpose. The `changes` job below filters
+  # PER IMAGE from `.github/path-filters.yml`; an outer filter would be a SECOND
+  # copy of the same union that has to be kept in step with the four inner ones
+  # — and it was already out of step (it never listed `rust-toolchain.toml`,
+  # which both cargo-built images read). A docs-only PR now runs one ~15s
+  # `changes` job that selects `[]` and builds nothing.
   pull_request:
-    paths:
-      - 'docker/server/Dockerfile'
-      - '.dockerignore'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**'
-      - 'ui/**'
-      - 'openapi.json'
-      - 'docker/clone/**'
-      - 'docker/sidecar/**'
-      - 'docker/wsfetch/**'
-      - '.github/workflows/image.yml'
   workflow_dispatch:
 
 env:
@@ -47,9 +41,66 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which images does this push actually change? (git-bug 602940c)
+  #
+  # A stylesheet edit used to rebuild all four images × two arches — eight
+  # check runs, six of them for images that contain no UI. Only `scarab-server`
+  # embeds it (its Dockerfile has an npm stage that copies `dist/`); `clone` and
+  # `results-sidecar` are self-contained shell images whose build context is
+  # their own directory, and `wsfetch` is a cargo bin target.
+  #
+  # The per-image filters live in `.github/path-filters.yml` — the same file
+  # `ci.yml` reads, so "did the UI change?" has one answer in this repo.
+  #
+  # ON A PUSH OR A TAG, ALL FOUR ARE BUILT. The `edge` / `sha-<sha>` / semver
+  # tags are how `kind.yml`, `just local-helm sha-<sha>` and the chart pin a
+  # build, and a tag that exists for some images and not others is a trap you
+  # only discover in a deploy. Selection is a PR-only economy.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      images: ${{ steps.select.outputs.images }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: .github/path-filters.yml
+      # Emits the JSON array the build matrix expands. Non-PR events short out
+      # to the full set before any filter output is read.
+      - name: Select the images to build
+        id: select
+        env:
+          ALL: '["scarab-server","scarab-clone","scarab-results-sidecar","scarab-wsfetch"]'
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+          SERVER: ${{ steps.filter.outputs.image_server }}
+          CLONE: ${{ steps.filter.outputs.image_clone }}
+          SIDECAR: ${{ steps.filter.outputs.image_results_sidecar }}
+          WSFETCH: ${{ steps.filter.outputs.image_wsfetch }}
+        run: |
+          set -euo pipefail
+          if [ "$IS_PR" != "true" ]; then
+            images="$ALL"
+          else
+            images=$(jq -cn \
+              --arg server "$SERVER" --arg clone "$CLONE" \
+              --arg sidecar "$SIDECAR" --arg wsfetch "$WSFETCH" \
+              '[ {"scarab-server":$server, "scarab-clone":$clone,
+                  "scarab-results-sidecar":$sidecar, "scarab-wsfetch":$wsfetch}
+                 | to_entries[] | select(.value == "true") | .key ]')
+          fi
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "building: $images" >> "$GITHUB_STEP_SUMMARY"
+
   # Per-image, per-arch build on a native runner. On push/tags each build is
   # pushed by digest (no tag yet); PRs just validate the Dockerfile.
   build:
+    needs: changes
+    if: needs.changes.outputs.images != '[]'
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -57,30 +108,46 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [scarab-server, scarab-clone, scarab-results-sidecar, scarab-wsfetch]
+        # Only the images this push can have changed (see `changes`). A plain
+        # string list on purpose: it keeps the check names readable
+        # (`build (scarab-server, linux/amd64)`), and the context/dockerfile
+        # mapping cannot ride along in `include:` — an `include` entry whose
+        # `image` is not in the matrix does not filter itself out, it appends a
+        # NEW combination with no `platform` and no `runner`. Hence the `case`
+        # step below.
+        image: ${{ fromJSON(needs.changes.outputs.images) }}
         platform: [linux/amd64, linux/arm64]
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
-          - image: scarab-server
-            context: .
-            dockerfile: docker/server/Dockerfile
-          - image: scarab-clone
-            context: docker/clone
-            dockerfile: docker/clone/Dockerfile
-          - image: scarab-results-sidecar
-            context: docker/sidecar
-            dockerfile: docker/sidecar/Dockerfile
-          # Context is the repo ROOT: the fetcher is a bin target of
-          # crates/scarab-workspace-client, deliberately, so it shares the one
-          # `Cas::materialize` that carries the fidelity rules.
-          - image: scarab-wsfetch
-            context: .
-            dockerfile: docker/wsfetch/Dockerfile
     steps:
       - uses: actions/checkout@v4
+
+      # The one mapping from image name to build context. `scarab-clone` and
+      # `scarab-results-sidecar` are self-contained (their context IS their
+      # directory); the other two build from the repo root because they are
+      # cargo targets — the fetcher deliberately so, to share the one
+      # `Cas::materialize` that carries the fidelity rules.
+      - name: Resolve the build context
+        id: target
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          case "$IMAGE" in
+            scarab-server)          ctx=.                ; df=docker/server/Dockerfile   ;;
+            scarab-clone)           ctx=docker/clone     ; df=docker/clone/Dockerfile    ;;
+            scarab-results-sidecar) ctx=docker/sidecar   ; df=docker/sidecar/Dockerfile  ;;
+            scarab-wsfetch)         ctx=.                ; df=docker/wsfetch/Dockerfile  ;;
+            *)
+              echo "::error::unmapped image '$IMAGE' — add it to this case AND to .github/path-filters.yml"
+              exit 1
+              ;;
+          esac
+          echo "context=$ctx" >> "$GITHUB_OUTPUT"
+          echo "dockerfile=$df" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v4
 
@@ -98,8 +165,8 @@ jobs:
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
+          context: ${{ steps.target.outputs.context }}
+          file: ${{ steps.target.outputs.dockerfile }}
           platforms: ${{ matrix.platform }}
           push: ${{ github.event_name != 'pull_request' }}
           outputs: ${{ github.event_name != 'pull_request' && format('type=image,name={0}/{1}/{2},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, github.repository_owner, matrix.image) || 'type=cacheonly' }}
@@ -127,7 +194,7 @@ jobs:
   # apply the human tags (edge / sha-<sha> / semver / latest).
   merge:
     if: github.event_name != 'pull_request'
-    needs: build
+    needs: [changes, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -135,7 +202,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [scarab-server, scarab-clone, scarab-results-sidecar, scarab-wsfetch]
+        # The same set `build` produced digests for. On the non-PR events this
+        # job runs on that is always all four, but reading it from `changes`
+        # rather than repeating the literal means the two lists cannot drift.
+        image: ${{ fromJSON(needs.changes.outputs.images) }}
     steps:
       - name: Download this image's digests
         uses: actions/download-artifact@v8
