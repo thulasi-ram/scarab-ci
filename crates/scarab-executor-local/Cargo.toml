@@ -9,3 +9,8 @@ scarab-engine = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# `services:` on a StepSpec is a scarab_pipeline type; the tests that pin the
+# sidecar rejection have to name it.
+scarab-pipeline = { workspace = true }
