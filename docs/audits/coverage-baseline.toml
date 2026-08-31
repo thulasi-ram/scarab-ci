@@ -2,6 +2,19 @@
 # scripts/coverage_ratchet.py: CI fails if any crate drops more than
 # 0.5 percentage points below its value here. Regenerate
 # deliberately with `just coverage` and commit the result.
+#
+# THESE NUMBERS ARE LOOSE, AND DELIBERATELY NOT REGENERATED HERE (2026-08-31).
+# A full re-measurement under CI env parity while clearing git-bug b007837 put
+# most crates 1-16pp ABOVE their value below — `scarab-storage-s3` +15.7,
+# `scarab-secrets-postgres` +14.2, `scarab-forge-github` +10.9, `scarab-server`
+# +10.5. The likely cause is that `just coverage` used to start Postgres but NOT
+# MinIO (fixed in the same change), so whoever last ran `--write` wrote a floor
+# from a narrower suite. A loose floor lets a real regression through.
+#
+# It is not fixed by pasting the numbers from that laptop run: raising a floor
+# on evidence CI has not produced reds `main` for whatever the two environments
+# disagree about. Regenerate from the `lcov` ARTIFACT of a green `coverage` job
+# on main (the job now uploads it `if: always()`), not from a local run.
 
 [crates]
 scarab-cli = 25.8
