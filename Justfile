@@ -268,9 +268,15 @@ test-one FILTER:
     fi
 
 # Coverage run (mirrors the CI `coverage` job): suite under cargo-llvm-cov
-# against the compose Postgres, per-crate summary, and REGENERATES
+# against the compose Postgres AND MinIO, per-crate summary, and REGENERATES
 # docs/audits/coverage-baseline.toml — review + commit the baseline deliberately.
 # Requires cargo-nextest + cargo-llvm-cov.
+#
+# The SCARAB_TEST_REQUIRE_* flags are set here and NOT in `just test`, on
+# purpose. This recipe writes the floor the CI ratchet then enforces: a run that
+# quietly skipped the PG- or S3-backed tier would bake that narrower suite in as
+# a permanently lowered baseline, and the loss would look like a real coverage
+# level rather than an absent service. A red run is the only safe failure here.
 coverage:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -280,6 +286,20 @@ coverage:
       docker compose -f deploy/local-proc/compose.yaml up -d --wait postgres
     fi
     export SCARAB_TEST_DATABASE_URL=postgres://scarab:scarab@127.0.0.1:55432/scarab
+    export SCARAB_TEST_REQUIRE_PG=1
+    # Same reuse-or-start dance as `just test-one` — see the note there about
+    # not re-running createbuckets against a foreign MinIO.
+    if (exec 3<>/dev/tcp/127.0.0.1/9000) 2>/dev/null; then
+      echo "==> reusing the MinIO already listening on 127.0.0.1:9000"
+    else
+      docker compose -f deploy/local-proc/compose.yaml up -d --wait minio
+      docker compose -f deploy/local-proc/compose.yaml run --rm createbuckets
+    fi
+    export SCARAB_TEST_S3_ENDPOINT=http://127.0.0.1:9000
+    export SCARAB_TEST_S3_BUCKET=scarab-test
+    export SCARAB_TEST_S3_ACCESS_KEY=scarab
+    export SCARAB_TEST_S3_SECRET_KEY=scarabsecret
+    export SCARAB_TEST_REQUIRE_S3=1
     cargo llvm-cov nextest --workspace \
       --ignore-filename-regex 'crates/scarab-testkit/|/tests/' \
       --lcov --output-path target/lcov.info

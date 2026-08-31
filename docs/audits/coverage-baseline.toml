@@ -2,22 +2,40 @@
 # scripts/coverage_ratchet.py: CI fails if any crate drops more than
 # 0.5 percentage points below its value here. Regenerate
 # deliberately with `just coverage` and commit the result.
+#
+# REGENERATED 2026-08-31 from the `lcov` ARTIFACT of a green CI `coverage` job
+# (run 33377942205, PR #4 head 68e768e) — not from a laptop. That distinction
+# was the reason the previous regeneration was refused, and it turned out to be
+# a fear worth testing rather than obeying: the same suite measured on darwin
+# and on the ubuntu runner agrees EXACTLY on sixteen of these seventeen crates,
+# and to 0.2pp on `scarab-server`. The 0.5pp slack absorbs that jitter.
+#
+# What it replaced was 10-16pp of slack nobody chose: `scarab-storage-s3` was
+# floored at 69.5 while measuring 85.2, `scarab-secrets-postgres` at 70.7 while
+# measuring 84.9, `scarab-forge-github` at 65.8 while measuring 76.7. A floor
+# 15pp below reality is not a ratchet, it is a decoration — those three crates
+# could have lost half their tests without CI saying a word.
+#
+# The cause was `just coverage` starting Postgres but not MinIO (fixed in the
+# same change), so an earlier `--write` recorded a narrower suite as the floor.
+# If a crate here ever drops far below what you can reproduce locally, suspect a
+# service that did not start before you suspect the tests.
 
 [crates]
 scarab-cli = 25.8
-scarab-db-postgres = 85.4
-scarab-engine = 89.1
-scarab-executor-k8s = 75.3
-scarab-executor-local = 80.0
-scarab-forge = 95.3
-scarab-forge-forgejo = 64.1
-scarab-forge-github = 65.8
+scarab-db-postgres = 86.4
+scarab-engine = 90.1
+scarab-executor-k8s = 78.9
+scarab-executor-local = 90.4
+scarab-forge = 95.0
+scarab-forge-forgejo = 72.9
+scarab-forge-github = 76.7
 scarab-identity = 100.0
-scarab-pipeline = 96.2
+scarab-pipeline = 96.6
 scarab-project = 96.9
 scarab-secrets = 85.6
-scarab-secrets-postgres = 70.7
-scarab-server = 75.6
-scarab-storage = 86.7
-scarab-storage-s3 = 69.5
-scarab-workspace-client = 74.6
+scarab-secrets-postgres = 84.9
+scarab-server = 85.9
+scarab-storage = 89.4
+scarab-storage-s3 = 85.2
+scarab-workspace-client = 79.3

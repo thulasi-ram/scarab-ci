@@ -220,3 +220,154 @@ async fn no_results_emitted_is_an_empty_map() {
     assert_eq!(drive(&exec, &handle).await, ExecState::Succeeded);
     assert!(exec.results(&handle).await.unwrap().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The Pod-shaped contracts the host-process backend cannot honor (ADR-0036).
+//
+// Each of these is a step kind whose contract is a *container* — a canonical
+// image, rootless BuildKit, a co-located sidecar. The local backend runs a bare
+// child process, so it must FAIL with direction rather than run the step
+// without the thing that makes it that kind of step. A silent no-source clone
+// or a service-less step that exits 0 is the failure mode being pinned here:
+// the step would look green while having done something else entirely.
+// ---------------------------------------------------------------------------
+
+/// ADR-0045: a clone step's contract is the `scarab-clone` image plus tmpfs
+/// credential delivery. Locally that is unhonorable — reject, never run a step
+/// that quietly checks nothing out.
+#[tokio::test]
+async fn a_clone_step_is_rejected_not_silently_run_without_source() {
+    let exec = LocalExecutor::new();
+    let s = step("r1", "checkout");
+    let mut sp = spec(&["sh", "-c", "exit 0"]);
+    sp.clone = Some(Default::default());
+
+    let err = exec
+        .launch(&s, &sp)
+        .await
+        .expect_err("a clone step must not launch on the local backend");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("k8s executor") && msg.contains("ADR-0045"),
+        "the rejection has to point at the backend that CAN do it: {msg}"
+    );
+}
+
+/// ADR-0018: a build step's contract is rootless BuildKit in a Pod.
+#[tokio::test]
+async fn a_build_step_is_rejected() {
+    let exec = LocalExecutor::new();
+    let s = step("r1", "image");
+    let mut sp = spec(&["sh", "-c", "exit 0"]);
+    sp.build = Some(Default::default());
+
+    let err = exec
+        .launch(&s, &sp)
+        .await
+        .expect_err("a build step must not launch on the local backend");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("k8s executor") && msg.contains("ADR-0018"),
+        "the rejection has to point at the backend that CAN do it: {msg}"
+    );
+}
+
+/// ADR-0058: a sidecar service is a container co-located in the step's Pod. A
+/// step whose command dials `localhost:5432` would exit non-zero here for a
+/// confusing reason; rejecting at launch says why.
+#[tokio::test]
+async fn a_step_with_sidecar_services_is_rejected() {
+    let exec = LocalExecutor::new();
+    let s = step("r1", "needs-pg");
+    let mut sp = spec(&["sh", "-c", "exit 0"]);
+    sp.services = vec![scarab_pipeline::ServiceSpec {
+        image: "postgres:16".into(),
+        ports: vec![5432],
+        ..Default::default()
+    }];
+
+    let err = exec
+        .launch(&s, &sp)
+        .await
+        .expect_err("a step with services must not launch on the local backend");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("k8s executor") && msg.contains("ADR-0058"),
+        "the rejection has to point at the backend that CAN do it: {msg}"
+    );
+}
+
+/// ADR-0047: a step that authors no `timeout:` inherits the executor's
+/// configured global default — the knob, not just the compiled-in hour.
+#[tokio::test]
+async fn a_step_without_a_timeout_inherits_the_configured_default() {
+    let exec = LocalExecutor::default().with_default_step_timeout_secs(1);
+    let s = step("r1", "no-timeout-authored");
+    let sp = spec(&["sh", "-c", "sleep 30"]);
+    assert!(sp.timeout_seconds.is_none(), "the step authors no timeout");
+
+    let handle = exec.launch(&s, &sp).await.unwrap();
+    assert_eq!(exec.poll(&handle).await.unwrap(), ExecState::Running);
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    assert_eq!(
+        exec.poll(&handle).await.unwrap(),
+        ExecState::Failed {
+            exit_code: None,
+            class: FailureClass::Timeout,
+            cause: None,
+        },
+        "the configured default deadline is enforced, not only an authored one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The evidence ports (ADR-0068 / 2e1a458). Both are REQUIRED trait methods
+// with no default precisely because a defaulted evidence method gets answered
+// by a decorator instead of the executor it wraps — that has silently dropped
+// evidence twice (98ea804, 56220d7). The local backend's answer is a
+// deliberate `None`; these pin that it is None *by decision*, so that a future
+// local infra plane (a container backend, say) cannot be added without either
+// reporting or knowingly re-affirming the silence here.
+// ---------------------------------------------------------------------------
+
+/// A child process has no scheduler to reject it, no image to pull and no node
+/// to be too small — there is no infra plane to narrate.
+#[tokio::test]
+async fn the_local_backend_reports_no_infra_condition() {
+    let exec = LocalExecutor::new();
+    let s = step("r1", "quiet");
+    let handle = exec
+        .launch(&s, &spec(&["sh", "-c", "sleep 30"]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        exec.infra_condition(&handle).await.unwrap(),
+        None,
+        "the local backend has no infra plane to report on"
+    );
+    // ...and the same for a fence it never launched: absence of a unit is not
+    // an error, it is still no condition.
+    let bogus = scarab_engine::ports::ExecHandle("local://nope/nope/0".into());
+    assert_eq!(exec.infra_condition(&bogus).await.unwrap(), None);
+}
+
+/// No workspace CAS leg locally (parity explicitly deferred, ADR-0036), so
+/// there is no fan-in sensor and nothing to report about provisioning.
+#[tokio::test]
+async fn the_local_backend_reports_no_workspace_provisioning() {
+    let exec = LocalExecutor::new();
+    let s = step("r1", "no-cas");
+    let handle = exec
+        .launch(&s, &spec(&["sh", "-c", "sleep 30"]))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        exec.workspace_provisioning(&handle).await.unwrap(),
+        None,
+        "the local backend has no workspace CAS leg to report a fan-in over"
+    );
+    let bogus = scarab_engine::ports::ExecHandle("local://nope/nope/0".into());
+    assert_eq!(exec.workspace_provisioning(&bogus).await.unwrap(), None);
+}

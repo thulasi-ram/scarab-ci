@@ -64,15 +64,37 @@ def read_baseline(path):
     return baseline
 
 
+DEFAULT_HEADER = [
+    "# Per-crate line-coverage baseline (percent), consumed by",
+    "# scripts/coverage_ratchet.py: CI fails if any crate drops more than",
+    f"# {SLACK} percentage points below its value here. Regenerate",
+    "# deliberately with `just coverage` and commit the result.",
+]
+
+
+def existing_header(path):
+    """The comment block above `[crates]` in an existing baseline, or None.
+
+    `--write` used to hardcode the header, so every regeneration silently
+    deleted whatever a human had written there — and this file is exactly where
+    a "these floors are loose because X" note belongs. The numbers are
+    generated; the prose above them is not, and must survive a rewrite.
+    """
+    if not Path(path).exists():
+        return None
+    header = []
+    for line in Path(path).read_text().splitlines():
+        if line.strip().startswith("["):
+            break
+        if line.strip().startswith("#") or not line.strip():
+            header.append(line)
+    while header and not header[-1].strip():
+        header.pop()
+    return header or None
+
+
 def write_baseline(path, coverage):
-    lines = [
-        "# Per-crate line-coverage baseline (percent), consumed by",
-        "# scripts/coverage_ratchet.py: CI fails if any crate drops more than",
-        f"# {SLACK} percentage points below its value here. Regenerate",
-        "# deliberately with `just coverage` and commit the result.",
-        "",
-        "[crates]",
-    ]
+    lines = (existing_header(path) or DEFAULT_HEADER) + ["", "[crates]"]
     lines += [f"{name} = {p:.1f}" for name, p in sorted(coverage.items())]
     Path(path).write_text("\n".join(lines) + "\n")
 
