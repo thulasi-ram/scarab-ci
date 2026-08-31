@@ -1,8 +1,55 @@
 # Handoff — CI does too much on every push
 
-**Branch:** none yet — this is analysis, no code written.
+**Branch:** `docs/ci-simplification`.
 **Tickets:** git-bug `b007837`, `6729fc2`, `b69c286`, `7fbf56d`, `602940c` (all `type:chore`, `area:infra`; each carries the same cross-reference comment).
 **Evidence PR:** [#3](https://github.com/thulasi-ram/scarab-ci/pull/3) — a UI/art-only change, which is what made the waste legible.
+
+---
+
+## Outcome (2026-08-31)
+
+Four of the five are done on `docs/ci-simplification`; the fifth is still the
+open trade this document parked.
+
+| ticket | outcome |
+|---|---|
+| `b007837` ratchet red on main | **fixed, with no baseline edit** — `scarab-executor-local` is 90.4% against its unchanged 80.0 baseline (floor 79.5). The drop was five never-tested behaviours; five acceptance tests cover 11 of the crate's 83 lines and take it 64/83 → 75/83 |
+| `6729fc2` no path filter | **fixed** — `.github/path-filters.yml` + a `changes` job in `ci.yml`; nothing is filtered on a push to `main` |
+| `7fbf56d` duplicate vitest job | **fixed** — `ui-unit` deleted, `ui-tests` kept (it is the name in `required-checks.txt`) |
+| `602940c` all four images rebuilt | **fixed** — `image.yml`'s matrix is now selected per-image from the same filter file; all four still build on push/tag |
+| `b69c286` Rust suite runs twice | **still open, by design** — see the work order below |
+
+Three things this document got wrong or did not see, corrected in the code:
+
+1. **`openapi-drift`'s 0.8 min was not waste.** Its second half runs
+   `npm run gen && npm run typecheck`, which makes it the ONLY TypeScript
+   typecheck in CI. Filtering it to Rust-only would have dropped `tsc` from
+   every UI PR. Its filter is `rust ∪ ui ∪ openapi.json`.
+2. **`pr_gate.py` passed a skipped `required` check at any tier.** A
+   workflow-level `paths:` filter makes a check *absent*; a job-level `if:`
+   makes it *skipped*, and only the first was treated as "did not run". Adding
+   filters without fixing this would have made the whole tier decorative.
+   Skipped and missing are now the same verdict, and `ci/changes` — which
+   always runs — is `required`, so a PR cannot pass having validated nothing.
+3. **`just coverage` did not mirror the CI `coverage` job** despite saying so:
+   no MinIO, no S3 env. It is the recipe that *regenerates the baseline*, so a
+   silently narrowed run there writes a permanently lowered floor. It now starts
+   both services and sets `SCARAB_TEST_REQUIRE_*`.
+4. **The whole baseline is loose, and that is the more interesting bug.** The
+   re-measurement put most crates well ABOVE their committed floor —
+   `scarab-storage-s3` +15.7pp, `scarab-secrets-postgres` +14.2,
+   `scarab-forge-github` +10.9, `scarab-server` +10.5 — which lines up exactly
+   with the missing-MinIO drift in (3). A floor 15pp low does not catch a
+   regression. It is **not** regenerated in this change: raising a floor from a
+   laptop run reds `main` on whatever the two environments disagree about.
+   `coverage` now uploads its lcov `if: always()`, so the next green run on main
+   yields numbers worth committing. See the note in
+   `docs/audits/coverage-baseline.toml`.
+
+The `if: always()` matters on its own: the upload step sat *after* the ratchet
+step, so the lcov was published only on green runs — never on the run whose
+numbers you need. `b007837` had to be reconstructed by reading percentages out
+of four job logs by hand because of it.
 
 ---
 
@@ -87,19 +134,27 @@ The most recent commit touching that crate is `13de34f feat(server): add the inf
 
 ## Work order
 
-1. **`b007837`** — settle the ratchet. Either add tests to `scarab-executor-local` or lower the
-   baseline deliberately. While `main` is red the ratchet protects nothing and the required-check
-   gate is pure noise.
-2. **`6729fc2`** — a `changes` job emitting `rust` / `ui` / `api`, each job gated on it, the
-   newly-skippable checks moved from `required` to `required-if-run`. Expected: a UI-only PR goes
-   from ~27 min / 15 jobs to roughly **1 min / 3 jobs**; a Rust PR is unchanged and still fully
-   gated.
+1. ~~**`b007837`** — settle the ratchet.~~ **DONE**, by the first branch: tests, not a lowered
+   baseline. The 1.9pp drop was two `Ok(None)` evidence-port stubs added by `13de34f` and `a8ade2e`
+   (`infra_condition`, `workspace_provisioning`) landing untested; going after them surfaced that
+   the crate had never tested its three *launch rejections* either — the clone / build / sidecar
+   contracts whose whole job is to refuse rather than run a step without the thing that makes it
+   that kind of step. Those are the tests that were missing, and the coverage number was a symptom.
+2. ~~**`6729fc2`**~~ **DONE.** A `changes` job emitting `rust` / `ui` / `coverage` / `contracts`
+   from `.github/path-filters.yml`, each job gated on it, the newly-skippable checks moved to
+   `required-if-run` in the same commit, plus a new always-runs `ci/changes` at `required` as the
+   anchor. Two deviations from the plan above: `api` became `contracts` and *includes* `ui`
+   (the typecheck, see finding 1), and **a push to `main` filters nothing** — trunk is what every
+   `sha-` image derives from, and the minutes were being burnt on PR pushes anyway.
 3. **`b69c286`** — decide `test` vs `coverage` *after* the filters land, because the filters remove
    the case for most PRs and leave only Rust-only changes paying double. This is a real trade:
    merging saves ~9 min per Rust PR but renames the required checks and couples the test signal to
    the coverage tooling. **Open question, deliberately not decided here.**
-4. **`7fbf56d`, `602940c`** — cheap tidy-ups once the `changes` job exists; `602940c` should reuse
-   it rather than adding a second filtering mechanism.
+4. ~~**`7fbf56d`, `602940c`**~~ **DONE.** `ui-unit` deleted. `image.yml` selects its build matrix
+   per-image from the same filter file — and its workflow-level `pull_request: paths:` was
+   *removed* rather than kept, because that was the second filtering mechanism: an outer union
+   that has to track four inner filters, and it was already out of step (it never listed
+   `rust-toolchain.toml`, which both cargo-built images read).
 
 ## Traps
 
