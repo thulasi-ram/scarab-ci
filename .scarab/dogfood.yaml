@@ -45,10 +45,19 @@ name: Dogfood — kitchen-sink pipeline
 # could not be scheduled either.
 #
 # Dispatch it by hand when you want the full tour; do not let every commit
-# start one. (`pull_request:` is left on, and carries the same cost — drop it
-# too if PRs to this repo ever become frequent.)
+# start one.
+#
+# `pull_request:` IS NOW OFF TOO, for the reason the paragraph above predicted:
+# PRs to this repo did become frequent. Every PR push was starting this
+# build-farm-sized run on the demo box alongside two runs of `.scarab/ci.yaml`,
+# and the runs that lost that fight died in 3-7 seconds without building
+# anything — then overwrote ci.yaml's green `scarab` commit status, because both
+# pipelines post to the SAME status context. A PR would go red for contention
+# and green again depending only on which run happened to finish last.
+#
+# `manual:` keeps the whole tour one dispatch away, which is how this pipeline
+# was always meant to be driven.
 on:
-  pull_request: {}
   manual: {}
 
 # --- interface.inputs: typed launch parameters (ADR-0043) -------------------

@@ -4643,6 +4643,71 @@ mod tests {
 
     // --- kitchen-sink sample guard --------------------------------------------
 
+    /// The repo's OWN CI pipeline must compile, and its triggers must be exactly
+    /// the ones intended. `dogfood.yaml` was guarded here and `ci.yaml` was not —
+    /// yet this is the one that runs on every push, so a typo in it breaks
+    /// Scarab-on-Scarab silently while the kitchen-sink sample stays green.
+    ///
+    /// The trigger shape is asserted, not just compilation. `push` and
+    /// `pull_request` OVERLAP on a PR branch: GitHub delivers both for one push,
+    /// so a bare `push: {}` here ran the whole pipeline twice per PR push. The
+    /// `when:` narrows `push` to trunk. A CEL predicate is only checked when it
+    /// is parsed, so a broken one would otherwise surface as a trigger that
+    /// never fires — i.e. `main` silently stopping being validated, which is the
+    /// failure mode you notice last.
+    #[test]
+    fn the_repos_own_ci_pipeline_compiles_and_fires_on_the_intended_triggers() {
+        let ci = include_str!("../../../.scarab/ci.yaml");
+        let ir = compile_yaml(ci).expect("the repo's own .scarab/ci.yaml must compile to IR");
+
+        assert!(ir.steps.iter().any(|s| s.is_clone()), "has a clone step");
+
+        let push = ir
+            .triggers
+            .0
+            .get("push")
+            .expect("still runs on push — post-merge validation of trunk");
+        assert_eq!(
+            push.when.as_deref(),
+            Some("event.branch == 'main'"),
+            "push must be narrowed to trunk, or every PR push runs this twice"
+        );
+        // The predicate has to be a VALID boolean CEL over a push context, or the
+        // trigger silently matches nothing. `event.branch` exists on a Push
+        // context and NOT on a PullRequest one, which is why it is only here.
+        crate::cel::check(push.when.as_deref().unwrap())
+            .expect("the push trigger predicate must be valid CEL");
+
+        let pr = ir
+            .triggers
+            .0
+            .get("pull_request")
+            .expect("still runs on PRs");
+        assert!(
+            pr.when.is_none(),
+            "a PullRequest context carries no `branch` — do not add a branch \
+             predicate here"
+        );
+    }
+
+    /// `.scarab/dogfood.yaml` is DISPATCH-ONLY on purpose. It is sized for a build
+    /// farm, not for the demo box that also runs the control plane, and it shares
+    /// the `scarab` commit-status context with `ci.yaml` — so when it ran on every
+    /// PR push its contention failures overwrote ci.yaml's green.
+    #[test]
+    fn the_dogfood_pipeline_is_dispatch_only() {
+        let dogfood = include_str!("../../../.scarab/dogfood.yaml");
+        let notify = include_str!("../../../.scarab/lib/notify.yaml");
+        let ir = compile_yaml_with_libs(dogfood, &libs(&[(".scarab/lib/notify.yaml", notify)]))
+            .expect("the dogfood sample must compile");
+        assert_eq!(
+            ir.triggers.0.keys().collect::<Vec<_>>(),
+            vec!["manual"],
+            "manual dispatch ONLY — adding `pull_request` back re-creates the \
+             status-overwrite race on the demo box"
+        );
+    }
+
     /// The repo's `.scarab/dogfood.yaml` kitchen-sink sample (and the library it
     /// invokes) must always compile to IR — this guards the teaching sample in CI
     /// so a schema change can never leave it stale/broken. The invoke is resolved
