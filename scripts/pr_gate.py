@@ -10,7 +10,8 @@ enforcement, run by whoever merges: it reads `.github/required-checks.txt`,
 asks `gh pr checks` for the PR's check runs, and exits non-zero unless every
 required check passed.
 
-Exit codes:  0 green  ·  1 a required check failed or is missing  ·
+Exit codes:  0 green  ·  1 a required check failed, is missing, or was
+                         skipped while listed `required`  ·
              8 a required check is still pending  ·  2 usage/tooling error
 
 Advisory checks are always reported and never affect the exit code — that is
@@ -68,20 +69,27 @@ def main(argv):
     for tier, workflow, job in spec:
         bucket = checks.get((workflow, job))
         ref = f"{workflow}/{job}"
-        if bucket is None:
-            verdict = "MISSING (did not run)"
-            if tier == "required":
-                failed.append(ref)
-            elif tier == "required-if-run":
-                verdict = "skipped (path filter) — OK"
+        # "It did not run" arrives in two shapes and they mean the same thing.
+        # A workflow-level `paths:` filter makes the check ABSENT (bucket None,
+        # as `kind/cluster-tests` is on an unrelated PR); a job-level
+        # `if: needs.changes.outputs.… == 'true'` makes it SKIPPED. Only the
+        # tier decides whether that is acceptable — never the mechanism. This
+        # used to let `skipping` pass at ANY tier, so a required check that was
+        # skipped by mistake reported green.
+        if bucket is None or bucket == "skipping":
+            how = "skipped" if bucket == "skipping" else "MISSING"
+            if tier == "required-if-run":
+                verdict = f"{how} (filtered) — OK"
+            else:
+                verdict = f"{how.upper()} (did not run)"
+                if tier == "required":
+                    failed.append(ref)
         elif bucket == "pass":
             verdict = "pass"
         elif bucket in ("pending",):
             verdict = "PENDING"
             if tier != "advisory":
                 pending.append(ref)
-        elif bucket in ("skipping",):
-            verdict = "skipped"
         else:  # fail, cancel
             verdict = bucket.upper()
             if tier != "advisory":

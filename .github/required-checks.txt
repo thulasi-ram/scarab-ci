@@ -14,11 +14,33 @@
 #                    absence is correct on an unrelated PR (the same case that
 #                    makes path-filtered required checks hang a real ruleset)
 #   advisory         reported, never blocks — a tier serving probation
+#
+# "DID NOT RUN" HAS TWO SHAPES and the tier is what decides, not the shape: a
+# workflow-level `paths:` filter makes a check ABSENT (`kind/cluster-tests`),
+# while `ci.yml`'s `changes` job makes one SKIPPED. `pr_gate.py` treats them
+# identically — a `required` line fails on either. So a job that can be
+# filtered out MUST be `required-if-run`, and the line MUST move in the same
+# commit as the filter, or the gate reds on a correct skip.
 
-required         ci/test                # workspace nextest against real Postgres
-required         ci/coverage            # llvm-cov + the ratchet
-required         ci/openapi-drift       # committed spec + generated client
-required         ci/ui-tests            # UI no-DOM vitest suites
+# The one check that always runs (`ci.yml`'s `changes` job computes the path
+# filters every other job is gated on). It is `required` because everything
+# below is now skippable: without an unconditional anchor, a docs-only PR would
+# pass this gate having validated literally nothing, and a broken filter
+# expression would report green.
+required         ci/changes             # the path-filter decision itself
+
+# Path-filtered by `changes` since git-bug 6729fc2 — a UI-only PR correctly
+# skips the Rust tier, a Rust-only PR correctly skips the UI tier, and a
+# Rust-or-UI PR always runs the contract gate. On a push to MAIN nothing is
+# filtered, so trunk still runs all three.
+#
+# `ci/test` and `ci/coverage` were ONE job as of git-bug b69c286 — the two ran
+# the same 1,056 tests, and `cargo llvm-cov nextest` fails on a red suite, so
+# the merged job reports a strict superset. If you are here because a check
+# named `ci/test` went missing: it is `ci/test-and-coverage` now.
+required-if-run  ci/test-and-coverage   # workspace nextest under llvm-cov, real PG + MinIO, then the ratchet
+required-if-run  ci/openapi-drift       # committed spec + generated client + tsc
+required-if-run  ci/ui-tests            # UI no-DOM vitest suites
 
 # Promoted off probation 2026-07-25. Nine runs, one failure — and that failure
 # was the harness `.expect()`ing a transient poll error the engine is designed

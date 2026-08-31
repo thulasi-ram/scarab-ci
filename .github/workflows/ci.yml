@@ -13,77 +13,85 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Test gate (test-strategy Phase 0): the whole workspace suite runs against a
-  # real Postgres (ADR-0017 — PG is a real collaborator, not a mock).
-  # SCARAB_TEST_REQUIRE_PG=1 turns the harnesses' silent skip-without-PG into a
-  # panic, so CI can never go green while quietly skipping the DB-backed tests.
-  test:
+  # What did this push actually touch? (git-bug 6729fc2)
+  #
+  # Every job below is gated on this one. A PR that changed only `ui/**` and a
+  # shell script used to cost 26.9 runner-minutes across 15 jobs — 18 of those
+  # minutes being the Rust suite, run twice, over code it could not have
+  # affected. See docs/handoffs/ci-does-too-much-per-push.md for the
+  # measurement.
+  #
+  # The filter definitions live in `.github/path-filters.yml` — ONE copy, shared
+  # with `image.yml`. Read that file's header before touching a filter.
+  #
+  # WHY A JOB AND NOT WORKFLOW-LEVEL `paths:`: a workflow-level filter is
+  # all-or-nothing, and this workflow's jobs have three different input sets
+  # (cargo / npm / both). A `changes` job gives each job its own answer.
+  #
+  # ON A PUSH TO MAIN, NOTHING IS FILTERED. Trunk is what every build and every
+  # `sha-` image derives from, so it is validated in full; the savings are taken
+  # on PR pushes, which is where the minutes actually were. That is the single
+  # `github.event_name != 'pull_request'` below — stated once, so each downstream
+  # job reads as a plain `== 'true'`.
+  #
+  # This job is `required` in `.github/required-checks.txt` precisely because it
+  # always runs: it is the anchor that stops a PR whose every other check is
+  # correctly skipped from passing the gate having validated nothing.
+  changes:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: scarab
-          POSTGRES_PASSWORD: scarab
-          POSTGRES_DB: scarab
-        ports:
-          - 55432:5432
-        options: >-
-          --health-cmd "pg_isready -U scarab -d scarab"
-          --health-interval 2s
-          --health-timeout 3s
-          --health-retries 30
-    env:
-      SCARAB_TEST_DATABASE_URL: postgres://scarab:scarab@127.0.0.1:55432/scarab
-      SCARAB_TEST_REQUIRE_PG: "1"
-      # The live-S3 tier (ADR-0067 part 1: the object store is a hard
-      # requirement, so its wire semantics get a real server in CI). REQUIRE
-      # turns the skip-without-env into a panic — same deal as PG above.
-      SCARAB_TEST_S3_ENDPOINT: http://127.0.0.1:9000
-      SCARAB_TEST_S3_BUCKET: scarab-test
-      SCARAB_TEST_S3_ACCESS_KEY: scarab
-      SCARAB_TEST_S3_SECRET_KEY: scarabsecret
-      SCARAB_TEST_REQUIRE_S3: "1"
-      # Debuginfo is the bulk of target/ and worthless in CI — without this the
-      # workspace build exhausts the runner's disk (ENOSPC on first run).
-      CARGO_PROFILE_DEV_DEBUG: "0"
+    permissions:
+      contents: read
+      pull-requests: read
+    # One output per GATED JOB, named after it — not one per filter. The filter
+    # file also defines `cargo` / `rust` / `ui_src`, which exist only as shared
+    # anchors the others build on; emitting an output nothing reads is how a
+    # dead gate goes unnoticed.
+    outputs:
+      test_and_coverage: ${{ github.event_name != 'pull_request' || steps.filter.outputs.test_and_coverage == 'true' }}
+      ui: ${{ github.event_name != 'pull_request' || steps.filter.outputs.ui == 'true' }}
+      contracts: ${{ github.event_name != 'pull_request' || steps.filter.outputs.contracts == 'true' }}
     steps:
-      - name: Free runner disk space
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup "$AGENT_TOOLSDIRECTORY"
-          sudo docker system prune -af >/dev/null 2>&1 || true
-          df -h /
       - uses: actions/checkout@v4
-      # MinIO is a plain step, not a `services:` container: GitHub's service
-      # containers cannot pass a command, and minio/minio needs `server /data`.
-      # Same image + credentials as the dev compose stack
-      # (deploy/local-proc/compose.yaml), so local and CI disagree about
-      # nothing. The runner's preinstalled aws CLI creates the bucket.
-      - name: Start MinIO (live object-store tier)
-        run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=scarab -e MINIO_ROOT_PASSWORD=scarabsecret \
-            minio/minio:latest server /data
-          for i in $(seq 1 30); do
-            curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null && break
-            sleep 1
-          done
-          AWS_ACCESS_KEY_ID=scarab AWS_SECRET_ACCESS_KEY=scarabsecret \
-            aws --endpoint-url http://127.0.0.1:9000 --region us-east-1 \
-            s3 mb s3://scarab-test
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      # PRs only: the action reads the PR's file list from the API, so it needs
+      # no history. On a push we do not filter at all (see above), so there is
+      # nothing here to compute against `github.event.before` — which is also
+      # what keeps this correct on a force-push or a multi-commit merge.
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'pull_request'
         with:
-          tool: cargo-nextest
-      - name: Run the suite
-        run: cargo nextest run --workspace --cargo-quiet
+          filters: .github/path-filters.yml
 
-  # Coverage + ratchet (sibling of `test` so the plain gate stays fast): lcov
-  # via cargo-llvm-cov, per-crate summary in the step summary, and a fail if
-  # any crate drops >0.5pp below docs/audits/coverage-baseline.toml.
-  coverage:
+  # THE Rust gate (test-strategy Phase 0), and the only one: the whole workspace
+  # suite runs ONCE, under cargo-llvm-cov, against a real Postgres and a real
+  # MinIO (ADR-0017 — PG is a real collaborator, not a mock; ADR-0067 part 1 —
+  # the object store is a hard requirement, so its wire semantics get a real
+  # server). The SCARAB_TEST_REQUIRE_* flags turn the harnesses'
+  # skip-without-service into a panic, so this can never go green while quietly
+  # skipping a whole tier. Then the per-crate summary, and a fail if any crate
+  # drops >0.5pp below docs/audits/coverage-baseline.toml.
+  #
+  # ONE JOB, NOT TWO (git-bug b69c286). There used to be a separate `test` job
+  # running `cargo nextest run --workspace` — the same 1,056 tests, minus the
+  # instrumentation — so every Rust push stood up two Postgres services and two
+  # MinIO containers and ran the suite twice for one verdict. `cargo llvm-cov
+  # nextest` exits non-zero when a test fails, so this job reports a strict
+  # superset of what `test` did: no signal was lost, ~9 runner-minutes per Rust
+  # push were.
+  #
+  # The case for keeping `test` was insurance — a cargo-llvm-cov or
+  # llvm-tools-preview breakage would at least leave a test signal. It was not
+  # insurance: `ci/coverage` was ALREADY required, so such a breakage already
+  # blocked every merge whether or not `test` sat beside it green. The suite was
+  # being paid for twice to buy a hedge that did not exist.
+  #
+  # Do NOT add `--ignore-run-fail` to the run step below. It makes llvm-cov
+  # write its report and exit 0 on a red suite — measured, not assumed — which
+  # is precisely how this job would start going green with failing tests.
+  test-and-coverage:
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.test_and_coverage == 'true'
     services:
       postgres:
         image: postgres:16
@@ -109,8 +117,9 @@ jobs:
       SCARAB_TEST_S3_ACCESS_KEY: scarab
       SCARAB_TEST_S3_SECRET_KEY: scarabsecret
       SCARAB_TEST_REQUIRE_S3: "1"
-      # Coverage mapping comes from -C instrument-coverage, not DWARF — safe to
-      # drop debuginfo here too (disk, see the test job).
+      # Coverage mapping comes from -C instrument-coverage, not DWARF, so
+      # debuginfo is pure disk cost — and without this the workspace build
+      # exhausts the runner's disk (ENOSPC on first run).
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
       - name: Free runner disk space
@@ -143,7 +152,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest,cargo-llvm-cov
-      - name: Run the suite under coverage
+      - name: Run the suite — this is the test verdict AND the coverage run
         # scarab-testkit is test scaffolding and tests/ dirs are harness code —
         # neither is product code we want in the coverage signal.
         run: >-
@@ -153,18 +162,30 @@ jobs:
       - name: Per-crate summary + ratchet against baseline
         # The script also appends its table to $GITHUB_STEP_SUMMARY itself.
         run: python3 scripts/coverage_ratchet.py lcov.info docs/audits/coverage-baseline.toml
+      # `if: always()` because the ratchet step above is the one that FAILS.
+      # Without it the lcov is uploaded only on green runs — i.e. never on the
+      # run whose numbers you actually need to explain. That is how git-bug
+      # b007837 had to be reconstructed by reading percentages out of job logs.
       - uses: actions/upload-artifact@v7
+        if: always()
         with:
           name: lcov
           path: lcov.info
 
-  # UI no-DOM tier (test-strategy Phase 3): the base of the UI pyramid —
-  # pure-function suites over the derivations that carry the run-detail logic
-  # (event folding, Takes, attempt grouping, log level parsing, DAG layout). No
-  # jsdom, no browser, no server: seconds to run, so it sits in the required
-  # tier next to the Rust suite.
+  # UI no-DOM tier: the base of the UI pyramid — pure-function suites over the
+  # derivations that carry the run-detail logic (event folding, Takes, attempt
+  # grouping, log level parsing, DAG layout). No jsdom, no browser, no server:
+  # seconds to run, so it sits in the required tier next to the Rust suite.
+  #
+  # THIS IS THE ONLY vitest job (git-bug 7fbf56d). There used to be a second,
+  # `ui-unit`, byte-identical to this one down to the node version and the cache
+  # path; the two comments claimed different test-strategy phases for what is
+  # one `npm test`. `ui-tests` is the name in `required-checks.txt`, so the
+  # duplicate — which was also the ungated one — is the one that went.
   ui-tests:
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -187,6 +208,8 @@ jobs:
   # deal as the `kind` job (git-bug a0b42ad).
   ui-e2e:
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -206,6 +229,8 @@ jobs:
 
   openapi-drift:
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.contracts == 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -236,23 +261,3 @@ jobs:
             echo '::error::the generated TS client is stale — run: npm run gen in ui/scarab-web-ui'
             exit 1
           }
-
-  # UI unit gate (test-strategy Phase 1): the no-DOM vitest suite over the
-  # extracted derivation seam (takes / dag-layout / attempts / events / logs).
-  # A sibling of `openapi-drift` rather than a step inside it, so a red
-  # derivation is distinguishable from a stale contract at a glance. Coverage
-  # stays report-only per the test strategy — this gates correctness, not a %.
-  ui-unit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: ui/scarab-web-ui/package-lock.json
-      - name: Run the UI vitest suite
-        working-directory: ui/scarab-web-ui
-        run: |
-          npm ci
-          npm test
