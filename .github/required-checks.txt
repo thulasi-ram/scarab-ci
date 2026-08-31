@@ -32,9 +32,13 @@ required         ci/changes             # the path-filter decision itself
 # Path-filtered by `changes` since git-bug 6729fc2 — a UI-only PR correctly
 # skips the Rust tier, a Rust-only PR correctly skips the UI tier, and a
 # Rust-or-UI PR always runs the contract gate. On a push to MAIN nothing is
-# filtered, so trunk still runs all four.
-required-if-run  ci/test                # workspace nextest against real Postgres
-required-if-run  ci/coverage            # llvm-cov + the ratchet
+# filtered, so trunk still runs all three.
+#
+# `ci/test` and `ci/coverage` were ONE job as of git-bug b69c286 — the two ran
+# the same 1,056 tests, and `cargo llvm-cov nextest` fails on a red suite, so
+# the merged job reports a strict superset. If you are here because a check
+# named `ci/test` went missing: it is `ci/test-and-coverage` now.
+required-if-run  ci/test-and-coverage   # workspace nextest under llvm-cov, real PG + MinIO, then the ratchet
 required-if-run  ci/openapi-drift       # committed spec + generated client + tsc
 required-if-run  ci/ui-tests            # UI no-DOM vitest suites
 

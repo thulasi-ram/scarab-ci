@@ -17,7 +17,7 @@ open trade this document parked.
 | `6729fc2` no path filter | **fixed** — `.github/path-filters.yml` + a `changes` job in `ci.yml`; nothing is filtered on a push to `main` |
 | `7fbf56d` duplicate vitest job | **fixed** — `ui-unit` deleted, `ui-tests` kept (it is the name in `required-checks.txt`) |
 | `602940c` all four images rebuilt | **fixed** — `image.yml`'s matrix is now selected per-image from the same filter file; all four still build on push/tag |
-| `b69c286` Rust suite runs twice | **still open, by design** — see the work order below |
+| `b69c286` Rust suite runs twice | **fixed** — merged into one `ci/test-and-coverage` job; the `test` job is deleted |
 
 Three things this document got wrong or did not see, corrected in the code:
 
@@ -146,10 +146,27 @@ The most recent commit touching that crate is `13de34f feat(server): add the inf
    anchor. Two deviations from the plan above: `api` became `contracts` and *includes* `ui`
    (the typecheck, see finding 1), and **a push to `main` filters nothing** — trunk is what every
    `sha-` image derives from, and the minutes were being burnt on PR pushes anyway.
-3. **`b69c286`** — decide `test` vs `coverage` *after* the filters land, because the filters remove
-   the case for most PRs and leave only Rust-only changes paying double. This is a real trade:
-   merging saves ~9 min per Rust PR but renames the required checks and couples the test signal to
-   the coverage tooling. **Open question, deliberately not decided here.**
+3. ~~**`b69c286`**~~ **DONE — merged into one job**, `ci/test-and-coverage`. The trade turned out
+   not to be a trade. The case for keeping a separate `test` was insurance against a
+   cargo-llvm-cov / `llvm-tools-preview` breakage taking the test signal with it — but
+   `ci/coverage` was *already* `required`, so such a breakage already blocked every merge whether
+   or not `test` sat beside it green. The suite was being run twice to buy a hedge that did not
+   exist. `cargo llvm-cov nextest` exits non-zero on a red suite, so the merged job reports a
+   strict superset of what `test` did.
+
+   Two measured facts settled it (`--ignore-run-fail` was the crux):
+
+   | invocation with one red test | result |
+   |---|---|
+   | plain `cargo llvm-cov nextest` | exit 100, **no lcov written at all** |
+   | `--ignore-run-fail` | exit **0**, full lcov, `LF:83 LH:75` — identical to the green run |
+
+   So the job MUST NOT carry `--ignore-run-fail`, and the workflow comment says so at the point of
+   temptation. (It also refutes the guess that a red run would distort the ratchet: the flag
+   implies `--no-fail-fast`, so every test still executes and still covers its lines.)
+
+   `just test` keeps its plain un-instrumented `cargo nextest` — the local inner loop should not
+   pay for instrumentation. This change is about CI paying twice, not about how you run tests.
 4. ~~**`7fbf56d`, `602940c`**~~ **DONE.** `ui-unit` deleted. `image.yml` selects its build matrix
    per-image from the same filter file — and its workflow-level `pull_request: paths:` was
    *removed* rather than kept, because that was the second filtering mechanism: an outer union

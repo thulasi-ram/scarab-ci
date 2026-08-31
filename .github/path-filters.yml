@@ -50,10 +50,14 @@ ui: &ui
   - ".github/workflows/ci.yml"
   - ".github/path-filters.yml"
 
-# `coverage` runs the Rust suite AND executes the ratchet against the committed
-# baseline. A baseline edit with no Rust change is exactly the case that must
-# re-run it — otherwise a lowered floor merges unvalidated.
-coverage:
+# The gate for `ci.yml`'s single Rust job. It is `rust` PLUS the ratchet's own
+# inputs, because that job runs the suite and then compares against the
+# committed baseline: a baseline edit with no Rust change is exactly the case
+# that must re-run it, or a lowered floor merges unvalidated.
+#
+# `rust` above is kept as the shared anchor (`contracts` builds on it) even
+# though no job is gated on it directly any more.
+test_and_coverage:
   - *rust
   - "scripts/coverage_ratchet.py"
   - "docs/audits/coverage-baseline.toml"

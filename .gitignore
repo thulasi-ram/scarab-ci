@@ -82,3 +82,7 @@
 # docs site points starlight-openapi at `../../openapi.json` in place
 # (ui/scarab-docs-ui/astro.config.mjs).
 /ui/scarab-docs-ui/openapi.gen.json
+
+# Python bytecode (scripts/ are run directly, never imported in normal use).
+__pycache__/
+*.pyc
