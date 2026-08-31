@@ -3,16 +3,31 @@
 # step type-checks a small crate and publishes a couple of artifacts of
 # record. Kept deliberately small: an uncached in-Pod cargo build is slow
 # (layer caching is future work, ADR-0018).
-# A PR push to a branch with an open PR delivers BOTH a `push` and a
-# `pull_request` event, so a bare `push: {}` alongside `pull_request: {}` ran this
-# whole pipeline TWICE for one push — clone, cargo and all. The `when:` narrows
-# `push` to trunk, which is the only place it was adding anything: post-merge
-# validation. `event.branch` exists on a Push context (`refs/heads/` stripped)
-# and NOT on a PullRequest one, so the predicate belongs here and only here.
+# `push:` ONLY, and DELIBERATELY WITH NO BRANCH FILTER.
+#
+# Do not add a `when:` here. `.github/workflows/demo-keepalive.yml` force-pushes
+# an empty commit to the `demo-keepalive` branch every four hours, and this
+# pipeline compiling at THAT commit is the entire mechanism: it is what keeps the
+# Oracle Always Free box from being reclaimed for idleness, and it is the public
+# demo's only recurring run (nothing schedules `on: cron:` yet — see that
+# workflow's header). A branch filter here makes those pushes silently produce no
+# run, and the failure mode is a box that quietly disappears in a week. That is
+# exactly what `push: { when: "event.branch == 'main'" }` did, briefly.
+#
+# `pull_request:` is gone instead, which fixes the original problem from the
+# other side. A push to a branch with an open PR delivers BOTH a `push` and a
+# `pull_request` event, so having both triggers ran this whole pipeline TWICE per
+# PR push — clone, cargo and all. With `push:` alone every push produces exactly
+# one run, and PRs still show the check: a commit status is keyed by SHA, and a
+# PR displays the statuses of its head SHA regardless of which event started the
+# run.
+#
+# The one thing this gives up: a fork PR pushes to the fork, so no webhook
+# reaches this repo and no run starts. This repo has no fork contributors, and
+# the alternative — keeping `pull_request:` — costs a duplicate run on every push
+# from everyone who does contribute.
 on:
-  pull_request: {}
-  push:
-    when: "event.branch == 'main'"
+  push: {}
 
 steps:
   - id: checkout
