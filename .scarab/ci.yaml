@@ -3,9 +3,16 @@
 # step type-checks a small crate and publishes a couple of artifacts of
 # record. Kept deliberately small: an uncached in-Pod cargo build is slow
 # (layer caching is future work, ADR-0018).
+# A PR push to a branch with an open PR delivers BOTH a `push` and a
+# `pull_request` event, so a bare `push: {}` alongside `pull_request: {}` ran this
+# whole pipeline TWICE for one push — clone, cargo and all. The `when:` narrows
+# `push` to trunk, which is the only place it was adding anything: post-merge
+# validation. `event.branch` exists on a Push context (`refs/heads/` stripped)
+# and NOT on a PullRequest one, so the predicate belongs here and only here.
 on:
   pull_request: {}
-  push: {}
+  push:
+    when: "event.branch == 'main'"
 
 steps:
   - id: checkout
