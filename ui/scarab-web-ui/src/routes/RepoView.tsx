@@ -23,6 +23,8 @@ import TriggerCell from "../components/TriggerCell";
 import RunNumber from "../components/RunNumber";
 import Icon from "../components/Icon";
 import SearchSelect from "../components/SearchSelect";
+import PrincipalSearch from "../components/PrincipalSearch";
+import { addToList } from "../identities";
 import ScopedSecrets from "../components/ScopedSecrets";
 import SecretMatrixEditor from "../components/SecretMatrixEditor";
 import Doodle from "../components/Doodle";
@@ -578,9 +580,17 @@ function EnvDialog(props: {
             <label>approvers</label>
             <input
               class="input"
-              placeholder="comma-separated users (blank = none)"
+              placeholder="comma-separated user ids (blank = none)"
               value={approvers()}
               onInput={(e) => setApprovers(e.currentTarget.value)}
+            />
+            {/* Approvers match a user id exactly and must name someone who
+                exists (ADR-0069 §3), so offer the search rather than leave
+                people to guess `github:alice` vs `alice`. */}
+            <PrincipalSearch
+              org={props.org}
+              placeholder="add an approver — find a user"
+              onPick={(id) => setApprovers(addToList(approvers(), id))}
             />
           </div>
           <div class="form-r">

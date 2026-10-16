@@ -22,6 +22,7 @@ import { getMe } from "../api/client";
 import ScopedSecrets from "../components/ScopedSecrets";
 import Connections from "../components/Connections";
 import ApiTokens from "../components/ApiTokens";
+import Members from "../components/Members";
 import Icon from "../components/Icon";
 
 export default function Settings() {
@@ -76,6 +77,9 @@ export default function Settings() {
                 {/* Org-scoped: a token narrowed to one Project is still issued
                     against the org that contains it, so this needs the same
                     `admin_orgs[0]` the secrets below do. */}
+                {/* Who holds what (ADR-0049/0069) — first among the org panels,
+                    because every other permission on this page is someone's. */}
+                <Members org={o()} />
                 <ApiTokens org={o()} />
                 <ScopedSecrets
                   scope={{ org: o() }}

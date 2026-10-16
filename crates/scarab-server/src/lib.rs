@@ -5308,14 +5308,14 @@ async fn link_callback(
     let location = match store.link(&principal.subject, &identity, now).await {
         Ok(scarab_identity::LinkOutcome::Merged { from }) => {
             format!(
-                "/?identity_linked={}&merged={}",
+                "/account?identity_linked={}&merged={}",
                 flow.provider,
                 query_escape(&from)
             )
         }
-        Ok(_) => format!("/?identity_linked={}", flow.provider),
+        Ok(_) => format!("/account?identity_linked={}", flow.provider),
         Err(scarab_identity::IdentityError::Conflict(why)) => {
-            format!("/?identity_link_error={}", query_escape(&why))
+            format!("/account?identity_link_error={}", query_escape(&why))
         }
         Err(e) => return Err(ApiError::BadRequest(e.to_string())),
     };
@@ -5468,6 +5468,16 @@ pub struct BindingDto {
     pub role: String,
     /// Empty = org-scoped.
     pub project: String,
+    /// The Principal's display name, when the identity store knows it
+    /// (ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in
+    /// as since.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// `false` = created by a forge import and not signed into yet — the
+    /// Members panel's "not signed in yet". Absent when the store does not
+    /// know the subject.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed: Option<bool>,
 }
 
 /// `POST /v1/repos/{org}/{repo}/bindings/import` body: the forge users whose
@@ -5517,19 +5527,24 @@ async fn list_bindings(
         .bindings(&org)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(
-        bindings
-            .into_iter()
-            .map(|b| BindingDto {
-                subject: b.subject,
-                role: role_name(b.role).to_string(),
-                project: match b.scope {
-                    scarab_identity::Scope::Org(_) => String::new(),
-                    scarab_identity::Scope::Project { name, .. } => name,
-                },
-            })
-            .collect(),
-    ))
+    let mut out = Vec::with_capacity(bindings.len());
+    for b in bindings {
+        let record = match st.identities.as_ref() {
+            Some(store) => store.principal(&b.subject).await.ok().flatten(),
+            None => None,
+        };
+        out.push(BindingDto {
+            display_name: record.as_ref().and_then(|r| r.display_name.clone()),
+            claimed: record.as_ref().map(|r| r.claimed_at.is_some()),
+            subject: b.subject,
+            role: role_name(b.role).to_string(),
+            project: match b.scope {
+                scarab_identity::Scope::Org(_) => String::new(),
+                scarab_identity::Scope::Project { name, .. } => name,
+            },
+        });
+    }
+    Ok(Json(out))
 }
 
 /// Natively grant `subject` a role in the org (or one of its projects).
@@ -5805,6 +5820,8 @@ async fn import_bindings(
                 subject,
                 role: role_name(role).to_string(),
                 project: repo.clone(),
+                display_name: None,
+                claimed: None,
             })
             .collect(),
     ))

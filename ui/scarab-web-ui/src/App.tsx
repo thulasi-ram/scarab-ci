@@ -10,6 +10,7 @@ import RepoView from "./routes/RepoView";
 import RunDetail from "./routes/RunDetail";
 import RunPipeline from "./routes/RunPipeline";
 import Settings from "./routes/Settings";
+import Account from "./routes/Account";
 
 export default function App() {
   // The sign-in gate sits ABOVE the Router, not inside its root, and that
@@ -29,6 +30,8 @@ export default function App() {
       {/* Global, org-scoped settings (ADR-0060). One segment, so it can't
           collide with the two-segment /:org/:repo tier. */}
       <Route path="/settings" component={Settings} />
+      {/* Your sign-in accounts (ADR-0069) — everyone's, not admin-gated. */}
+      <Route path="/account" component={Account} />
       <Route path="/:org/:repo/run" component={RunPipeline} />
       <Route path="/:org/:repo/runs/:id" component={RunDetail} />
       <Route path="/:org/:repo" component={RepoView} />

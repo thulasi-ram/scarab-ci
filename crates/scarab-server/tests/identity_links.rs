@@ -356,7 +356,7 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
     assert_eq!(resp.status(), StatusCode::FOUND);
     assert_eq!(
         resp.headers()["location"],
-        "/?identity_linked=default&merged=ada-gh"
+        "/account?identity_linked=default&merged=ada-gh"
     );
     let folded = pg.principal("ada-gh").await.unwrap().unwrap();
     assert_eq!(folded.merged_into.as_deref(), Some(ada_id));
@@ -405,7 +405,7 @@ async fn linking_proves_and_merges_an_imported_account_without_email() {
     .await;
     assert_eq!(resp.status(), StatusCode::FOUND);
     let loc = resp.headers()["location"].to_str().unwrap().to_string();
-    assert!(loc.starts_with("/?identity_link_error="), "{loc}");
+    assert!(loc.starts_with("/account?identity_link_error="), "{loc}");
     assert_eq!(
         pg.principal("bob").await.unwrap().unwrap().merged_into,
         None

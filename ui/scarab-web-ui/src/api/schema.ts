@@ -1491,6 +1491,18 @@ export interface components {
             webhook_registered: boolean;
         };
         BindingDto: {
+            /**
+             * @description `false` = created by a forge import and not signed into yet — the
+             *     Members panel's "not signed in yet". Absent when the store does not
+             *     know the subject.
+             */
+            claimed?: boolean | null;
+            /**
+             * @description The Principal's display name, when the identity store knows it
+             *     (ADR-0069). Absent for a pre-upgrade bare subject nobody has signed in
+             *     as since.
+             */
+            display_name?: string | null;
             /** @description Empty = org-scoped. */
             project: string;
             role: string;
