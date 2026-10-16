@@ -138,6 +138,19 @@ spec:
                   name: {{ .Values.secrets.oauthClientSecret.name | quote }}
                   key: {{ .Values.secrets.oauthClientSecret.key | quote }}
             {{- end }}
+            {{- if .Values.scarab.connections }}
+            # The same trap, opposite fix. SCARAB_CONNECTIONS_FILE arrives via
+            # the shared ConfigMap, and the config gate reads + credential-
+            # resolves that file for EVERY role, before dispatch
+            # (config.rs `connections_from_env`). This Pod does not mount the
+            # connections ConfigMap, so it would refuse to boot with "cannot
+            # read SCARAB_CONNECTIONS_FILE". Mounting it is the wrong cure — the
+            # workspace role never provisions connections, and an `env:`
+            # credential would then have to be projected here too. Blank it:
+            # an empty value is "unset" to the gate.
+            - name: SCARAB_CONNECTIONS_FILE
+              value: ""
+            {{- end }}
           ports:
             - name: http
               containerPort: 8080
