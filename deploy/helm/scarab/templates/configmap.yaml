@@ -126,10 +126,16 @@ data:
   SCARAB_WSFETCH_CPU_MILLIS: {{ .Values.workspace.helperCpuMillis | quote }}
   {{- end }}
   {{- end }}
-  {{- if .Values.secrets.resultsTokenSecret }}
+  {{- /* Results egress (ADR-0042). Rendered UNCONDITIONALLY: the server reads
+         both only once SCARAB_RESULTS_TOKEN_SECRET is set, so they are inert
+         without it — and the chart cannot see where that token comes from.
+         They used to be gated on the plaintext `secrets.resultsTokenSecret`,
+         which is empty under `secrets.existingSecret`; the server then fell
+         back to the floating `:edge` sidecar and to `http://scarab-server`,
+         right only for a release literally named that in its own namespace,
+         so sidecars pulled an unpinned image and posted results nowhere. */}}
   SCARAB_SIDECAR_IMAGE: {{ .Values.scarab.sidecarImage | quote }}
   SCARAB_RESULTS_API_URL: {{ .Values.scarab.resultsApiUrl | default (printf "http://%s.%s.svc" (include "scarab.fullname" .) .Release.Namespace) | quote }}
-  {{- end }}
   {{- range $k, $v := .Values.scarab.extraEnv }}
   {{ $k }}: {{ $v | quote }}
   {{- end }}

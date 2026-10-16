@@ -236,7 +236,9 @@ scarab:
   devInsecure: false
 
   # Results-egress sidecar image injected into step Pods (ADR-0042). Only used
-  # when secrets.resultsTokenSecret is set.
+  # once the results token is set — `secrets.resultsTokenSecret`, or a
+  # SCARAB_RESULTS_TOKEN_SECRET key in `secrets.existingSecret`. Pin it (a tag or
+  # digest) in production: the default floats.
   sidecarImage: "ghcr.io/thulasi-ram/scarab-results-sidecar:edge"
   # Base URL step-Pod sidecars POST results back to. Empty => the in-cluster
   # Service DNS name derived from the release.

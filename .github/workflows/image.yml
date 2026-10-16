@@ -315,6 +315,15 @@ jobs:
             --set-json 'scarab.connections=[{"id":"c","kind":"forgejo","base_url":"https://git.example.com","credential":{"env":"T"}}]' \
             --set-json 'scarab.placement={"baseline":{"spec":{"tolerations":[{"key":"k","operator":"Exists"}]}},"profiles":[{"name":"big","k8s":{"spec":{"nodeSelector":{"pool":"big"}}}}]}' \
             > /dev/null
+          # Regression: under existingSecret the results token is invisible to
+          # the chart, and the sidecar image + results URL used to vanish with
+          # it — the server then pulled the floating :edge sidecar and posted
+          # results to http://scarab-server. They must render regardless.
+          out=$(helm template t "$CHART_DIR" -n ci \
+            --set secrets.existingSecret=mine \
+            --set scarab.sidecarImage=ghcr.io/x/sidecar:pinned)
+          grep -q 'SCARAB_SIDECAR_IMAGE: "ghcr.io/x/sidecar:pinned"' <<<"$out"
+          grep -q 'SCARAB_RESULTS_API_URL: "http://t-scarab.ci.svc"' <<<"$out"
 
       - name: Package + push to ghcr
         if: startsWith(github.ref, 'refs/tags/v')
