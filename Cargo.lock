@@ -2614,7 +2614,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "reqwest",
@@ -2625,7 +2625,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-db-postgres"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "scarab-engine",
@@ -2643,7 +2643,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-e2e"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "reqwest",
@@ -2658,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "scarab-pipeline",
@@ -2670,7 +2670,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-executor-k8s"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2695,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-executor-local"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "scarab-engine",
@@ -2706,7 +2706,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-forge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -2716,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-forge-forgejo"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-forge-github"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2748,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-identity"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -2759,7 +2759,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-pipeline"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cel-interpreter",
  "serde",
@@ -2770,7 +2770,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-project"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "scarab-forge",
@@ -2782,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-secrets"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -2792,7 +2792,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-secrets-postgres"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -2806,7 +2806,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2857,7 +2857,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -2870,7 +2870,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-storage-s3"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -2887,7 +2887,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-testkit"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "scarab-engine",
@@ -2902,7 +2902,7 @@ dependencies = [
 
 [[package]]
 name = "scarab-workspace-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
