@@ -1,1 +1,1 @@
-{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":3,"timestamp":1792172464,"nonce":"r6YPF4XUDaDMNhSr5ERrc2sQkzg=","message":"Built on branch feat/identity-links, commit 7aeb8b3. Acceptance tests green against real Postgres (local PG 14).","files":null}]}
+{"author":{"id":"2eecc7d99b502c158aacb0868dca9358610edc02724d21fe49b0196402d3364e"},"ops":[{"type":4,"timestamp":1792172464,"nonce":"hRAmx7S0PmWZ/27aBAnGte4w8Vs=","status":2}]}
