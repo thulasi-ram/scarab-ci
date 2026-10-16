@@ -63,8 +63,36 @@ jobs:
       pull-requests: read
     outputs:
       images: ${{ steps.select.outputs.images }}
+      chart: ${{ steps.filter.outputs.chart == 'true' }}
     steps:
       - uses: actions/checkout@v4
+
+      # A release tag must name ONE version everywhere: the image tags
+      # (`metadata-action` semver), the chart version, and the chart's
+      # `appVersion` — which is the chart's default `image.tag`, so a chart
+      # whose appVersion was never pushed installs an ImagePullBackOff. Checked
+      # HERE, before `build`, so a mismatched tag fails before a single image is
+      # pushed rather than leaving images-without-a-chart behind.
+      - name: Check the release version is consistent
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          want="${TAG#v}"
+          chart=$(sed -n 's/^version:[[:space:]]*//p' deploy/helm/scarab/Chart.yaml | tr -d '"')
+          app=$(sed -n 's/^appVersion:[[:space:]]*//p' deploy/helm/scarab/Chart.yaml | tr -d '"')
+          cargo=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' Cargo.toml)
+          echo "tag=$want chart=$chart appVersion=$app cargo=$cargo"
+          bad=0
+          for pair in "Chart.yaml version:$chart" "Chart.yaml appVersion:$app" "Cargo.toml workspace.package.version:$cargo"; do
+            if [ "${pair##*:}" != "$want" ]; then
+              echo "::error::$TAG wants $want but ${pair%:*} is '${pair##*:}' — bump it and re-tag"
+              bad=1
+            fi
+          done
+          exit "$bad"
+
       - uses: dorny/paths-filter@v3
         id: filter
         if: github.event_name == 'pull_request'
@@ -245,3 +273,59 @@ jobs:
       - name: Record image reference
         run: |
           echo "**${{ matrix.image }}**: \`${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}\` (multi-arch)" >> "$GITHUB_STEP_SUMMARY"
+
+  # The Helm chart. On a PR that touches it: lint + render, no push. On a `v*`
+  # tag: the same, then package + push to oci://ghcr.io/<owner>/charts/scarab.
+  #
+  # `needs: merge` on purpose — on a tag the chart is published only AFTER every
+  # image's multi-arch manifest exists, because the chart's default `image.tag`
+  # is its appVersion (= the tag, enforced in `changes`). A chart that can be
+  # pulled before its image can is a chart that installs an ImagePullBackOff.
+  # On a PR `merge` is skipped, hence the `always()` + explicit result checks.
+  chart:
+    needs: [changes, merge]
+    if: >-
+      always() && needs.changes.result == 'success' && (
+        (github.event_name == 'pull_request' && needs.changes.outputs.chart == 'true') ||
+        (startsWith(github.ref, 'refs/tags/v') && needs.merge.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CHART_DIR: deploy/helm/scarab
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      # Defaults alone render almost nothing (no workspace token => no
+      # StatefulSet, empty blocks => no ConfigMaps), so render once more with
+      # every optional block switched on: that is where a template typo hides.
+      - name: Lint + render
+        run: |
+          set -euo pipefail
+          helm lint "$CHART_DIR"
+          helm template t "$CHART_DIR" > /dev/null
+          helm template t "$CHART_DIR" \
+            --set secrets.workspaceTokenSecret=x \
+            --set-json 'scarab.connections=[{"id":"c","kind":"forgejo","base_url":"https://git.example.com","credential":{"env":"T"}}]' \
+            --set-json 'scarab.placement={"baseline":{"spec":{"tolerations":[{"key":"k","operator":"Exists"}]}},"profiles":[{"name":"big","k8s":{"spec":{"nodeSelector":{"pool":"big"}}}}]}' \
+            > /dev/null
+
+      - name: Package + push to ghcr
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | helm registry login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
+          helm package "$CHART_DIR" -d /tmp/chart
+          pkg=$(ls /tmp/chart/scarab-*.tgz)
+          helm push "$pkg" "oci://$REGISTRY/${OWNER,,}/charts"
+          echo "**chart**: \`oci://$REGISTRY/${OWNER,,}/charts/scarab\` version \`${GITHUB_REF_NAME#v}\`" >> "$GITHUB_STEP_SUMMARY"

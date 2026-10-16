@@ -113,3 +113,11 @@ image_wsfetch:
   - ".dockerignore"
   - ".github/workflows/image.yml"
   - ".github/path-filters.yml"
+
+# The Helm chart (`image.yml`'s `chart` job): lint + render on a PR that touches
+# it, so a template that only fails at render time cannot first fail in a
+# release tag. Its rendered defaults read nothing outside `deploy/helm/`.
+chart:
+  - "deploy/helm/**"
+  - ".github/workflows/image.yml"
+  - ".github/path-filters.yml"

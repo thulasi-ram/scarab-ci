@@ -15,6 +15,18 @@ with the RBAC it needs to launch one Pod per step in its namespace.
 
 ## Install
 
+Every `v*` tag publishes this chart to `oci://ghcr.io/thulasi-ram/charts/scarab`
+at the same version as the images (`.github/workflows/image.yml`, `chart` job),
+so a released chart's default `image.tag` (its `appVersion`) always exists:
+
+```sh
+helm upgrade --install scarab oci://ghcr.io/thulasi-ram/charts/scarab \
+  --version 0.1.0 --namespace scarab --create-namespace -f values.yaml
+```
+
+From a checkout, point at the directory instead (and pin `image.tag` — the
+in-tree `appVersion` may be ahead of the last release):
+
 ```sh
 helm upgrade --install scarab deploy/helm/scarab \
   --namespace scarab --create-namespace \
