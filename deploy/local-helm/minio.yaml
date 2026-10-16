@@ -6,8 +6,13 @@
 # wipe all workspaces, hanging any rerun of a prior run. Wipe a clean slate by
 # deleting the PVC (see deploy/local-helm/README.md).
 #
-# Official `minio/minio` + `minio/mc` images (multi-arch, run on arm64) — we
-# deliberately avoid the Bitnami images, matching the Postgres setup.
+# `pgsty/minio` + `pgsty/mc` (multi-arch, run on arm64) — we deliberately avoid
+# the Bitnami images, matching the Postgres setup.
+# MinIO upstream is ARCHIVED (minio/minio, read-only since 2026-04) and its
+# images are GONE from Docker Hub (`pull access denied`), which turned every CI
+# run red. pgsty/minio is the maintained AGPL community fork: same binary, same
+# env vars, same `server /data`, same entrypoint. Pinned by digest — bump the
+# tag AND the digest together, never to a floating tag again.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -34,7 +39,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio:latest   # official image is multi-arch (runs on arm64)
+          image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372   # multi-arch (runs on arm64)
           args: ["server", "/data", "--console-address", ":9001"]
           env:
             - { name: MINIO_ROOT_USER, value: scarab }
@@ -81,7 +86,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: mc
-          image: minio/mc:latest
+          image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z@sha256:cfc83108c3abb371f8fb84d99c1fdc88f8c237e022409b0081fb7c0a3be634dd
           command:
             - /bin/sh
             - -c
@@ -92,7 +97,7 @@ spec:
               # configure HERE — MinIO expires stale multipart uploads
               # natively (api: stale_uploads_expiry=24h, swept every
               # stale_uploads_cleanup_interval=6h; verified against these
-              # images 2026-08-25), and minio/mc ships NO
+              # images 2026-08-25), and mc ships NO
               # abort-incomplete-multipart ILM flag ('mc ilm rule add --help'
               # lists none). On real S3 the equivalent is a REQUIRED bucket
               # lifecycle rule — see the scarab.s3 comment in

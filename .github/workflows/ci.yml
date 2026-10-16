@@ -129,7 +129,12 @@ jobs:
           df -h /
       - uses: actions/checkout@v4
       # MinIO is a plain step, not a `services:` container: GitHub's service
-      # containers cannot pass a command, and minio/minio needs `server /data`.
+      # containers cannot pass a command, and MinIO needs `server /data`.
+      # MinIO upstream is ARCHIVED (minio/minio, read-only since 2026-04) and its
+      # images are GONE from Docker Hub (`pull access denied`), which turned every CI
+      # run red. pgsty/minio is the maintained AGPL community fork: same binary, same
+      # env vars, same `server /data`, same entrypoint. Pinned by digest — bump the
+      # tag AND the digest together, never to a floating tag again.
       # Same image + credentials as the dev compose stack
       # (deploy/local-proc/compose.yaml), so local and CI disagree about
       # nothing. The runner's preinstalled aws CLI creates the bucket.
@@ -137,7 +142,7 @@ jobs:
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=scarab -e MINIO_ROOT_PASSWORD=scarabsecret \
-            minio/minio:latest server /data
+            pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372 server /data
           for i in $(seq 1 30); do
             curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null && break
             sleep 1
