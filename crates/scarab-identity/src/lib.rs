@@ -373,6 +373,25 @@ pub struct PrincipalRecord {
     pub merged_into: Option<String>,
 }
 
+/// A Principal as a search returns it (ADR-0069 §3): enough for an admin to
+/// pick the right person in a typeahead — the id they will grant to, what the
+/// person is called, and whether anyone has signed in as them yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrincipalMatch {
+    pub id: String,
+    pub display_name: Option<String>,
+    /// `false` = created by a forge import; nobody has signed in as it yet.
+    pub claimed: bool,
+    pub identities: Vec<ProviderIdentity>,
+}
+
+/// Escape `%`, `_` and `\` so a typed query is matched literally by `LIKE`.
+pub fn like_literal(q: &str) -> String {
+    q.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// Can `s` stand in a minted id as-is? Deliberately narrow: no `:` (it would
 /// leave the provider's namespace) and no `~` (the suffix separator — a handle
 /// carrying one could pre-mint someone else's `~2`).
@@ -439,6 +458,36 @@ pub trait IdentityStore: Send + Sync {
     async fn principal(&self, id: &str) -> Result<Option<PrincipalRecord>, IdentityError>;
     /// Every identity pinned to Principal `id`, ordered by provider.
     async fn identities_of(&self, id: &str) -> Result<Vec<ProviderIdentity>, IdentityError>;
+    /// Unmerged Principals whose id or a handle starts with `query`, or whose
+    /// display name contains it (case-insensitive), ordered by id, at most
+    /// `limit`.
+    async fn search(&self, query: &str, limit: usize)
+        -> Result<Vec<PrincipalMatch>, IdentityError>;
+}
+
+/// What an admin-typed subject means (ADR-0069 §3): the live Principal it
+/// names, following merges to their target. `None` = no such Principal was
+/// ever minted, which is a refusal — a string nobody holds would be claimed by
+/// whoever next produced it at sign-in.
+pub async fn resolve_principal(
+    store: &dyn IdentityStore,
+    subject: &str,
+) -> Result<Option<String>, IdentityError> {
+    let mut id = subject.to_string();
+    // A merge target can itself be merged later; the chain is short, and a
+    // bound keeps a corrupt cycle from spinning.
+    for _ in 0..16 {
+        match store.principal(&id).await? {
+            None => return Ok(None),
+            Some(p) => match p.merged_into {
+                Some(next) => id = next,
+                None => return Ok(Some(id)),
+            },
+        }
+    }
+    Err(IdentityError::Issuance(format!(
+        "principal `{subject}` has a merge chain that does not end"
+    )))
 }
 
 /// Claims to embed in a minted per-run OIDC JWT for keyless cloud federation

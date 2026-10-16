@@ -797,6 +797,52 @@
         ]
       }
     },
+    "/v1/orgs/{org}/principals": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "Search users for a grant or approver entry (ADR-0069)",
+        "operationId": "search_principals",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "id or handle prefix, or a display-name fragment",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PrincipalDto"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "not an org admin"
+          }
+        },
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
     "/v1/orgs/{org}/tokens": {
       "get": {
         "tags": [
@@ -3868,6 +3914,54 @@
           "step": {
             "type": "string",
             "description": "The step that re-runs (a gate re-arms and pauses instead of running)."
+          }
+        }
+      },
+      "PrincipalDto": {
+        "type": "object",
+        "description": "A Principal, as the grant/approver typeahead offers it (ADR-0069 §3).",
+        "required": [
+          "id",
+          "claimed",
+          "identities"
+        ],
+        "properties": {
+          "claimed": {
+            "type": "boolean",
+            "description": "`false` = created by a forge import, not signed into yet."
+          },
+          "display_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "description": "What a grant or an approver entry stores."
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PrincipalIdentityDto"
+            }
+          }
+        }
+      },
+      "PrincipalIdentityDto": {
+        "type": "object",
+        "description": "One linked identity of a [`PrincipalDto`].",
+        "required": [
+          "provider",
+          "handle"
+        ],
+        "properties": {
+          "handle": {
+            "type": "string",
+            "description": "The person's handle there today (login / email) — display only."
+          },
+          "provider": {
+            "type": "string"
           }
         }
       },

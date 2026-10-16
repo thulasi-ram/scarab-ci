@@ -3041,6 +3041,47 @@ impl scarab_identity::IdentityStore for InMemoryIdentities {
         out.sort_by(|a, b| a.provider.cmp(&b.provider));
         Ok(out)
     }
+
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<scarab_identity::PrincipalMatch>, IdentityError> {
+        let q = query.to_lowercase();
+        let mut ids: Vec<String> = {
+            let st = self.inner.lock().unwrap();
+            st.principals
+                .values()
+                .filter(|p| p.merged_into.is_none())
+                .filter(|p| {
+                    p.id.to_lowercase().starts_with(&q)
+                        || p.display_name
+                            .as_deref()
+                            .is_some_and(|d| d.to_lowercase().contains(&q))
+                        || st
+                            .identities
+                            .values()
+                            .any(|(pid, i)| pid == &p.id && i.handle.to_lowercase().starts_with(&q))
+                })
+                .map(|p| p.id.clone())
+                .collect()
+        };
+        ids.sort();
+        ids.truncate(limit);
+        let mut out = Vec::new();
+        for id in ids {
+            let identities = scarab_identity::IdentityStore::identities_of(self, &id).await?;
+            let st = self.inner.lock().unwrap();
+            let p = &st.principals[&id];
+            out.push(scarab_identity::PrincipalMatch {
+                id: id.clone(),
+                display_name: p.display_name.clone(),
+                claimed: p.claimed_at.is_some(),
+                identities,
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// An in-memory [`scarab_identity::RbacStore`] with the same origin semantics

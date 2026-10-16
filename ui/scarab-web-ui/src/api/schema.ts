@@ -438,6 +438,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/orgs/{org}/principals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Search users for a grant or approver entry (ADR-0069) */
+        get: operations["search_principals"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/orgs/{org}/tokens": {
         parameters: {
             query?: never;
@@ -1880,6 +1897,21 @@ export interface components {
             /** @description The step that re-runs (a gate re-arms and pauses instead of running). */
             step: string;
         };
+        /** @description A Principal, as the grant/approver typeahead offers it (ADR-0069 §3). */
+        PrincipalDto: {
+            /** @description `false` = created by a forge import, not signed into yet. */
+            claimed: boolean;
+            display_name?: string | null;
+            /** @description What a grant or an approver entry stores. */
+            id: string;
+            identities: components["schemas"]["PrincipalIdentityDto"][];
+        };
+        /** @description One linked identity of a [`PrincipalDto`]. */
+        PrincipalIdentityDto: {
+            /** @description The person's handle there today (login / email) — display only. */
+            handle: string;
+            provider: string;
+        };
         /** @description One registered project (governed repo, ADR-0046) in the repos list. */
         ProjectDto: {
             /**
@@ -3117,6 +3149,35 @@ export interface operations {
         responses: {
             /** @description revoked */
             204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    search_principals: {
+        parameters: {
+            query: {
+                /** @description id or handle prefix, or a display-name fragment */
+                q: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrincipalDto"][];
+                };
+            };
+            /** @description not an org admin */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

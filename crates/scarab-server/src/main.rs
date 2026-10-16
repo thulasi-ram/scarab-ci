@@ -834,7 +834,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         // The port-level authenticator is the first provider; every login path
         // that knows its provider routes by id instead.
-        state = state.with_auth(providers[0].clone(), pg.clone());
+        state = state
+            .with_auth(providers[0].clone(), pg.clone())
+            // Admin-typed subjects must name a Principal (ADR-0069 §3).
+            .with_identities(pg.clone());
         for login in providers {
             state = state.with_oauth_login(login);
         }

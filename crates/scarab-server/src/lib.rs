@@ -187,6 +187,10 @@ pub struct AppState {
     /// consults per request against the path's Org/Project. `None` = only the
     /// principal's flat global roles decide (the C1 bootstrap).
     pub rbac: Option<Arc<dyn scarab_identity::RbacStore>>,
+    /// Principals and their pinned provider identities (ADR-0069). `Some` makes
+    /// every admin-typed subject (a grant, an approver) resolve to a Principal
+    /// that exists; `None` (dev/tests) leaves typed strings unchecked.
+    pub identities: Option<Arc<dyn scarab_identity::IdentityStore>>,
     /// The configured login providers (ADR-0049, several since ADR-0069): the
     /// browser redirect + callback and the API/CLI exchange. Empty leaves only
     /// the credential-exchange `POST /v1/auth/login` through [`Self::auth`].
@@ -242,6 +246,7 @@ impl AppState {
             debug_launcher: None,
             ui_dir: None,
             rbac: None,
+            identities: None,
             oauth_providers: Vec::new(),
             public_url: "http://localhost:8080".into(),
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
@@ -414,6 +419,13 @@ impl AppState {
     /// per request against the path's Org/Project scope.
     pub fn with_rbac(mut self, rbac: Arc<dyn scarab_identity::RbacStore>) -> Self {
         self.rbac = Some(rbac);
+        self
+    }
+
+    /// Resolve admin-typed subjects against the Principal store (ADR-0069 §3)
+    /// and serve the principals typeahead.
+    pub fn with_identities(mut self, store: Arc<dyn scarab_identity::IdentityStore>) -> Self {
+        self.identities = Some(store);
         self
     }
 
@@ -5332,7 +5344,7 @@ async fn put_binding(
         return Err(ApiError::BadRequest("subject is required".into()));
     }
     let binding = scarab_identity::Binding {
-        subject: req.subject,
+        subject: resolve_typed_subject(&st, &req.subject).await?,
         scope: match req.project.filter(|p| !p.is_empty()) {
             Some(name) => scarab_identity::Scope::Project { org, name },
             None => org_scope,
@@ -5344,6 +5356,97 @@ async fn put_binding(
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+/// An admin-typed subject → the Principal id it names (ADR-0069 §3): a merged
+/// id follows to its target; a string no Principal holds is refused. Granting
+/// to one would hand the role to whoever next produced that string at sign-in —
+/// the recycled-login takeover, re-opened for every pre-assigned surface.
+async fn resolve_typed_subject(st: &AppState, subject: &str) -> Result<String, ApiError> {
+    let Some(store) = st.identities.as_ref() else {
+        return Ok(subject.to_string());
+    };
+    scarab_identity::resolve_principal(store.as_ref(), subject)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?
+        .ok_or_else(|| {
+            ApiError::BadRequest(format!(
+                "`{subject}` is not a Scarab user. They must sign in once, or be imported \
+                 from the forge (POST /v1/repos/{{org}}/{{repo}}/bindings/import), before \
+                 a role or an approval can name them (ADR-0069)"
+            ))
+        })
+}
+
+/// `GET /v1/orgs/{org}/principals?q=` query.
+#[derive(Debug, Deserialize)]
+struct PrincipalQuery {
+    #[serde(default)]
+    q: String,
+}
+
+/// One linked identity of a [`PrincipalDto`].
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PrincipalIdentityDto {
+    pub provider: String,
+    /// The person's handle there today (login / email) — display only.
+    pub handle: String,
+}
+
+/// A Principal, as the grant/approver typeahead offers it (ADR-0069 §3).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PrincipalDto {
+    /// What a grant or an approver entry stores.
+    pub id: String,
+    pub display_name: Option<String>,
+    /// `false` = created by a forge import, not signed into yet.
+    pub claimed: bool,
+    pub identities: Vec<PrincipalIdentityDto>,
+}
+
+/// Search Principals for the grant/approver typeahead (ADR-0069 §3). Principals
+/// are install-wide, so this is Administer-gated and capped: an org admin needs
+/// to find someone who holds no role here yet, which no org-scoped list could
+/// contain.
+#[utoipa::path(get, path = "/v1/orgs/{org}/principals", summary = "Search users for a grant or approver entry (ADR-0069)", params(("q" = String, Query, description = "id or handle prefix, or a display-name fragment")), responses((status = 200, body = [PrincipalDto]), (status = 403, description = "not an org admin")))]
+async fn search_principals(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(org): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<PrincipalQuery>,
+) -> Result<Json<Vec<PrincipalDto>>, ApiError> {
+    let org_scope = scarab_identity::Scope::Org(org);
+    authorize_scoped(&st, &headers, Action::Administer, Some(&org_scope)).await?;
+    let store = st.identities.as_ref().ok_or(ApiError::NotFound)?;
+    let q = q.q.trim();
+    if q.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let found = store
+        .search(q, PRINCIPAL_SEARCH_LIMIT)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(
+        found
+            .into_iter()
+            .map(|m| PrincipalDto {
+                id: m.id,
+                display_name: m.display_name,
+                claimed: m.claimed,
+                identities: m
+                    .identities
+                    .into_iter()
+                    .map(|i| PrincipalIdentityDto {
+                        provider: i.provider,
+                        handle: i.handle,
+                    })
+                    .collect(),
+            })
+            .collect(),
+    ))
+}
+
+/// A typeahead shows a handful; more is enumeration, not search.
+const PRINCIPAL_SEARCH_LIMIT: usize = 20;
 
 /// Natively revoke `subject`'s binding at the scope — a durable tombstone a
 /// later forge import cannot resurrect.
@@ -6496,6 +6599,13 @@ async fn put_environment(
         environment: name.clone(),
     };
     protection.oidc_subject = format!("scarab:org/{org}/repo/{repo}/env/{name}");
+    // Approvers are matched by exact string against the approving Principal's
+    // id (`ProtectionRules::admits`), so each must name one (ADR-0069 §3).
+    let mut approvers = Vec::with_capacity(protection.approvers.len());
+    for a in &protection.approvers {
+        approvers.push(resolve_typed_subject(&st, a).await?);
+    }
+    protection.approvers = approvers;
     let env = scarab_project::Environment {
         name: name.clone(),
         protection,
@@ -8221,6 +8331,7 @@ fn tag_for_path(path: &str) -> Option<&'static str> {
         || path.starts_with("/v1/auth/")
         || path == "/v1/me"
         || path.contains("bindings")
+        || path.contains("/principals")
         || path.contains("/tokens")
     {
         "Auth & Identity"
@@ -8379,6 +8490,7 @@ impl utoipa::Modify for SecuritySchemes {
         jwks,
         openid_configuration,
         login,
+        search_principals,
         oauth_login_redirect,
         oauth_callback,
         auth_providers,
@@ -8492,6 +8604,8 @@ impl utoipa::Modify for SecuritySchemes {
         GrantedPermissionDto,
         MeResponse,
         AuthProviderDto,
+        PrincipalDto,
+        PrincipalIdentityDto,
         MintTokenRequest,
         MintedTokenDto,
         ApiTokenDto
@@ -8533,6 +8647,7 @@ fn router_inner(state: AppState) -> Router {
             "/v1/orgs/{org}/bindings",
             get(list_bindings).put(put_binding).delete(delete_binding),
         )
+        .route("/v1/orgs/{org}/principals", get(search_principals))
         .route(
             "/v1/orgs/{org}/tokens",
             get(list_api_tokens).post(mint_api_token),

@@ -3028,6 +3028,40 @@ impl scarab_identity::IdentityStore for PostgresDb {
             })
             .collect())
     }
+
+    async fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<scarab_identity::PrincipalMatch>, scarab_identity::IdentityError> {
+        let q = scarab_identity::like_literal(query);
+        let rows = sqlx::query(
+            "SELECT p.id, p.display_name, p.claimed_at FROM principals p
+             WHERE p.merged_into IS NULL
+               AND (p.id ILIKE $1 || '%'
+                    OR p.display_name ILIKE '%' || $1 || '%'
+                    OR EXISTS (SELECT 1 FROM principal_identities i
+                               WHERE i.principal_id = p.id AND i.handle ILIKE $1 || '%'))
+             ORDER BY p.id
+             LIMIT $2",
+        )
+        .bind(&q)
+        .bind(limit as i64)
+        .fetch_all(self.pool())
+        .await
+        .map_err(identity_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let id: String = r.get("id");
+            out.push(scarab_identity::PrincipalMatch {
+                identities: self.identities_of(&id).await?,
+                display_name: r.get("display_name"),
+                claimed: r.get::<Option<i64>, _>("claimed_at").is_some(),
+                id,
+            });
+        }
+        Ok(out)
+    }
 }
 
 const API_TOKEN_COLS: &str = "id, name, owner_subject, scope_org, scope_project, role, \
