@@ -89,6 +89,42 @@ scarab:
   #       - acme/widgets
   connections: []
 
+  # --- operator placement config (ADR-0055) -------------------------------
+  # Where step Pods schedule. On a cluster whose every node pool is tainted this
+  # is REQUIRED: it is the only place step Pods (including clone steps) get
+  # tolerations, so without it they stay Pending. It does NOT place the server
+  # or the workspace StatefulSet — those use the top-level `tolerations` /
+  # `nodeSelector` and `workspace.tolerations` / `workspace.nodeSelector`.
+  #
+  # Rendered verbatim into a mounted ConfigMap, so these keys are the SERVER's
+  # schema (snake_case). Only `baseline`, `default_resources` and `profiles` are
+  # accepted; any other top-level key fails the render (the server itself would
+  # silently ignore it, leaving every step Pod Pending).
+  #
+  # `baseline` and each profile's `k8s` are POD fragments, merge-patched onto
+  # the whole Pod — so pod-spec fields go under `spec:`. A `tolerations:` placed
+  # directly under `baseline:` would be dropped silently; the chart refuses it.
+  #
+  #   baseline:              # merged onto EVERY step Pod
+  #     spec:
+  #       tolerations:
+  #         - key: dedicated
+  #           operator: Equal
+  #           value: ci
+  #           effect: NoSchedule
+  #       nodeSelector:
+  #         pool: ci
+  #   default_resources:     # applied when a step requests none; a step's own
+  #     cpu_millis: 500      # `resources` wins per field
+  #     memory_mib: 1024
+  #   profiles:              # named; a step selects with `placement_profiles: [big]`
+  #     - name: big
+  #       k8s:
+  #         spec:
+  #           nodeSelector:
+  #             pool: ci-large
+  placement: {}
+
   # Object store (logs, artifacts, the workspace CAS cold tier). EFFECTIVELY
   # MANDATORY (ADR-0067 part 1): the server no longer falls back to a local
   # directory when bucket is empty — it refuses to boot (MissingObjectStore),

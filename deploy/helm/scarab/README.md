@@ -183,6 +183,40 @@ Projects — and their Environments, secrets and RBAC — hang off its repo bind
 the running server can store it). `SCARAB_GITHUB_APP_PEM[_FILE]` above is the same
 mechanism, applied kind-wide to GitHub App-mode connections.
 
+## Step Pod placement (`scarab.placement`, ADR-0055)
+
+Step Pods are created by the server at run time, so the chart's `tolerations` /
+`nodeSelector` (which place the **server**) never reach them. On a cluster whose
+every node pool is tainted, step Pods — clone steps included — stay `Pending`
+until you give them tolerations here:
+
+```yaml
+scarab:
+  placement:
+    baseline:            # merged onto EVERY step Pod
+      spec:
+        tolerations:
+          - { key: dedicated, operator: Equal, value: ci, effect: NoSchedule }
+        nodeSelector:
+          pool: ci
+    profiles:            # opt-in per step: `placement_profiles: [big]`
+      - name: big
+        k8s:
+          spec:
+            nodeSelector: { pool: ci-large }
+```
+
+**`baseline` and `k8s` are Pod fragments, not pod-spec fragments** — they are
+RFC-7386 merge-patched onto the whole Pod, so tolerations live under `spec:`.
+
+The block is rendered verbatim into a mounted ConfigMap and
+`SCARAB_PLACEMENT_CONFIG_FILE` points at it, so the keys are the **server's**
+schema (`baseline`, `default_resources`, `profiles`). Two mistakes are silent on
+the server — an unknown top-level key, and a fragment key other than
+`metadata`/`spec` (dropped when the merged Pod is decoded) — and either leaves
+every step Pod `Pending` with no error. The chart **fails the render** on both
+instead. A change rolls the server (it is read once at boot).
+
 ## The workspace service (`workspace`, ADR-0061)
 
 A second workload in the same release: a **StatefulSet** running the **same
@@ -261,6 +295,7 @@ which is exactly the cost the warm tier exists to remove.
 | `secrets.oauthClientSecret.name` / `.key` | — / `oauth-client-secret` | OAuth client secret by reference from your own Secret (above) |
 | `secrets.githubAppPemSecret.name` / `.key` | — / `github-app.pem` | mount the App PEM from your own Secret (above) |
 | `scarab.connections` | `[]` | declarative, config-owned forge connections (above) |
+| `scarab.placement` | `{}` | step Pod baseline + PlacementProfiles (above); required on an all-tainted cluster |
 | `workspace.enabled` | `true` | the ADR-0061 workspace service; renders only when a workspace token secret exists (above) |
 | `workspace.dataDir` | `/var/lib/scarab/cas` | where the warm tier's PVC is mounted (`SCARAB_WORKSPACE_DATA_DIR`) |
 | `workspace.persistence.size` / `.storageClass` | `20Gi` / cluster default | the warm tier's volume — bounded by SPACE via the LRU sweep (git-bug cba7165); prefer local disk (above) |

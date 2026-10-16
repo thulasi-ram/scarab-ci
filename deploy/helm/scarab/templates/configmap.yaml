@@ -75,6 +75,13 @@ data:
          fails the boot loudly, never a degraded start. */}}
   SCARAB_CONNECTIONS_FILE: {{ include "scarab.connectionsPath" . | quote }}
   {{- end }}
+  {{- if .Values.scarab.placement }}
+  {{- /* Operator placement config (ADR-0055): a mounted ConfigMap, only its
+         path is env. A bad path/parse fails the boot loudly. The workspace
+         StatefulSet sees this key too (shared ConfigMap) but never reads it —
+         its role returns before the placement load in main.rs. */}}
+  SCARAB_PLACEMENT_CONFIG_FILE: {{ include "scarab.placementPath" . | quote }}
+  {{- end }}
   {{- if include "scarab.workspaceEnabled" . }}
   {{- /* The workspace service (ADR-0061). This key is read by BOTH workloads:
          the server dials the URL, and the workspace StatefulSet — which consumes

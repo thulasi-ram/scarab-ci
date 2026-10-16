@@ -141,6 +141,25 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- printf "%s-connections" (include "scarab.fullname" .) -}}
 {{- end -}}
 
+{{/* Directory the operator placement config (ADR-0055) is projected into. */}}
+{{- define "scarab.placementDir" -}}
+/etc/scarab/placement
+{{- end -}}
+
+{{/* Absolute path of the rendered placement config — the value of
+     SCARAB_PLACEMENT_CONFIG_FILE and the file the ConfigMap is mounted as. One
+     definition so the ConfigMap, the env var and the mount cannot disagree. */}}
+{{- define "scarab.placementPath" -}}
+{{- printf "%s/placement.yaml" (include "scarab.placementDir" .) -}}
+{{- end -}}
+
+{{/* Name of the ConfigMap holding the placement config. Separate from the main
+     ConfigMap for the same reason as the connections one: that one is consumed
+     with `envFrom`. */}}
+{{- define "scarab.placementConfigMapName" -}}
+{{- printf "%s-placement" (include "scarab.fullname" .) -}}
+{{- end -}}
+
 {{/* Is OAuth login (ADR-0049) configured at all? Emits a non-empty string when
      ANY of the login knobs is set, so a half-configured provider is caught by
      scarab.validateAuth instead of silently rendering nothing. */}}
