@@ -819,15 +819,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Real authn (ADR-0049): OAuth/OIDC login + PG-backed sessions. Absent
     // OAuth config the process only booted under SCARAB_DEV_INSECURE (ADR-0048
     // default-deny) — sessions stay unwired and authz is off, loudly.
-    if let Some(oauth_cfg) = config.oauth.clone() {
+    if !config.oauth.is_empty() {
         // Every sign-in is pinned to a Principal by the provider's immutable id
         // (ADR-0069), so a recycled login can never inherit someone's grants.
-        let login = Arc::new(
-            scarab_server::oauth::OAuthAuthenticator::new(oauth_cfg).with_identities(pg.clone()),
-        );
+        let providers: Vec<_> = config
+            .oauth
+            .iter()
+            .cloned()
+            .map(|cfg| {
+                Arc::new(
+                    scarab_server::oauth::OAuthAuthenticator::new(cfg).with_identities(pg.clone()),
+                )
+            })
+            .collect();
+        // The port-level authenticator is the first provider; every login path
+        // that knows its provider routes by id instead.
+        state = state.with_auth(providers[0].clone(), pg.clone());
+        for login in providers {
+            state = state.with_oauth_login(login);
+        }
         state = state
-            .with_auth(login.clone(), pg.clone())
-            .with_oauth_login(login)
             // Scoped RBAC (ADR-0049 C2): per-request role-in-Org/Project from
             // the native bindings in Postgres.
             .with_rbac(pg.clone())

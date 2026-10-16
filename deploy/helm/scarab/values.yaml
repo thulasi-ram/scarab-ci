@@ -200,7 +200,35 @@ scarab:
     # SCARAB_OAUTH_OWNERS. Leave empty and nobody can administer the install.
     # An entry matches the provider subject OR a verified email claim — with an
     # OIDC issuer, `sub` is usually an opaque id, so prefer the email there.
+    #
+    # ADR-0069: an entry matches a Principal ID (`alice` from this legacy
+    # provider, `github:alice` from a named one below) or `<provider>:<email>`,
+    # honoured only when THAT provider asserts email_verified. A bare email is
+    # refused at boot when more than one provider is configured.
     owners: []
+    # This provider's id (ADR-0069; default `default`). It keeps minting the
+    # pre-ADR-0069 bare ids, so existing bindings keep resolving.
+    providerId: ""
+    providerName: ""    # login-button label; default "Sign in"
+    # The forge this provider IS, equal to that forge's connection base_url
+    # (`https://api.github.com` for GitHub, the web host for Forgejo), so a
+    # forge-permission import resolves through it (ADR-0069).
+    forgeUrl: ""
+    # Further login providers (ADR-0069), each minting `<id>:<handle>` ids.
+    # Every entry needs id ([a-z0-9-]+), clientId, the three URLs, and
+    # clientSecret.name (a Secret you manage; key defaults to client-secret) —
+    # the secret reaches the Pod by secretKeyRef, never through this ConfigMap.
+    #   - id: okta
+    #     name: Okta
+    #     clientId: "0oa…"
+    #     authorizeUrl: https://acme.okta.com/oauth2/v1/authorize
+    #     tokenUrl: https://acme.okta.com/oauth2/v1/token
+    #     userinfoUrl: https://acme.okta.com/oauth2/v1/userinfo
+    #     issuer: https://acme.okta.com
+    #     scopes: openid profile email
+    #     forgeUrl: ""
+    #     clientSecret: { name: okta-oauth, key: client-secret }
+    providers: []
 
   # ⚠ Dev-only (ADR-0048): boots without an authenticator/KEK, with loud
   # warnings, instead of refusing. NEVER set in production — every caller

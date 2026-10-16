@@ -119,9 +119,23 @@
         ],
         "summary": "Begin the browser OAuth flow (ADR-0049)",
         "operationId": "oauth_login_redirect",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "query",
+            "description": "login provider id (ADR-0069); default = the only, or the unqualified_ids, provider",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "302": {
             "description": "redirect to the provider with a state cookie"
+          },
+          "400": {
+            "description": "unknown provider, or several and none named"
           },
           "404": {
             "description": "OAuth not configured"
@@ -166,6 +180,31 @@
         "responses": {
           "204": {
             "description": "session revoked; cookies expired"
+          }
+        },
+        "security": []
+      }
+    },
+    "/v1/auth/providers": {
+      "get": {
+        "tags": [
+          "Auth & Identity"
+        ],
+        "summary": "List login providers (ADR-0069)",
+        "operationId": "auth_providers",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AuthProviderDto"
+                  }
+                }
+              }
+            }
           }
         },
         "security": []
@@ -3076,6 +3115,29 @@
             "type": "integer",
             "format": "int64",
             "description": "When this attempt started (unix-ms)."
+          }
+        }
+      },
+      "AuthProviderDto": {
+        "type": "object",
+        "description": "One login provider, as the login page offers it (ADR-0069).",
+        "required": [
+          "id",
+          "name",
+          "default"
+        ],
+        "properties": {
+          "default": {
+            "type": "boolean",
+            "description": "The one used when a login names none."
+          },
+          "id": {
+            "type": "string",
+            "description": "Pass as `provider` to `GET`/`POST /v1/auth/login`."
+          },
+          "name": {
+            "type": "string",
+            "description": "The button label."
           }
         }
       },

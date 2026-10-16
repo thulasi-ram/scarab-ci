@@ -110,6 +110,39 @@ With an OIDC issuer, `sub` is typically an opaque per-client id, so prefer the
 `issuer` *without* the four endpoints is a render error, same as any other
 partial provider.
 
+### Several providers (`scarab.oauth.providers`, ADR-0069)
+
+Each sign-in is pinned to a Scarab Principal by the provider's **immutable** user
+id (OIDC `sub`, or GitHub/Forgejo's numeric `id`), never by the login, so a
+recycled login cannot inherit someone's roles. The provider above keeps minting
+the bare ids it always has (`alice`), so upgrading changes no existing binding.
+Set `scarab.oauth.forgeUrl` to the forge it signs into (`https://api.github.com`
+for GitHub, the web host for Forgejo) so a forge-permission import resolves
+through it.
+
+Further providers mint ids in their own namespace (`okta:ada@example.com`,
+`forgejo:alice`) and share the one callback URL:
+
+```yaml
+scarab:
+  oauth:
+    owners: [alice, "okta:ada@example.com"]
+    providers:
+      - id: okta
+        name: Okta
+        clientId: 0oa1example
+        authorizeUrl: https://acme.okta.com/oauth2/v1/authorize
+        tokenUrl: https://acme.okta.com/oauth2/v1/token
+        userinfoUrl: https://acme.okta.com/oauth2/v1/userinfo
+        issuer: https://acme.okta.com
+        scopes: openid profile email
+        clientSecret: { name: okta-oauth, key: client-secret }
+```
+
+With more than one provider an owners email must be qualified as
+`<provider>:<email>`. It is honoured only when that provider asserts the address
+verified, so the weakest IdP cannot mint an Owner. A bare email refuses boot.
+
 **All five or none.** The server refuses to boot on a partially configured
 provider, so the chart refuses to render one: a missing endpoint, or a login
 config with no reachable client secret, **fails `helm upgrade`** with the exact

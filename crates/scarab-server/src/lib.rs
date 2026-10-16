@@ -187,9 +187,10 @@ pub struct AppState {
     /// consults per request against the path's Org/Project. `None` = only the
     /// principal's flat global roles decide (the C1 bootstrap).
     pub rbac: Option<Arc<dyn scarab_identity::RbacStore>>,
-    /// The browser OAuth login flow (ADR-0049): redirect + callback. `None`
-    /// leaves only the credential-exchange `POST /v1/auth/login` (API/CLI).
-    pub oauth_login: Option<Arc<oauth::OAuthAuthenticator>>,
+    /// The configured login providers (ADR-0049, several since ADR-0069): the
+    /// browser redirect + callback and the API/CLI exchange. Empty leaves only
+    /// the credential-exchange `POST /v1/auth/login` through [`Self::auth`].
+    pub oauth_providers: Vec<Arc<oauth::OAuthAuthenticator>>,
     /// Scarab's public base URL — where the outside world reaches this server.
     /// Two things are built from it, and **neither depends on login being on**:
     /// the OAuth callback `redirect_uri` (`{public_url}/v1/auth/callback`) and
@@ -241,7 +242,7 @@ impl AppState {
             debug_launcher: None,
             ui_dir: None,
             rbac: None,
-            oauth_login: None,
+            oauth_providers: Vec::new(),
             public_url: "http://localhost:8080".into(),
             credential_overrides: Arc::new(connections_config::CredentialOverrides::new()),
             snapshot_retention_days: DEFAULT_SNAPSHOT_RETENTION_DAYS,
@@ -437,9 +438,44 @@ impl AppState {
     /// Auth only — the public URL comes from
     /// [`with_public_url`](AppState::with_public_url), because webhook
     /// registration needs it whether or not login is configured.
+    ///
+    /// Call once per provider (ADR-0069); they share the one callback URL, the
+    /// state cookie naming which provider the flow went to.
     pub fn with_oauth_login(mut self, login: Arc<oauth::OAuthAuthenticator>) -> Self {
-        self.oauth_login = Some(login);
+        self.oauth_providers.push(login);
         self
+    }
+
+    /// The provider a login names, or the default when it names none
+    /// (ADR-0069 §4): the only provider, else the `unqualified_ids` one. With
+    /// several and no default, the caller must choose — guessing would sign
+    /// someone into the wrong identity. `Ok(None)` = no OAuth provider at all.
+    fn oauth_provider(
+        &self,
+        id: Option<&str>,
+    ) -> Result<Option<&Arc<oauth::OAuthAuthenticator>>, ApiError> {
+        if self.oauth_providers.is_empty() {
+            return Ok(None);
+        }
+        match id.filter(|i| !i.is_empty()) {
+            Some(id) => self
+                .oauth_providers
+                .iter()
+                .find(|p| p.provider_id() == id)
+                .map(Some)
+                .ok_or_else(|| ApiError::BadRequest(format!("unknown login provider `{id}`"))),
+            None if self.oauth_providers.len() == 1 => Ok(self.oauth_providers.first()),
+            None => self
+                .oauth_providers
+                .iter()
+                .find(|p| p.unqualified_ids())
+                .map(Some)
+                .ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "several login providers are configured — name one with `provider`".into(),
+                    )
+                }),
+        }
     }
 }
 
@@ -4965,6 +5001,10 @@ pub struct LoginRequest {
     /// server-side browser flow to carry a verifier through.
     #[serde(default)]
     pub code_verifier: Option<String>,
+    /// Which login provider issued `credential` (ADR-0069) — a provider id
+    /// from `GET /v1/auth/providers`. Absent = the default provider.
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -4990,9 +5030,9 @@ async fn login(
     // A client that carries a verifier gets it replayed at the token endpoint;
     // otherwise this is exactly the pre-PKCE port call.
     let verifier = req.code_verifier.as_deref().filter(|v| !v.is_empty());
-    let principal = match (st.oauth_login.as_ref(), verifier) {
-        (Some(oauth), Some(v)) => oauth.exchange(&req.credential, Some(v), None).await,
-        _ => auth.authenticate(&req.credential).await,
+    let principal = match st.oauth_provider(req.provider.as_deref())? {
+        Some(oauth) => oauth.exchange(&req.credential, verifier, None).await,
+        None => auth.authenticate(&req.credential).await,
     }
     .map_err(|_| ApiError::Unauthorized)?;
     let now = st.clock.now().await.0;
@@ -5047,12 +5087,17 @@ fn set_session_cookies(headers: &mut HeaderMap, session: &Session) {
 /// login secrets (`state` + PKCE verifier + OIDC nonce), keep them in one
 /// HttpOnly cookie (10 min), and redirect to the provider's authorize endpoint
 /// with the `state` echo and the S256 `code_challenge`.
-#[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 404, description = "OAuth not configured")))]
-async fn oauth_login_redirect(State(st): State<AppState>) -> Result<Response, ApiError> {
-    let Some(provider) = st.oauth_login.as_ref() else {
+#[utoipa::path(get, path = "/v1/auth/login", summary = "Begin the browser OAuth flow (ADR-0049)", params(("provider" = Option<String>, Query, description = "login provider id (ADR-0069); default = the only, or the unqualified_ids, provider")), responses((status = 302, description = "redirect to the provider with a state cookie"), (status = 400, description = "unknown provider, or several and none named"), (status = 404, description = "OAuth not configured")))]
+async fn oauth_login_redirect(
+    State(st): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Response, ApiError> {
+    let Some(provider) = st.oauth_provider(q.get("provider").map(String::as_str))? else {
         return Err(ApiError::NotFound);
     };
-    let flow = oauth::LoginFlow::generate();
+    // The provider rides in the state cookie, so every provider shares the one
+    // registered callback URL (ADR-0069).
+    let flow = oauth::LoginFlow::generate().for_provider(provider.provider_id());
     let redirect_uri = format!("{}/v1/auth/callback", st.public_url.trim_end_matches('/'));
     let location = provider.authorize_redirect(&redirect_uri, &flow);
     let mut resp = (StatusCode::FOUND, ()).into_response();
@@ -5096,7 +5141,7 @@ async fn oauth_callback(
     };
     // The OAuth provider is the one that can honour PKCE/nonce; a non-OAuth
     // authenticator (dev fakes) still goes through the port unchanged.
-    let principal = match st.oauth_login.as_ref() {
+    let principal = match st.oauth_provider(Some(flow.provider.as_str()))? {
         Some(oauth) => oauth.exchange(code, flow.verifier(), flow.nonce()).await,
         None => auth.authenticate(code).await,
     }
@@ -5121,6 +5166,39 @@ async fn oauth_callback(
         resp.headers_mut().append(axum::http::header::SET_COOKIE, v);
     }
     Ok(resp)
+}
+
+/// One login provider, as the login page offers it (ADR-0069).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuthProviderDto {
+    /// Pass as `provider` to `GET`/`POST /v1/auth/login`.
+    pub id: String,
+    /// The button label.
+    pub name: String,
+    /// The one used when a login names none.
+    pub default: bool,
+}
+
+/// `GET /v1/auth/providers` (ADR-0069): the configured login providers, for
+/// the login page. Unauthenticated by necessity — it is what you see before
+/// you have signed in — and it carries nothing secret.
+#[utoipa::path(get, path = "/v1/auth/providers", summary = "List login providers (ADR-0069)", responses((status = 200, body = [AuthProviderDto])))]
+async fn auth_providers(State(st): State<AppState>) -> Json<Vec<AuthProviderDto>> {
+    let default = st
+        .oauth_provider(None)
+        .ok()
+        .flatten()
+        .map(|p| p.provider_id().to_string());
+    Json(
+        st.oauth_providers
+            .iter()
+            .map(|p| AuthProviderDto {
+                id: p.provider_id().to_string(),
+                name: p.name().to_string(),
+                default: default.as_deref() == Some(p.provider_id()),
+            })
+            .collect(),
+    )
 }
 
 /// `POST /v1/auth/logout` (ADR-0049): revoke the presented session server-side
@@ -5756,9 +5834,12 @@ async fn live_role_in(
 /// mint endpoint bounds a grant with exactly this view too, so what a minter is
 /// allowed to issue and what the token will actually do cannot drift.
 fn token_owner_roles(st: &AppState, subject: &str) -> Vec<scarab_identity::Role> {
-    st.oauth_login
-        .as_ref()
-        .and_then(|o| o.bootstrap_owner_role(subject))
+    // The owners list is install-wide (ADR-0069), so any provider's view of it
+    // answers; `max` keeps this correct should they ever differ.
+    st.oauth_providers
+        .iter()
+        .filter_map(|o| o.bootstrap_owner_role(subject))
+        .max()
         .into_iter()
         .collect()
 }
@@ -8300,6 +8381,7 @@ impl utoipa::Modify for SecuritySchemes {
         login,
         oauth_login_redirect,
         oauth_callback,
+        auth_providers,
         logout,
         me,
         mint_api_token,
@@ -8409,6 +8491,7 @@ impl utoipa::Modify for SecuritySchemes {
         CapabilityRequirementDto,
         GrantedPermissionDto,
         MeResponse,
+        AuthProviderDto,
         MintTokenRequest,
         MintedTokenDto,
         ApiTokenDto
@@ -8443,6 +8526,7 @@ fn router_inner(state: AppState) -> Router {
         )
         .route("/v1/auth/login", post(login).get(oauth_login_redirect))
         .route("/v1/auth/callback", get(oauth_callback))
+        .route("/v1/auth/providers", get(auth_providers))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/me", get(me))
         .route(

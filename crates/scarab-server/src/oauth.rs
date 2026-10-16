@@ -76,11 +76,15 @@ fn random_urlsafe() -> String {
 ///   [`challenge`](Self::challenge) leaves the server on the redirect.
 /// - `nonce` — the value the issuer must stamp into the `id_token`, which
 ///   binds the token to this authorize request (OIDC replay guard).
+/// - `provider` — which configured provider this login went to (ADR-0069),
+///   so every provider shares ONE callback URL. Empty = the default provider
+///   (a flow minted before ADR-0069, still completing across a deploy).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginFlow {
     pub state: String,
     pub verifier: String,
     pub nonce: String,
+    pub provider: String,
 }
 
 impl LoginFlow {
@@ -90,7 +94,15 @@ impl LoginFlow {
             state: random_urlsafe(),
             verifier: random_urlsafe(),
             nonce: random_urlsafe(),
+            provider: String::new(),
         }
+    }
+
+    /// The same flow, bound to `provider` (an `[a-z0-9-]+` id, so it can never
+    /// carry the `.` separator).
+    pub fn for_provider(mut self, provider: &str) -> Self {
+        self.provider = provider.to_string();
+        self
     }
 
     /// The PKCE `code_challenge`: base64url(SHA-256(verifier)), method `S256`.
@@ -99,9 +111,16 @@ impl LoginFlow {
     }
 
     /// The opaque state-cookie value carrying the whole flow. Every component
-    /// is base64url, so `.` is an unambiguous separator.
+    /// is base64url or a provider id, so `.` is an unambiguous separator.
     pub fn to_cookie(&self) -> String {
-        format!("{}.{}.{}", self.state, self.verifier, self.nonce)
+        if self.provider.is_empty() {
+            format!("{}.{}.{}", self.state, self.verifier, self.nonce)
+        } else {
+            format!(
+                "{}.{}.{}.{}",
+                self.state, self.verifier, self.nonce, self.provider
+            )
+        }
     }
 
     /// Parse the state cookie back. A single component is accepted as a
@@ -112,6 +131,7 @@ impl LoginFlow {
         let state = parts.next().filter(|s| !s.is_empty())?;
         let verifier = parts.next().unwrap_or_default();
         let nonce = parts.next().unwrap_or_default();
+        let provider = parts.next().unwrap_or_default();
         if parts.next().is_some() {
             return None;
         }
@@ -119,6 +139,7 @@ impl LoginFlow {
             state: state.to_string(),
             verifier: verifier.to_string(),
             nonce: nonce.to_string(),
+            provider: provider.to_string(),
         })
     }
 
@@ -155,6 +176,21 @@ impl OAuthAuthenticator {
             jwks: RwLock::new(HashMap::new()),
             identities: None,
         }
+    }
+
+    /// This provider's stable id (ADR-0069).
+    pub fn provider_id(&self) -> &str {
+        &self.cfg.provider_id
+    }
+
+    /// The login button's label.
+    pub fn name(&self) -> &str {
+        &self.cfg.name
+    }
+
+    /// Does this provider mint the pre-ADR-0069 bare ids (the default one)?
+    pub fn unqualified_ids(&self) -> bool {
+        self.cfg.unqualified_ids
     }
 
     /// Pin every sign-in through `store` (ADR-0069): the Principal is the one
@@ -401,21 +437,27 @@ impl OAuthAuthenticator {
             .then_some(Role::Owner)
     }
 
-    /// An owner entry matches the stored subject **or** a VERIFIED email
-    /// (ADR-0049 amendment): with a real OIDC issuer `sub` is an opaque
-    /// per-client id, so subject-only bootstrap means pasting UUIDs before
-    /// anyone can administer anything. `sub` stays the Principal's identity;
-    /// email is only ever a *matcher*, and only when the issuer asserts
-    /// `email_verified` — an unverified email would let anyone who can set a
-    /// profile field claim `Owner`.
+    /// An owner entry matches the Principal id **or** a VERIFIED email
+    /// (ADR-0049 amendment, scoped per provider by ADR-0069): with a real OIDC
+    /// issuer `sub` is an opaque per-client id, so id-only bootstrap means
+    /// pasting UUIDs before anyone can administer anything. Email is only ever
+    /// a *matcher*, and only when THIS provider asserts `email_verified`:
+    ///
+    /// - `<provider>:<email>` matches only when `<provider>` is this one —
+    ///   otherwise the weakest IdP willing to call an address verified would
+    ///   mint a global Owner;
+    /// - a bare email matches any provider, which boot permits only when there
+    ///   is exactly one.
     fn is_owner(&self, subject: &str, verified_email: Option<&str>) -> bool {
-        self.cfg.owners.iter().any(|o| o == subject)
-            || verified_email.is_some_and(|email| {
-                self.cfg
-                    .owners
-                    .iter()
-                    .any(|o| o.eq_ignore_ascii_case(email))
-            })
+        self.cfg.owners.iter().any(|o| {
+            o == subject
+                || verified_email.is_some_and(|email| match o.split_once(':') {
+                    Some((provider, addr)) => {
+                        provider == self.cfg.provider_id && addr.eq_ignore_ascii_case(email)
+                    }
+                    None => o.eq_ignore_ascii_case(email),
+                })
+        })
     }
 
     /// Verify an `id_token`: RS256 signature against the issuer's JWKS, plus
@@ -593,6 +635,7 @@ mod tests {
             state: "s".into(),
             verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into(),
             nonce: "n".into(),
+            provider: String::new(),
         };
         assert_eq!(
             flow.challenge(),
@@ -618,7 +661,13 @@ mod tests {
         assert_eq!(flow.verifier(), None, "nothing to replay");
         assert_eq!(flow.nonce(), None, "nothing to check");
         assert_eq!(LoginFlow::from_cookie(""), None);
-        assert_eq!(LoginFlow::from_cookie("a.b.c.d"), None);
+        assert_eq!(LoginFlow::from_cookie("a.b.c.d.e"), None);
+        // ADR-0069: a fourth component names the provider the flow went to.
+        let bound = LoginFlow::generate().for_provider("okta");
+        assert_eq!(
+            LoginFlow::from_cookie(&bound.to_cookie()),
+            Some(bound.clone())
+        );
     }
 
     fn cfg(owners: Vec<String>) -> OAuthConfig {
@@ -633,6 +682,8 @@ mod tests {
             owners,
             provider_id: "default".into(),
             unqualified_ids: true,
+            name: "Sign in".into(),
+            forge_url: None,
         }
     }
 
@@ -661,5 +712,35 @@ mod tests {
                 "unverified/absent email must not grant Owner: {unverified}"
             );
         }
+    }
+
+    /// ADR-0069: a qualified email owner entry is honoured only by the
+    /// provider it names — another IdP asserting the same address verified
+    /// must not mint an Owner.
+    #[test]
+    fn a_qualified_email_owner_entry_binds_to_its_provider() {
+        let claims = serde_json::json!({
+            "sub": "s1", "email": "ada@example.com", "email_verified": true,
+        });
+        let owners = vec!["okta:ada@example.com".to_string()];
+        let okta = OAuthAuthenticator::new(OAuthConfig {
+            provider_id: "okta".into(),
+            unqualified_ids: false,
+            ..cfg(owners.clone())
+        });
+        let other = OAuthAuthenticator::new(OAuthConfig {
+            provider_id: "weak-idp".into(),
+            unqualified_ids: false,
+            ..cfg(owners)
+        });
+        assert_eq!(
+            okta.principal_from(&claims).unwrap().roles,
+            vec![Role::Owner]
+        );
+        assert_eq!(
+            other.principal_from(&claims).unwrap().roles,
+            vec![Role::Viewer],
+            "the same verified address from another provider grants nothing"
+        );
     }
 }

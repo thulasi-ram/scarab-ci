@@ -260,6 +260,8 @@ fn app_for(p: &Provider, owners: Vec<String>, oidc: bool) -> axum::Router {
             owners,
             provider_id: "default".into(),
             unqualified_ids: true,
+            name: "GitHub".into(),
+            forge_url: None,
         })
         .with_identities(Arc::new(InMemoryIdentities::new())),
     );
@@ -284,23 +286,30 @@ fn cookie_from(resp: &axum::response::Response, name: &str) -> Option<String> {
 
 /// The login secrets the server planted, read the way the browser would — and
 /// split here (not via the production parser) so the test is an independent
-/// check on the cookie's shape: `state.verifier.nonce`.
+/// check on the cookie's shape: `state.verifier.nonce.provider` (the provider
+/// id since ADR-0069 — one callback URL serves every provider).
 struct Flow {
     state: String,
     verifier: String,
     nonce: String,
+    provider: String,
 }
 
 fn parse_flow(cookie: &str) -> Flow {
     let parts: Vec<&str> = cookie.split('.').collect();
-    assert_eq!(parts.len(), 3, "state cookie must carry state.verifier.nonce");
-    for p in &parts {
+    assert_eq!(
+        parts.len(),
+        4,
+        "state cookie must carry state.verifier.nonce.provider"
+    );
+    for p in &parts[..3] {
         assert!(p.len() >= 20, "each component must be high-entropy: {p}");
     }
     Flow {
         state: parts[0].into(),
         verifier: parts[1].into(),
         nonce: parts[2].into(),
+        provider: parts[3].into(),
     }
 }
 
@@ -325,8 +334,8 @@ async fn begin_login(app: &axum::Router) -> (String, Flow) {
 /// `GET /v1/auth/callback` with the flow cookie replayed.
 async fn callback(app: &axum::Router, flow: &Flow, code: &str) -> axum::response::Response {
     let cookie = format!(
-        "scarab_oauth_state={}.{}.{}",
-        flow.state, flow.verifier, flow.nonce
+        "scarab_oauth_state={}.{}.{}.{}",
+        flow.state, flow.verifier, flow.nonce, flow.provider
     );
     app.clone()
         .oneshot(
@@ -852,4 +861,140 @@ async fn a_userinfo_with_no_immutable_id_is_refused() {
         api_login(&app, "good-code").await.status(),
         StatusCode::UNAUTHORIZED
     );
+}
+
+/// Two providers in one app, sharing one identity store: `default` (the
+/// legacy, bare-id GitHub provider) and a named `forgejo` one. Both stubs
+/// answer the same `{id: 1001, login: alice}` — two different people who
+/// happen to share a login on two forges.
+fn two_provider_app(github: &Provider, forgejo: &Provider, owners: Vec<String>) -> axum::Router {
+    let db: Arc<InMemoryDb> = Arc::new(InMemoryDb::new());
+    let clock = Arc::new(FakeClock::new(1_000));
+    let logs = Arc::new(LogService::new(
+        Arc::new(InMemoryObjectStore::new()),
+        db.clone(),
+    ));
+    let identities = Arc::new(InMemoryIdentities::new());
+    let provider = |p: &Provider, id: &str, unqualified: bool| {
+        Arc::new(
+            OAuthAuthenticator::new(OAuthConfig {
+                client_id: "cid".into(),
+                client_secret: "sekret".into(),
+                authorize_url: format!("{}/authorize", p.base),
+                token_url: format!("{}/token", p.base),
+                userinfo_url: format!("{}/user", p.base),
+                oidc_issuer: None,
+                scopes: String::new(),
+                owners: owners.clone(),
+                provider_id: id.into(),
+                unqualified_ids: unqualified,
+                name: id.to_uppercase(),
+                forge_url: None,
+            })
+            .with_identities(identities.clone()),
+        )
+    };
+    let gh = provider(github, "default", true);
+    let fj = provider(forgejo, "forgejo", false);
+    router(
+        AppState::new(db, clock, logs)
+            .with_public_url("https://scarab.example.com")
+            .with_auth(gh.clone(), Arc::new(InMemorySessions::new()))
+            .with_oauth_login(gh)
+            .with_oauth_login(fj),
+    )
+}
+
+/// Problem (3) of ADR-0069, end to end: `alice` on Forgejo and `alice` on
+/// GitHub were one subject, so a bare `alice` owner entry made BOTH Owner.
+/// Now each provider mints in its own namespace, the browser flow carries
+/// which provider it went to through the one shared callback, and the API
+/// path names it explicitly.
+#[tokio::test]
+async fn two_providers_keep_two_alices_apart() {
+    let github = provider(None).await;
+    let forgejo = provider(None).await;
+    let app = two_provider_app(&github, &forgejo, vec!["alice".into()]);
+
+    // The login page's list, with the default marked.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/providers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "readable before sign-in");
+    let list = body_json(resp).await;
+    assert_eq!(
+        list,
+        serde_json::json!([
+            { "id": "default", "name": "DEFAULT", "default": true },
+            { "id": "forgejo", "name": "FORGEJO", "default": false },
+        ])
+    );
+
+    // Browser flow to Forgejo: the redirect goes to the Forgejo stub, and the
+    // callback (the SAME url) resolves through Forgejo, not the default.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/login?provider=forgejo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    assert!(location.starts_with(&forgejo.base), "{location}");
+    let flow = parse_flow(&cookie_from(&resp, "scarab_oauth_state").unwrap());
+    assert_eq!(flow.provider, "forgejo");
+    let resp = callback(&app, &flow, "good-code").await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    let fj_session = cookie_from(&resp, "scarab_session").unwrap();
+    assert_eq!(*forgejo.userinfo_hits.lock().unwrap(), 1);
+    assert_eq!(*github.userinfo_hits.lock().unwrap(), 0);
+    assert!(
+        !may_write(&app, &fj_session).await,
+        "Forgejo's alice is `forgejo:alice`, not the `alice` owner entry"
+    );
+
+    // The API path: default provider when unnamed, Forgejo when named.
+    let gh = body_json(api_login(&app, "good-code").await).await;
+    assert_eq!(gh["subject"], "alice");
+    assert!(may_write(&app, gh["session"].as_str().unwrap()).await);
+    let named = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "credential": "good-code", "provider": "forgejo" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(body_json(named).await["subject"], "forgejo:alice");
+
+    // An unknown provider is refused, never silently defaulted.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/auth/login?provider=gitlab")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

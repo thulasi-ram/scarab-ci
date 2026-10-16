@@ -52,17 +52,26 @@ spec:
             - secretRef:
                 name: {{ include "scarab.secretName" . }}
                 optional: true
-          {{- if .Values.secrets.oauthClientSecret.name }}
-          # The OAuth client secret (ADR-0049) comes from a Secret you manage
-          # out-of-band, by reference — it never passes through Helm values. An
-          # explicit `env` entry wins over the `envFrom` above, so this also
-          # overrides any SCARAB_OAUTH_CLIENT_SECRET in the referenced Secret.
+          {{- if or .Values.secrets.oauthClientSecret.name .Values.scarab.oauth.providers }}
+          # OAuth client secrets (ADR-0049, ADR-0069) come from Secrets you
+          # manage out-of-band, by reference — they never pass through Helm
+          # values. An explicit `env` entry wins over the `envFrom` above, so
+          # this also overrides any same-named key in the referenced Secret.
           env:
+            {{- if .Values.secrets.oauthClientSecret.name }}
             - name: SCARAB_OAUTH_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.secrets.oauthClientSecret.name | quote }}
                   key: {{ .Values.secrets.oauthClientSecret.key | quote }}
+            {{- end }}
+            {{- range .Values.scarab.oauth.providers }}
+            - name: {{ include "scarab.providerSecretEnv" .id }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .clientSecret.name | quote }}
+                  key: {{ default "client-secret" .clientSecret.key | quote }}
+            {{- end }}
           {{- end }}
           ports:
             - name: http

@@ -163,6 +163,11 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/* Is OAuth login (ADR-0049) configured at all? Emits a non-empty string when
      ANY of the login knobs is set, so a half-configured provider is caught by
      scarab.validateAuth instead of silently rendering nothing. */}}
+{{/* The env var a named provider's client secret is injected as (ADR-0069). */}}
+{{- define "scarab.providerSecretEnv" -}}
+{{- printf "SCARAB_OAUTH_SECRET_%s" (. | upper | replace "-" "_") -}}
+{{- end -}}
+
 {{- define "scarab.oauthConfigured" -}}
 {{- $o := .Values.scarab.oauth -}}
 {{- if or $o.clientId $o.authorizeUrl $o.tokenUrl $o.userinfoUrl $o.issuer .Values.secrets.oauthClientSecret.name -}}
@@ -192,6 +197,16 @@ true
 {{- if not (or .Values.secrets.oauthClientSecret.name .Values.secrets.existingSecret) -}}
 {{- fail "scarab: OAuth login is configured but no client secret can reach the Pod. Set secrets.oauthClientSecret.name to a Secret you manage out-of-band (key defaults to oauth-client-secret), or put a SCARAB_OAUTH_CLIENT_SECRET key in secrets.existingSecret. The client secret is never accepted as a plaintext chart value." -}}
 {{- end -}}
+{{- end -}}
+{{- range .Values.scarab.oauth.providers -}}
+{{- if not (and .id .clientId .authorizeUrl .tokenUrl .userinfoUrl) -}}
+{{- fail (printf "scarab: scarab.oauth.providers entry `%s` needs id, clientId, authorizeUrl, tokenUrl and userinfoUrl (ADR-0069)." (default "<no id>" .id)) -}}
+{{- end -}}
+{{- if not (and .clientSecret .clientSecret.name) -}}
+{{- fail (printf "scarab: scarab.oauth.providers entry `%s` needs clientSecret.name — a Secret you manage; the client secret is never a plaintext chart value." .id) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (include "scarab.oauthConfigured" .) .Values.scarab.oauth.providers -}}
 {{- if .Values.scarab.devInsecure -}}
 {{- fail "scarab: scarab.devInsecure=true AND scarab.oauth are both set — that is a contradiction, not a fallback: dev-insecure makes EVERY caller a synthetic Owner and would silently neuter the login you just configured. Pick one: clear scarab.devInsecure for real authn (ADR-0049), or clear scarab.oauth for a dev/eval install." -}}
 {{- end -}}

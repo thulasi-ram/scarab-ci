@@ -56,7 +56,9 @@
 //! | `SCARAB_RETENTION_WORKSPACE_DAYS` | env | terminal runs' workspace-CAS reachability TTL in days (ADR-0050 mark-sweep); default 14 — non-terminal runs always reachable |
 //! | `SCARAB_RETENTION_PACK_DAYS` | env | terminal runs' Depot pack TTL in days (git-bug 6499fb1, ADR-0065/0067); default = the workspace TTL, and must be ≥ it (packs back Workspace Snapshots) |
 //! | `SCARAB_RETENTION_CONFIG_FILE` | env | path to the operator retention config (ADR-0065 s2): the named RetentionProfile registry, TTL-only (YAML/JSON, gitops-managed); a bad path/parse/validation is a boot failure |
-//! | `SCARAB_OAUTH_OWNERS` | env | comma-separated entries granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer`. An entry matches the Principal subject (`sub`/`login`/`id`) **or** a provider-VERIFIED `email` claim (`email_verified`) — unverified/absent verification never grants `Owner` |
+//! | `SCARAB_OAUTH_OWNERS` | env | comma-separated entries granted `Owner` at login (bootstrap until scoped RBAC, ADR-0049 C2); everyone else logs in as `Viewer`. An entry matches a **Principal id** (`alice` from the legacy provider, `github:alice` from a named one) **or** `<provider>:<email>` when THAT provider asserts `email_verified`. A bare email is accepted only with a single provider (ADR-0069) — unverified/absent verification never grants `Owner` |
+//! | `SCARAB_OAUTH_PROVIDER_ID` / `_PROVIDER_NAME` / `_FORGE_URL` | env | the legacy single provider's id (default `default`; it mints the pre-ADR-0069 bare ids), its login-button label, and the forge it IS (equal to that forge's connection `base_url`, e.g. `https://api.github.com`) so a forge import resolves through it (ADR-0069) |
+//! | `SCARAB_OAUTH_PROVIDERS` / `_FILE` | env | further login providers as a YAML/JSON list (ADR-0069): `{id, name, client_id, client_secret \| client_secret_env, authorize_url, token_url, userinfo_url, issuer?, scopes?, forge_url?, unqualified_ids?}`. Ids are `[a-z0-9-]+` and prefix the Principal ids they mint. Duplicate ids, two `unqualified_ids`, or two providers on one `forge_url` refuse boot. Inline wins over `_FILE` |
 //! | `SCARAB_CONNECTIONS` | env | the declarative `connections:` block inline (YAML/JSON, ADR-0060 part D): config-owned forge connections, provisioned at boot and read-only in the UI. Wins over `_FILE` |
 //! | `SCARAB_CONNECTIONS_FILE` | env | path to a file holding the same `connections:` block (the GitOps shape: a ConfigMap mount). A bad path/parse/validation is a boot failure |
 //!
@@ -512,9 +514,10 @@ pub struct Config {
     /// and an empty registry (pre-0055 behavior). Read at boot; a bad path/parse
     /// is a boot failure (ADR-0048), mirroring the OIDC signing key.
     pub placement_config_file: Option<String>,
-    /// OAuth/OIDC login (ADR-0049 C1). `Some` = real authn wired; `None` is
-    /// only bootable under `SCARAB_DEV_INSECURE=1`.
-    pub oauth: Option<OAuthConfig>,
+    /// OAuth/OIDC login providers (ADR-0049 C1, ADR-0069). Non-empty = real
+    /// authn wired; empty is only bootable under `SCARAB_DEV_INSECURE=1`. The
+    /// legacy single-provider `SCARAB_OAUTH_*` variables, if set, are first.
+    pub oauth: Vec<OAuthConfig>,
     /// How long a terminal run's logs are retained, in days (ADR-0050;
     /// ADR-0030 default 30). Run metadata is retained regardless.
     pub retention_log_days: u32,
@@ -591,6 +594,161 @@ pub struct OAuthConfig {
     /// entries keep resolving. The single-provider `SCARAB_OAUTH_*` variables
     /// set it; at most one provider may.
     pub unqualified_ids: bool,
+    /// What the login page's button says.
+    pub name: String,
+    /// The forge instance this provider's identities ARE accounts on
+    /// (ADR-0069 §5): equal to that forge's `ForgeConnection.base_url`
+    /// (`https://api.github.com`, or a Forgejo web host), trailing `/` trimmed.
+    /// `None` = not a forge (an OIDC IdP); a forge import can then never be
+    /// signed into through it.
+    pub forge_url: Option<String>,
+}
+
+/// One entry of `SCARAB_OAUTH_PROVIDERS[_FILE]` (ADR-0069 §4), as written.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOAuthProvider {
+    id: String,
+    name: Option<String>,
+    client_id: String,
+    /// The secret inline, or…
+    client_secret: Option<String>,
+    /// …the name of the env var holding it (how Helm injects a `secretKeyRef`
+    /// without the secret ever entering a ConfigMap).
+    client_secret_env: Option<String>,
+    authorize_url: String,
+    token_url: String,
+    userinfo_url: String,
+    issuer: Option<String>,
+    #[serde(default)]
+    scopes: String,
+    forge_url: Option<String>,
+    #[serde(default)]
+    unqualified_ids: bool,
+}
+
+/// Every configured login provider (ADR-0069 §4): the legacy single-provider
+/// `SCARAB_OAUTH_*` set (if any) first, then `SCARAB_OAUTH_PROVIDERS` (inline
+/// YAML/JSON list, wins) or `SCARAB_OAUTH_PROVIDERS_FILE`. The install-wide
+/// `SCARAB_OAUTH_OWNERS` is attached to each. Refuses what would make one
+/// typed string mean two people: duplicate ids, two `unqualified_ids`
+/// providers, two providers claiming one forge, or a bare-email owner entry
+/// that more than one provider could satisfy.
+fn oauth_providers(
+    legacy: Option<OAuthConfig>,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Vec<OAuthConfig>, ConfigError> {
+    let bad = |m: String| ConfigError::InvalidOAuthProviders(m);
+    let mut out: Vec<OAuthConfig> = legacy.into_iter().collect();
+
+    let raw = match env("SCARAB_OAUTH_PROVIDERS").filter(|v| !v.trim().is_empty()) {
+        Some(inline) => Some((inline, "SCARAB_OAUTH_PROVIDERS".to_string())),
+        None => match env("SCARAB_OAUTH_PROVIDERS_FILE").filter(|v| !v.is_empty()) {
+            Some(path) => Some((
+                std::fs::read_to_string(&path).map_err(|e| {
+                    bad(format!(
+                        "cannot read SCARAB_OAUTH_PROVIDERS_FILE {path}: {e}"
+                    ))
+                })?,
+                format!("SCARAB_OAUTH_PROVIDERS_FILE {path}"),
+            )),
+            None => None,
+        },
+    };
+    if let Some((raw, source)) = raw {
+        // YAML is a superset of JSON, so one parser accepts both shapes.
+        let entries: Vec<RawOAuthProvider> =
+            serde_yaml::from_str(&raw).map_err(|e| bad(format!("{source}: {e}")))?;
+        for e in entries {
+            if !is_provider_id(&e.id) {
+                return Err(bad(format!(
+                    "{source}: provider id `{}` — want lowercase letters, digits and `-`",
+                    e.id
+                )));
+            }
+            let client_secret = match (e.client_secret, e.client_secret_env) {
+                (Some(s), None) if !s.is_empty() => s,
+                (None, Some(var)) => env(&var).filter(|v| !v.is_empty()).ok_or_else(|| {
+                    bad(format!(
+                        "{source}: provider `{}` names client_secret_env `{var}`, which is unset",
+                        e.id
+                    ))
+                })?,
+                _ => {
+                    return Err(bad(format!(
+                        "{source}: provider `{}` needs exactly one of client_secret / client_secret_env",
+                        e.id
+                    )))
+                }
+            };
+            out.push(OAuthConfig {
+                name: e.name.unwrap_or_else(|| e.id.clone()),
+                provider_id: e.id,
+                client_id: e.client_id,
+                client_secret,
+                authorize_url: e.authorize_url,
+                token_url: e.token_url,
+                userinfo_url: e.userinfo_url,
+                oidc_issuer: e.issuer.filter(|v| !v.is_empty()),
+                scopes: e.scopes,
+                owners: Vec::new(),
+                forge_url: e
+                    .forge_url
+                    .filter(|v| !v.is_empty())
+                    .map(|u| u.trim_end_matches('/').to_string()),
+                unqualified_ids: e.unqualified_ids,
+            });
+        }
+    }
+
+    for (i, p) in out.iter().enumerate() {
+        for q in &out[..i] {
+            if q.provider_id == p.provider_id {
+                return Err(bad(format!(
+                    "provider id `{}` is configured twice",
+                    p.provider_id
+                )));
+            }
+            if q.unqualified_ids && p.unqualified_ids {
+                return Err(bad(format!(
+                    "`{}` and `{}` are both unqualified_ids — two providers minting bare ids \
+                     could each produce `alice` for a different person",
+                    q.provider_id, p.provider_id
+                )));
+            }
+            if p.forge_url.is_some() && q.forge_url == p.forge_url {
+                return Err(bad(format!(
+                    "`{}` and `{}` both claim forge_url {} — an imported forge account \
+                     must resolve to exactly one provider",
+                    q.provider_id,
+                    p.provider_id,
+                    p.forge_url.as_deref().unwrap_or_default()
+                )));
+            }
+        }
+    }
+
+    let owners: Vec<String> = env("SCARAB_OAUTH_OWNERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    if out.len() > 1 {
+        if let Some(o) = owners.iter().find(|o| o.contains('@') && !o.contains(':')) {
+            return Err(bad(format!(
+                "SCARAB_OAUTH_OWNERS entry `{o}` is a bare email, but {} providers are \
+                 configured — any of them asserting it verified would mint an Owner. \
+                 Qualify it as `<provider>:{o}`",
+                out.len()
+            )));
+        }
+    }
+    for p in &mut out {
+        p.owners = owners.clone();
+    }
+    Ok(out)
 }
 
 /// A configuration the process must refuse to start under, with a message
@@ -694,6 +852,9 @@ pub enum ConfigError {
          mints, so it may not carry the `:`/`~` an id is parsed by."
     )]
     InvalidProviderId(String),
+
+    #[error("login providers are misconfigured (ADR-0069): {0}")]
+    InvalidOAuthProviders(String),
 
     #[error(
         "SCARAB_RETENTION_LOG_DAYS is set but invalid — want a positive integer number \
@@ -928,13 +1089,9 @@ impl Config {
                 // id_token verification (ADR-0049 amendment).
                 oidc_issuer: env("SCARAB_OAUTH_ISSUER").filter(|v| !v.is_empty()),
                 scopes: env("SCARAB_OAUTH_SCOPES").unwrap_or_default(),
-                owners: env("SCARAB_OAUTH_OWNERS")
-                    .unwrap_or_default()
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .collect(),
+                // Filled below: the owners list is install-wide, shared by
+                // every provider (ADR-0069 §4).
+                owners: Vec::new(),
                 provider_id: {
                     let id = env("SCARAB_OAUTH_PROVIDER_ID")
                         .filter(|v| !v.is_empty())
@@ -944,6 +1101,12 @@ impl Config {
                     }
                     id
                 },
+                name: env("SCARAB_OAUTH_PROVIDER_NAME")
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "Sign in".into()),
+                forge_url: env("SCARAB_OAUTH_FORGE_URL")
+                    .filter(|v| !v.is_empty())
+                    .map(|u| u.trim_end_matches('/').to_string()),
                 unqualified_ids: true,
             })
         } else if oauth_vals.iter().any(Option::is_some)
@@ -961,6 +1124,7 @@ impl Config {
         } else {
             None
         };
+        let oauth = oauth_providers(oauth, &env)?;
 
         // Auth default-deny (ADR-0048): a boot that can authenticate no one
         // must not pretend to be up — OAuth login (ADR-0049) or the loud
@@ -969,7 +1133,7 @@ impl Config {
         // workspace token (SCARAB_WORKSPACE_TOKEN_SECRET — its own refusal
         // below, so this is not "authenticates no one"), it mounts no OAuth
         // login route, and an OAuth config there would configure nothing.
-        if oauth.is_none() && !dev_insecure && !matches!(cli.role, Role::Workspace) {
+        if oauth.is_empty() && !dev_insecure && !matches!(cli.role, Role::Workspace) {
             return Err(ConfigError::NoAuthenticator);
         }
 
@@ -1250,15 +1414,19 @@ impl Config {
             ),
             format!(
                 "auth: {}",
-                match (&self.oauth, self.dev_insecure) {
-                    (Some(o), _) => format!(
-                        "OAuth/OIDC login enabled (authorize={}, {} owner(s), ADR-0049)",
-                        o.authorize_url,
-                        o.owners.len(),
-                    ),
-                    (None, true) =>
+                match (self.oauth.as_slice(), self.dev_insecure) {
+                    ([], true) =>
                         "DISABLED — SCARAB_DEV_INSECURE (all callers are Owner)".to_string(),
-                    (None, false) => "enabled".to_string(),
+                    ([], false) => "enabled".to_string(),
+                    (providers, _) => format!(
+                        "OAuth/OIDC login enabled — {} ({} owner(s), ADR-0049/0069)",
+                        providers
+                            .iter()
+                            .map(|o| format!("{}={}", o.provider_id, o.authorize_url))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        providers[0].owners.len(),
+                    ),
                 },
             ),
             format!(
@@ -2504,6 +2672,93 @@ connections:
     /// the five-knob provider — with them it turns on id_token verification;
     /// alone it is partial config, never a silent no-op. Owners parse as
     /// subject-or-email entries.
+    /// ADR-0069 §4: several providers. The legacy five knobs are the bare-id
+    /// provider and come first; `SCARAB_OAUTH_PROVIDERS` adds named ones whose
+    /// secret may come from another env var (Helm's `secretKeyRef`). Every
+    /// configuration that would let one typed string mean two people is a
+    /// boot refusal, not a runtime surprise.
+    #[test]
+    fn several_login_providers_and_what_refuses_boot() {
+        const LEGACY: &[(&str, &str)] = &[
+            ("SCARAB_OAUTH_CLIENT_ID", "cid"),
+            ("SCARAB_OAUTH_CLIENT_SECRET", "sekret"),
+            (
+                "SCARAB_OAUTH_AUTHORIZE_URL",
+                "https://github.com/login/oauth/authorize",
+            ),
+            (
+                "SCARAB_OAUTH_TOKEN_URL",
+                "https://github.com/login/oauth/access_token",
+            ),
+            ("SCARAB_OAUTH_USERINFO_URL", "https://api.github.com/user"),
+            ("SCARAB_OAUTH_FORGE_URL", "https://api.github.com/"),
+            ("SCARAB_OAUTH_OWNERS", "alice,okta:ada@example.com"),
+            ("OKTA_SECRET", "s3"),
+            (
+                "SCARAB_OAUTH_PROVIDERS",
+                r#"[{"id":"okta","name":"Okta","client_id":"o","client_secret_env":"OKTA_SECRET",
+                    "authorize_url":"https://okta.example/authorize","token_url":"https://okta.example/token",
+                    "userinfo_url":"https://okta.example/userinfo","issuer":"https://okta.example"}]"#,
+            ),
+        ];
+        let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(LEGACY)).unwrap();
+        let ids: Vec<_> = cfg.oauth.iter().map(|o| o.provider_id.as_str()).collect();
+        assert_eq!(ids, ["default", "okta"]);
+        assert!(cfg.oauth[0].unqualified_ids && !cfg.oauth[1].unqualified_ids);
+        assert_eq!(
+            cfg.oauth[0].forge_url.as_deref(),
+            Some("https://api.github.com")
+        );
+        assert_eq!(
+            cfg.oauth[1].client_secret, "s3",
+            "secret resolved from the named env var"
+        );
+        assert_eq!(
+            cfg.oauth[1].owners, cfg.oauth[0].owners,
+            "owners are install-wide"
+        );
+
+        const BARE_EMAIL_TWO_PROVIDERS: &[(&str, &str)] = &[
+            (
+                "SCARAB_OAUTH_PROVIDERS",
+                r#"[{"id":"a","client_id":"x","client_secret":"y","authorize_url":"u","token_url":"u","userinfo_url":"u"},
+                    {"id":"b","client_id":"x","client_secret":"y","authorize_url":"u","token_url":"u","userinfo_url":"u"}]"#,
+            ),
+            ("SCARAB_OAUTH_OWNERS", "ada@example.com"),
+        ];
+        const TWO_UNQUALIFIED: &[(&str, &str)] = &[(
+            "SCARAB_OAUTH_PROVIDERS",
+            r#"[{"id":"a","client_id":"x","client_secret":"y","authorize_url":"u","token_url":"u","userinfo_url":"u","unqualified_ids":true},
+                {"id":"b","client_id":"x","client_secret":"y","authorize_url":"u","token_url":"u","userinfo_url":"u","unqualified_ids":true}]"#,
+        )];
+        const ONE_FORGE_TWICE: &[(&str, &str)] = &[(
+            "SCARAB_OAUTH_PROVIDERS",
+            r#"[{"id":"a","client_id":"x","client_secret":"y","authorize_url":"u","token_url":"u","userinfo_url":"u","forge_url":"https://git.example"},
+                {"id":"b","client_id":"x","client_secret":"y","authorize_url":"u","token_url":"u","userinfo_url":"u","forge_url":"https://git.example/"}]"#,
+        )];
+        const DUP_ID: &[(&str, &str)] = &[(
+            "SCARAB_OAUTH_PROVIDERS",
+            r#"[{"id":"a","client_id":"x","client_secret":"y","authorize_url":"u","token_url":"u","userinfo_url":"u"},
+                {"id":"a","client_id":"x","client_secret":"y","authorize_url":"u","token_url":"u","userinfo_url":"u"}]"#,
+        )];
+        const BAD_ID: &[(&str, &str)] = &[(
+            "SCARAB_OAUTH_PROVIDERS",
+            r#"[{"id":"Git:Hub","client_id":"x","client_secret":"y","authorize_url":"u","token_url":"u","userinfo_url":"u"}]"#,
+        )];
+        for (env, needle) in [
+            (BARE_EMAIL_TWO_PROVIDERS, "bare email"),
+            (TWO_UNQUALIFIED, "both unqualified_ids"),
+            (ONE_FORGE_TWICE, "both claim forge_url"),
+            (DUP_ID, "configured twice"),
+            (BAD_ID, "provider id `Git:Hub`"),
+        ] {
+            let err = Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(env))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "want `{needle}` in: {err}");
+        }
+    }
+
     #[test]
     fn oauth_issuer_is_optional_but_never_silently_ignored() {
         const FIVE: &[(&str, &str)] = &[
@@ -2526,7 +2781,7 @@ connections:
 
         // Plain OAuth2 (the GitHub shape): no issuer, so no id_token is trusted.
         let cfg = Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(FIVE)).unwrap();
-        let oauth = cfg.oauth.as_ref().expect("five knobs enable login");
+        let oauth = cfg.oauth.first().expect("five knobs enable login");
         assert_eq!(oauth.oidc_issuer, None);
         assert_eq!(oauth.owners, vec!["ada@example.com", "8f3c-opaque"]);
 
@@ -2534,7 +2789,7 @@ connections:
         let cfg =
             Config::resolve_from(&cli(Some("postgres://l/scarab")), dev_env(WITH_ISSUER)).unwrap();
         assert_eq!(
-            cfg.oauth.unwrap().oidc_issuer.as_deref(),
+            cfg.oauth[0].oidc_issuer.as_deref(),
             Some("https://dex.example/")
         );
 

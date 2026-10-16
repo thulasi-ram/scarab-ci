@@ -9439,7 +9439,7 @@ mod tests {
             github_app_pem_file: None,
             clone_image: "ghcr.io/example/clone:test".into(),
             placement_config_file: None,
-            oauth: None,
+            oauth: Vec::new(),
             retention_log_days: 30,
             retention_artifact_days: 90,
             retention_workspace_days: 14,

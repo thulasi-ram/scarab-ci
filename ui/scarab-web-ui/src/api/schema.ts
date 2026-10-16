@@ -141,6 +141,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/auth/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List login providers (ADR-0069) */
+        get: operations["auth_providers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/connections": {
         parameters: {
             query?: never;
@@ -1356,6 +1373,15 @@ export interface components {
              */
             started_at: number;
         };
+        /** @description One login provider, as the login page offers it (ADR-0069). */
+        AuthProviderDto: {
+            /** @description The one used when a login names none. */
+            default: boolean;
+            /** @description Pass as `provider` to `GET`/`POST /v1/auth/login`. */
+            id: string;
+            /** @description The button label. */
+            name: string;
+        };
         /**
          * @description `GET /v1/connections/{id}/available-repos`: what the connection's credential
          *     reaches, and which of those Scarab already governs.
@@ -2516,7 +2542,10 @@ export interface operations {
     };
     oauth_login_redirect: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description login provider id (ADR-0069); default = the only, or the unqualified_ids, provider */
+                provider?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -2525,6 +2554,13 @@ export interface operations {
         responses: {
             /** @description redirect to the provider with a state cookie */
             302: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description unknown provider, or several and none named */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2587,6 +2623,25 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    auth_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthProviderDto"][];
+                };
             };
         };
     };
